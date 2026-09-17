@@ -37,3 +37,10 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.pytest.ini_options]
+# 单一事实源是 src/skill3d（§2）；`pytest` 从仓库根可直接运行，无需先安装。
+testpaths = ["tests"]
+pythonpath = ["src"]
+# legacy/ 为原 Skill-3D 参考代码，不参与新系统测试收集。
+norecursedirs = ["legacy", "third_party", ".git", "build", "dist"]

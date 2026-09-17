@@ -11,6 +11,13 @@ __pycache__/
 .vscode/
 .idea/
 
+# ---- 新系统（§2 目录树）----
+# 数据集与重建产物不入库（§2：data/ 不入库；DVC/软链）
+/data/**
+!/data/.gitkeep
+/data/.gitkeep
+
+# ---- legacy Skill-3D 参考代码（legacy/，见 legacy/README.md）----
 # Datasets and generated samples. Keep dataset utility code only.
 /dataset/*
 !/dataset/*.py
@@ -23,10 +30,10 @@ __pycache__/
 
 # Checkpoints, model links, and heavyweight third-party assets. Keep only the
 # public checkpoints/ directory skeleton through .gitkeep files.
-/checkpoints/**
-!/checkpoints/
-!/checkpoints/**/
-!/checkpoints/**/.gitkeep
+/legacy/checkpoints/**
+!/legacy/checkpoints/
+!/legacy/checkpoints/**/
+!/legacy/checkpoints/**/.gitkeep
 /model_links/
 /models/
 /Qwen*/
@@ -35,7 +42,8 @@ __pycache__/
 /clip-vit-large-patch14/
 /models--*/
 /GroundingDINO/weights/
-/spagent/external_experts/**/checkpoints/
+/legacy/third_party/**/weights/
+/legacy/third_party/**/checkpoints/
 
 # Runtime outputs.
 /logs/
@@ -44,20 +52,20 @@ __pycache__/
 /outputs/
 /outputs_old/
 /wandb/
-/train/logs/
-/train/temp_frames_train/
+/legacy/train/logs/
+/legacy/train/temp_frames_train/
 
 # Learned memories/skills are generated artifacts. The public repository keeps
 # the statics/skill3d_shared directory skeleton through README.md/.gitkeep only.
-/statics/skill3d_by_benchmark/
-/statics/learned*.json
-/statics/skill3d_shared/**/*.json
-/statics/skill3d_shared/**/*.jsonl
-!/statics/
-!/statics/skill3d_shared/
-!/statics/skill3d_shared/**/
-!/statics/skill3d_shared/README.md
-!/statics/skill3d_shared/**/.gitkeep
+/legacy/statics/skill3d_by_benchmark/
+/legacy/statics/learned*.json
+/legacy/statics/skill3d_shared/**/*.json
+/legacy/statics/skill3d_shared/**/*.jsonl
+!/legacy/statics/
+!/legacy/statics/skill3d_shared/
+!/legacy/statics/skill3d_shared/**/
+!/legacy/statics/skill3d_shared/README.md
+!/legacy/statics/skill3d_shared/**/.gitkeep
 
 # Large model/media/result files.
 *.safetensors
@@ -75,10 +83,10 @@ __pycache__/
 *.jpeg
 *.png
 *.webp
-!/assets/
-!/assets/.gitkeep
-!/assets/main.png
-!/assets/motivation.png
+!/legacy/assets/
+!/legacy/assets/.gitkeep
+!/legacy/assets/main.png
+!/legacy/assets/motivation.png
 *.ply
 *.pcd
 *.npy
