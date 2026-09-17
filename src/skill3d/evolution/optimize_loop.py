@@ -289,9 +289,13 @@ def main(argv: list[str] | None = None) -> int:
                              outs_a, outs_b, [it.episode.question_type for it in items],
                              base_cfg.active_snapshot_ref, args.seed)
         d_mca, d_mra = _delta_by_metric(outs_a, outs_b)
+        mixed = d_mca is not None and d_mra is not None
         print(f"\n[{level}] n={po.n_episodes} delta={po.delta:+.4f} "
               f"CI95=[{po.ci95_lo:+.4f},{po.ci95_hi:+.4f}] p={po.wilcoxon_p:.4f} "
               f"d_mca={_fmt(d_mca)} d_mra={_fmt(d_mra)} slice_ok={po.slice_no_regression}")
+        if mixed:
+            print("        ⚠ 面板同时含 MCA/NA：delta 为混合分数（非单一指标），"
+                  "结论需按题型切片分别看 d_mca / d_mra")
         print(f"        arm_a accuracy/mra: "
               f"{_acc(outs_a)}/{_mra(outs_a)}    arm_b: {_acc(outs_b)}/{_mra(outs_b)}")
         trace_store.append("paired_outcome", po)

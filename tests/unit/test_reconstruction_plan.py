@@ -90,3 +90,37 @@ def test_run_jobs_dp_assignment_across_gpus(tmp_path):
     jobs = run_jobs(jobs, {j.scene_name: [it] for j, it in zip(jobs, items)},
                     tmp_path, "vggt", gpus=[0, 1])
     assert [j.gpu_rank for j in jobs] == [0, 1, 0]
+
+
+def test_run_jobs_passes_one_episode_frames_per_scene(tmp_path, monkeypatch):
+    """回归：同 scene 多 episode 来自同一段视频 → 只喂一份 32 帧，不拼接多份。
+
+    拼接会把 32×N 帧塞进重建（错误输入），这里用替身捕获真实入参。
+    """
+    import skill3d.reconstruction.run as run_mod
+    from skill3d.schemas import ConfidenceMap, QualityMetrics, ReconstructionArtifact
+
+    captured: dict[str, int] = {}
+    nan = float("nan")
+
+    def fake_reconstruct(frames, scene_name, output_dir, method="vggt"):
+        captured[scene_name] = len(frames)
+        return ReconstructionArtifact(
+            artifact_id="x", artifact_version="x", scene_name=scene_name,
+            recon_method="vggt", c2w_list="", intrinsics="", depth_maps="",
+            point_map="", point_conf="", track_list=None, metric_scale=None,
+            scale_known=False,
+            quality=QualityMetrics(
+                g1_blur_ok=nan, g2_brightness=nan, g3_motion_blur=nan, g4_frame_count=32,
+                g5_reproj_err_median=nan, g5_reproj_err_p95=nan, g6_depth_var_coeff=nan,
+                g7_dynamic_ratio=nan, g8_bbox_coverage_min=nan, g9_tracker_consistency=nan,
+                g10_baseline_quality=nan, g11_scale_ci=nan, overall_quality=nan),
+            confidence=ConfidenceMap(per_point_confidence="", coverage_count_per_frame=""),
+        )
+
+    monkeypatch.setattr(run_mod, "reconstruct", fake_reconstruct)
+    items = [_item("scene-a", "a1"), _item("scene-a", "a2"), _item("scene-a", "a3")]
+    jobs = plan_scene_jobs(items, tmp_path, "vggt")
+    jobs = run_jobs(jobs, {"scene-a": items}, tmp_path, "vggt", gpus=[0])
+    assert captured == {"scene-a": 32}
+    assert jobs[0].status == "done"

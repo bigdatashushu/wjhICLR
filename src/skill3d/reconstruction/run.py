@@ -86,7 +86,9 @@ def run_jobs(jobs: list[SceneJob], items_by_scene: dict[str, list[EpisodeItem]],
     for job in pending:
         gpu = scheduler.assign(job.scene_name, role="reconstruct")
         job.gpu_rank = gpu.gpu_rank
-        frames = [p for it in items_by_scene.get(job.scene_name, []) for p in it.pixels]
+        # 同 scene 的多个 episode 来自同一段视频 → 只取一份 32 帧（不拼接多份帧）
+        scene_items = items_by_scene.get(job.scene_name, [])
+        frames = list(scene_items[0].pixels) if scene_items else []
         if not frames:
             job.status, job.note = "failed", "无可用帧（视频缺失或抽帧失败）"
             continue
