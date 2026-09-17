@@ -9,11 +9,15 @@ from __future__ import annotations
 import hashlib
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict
 
 GENESIS_HASH = "0" * 64
+
+
+def _default_id() -> str:
+    return uuid.uuid4().hex
 
 
 class SandboxReceipt(BaseModel):
@@ -48,10 +52,21 @@ def _compute_hash(
 
 
 class ReceiptChain:
-    """per-episode 收据链。"""
+    """per-episode 收据链。
 
-    def __init__(self, episode_id: str) -> None:
+    clock / id_factory 可注入：重放确定性模式（§4 M8/M17 同 seed 字节级一致）
+    下由上层传入固定时钟与计数器式 id；默认仍是 wall-clock + uuid4。
+    """
+
+    def __init__(
+        self,
+        episode_id: str,
+        clock: Callable[[], float] = time.time,
+        id_factory: Callable[[], str] = _default_id,
+    ) -> None:
         self.episode_id = episode_id
+        self._clock = clock
+        self._id_factory = id_factory
         self._receipts: list[SandboxReceipt] = []
 
     @property
@@ -69,12 +84,12 @@ class ReceiptChain:
         source: str = "real",
         error_code: Optional[str] = None,
     ) -> SandboxReceipt:
-        ts = time.time()
+        ts = self._clock()
         pd = _digest_payload(payload)
         prev = self.head_hash
         h = _compute_hash(self.episode_id, prev, event, pd, source, error_code, ts)
         r = SandboxReceipt(
-            receipt_id=uuid.uuid4().hex,
+            receipt_id=self._id_factory(),
             episode_id=self.episode_id,
             prev_hash=prev,
             event=event,

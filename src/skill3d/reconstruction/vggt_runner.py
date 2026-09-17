@@ -132,11 +132,16 @@ def reconstruct(
 ) -> ReconstructionArtifact:
     """重建入口 + 降级链（§4 M3 字段 9）：
     vggt → dust3r_mast3r → 单目深度 2D-only（后者不产生 3D artifact）。
+
+    每次降级都保留上一级失败原因，最终异常里汇总（便于定位缺权重/缺依赖）。
     """
+    reasons: list[str] = []
+
     if method == "vggt":
         try:
             return run_vggt(frames, scene_name, output_dir)
-        except ReconstructionFailed:
+        except ReconstructionFailed as exc:
+            reasons.append(f"vggt: {exc}")
             method = "dust3r_mast3r"  # 降级链
 
     if method == "dust3r_mast3r":
@@ -144,14 +149,16 @@ def reconstruct(
 
         try:
             return run_dust3r_mast3r(frames, scene_name, output_dir)
-        except ReconstructionFailed:
+        except ReconstructionFailed as exc:
+            reasons.append(f"dust3r_mast3r: {exc}")
             method = "monocular"
 
     if method == "monocular":
         # 单目深度 2D-only：不产出 ReconstructionArtifact，
         # 上游应将 SceneState.route 置为 "fallback_2d_only"
         raise ReconstructionFailed(
-            "所有 3D 重建路径失败，降级为单目深度 2D-only（不产生 3D artifact）"
+            "所有 3D 重建路径失败，降级为单目深度 2D-only（不产生 3D artifact）；"
+            "各级原因: " + " | ".join(reasons)
         )
 
     raise ValueError(f"未知重建方法: {method}")

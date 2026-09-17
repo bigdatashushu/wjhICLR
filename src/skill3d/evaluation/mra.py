@@ -6,9 +6,31 @@ rel = |gt - pred| / max(|gt|, 1)；对 θ ∈ {0.50, 0.55, …, 0.95} 共 10 阈
 
 from __future__ import annotations
 
+import re
+from typing import Optional
+
 import numpy as np
 
 MRA_THETAS = np.arange(0.50, 0.951, 0.05)  # 10 阈值（以官方为准 TODO）
+
+# 数值抽取：首个带可选正负号/小数/科学计数法的数字
+_NUM_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+
+def parse_numeric_answer(text: Optional[str]) -> Optional[float]:
+    """从模型输出抽取数值（§4 M12 字段 9：不可解析 → 记 wrong / MRA 0）。
+
+    NA 题答案可能带单位（"3.5 m"、"12 meters"、"48 m2"），取首个数值。
+    """
+    if text is None:
+        return None
+    m = _NUM_RE.search(str(text))
+    if m is None:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
+        return None
 
 
 def mra(preds, gts) -> float:

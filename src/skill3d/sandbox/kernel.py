@@ -10,12 +10,15 @@ cell 超时与错误捕获；两级兜底（no-tool CoT → 正则抽取）留�
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import signal
 import types
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from skill3d.schemas import ToolCall, ToolResult
 from skill3d.tools.registry import ToolRegistry
 from skill3d.tools.scene_handle import SceneHandle
 
@@ -81,16 +84,22 @@ class RestrictedNamespaceKernel:
         # 两级兜底钩子（termination node：no-tool CoT → 正则抽取），由上层注入
         fallback_cot_fn: Optional[Callable[[], str]] = None,
         fallback_regex_fn: Optional[Callable[[str], Optional[str]]] = None,
+        # tool call_id 生成器：重放确定性模式由上层注入计数器（§4 M17 同 seed 字节级一致）
+        call_id_factory: Optional[Callable[[], str]] = None,
     ) -> None:
         self._registry = tool_registry
         self._scene = scene
         self._mode = mode
         self._mock_switch = mock_switch
+        self._call_id_factory = call_id_factory or (lambda: uuid.uuid4().hex[:12])
         self.cell_timeout_s = cell_timeout_s
         self.answer_slot = _AnswerSlot()
         self.show_log: list[Any] = []
         self.fallback_cot_fn = fallback_cot_fn
         self.fallback_regex_fn = fallback_regex_fn
+        # M10 产物：ProgramExecutionTrace 的 calls/results（§5.4）
+        self.tool_calls: list[ToolCall] = []
+        self.tool_results: list[ToolResult] = []
 
         # tools 命名空间：tools.<name>(**args) → 经 REGISTRY.call_tool
         tools_ns = types.SimpleNamespace()
@@ -116,10 +125,23 @@ class RestrictedNamespaceKernel:
             self._ns[k] = v
 
     def _make_tool_fn(self, name: str) -> Callable[..., Any]:
-        def _fn(**args):
+        """Tool 包装：位置/关键字传参均可（program 里 `euclidean_distance(a, b)` 与
+        `euclidean_distance(point_a=a, point_b=b)` 等价）。"""
+        sig = inspect.signature(self._registry.get(name).fn)
+
+        def _fn(*args, **kwargs):
+            bound = sig.bind(self._scene, *args, **kwargs)
+            call_args = {k: v for k, v in bound.arguments.items()
+                         if k not in ("handle", "scene")}
             result = self._registry.call_tool(
-                name, args, self._scene, mode=self._mode, mock_switch=self._mock_switch
+                name, call_args, self._scene, mode=self._mode,
+                mock_switch=self._mock_switch,
             )
+            # 记录到 ProgramExecutionTrace（§5.4）：调用与结果成对入库
+            self.tool_calls.append(
+                ToolCall(tool=name, args=call_args, call_id=self._call_id_factory())
+            )
+            self.tool_results.append(result)
             if result.error is not None:
                 raise RuntimeError(f"Tool {name} 执行失败: {result.error}")
             import json

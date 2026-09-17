@@ -18,6 +18,7 @@ from skill3d.reconstruction_gate.confidence_map import (
 )
 from skill3d.schemas.reconstruction import (
     ConfidenceMap,
+    QualityMetrics,
     ReconstructionArtifact,
     SceneState,
 )
@@ -25,6 +26,18 @@ from skill3d.schemas.reconstruction import (
 # 整体质量阈值（TODO_CALIBRATE，§4 M4 字段 7：低于则 route=fallback_2d_only）
 TH_OVERALL_QUALITY: float = 0.5   # TODO_CALIBRATE
 TH_SCALE_CI: float = 0.1          # TODO_CALIBRATE: G11 CI 过宽记 scale_unknown（m）
+
+
+def route_from_quality(q: QualityMetrics, scale_known: bool) -> str:
+    """§4 M4 伪代码的分流规则（单一事实源）。
+
+    unanswerable（无可用帧）/ fallback_2d_only（质量不足或尺度未知）/ full_3d。
+    """
+    if q.g4_frame_count < 1:
+        return "unanswerable"
+    if not scale_known or q.overall_quality < TH_OVERALL_QUALITY:
+        return "fallback_2d_only"
+    return "full_3d"
 
 
 def quality_gate(
@@ -80,12 +93,7 @@ def quality_gate(
             per_object_coverage(fused, object_point_indices)
 
     # 分流（§4 M4 伪代码：overall_quality < TH → fallback_2d_only）
-    if not scale_known or q.overall_quality < TH_OVERALL_QUALITY:
-        route = "fallback_2d_only"
-    else:
-        route = "full_3d"
-    if q.g4_frame_count < 1:
-        route = "unanswerable"
+    route = route_from_quality(q, scale_known)
 
     summary = (
         f"scene={art.scene_name} method={art.recon_method} route={route} "

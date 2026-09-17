@@ -10,6 +10,7 @@ Skill 状态机：draft → shadow → canary → promoted；异常 → quaranti
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from skill3d.schemas import SkillSpec, SkillState
 
@@ -87,7 +88,6 @@ def validate_version_bump(old: SkillSpec, new: SkillSpec) -> None:
 
 class SkillRegistry:
     """SkillSpec 注册表：语义版本 + 状态机（M15）。"""
-
     def __init__(self) -> None:
         # skill_id -> semver -> SkillSpec
         self._specs: dict[str, dict[str, SkillSpec]] = {}
@@ -132,3 +132,39 @@ class SkillRegistry:
                 if s == state:
                     out.append(self._specs[skill_id][semver])
         return out
+
+
+# ------------------------------------------------------------- active 快照读取 ----
+
+def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], str]:
+    """读 active snapshot（M15 原子指针）→ 已 consolidated 的 SkillSpec 列表。
+
+    `path` 可为 snapshot 目录或 `active_snapshot.json` 文件（§13.5 CLI 传文件）。
+    返回 `(skills, warnings, snapshot_ref)`；无 active 时返回空列表（空 Skill baseline）。
+    在线链只读 active（硬约束 12：在线只读，写 promote 在离线）。
+    """
+    import json
+    from pathlib import Path as _Path
+
+    from .promote_atomic import read_active_snapshot
+
+    p = _Path(path)
+    store_dir = p if p.is_dir() else p.parent
+    warnings: list[str] = []
+    if not (store_dir / "active_snapshot.json").exists():
+        return [], [f"无 active snapshot（{store_dir}/active_snapshot.json 不存在）→ 空 Skill"], "genesis"
+    try:
+        snap = read_active_snapshot(store_dir)
+    except Exception as exc:  # noqa: BLE001 - 损坏的指针不应让在线链崩掉
+        return [], [f"active snapshot 读取失败: {type(exc).__name__}: {exc}"], "genesis"
+
+    skills: list[SkillSpec] = []
+    for rid, entry in (snap.get("entries") or {}).items():
+        if entry.get("candidate_type") != "skill":
+            continue
+        raw = entry.get("spec_content") or ""
+        try:
+            skills.append(SkillSpec.model_validate(json.loads(raw)))
+        except Exception as exc:  # noqa: BLE001 - 单条损坏不阻断其余
+            warnings.append(f"条目 {rid} 无法解析为 SkillSpec: {type(exc).__name__}: {exc}")
+    return skills, warnings, str(snap.get("snapshot_id", "genesis"))

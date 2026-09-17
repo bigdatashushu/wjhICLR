@@ -1,7 +1,7 @@
 """硬约束 1 静态守卫：在线链模块源码中不得 import governance / gpt6（大小写不敏感）。
 
 扫描目录：adapters/gates/reconstruction/reconstruction_gate/segmentation/tools/
-routing/synthesis/sandbox/verifier/evaluation/trace + fsm/online_fsm.py。
+routing/synthesis/sandbox/verifier/evaluation/trace/online + fsm/online_fsm.py。
 仅检查 import 语句行（注释中提及 GPT-6 的设计说明不算违规）。
 """
 
@@ -13,6 +13,7 @@ SRC = Path(__file__).resolve().parents[2] / "src" / "skill3d"
 ONLINE_DIRS = [
     "adapters", "gates", "reconstruction", "reconstruction_gate", "segmentation",
     "tools", "routing", "synthesis", "sandbox", "verifier", "evaluation", "trace",
+    "online",  # 在线链编排层（M1-M13 driver，§6.1）
 ]
 ONLINE_FILES = ["fsm/online_fsm.py"]
 
