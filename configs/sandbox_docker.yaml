@@ -1,0 +1,12 @@
+# 沙箱 Docker 参数（§13.2）
+image: skill3d-sandbox:latest
+read_only: true
+tmpfs: /tmp
+network: none
+cpus: 4
+memory: 8g
+pids_limit: 256
+cap_drop: ALL
+security_opt: no-new-privileges
+mount_recon_readonly: true
+# final-test 目录绝不挂载（硬约束 9）

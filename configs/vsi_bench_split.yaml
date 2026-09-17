@@ -1,0 +1,9 @@
+# VSI-Bench 分层切分（§13.3）：按 scene_id 分层，不共享 scene
+# 比例起始建议 induction:inner:outer:final = 5:3:2:留出，TODO_CALIBRATE
+split_version: "v1"
+induction_scene_ids: []        # TODO_CALIBRATE 启动时由 split 脚本按 scene+题型分层填充
+inner_validation_scene_ids: []
+outer_holdout_scene_ids: []
+final_test_scene_ids: []       # 系统不可见，仅记录存在（硬约束 9）
+task_type_stratification: true
+contamination_check_log_ref: data/splits/contamination_check.log

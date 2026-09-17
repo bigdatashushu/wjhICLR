@@ -1,0 +1,43 @@
+# 主配置（系统架构.md §2 / §13.5）
+# mode=online 走在线推理链（M1-M13，绝对无 GPT-6）
+# mode=offline_evolution 走离线演进链（M14-M21）
+mode: online  # online | offline_evolution
+
+seed: 0
+
+paths:
+  data_root: data
+  vsi_bench_meta: data/vsi_bench_meta
+  raw_videos: data/raw_videos          # TODO_USER_INPUT 原始视频获取方式
+  reconstructions: data/reconstructions
+  trace_store: data/traces
+  memory_db: data/memory_lancedb
+  skill_registry: data/skill_registry
+  active_snapshot: data/active_snapshot.json
+
+frame_sampling:
+  n_frames: 32                          # 与 VSI-Bench 官方开源模型对齐
+  strategy: uniform
+
+vllm:
+  model: Qwen/Qwen3-VL-8B-Instruct
+  quantization: awq                     # 关键结果用官方 FP8 交叉验证
+  max_model_len: 32768
+  gpu_memory_utilization: 0.92
+  tensor_parallel_size: 1               # DP×8 不 TP（ADR-2）
+  dp_world_size: 8
+  base_port: 8100
+  temperature: 0.0                      # greedy，保证同 seed 字节级一致
+
+sandbox:
+  image: skill3d-sandbox:latest
+  network: none
+  read_only: true
+  cpus: 4
+  memory: 8g
+  pids_limit: 256
+  cell_timeout_s: 120                   # TODO_CALIBRATE
+  max_regenerate: 3                     # AST 失败有限重生成 TODO_CALIBRATE
+
+split_config: configs/vsi_bench_split.yaml
+admission_thresholds: configs/admission_thresholds.yaml

@@ -1,0 +1,9 @@
+# Qwen3-VL-8B DP×8 启动参数（§13.1，ADR-2：DP 不 TP）
+model: Qwen/Qwen3-VL-8B-Instruct
+quantization: awq            # 社区 AWQ（cpatonn/Qwen3-VL-8B-Instruct-AWQ，落地前二次确认）；关键结果用官方 FP8 交叉验证
+served_model_name_prefix: qwen3vl-8b-r
+tensor_parallel_size: 1
+max_model_len: 32768
+gpu_memory_utilization: 0.92
+dp_world_size: 8
+base_port: 8100              # 卡 i -> port 8100+i, CUDA_VISIBLE_DEVICES=i

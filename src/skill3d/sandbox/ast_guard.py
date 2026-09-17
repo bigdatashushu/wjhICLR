@@ -1,0 +1,202 @@
+"""AST 白名单静态检查（§4 M9 / §9.1）。
+
+仅允许：白名单库（numpy/scipy/math/statistics）+ REGISTRY 内 Tool 调用
++ 变量赋值/循环/print。
+禁止：import os/socket/subprocess/requests、eval/exec/__import__、
+文件写（.save/.to_csv/open(w)）、访问宿主路径、show/ReturnAnswer 重赋值。
+
+AST 检查不能替代容器隔离（L2/L3/L4 由 M10 docker 承担）。
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from typing import Optional, Set
+
+from skill3d.schemas import ASTCheckResult
+
+from skill3d.tools.registry import REGISTRY
+
+# 白名单 import 模块（§9.1）
+ALLOWED_MODULES = frozenset({"numpy", "scipy", "math", "statistics"})
+
+# 保留名：禁止 program 重赋值（§4 M10 字段 5）
+RESERVED_NAMES = frozenset({"show", "ReturnAnswer", "tools", "scene", "frames"})
+
+# 禁止调用的内建/危险函数名
+FORBIDDEN_CALLS = frozenset(
+    {
+        "eval", "exec", "__import__", "compile", "open", "input",
+        "getattr", "setattr", "delattr", "globals", "locals", "vars",
+        "exit", "quit", "breakpoint", "help", "dir",
+    }
+)
+
+# 允许的安全内建
+SAFE_BUILTINS = frozenset(
+    {
+        "print", "len", "range", "float", "int", "str", "bool", "abs",
+        "min", "max", "sum", "sorted", "list", "dict", "tuple", "set",
+        "enumerate", "zip", "round", "isinstance", "format", "repr",
+    }
+)
+
+# 危险方法/属性（文件写、网络、进程、自省）
+FORBIDDEN_ATTRS = frozenset(
+    {
+        "save", "to_csv", "to_pickle", "write", "writelines", "dump", "dumps_pickle",
+        "remove", "unlink", "rmtree", "mkdir", "rename", "replace_file",
+        "system", "popen", "spawnl", "spawnv", "execv", "fork",
+        "connect", "request", "urlopen", "urlretrieve", "geturl",
+        "loadtxt_from_url", "socket",
+    }
+)
+
+# 正则二次扫描（AST 之外兜底，SpatialClaw 同款机制）
+_REGEX_BLACKLIST = [
+    re.compile(p)
+    for p in [
+        r"\b__import__\b",
+        r"\beval\s*\(",
+        r"\bexec\s*\(",
+        r"\bopen\s*\(",
+        r"\bcompile\s*\(",
+        r"\bos\s*\.",
+        r"\bsys\s*\.",
+        r"\bsocket\b",
+        r"\bsubprocess\b",
+        r"\brequests\b",
+        r"\burllib\b",
+        r"\bshutil\b",
+        r"\bpathlib\b",
+        r"\.save\s*\(",
+        r"\.to_csv\s*\(",
+        r"\.to_pickle\s*\(",
+        r"/etc/", r"/proc/", r"/root/", r"~/",  # 宿主路径
+    ]
+]
+
+
+class _WhiteListVisitor(ast.NodeVisitor):
+    def __init__(self, allowed_tools: Set[str]) -> None:
+        self.allowed_tools = allowed_tools
+        self.violations: list[str] = []
+        self.tool_calls: list[str] = []
+        self.local_defs: Set[str] = set()
+        self.imported_names: Set[str] = set()
+
+    # ---- import 白名单 ----
+    def visit_Import(self, node: ast.Import) -> None:
+        for a in node.names:
+            root = a.name.split(".")[0]
+            if root not in ALLOWED_MODULES:
+                self.violations.append(f"禁止 import 模块: {a.name}")
+            self.imported_names.add((a.asname or root).split(".")[0])
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        root = (node.module or "").split(".")[0]
+        if root not in ALLOWED_MODULES:
+            self.violations.append(f"禁止 from-import 模块: {node.module}")
+        for a in node.names:
+            self.imported_names.add(a.asname or a.name)
+        self.generic_visit(node)
+
+    # ---- 函数调用白名单 ----
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Name):
+            name = func.id
+            if name in FORBIDDEN_CALLS:
+                self.violations.append(f"禁止调用危险函数: {name}")
+            elif name in self.allowed_tools:
+                self.tool_calls.append(name)
+            elif name in ("show", "ReturnAnswer"):
+                pass  # 保留名回调允许调用（仅禁止重赋值）
+            elif name in SAFE_BUILTINS or name in self.local_defs or name in self.imported_names:
+                pass
+            else:
+                self.violations.append(f"REGISTRY 外未定义函数调用: {name}")
+        elif isinstance(func, ast.Attribute):
+            if func.attr.startswith("_"):
+                self.violations.append(f"禁止访问下划线属性: {func.attr}")
+            elif func.attr in FORBIDDEN_ATTRS:
+                self.violations.append(f"禁止调用危险方法: .{func.attr}")
+            elif isinstance(func.value, ast.Name) and func.value.id == "tools":
+                if func.attr in self.allowed_tools:
+                    self.tool_calls.append(func.attr)
+                else:
+                    self.violations.append(f"tools 命名空间内未知 Tool: {func.attr}")
+        self.generic_visit(node)
+
+    # ---- 属性访问（非调用）----
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr.startswith("_"):
+            self.violations.append(f"禁止访问下划线属性: {node.attr}")
+        self.generic_visit(node)
+
+    # ---- 保留名重赋值 ----
+    def _check_target(self, target: ast.expr) -> None:
+        if isinstance(target, ast.Name) and target.id in RESERVED_NAMES:
+            self.violations.append(f"禁止重赋值保留名: {target.id}")
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for elt in target.elts:
+                self._check_target(elt)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        for t in node.targets:
+            self._check_target(t)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self._check_target(node.target)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._check_target(node.target)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        if node.name in RESERVED_NAMES:
+            self.violations.append(f"禁止定义与保留名同名的函数: {node.name}")
+        self.local_defs.add(node.name)
+        self.generic_visit(node)
+
+    def visit_For(self, node: ast.For) -> None:
+        self._check_target(node.target)
+        self.generic_visit(node)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self._check_target(node.target)
+        self.generic_visit(node)
+
+
+def ast_guard(
+    program: str,
+    allowed_tools: Optional[Set[str]] = None,
+) -> ASTCheckResult:
+    """AST 白名单 + 正则二次扫描，返回 ASTCheckResult。"""
+    tools = allowed_tools if allowed_tools is not None else set(REGISTRY.names())
+
+    # 正则二次扫描
+    regex_hits = [p.pattern for p in _REGEX_BLACKLIST if p.search(program)]
+
+    try:
+        tree = ast.parse(program)
+    except SyntaxError as exc:
+        return ASTCheckResult(ok=False, violations=[f"语法错误: {exc}"], allowed_tool_calls=[])
+
+    # 先收集全部 local def，再正式检查（允许先定义后调用之外的任意顺序）
+    collector = _WhiteListVisitor(tools)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            collector.local_defs.add(node.name)
+    collector.visit(tree)
+
+    violations = collector.violations + [f"正则二次扫描命中: {p}" for p in regex_hits]
+    return ASTCheckResult(
+        ok=not violations,
+        violations=violations,
+        allowed_tool_calls=collector.tool_calls,
+    )

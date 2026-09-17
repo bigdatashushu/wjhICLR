@@ -1,0 +1,9 @@
+# Qwen3-VL-8B vLLM 推理镜像（系统架构.md §2 / §13.1）
+# TODO: 构建后锁定 digest（docker image inspect --format '{{.Id}}'，见 §13.6 版本锁定）
+FROM vllm/vllm-openai:latest  # TODO: 落地时固定为具体 tag/digest，vLLM>=0.11.0
+
+# transformers>=4.57（Qwen3-VL 新 chat 模板，不复用 Qwen2.5-VL 模板）
+RUN pip install --no-cache-dir "transformers>=4.57"
+
+# 默认 serve 官方 FP8（关键结果交叉验证用）；INT4/AWQ 由启动命令覆盖
+ENTRYPOINT ["vllm", "serve"]
