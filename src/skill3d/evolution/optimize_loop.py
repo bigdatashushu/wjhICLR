@@ -47,6 +47,12 @@ from skill3d.evolution.optimization_loop import (
     run_optimization_loop,
 )
 from skill3d.evolution.paired_score import score_paired
+from skill3d.evolution.panel import (
+    delta_by_metric,
+    paired_outcome,
+    run_panel,
+    score_of,
+)
 from skill3d.governance.gpt6_client import GPT6NotConfiguredError
 from skill3d.memory.consolidation import leakage_scan_text
 from skill3d.online.config import DEFAULT_CONFIG, load_config, load_yaml, paths_from
@@ -65,63 +71,16 @@ MODES = ("real", "mock_light")
 
 
 # ------------------------------------------------------------------ 面板执行 ----
+# 面板/配对装配与离线 driver（G-35）共用 `evolution/panel.py`，避免两份实现漂移。
 
-def _score_of(outcome) -> float:
-    """单 episode 分数：MCA → 1/0；NA → MRA。"""
-    if outcome.is_mca:
-        return 1.0 if outcome.correct else 0.0
-    return float(outcome.mra_value) if outcome.mra_value is not None else 0.0
-
-
-def run_panel(items: list[EpisodeItem], cfg: OnlineRunConfig, trace_store=None,
-              llm=None) -> list:
-    """跑一臂：逐条 episode 执行在线链（real 模式按 scene 复用 artifact，硬约束 18）。"""
-    outcomes = []
-    for it in items:
-        item_cfg = cfg
-        if cfg.mode == "real" and cfg.recon_dir:
-            p = artifact_path(cfg.recon_dir, it.episode.scene_name, cfg.recon_method)
-            if p.exists():
-                item_cfg = replace(cfg, reuse_artifact=str(p))
-        outcomes.append(run_episode(it.episode, it.pixels, item_cfg, geometry=it.geometry,
-                                    trace_store=trace_store, llm=llm))
-    return outcomes
+_score_of = score_of
+run_panel = run_panel
+_delta_by_metric = delta_by_metric
 
 
 def _paired_outcome(pair_id: str, cfg: OnlineRunConfig, outs_a: list, outs_b: list,
                     task_types: list[str], snapshot_ref: str, seed: int) -> PairedOutcome:
-    sa = [_score_of(o) for o in outs_a]
-    sb = [_score_of(o) for o in outs_b]
-    st = score_paired(sa, sb, task_types, seed=seed)
-    return PairedOutcome(
-        pair_id=pair_id,
-        snapshot_id=snapshot_ref,
-        arm_a_branch_id="arm-a-baseline",
-        arm_b_branch_id="arm-b-candidate",
-        n_episodes=st["n_episodes"],
-        metric="accuracy" if all(o.is_mca for o in outs_a) else "mra",
-        mean_a=st["mean_a"],
-        mean_b=st["mean_b"],
-        delta=st["delta"],
-        ci95_lo=st["ci95_lo"],
-        ci95_hi=st["ci95_hi"],
-        wilcoxon_p=st["wilcoxon_p"],
-        slice_table=st["slice_table"],
-        resource_cost={"n_episodes": st["n_episodes"]},
-        slice_no_regression=st["slice_no_regression"],
-        within_budget=True,
-    )
-
-
-def _delta_by_metric(outs_a, outs_b) -> tuple[Optional[float], Optional[float]]:
-    """分别给出 MCA 精度差与 NA MRA 差（无该类样本则 None）。"""
-    mca = [i for i, o in enumerate(outs_a) if o.is_mca]
-    na = [i for i, o in enumerate(outs_a) if not o.is_mca]
-    d_mca = (sum(1.0 if outs_b[i].correct else 0.0 for i in mca) / len(mca)
-             - sum(1.0 if outs_a[i].correct else 0.0 for i in mca) / len(mca)) if mca else None
-    d_mra = (sum(float(outs_b[i].mra_value or 0.0) for i in na) / len(na)
-             - sum(float(outs_a[i].mra_value or 0.0) for i in na) / len(na)) if na else None
-    return d_mca, d_mra
+    return paired_outcome(pair_id, outs_a, outs_b, task_types, snapshot_ref, seed)
 
 
 # ------------------------------------------------------------------ 数据/候选 ----
@@ -290,8 +249,12 @@ def main(argv: list[str] | None = None) -> int:
                              base_cfg.active_snapshot_ref, args.seed)
         d_mca, d_mra = _delta_by_metric(outs_a, outs_b)
         mixed = d_mca is not None and d_mra is not None
+        # 退化样本（零方差/完全相同组）→ p 记 None，措辞为"不显著"（§7/E-2）
+        p_txt = ("退化(不显著)" if po.degenerate and po.wilcoxon_p is None
+                 else f"{po.wilcoxon_p:.4f}" if po.wilcoxon_p is not None else "n/a")
         print(f"\n[{level}] n={po.n_episodes} delta={po.delta:+.4f} "
-              f"CI95=[{po.ci95_lo:+.4f},{po.ci95_hi:+.4f}] p={po.wilcoxon_p:.4f} "
+              f"CI95=[{po.ci95_lo:+.4f},{po.ci95_hi:+.4f}] p={p_txt} "
+              f"cliff={po.cliffs_delta:+.3f} d={po.cohens_d:+.3f} "
               f"d_mca={_fmt(d_mca)} d_mra={_fmt(d_mra)} slice_ok={po.slice_no_regression}")
         if mixed:
             print("        ⚠ 面板同时含 MCA/NA：delta 为混合分数（非单一指标），"

@@ -12,6 +12,13 @@ def test_online_happy_path_to_log_trace():
     fsm.step("gate_done", {"action": "proceed"})
     assert fsm.state is OnlineState.RECONSTRUCT
     fsm.step("done")
+    # v4 §5.1：重建后先尺度估计/校准（多锚点融合 + 冻结校准器 + 逐题授权），
+    # 再进质量门禁；两态都不改 route
+    assert fsm.state is OnlineState.SCALE_ESTIMATE
+    fsm.step("done")
+    assert fsm.state is OnlineState.SCALE_CALIBRATE
+    fsm.step("done", {"metric_tasks_withdrawn": True, "scale_conflict": False})
+    assert "scale_low_metric_tasks_withdrawn" in fsm.answer_flags
     assert fsm.state is OnlineState.QUALITY_GATE
     fsm.step("gate_done", {"action": "proceed"})
     assert fsm.state is OnlineState.CLASSIFY_TASK
@@ -30,12 +37,44 @@ def test_online_happy_path_to_log_trace():
     assert fsm.terminated
 
 
-def test_online_static_check_fail_regenerate_limited():
-    fsm = OnlineFSM(max_regen=3)
+def test_online_scale_states_do_not_block_on_failure():
+    """v4 §5.1：尺度估计/校准失败**不**中止 episode（只落 low + 收回米制题型）。
+
+    尺度为 low 不得把质量合格场景的非尺度 3D 能力一起砍掉（HC33）。
+    """
+    fsm = OnlineFSM()
     for ev, ctx in [("episode_ready", {}), ("gate_done", {"action": "proceed"}),
-                    ("done", {}), ("gate_done", {"action": "proceed"}),
+                    ("done", {})]:
+        fsm.step(ev, ctx)
+    assert fsm.state is OnlineState.SCALE_ESTIMATE
+    fsm.step("done")
+    fsm.step("done", {"metric_tasks_withdrawn": True, "scale_conflict": True})
+    assert fsm.state is OnlineState.QUALITY_GATE      # 仍在正常链上
+    assert "scale_conflict" in fsm.answer_flags
+    assert "unanswerable" not in fsm.answer_flags
+
+
+def test_online_reconstruct_skip_bypasses_scale_states():
+    """复用 artifact / mock_light：尺度已随 artifact 落盘 → 跳过两态直达质门。"""
+    fsm = OnlineFSM()
+    for ev, ctx in [("episode_ready", {}), ("gate_done", {"action": "proceed"})]:
+        fsm.step(ev, ctx)
+    fsm.step("skip")
+    assert fsm.state is OnlineState.QUALITY_GATE
+
+
+def _to_static_check(fsm: OnlineFSM) -> None:
+    """驱动到 STATIC_CHECK（含 v4 新增的 SCALE_ESTIMATE/SCALE_CALIBRATE 两态）。"""
+    for ev, ctx in [("episode_ready", {}), ("gate_done", {"action": "proceed"}),
+                    ("done", {}), ("done", {}), ("done", {}),
+                    ("gate_done", {"action": "proceed"}),
                     ("done", {}), ("done", {}), ("done", {})]:
         fsm.step(ev, ctx)
+
+
+def test_online_static_check_fail_regenerate_limited():
+    fsm = OnlineFSM(max_regen=3)
+    _to_static_check(fsm)
     assert fsm.state is OnlineState.STATIC_CHECK
     # 第 1、2 次失败 → 回 SYNTHESIZE_PROGRAM
     for _ in range(2):
@@ -53,11 +92,9 @@ def test_online_static_check_fail_regenerate_limited():
 
 def test_online_geometry_reject_still_logs():
     fsm = OnlineFSM()
-    for ev, ctx in [("episode_ready", {}), ("gate_done", {"action": "proceed"}),
-                    ("done", {}), ("gate_done", {"action": "proceed"}),
-                    ("done", {}), ("done", {}), ("done", {}),
-                    ("pass", {}), ("ok", {})]:
-        fsm.step(ev, ctx)
+    _to_static_check(fsm)
+    for ev in ("pass", "ok"):
+        fsm.step(ev)
     fsm.step("reject")  # GEOMETRY_VERIFY 拒绝
     assert "geometry_rejected" in fsm.answer_flags
     fsm.step("done")
@@ -104,3 +141,33 @@ def test_offline_insufficient_samples_rejects():
     fsm = OfflineFSM()
     fsm.step("clustered", {"cross_scene_ok": False})
     assert fsm.state is OfflineState.REJECT
+
+
+def _offline_to_loop_synthesize(fsm: OfflineFSM) -> None:
+    fsm.step("clustered", {"cross_scene_ok": True})
+    fsm.step("candidate_ready")
+    fsm.step("pass")  # LEAKAGE_CHECK
+    assert fsm.state is OfflineState.LOOP_SYNTHESIZE
+
+
+def test_offline_loop_macro_edges_are_terminal_reachable():
+    """§5.2：内环整体执行完（driver 把 L1→L2→L3 委托给 run_optimization_loop）时，
+    LOOP_SYNTHESIZE 必须有 pass/fail 宏边——否则 PROMOTE 不可达，
+    准入/promote（硬约束 12/13）在 driver 里永远不会被触发。"""
+    ok = OfflineFSM()
+    _offline_to_loop_synthesize(ok)
+    ok.step("pass")                       # 内环整体通过（含 L3 outer 一次）
+    assert ok.state is OfflineState.PROMOTE
+    assert ok.terminated
+    assert ok.outer_attempted             # outer 只跑一次的审计位（硬约束 10）
+
+    bad = OfflineFSM()
+    _offline_to_loop_synthesize(bad)
+    bad.step("fail")                      # 内环整体失败 → REJECT（不得 Revise）
+    assert bad.state is OfflineState.REJECT
+    assert bad.terminated
+
+    granular = OfflineFSM()
+    _offline_to_loop_synthesize(granular)
+    granular.step("done")                 # 逐状态驱动仍可用（→ STATIC_CHECK）
+    assert granular.state is OfflineState.LOOP_STATIC_CHECK

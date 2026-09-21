@@ -29,7 +29,10 @@ def test_no_difference_not_significant():
     assert res["delta"] == 0.0
     assert res["ci95_lo"] <= 0
     assert res["ci_significant"] is False
-    assert wilcoxon_p(a, b) == 1.0  # 全零差
+    # §7/E-2：全零差 = 退化样本 → p 归一化为 None（判"不显著"），
+    # 不再用 1.0 冒充"测过但不显著"
+    assert wilcoxon_p(a, b) is None
+    assert res["degenerate"] is True
 
 
 def test_bootstrap_ci_deterministic():

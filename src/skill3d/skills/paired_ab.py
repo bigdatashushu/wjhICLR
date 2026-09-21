@@ -7,13 +7,41 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Sequence
 
 from skill3d.schemas import EnvironmentSnapshot, ExperimentBranch
 
 
 class PairedArtifactMismatchError(AssertionError):
     """A/B 两臂 reconstruction_artifact_ref 不一致（违反硬约束 18）。"""
+
+
+class PairedFrameSetMismatchError(AssertionError):
+    """A/B 两臂 frame_set_hash 不一致（违反硬约束 18/21：禁止双帧集）。"""
+
+
+def assert_paired_outcomes_share_artifact(outs_a: Sequence, outs_b: Sequence) -> None:
+    """逐 episode 断言：A/B 两臂同 artifact ref 且同 frame_set_hash（硬约束 18/21）。
+
+    两臂的 scene 不同会各自有不同帧集，因此判定必须**逐 episode 配对**做，
+    不能在整批层面比单一哈希。
+    """
+    if len(outs_a) != len(outs_b):
+        raise PairedArtifactMismatchError(
+            f"A/B 两臂 episode 数不同: {len(outs_a)} vs {len(outs_b)}")
+    for oa, ob in zip(outs_a, outs_b):
+        ra = str(getattr(oa, "artifact_ref", "") or "")
+        rb = str(getattr(ob, "artifact_ref", "") or "")
+        if ra and rb and ra != rb:
+            raise PairedArtifactMismatchError(
+                f"episode {getattr(oa, 'qa_id', '?')} 两臂 artifact 不同: {ra} vs {rb}"
+                "（硬约束 18：paired A/B 必须复用同一 ReconstructionArtifact）")
+        ha = str(getattr(oa, "frame_set_hash", "") or "")
+        hb = str(getattr(ob, "frame_set_hash", "") or "")
+        if ha and hb and ha != hb:
+            raise PairedFrameSetMismatchError(
+                f"episode {getattr(oa, 'qa_id', '?')} 两臂 frame_set_hash 不同:"
+                f" {ha[:12]} vs {hb[:12]}（硬约束 21：禁止双帧集）")
 
 
 def assert_same_reconstruction_artifact(branch_a: ExperimentBranch,

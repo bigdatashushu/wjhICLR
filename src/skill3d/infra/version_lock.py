@@ -58,10 +58,29 @@ def config_hash(config_path: str) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def inference_env_versions() -> dict:
+    """推理环境版本记录（§16.4：所有主结果必须记录推理环境）。
+
+    取 vLLM / torch / transformers 版本；未安装记 "absent"（不虚构版本号）。
+    """
+    import importlib
+
+    out: dict = {}
+    for mod in ("vllm", "torch", "transformers", "sam2", "pycolmap"):
+        try:
+            m = importlib.import_module(mod)
+            out[mod] = str(getattr(m, "__version__", "unknown"))
+        except Exception:  # noqa: BLE001 - 未安装 → 显式 absent
+            out[mod] = "absent"
+    return out
+
+
 def build_run_manifest(docker_image: str, checkpoint_path: str,
                        config_path: str, repo_dir: str,
-                       mlflow_run_id: str = "unknown") -> RunManifest:
-    return RunManifest(
+                       mlflow_run_id: str = "unknown",
+                       *, split_version: str = "", seed: int | None = None,
+                       split_config_path: str = "") -> RunManifest:
+    manifest = RunManifest(
         code_commit=git_head(repo_dir),
         docker_digest=docker_digest(docker_image),
         checkpoint_sha256=checkpoint_sha256(checkpoint_path),
@@ -69,3 +88,25 @@ def build_run_manifest(docker_image: str, checkpoint_path: str,
         config_hash=config_hash(config_path),
         mlflow_run_id=mlflow_run_id,
     )
+    # §16.4：split version / split 配置哈希 / seed / 推理环境版本一并落盘
+    return manifest.model_copy(update={
+        "split_version": split_version,
+        "split_config_hash": (config_hash(split_config_path)
+                              if split_config_path else ""),
+        "seed": seed,
+        "inference_env": inference_env_versions(),
+    })
+
+
+def write_run_manifest(manifest: RunManifest, out_path: str | Path,
+                       extra: dict | None = None) -> Path:
+    """把 RunManifest 落盘 JSON（§16.4：论文 artifact 审计用）。"""
+    import json
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    data = manifest.model_dump()
+    if extra:
+        data.update(extra)
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out

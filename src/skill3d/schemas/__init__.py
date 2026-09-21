@@ -18,15 +18,27 @@ class Spec(BaseModel):
                               ser_json_inf_nan="constants")
 
 
-from .episode import DataSplitConfig, InputFrame, InputGateVerdict, VSIBenchEpisode
+from .episode import (
+    DataSplitConfig,
+    FrameSet,
+    InputFrame,
+    InputGateVerdict,
+    VSIBenchEpisode,
+)
 from .reconstruction import (
+    LEGACY_ONLY_FIELDS,
+    METRIC_TASK_TYPES,
     ConfidenceMap,
-    CoverageMap,
+    ImageGridTransform,
     ObjectInstance,
     QualityMetrics,
     ReconstructionArtifact,
+    ScaleAnchorEvidence,
     SceneState,
 )
+from .legacy import LegacyArtifact, LegacyArtifactError
+from .sparse_ba import SparseBAReceipt
+from .readiness import ExperimentReadiness
 from .tool import ToolCall, ToolResult, ToolSpec
 from .program import ASTCheckResult, EpisodeProgram, ProgramExecutionTrace
 from .skill import (

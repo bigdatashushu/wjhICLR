@@ -69,3 +69,40 @@ def test_build_parquet_skips_without_pyarrow(tmp_path):
     else:
         out = store.build_parquet("t")
         assert out is not None and out.exists()
+
+
+def test_episode_trace_carries_contract_and_abstain_attribution():
+    """§4 M13/D-3：契约违规与 abstain 的逐 episode 事实必须落盘（与 failure 分开）。"""
+    store_trace = _trace(1).model_copy(update={
+        "tool_contract_hits": 2, "abstained": True, "answer_untrusted": True,
+        "scene_route": "fallback_2d_only", "quality_status": "computed"})
+    rec = json.loads(store_trace.model_dump_json())
+    assert rec["tool_contract_hits"] == 2 and rec["abstained"] is True
+    assert rec["answer_untrusted"] is True and rec["scene_route"] == "fallback_2d_only"
+    assert rec["failure"] is None            # 归因字段不影响 failure 语义
+
+
+def test_build_all_parquet_writes_manifest(tmp_path):
+    """M13 聚合入口：全部 topic → Parquet + manifest（无 pyarrow 时静默空结果）。"""
+    from skill3d.trace.store import TraceStore as _TS
+
+    store = _TS(tmp_path)
+    store.append_episode(_trace(0))
+    store.append("evaluation_result", {"qa_id": "qa-0", "mra_value": 0.5})
+    out = store.build_all_parquet(tmp_path / "pq")
+    try:
+        import pyarrow  # noqa: F401
+    except ImportError:
+        assert out == {}
+        return
+    assert set(out) == {"episode_trace", "evaluation_result"}
+    assert (tmp_path / "pq" / "parquet_manifest.json").is_file()
+    manifest = json.loads((tmp_path / "pq" / "parquet_manifest.json").read_text())
+    assert manifest["n_topics"] == 2
+
+
+def test_store_cli_returns_nonzero_without_topics(tmp_path):
+    """CLI 无可聚合 topic 时返回 1（不静默成功）。"""
+    from skill3d.trace.store import main
+
+    assert main(["--trace-dir", str(tmp_path)]) == 1

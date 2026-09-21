@@ -1,9 +1,23 @@
-# Qwen3-VL-8B DP×8 启动参数（§13.1，ADR-2：DP 不 TP）
-model: Qwen/Qwen3-VL-8B-Instruct
-quantization: awq            # 社区 AWQ（cpatonn/Qwen3-VL-8B-Instruct-AWQ，落地前二次确认）；关键结果用官方 FP8 交叉验证
+# Qwen3-VL-8B DP×N 启动参数（§13.1，ADR-2：DP 不 TP）
+# 2026-09-18 在本机 8×RTX4090 实测确认（见 scripts/serve_qwen3vl_dp8.sh）
+model: Qwen/Qwen3-VL-8B-Instruct-FP8    # 官方 FP8 block=128；BF16(17GB) 在 24GB 卡上与他人共用时 OOM
+quantization: none            # FP8 权重自带量化；若改用社区 AWQ 则填 awq（且关键结果须用 FP8 交叉验证）
 served_model_name_prefix: qwen3vl-8b-r
-tensor_parallel_size: 1
+tensor_parallel_size: 1       # DP 不 TP（ADR-2）
 max_model_len: 32768
-gpu_memory_utilization: 0.92
+gpu_memory_utilization: 0.90  # 实测 0.77 可用（他人占 4.5GB 时）；独占整卡可到 0.92
 dp_world_size: 8
-base_port: 8100              # 卡 i -> port 8100+i, CUDA_VISIBLE_DEVICES=i
+base_port: 8100               # 卡 i -> port 8100+i, CUDA_VISIBLE_DEVICES=i
+# ---- 32 帧输入相关（TODO_CALIBRATE，以下为实测起点）----
+n_frames: 32                  # §4 M1：与官方开源模型对齐的均匀采样帧数
+max_pixels: 131072            # 单帧像素上限；实测 32 帧 @131072 → prompt_tokens≈9703（≈303/帧）
+limit_images_per_prompt: 32   # 必须 >= n_frames，否则 vLLM 直接 400 拒绝
+# 实测记录（单卡 FP8，4090）：32 帧 1.4s / 4 帧 0.9s；KV cache 7.53GiB → 54848 tokens
+measured:
+  date: "2026-09-18"
+  gpu: "RTX 4090 24GB"
+  vllm: "0.19.1"
+  torch: "2.10.0+cu128"
+  transformers: "4.57.1"
+  tokens_32_frames: 9703
+  latency_s_32_frames: 1.4

@@ -5,9 +5,10 @@ fused = point_conf × coverage × reproj 衰减；退化区压零。
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
+
 
 # 退化区判定阈值（TODO_CALIBRATE，§4 M4 字段 11：注入短基线退化验证压零）
 TH_REPROJ_ERR: float = 5.0        # TODO_CALIBRATE: 重投影残差退化阈值（px）
@@ -56,7 +57,7 @@ def per_object_coverage(
     object_point_indices: dict[str, np.ndarray],
     conf_thresh: float = 0.5,
 ) -> dict[str, float]:
-    """逐对象覆盖率（object_id -> 覆盖率），供 G8 / CoverageMap 使用。"""
+    """逐对象覆盖率（object_id -> 覆盖率）：按融合置信度对每对象取均值。"""
     out: dict[str, float] = {}
     for oid, idx in object_point_indices.items():
         idx = np.asarray(idx)
@@ -64,4 +65,31 @@ def per_object_coverage(
             out[oid] = 0.0
             continue
         out[oid] = float(np.mean(np.asarray(fused_conf).ravel()[idx] >= conf_thresh))
+    return out
+
+
+# --------------------------------------------------------------------- G9 ----
+
+
+def track_ious_from_masks(
+    masks_per_object: Sequence[dict[int, np.ndarray]],
+) -> list[float]:
+    """G9 跟踪一致性：每个对象相邻帧 mask 的 IoU 均值（[0,1]）。
+
+    帧间 IoU 低 = mask 传播不稳（对象不确定）→ 该对象标 unverified（§10 G9）。
+    """
+    out: list[float] = []
+    for masks in masks_per_object:
+        frames = sorted(masks)
+        ious: list[float] = []
+        for a, b in zip(frames, frames[1:]):
+            ma, mb = np.asarray(masks[a], dtype=bool), np.asarray(masks[b], dtype=bool)
+            if ma.shape != mb.shape:
+                continue
+            union = int(np.logical_or(ma, mb).sum())
+            if union == 0:
+                continue
+            ious.append(float(np.logical_and(ma, mb).sum()) / union)
+        if ious:
+            out.append(float(np.mean(ious)))
     return out

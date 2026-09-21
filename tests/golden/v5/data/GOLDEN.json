@@ -1,0 +1,16 @@
+{
+  "golden_version": "v5-golden-1",
+  "schema_version": "5.0",
+  "quality_metric_version": "v5-no-g8-g5-optional",
+  "artifact_version": "97f4f918120540e6",
+  "artifact_content_sha256": "2b3898a83931c418ca89cab3c477bf1d39c4e36f4f71f2018667f6ae15ed65e4",
+  "env_versions": {
+    "scipy": "1.16.2",
+    "numpy": "2.1.2"
+  },
+  "pip_freeze_hash": "038ca1fedbf8132b0109a7fabe583d1a61491ce8e25961df4aaa178de6ca74bd",
+  "code_commit": "0d0660db7c3042d91878911740842b6cfb0ebe0e",
+  "generated_by": "tests/golden/v5/make_golden.py",
+  "incomparable_with_v5": false,
+  "notes": "v5 golden 由 v5 Schema/pipeline 重新生成：G5 为条件项（本夹具无真 BA → None，不入 overall_quality 分母）、不含 G8 字段。"
+}

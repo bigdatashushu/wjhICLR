@@ -37,13 +37,8 @@ def run_dust3r_mast3r(
 
 def _placeholder_artifact(scene_name: str, out_refs: dict) -> ReconstructionArtifact:
     """组装 artifact 的公共辅助（供未来真实实现复用）。"""
-    nan = float("nan")
-    quality = QualityMetrics(
-        g1_blur_ok=nan, g2_brightness=nan, g3_motion_blur=nan, g4_frame_count=0,
-        g5_reproj_err_median=nan, g5_reproj_err_p95=nan, g6_depth_var_coeff=nan,
-        g7_dynamic_ratio=nan, g8_bbox_coverage_min=nan, g9_tracker_consistency=nan,
-        g10_baseline_quality=nan, g11_scale_ci=nan, overall_quality=nan,
-    )
+    # 硬约束 22：质量未算就是 not_computed + None（不得用 NaN 占位冒充实算值）；
+    # 由 M4（P1 run_jobs 或 P2 quality_gate）实算后写回。
     confidence = ConfidenceMap(
         per_point_confidence=out_refs.get("point_conf", ""),
         coverage_count_per_frame="",
@@ -61,6 +56,7 @@ def _placeholder_artifact(scene_name: str, out_refs: dict) -> ReconstructionArti
         track_list=None,
         metric_scale=None,
         scale_known=False,
-        quality=quality,
+        quality_status="not_computed",
+        quality=None,
         confidence=confidence,
     )

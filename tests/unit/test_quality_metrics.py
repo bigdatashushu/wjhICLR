@@ -42,20 +42,27 @@ def test_g1_g2_with_synthetic_frames():
     assert qm.g2_brightness(white) == 0.0
 
 
-def test_g5_g7_g9_g11_nan_when_missing():
-    """依赖外部产物的指标无数据时为 NaN（§10 TODO）。"""
+def test_g5_g7_g9_g11_missing_values():
+    """v5 HC37：G5 缺失必须是 `None`（不是 NaN/0/1 分）；其余指标缺数据记 NaN。"""
     med, p95 = qm.g5_reproj_err(None)
-    assert np.isnan(med) and np.isnan(p95)
+    assert med is None and p95 is None
+    # 未跑真 BA（正式 vggt 主线）→ not_available → 一律 None，禁止代理值
+    med2, p95_2 = qm.g5_reproj_err(np.arange(1, 11, dtype=float))
+    assert med2 is None and p95_2 is None
     assert np.isnan(qm.g7_dynamic_ratio(None))
     assert np.isnan(qm.g9_tracker_consistency(None))
     assert np.isnan(qm.g11_scale_ci(None))
 
 
 def test_g5_reproj_err_computed():
+    """只有 reprojection_status="computed"（真 BA）才产出 G5 标量。"""
     e = np.arange(1, 101, dtype=float)  # 1..100
-    med, p95 = qm.g5_reproj_err(e)
+    med, p95 = qm.g5_reproj_err(e, status="computed")
     assert med == 50.5
     assert p95 == pytest.approx(95.05, rel=1e-3)
+    # 全非有限残差 → 仍为 None（由调用方把状态降为 failed，不得补分）
+    med2, p95_2 = qm.g5_reproj_err(np.array([np.nan, np.inf]), status="computed")
+    assert med2 is None and p95_2 is None
 
 
 def test_g10_baseline_quality():
@@ -81,9 +88,13 @@ def test_compute_g1_g11_partial():
     assert q.g1_blur_ok == 1.0
     assert q.g4_frame_count == 32
     assert np.isfinite(q.g6_depth_var_coeff)
-    assert np.isnan(q.g5_reproj_err_median)
+    # v5 HC37：G5 未计算 → None（从 overall 分母排除，不补默认分）
+    assert q.g5_reproj_err_median is None and q.g5_reproj_err_p95 is None
     assert np.isnan(q.g7_dynamic_ratio)
     assert 0.0 <= q.overall_quality <= 1.0
+    # 与"把 G5 补成满分"的历史口径对比：分母少两项，不得因此虚高
+    from skill3d.reconstruction_gate.quality_metrics import overall_from_metrics
+    assert q.overall_quality == pytest.approx(overall_from_metrics(q))
 
 
 def test_fuse_confidence_degenerate_zero():

@@ -15,10 +15,22 @@ from typing import Callable, Iterable, Optional, Sequence
 
 import numpy as np
 
-from skill3d.schemas.episode import DataSplitConfig, InputFrame, VSIBenchEpisode
+from skill3d.schemas.episode import (
+    DataSplitConfig,
+    FrameSet,
+    InputFrame,
+    VSIBenchEpisode,
+)
 
-# 与官方开源模型对齐的均匀采样帧数（§4 M1）
-N_FRAMES = 32
+from .frame_set import N_FRAMES, FrameSetError, build_frame_set, uniform_frame_ids
+from .frame_set import frame_set_hash as _frame_set_hash
+
+__all__ = [
+    "N_FRAMES", "SPLIT_RATIOS", "EpisodeUnavailable", "FrameSetError",
+    "load_meta", "sample_uniform_indices", "video_path_for", "build_episode",
+    "make_split_config", "assert_final_test_isolation", "split_of",
+    "build_frame_set", "_frame_set_hash",
+]
 
 # split 划分起始比例 induction:inner:outer:final（TODO_CALIBRATE，§4 M1 字段 12）
 SPLIT_RATIOS = {
@@ -33,12 +45,32 @@ class EpisodeUnavailable(Exception):
     """scene 原始视频缺失等导致 episode 不可用时抛出（§4 M1 字段 9）。"""
 
 
-def load_meta(cache_dir: Optional[str] = None) -> list[dict]:
-    """加载 VSI-Bench HF meta-info（lazy import datasets，未安装时抛错）。
+# 本地 meta 约定路径（官方 HF 仓库的 test.jsonl；免 `datasets` 依赖，§13.3）
+LOCAL_META_JSONL = "data/vsi_bench_meta/test.jsonl"
+
+
+def load_meta(cache_dir: Optional[str] = None,
+              local_path: Optional[str | Path] = None) -> list[dict]:
+    """加载 VSI-Bench QA meta-info。
+
+    优先读本地导出（`LOCAL_META_JSONL` / `local_path`，官方仓库的 `test.jsonl`，
+    5130 行 / 288 scene），本地不存在时回退 HF `load_dataset`（lazy import）。
 
     HF 仅提供 QA meta，原始视频需另行获取（TODO_USER_INPUT 视频访问方式）。
     """
-    from datasets import load_dataset  # lazy import：未安装库禁止顶层导入
+    path = Path(local_path) if local_path is not None else Path(LOCAL_META_JSONL)
+    if path.is_file():
+        from skill3d.adapters.split_builder import load_local_meta
+
+        return load_local_meta(path)
+
+    try:
+        from datasets import load_dataset  # lazy import：未安装库禁止顶层导入
+    except ImportError as exc:  # 本地 meta 缺失且无 datasets → 明确报错，不静默返回空
+        raise ImportError(
+            f"本地 meta 不存在（{path}）且未安装 datasets："
+            "请下载 nyu-visionx/vsi-bench 的 test.jsonl 到该路径，或 pip install datasets"
+        ) from exc
 
     ds = load_dataset("nyu-visionx/vsi-bench", cache_dir=cache_dir)
     # 官方列：id/dataset/scene_name/question_type/question/ground_truth/options
@@ -47,16 +79,12 @@ def load_meta(cache_dir: Optional[str] = None) -> list[dict]:
 
 
 def sample_uniform_indices(total_frames: int, n: int = N_FRAMES) -> list[int]:
-    """32 帧均匀采样索引：严格单调递增且均匀（§4 M1 验收条件 b）。"""
-    if total_frames < 1:
-        raise ValueError("total_frames 必须 >= 1")
-    if total_frames < n:
-        # 视频不足 32 帧时重复末帧补齐，由上游 G4 帧数指标判定不全
-        idx = np.linspace(0, total_frames - 1, num=total_frames)
-        idx = np.concatenate([idx, np.full(n - total_frames, total_frames - 1)])
-        return idx.astype(int).tolist()
-    idx = np.linspace(0, total_frames - 1, num=n)
-    return np.floor(idx).astype(int).tolist()
+    """32 帧时间均匀采样索引（§4 M1）：严格单调递增、唯一、确定性。
+
+    委托 `adapters/frame_set.uniform_frame_ids`（单一事实源）。视频不足 n 帧时抛
+    `FrameSetError`（输入合法性硬失败，硬约束 21 禁止重复帧补齐）。
+    """
+    return uniform_frame_ids(total_frames, n)
 
 
 def _default_frame_reader(video_path: str, indices: Sequence[int]) -> list[np.ndarray]:
@@ -109,7 +137,12 @@ def build_episode(
     if total < 1:
         raise EpisodeUnavailable(f"视频无有效帧: {video_path}")
 
-    indices = sample_uniform_indices(total, n_frames)
+    # M1 冻结帧集：32 个唯一物理帧 + frame_set_hash（硬约束 21）
+    try:
+        fset = build_frame_set(total, n_frames=n_frames, fps=float(fps))
+    except FrameSetError as exc:
+        raise EpisodeUnavailable(f"scene {qa_row.get('scene_name')} {exc}") from exc
+    indices = list(fset.frame_ids)
     images = frame_reader(str(video_path), indices)
 
     frames = []
@@ -122,7 +155,7 @@ def build_episode(
                 width=w,
                 height=h,
                 # 逐帧质量统计由 M2 input_gate 计算；此处先填占位，
-                # quality_ok 默认 True，等待门禁覆写
+                # quality_ok 默认 True，等待门禁覆写（M2 只打权重，不改帧集）
                 blur_var=0.0,
                 overexposed_ratio=0.0,
                 underexposed_ratio=0.0,
@@ -140,6 +173,7 @@ def build_episode(
         ground_truth=str(qa_row["ground_truth"]),
         frames=frames,
         split=split,  # type: ignore[arg-type]
+        frame_set=fset,
     )
 
 

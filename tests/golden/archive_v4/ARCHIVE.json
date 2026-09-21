@@ -1,0 +1,28 @@
+{
+  "archive_of": "tests/golden/evolution/data（v4 golden）",
+  "incomparable_with_v5": true,
+  "reason": "旧 golden 的 overall_quality 分母含已退役的 G8，且 G5 为必填 NaN 占位；v5 活动指标集合为 G1–G4/G6/G7/G9–G11 + 条件项 G5，两者口径不可互推（HC37/38/39）",
+  "deprecated_fields_present": [
+    "g8_bbox_coverage_min",
+    "scale_ci"
+  ],
+  "detected_schema_version": null,
+  "archived_artifact_version": "161fddc4a5876afb",
+  "archived_artifact_content_sha256": "61b2f5e19f241bce56651fa1a3d13b6f1e380e49b300c2826c56c388a16bdfd5",
+  "env_versions": {
+    "scipy": "1.16.2",
+    "numpy": "2.1.2"
+  },
+  "generator": "tests/golden/archive_v4/make_golden_v4.py（保留用于溯源；不得用于 v5 统计）",
+  "files": [
+    "frozen_artifact.json",
+    "frozen_c2w.npy",
+    "frozen_depth.npy",
+    "frozen_intrinsics.npy",
+    "frozen_point_conf.npy",
+    "frozen_point_map.npy",
+    "golden-scene-001_obj_0_mask.npy",
+    "golden-scene-001_obj_0_points.npy",
+    "golden_stats.json"
+  ]
+}

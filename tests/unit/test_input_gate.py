@@ -1,4 +1,8 @@
-"""M2 input_gate 单测（§4 M2 字段 11）。"""
+"""M2 input_gate 单测（§4 M2 字段 11，**被动观测**口径）。
+
+硬约束 21：M2 只打 flag/weight，绝不删/换/补/重排帧；
+唯一 hard fail 通道是输入合法性（空帧/尺寸非法/损坏/帧数 < 32）。
+"""
 
 import cv2
 import numpy as np
@@ -54,27 +58,46 @@ def test_blurred_frames_marked_degraded():
     assert verdict.action == "proceed"
 
 
-def test_locally_degraded_triggers_drop_and_refill():
-    """劣化帧占比超阈 → locally_degraded + drop_and_refill。"""
+def test_locally_degraded_only_flags_and_downweights():
+    """劣化帧占比超阈 → locally_degraded，但 action 仍是 proceed（硬约束 21）。
+
+    旧的 `drop_and_refill`（删帧/补帧）已废弃：帧集在 M1 后冻结，
+    这里只降权 + 打 flag，帧数与帧序不变。
+    """
     frames = [_mk_input_frame(blur=500.0) for _ in range(MIN_FRAMES)]
     for i in range(0, 16):  # 50% 劣化
         frames[i] = _mk_input_frame(blur=10.0)
     verdict = input_gate(frames)
     assert verdict.level == "locally_degraded"
-    assert verdict.action == "drop_and_refill"
+    assert verdict.action == "proceed"
     assert len(verdict.degraded_frame_ids) == 16
+    assert verdict.n_frames == MIN_FRAMES              # 帧数不变
+    assert 0.0 < verdict.quality_weight < 1.0          # 只降权
+    assert verdict.degradation_flags == ["blur"]
 
 
-def test_overall_unusable_when_all_degraded():
-    """整体不合格 → overall_unusable + unanswerable（§4 M2 字段 9）。"""
+def test_all_degraded_still_proceeds_with_low_weight():
+    """全帧劣化也**不是** hard fail：只降权（输入合法性才是唯一 hard fail 通道）。"""
     frames = [_mk_input_frame(blur=1.0) for _ in range(MIN_FRAMES)]
+    verdict = input_gate(frames)
+    assert verdict.level == "locally_degraded"
+    assert verdict.action == "proceed"
+    assert verdict.quality_weight == pytest.approx(0.5)
+    assert len(verdict.degraded_frame_ids) == MIN_FRAMES
+
+
+def test_illegal_frames_are_hard_fail():
+    """输入合法性（空帧 / 尺寸非法）→ overall_unusable + unanswerable（§4 M2）。"""
+    frames = [np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(MIN_FRAMES)]
+    frames[7] = np.zeros((0, 0, 3), dtype=np.uint8)      # 空帧
     verdict = input_gate(frames)
     assert verdict.level == "overall_unusable"
     assert verdict.action == "unanswerable"
+    assert 7 in verdict.hard_fail_frame_ids
 
 
 def test_insufficient_frames_unanswerable():
-    """G4 帧数不足 32 → overall_unusable（§10 G4）。"""
+    """G4 帧数不足 32 → 输入合法性 hard fail（§10 G4）。"""
     frames = [_mk_input_frame(blur=500.0) for _ in range(MIN_FRAMES - 1)]
     verdict = input_gate(frames)
     assert verdict.level == "overall_unusable"

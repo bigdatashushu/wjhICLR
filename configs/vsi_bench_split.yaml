@@ -1,9 +1,424 @@
-# VSI-Bench 分层切分（§13.3）：按 scene_id 分层，不共享 scene
-# 比例起始建议 induction:inner:outer:final = 5:3:2:留出，TODO_CALIBRATE
-split_version: "v1"
-induction_scene_ids: []        # TODO_CALIBRATE 启动时由 split 脚本按 scene+题型分层填充
-inner_validation_scene_ids: []
-outer_holdout_scene_ids: []
-final_test_scene_ids: []       # 系统不可见，仅记录存在（硬约束 9）
+# 由 scripts/build_splits.py 生成（G-09，§4 M1 / §13.3）——请勿手工编辑。
+# 纪律：按 scene 整块切分、四层不共享 scene（硬约束 19）；final_test 完全隔离
+#（硬约束 9，仅记录存在）。所有比例/阈值 TODO_CALIBRATE。
+split_version: v1-33aeca2434e9b1a9
+seed: 0
+final_ratio: 0.2
+ratios:
+  induction: 0.5
+  inner_validation: 0.3
+  outer_holdout: 0.2
 task_type_stratification: true
-contamination_check_log_ref: data/splits/contamination_check.log
+contamination_check_log_ref: configs/contamination_check.log
+meta_source: data/vsi_bench_meta/test.jsonl
+meta_sha256: aa3ff8cc2010e555f4f865ff96483812ec0b275005b68562f53bb114ad4db9db
+n_rows: 5130
+total_scenes: 288
+dataset_scene_counts:
+  arkitscenes: 150
+  scannet: 88
+  scannetpp: 50
+per_split_scenes:
+  induction: 116
+  inner_validation: 69
+  outer_holdout: 45
+  final_test: 58
+per_split_qa:
+  induction: 1993
+  inner_validation: 1283
+  outer_holdout: 882
+  final_test: 972
+induction_scene_ids:
+- 13c3e046d7
+- 25f3b7a318
+- '3864514494'
+- 38d58a7a31
+- 3db0a1c8f3
+- 40aec5fffa
+- '41125700'
+- '41125731'
+- '41159525'
+- '41159541'
+- '41159555'
+- '41254246'
+- '41254386'
+- '42444950'
+- '42444954'
+- '42445031'
+- '42446103'
+- '42446167'
+- '42446529'
+- '42446535'
+- '42446541'
+- '42897508'
+- '42897528'
+- '42897550'
+- '42897692'
+- '42898486'
+- '42898527'
+- '42898544'
+- '42898581'
+- '42898817'
+- '42898849'
+- '42898869'
+- '42899612'
+- '42899685'
+- '42899696'
+- '42899712'
+- '42899729'
+- '42899739'
+- '44358442'
+- '44358536'
+- '44358582'
+- '45261121'
+- '45261182'
+- '45662924'
+- '45662970'
+- '45663154'
+- '47115525'
+- '47115543'
+- '47204552'
+- '47204578'
+- '47331063'
+- '47331319'
+- '47331336'
+- '47331644'
+- '47331668'
+- '47331970'
+- '47331972'
+- '47332899'
+- '47332908'
+- '47332918'
+- '47333457'
+- '47333932'
+- '47334103'
+- '47334117'
+- '47429922'
+- '47429992'
+- '47430048'
+- '47430475'
+- 5748ce6f01
+- 5eb31827b7
+- 5ee7c22ba0
+- 7831862f02
+- 9071e139d9
+- ac48a9b736
+- b0a08200c9
+- bcd2436daf
+- bde1e479ad
+- d755b3d9d8
+- e398684d27
+- f9f95681fd
+- fb5a96b1a2
+- scene0050_01
+- scene0081_02
+- scene0086_02
+- scene0088_01
+- scene0144_00
+- scene0146_01
+- scene0153_00
+- scene0164_02
+- scene0169_01
+- scene0196_00
+- scene0208_00
+- scene0246_00
+- scene0378_01
+- scene0426_00
+- scene0488_01
+- scene0494_00
+- scene0550_00
+- scene0553_00
+- scene0568_02
+- scene0574_01
+- scene0580_01
+- scene0621_00
+- scene0643_00
+- scene0645_00
+- scene0648_00
+- scene0664_02
+- scene0665_00
+- scene0671_01
+- scene0684_01
+- scene0686_00
+- scene0693_00
+- scene0695_00
+- scene0696_01
+- scene0701_00
+- scene0702_02
+inner_validation_scene_ids:
+- 0d2ee665be
+- 1ada7a0617
+- 21d970d8de
+- 27dd4da69e
+- 286b55a2bf
+- 3e8bba0176
+- 3f15a9266d
+- '41069043'
+- '41159530'
+- '41159572'
+- '41254432'
+- '42446049'
+- '42446056'
+- '42446116'
+- '42897554'
+- '42897647'
+- '42897688'
+- '42898826'
+- '42899461'
+- '44358436'
+- '44358451'
+- '44358518'
+- '45260928'
+- '45261620'
+- '45662943'
+- '45663114'
+- '45663164'
+- '47115469'
+- '47204566'
+- '47204607'
+- '47331068'
+- '47331331'
+- '47332886'
+- '47332901'
+- '47333441'
+- '47333918'
+- '47333924'
+- '47334096'
+- '47334362'
+- '47334372'
+- '47334380'
+- '47429912'
+- '47430007'
+- '47430023'
+- 5f99900f09
+- 6115eddb86
+- 7b6477cb95
+- 99fa5c25e1
+- a980334473
+- c5439f4607
+- cc5237fd77
+- scene0077_01
+- scene0095_01
+- scene0193_01
+- scene0221_01
+- scene0328_00
+- scene0356_00
+- scene0357_01
+- scene0461_00
+- scene0474_04
+- scene0496_00
+- scene0565_00
+- scene0591_01
+- scene0593_00
+- scene0598_02
+- scene0651_02
+- scene0653_00
+- scene0697_01
+- scene0699_00
+outer_holdout_scene_ids:
+- '41125760'
+- '41142280'
+- '41159504'
+- '41254402'
+- '42444976'
+- '42445984'
+- '42446151'
+- '42446517'
+- '42897538'
+- '42899720'
+- '45260900'
+- '45261142'
+- '45261150'
+- '45261594'
+- '47331316'
+- '47332005'
+- '47333899'
+- '47333940'
+- '47334238'
+- '47334239'
+- '47430422'
+- '47430468'
+- 578511c8a9
+- '5942004064'
+- 7bc286c1b6
+- a24f64f7fb
+- a8bf42d646
+- acd95847c5
+- c49a8c6cff
+- e7af285f7d
+- f3685d06a9
+- f3d64c30f8
+- scene0025_01
+- scene0046_01
+- scene0203_01
+- scene0207_02
+- scene0231_00
+- scene0307_02
+- scene0338_00
+- scene0435_02
+- scene0441_00
+- scene0458_00
+- scene0500_00
+- scene0629_01
+- scene0685_00
+final_test_scene_ids:
+- 09c1414f1b
+- 31a2c91c43
+- '41069025'
+- '41069048'
+- '42445026'
+- '42445429'
+- '42445981'
+- '42897564'
+- '42897629'
+- '42899617'
+- '42899698'
+- '42899725'
+- '44358499'
+- '45260856'
+- '45260905'
+- '45261575'
+- '45261637'
+- '45662987'
+- '45663105'
+- 45b0dac5e3
+- '47115460'
+- '47331262'
+- '47331654'
+- '47331990'
+- '47333436'
+- '47334107'
+- '47334254'
+- '47429904'
+- '47429977'
+- '47429998'
+- '47430034'
+- '47430038'
+- 825d228aec
+- c4c04e6d6c
+- c50d2d1d42
+- f2dc06b1d2
+- scene0030_02
+- scene0100_00
+- scene0149_00
+- scene0222_01
+- scene0251_00
+- scene0277_02
+- scene0304_00
+- scene0316_00
+- scene0353_00
+- scene0354_00
+- scene0412_00
+- scene0462_00
+- scene0518_00
+- scene0575_01
+- scene0608_00
+- scene0616_01
+- scene0633_00
+- scene0647_00
+- scene0658_00
+- scene0663_00
+- scene0700_02
+- scene0704_01
+per_task_scenes:
+  obj_appearance_order:
+    induction: 13
+    inner_validation: 8
+    outer_holdout: 5
+    final_test: 6
+  object_abs_distance:
+    induction: 87
+    inner_validation: 52
+    outer_holdout: 35
+    final_test: 47
+  object_counting:
+    induction: 81
+    inner_validation: 49
+    outer_holdout: 32
+    final_test: 40
+  object_rel_direction_easy:
+    induction: 31
+    inner_validation: 18
+    outer_holdout: 12
+    final_test: 15
+  object_rel_direction_hard:
+    induction: 42
+    inner_validation: 25
+    outer_holdout: 17
+    final_test: 21
+  object_rel_direction_medium:
+    induction: 43
+    inner_validation: 26
+    outer_holdout: 17
+    final_test: 21
+  object_rel_distance:
+    induction: 44
+    inner_validation: 26
+    outer_holdout: 18
+    final_test: 22
+  object_size_estimation:
+    induction: 111
+    inner_validation: 67
+    outer_holdout: 44
+    final_test: 56
+  room_size_estimation:
+    induction: 116
+    inner_validation: 69
+    outer_holdout: 45
+    final_test: 58
+  route_planning:
+    induction: 77
+    inner_validation: 47
+    outer_holdout: 31
+    final_test: 39
+per_task_qa:
+  obj_appearance_order:
+    induction: 243
+    inner_validation: 153
+    outer_holdout: 121
+    final_test: 101
+  object_abs_distance:
+    induction: 333
+    inner_validation: 198
+    outer_holdout: 140
+    final_test: 163
+  object_counting:
+    induction: 202
+    inner_validation: 145
+    outer_holdout: 103
+    final_test: 115
+  object_rel_direction_easy:
+    induction: 84
+    inner_validation: 54
+    outer_holdout: 35
+    final_test: 44
+  object_rel_direction_hard:
+    induction: 154
+    inner_validation: 92
+    outer_holdout: 58
+    final_test: 69
+  object_rel_direction_medium:
+    induction: 143
+    inner_validation: 94
+    outer_holdout: 69
+    final_test: 72
+  object_rel_distance:
+    induction: 261
+    inner_validation: 209
+    outer_holdout: 111
+    final_test: 129
+  object_size_estimation:
+    induction: 380
+    inner_validation: 222
+    outer_holdout: 169
+    final_test: 182
+  room_size_estimation:
+    induction: 116
+    inner_validation: 69
+    outer_holdout: 45
+    final_test: 58
+  route_planning:
+    induction: 77
+    inner_validation: 47
+    outer_holdout: 31
+    final_test: 39

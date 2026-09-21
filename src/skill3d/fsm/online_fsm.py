@@ -4,7 +4,9 @@
 任何状态、任何 prompt 不得出现 GPT-6 调用/verify/重试裁决。
 纯 Python 轻量状态机实现（不依赖 transitions 库）：状态枚举 + 转移表 + guard 函数。
 
-状态链：INGEST→INPUT_GATE→RECONSTRUCT→QUALITY_GATE→CLASSIFY_TASK→RETRIEVE_SKILL
+状态链（v4 新增 SCALE_ESTIMATE / SCALE_CALIBRATE，§5.1）：
+INGEST→INPUT_GATE→RECONSTRUCT→SCALE_ESTIMATE(多锚点融合)→SCALE_CALIBRATE(冻结校准器,
+逐题授权)→QUALITY_GATE(写回 artifact)→CLASSIFY_TASK→RETRIEVE_SKILL
 →SYNTHESIZE_PROGRAM→STATIC_CHECK→SANDBOX_EXECUTE→GEOMETRY_VERIFY→BENCHMARK_EVAL
 →ANSWER→LOG_TRACE；失败转移见 §6.3。
 """
@@ -22,6 +24,11 @@ class OnlineState(str, Enum):
     INGEST = "INGEST"
     INPUT_GATE = "INPUT_GATE"
     RECONSTRUCT = "RECONSTRUCT"
+    # v4 §5.1：尺度估计与校准是**独立状态**，位于重建之后、质量门禁之前。
+    # 两者都不改 route（route 只由质量决定）；它们只产出 ScaleAssessment
+    # （scale/ci_rel/confidence/allowed_metric_tasks），供 M7 逐题授权消费。
+    SCALE_ESTIMATE = "SCALE_ESTIMATE"
+    SCALE_CALIBRATE = "SCALE_CALIBRATE"
     QUALITY_GATE = "QUALITY_GATE"
     CLASSIFY_TASK = "CLASSIFY_TASK"
     RETRIEVE_SKILL = "RETRIEVE_SKILL"
@@ -79,9 +86,31 @@ class OnlineFSM:
 
         elif s is OnlineState.RECONSTRUCT:
             if event == "done":
+                self.state = OnlineState.SCALE_ESTIMATE
+            elif event == "skip":
+                # 复用既有 artifact / mock_light：尺度评估已随 artifact 落盘，跳过两态
                 self.state = OnlineState.QUALITY_GATE
             else:
                 self._to_unanswerable()  # 重建不可恢复
+
+        elif s is OnlineState.SCALE_ESTIMATE:
+            # v4 §5.1：多锚点鲁棒融合（地平面/相机高 + 门/桌/椅等标准物体）。
+            # 失败（无有效锚点/融合非有限）**不**中止 episode：落 low 档并继续。
+            if event != "done":
+                raise ValueError(f"{s} 不支持事件 {event}")
+            self.state = OnlineState.SCALE_CALIBRATE
+
+        elif s is OnlineState.SCALE_CALIBRATE:
+            # v4 §5.1：冻结 conformal 校准器 + 逐题型授权。
+            # 校准器缺失 / 口径校验失败 / 锚点冲突 / 经验覆盖不足 → confidence=low 且
+            # allowed_metric_tasks=∅；**不得**改变质量合格场景的非尺度 full_3d route。
+            if event != "done":
+                raise ValueError(f"{s} 不支持事件 {event}")
+            if ctx.get("metric_tasks_withdrawn"):
+                self.answer_flags.append("scale_low_metric_tasks_withdrawn")
+            if ctx.get("scale_conflict"):
+                self.answer_flags.append("scale_conflict")
+            self.state = OnlineState.QUALITY_GATE
 
         elif s is OnlineState.QUALITY_GATE:
             if event != "gate_done":
@@ -95,7 +124,16 @@ class OnlineFSM:
                 self.state = OnlineState.CLASSIFY_TASK
 
         elif s is OnlineState.CLASSIFY_TASK:
-            if event == "done":
+            # guard（v4 HC33 逐题型米制授权；G8 拒答门已随指标删除）：题型识别后立即生效
+            # ctx: question_ok（False = 该题拒答）/ reject_flag / downgrade_2d_only
+            if event != "done":
+                raise ValueError(f"{s} 不支持事件 {event}")
+            if not ctx.get("question_ok", True):
+                self.answer_flags.append(str(ctx.get("reject_flag", "question_gate_reject")))
+                self._to_unanswerable()
+            else:
+                if ctx.get("downgrade_2d_only"):
+                    self.answer_flags.append("fallback_2d_only")
                 self.state = OnlineState.RETRIEVE_SKILL
 
         elif s is OnlineState.RETRIEVE_SKILL:
@@ -120,6 +158,14 @@ class OnlineFSM:
         elif s is OnlineState.SANDBOX_EXECUTE:
             if event == "ok":
                 self.state = OnlineState.GEOMETRY_VERIFY
+            elif event == "contract_recover":
+                # D-3：回灌一次 / 裁剪 prompt 重生成一次 → 重执行（不消耗重启预算）
+                self.answer_flags.append("tool_contract_recovered")
+                pass
+            elif event == "contract_fail":
+                # D-3（v3 §6.1 新边）：两次机会用尽 → **显式 abstain**，主榜按错计
+                self.answer_flags.append("tool_contract")
+                self._to_unanswerable()
             elif event == "error":
                 self.kernel_restart_count += 1
                 if self.kernel_restart_count < self.max_kernel_restarts:

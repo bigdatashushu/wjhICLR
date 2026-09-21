@@ -69,8 +69,18 @@ class OfflineFSM:
                 else OfflineState.REJECT
 
         elif s is OfflineState.LOOP_SYNTHESIZE:
+            # `done`：逐状态驱动（内环本身由上层 state-by-state 推进）；
+            # `pass`/`fail`：内环作为整体被执行完（`run_optimization_loop` 一次跑完
+            # LOOP_STATIC_CHECK→TEST(L1→L2→L3)→DIAGNOSE→REVISE），按其终态一次性推进。
+            # 缺了这条宏边会让 PROMOTE 不可达（硬约束 12/13 在 driver 里从未被触发）。
             if event == "done":
                 self.state = OfflineState.LOOP_STATIC_CHECK
+            elif event == "pass":
+                # 只有真正跑过 outer（L3）才会走到这里：outer 只跑一次（硬约束 10）
+                self.outer_attempted = True
+                self.state = OfflineState.PROMOTE
+            elif event == "fail":
+                self.state = OfflineState.REJECT
 
         elif s is OfflineState.LOOP_STATIC_CHECK:
             if event == "pass":

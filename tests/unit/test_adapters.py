@@ -13,8 +13,8 @@ def _fake_rows() -> list[dict]:
     """构造 8 题型 × 每型 10 scene 的假 meta。"""
     qtypes = [
         "object_rel_direction", "object_rel_distance", "object_rel_height",
-        "object_counting", "object_size", "room_size",
-        "absolute_distance", "route_plan",
+        "object_counting", "object_size_estimation", "room_size_estimation",
+        "object_abs_distance", "route_planning",
     ]
     rows = []
     for qt in qtypes:
@@ -41,11 +41,23 @@ def test_sample_uniform_indices_strictly_monotonic_uniform():
     assert idx[0] == 0 and idx[-1] <= 999
 
 
-def test_sample_uniform_indices_short_video():
-    """视频不足 32 帧时仍返回 32 个索引（由 G4 判定不全）。"""
-    idx = vl.sample_uniform_indices(total_frames=10, n=32)
-    assert len(idx) == 32
-    assert max(idx) == 9
+def test_sample_uniform_indices_short_video_is_hard_fail():
+    """视频不足 32 帧 → 输入合法性硬失败（硬约束 21 禁止重复帧补齐）。"""
+    with pytest.raises(vl.FrameSetError):
+        vl.sample_uniform_indices(total_frames=10, n=32)
+
+
+def test_frame_set_hash_is_deterministic_and_content_addressed():
+    """FrameSet：32 个唯一物理帧 + 确定性 frame_set_hash（§4 M1 验收）。"""
+    fs = vl.build_frame_set(total_frames=1000, n_frames=32, fps=30.0)
+    assert len(fs.frame_ids) == 32 and len(set(fs.frame_ids)) == 32
+    assert fs.frame_ids == sorted(fs.frame_ids)                # 严格递增
+    assert all(a < b for a, b in zip(fs.timestamps, fs.timestamps[1:]))
+    fs2 = vl.build_frame_set(total_frames=1000, n_frames=32, fps=30.0)
+    assert fs.frame_set_hash == fs2.frame_set_hash             # 确定性
+    fs3 = vl.build_frame_set(total_frames=1000, n_frames=32, fps=60.0)
+    assert fs3.frame_set_hash == fs.frame_set_hash             # 哈希只看帧号
+    assert fs.frame_ids[0] == 0 and fs.frame_ids[-1] == 999    # 与官方一致
 
 
 def test_split_isolation_final_test():

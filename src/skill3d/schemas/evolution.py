@@ -77,11 +77,18 @@ class PairedOutcome(Spec):
     delta: float
     ci95_lo: float
     ci95_hi: float
-    wilcoxon_p: float
+    # §7 / E-2：退化样本（零方差/完全相同组）p 记 None → 判"不显著"（不得声称显著）
+    wilcoxon_p: Optional[float] = None
     slice_table: dict
     resource_cost: dict
     slice_no_regression: bool
     within_budget: bool
+    # §7：多重比较校正（Bonferroni，按被测切片数）与效应量
+    wilcoxon_p_bonferroni: Optional[float] = None
+    n_comparisons: int = 1
+    degenerate: bool = False
+    cliffs_delta: Optional[float] = None
+    cohens_d: Optional[float] = None
 
 
 class AdmissionDecision(Spec):

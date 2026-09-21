@@ -1,4 +1,4 @@
-"""skill3d.tools 包（系统架构.md §2 新建建议）。
+"""skill3d.tools 包（系统架构3.md §2.1 目录树）。
 
 import 本包即注册全部确定性几何 Tool 到 REGISTRY。
 """

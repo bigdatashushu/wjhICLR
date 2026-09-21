@@ -32,10 +32,12 @@ _FALLBACK: dict[str, Any] = {
     },
     "frame_sampling": {"n_frames": 32, "strategy": "uniform"},
     "vllm": {
-        "model": "Qwen/Qwen3-VL-8B-Instruct",
-        "quantization": "awq",
+        "model": "Qwen/Qwen3-VL-8B-Instruct-FP8",
+        "quantization": "none",
         "max_model_len": 32768,
-        "gpu_memory_utilization": 0.92,
+        "gpu_memory_utilization": 0.90,
+        "n_frames": 32,
+        "max_pixels": 131072,
         "tensor_parallel_size": 1,
         "dp_world_size": 8,
         "base_port": 8100,
@@ -53,6 +55,14 @@ _FALLBACK: dict[str, Any] = {
     },
     "split_config": "configs/vsi_bench_split.yaml",
     "admission_thresholds": "configs/admission_thresholds.yaml",
+    # v4 尺度评估（HC29–33）：CI 口径 / 冻结校准器 / 逐题型授权
+    "scale": {
+        "confidence_level": 0.90,
+        "calibration_path": "data/scale_calibration/calibrator.json",
+        "split_audit_manifest": "data/scale_calibration/split_audit.json",
+        "vsi_bench_meta": "data/vsi_bench_meta/test.jsonl",
+        "excluded_vsibench_scene_count": 150,
+    },
 }
 
 
@@ -100,6 +110,9 @@ class VLLMSettings:
     dp_world_size: int = 8
     base_port: int = 8100
     temperature: float = 0.0
+    # 32 帧输入与单帧像素上限（§1.2 / §4 M1；实测 32 帧 @131072 → ~9703 prompt tokens）
+    n_frames: int = 32
+    max_pixels: int = 131072
     endpoints: list[str] = field(default_factory=list)
 
     @property

@@ -26,7 +26,9 @@ class ProgramExecutionTrace(Spec):
     stdout_tail: str
     error_code: Optional[
         Literal["timeout", "oom", "disk_full", "violation_syntax",
-                "violation_runtime", "violation_policy"]
-    ]
+                "violation_runtime", "violation_policy", "tool_contract"]
+    ]  # tool_contract：Tool 所需产物缺失/局部质量门未过/域值错误（D-3，硬约束 23）
     steps: int
     wallclock_s: float
+    # D-3：一旦 `ReturnAnswer` 依赖的某次 Tool 抛 ToolContractError，最终答案不得采纳
+    answer_untrusted: bool = False

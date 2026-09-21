@@ -1,0 +1,55 @@
+{
+  "scores_a": [
+    1.0,
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0
+  ],
+  "scores_b": [
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "task_types": [
+    "object_counting",
+    "object_counting",
+    "object_counting",
+    "object_counting",
+    "room_size_estimation",
+    "room_size_estimation",
+    "room_size_estimation",
+    "room_size_estimation"
+  ],
+  "seed": 0,
+  "delta": 0.25,
+  "ci95_lo": 0.0,
+  "ci95_hi": 0.625,
+  "wilcoxon_p": 0.5,
+  "wilcoxon_p_bonferroni": 1.0,
+  "n_comparisons": 2,
+  "cliffs_delta": 0.25,
+  "cohens_d": 0.5400617248673217,
+  "degenerate": false,
+  "slice_no_regression": true,
+  "golden_version": "v5-golden-1",
+  "schema_version": "5.0",
+  "quality_metric_version": "v5-no-g8-g5-optional",
+  "artifact_content_sha256": "2b3898a83931c418ca89cab3c477bf1d39c4e36f4f71f2018667f6ae15ed65e4",
+  "artifact_version": "97f4f918120540e6",
+  "env_versions": {
+    "scipy": "1.16.2",
+    "numpy": "2.1.2"
+  },
+  "reprojection_status": "not_available",
+  "g5_reproj_err_median": null,
+  "notes": "v5 夹具：合成数据，只验证 A/B 机制与统计确定性，不得作为精度结论（HC24）；G5=None 不入 overall_quality 分母（HC37）"
+}

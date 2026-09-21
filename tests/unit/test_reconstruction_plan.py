@@ -22,7 +22,8 @@ from skill3d.reconstruction.run import (
 from skill3d.schemas import QualityMetrics, ReconstructionArtifact
 
 
-def _item(scene: str, qa_id: str, question_type: str = "room_size") -> EpisodeItem:
+def _item(scene: str, qa_id: str,
+          question_type: str = "room_size_estimation") -> EpisodeItem:
     se = syn.make_synthetic_episode(question_type, scene_name=scene, qa_id=qa_id,
                                     frame_size=(60, 80))
     return EpisodeItem(episode=se.episode, pixels=se.frames, geometry=se.geometry,
@@ -62,7 +63,7 @@ def test_artifact_json_roundtrip_keeps_nan(tmp_path):
         quality=QualityMetrics(
             g1_blur_ok=nan, g2_brightness=nan, g3_motion_blur=nan, g4_frame_count=32,
             g5_reproj_err_median=nan, g5_reproj_err_p95=nan, g6_depth_var_coeff=nan,
-            g7_dynamic_ratio=nan, g8_bbox_coverage_min=nan, g9_tracker_consistency=nan,
+            g7_dynamic_ratio=nan, g9_tracker_consistency=nan,
             g10_baseline_quality=nan, g11_scale_ci=nan, overall_quality=nan),
         confidence={"per_point_confidence": "", "coverage_count_per_frame": ""},
     )
@@ -74,13 +75,24 @@ def test_artifact_json_roundtrip_keeps_nan(tmp_path):
 
 
 def test_run_jobs_reports_failure_without_crash(tmp_path, monkeypatch):
-    """无 VGGT 权重/依赖时：逐 scene 记 failed + note，不抛异常（§4 M3 字段 9）。"""
+    """重建失败时：逐 scene 记 failed + note，不抛异常（§4 M3 字段 9）。
+
+    单测不依赖 GPU/权重：把真实重建替换为确定性失败（否则会因他人占满显存而 OOM，
+    错误信息随环境变化 —— 那是集成测试该覆盖的事，不是本单测的断言点）。
+    """
+    from skill3d.reconstruction import run as recon_run
+    from skill3d.reconstruction.vggt_runner import ReconstructionFailed
+
+    def _boom(*_a, **_kw):
+        raise ReconstructionFailed("单测桩：权重缺失")
+
+    monkeypatch.setattr(recon_run, "reconstruct", _boom, raising=False)
     items = [_item("scene-a", "a1")]
     jobs = plan_scene_jobs(items, tmp_path, "vggt")
     jobs = run_jobs(jobs, {"scene-a": items}, tmp_path, "vggt", gpus=[0])
     assert jobs[0].status == "failed"
     assert jobs[0].gpu_rank == 0
-    assert "重建失败" in jobs[0].note
+    assert "重建失败" in jobs[0].note or "单测桩" in jobs[0].note
 
 
 def test_run_jobs_dp_assignment_across_gpus(tmp_path):
@@ -103,17 +115,19 @@ def test_run_jobs_passes_one_episode_frames_per_scene(tmp_path, monkeypatch):
     captured: dict[str, int] = {}
     nan = float("nan")
 
-    def fake_reconstruct(frames, scene_name, output_dir, method="vggt"):
+    def fake_reconstruct(frames, scene_name, output_dir, method="vggt", **kwargs):
         captured[scene_name] = len(frames)
+        captured["ba_enabled"] = bool(kwargs.get("use_ba", False))
         return ReconstructionArtifact(
             artifact_id="x", artifact_version="x", scene_name=scene_name,
             recon_method="vggt", c2w_list="", intrinsics="", depth_maps="",
             point_map="", point_conf="", track_list=None, metric_scale=None,
             scale_known=False,
+            quality_status="computed",
             quality=QualityMetrics(
                 g1_blur_ok=nan, g2_brightness=nan, g3_motion_blur=nan, g4_frame_count=32,
                 g5_reproj_err_median=nan, g5_reproj_err_p95=nan, g6_depth_var_coeff=nan,
-                g7_dynamic_ratio=nan, g8_bbox_coverage_min=nan, g9_tracker_consistency=nan,
+                g7_dynamic_ratio=nan, g9_tracker_consistency=nan,
                 g10_baseline_quality=nan, g11_scale_ci=nan, overall_quality=nan),
             confidence=ConfidenceMap(per_point_confidence="", coverage_count_per_frame=""),
         )
@@ -122,5 +136,6 @@ def test_run_jobs_passes_one_episode_frames_per_scene(tmp_path, monkeypatch):
     items = [_item("scene-a", "a1"), _item("scene-a", "a2"), _item("scene-a", "a3")]
     jobs = plan_scene_jobs(items, tmp_path, "vggt")
     jobs = run_jobs(jobs, {"scene-a": items}, tmp_path, "vggt", gpus=[0])
-    assert captured == {"scene-a": 32}
+    assert captured["scene-a"] == 32          # 只喂一份 32 帧，不拼接
+    assert captured["ba_enabled"] is False    # BA route 默认关闭（§10.1 Conditional Go）
     assert jobs[0].status == "done"

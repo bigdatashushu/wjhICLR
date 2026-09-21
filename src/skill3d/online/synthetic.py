@@ -23,8 +23,8 @@ import numpy as np
 from skill3d.gates import iqa
 from skill3d.reconstruction_gate.confidence_map import fuse_confidence, coverage_ratio
 from skill3d.reconstruction_gate.quality_metrics import compute_g1_g11
-from skill3d.reconstruction_gate.scene_state import TH_SCALE_CI, route_from_quality
-from skill3d.routing.task_classifier import MCA_TYPES, NA_TYPES
+from skill3d.reconstruction_gate.scene_state import TH_SCALE_CI_REL, route_from_quality
+from skill3d.routing.task_classifier import canonical_task
 from skill3d.schemas import (
     InputFrame,
     ObjectInstance,
@@ -33,6 +33,7 @@ from skill3d.schemas import (
     SceneState,
     VSIBenchEpisode,
 )
+from skill3d.tools.contract import available_artifacts_for
 from skill3d.tools.scene_handle import SceneHandle
 
 # 与 VSI-Bench 视频规格对齐（§1.2：640×480）
@@ -46,7 +47,7 @@ ROOM_MAX = np.array([3.0, 4.0, 2.8])
 FOCAL = 500.0
 # 深度图子采样网格（省内存：32×60×80）
 DEPTH_H, DEPTH_W = 60, 80
-# 合成尺度 CI（米）：小于 TH_SCALE_CI 记 scale_known=True
+# 合成尺度 **相对** CI 半宽（分数口径，HC29）：小于 TH_SCALE_CI_REL 记 scale_known=True
 SYNTH_SCALE_CI = 0.02
 
 
@@ -267,42 +268,53 @@ def _apply_degrade(frames: list[np.ndarray], mode: str) -> list[np.ndarray]:
 
 def _question_and_gt(question_type: str, geometry: SyntheticGeometry,
                      rng: np.random.Generator) -> tuple[str, list[str] | None, str]:
-    """合成 question / options / ground_truth。
+    """合成 question / options / ground_truth（题型为 §4 M7 的 8 个规范题型）。
 
-    route_plan / appearance_order 的 GT 无真实语义（固定字母占位），
+    MCA/NA 分流与官方 meta 一致（§1.2：4 MCA + 4 NA）：
+    `object_counting`/`object_abs_distance`/`object_size_estimation`/
+    `room_size_estimation` 为数值题（无 options）；其余四类为选择题。
+
+    route_planning / obj_appearance_order 的 GT 无真实语义（固定字母占位），
     见模块 docstring：合成集精度不构成结论。
     """
     names = [o.class_hint for o in geometry.objects]
     if question_type == "object_counting":
         n = len(names)
-        options = ["2", "3", "4", "5"]
-        gt_letter = "ABCD"[options.index(str(n))] if str(n) in options else "A"
-        return ("How many objects are in the scene? Count them.", options, gt_letter)
-    if question_type == "relative_direction":
+        return ("How many objects are in the scene? Count them.", None, str(n))
+    if question_type == "object_rel_direction":
         options = ["left", "right", "front", "behind"]
         direction = _independent_direction(geometry)
         gt = "ABCD"[options.index(direction)] if direction in options else "A"
         return ("What is the relative direction of the sofa from the chair "
                 "(facing +y)?", options, gt)
-    if question_type == "route_plan":
+    if question_type == "route_planning":
         options = ["A", "B", "C", "D"]
         return ("Which route leads to the sofa?", options, "ABCD"[int(rng.integers(0, 4))])
-    if question_type == "appearance_order":
+    if question_type == "obj_appearance_order":
         options = ["A", "B", "C", "D"]
         return ("In what order do the objects appear?", options,
                 "ABCD"[int(rng.integers(0, 4))])
-    if question_type == "room_size":
+    if question_type == "room_size_estimation":
         gt = float(np.prod(ROOM_MAX[:2] - ROOM_MIN[:2]))
         return ("What is the area of the room in square meters?", None, f"{gt:.2f}")
-    if question_type == "object_size":
+    if question_type == "object_size_estimation":
         gt = float(max(_SYNTH_OBJECTS[0][2]))
         return ("What is the longest dimension of the sofa in meters?", None, f"{gt:.2f}")
-    if question_type in ("absolute_distance", "relative_distance"):
+    if question_type == "object_abs_distance":
         a = np.asarray(geometry.objects[0].centroid_world)
         b = np.asarray(geometry.objects[2].centroid_world)
         gt = float(np.linalg.norm(a - b))
         return ("What is the distance between the sofa and the chair in meters?",
                 None, f"{gt:.2f}")
+    if question_type == "object_rel_distance":
+        # MCA：观察者在 objects[3]，比较 objects[0]/objects[2] 谁更近（选项 = 对象名）
+        obs = np.asarray(geometry.objects[3].centroid_world)
+        d0 = float(np.linalg.norm(np.asarray(geometry.objects[0].centroid_world) - obs))
+        d2 = float(np.linalg.norm(np.asarray(geometry.objects[2].centroid_world) - obs))
+        options = [names[0], names[2]]
+        gt = "A" if d0 <= d2 else "B"
+        return (f"Between the {names[0]} and the {names[2]}, which is closer to the "
+                f"{names[3]}?", options, gt)
     raise ValueError(f"未支持的合成题型: {question_type}")
 
 
@@ -335,8 +347,7 @@ def make_synthetic_episode(
     out_dir: Optional[str] = None,
 ) -> SyntheticEpisode:
     """构造一个确定性的合成 episode（帧 + 几何 + 合成 GT）。"""
-    if question_type not in (MCA_TYPES | NA_TYPES):
-        raise ValueError(f"未知题型: {question_type}")
+    question_type = canonical_task(question_type)  # 官方取值/别名 → 规范题型
     if degrade is not None and degrade not in _DEGRADE_MODES:
         raise ValueError(f"未知 degradation: {degrade}（可选 {_DEGRADE_MODES}）")
 
@@ -379,6 +390,20 @@ def make_synthetic_episode(
             )
         )
 
+    # 统一固定 FrameSet（硬约束 21）：mock_light 也走同一条帧集契约，
+    # 帧集哈希随 episode 落盘，保证消融/重放可对齐
+    from skill3d.adapters.frame_set import frame_set_hash as _fsh
+
+    ids = list(range(len(pixels)))
+    fset = {
+        "frame_ids": ids,
+        "source_frame_indices": ids,
+        "timestamps": [i / 30.0 for i in ids],
+        "frame_set_hash": _fsh(ids),
+        "n_frames": len(pixels),
+        "n_total_frames": n_frames,
+        "fps": 30.0,
+    }
     episode = VSIBenchEpisode(
         qa_id=qa_id,
         scene_name=scene_name,
@@ -389,6 +414,7 @@ def make_synthetic_episode(
         ground_truth=gt,
         frames=frames,
         split=split,  # type: ignore[arg-type]
+        frame_set=fset,
     )
     return SyntheticEpisode(episode=episode, frames=pixels, geometry=geometry)
 
@@ -396,35 +422,65 @@ def make_synthetic_episode(
 # ------------------------------------------------------- SceneState / 句柄 ----
 
 def synthetic_scale_known() -> bool:
-    """合成场景量在米制下定义，CI 取 SYNTH_SCALE_CI ≤ TH_SCALE_CI → 尺度已知。"""
-    return SYNTH_SCALE_CI <= TH_SCALE_CI
+    """合成场景量在米制下定义，CI 取 SYNTH_SCALE_CI ≤ TH_SCALE_CI_REL → 尺度已知。
+
+    仅 mock_light 管道验证路径使用（真实路径一律由 M3 ScaleAssessment 决定）。
+    """
+    return SYNTH_SCALE_CI <= TH_SCALE_CI_REL
+
+
+def synthetic_metric_tasks() -> set[str]:
+    """mock_light 合成场景的米制题型授权（v4 HC33）。
+
+    **为什么合成场景可以授权**：合成几何是**按米制构造**的（相机高 1.55m、房间与
+    物体尺寸已知），尺度来自"构造真值"而非锚点估计。这条通道只用于**管道验证**
+    （`synthesis_source=deterministic_stub`、`scale_source=synthetic_mock_light`），
+    **绝不允许进入论文主表或真实结果**（HC24：mock 仅开发用；mock_switch 负责
+    阻断 real 模式下的 mock 污染）。
+    真实路径（mode=real）完全不读本函数：逐题型授权严格由 M3 的 ScaleAssessment 决定。
+    """
+    return {"object_abs_distance", "object_size_estimation", "room_size_estimation"}
 
 
 def build_scene_state(
     geometry: SyntheticGeometry,
     frames: Sequence[np.ndarray],
     artifact_ref: Optional[str] = None,
+    *,
+    input_quality_weight: float = 1.0,
+    input_degradation_flags: Optional[Sequence[str]] = None,
+    metric_tasks: Optional[set[str]] = None,
 ) -> tuple[SceneState, SceneHandle, QualityMetrics]:
     """按 §4 M4 口径在合成数据上**真实计算** G1–G11 并构造 SceneState。
 
     不构造 ReconstructionArtifact（其 recon_method 为 §5.2 受控枚举，
     合成产物不得冒用 vggt/dust3r_mastr/colmap 名义）。
+
+    v4 HC33：`metric_tasks` 默认 `synthetic_metric_tasks()`（合成 GT 尺度，仅管道
+    验证）；要验证"尺度不可用 → 米制 Tool 收回"的路径时显式传空集。
     """
     import numpy as np
 
     depth = geometry.depth_maps
-    # 合成场景无对应关系 → G5 重投影残差留空（NaN）；G7/G8/G9 需 M5 产物 → 交真实路径
+    # 合成场景无对应关系 → G5 重投影残差留空（NaN）；G7/G9 需 M5 产物 → 交真实路径
     q = compute_g1_g11(
         None,
         frames=frames,
         depth_maps=depth,
         c2w_list=geometry.c2w,
-        scale_ci=SYNTH_SCALE_CI,
+        scale_ci_rel=SYNTH_SCALE_CI,
     )
     fused = fuse_confidence(geometry.point_conf, geometry.coverage_count)
     coverage = coverage_ratio(fused)
     scale_known = synthetic_scale_known()
-    route = route_from_quality(q, scale_known)
+    # M2 被动观测（flag/weight）参与 route 判定（§4 M2 字段 6）：
+    # 有效质量 = G1–G11 综合分 × 输入权重；权重不改变帧集，只影响分流
+    effective_quality = q.overall_quality * float(input_quality_weight)
+    q_eff = q.model_copy(update={"overall_quality": effective_quality})
+    # route 只由质量决定（Appendix A route 总纲）；尺度走逐题通道
+    # （v4 HC33：M7 硬过滤 metric_task_authorized / question_gate 的逐题型授权）
+    route = route_from_quality(q_eff)
+    allowed = set(metric_tasks) if metric_tasks is not None else synthetic_metric_tasks()
 
     scene = SceneState(
         artifact_ref=artifact_ref or f"mock_light:{geometry.scene_name}",
@@ -434,18 +490,33 @@ def build_scene_state(
         objects=[o.instance_id for o in geometry.objects],
         summary=(
             f"scene={geometry.scene_name} (mock_light 合成) route={route} "
-            f"overall_quality={q.overall_quality:.3f} scale_known={scale_known} "
+            f"overall_quality={effective_quality:.3f} "
+            f"(G1-G11={q.overall_quality:.3f} × M2 权重={float(input_quality_weight):.2f}) "
+            f"input_flags={sorted(set(input_degradation_flags or [])) or '无'} "
+            f"scale_known={scale_known} "
+            f"scale_ci_rel={SYNTH_SCALE_CI} "
+            f"metric_tasks={sorted(allowed)}（合成 GT 尺度，仅管道验证，不得当结果）"
             f"coverage={coverage:.3f} objects={len(geometry.objects)}"
         ),
+        scale_ci_rel=SYNTH_SCALE_CI,
+        # mock_light 合成场景用"构造真值尺度"（仅管道验证，mock 不进论文）；
+        # 真实路径的置信档一律由冻结校准器派生（HC30）。
+        scale_confidence="high" if allowed else "low",
+        allowed_metric_tasks=allowed,
+        # v5 HC38：不设置 geometric_coverage 门（字段恒为 not_defined）
+        coverage_gate_status="not_defined",
+        available_artifacts=set(available_artifacts_for(route)),
     )
     handle = SceneHandle(
         scene,
         objects=geometry.objects,
         c2w_list=geometry.c2w,
         intrinsics=geometry.intrinsics,
-        quality_overall=q.overall_quality,
+        quality_overall=effective_quality,
+        # 合成几何自述 depth 单位为米 → metric_scale=1.0（米制 Tool 的换算系数）
+        metric_scale=geometry.metric_scale,
     )
-    return scene, handle, q
+    return scene, handle, q_eff
 
 
 # --------------------------------------------------------- 确定性 stub 程序 ----
@@ -454,26 +525,30 @@ _STUB_BANNER = "# mock_light 确定性 stub（非 Qwen3-VL-8B 输出，仅管道
 
 
 def stub_program(question_type: str, episode: VSIBenchEpisode,
-                 geometry: SyntheticGeometry) -> str:
-    """按题型给出确定性 stub program（仅 mock_light；程序仍走 M9 AST + M10 沙箱）。"""
-    names = [o.class_hint for o in geometry.objects]
+                 geometry: Optional[SyntheticGeometry] = None,
+                 *, object_names: Optional[Sequence[str]] = None) -> str:
+    """按题型给出确定性 stub program（仅 mock_light；程序仍走 M9 AST + M10 沙箱）。
+
+    `geometry` 为 None 时用 `object_names`（来自真实 SceneHandle 的对象名）——
+    使 mock_light 的确定性 stub 也能跑在**冻结的真实 artifact** 上（golden 重放、
+    A/B 对照用），不必造合成几何。
+    """
+    if geometry is None and object_names is None:
+        raise ValueError("stub_program 需要 geometry 或 object_names 之一")
+    names = ([o.class_hint for o in geometry.objects] if geometry is not None
+             else list(object_names or []))
     anchor_a = names[0] if names else "sofa"
     anchor_b = names[2] if len(names) > 2 else anchor_a
     opts = list(episode.options or [])
 
     if question_type == "object_counting":
-        pairs = ", ".join(f'("{o}", "{"ABCD"[i]}")' for i, o in enumerate(opts))
+        # NA 数值题：答案是被查询类别的对象数（合成场景中即 list_objects 计数）
         return (
             f"{_STUB_BANNER}\n"
-            f"pairs = [{pairs}]\n"
             f"n = len(scene.list_objects())\n"
-            f'answer = pairs[0][1]\n'
-            f"for text, letter in pairs:\n"
-            f"    if text.strip() == str(n):\n"
-            f"        answer = letter\n"
-            f"ReturnAnswer(answer)\n"
+            f"ReturnAnswer(str(n))\n"
         )
-    if question_type == "relative_direction":
+    if question_type == "object_rel_direction":
         pairs = ", ".join(f'("{o}", "{"ABCD"[i]}")' for i, o in enumerate(opts))
         return (
             f"{_STUB_BANNER}\n"
@@ -487,18 +562,35 @@ def stub_program(question_type: str, episode: VSIBenchEpisode,
             f"        answer = letter\n"
             f"ReturnAnswer(answer)\n"
         )
-    if question_type in ("route_plan", "appearance_order"):
+    if question_type == "object_rel_distance":
+        # MCA：比较两个对象到观察者的距离，选项为对象名
+        pairs = ", ".join(f'("{o}", "{"ABCD"[i]}")' for i, o in enumerate(opts))
+        return (
+            f"{_STUB_BANNER}\n"
+            f"pairs = [{pairs}]\n"
+            f'obs = object_centroid("{names[3] if len(names) > 3 else anchor_b}")\n'
+            f'dists = {{}}\n'
+            f"for text, letter in pairs:\n"
+            f"    dists[text] = euclidean_distance(obs, object_centroid(text))\n"
+            f'nearest = min(dists, key=dists.get)\n'
+            f'answer = pairs[0][1]\n'
+            f"for text, letter in pairs:\n"
+            f"    if text == nearest:\n"
+            f"        answer = letter\n"
+            f"ReturnAnswer(answer)\n"
+        )
+    if question_type in ("route_planning", "obj_appearance_order"):
         # 非信息性 stub：该两类合成 GT 也无真实语义（见模块 docstring）
         letter = "ABCD"[_stable_seed(episode.qa_id + question_type, 4)]
         return f"{_STUB_BANNER}\nReturnAnswer(\"{letter}\")\n"
-    if question_type == "room_size":
+    if question_type == "room_size_estimation":
         return f"{_STUB_BANNER}\nReturnAnswer(str(round(room_size_m2(), 2)))\n"
-    if question_type == "object_size":
+    if question_type == "object_size_estimation":
         return (
             f"{_STUB_BANNER}\n"
             f'ReturnAnswer(str(round(object_size_longest_dim("{anchor_a}"), 2)))\n'
         )
-    if question_type in ("absolute_distance", "relative_distance"):
+    if question_type == "object_abs_distance":
         return (
             f"{_STUB_BANNER}\n"
             f'a = object_centroid("{anchor_a}")\n'

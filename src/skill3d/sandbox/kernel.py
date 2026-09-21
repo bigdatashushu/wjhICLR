@@ -19,6 +19,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from skill3d.schemas import ToolCall, ToolResult
+from skill3d.tools.contract import (
+    ArtifactUnavailableError,
+    ConfidenceGateError,
+    DomainValueError,
+    ToolContractError,
+)
 from skill3d.tools.registry import ToolRegistry
 from skill3d.tools.scene_handle import SceneHandle
 
@@ -65,9 +71,13 @@ class _Timeout:
 class CellResult:
     stdout_tail: str
     error: Optional[str] = None
-    error_code: Optional[str] = None  # timeout / violation_syntax / violation_runtime / violation_policy
+    # timeout / oom / violation_syntax / violation_runtime / violation_policy / tool_contract
+    error_code: Optional[str] = None
     answer: Optional[str] = None
     new_vars: list[str] = field(default_factory=list)
+    # D-3：命中契约违规后，ReturnAnswer 的答案不得采纳（上层据此 abstain）
+    answer_untrusted: bool = False
+    contract_violations: list[dict] = field(default_factory=list)
 
 
 class RestrictedNamespaceKernel:
@@ -100,6 +110,9 @@ class RestrictedNamespaceKernel:
         # M10 产物：ProgramExecutionTrace 的 calls/results（§5.4）
         self.tool_calls: list[ToolCall] = []
         self.tool_results: list[ToolResult] = []
+        # D-3：契约违规记录；一旦命中，ReturnAnswer 的答案不得采纳
+        self.contract_violations: list[ToolResult] = []
+        self.answer_untrusted: bool = False
 
         # tools 命名空间：tools.<name>(**args) → 经 REGISTRY.call_tool
         tools_ns = types.SimpleNamespace()
@@ -124,6 +137,22 @@ class RestrictedNamespaceKernel:
                 raise ValueError(f"禁止覆盖保留名: {k}")
             self._ns[k] = v
 
+    def _record_failed_call(self, name: str, call_args: dict, exc: ToolContractError,
+                            result: Optional[ToolResult] = None) -> None:
+        """契约违规也要进 calls/results（§5.4 审计可回放），再抛给 run_cell 归因。"""
+        if result is None:
+            result = ToolResult(
+                tool=name, args=call_args, value="null", source=self._mode,  # type: ignore[arg-type]
+                request_digest="", latency_ms=0.0,
+                error=f"{type(exc).__name__}: {exc}", error_code=exc.error_code,  # type: ignore[arg-type]
+                missing_artifacts=list(exc.missing),
+                available_artifacts=list(exc.available))
+            self.tool_calls.append(
+                ToolCall(tool=name, args=call_args, call_id=self._call_id_factory()))
+            self.tool_results.append(result)
+        self.contract_violations.append(result)
+        self.answer_untrusted = True
+
     def _make_tool_fn(self, name: str) -> Callable[..., Any]:
         """Tool 包装：位置/关键字传参均可（program 里 `euclidean_distance(a, b)` 与
         `euclidean_distance(point_a=a, point_b=b)` 等价）。"""
@@ -133,15 +162,48 @@ class RestrictedNamespaceKernel:
             bound = sig.bind(self._scene, *args, **kwargs)
             call_args = {k: v for k, v in bound.arguments.items()
                          if k not in ("handle", "scene")}
-            result = self._registry.call_tool(
-                name, call_args, self._scene, mode=self._mode,
-                mock_switch=self._mock_switch,
-            )
+            try:
+                result = self._registry.call_tool(
+                    name, call_args, self._scene, mode=self._mode,
+                    mock_switch=self._mock_switch,
+                )
+            except ToolContractError as exc:
+                # 执行期 fail-closed：产物缺失在调用实现前就抛（硬约束 23）
+                self._record_failed_call(name, call_args, exc)
+                raise
             # 记录到 ProgramExecutionTrace（§5.4）：调用与结果成对入库
             self.tool_calls.append(
                 ToolCall(tool=name, args=call_args, call_id=self._call_id_factory())
             )
             self.tool_results.append(result)
+            if result.error_code == "tool_contract":
+                # D-3/硬约束 23：产物缺失等契约违规 → 确定性异常，绝不静默返回假值
+                self._record_failed_call(name, call_args, ArtifactUnavailableError(
+                    name, result.missing_artifacts or ["(未标注)"],
+                    route=self._scene.route,
+                    available=result.available_artifacts,
+                    args=call_args), result=result)
+                raise ArtifactUnavailableError(
+                    name, result.missing_artifacts or ["(未标注)"],
+                    route=self._scene.route,
+                    available=result.available_artifacts,
+                    args=call_args)
+            if result.error_code == "confidence_gate":
+                exc = ConfidenceGateError(
+                    name, result.error or "局部质量门未过", route=self._scene.route,
+                    available=result.available_artifacts, args=call_args)
+                self._record_failed_call(name, call_args, exc, result=result)
+                raise exc
+            if result.error_code == "domain_value":
+                exc = DomainValueError(
+                    name, result.error or "域值错误", route=self._scene.route,
+                    available=result.available_artifacts, args=call_args)
+                self._record_failed_call(name, call_args, exc, result=result)
+                raise exc
+                self.answer_untrusted = True
+                raise DomainValueError(
+                    name, result.error or "域值错误", route=self._scene.route,
+                    available=result.available_artifacts, args=call_args)
             if result.error is not None:
                 raise RuntimeError(f"Tool {name} 执行失败: {result.error}")
             import json
@@ -156,7 +218,11 @@ class RestrictedNamespaceKernel:
 
     # ---- 执行 ----
     def run_cell(self, code: str) -> CellResult:
-        """执行一个 cell；捕获 stdout / 错误；答案经 ReturnAnswer 记录。"""
+        """执行一个 cell；捕获 stdout / 错误；答案经 ReturnAnswer 记录。
+
+        `ToolContractError` 家族（tool_contract / confidence_gate / domain_value）
+        由调用方归因：不静默吞掉，也不当作普通运行时错误（§4 M10，硬约束 23）。
+        """
         buf = io.StringIO()
         before = set(self._ns.keys())
         error: Optional[str] = None
@@ -168,6 +234,11 @@ class RestrictedNamespaceKernel:
             error, error_code = "cell 执行超时", "timeout"
         except SyntaxError:
             error, error_code = "语法错误", "violation_syntax"
+        except (ArtifactUnavailableError, ConfidenceGateError, DomainValueError) as exc:
+            # 契约违规一律记 tool_contract 桶（§5 FailureTaxonomy 已有该桶）
+            error = f"{type(exc).__name__}: {exc}"
+            error_code = "tool_contract"
+            self.answer_untrusted = True
         except Exception as exc:
             error, error_code = f"{type(exc).__name__}: {exc}", "violation_runtime"
         new_vars = sorted(set(self._ns.keys()) - before)
@@ -177,7 +248,29 @@ class RestrictedNamespaceKernel:
             error_code=error_code,
             answer=self.answer_slot.answer,
             new_vars=new_vars,
+            answer_untrusted=self.answer_untrusted,
+            contract_violations=[r.model_dump() for r in self.contract_violations],
         )
+
+    # ---- 状态重置（回灌重执行前必须重注入，§4 M6 字段 9）----
+    def reset_user_namespace(self) -> None:
+        """清空用户命名空间并重注入保留名（保留 Tool/帧/答案槽）。
+
+        回灌重生成后重执行前必须调用：per-episode 状态不得跨次执行泄漏
+        （SpatialClaw §E.3 先例）。
+        """
+        tools_ns = self._ns["tools"]
+        keep = ("frames", "scene", "tools", "show", "ReturnAnswer")
+        preserved = {k: self._ns[k] for k in keep if k in self._ns}
+        self._ns.clear()
+        self._ns.update(preserved)
+        for name in self._registry.names():
+            self._ns[name] = tools_ns.__dict__[name]
+        self.answer_slot.answer = None
+        self.tool_calls = []
+        self.tool_results = []
+        self.contract_violations = []
+        self.answer_untrusted = False
 
     def run_program(self, program_source: str) -> CellResult:
         return self.run_cell(program_source)

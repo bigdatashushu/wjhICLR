@@ -8,6 +8,7 @@ MR 容差 TODO_CALIBRATE。
 from __future__ import annotations
 
 import uuid
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -85,3 +86,78 @@ def run_metamorphic(kind: str, **kwargs) -> bool:
     if kind not in dispatch:
         raise ValueError(f"未知 MR 类型: {kind}")
     return bool(dispatch[kind](**kwargs))
+
+
+# ---------- 5 类 MR 的**变换侧**（变换 + 不变量配对，供 hypothesis 驱动）----------
+
+def random_rotation(rng: np.random.Generator) -> np.ndarray:
+    """均匀随机旋转（QR 分解法，行列式为 +1）。"""
+    a = rng.normal(size=(3, 3))
+    q, r = np.linalg.qr(a)
+    q = q @ np.diag(np.sign(np.diag(r)))
+    if np.linalg.det(q) < 0:
+        q[:, 0] = -q[:, 0]
+    return q
+
+
+def apply_rigid_transform(points: np.ndarray, rotation: np.ndarray,
+                          translation: np.ndarray) -> np.ndarray:
+    """刚体变换：`R @ p + t`（MR：成对距离、边长、夹角不变）。"""
+    p = np.asarray(points, dtype=float)
+    return p @ np.asarray(rotation, dtype=float).T + np.asarray(translation, dtype=float)
+
+
+def apply_viewpoint_change(c2w_list: np.ndarray, rotation: np.ndarray,
+                           translation: np.ndarray) -> np.ndarray:
+    """视角/世界系变换：对整条相机轨迹施加同一刚体变换 `T`。
+
+    MR 期望：场景内几何关系（相对距离/方向、计数、尺寸）不变 —— 因为这是
+    同一个物理场景换了一个世界坐标系，任何依赖绝对坐标的答案都应当不变。
+    """
+    c2w = np.asarray(c2w_list, dtype=float).copy()
+    t = np.eye(4)
+    t[:3, :3] = np.asarray(rotation, dtype=float)
+    t[:3, 3] = np.asarray(translation, dtype=float)
+    return np.stack([t @ m for m in c2w])
+
+
+def permute_objects(objects: Sequence, order: Sequence[int]) -> list:
+    """对象排列变换（MR：计数、类别集合、成对距离不变）。"""
+    return [objects[i] for i in order]
+
+
+def drop_frames(arrays: Sequence[np.ndarray], drop_idx: Sequence[int]) -> list[np.ndarray]:
+    """遮挡/缺帧变换：按索引删除帧（MR：保留帧的几何量与计数不变，或显式降级拒答）。"""
+    dropped = set(int(i) for i in drop_idx)
+    return [a for i, a in enumerate(arrays) if i not in dropped]
+
+
+def pairwise_distance_matrix(points: np.ndarray) -> np.ndarray:
+    """成对欧氏距离矩阵（刚体/视角变换的 MR 观测量）。"""
+    p = np.asarray(points, dtype=float)
+    return np.linalg.norm(p[:, None, :] - p[None, :, :], axis=-1)
+
+
+def invariant_holds(observed: float, expected: float,
+                    rel_tol: float = 1e-6, abs_tol: float = 1e-9) -> bool:
+    """MR 不变量判定的统一口径（相对+绝对容差；TODO_CALIBRATE）。"""
+    return abs(float(observed) - float(expected)) <= max(abs_tol,
+                                                         rel_tol * abs(float(expected)))
+
+
+def find_violating_transform(program_fn, transform_fn, invariant_fn, params,
+                             max_examples: int = 200) -> Optional[dict]:
+    """在给定参数空间内搜索首个违反 MR 的变换（CEGIS 的 verify 步骤，确定性枚举）。
+
+    `program_fn(params) -> 观测值`；`transform_fn(params) -> 被变换后的 params`；
+    `invariant_fn(params, transformed_params) -> (观测值, 期望值)`。
+    返回 `{"params": ..., "observed": ..., "expected": ...}` 或 None。
+    搜索顺序为参数列表顺序（确定性，可复现）。
+    """
+    for p in params[:max_examples]:
+        tp = transform_fn(p)
+        observed, expected = invariant_fn(p, tp)
+        if not invariant_holds(observed, expected):
+            return {"params": p, "transformed": tp,
+                    "observed": float(observed), "expected": float(expected)}
+    return None

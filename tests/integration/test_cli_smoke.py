@@ -73,7 +73,7 @@ def test_reconstruction_plan_only(tmp_path):
     """重建 CLI：--plan-only 按 scene 归并并列出作业表，不触发真实重建。"""
     frames_dir = tmp_path / "frames"
     frames_dir.mkdir()
-    se = syn.make_synthetic_episode("room_size", scene_name="cli-scene-1", qa_id="c-1",
+    se = syn.make_synthetic_episode("room_size_estimation", scene_name="cli-scene-1", qa_id="c-1",
                                     frame_size=(60, 80))
     frame_paths = []
     for i, px in enumerate(se.frames):
@@ -85,7 +85,7 @@ def test_reconstruction_plan_only(tmp_path):
         "qa_id": f"c-{k}", "scene_name": "cli-scene-1", "dataset": "scannet",
         "question_type": qt, "question": "q", "options": None, "ground_truth": "1.0",
         "split": "induction", "frame_paths": frame_paths,
-    }) for k, qt in enumerate(["room_size", "object_size"])) + "\n", encoding="utf-8")
+    }) for k, qt in enumerate(["room_size_estimation", "object_size_estimation"])) + "\n", encoding="utf-8")
 
     r = _run("skill3d.reconstruction.run", "--source", "jsonl", "--episodes-jsonl", str(jl),
              "--split", "induction", "--method", "vggt", "--plan-only",
@@ -105,7 +105,7 @@ def test_reconstruction_blocks_final_test(tmp_path):
 def test_optimize_loop_pauses_without_gpt6(tmp_path):
     """§8：GPT-6 未配置 → 候选暂停不 promote（退出码 3），且不写入 active 快照。"""
     spec = {
-        "skill_id": "sk-room-size", "semver": "1.0.0", "task_type": "room_size",
+        "skill_id": "sk-room-size", "semver": "1.0.0", "task_type": "room_size_estimation",
         "description": "房间面积：包围盒地面两轴乘积",
         "call_graph_template": "ReturnAnswer(str(round(room_size_m2(), 2)))",
         "requires_artifacts": ["objects"], "minimum_quality": 0.3,
