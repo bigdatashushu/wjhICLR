@@ -1,0 +1,86 @@
+{
+  "kind": "v6_tau_calibration_evidence",
+  "spec_section": "v6 10.6 最小 PoC 标定（起始证据，不是标定结论）",
+  "date": "2026-09-21",
+  "n_scenes": 3,
+  "thresholds_in_use": {
+    "tau_warp": 0.5,
+    "tau_cloud": 0.3,
+    "status": "[TODO_CALIBRATE] 起始参考值，未经标定"
+  },
+  "observed": [
+    {
+      "scene_name": "41069043",
+      "warp_inlier_ratio": 0.6680613106971879,
+      "warp_photometric_inlier_ratio": 0.44289334996178137,
+      "cloud_overlap_ratio": 0.551015,
+      "main_gate_passed": true,
+      "overall_quality": 0.9791666666666666,
+      "world_frame_status": "degraded",
+      "world_up": [
+        -0.1694394526975328,
+        -0.11009995758507754,
+        -0.9793713653202879
+      ],
+      "handedness": "right",
+      "n_frames": 32,
+      "diagnostic_warnings": [
+        "warp 配对覆盖率低：97/160 对被跳过（可比像素 < 64）→ warp 内点率只代表剩余配对（多为互视图重叠的那些），不能当作全序列证据（§10.5 诚实边界）",
+        "相邻帧旋转跳变中位数 43.3° 超阈（诊断告警，不计入主门；§10.2）"
+      ]
+    },
+    {
+      "scene_name": "42446049",
+      "warp_inlier_ratio": 0.8580080840327481,
+      "warp_photometric_inlier_ratio": 0.6140453632665671,
+      "cloud_overlap_ratio": 0.387885,
+      "main_gate_passed": true,
+      "overall_quality": 0.953125,
+      "world_frame_status": "degraded",
+      "world_up": [
+        -0.009377394491045962,
+        -0.08139837940793478,
+        -0.996637531052449
+      ],
+      "handedness": "right",
+      "n_frames": 32,
+      "diagnostic_warnings": [
+        "相邻帧旋转跳变中位数 35.1° 超阈（诊断告警，不计入主门；§10.2）"
+      ]
+    },
+    {
+      "scene_name": "42899461",
+      "warp_inlier_ratio": 0.44459187675771306,
+      "warp_photometric_inlier_ratio": 0.4343272496641047,
+      "cloud_overlap_ratio": 0.223855,
+      "main_gate_passed": false,
+      "overall_quality": 0.0,
+      "world_frame_status": "available",
+      "world_up": [
+        0.040386275107729054,
+        -0.8013197709849768,
+        -0.5968714881877899
+      ],
+      "handedness": "right",
+      "n_frames": 32,
+      "diagnostic_warnings": [
+        "warp_inlier_ratio=0.4446 < 阈值 0.5000 → 子项未过",
+        "cloud_overlap_ratio=0.2239 < 阈值 0.3000 → 子项未过",
+        "warp 配对覆盖率低：86/160 对被跳过（可比像素 < 64）→ warp 内点率只代表剩余配对（多为互视图重叠的那些），不能当作全序列证据（§10.5 诚实边界）",
+        "相邻帧旋转跳变中位数 49.7° 超阈（诊断告警，不计入主门；§10.2）"
+      ]
+    }
+  ],
+  "n_passed": 2,
+  "observations": [
+    "通过场景 warp in {0.668,0.858}、overlap in {0.551,0.388}；未通过场景 warp=0.445、overlap=0.224",
+    "未通过场景在两个子指标上同时低于阈值（不是临界单指标失败）→ 门判读自洽",
+    "未通过场景旋转跳变 49.7 度（通过场景 43.3 度）→ 与手持拍摄不稳的直觉一致",
+    "world_frame 普遍 degraded（相机俯仰抖动），已在 7.2 口径下容忍 degraded"
+  ],
+  "honest_limits": [
+    "n=3，远不足以标定阈值；10.6 要求 1 个好 episode + 抽稀/跨场景帧/运动模糊三种注入退化",
+    "本文件不得用于任何阈值结论或论文主表；只作为标定流程的起始数据点",
+    "未跑 MoGe-2 PoC；metric_scale 恒 None"
+  ]
+}

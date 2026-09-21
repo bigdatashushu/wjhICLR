@@ -1,0 +1,101 @@
+{
+  "kind": "v6_real_gpu_smoke_receipt",
+  "spec_section": "v6 §23.1 Phase 1 DoD（M4 主门 + 世界系契约，真实 GPU）",
+  "date": "2026-09-21",
+  "environment": {
+    "gpus": "8×RTX 4090 24GiB（本次用 CUDA_VISIBLE_DEVICES=3，与 vLLM 分卡）",
+    "env": "conda skill3d-exp（冻结）",
+    "vggt_checkpoint": "/home/cvailab/.cache/huggingface/geothinker/VGGT-1B",
+    "offline": "HF_HUB_OFFLINE=1"
+  },
+  "episode": {
+    "split": "inner_validation",
+    "scene": "41069043",
+    "dataset": "arkitscenes",
+    "frame_set_hash": "02599dcb092c"
+  },
+  "m3_reconstruction": {
+    "schema_version": "6.0",
+    "quality_metric_version": "v6-warp-overlap-no-g5",
+    "recon_method": "vggt",
+    "quality_status": "computed",
+    "overall_quality": 0.9791666666666666
+  },
+  "m4_main_gate": {
+    "warp_inlier_ratio": 0.6680613106971879,
+    "warp_photometric_inlier_ratio": 0.44289334996178137,
+    "cloud_overlap_ratio": 0.551015,
+    "thresholds": {
+      "warp_inlier_ratio": 0.5,
+      "cloud_overlap_ratio": 0.3
+    },
+    "main_gate_passed": true,
+    "scene_route": "full_3d",
+    "diagnostic_warnings": [
+      "warp 配对覆盖率低：97/160 对被跳过（可比像素 < 64）",
+      "相邻帧旋转跳变中位数 43.3° 超阈（诊断告警，不计入主门）"
+    ]
+  },
+  "world_frame_contract": {
+    "world_frame_status": "degraded",
+    "world_up": [
+      -0.1694,
+      -0.1101,
+      -0.9794
+    ],
+    "handedness": "right"
+  },
+  "metric_fusion": {
+    "scale_fusion_status": "not_run",
+    "metric_scale": null,
+    "metric_model": "none",
+    "note": "MoGe-2 PoC 未跑（§11 全部 [待实验]）；默认不融合，禁止冒充"
+  },
+  "evidence_profile": {
+    "geometry_3d": "degraded",
+    "world_frame": "degraded",
+    "metric_scale": "unavailable",
+    "object_detection": "available",
+    "track_consensus": "available",
+    "temporal": "available",
+    "image_2d": "available",
+    "object_grounding": "available"
+  },
+  "tool_face_by_question": {
+    "object_counting": {
+      "scope": "full_3d",
+      "n_tools": 11
+    },
+    "object_rel_direction": {
+      "scope": "full_3d",
+      "n_tools": 11
+    },
+    "object_abs_distance": {
+      "scope": "full_3d",
+      "n_tools": 11,
+      "gate_missing": [
+        "scale_fusion_success",
+        "scale_self_consistency_ok"
+      ],
+      "note": "米制 Tool 收回，非米制 3D Tool 全保留（D3/D4）"
+    }
+  },
+  "checks": {
+    "schema_6_0_and_recon_method_vggt": true,
+    "g5_permanently_not_available_no_proxy": true,
+    "old_v5_fields_absent": true,
+    "m4_main_gate_cross_checked_two_metrics": true,
+    "world_up_unit_vector_and_handedness_recorded": true,
+    "metric_scale_none_before_poc": true,
+    "metric_gate_blocks_metric_tools_only": true,
+    "mca_tasks_keep_full_3d_tool_face": true
+  },
+  "not_claimed": [
+    "单 episode 只证明链路可跑，不是精度结论，不进论文主表",
+    "度量尺度融合（MoGe-2）未跑：metric_scale=None，C1–C6 六项验收全部未通过",
+    "track 共识计数效果、程序路径赢直答均为 [待实验]，本回执不作任何效果声明",
+    "world_frame/geometry_3d 实测为 degraded —— 这是真实数据的事实，不是缺陷结论",
+    "M8 多模态合成未在本回执内运行（无 vLLM 服务）；M4/M3 证据链已在真实数据上跑通"
+  ],
+  "passed": true
+}
