@@ -13,6 +13,19 @@ v6 三条纪律：
    只隐藏米制 Tool，`list_objects` / `object_centroid` / `relative_direction_of`
    照常可用。
 
+**`tolerates_degraded` 的口径（2026-09-21 真实 GPU 实测修正）**：
+
+除了 `metric_scale`（D3 硬契约：米制 Tool 只在 gate 通过 =
+`metric_scale==available` 时可用），其余能力的 `degraded` 一律**容忍**，
+工具照常暴露但答案带 `evidence_degraded:<能力>` 标记。理由是真实数据给的教训：
+本机真实 VGGT corpus（scene 41069043）实测 `warp_inlier=0.668` / `cloud_overlap=0.551`
+→ 主门**通过**，但因为"相邻帧旋转跳变 43.3°"这条**诊断告警**，`geometry_3d`
+被判 `degraded`；若不容忍，整个 3D Tool 面（含方向题唯一可用的
+`relative_direction_of`）会被一起隐藏 —— 这与 §6.2"主门告警未崩 → 仍走 full_3d"
+和 §2.3"4 个 MCA 题型不受度量路线影响"直接冲突。
+
+`degraded` 的语义是"能用但有告警"，不是"不能用"；`unavailable` 才是收回工具的信号。
+
 域值错误（负距离 / 点在相机后方 / 对象不存在 / 单位错）统一抛
 `DomainValueError`，进 `ProgramExecutionTrace.error_code="domain_value"`。
 """
@@ -139,6 +152,7 @@ def _degraded_property(distance_result, *, metric_ok: bool) -> list[str]:
         source_default="real",
         requires_artifacts=["objects"],
         requires_evidence=[EV_DETECTION],
+        tolerates_degraded=[EV_DETECTION],
     )
 )
 def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
@@ -177,7 +191,7 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
         requires_artifacts=["objects"],
         requires_evidence=[EV_DETECTION, EV_TRACK],
         # §9.2：track_consensus 降级仍可计数，但答案必须带 evidence_degraded 标记
-        tolerates_degraded=[EV_TRACK],
+        tolerates_degraded=[EV_DETECTION, EV_TRACK],
     )
 )
 def count_objects(handle: SceneHandle, category_name: str) -> dict:
@@ -230,6 +244,7 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
         requires_artifacts=["objects"],
         # §7.3 示例 B：metric_scale 失败时 object_centroid（相对坐标）仍必须可用
         requires_evidence=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
     )
 )
 def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
@@ -350,6 +365,7 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
         source_default="real",
         requires_artifacts=["point_cloud", "objects"],
         requires_evidence=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
     )
 )
 def robust_distance(handle: SceneHandle, reference: str, target: str) -> dict:
@@ -428,6 +444,7 @@ def camera_object_distance(handle: SceneHandle, obj_id: str) -> dict:
         source_default="real",
         requires_artifacts=["point_cloud", "objects"],
         requires_evidence=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
     )
 )
 def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
@@ -473,6 +490,9 @@ def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str
         source_default="real",
         requires_artifacts=["objects"],
         requires_evidence=[EV_GEOMETRY, EV_WORLD, EV_DETECTION, EV_GROUNDING],
+        # §9.8：world_up 为 degraded 时仍给出方向（带 evidence_degraded 标记）——
+        # 真实数据上 pose-only 的 up 一致性很难稳定 ≥0.9，不容忍会让方向题直接不可答
+        tolerates_degraded=[EV_GEOMETRY, EV_WORLD, EV_DETECTION, EV_GROUNDING],
     )
 )
 def relative_direction_of(handle: SceneHandle, observer_id: str,
@@ -519,6 +539,7 @@ def relative_direction_of(handle: SceneHandle, observer_id: str,
         source_default="real",
         requires_artifacts=["objects"],
         requires_evidence=[EV_TEMPORAL, EV_DETECTION, EV_GROUNDING],
+        tolerates_degraded=[EV_DETECTION, EV_GROUNDING],
     )
 )
 def object_visible_frames(handle: SceneHandle, obj_id: str) -> list[int]:
@@ -538,6 +559,7 @@ def object_visible_frames(handle: SceneHandle, obj_id: str) -> list[int]:
         source_default="real",
         requires_artifacts=["point_cloud", "objects"],
         requires_evidence=[EV_GEOMETRY, EV_WORLD, EV_DETECTION],
+        tolerates_degraded=[EV_GEOMETRY, EV_WORLD, EV_DETECTION],
     )
 )
 def connectivity_graph(handle: SceneHandle) -> dict:
@@ -569,6 +591,7 @@ def connectivity_graph(handle: SceneHandle) -> dict:
         # 返回 False 当且仅当 objects 可用且真无此实例
         requires_artifacts=["objects"],
         requires_evidence=[EV_DETECTION],
+        tolerates_degraded=[EV_DETECTION],
     )
 )
 def exists_in_scene(handle: SceneHandle, name: str) -> bool:
@@ -592,6 +615,7 @@ def exists_in_scene(handle: SceneHandle, name: str) -> bool:
         source_default="real",
         requires_artifacts=["poses", "intrinsics"],
         requires_evidence=[EV_GEOMETRY],
+        tolerates_degraded=[EV_GEOMETRY],
     )
 )
 def reproject(handle: SceneHandle, p3d: list[float], frame_idx: int) -> list[float]:

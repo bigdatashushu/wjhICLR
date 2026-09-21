@@ -487,3 +487,56 @@ def test_registry_docs_tracks_evidence_and_scope():
     names_2d = REGISTRY.names_for_scope(SCOPE_FALLBACK_2D_ONLY, evidence_profile=full)
     assert "list_objects" not in names_2d
     assert "euclidean_distance" in names_2d
+
+
+# ------------------------------- 9. degraded 容忍口径（真实 GPU 实测修正）----
+
+def test_geometry_degraded_keeps_3d_tools_but_metric_degraded_does_not():
+    """真实 corpus 实测口径：`degraded` 是"能用但有告警"，不是"不能用"。
+
+    背景（本机真实 VGGT 数据，scene 41069043）：`warp_inlier=0.668` /
+    `cloud_overlap=0.551` → M4 主门**通过**，但因"相邻帧旋转跳变 43.3°"这条
+    **诊断告警**，`geometry_3d` 被判 `degraded`。若不容忍 degraded，
+    `relative_direction_of`（方向题唯一可用原语）会被一起隐藏，与 §6.2
+    "主门告警未崩 → 仍走 full_3d" 冲突。
+
+    但 `metric_scale` 例外：D3 硬契约要求米制 Tool 只在 gate 通过
+    （= `metric_scale == "available"`）时可用，`degraded` 也不放行。
+    """
+    import skill3d.tools  # noqa: F401 - 触发注册
+
+    from skill3d.tools.registry import REGISTRY
+
+    degraded_geo = EvidenceProfile(
+        geometry_3d="degraded", world_frame="degraded", metric_scale="available",
+        object_detection="available", track_consensus="available",
+        object_grounding="available")
+    names = REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=degraded_geo)
+    assert "relative_direction_of" in names     # 方向题必须仍然可用
+    assert "object_centroid" in names
+    assert "connectivity_graph" in names
+
+    # metric_scale 降级 → 米制 Tool 一律收回（D3）
+    degraded_metric = EvidenceProfile(
+        geometry_3d="available", world_frame="available", metric_scale="degraded",
+        object_detection="available", track_consensus="available",
+        object_grounding="available")
+    names2 = REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED,
+                                      evidence_profile=degraded_metric)
+    for metric_tool in ("camera_object_distance", "object_3d_extent",
+                        "plane_fit_room_size"):
+        assert metric_tool not in names2, metric_tool
+    # 非米制 3D Tool 不受影响（§7.2 单项失败只收回依赖它的）
+    assert "object_centroid" in names2 and "relative_direction_of" in names2
+
+
+def test_metric_tools_never_tolerate_degraded_metric_scale():
+    """D3 硬契约：任何 requires `metric_scale` 的 Tool 都不得声明容忍它。"""
+    import skill3d.tools  # noqa: F401
+
+    from skill3d.tools.registry import REGISTRY
+
+    for name in REGISTRY.names():
+        spec = REGISTRY.spec(name)
+        if EVIDENCE_METRIC_SCALE in (spec.requires_evidence or []):
+            assert EVIDENCE_METRIC_SCALE not in (spec.tolerates_degraded or []), name
