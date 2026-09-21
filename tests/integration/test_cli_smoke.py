@@ -38,19 +38,32 @@ def test_help_available(module):
 
 
 def test_online_eval_writes_traces(tmp_path):
-    """在线评测 CLI 端到端：退出码 0，EvaluationRun 与 trace 落盘。"""
+    """在线评测 CLI 端到端：退出码 0，EvaluationRun 与 trace 落盘（v6 语义）。"""
     trace_dir = tmp_path / "traces"
     r = _run("skill3d.online.eval", "--split", "inner_validation", "--source", "synthetic",
              "--mode", "mock_light", "--limit", "2", "--deterministic-replay",
-             "--trace-dir", str(trace_dir), "--seed", "0")
+             "--trace-dir", str(trace_dir), "--seed", "0",
+             # 记忆与 RunManifest 也落在 tmp，避免污染仓库工作目录
+             "--memory-dir", str(tmp_path / "mem"),
+             "--run-manifest", str(tmp_path / "run_manifest.json"))
     assert r.returncode == 0, r.stderr
     assert "EvaluationRun" in r.stdout
-    for topic in ("episode_trace", "evaluation_run", "online_run"):
+    for topic in ("episode_trace", "evaluation_run", "online_run", "trace_record"):
         p = trace_dir / f"{topic}.jsonl"
         assert p.is_file() and p.read_text(encoding="utf-8").strip(), topic
     rec = json.loads((trace_dir / "online_run.jsonl").read_text(encoding="utf-8").splitlines()[0])
     assert rec["mode"] == "mock_light"
     assert "不构成任何精度结论" in rec["note"]
+    # §19.3：mock 路径的 program 来源显式标 mock_stub（v5 的 deterministic_stub 已废止）
+    assert "mock_stub" in r.stdout
+    trec = json.loads((trace_dir / "trace_record.jsonl").read_text(
+        encoding="utf-8").splitlines()[0])
+    assert trec["synthesis_source"] == "mock_stub"
+    # §6.2：route 由真算的 M4 主门给出（合成 bundle 必须真的过门，不得绕过）
+    assert trec["scene_route"] == "full_3d"
+    assert trec["evidence_profile"]["geometry_3d"] == "available"
+    # RunManifest 落在指定路径（§19.2）
+    assert (tmp_path / "run_manifest.json").is_file()
 
 
 def test_online_eval_blocks_final_test_without_flag(tmp_path):
@@ -102,15 +115,21 @@ def test_reconstruction_blocks_final_test(tmp_path):
     assert "硬约束 9" in r.stderr
 
 
-def test_optimize_loop_pauses_without_gpt6(tmp_path):
-    """§8：GPT-6 未配置 → 候选暂停不 promote（退出码 3），且不写入 active 快照。"""
+def test_optimize_loop_pauses_without_offline_model(tmp_path):
+    """§3.4：离线强模型（DeepSeek-V4.1-Flash）不可用 → 候选暂停不 promote（退出码 3），
+    且不写入 active 快照。密钥未注入 → 记 `offline_auth_error`（不重试、不降级为 mock）。"""
     spec = {
-        "skill_id": "sk-room-size", "semver": "1.0.0", "task_type": "room_size_estimation",
-        "description": "房间面积：包围盒地面两轴乘积",
-        "call_graph_template": "ReturnAnswer(str(round(room_size_m2(), 2)))",
-        "requires_artifacts": ["objects"], "minimum_quality": 0.3,
-        "supported_coordinate_frames": ["world"], "metric_scale_required": True,
-        "validation_assertions": ["area > 0"],
+        "skill_id": "sk-room-size", "version": "1.0.0",
+        "applicable_question_types": ["room_size_estimation"],
+        # v6 §5.8：米制 Skill 必须声明证据签名 + gate 版本（双重 fail-closed）
+        "required_evidence_signature": {"metric_scale": "available"},
+        "requires_metric_evidence": True,
+        "applicable_gate_version": "metric-evidence-gate-v6",
+        "skill_family": "metric", "source": "real",
+        "description": "房间面积：平面拟合的地面两轴乘积",
+        "call_graph_template": ("area = plane_fit_room_size()\n"
+                                "ReturnAnswer(str(round(area['room_area_m2'], 2)))"),
+        "validation_assertions": ["area['room_area_m2'] > 0"],
     }
     spec_file = tmp_path / "skill.json"
     spec_file.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
@@ -121,7 +140,8 @@ def test_optimize_loop_pauses_without_gpt6(tmp_path):
              "--seed", "0", "--skill-store", str(store),
              "--trace-dir", str(tmp_path / "traces"))
     assert r.returncode == 3, (r.stdout, r.stderr)
-    assert "GPT-6 不可用" in r.stderr
+    assert "离线强模型不可用" in r.stderr
+    assert "offline_auth_error" in r.stderr      # §3.4 结局码可审计（非"模型答得不好"）
     assert "准入必须 real" in r.stdout
     # 未 promote：没有任何 active 指针写入（硬约束 12）
     assert not (store / "active_snapshot.json").exists()

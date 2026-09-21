@@ -1,446 +1,416 @@
-"""§5.2 重建 Schema。"""
+"""§5.2/§5.3/§5.6 重建 / 场景 / 对象 Schema（harness3D v6.0）。
+
+v6 与 v5 的三处硬性差异（都是"规格要求"，不是实现选择）：
+
+1. **米制路线整体替换**（D1/D2，§11）：多锚点 + log-scale 融合 + conformal 校准池
+   全部废止 → artifact 不再有 `scale_anchor_fired / scale_ci_rel / scale_calibration_id /
+   allowed_metric_tasks / scale_confidence` 等字段；取而代之的是
+   `metric_scale / scale_self_consistency / per_frame_scale_ref / metric_model /
+   metric_fusion_version / scale_fusion_status`（零样本度量深度跨帧融合）。
+2. **世界系契约进 Schema**（D5，§7/§9）：`world_up` + `handedness` +
+   `world_frame_status`；缺失时方向/路线类 Tool fail-closed（不猜）。
+3. **scene_route × question_tool_scope 解耦**（D4，§5.3/§6.2）：`route` 一词三义废止。
+   `scene_route` 只由 M4 质量决定；`question_tool_scope` 逐题派生，只收窄不新增。
+
+`ReconstructionArtifact` 只接受 `schema_version="6.0"`；v5 及更早的尺度/G8/BA 字段
+一律 hard fail（见 `LEGACY_ONLY_FIELDS`），旧产物只能经 `skill3d.legacy.readers`
+只读审计，要进运行时/统计必须重跑 v6 pipeline。
+"""
 
 from typing import Any, Literal, Optional
 
+import numpy as np
 from pydantic import Field, field_validator, model_validator
 
 from . import Spec
+from .evidence import (
+    EvidenceProfile,
+    MetricEvidenceGateResult,
+    metric_scale_state_from_gate,
+)
 
-# v4 HC33：需要米制尺度的题型集合（逐题型授权的词汇表，单一事实源）
+# 需要米制尺度的题型集合（逐题型授权的词汇表，单一事实源）
 METRIC_TASK_TYPES: tuple[str, ...] = (
     "object_abs_distance", "object_size_estimation", "room_size_estimation")
 
+# v6 §5.2：质量指标版本标识（G5 永久 not_available、G8 退役、主门=warp+重叠）
+QUALITY_METRIC_VERSION: str = "v6-warp-overlap-no-g5"
 
-def _ci_inconsistency_reason(data: dict) -> str:
-    """HC29 不变量检查：返回非空字符串 = 不自洽（原因），空串 = 通过。
-
-    与 `reconstruction.scale_units` 共用同一口径判定（不重复一份阈值逻辑）；
-    此处只做"能不能由同一公式互推"的检查，不做业务降级。
-    """
-    from skill3d.reconstruction.scale_units import check_ci_rel, ci_abs_m
-
-    s, r, a = data.get("metric_scale"), data.get("scale_ci_rel"), data.get("scale_ci_abs_m")
-    if s is None and r is None and a is None:
-        return ""
-    if r is None and a is None:
-        # v5 HC30：有点估计但**没有可用区间**（缺冻结校准器 / 融合不可用）
-        # → 不可准入：无区间就不能声称经验覆盖，逐题授权必须收回。
-        return ("v5 口径 CI 缺失（有 metric_scale 但无 scale_ci_rel/abs_m：未标定或"
-                "无可用区间）→ 不可用于准入（硬约束 29/30）")
-    if s is None or r is None or a is None:
-        return f"scale/ci_rel/ci_abs 必须同时提供（收到 {s}, {r}, {a}）"
-    chk = check_ci_rel(r, confidence_level=data.get("scale_confidence_level"))
-    if not chk.ok:
-        return chk.as_note()
-    expected = ci_abs_m(float(s), float(r))
-    if expected is None:
-        return f"ci_abs 无法由 scale={s} × ci_rel={r} 导出"
-    if abs(float(a) - expected) > 1e-6 * max(abs(expected), 1e-12):
-        return f"ci_abs_m={a} ≠ scale×ci_rel={expected}（硬约束 29）"
-    return ""
+# scene_route（只由 M4 质量决定）
+SceneRoute = Literal["full_3d", "fallback_2d_only", "unanswerable"]
+# question_tool_scope（逐题派生收窄）
+QuestionToolScope = Literal["full_3d", "metric_enabled", "fallback_2d_only"]
+# 答案来源（D9）
+AnswerSource = Literal["tool_program", "direct_vlm_routed", "abstain", "tool_contract"]
 
 
-def _hc30_confidence_reason(data: dict) -> str:
-    """HC30 数据层兜底：`medium/high` 必须由冻结校准器支撑，且授权不得超纲。
-
-    两条规则（都 fail-closed 到 `low`）：
-
-    1. `scale_confidence ∈ {medium, high}` 但 `scale_calibration_id` 为空 →
-       未标定不得提升置信度（"不得靠常量或放宽门槛提升"）；
-    2. `allowed_metric_tasks` 超出该置信档的预授权集合（例如 `medium` 却授权
-       `object_abs_distance`，或 `high` 但 `ci_rel` 非有限）→ 越权授权。
-
-    这堵住了"任何绕过 `assess_scale` 直接构造 artifact 的路径"：即使未来有新的
-    生产者忘了走 v4 评估，也写不进一个未标定的 medium/high。
-    """
-    from skill3d.reconstruction.scale_units import pre_authorized_metric_tasks
-
-    conf = str(data.get("scale_confidence", "low") or "low")
-    if conf == "low":
-        return ""
-    if not data.get("scale_calibration_id"):
-        return (f"scale_confidence={conf} 但无 scale_calibration_id"
-                "（HC30：未标定一律 low）")
-    allowed = {str(t) for t in (data.get("allowed_metric_tasks") or set())}
-    if not allowed:
-        return ""
-    pre = pre_authorized_metric_tasks(conf, data.get("scale_ci_rel"),
-                                      tuple(sorted(allowed)))
-    over = allowed - pre
-    if over:
-        return (f"allowed_metric_tasks 越权授权 {sorted(over)}"
-                f"（confidence={conf}, ci_rel={data.get('scale_ci_rel')}；HC33）")
-    return ""
-
-
-class ConfidenceMap(Spec):
-    per_point_confidence: str  # 指向数组文件 ref
-    coverage_count_per_frame: str
-
-
-# v5 HC38：G8 已**永久退役**——当前 Schema 不声明 `g8_bbox_coverage_min`、
-# 不声明 `CoverageMap`，也不存在任何替代的几何覆盖门。旧字段只能由
-# `skill3d.legacy.readers` 读取为 `LegacyArtifact`（只读审计，不入准入/路由/统计）。
-LEGACY_ONLY_FIELDS: tuple[str, ...] = (
-    "scale_ci",              # 旧绝对 CI 半宽（旧公式）
-    "relative_ci",           # 旧未注明置信水平的相对 CI
-    "g8_bbox_coverage_min",  # 已退役的 G8
-    "bbox_coverage_ratio",   # 旧 CoverageMap 内部字段
-    "CoverageMap",
-)
-
+# ---------------------------------------------------------------------------
+# §5.2 质量指标（v6：M4 无真值质量门，D11）
+# ---------------------------------------------------------------------------
 
 class QualityMetrics(Spec):
-    """G1–G11 重建/输入质量指标（附录 A；阈值全部 TODO_CALIBRATE）。
+    """M4 质量指标（§10；阈值全部 `[TODO_CALIBRATE]`）。
 
-    v5 活动指标集合 = G1–G4、G6、G7、G9–G11，**外加条件项 G5**：
-    G5 只在 `ReconstructionArtifact.reprojection_status == "computed"` 时为有限值，
-    否则必须为 `None`（v5 HC37：正式 `vggt` 主线无真 BA → `not_available`）。
-    G8 已永久退役，本 Schema 不含该字段（HC38）。
+    v6 结构（D11）：
+
+    - **主门**（§10.1）= 跨视图 warp 内点率 **且** 分组点云重叠率，两者都过才
+      `main_gate_passed=True`。**多指标不得单挑**（SysCON3D 依据：前馈 backbone
+      会幻觉跨视图一致性）；
+    - **诊断**（§10.2）：track 重投影残差、相邻帧旋转平滑 —— 只产告警，不决定主门；
+    - **conf-warp 单调自检**（§10.3）：VGGT conf 分桶 vs warp 差中位数应单调，
+      不单调则降权；conf **只作软权重，不作硬门**；
+    - **G5 永久 not_available**（§10.4）：本 Schema **不声明** G5 字段，
+      它俩在 `ReconstructionArtifact` 上固定为 `None`；**严禁**用
+      `depth_conf/point_conf`/点云密度冒充 BA 重投影残差；
+    - **G8 永久退役**：本 Schema 不声明该字段，出现即 hard fail。
     """
 
+    # ---- 主门（§10.1 交叉双指标）----
+    warp_inlier_ratio: float              # 跨视图 warp 相对深度差内点率
+    warp_photometric_inlier_ratio: float  # 跨视图 warp 光度内点率
+    cloud_overlap_ratio: float            # 前 16 vs 后 16 帧分组点云双向重叠率
+    main_gate_passed: bool
+    # 主门用的阈值快照（trace 可审计："这个 pass 是按哪版阈值判的"）
+    gate_thresholds: dict[str, float] = {}
+    # ---- 诊断（§10.2，只产告警）----
     g1_blur_ok: float
     g2_brightness: float
     g3_motion_blur: float
     g4_frame_count: int
-    # v5 HC37：G5 是**可选**指标；`None` = 未计算（从 overall_quality 分母排除，
-    # 不得补 1.0/历史值/代理值）。有限值仅允许伴随 reprojection_status="computed"。
-    g5_reproj_err_median: Optional[float] = None
-    g5_reproj_err_p95: Optional[float] = None
     g6_depth_var_coeff: float
     g7_dynamic_ratio: float
     g9_tracker_consistency: float
     g10_baseline_quality: float
-    g11_scale_ci: float
+    track_reproj_residual_median: Optional[float] = None
+    rotation_smoothness: Optional[float] = None
+    diagnostic_warnings: list[str] = []
+    # ---- conf-warp 单调自检（§10.3）----
+    conf_warp_monotonic: Optional[bool] = None
+    conf_warp_spearman: Optional[float] = None
+    # ---- 聚合（仅用于路由/报告；== NaN 时路由必须 fail-closed）----
     overall_quality: float
 
     @model_validator(mode="before")
     @classmethod
-    def _reject_retired_g8(cls, data: Any) -> Any:
-        """G8 字段一旦出现即 fail-closed（HC38：不计算、不序列化、不门控）。
-
-        不做"读进来忽略掉"的静默兼容——静默接受会让旧 golden/旧 artifact 被当成
-        当前口径的产物混入统计。旧数据请走 `skill3d.legacy.readers`。
-        """
-        if isinstance(data, dict) and "g8_bbox_coverage_min" in data:
-            raise ValueError(
-                "QualityMetrics 不再声明 g8_bbox_coverage_min（v5 HC38：G8 永久退役）。"
-                "旧产物请用 skill3d.legacy.readers 只读解析，并从原始帧重跑 v5 pipeline。")
+    def _reject_retired_metrics(cls, data: Any) -> Any:
+        """G5 / G8 字段一旦出现即 fail-closed（§10.4：禁止代理值冒充）。"""
+        if isinstance(data, dict):
+            for banned in ("g5_reproj_err_median", "g5_reproj_err_p95",
+                           "g8_bbox_coverage_min", "g11_scale_ci"):
+                if banned in data:
+                    raise ValueError(
+                        f"QualityMetrics 不再声明 {banned}（v6 §10.4/§20："
+                        "G5 永久 not_available、G8 永久退役、G11 随尺度路线废止）。"
+                        "严禁用 depth_conf/point_conf 或其他代理值冒充。")
         return data
 
 
-class ImageGridTransform(Spec):
-    """§9 坐标层：`original 像素 → VGGT-depth-grid` 的仿射映射（v4/A-8 新增）。
-
-    **为什么必须显式记录**：BA route 的硬前提是正方形输入（官方 `track_predict`
-    断言 `height == width`），官方预处理是**中心 pad 到正方形再缩放**
-    （`load_and_preprocess_images_square`）。pad 让映射不再是纯缩放，而是
-    `dst = (src + pad_offset) × scale`；若下游仍按"纯缩放"处理 mask，
-    mask 与深度网格会错位最多约 `pad_offset` 个像素（C-7 类缺陷）。
-    故把映射当**数据**落进 artifact，M5 按它做最近邻重采样。
-
-    feed-forward 主线（非正方形、无 pad）写 `padded_to_square=False` 的纯缩放映射，
-    行为与 v3 完全一致（老 artifact 缺该字段时按纯缩放回退）。
-    """
-
-    source_hw: list[int]          # 原始帧 (H, W)，如 [480, 640]
-    grid_hw: list[int]            # 深度/点图网格 (H, W)，如 [518, 518]
-    pad_side: int = 0             # 中心 pad 后的正方形边长（原图像素）
-    pad_offset_xy: list[int] = [0, 0]
-    scale_x: float = 1.0
-    scale_y: float = 1.0
-    padded_to_square: bool = False
-    method: str = "resize"        # resize | center_pad_then_resize
+class ConfidenceMap(Spec):
+    per_point_confidence: str  # 指向数组文件 ref
+    coverage_count_per_frame: str = ""
 
 
-class ScaleAnchorEvidence(Spec):
-    """单个尺度锚点的证据（§4.1 v4；硬约束 31）。
+# ---------------------------------------------------------------------------
+# §5.2 重建产物
+# ---------------------------------------------------------------------------
 
-    每个锚点必须保存：来源、尺度估计、不确定性、残差、是否被接受、拒收原因码、
-    参与帧。物体尺寸先验一律 `[TODO_CALIBRATE]`，**不得**当无误差真值。
-    """
-
-    anchor_type: Literal["camera_height_floor", "door", "table", "chair", "other"]
-    scale_estimate: float          # 该锚点单独给出的尺度（m / rel-unit）
-    ci_rel: float                  # 该锚点的相对不确定度（半宽分数，HC29 口径）
-    residual: float                # log 尺度空间中到融合解的距离
-    accepted: bool                 # 是否进入最终融合
-    reason_code: str               # ok / outlier / conflict / geometry_gate / low_weight …
-    source_frame_ids: list[int] = []
-    # 原始可读证据（审计/论文用；不参与任何判定）
-    anchor_name: str = ""
-    measured: Optional[float] = None
-    prior_m: Optional[float] = None
-    weight: float = 0.0
-    note: str = ""
+# v6 §5.2/§20：当前 Schema **不接受**的历史字段（出现即 hard fail）。
+# 分三类：v5 多锚点+conformal 尺度路线、v5 BA 路线、v5 已退役质量指标。
+LEGACY_ONLY_FIELDS: tuple[str, ...] = (
+    # ---- v5 尺度路线（多锚点 + 冻结 conformal 校准池；§20 整体废止）----
+    "scale_known",
+    "scale_ci_rel",
+    "scale_ci_abs_m",
+    "scale_confidence",
+    "scale_confidence_level",
+    "scale_anchor_fired",
+    "scale_conflict",
+    "scale_calibration_id",
+    "scale_calibration_dataset",
+    "scale_dataset_match",
+    "scale_empirical_coverage",
+    "scale_nominal_coverage",
+    "allowed_metric_tasks",
+    "scale_method",
+    "scale_source",
+    # ---- v5 更早的尺度字段 ----
+    "scale_ci",
+    "relative_ci",
+    # ---- v5 BA / sparse BA 路线（§20：BA 正式关闭）----
+    "sparse_ba_receipt_ref",
+    "reproj_errors",
+    # ---- v5 已退役质量指标 ----
+    "g8_bbox_coverage_min",
+    "bbox_coverage_ratio",
+    "CoverageMap",
+    # ---- v5 正方形 pad 映射（BA route 专用；BA 关闭后不存在该形态）----
+    "grid_transform",
+)
 
 
 class ReconstructionArtifact(Spec):
-    """重建产物 = 几何 ref + 帧集身份 + 尺度 + **质量单一事实源**（§4 M4 / 硬约束 22）。
+    """重建产物（§5.2）= 几何 ref + 帧集身份 + **世界系契约** + **度量尺度** + 质量。
 
-    `quality_status` 三态：`not_computed`（默认，保证旧数据反序列化兼容）/
-    `computed` / `failed`。`quality=None` 当且仅当状态非 `computed`。
-    route 判定必须 fail-closed：状态非 computed 或 quality 为 None 或
-    `overall_quality` 为 NaN/非有限值 → **不得**停在 `full_3d`。
+    v6 不变量（违反即实现错误）：
 
-    v5 版本纪律（HC39）：本 Schema 只接受 `schema_version="5.0"`；
-    `quality_metric_version` 固定活动指标集合；G5 由 `reprojection_status` 门控
-    （HC37：正式 `vggt` 主线无真 BA → `not_available` + G5=None，禁止代理值）；
-    旧尺度/G8 字段一律不接受（HC38/HC39）。
+    - `recon_method` **只允许** `vggt`（D11：BA 正式关闭；`vggt_sparse_ba` 与官方
+      VGGSfRM BA 均不进入生产路线）；
+    - G5 字段**固定为 `None` / `not_available`**，不进入 `overall_quality`；
+    - `world_up`/`handedness` 缺失或非法 → 方向/路线类 Tool 必须 fail-closed（§9.8/§9.10）；
+    - `metric_scale` 在度量融合 PoC 通过前保持 `None` + `scale_fusion_status="not_run"`；
+      **不得**用未标定值冒充。
     """
 
-    # ---- v5 版本字段（HC39：与历史数据版本隔离，不兼容混写）----
-    schema_version: Literal["5.0"] = "5.0"
-    quality_metric_version: Literal["v5-no-g8-g5-optional"] = "v5-no-g8-g5-optional"
+    # ---- 版本字段（§5.2；与历史数据版本隔离，不兼容混写）----
+    schema_version: Literal["6.0"] = "6.0"
+    quality_metric_version: Literal["v6-warp-overlap-no-g5"] = "v6-warp-overlap-no-g5"
     artifact_id: str
-    artifact_version: str  # 内容寻址哈希
+    artifact_version: str                 # 内容寻址哈希
     scene_name: str
-    recon_method: Literal["vggt", "vggt_sparse_ba", "dust3r_mast3r", "colmap"]
-    # ---- 帧集身份（统一 FrameSet，硬约束 21；M1 冻结后全链共用）----
+    recon_method: Literal["vggt"] = "vggt"
+
+    # ---- 帧集身份（统一 FrameSet；M1 冻结后全链共用）----
     frame_ids: list[int] = []
     source_frame_indices: list[int] = []
     timestamps: list[float] = []
     frame_set_hash: str = ""
-    # §9：原图→深度网格 的仿射映射（BA route 的正方形 pad 会改变它；缺省 = 纯缩放）
-    grid_transform: Optional[ImageGridTransform] = None
-    # ---- 几何产物 ref ----
-    c2w_list: str  # camera→world SE(3) 序列 ref（VGGT extrinsic 取逆，c2w[0]=I）
-    intrinsics: str
-    depth_maps: str
+
+    # ---- 几何产物 ref（VGGT 前馈）----
+    c2w_list: str                         # camera→world；世界系=首帧相机系，c2w[0]=I
+    intrinsics: str                       # K；VGGT 输出需对齐
+    depth_maps: str                       # 预处理分辨率（如 518×392）
     point_map: str
     point_conf: str
-    track_list: Optional[str]
-    # ---- 尺度（v4：统一口径 + 多锚点 + 经验校准；硬约束 29–33）----
-    metric_scale: Optional[float]
-    scale_known: bool
-    # v4 HC29：相对 CI **半宽分数**（[0,+∞)），指定 `scale_confidence_level` 下有效。
-    # 旧 `scale_ci`（绝对 m，旧公式）保留只读，**不得用于准入**（§10.2/§10.5）。
-    scale_ci_rel: Optional[float] = None
-    # v4 HC29：`= metric_scale * scale_ci_rel`（m）；与上式不自洽即 fail-closed 为 low
-    scale_ci_abs_m: Optional[float] = None
-    # 该 CI 对应的置信水平（如 0.90）；必须与冻结校准器一致
-    scale_confidence_level: Optional[float] = None
-    # v4 HC31：多锚点证据（来源/估计/不确定性/残差/接受状态）
-    scale_anchor_fired: list[ScaleAnchorEvidence] = []
-    # v4 HC31：锚点间尺度比超过冲突阈值 → 显式记录，且不得返回虚假的 medium
-    scale_conflict: bool = False
-    # v4 HC32：在线只加载冻结校准器；未标定时为 None → 置信度恒 low
-    scale_calibration_id: Optional[str] = None
-    # v5.1：校准器来源数据集 + 是否与被评测数据集同源（论文口径必须可审计）
-    scale_calibration_dataset: str = ""
-    scale_dataset_match: Optional[bool] = None
-    # v4 HC32/§7：名义 coverage 与经验 coverage 都要报
-    scale_empirical_coverage: Optional[float] = None
-    scale_nominal_coverage: Optional[float] = None
-    # v4 HC33：当前尺度评估**实际授权**的米制题型（逐题型授权，不是全局开关）
-    allowed_metric_tasks: set[str] = set()
-    # ---- 质量（唯一事实源，D-5 / 硬约束 22）----
+    depth_conf: str = ""                  # VGGT depth 头置信度（§10.3 软权重来源）
+    track_list: Optional[str] = None
+
+    # ---- 世界系契约（D5）----
+    world_up: Optional[list[float]] = None      # 单位 3 向量；M3 从相机位姿束估计
+    handedness: Optional[Literal["right", "left"]] = None
+    world_frame_status: Literal["available", "degraded", "unavailable"] = "unavailable"
+
+    # ---- 度量尺度融合（D1/D2，§11 [待实验]）----
+    metric_scale: Optional[float] = None          # s_global = median_k(s_k)
+    scale_self_consistency: Optional[float] = None  # 32 帧 s_k 的 std/median（离散度）
+    per_frame_scale_ref: Optional[str] = None     # 32 个 s_k、离群帧列表（只读 receipt）
+    metric_model: Optional[Literal["moge2", "metric3d_v2", "none"]] = None
+    metric_fusion_version: Optional[str] = None
+    scale_fusion_status: Literal["success", "failed", "not_run"] = "not_run"
+
+    # ---- 质量（唯一事实源，M4）----
     quality_status: Literal["not_computed", "computed", "failed"] = "not_computed"
     quality: Optional[QualityMetrics] = None
     confidence: ConfidenceMap
-    # ---- 尺度锚定证据（论文消融用；旧绝对 CI 字段 scale_ci 已按 HC39 移除）----
-    # D-2：默认 **low**（未标定一律 low，不得进主表）。显式 null 在校验期归一为 low，
-    # 堵住"None = 不做置信度否决"这种 fail-open 读法（§3 M7 硬过滤谓词）。
-    scale_confidence: Literal["high", "medium", "low"] = "low"
-    scale_method: str = ""
-    # 尺度来源（§10 D-2 / RunManifest：把"哪个先验锚出来的"记进复现清单）
-    scale_source: str = ""
-    # ---- 重投影证据（G5 显式可用性，v5 HC35/37）----
-    # 正式 `vggt` 主线（无真 BA）**固定** `not_available` + G5=None；
-    # 只有 `vggt_sparse_ba` 通过 §10.1 PoC 后才允许 `computed`。
-    reprojection_status: Literal["not_available", "computed", "failed"] = "not_available"
-    # G5 残差数组 ref（BA 产物才有）
-    reproj_errors: Optional[str] = None
-    # G5 残差标量（仅 reprojection_status="computed" 时允许有限值，否则必须 None）
-    g5_reproj_err_median: Optional[float] = None
-    g5_reproj_err_p95: Optional[float] = None
-    # `vggt_sparse_ba` 的 PoC 回执 ref（§4.5 SparseBAReceipt）；正式主线为 None
-    sparse_ba_receipt_ref: Optional[str] = None
+
+    # ---- G5：永久 not_available（D11，§10.4）----
+    reprojection_status: Literal["not_available"] = "not_available"
+    g5_reproj_err_median: None = None
+    g5_reproj_err_p95: None = None
+
+    @field_validator("world_up")
+    @classmethod
+    def _world_up_unit(cls, v: Any) -> Any:
+        """`world_up` 必须是**单位** 3 向量且有限；否则 hard fail（不猜、不归一化）。"""
+        if v is None:
+            return None
+        arr = np.asarray([float(x) for x in v], dtype=np.float64)
+        if arr.shape != (3,):
+            raise ValueError(f"world_up 必须是 3 向量（收到 {v!r}）")
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"world_up 含 NaN/Inf（收到 {v!r}）")
+        n = float(np.linalg.norm(arr))
+        if not np.isfinite(n) or abs(n - 1.0) > 1e-3:
+            raise ValueError(
+                f"world_up 必须是单位向量（模长={n}，收到 {v!r}）；"
+                "非单位向量一律 fail-closed，不做静默归一化")
+        return [float(x) for x in arr]
 
     @model_validator(mode="before")
     @classmethod
     def _reject_legacy_fields(cls, data: Any) -> Any:
-        """HC38/HC39：当前 Schema 不接受旧尺度/G8 字段，出现即 hard fail。
+        """当前 Schema 不接受 legacy 字段，出现即 hard fail（不静默忽略）。
 
-        不做静默忽略：`scale_ci`、`relative_ci`、`g8_bbox_coverage_min` 等旧字段
-        与 v5 口径不可互推，静默接受会把历史数字混进 v5 统计。旧产物必须走
-        `skill3d.legacy.readers`（只读审计），要进运行时/统计必须重跑 v5 pipeline。
+        静默接受会让历史数字混进 v6 统计；旧产物必须走 `skill3d.legacy.readers`。
         """
         if not isinstance(data, dict):
             return data
         present = sorted(f for f in LEGACY_ONLY_FIELDS if f in data)
         if present:
             raise ValueError(
-                f"ReconstructionArtifact 含 legacy 字段 {present}（v5 HC38/39："
-                "当前 Schema 不兼容混写）。请用 skill3d.legacy.readers 只读解析，"
-                "并从原始帧重跑 v5 pipeline 生成新产物。")
+                f"ReconstructionArtifact 含 legacy 字段 {present}（v6 §20：当前 Schema "
+                "不兼容混写）。请用 skill3d.legacy.readers 只读解析，"
+                "并从原始帧重跑 v6 pipeline 生成新产物。")
         return data
 
-    @model_validator(mode="before")
-    @classmethod
-    def _g5_availability_consistency(cls, data: Any) -> Any:
-        """v5 HC37：G5 有限值 **当且仅当** `reprojection_status="computed"`。
-
-        - 状态非 `computed` 而 G5 有有限值 → 视为"用代理值冒充重投影残差"，hard fail；
-        - 状态 `computed` 但 G5 缺失 → hard fail（既然声明算过就必须有值）。
-        NaN 与 `None` 等价（`ser_json_inf_nan="constants"` 下 NaN 可落盘，读回要一致）。
-        """
-        if not isinstance(data, dict):
-            return data
-        status = str(data.get("reprojection_status", "not_available") or "not_available")
-        finite = []
-        for k in ("g5_reproj_err_median", "g5_reproj_err_p95"):
-            v = data.get(k)
-            if v is None:
-                continue
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                continue
-            if fv == fv and abs(fv) != float("inf"):
-                finite.append(k)
-        if status != "computed" and finite:
+    @model_validator(mode="after")
+    def _v6_invariants(self) -> "ReconstructionArtifact":
+        """G5 固定 None / 世界系契约自洽 / 度量融合字段自洽。"""
+        # G5（§10.4）
+        if self.reprojection_status != "not_available":
             raise ValueError(
-                f"reprojection_status={status} 但 {finite} 为有限值："
-                "G5 只能用真 BA 的重投影残差（HC37 禁止代理值/缺省补分）。")
-        if status == "computed" and len(finite) != 2:
+                "reprojection_status 在 v6 固定为 not_available（D11：BA 正式关闭）")
+        if self.g5_reproj_err_median is not None or self.g5_reproj_err_p95 is not None:
+            raise ValueError("G5 标量在 v6 固定为 None（§10.4：严禁代理值冒充）")
+        # 世界系契约（D5）
+        if self.world_frame_status == "available" and (
+                self.world_up is None or self.handedness is None):
             raise ValueError(
-                "reprojection_status=computed 必须同时给出有限的 "
-                "g5_reproj_err_median / g5_reproj_err_p95（HC37）。")
-        return data
-
-    @field_validator("scale_confidence", mode="before")
-    @classmethod
-    def _null_scale_confidence_is_low(cls, v: Any) -> Any:
-        """旧 artifact 可能显式写 `scale_confidence: null`。
-
-        `None` **不等于**"不做置信度否决"，它是"没锚定过"——一律归一为 `low`
-        （fail-closed，§3 M7：metric_scale_required 只接受 medium/high）。
-        """
-        return "low" if v is None else v
-
-    @field_validator("allowed_metric_tasks", mode="before")
-    @classmethod
-    def _unknown_metric_tasks_rejected(cls, v: Any) -> Any:
-        """未在 HC33 词汇表内的题型名不得进入授权集合（否则门控静默失效）。"""
-        if v is None:
-            return set()
-        names = {str(x) for x in v}
-        unknown = names - set(METRIC_TASK_TYPES)
-        if unknown:
+                "world_frame_status=available 必须同时给出 world_up 与 handedness"
+                "（否则方向类 Tool 会拿到半个约定 → 必须 fail-closed）")
+        # 度量融合（D1/D2）
+        if self.scale_fusion_status == "success":
+            if self.metric_scale is None or not np.isfinite(float(self.metric_scale)):
+                raise ValueError("scale_fusion_status=success 必须有有限 metric_scale")
+            if float(self.metric_scale) <= 0:
+                raise ValueError(f"metric_scale 必须为正（收到 {self.metric_scale}）")
+        elif self.metric_scale is not None:
             raise ValueError(
-                f"allowed_metric_tasks 含未知题型 {sorted(unknown)}；"
-                f"词汇表见 schemas.reconstruction.METRIC_TASK_TYPES")
-        return names
+                f"scale_fusion_status={self.scale_fusion_status} 但 metric_scale="
+                f"{self.metric_scale} 非空（§5.2 不变量：PoC 通过前保持 None）")
+        # 质量单一事实源（硬约束 22）
+        if (self.quality is None) != (self.quality_status != "computed"):
+            raise ValueError(
+                f"quality_status={self.quality_status} 与 quality="
+                f"{'None' if self.quality is None else '有值'} 不自洽"
+                "（quality=None 当且仅当状态非 computed）")
+        return self
 
-    @model_validator(mode="before")
-    @classmethod
-    def _scale_ci_v4_consistency(cls, data: Any) -> Any:
-        """HC29 + HC30 数据层兜底：口径不自洽 / 未标定提升置信度 → fail-closed。
 
-        - HC29：`scale_ci_abs_m ≈ metric_scale * scale_ci_rel`，否则降 low + 清空授权；
-        - HC30：`medium/high` 必须有 `scale_calibration_id` 且授权不越纲，否则降 low。
-
-        一律**降级**而非抛异常：artifact 是既成事实，反序列化旧数据时抛异常会让整条
-        链不可用；"降为 low"才是硬约束 29/30 要求的更安全失败方式。新写回的 artifact
-        由 M3 的 `assess_scale`/`apply_scale_assessment` 保证合规（生产端保证），
-        本校验器是消费端兜底（旧数据 / 手工构造 / 篡改）。
-        """
-        if not isinstance(data, dict):
-            return data
-        bad = _ci_inconsistency_reason(data) or _hc30_confidence_reason(data)
-        if not bad:
-            return data
-        out = dict(data)
-        tasks = out.get("allowed_metric_tasks")
-        already_downgraded = (out.get("scale_confidence") == "low"
-                              and not (tasks or set()))
-        if already_downgraded:
-            return out
-        out["scale_confidence"] = "low"
-        out["allowed_metric_tasks"] = set()
-        # HC31：`scale_conflict` **只**表示"锚点间尺度比超冲突阈值"，不得被用作
-        # "口径降级"的标记（那会把两类事实混在一起，让报告误报锚点冲突）。
-        # 降级事实由 `scale_method` 的原因串 + 清空的授权集合承载。
-        method = str(out.get("scale_method") or "")
-        out["scale_method"] = f"{method} | [HC29/30 fail-closed] {bad}".strip(" |")
-        return out
-
+# ---------------------------------------------------------------------------
+# §5.3 场景状态（scene_route × question_tool_scope 解耦）
+# ---------------------------------------------------------------------------
 
 class SceneState(Spec):
-    """M4 场景状态：持久层 `artifact_ref` + 运行时活句柄 + route/产物集合。
+    """M4 场景状态：持久层 `artifact_ref` + 运行时活句柄 + 双路由字段 + 证据画像。
 
-    不持有独立 quality 副本（一切质量信息从 artifact 派生，硬约束 22）。
-    `available_artifacts` 与 `tools.contract.ROUTE_ARTIFACTS` 同源（硬约束 23）。
+    D4 不变量（§5.3）：
+
+    - `ROUTE_ARTIFACTS` 纯函数，**只挂 `scene_route``**；`available_artifacts` 是
+      `ROUTE_ARTIFACTS[scene_route]` 再并上条件集 `{scale}`（米制题 ∧ gate_passed）；
+    - prompt 头部与 scene 摘要**必须同源**（都从 `scene_route` + `question_tool_scope`
+      派生），杜绝"头部 fallback、摘要 full_3d"自相矛盾；
+    - `scene_route` 在同一 scene 的所有 episode 间稳定；`question_tool_scope` 可逐题不同；
+    - `scene_route` **不因逐题 metric_scale 失败而改变**（metric 失败只收窄 scope）。
     """
 
-    artifact_ref: str
-    route: Literal["full_3d", "fallback_2d_only", "unanswerable"]
-    frame: Literal["world", "camera", "image"]
-    scale_known: bool
-    objects: list[str]  # ObjectInstance id ref
-    summary: str  # 给 Synthesizer 的场景摘要
-    # G-11：尺度置信档位（high/medium/low）；low 时 measurement 题降级 2D-only。
-    # 与 ReconstructionArtifact 同口径：默认 low，显式 null 也归一为 low。
-    scale_confidence: Literal["high", "medium", "low"] = "low"
-    # v5 HC31：锚点冲突必须显式可见（不得用 getattr 兜底成 False 而看不到真冲突）
-    scale_conflict: bool = False
-    # v4 HC29/HC33：v4 口径的相对 CI 半宽（分数）与逐题型授权
-    scale_ci_rel: Optional[float] = None
-    # v5 HC38：本版**不设置** geometric_coverage 门；trace/报告只能写 not_defined，
-    # 不得写 "coverage passed"（旧字段 scale_ci 已按 HC39 移除）。
-    coverage_gate_status: Literal["not_defined"] = "not_defined"
-    # v4 HC33：当前尺度评估授权的米制题型（从 artifact 派生，逐题门控的唯一依据）
-    allowed_metric_tasks: set[str] = set()
-    # v4 HC33：本 episode 的规范题型（逐题授权的第二维；空 = 未分类 → 米制 Tool 全拒）
-    question_type: str = ""
-    # M4：route → 可用重建产物集合（D-3 静态裁剪的执行期依据）
-    available_artifacts: set[str] = set()
-    # 运行时活句柄（只读引用，不参与序列化/哈希；持久层用 artifact_ref）
+    artifact_ref: str                     # 文件路径 / content hash
+    # 运行时活句柄（只读引用，不复制、不序列化）
     artifact: Optional[Any] = Field(default=None, exclude=True)
+
+    # D4：两个正交字段
+    scene_route: SceneRoute = "fallback_2d_only"
+    question_tool_scope: QuestionToolScope = "fallback_2d_only"
+    # = ROUTE_ARTIFACTS[scene_route] ∪ ({scale} if 米制题 ∧ gate_passed)
+    available_artifacts: set[str] = set()
+
+    # EvidenceProfile 驱动（D6）
+    evidence_profile: Optional[EvidenceProfile] = None
+    metric_evidence_gate_result: Optional[MetricEvidenceGateResult] = None
+
+    # 答案来源（D9）
+    answer_source: AnswerSource = "abstain"
+
+    # 对象与摘要
+    objects: list[str] = []               # scene 级基础清单的 obj_id 列表
+    summary: str = ""
+    # 本题规范题型（逐题 scope 派生的第二维；空 = 未分类 → 米制 Tool 全拒）
+    question_type: str = ""
     # 质量只读引用（= artifact.quality；artifact 不可用时为 None）
     quality: Optional[QualityMetrics] = Field(default=None, exclude=True)
 
-    @field_validator("scale_confidence", mode="before")
-    @classmethod
-    def _null_scale_confidence_is_low(cls, v: Any) -> Any:
-        """同 ReconstructionArtifact：显式 null 一律归一为 low（fail-closed）。"""
-        return "low" if v is None else v
+    @model_validator(mode="after")
+    def _scope_narrower_than_route(self) -> "SceneState":
+        """`docs(question_tool_scope) ⊆ docs(scene_route)`（§5.3 不变量，fail-closed）。
 
-    @field_validator("allowed_metric_tasks", mode="before")
-    @classmethod
-    def _unknown_metric_tasks_rejected(cls, v: Any) -> Any:
-        """同 ReconstructionArtifact：未知题型名不得进入授权集合。"""
-        if v is None:
-            return set()
-        names = {str(x) for x in v}
-        unknown = names - set(METRIC_TASK_TYPES)
-        if unknown:
+        `scene_route != full_3d` 时 scope 只能是 `fallback_2d_only` ——
+        "头部 full_3d、摘要 fallback"这一类自相矛盾必须在数据层就写不进来。
+        """
+        if self.scene_route != "full_3d" and self.question_tool_scope == "full_3d":
             raise ValueError(
-                f"SceneState.allowed_metric_tasks 含未知题型 {sorted(unknown)}；"
-                f"词汇表见 schemas.reconstruction.METRIC_TASK_TYPES")
-        return names
+                f"question_tool_scope=full_3d 但 scene_route={self.scene_route}"
+                "（§5.3：逐题只能收窄，不得新增工具）")
+        if self.question_tool_scope == "metric_enabled" and self.scene_route != "full_3d":
+            raise ValueError(
+                "question_tool_scope=metric_enabled 要求 scene_route=full_3d"
+                "（§13.2：米制能力只在 full_3d 下可能暴露）")
+        return self
+
+    # ---- 派生只读视图 ----
+    @property
+    def metric_gate_passed(self) -> bool:
+        g = self.metric_evidence_gate_result
+        return bool(g is not None and g.gate_passed)
 
     def metric_task_authorized(self, question_type: str) -> bool:
-        """逐题型授权判定（HC33）：`question_type ∈ allowed_metric_tasks`。
+        """本题是否被授权使用米制 Tool：题型是米制 ∧ gate 通过 ∧ scope 允许。"""
+        qt = str(question_type or "")
+        return (qt in METRIC_TASK_TYPES
+                and self.metric_gate_passed
+                and self.question_tool_scope == "metric_enabled")
 
-        `question_type` 为空 = 尚未分类 → **不授权**（fail-closed：米制 Tool 必须先
-        知道题型才能证明自己被授权）。
-        """
-        return bool(question_type) and str(question_type) in self.allowed_metric_tasks
+    def evidence_state(self, capability: str) -> str:
+        if self.evidence_profile is None:
+            return "unavailable"
+        return self.evidence_profile.state(capability)
 
 
-class ObjectInstance(Spec):
-    """M5 对象绑定/分割输出（§4 M5 字段 6）。"""
+# ---------------------------------------------------------------------------
+# §5.6 对象记录（scene 级基础清单，自描述）
+# ---------------------------------------------------------------------------
 
-    instance_id: str
-    class_hint: str
-    mask_per_frame: str  # mask 数组文件 ref
-    pointcloud_world: str  # 世界坐标点云 ref
-    centroid_world: list[float]
-    bbox: list[float]
-    confidence: float
-    # M5 掩码支撑帧（帧集槽位序号，升序）。用于"物体首次出现顺序"这类**逐帧可见性**
-    # 题型的程序化作答（mask 已在 M5 内存中，这里只落 32 个整数，不额外占显存）。
-    # 空列表 = 该对象在 32 帧内没有有效掩码（unverified/分割失败）。
-    visible_frames: list[int] = []
+class ObjectRecord(Spec):
+    """scene 级基础清单的记录（§5.6）。
+
+    **自描述**是硬要求（`category_name` 必须落盘）：v5 实测过"模型把 `obj_7`
+    当类别名"的误用面 —— id 不含类别名，程序路径就会拿 id 去匹配类别。
+    """
+
+    obj_id: str                           # scene 级稳定 ID（跨 episode 不变）
+    category_name: str                    # 自描述：消灭 "id 不含类别名" 误用面
+    visible_frames: list[int] = []         # 该对象在哪些帧可见（帧槽位序号，升序）
+    centroid_ref: str = ""                # 3D 质心引用（世界系，审计用）
+    track_id: Optional[str] = None        # 跨帧 track
+    det_conf: float = 0.0
+    grounding_status: Literal["base_list", "question_targeted_fill"] = "base_list"
+    duplicate_suspect: bool = False       # D6：重复嫌疑（计数降级信号）
+    # ---- 运行时产物引用（M5 全量绑定产物；Tool 经 SceneHandle 只读访问）----
+    mask_per_frame: str = ""              # mask 数组文件 ref
+    pointcloud_world: str = ""            # 世界坐标点云 ref
+    # 与点云逐点对齐的置信度 ref（§12.2 软权重来源；空 = 不可用，conf 不参与加权）
+    pointconf_world: str = ""
+    centroid_world: list[float] = [0.0, 0.0, 0.0]
+    bbox: list[float] = []                # [min_x,min_y,min_z,max_x,max_y,max_z]
+
+    # ---- 过渡期只读别名（v5 字段名；不参与序列化，迁移完成后删除）----
+    @property
+    def instance_id(self) -> str:
+        return self.obj_id
+
+    @property
+    def class_hint(self) -> str:
+        return self.category_name
+
+    @property
+    def confidence(self) -> float:
+        return self.det_conf
+
+
+# v5 名称别名（内部过渡用；新代码一律用 ObjectRecord）
+ObjectInstance = ObjectRecord
+
+
+__all__ = [
+    "AnswerSource",
+    "ConfidenceMap",
+    "LEGACY_ONLY_FIELDS",
+    "METRIC_TASK_TYPES",
+    "ObjectInstance",
+    "ObjectRecord",
+    "QUALITY_METRIC_VERSION",
+    "QualityMetrics",
+    "QuestionToolScope",
+    "ReconstructionArtifact",
+    "SceneRoute",
+    "SceneState",
+    "metric_scale_state_from_gate",
+]

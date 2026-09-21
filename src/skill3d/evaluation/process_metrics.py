@@ -10,6 +10,12 @@
 - 发现 bug 数（变形测试/反例挖掘；由离线侧注入）
 - 资源成本（wall-clock / tool 调用数；构建成本与推理成本分开报告）
 
+v6 增量（§19.3）：`synthesis_source` 拆 **6 类**（`vllm_ok` / `vllm_parse_error` /
+`vllm_service_error` / `m8_parse_recovered` / `direct_answer_fallback` /
+`partial_tool_recovery`）+ 显式非论文值 `mock_stub`。v5 的 `deterministic_stub`
+只作为**历史取值回读**保留识别（等价 `mock_stub`）；两者都不得进主表。
+`partial_tool_recovery` / `recovery_count`（§14.1）也在此逐 episode 计数。
+
 输入为在线链产物（`EpisodeOutcome` 或同构对象）+ 可选的代际曲线；
 不依赖具体实验规模，缺项以 `None` 表示"不可算"，不臆造 0。
 """
@@ -21,6 +27,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
+
+from .experiment_protocol import MOCK_SYNTHESIS_SOURCES, normalize_synthesis_source
 
 # TODO_CALIBRATE：几何验证 / 成功率的目标阈值（论文报告用）
 DEFAULT_TARGET_MCA = 0.5
@@ -60,11 +68,19 @@ class ProcessMetrics:
     regression_rate: Optional[float] = None
     bugs_found: int = 0
     notes: list[str] = field(default_factory=list)
+    # --- v6 §19.3：synthesis_source 6 类分布 + D7 partial recovery 事实 ---
+    synthesis_source_counts: dict = field(default_factory=dict)
+    n_partial_tool_recovery: int = 0                  # 走过 partial recovery 的 episode 数
+    recovery_count_total: int = 0                     # §14.1 recovery_count 之和
+    invalidated_result_ids_total: int = 0             # §14.1 级联撤销的结果数之和
 
     def to_row(self) -> dict:
         d = asdict(self)
         d.pop("notes", None)
         d["per_generation_delta"] = json.dumps(self.per_generation_delta)
+        # 用分号而非逗号分隔，避免把 CSV 的朴素 split(",") 读法错位
+        d["synthesis_source_counts"] = ";".join(
+            f"{k}={v}" for k, v in sorted(self.synthesis_source_counts.items()))
         return d
 
 
@@ -134,6 +150,7 @@ def aggregate_process_metrics(
     tools: list[str] = []
     regen: list[int] = []
     from_mock = 0
+    synth_counts: dict[str, int] = {}
     for o in outcomes:
         state = getattr(o, "final_state", "")
         if state == "answer":
@@ -158,8 +175,16 @@ def aggregate_process_metrics(
             tools.extend(r.tool for r in (trace.results or []))
             m.wallclock_s_total += float(getattr(trace, "wallclock_s", 0.0) or 0.0)
         regen.append(_regen_rounds(o))
-        if getattr(o, "synthesis_source", "") == "deterministic_stub":
+        # §19.3：按 6 类（+mock_stub）归一分桶；未知取值保守归到 vllm_ok 之外的空桶
+        src = normalize_synthesis_source(getattr(o, "synthesis_source", ""))
+        synth_counts[src or "(none)"] = synth_counts.get(src or "(none)", 0) + 1
+        if src in MOCK_SYNTHESIS_SOURCES:
             from_mock += 1
+        if bool(getattr(o, "partial_tool_recovery", False)):
+            m.n_partial_tool_recovery += 1
+        m.recovery_count_total += int(getattr(o, "recovery_count", 0) or 0)
+        m.invalidated_result_ids_total += len(
+            getattr(o, "invalidated_result_ids", []) or [])
 
     m.program_success_rate = _ratio(n_prog_ok, n_prog)
     m.geometry_pass_rate = _ratio(n_geo_ok, n_geo)
@@ -168,6 +193,7 @@ def aggregate_process_metrics(
     m.unique_tools = len(set(tools))
     m.tool_reuse_rate = _ratio(m.unique_tools, m.tool_calls_total)
     m.stub_program_ratio = _ratio(from_mock, len(outcomes))
+    m.synthesis_source_counts = synth_counts
 
     # --- D-3/硬约束 23：契约与可靠性指标（与主表分离报告）---
     n_contract = 0
@@ -178,7 +204,11 @@ def aggregate_process_metrics(
         flags_o = getattr(o, "answer_flags", []) or []
         if hits or "tool_contract" in flags_o:
             n_contract += 1
-            if getattr(o, "replay_used", False) or getattr(o, "trimmed_regen_used", False):
+            # v6 §14：partial_tool_recovery 生效即算"恢复过"（v5 的 replay/trimmed
+            # 两档阶梯已废止，字段保留只作历史 trace 回读）
+            if (getattr(o, "partial_tool_recovery", False)
+                    or getattr(o, "replay_used", False)
+                    or getattr(o, "trimmed_regen_used", False)):
                 n_recovered += 1
         trace_o = getattr(o, "program_trace", None)
         if trace_o is not None:
@@ -225,8 +255,13 @@ def aggregate_process_metrics(
         if m.sample_efficiency is None:
             m.notes.append(f"sample_efficiency=None：未在曲线上达到 target={target_metric}")
     if m.stub_program_ratio:
-        m.notes.append("含 deterministic_stub program：mock_light 仅管道验证，"
-                       "不得作为结果（§9.2）")
+        m.notes.append("含 mock_stub program（v5 名 deterministic_stub 等价）："
+                       "mock_light 仅管道验证，不得作为结果（§9.2）")
+    if m.n_partial_tool_recovery:
+        m.notes.append(
+            f"{m.n_partial_tool_recovery}/{len(outcomes)} 个 episode 走过 partial "
+            f"recovery（§14.1），级联撤销 {m.invalidated_result_ids_total} 个结果 —— "
+            "恢复成功不算 failure，但必须留痕（D7）")
     if m.tool_contract_rate:
         m.notes.append(
             f"tool_contract 命中 {n_contract}/{len(outcomes)} 个 episode（"

@@ -55,14 +55,10 @@ _FALLBACK: dict[str, Any] = {
     },
     "split_config": "configs/vsi_bench_split.yaml",
     "admission_thresholds": "configs/admission_thresholds.yaml",
-    # v4 尺度评估（HC29–33）：CI 口径 / 冻结校准器 / 逐题型授权
-    "scale": {
-        "confidence_level": 0.90,
-        "calibration_path": "data/scale_calibration/calibrator.json",
-        "split_audit_manifest": "data/scale_calibration/split_audit.json",
-        "vsi_bench_meta": "data/vsi_bench_meta/test.jsonl",
-        "excluded_vsibench_scene_count": 150,
-    },
+    # v6 §20：v4/v5 的 `scale` 段（冻结 conformal 校准器 / 标定池 / 逐题型授权校准）
+    # 随"放弃一切需要校准的路线"整体废止，键已删除；米制尺度改由
+    # `reconstruction/metric_fusion.py`（零样本度量深度跨帧融合，§11）在推理期产出，
+    # 其模型卡/阈值属 [待实验]/[TODO_CALIBRATE]，PoC 通过后再登记新键。
 }
 
 

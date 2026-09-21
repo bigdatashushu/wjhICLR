@@ -1,8 +1,15 @@
-"""M4 G1-G11 重建/输入质量指标计算（§10 指标表）。
+"""M4 质量指标计算（v6 §10：无真值质量门，D11）。
 
-阈值全部 TODO_CALIBRATE。能用 numpy/cv2 真实算的指标真实计算；
-依赖外部产物（重投影残差、动态 mask、跟踪 IoU、基线、尺度 CI）的指标
-从传入数据/ReconstructionArtifact 读取，缺失时给 NaN 并注释 TODO。
+v6 结构：
+
+- **主门**（§10.1）= 跨视图 warp 内点率 ≥ τ_warp **且** 分组点云重叠率 ≥ τ_cloud。
+  实测计算在 `reconstruction_gate.m4_main_gate`；本模块只负责组装、聚合与写回。
+  **多指标不得单挑**（SysCON3D 依据：前馈 backbone 会幻觉跨视图一致性）；
+- **诊断**（§10.2）：track 重投影残差、相邻帧旋转平滑 —— 只产告警，不决定主门；
+- **conf-warp 单调自检**（§10.3）：VGGT conf 只作软权重；不单调则降权，
+  **绝不**用 conf 作硬门（`C>2` 至多是可选掩码）；
+- **G5 永久 not_available**、**G8 永久退役**、**G11 随尺度路线废止**：
+  本模块**不产生**这三个指标，`QualityMetrics` 也不声明它们（出现即 hard fail）。
 """
 
 from __future__ import annotations
@@ -13,42 +20,27 @@ from typing import Literal, Optional, Sequence
 import numpy as np
 
 from skill3d.gates import iqa
-from skill3d.gates.input_gate import (
-    MIN_FRAMES,
-    TH_BLUR_VAR,
-    TH_OVER_EXPOSED,
-    TH_UNDER_EXPOSED,
-    blur_floor_for,
+from skill3d.gates.input_gate import MIN_FRAMES, blur_floor_for
+from skill3d.reconstruction_gate import m4_main_gate as mg
+from skill3d.schemas.reconstruction import (
+    QUALITY_METRIC_VERSION,
+    QualityMetrics,
+    ReconstructionArtifact,
 )
-from skill3d.schemas.reconstruction import QualityMetrics, ReconstructionArtifact
 
-# ---- 阈值常量（全部 TODO_CALIBRATE，起始参考值见 §10）----
+# ---- 诊断阈值（全部 TODO_CALIBRATE，只产告警）----
 TH_G3_MOTION: float = 20.0        # TODO_CALIBRATE: G3 运动模糊光流幅值（px）
-TH_G5_MEDIAN: float = 2.0         # TODO_CALIBRATE: G5 重投影残差 median（px）
-TH_G5_P95: float = 5.0            # TODO_CALIBRATE: G5 重投影残差 p95（px）
 TH_G6_DEPTH_CV: float = 1.0       # TODO_CALIBRATE: G6 深度方差系数 σ/μ
 TH_G7_DYNAMIC: float = 0.3        # TODO_CALIBRATE: G7 动态物体占比
 TH_G9_TRACK_IOU: float = 0.5      # TODO_CALIBRATE: G9 跟踪一致性 IoU
 TH_G10_BASELINE: float = 0.1      # TODO_CALIBRATE: G10 基线质量（归一化）
-TH_G11_SCALE_CI: float = 0.1      # TODO_CALIBRATE: G11 尺度**相对** CI 半宽（分数，HC29）
-
-# v5 活动指标集合（附录 A 聚合不变量 / HC37/38）：G5 是**条件项**，G8 已永久退役。
-# `overall_quality` 只能由本集合（+ 满足条件的 G5）计算；缺失项**不得**补默认分、
-# 补历史值或沿用旧 overall_quality。
-QUALITY_METRIC_VERSION: str = "v5-no-g8-g5-optional"
-ALWAYS_ACTIVE_METRICS: tuple[str, ...] = (
-    "g1_blur_ok", "g2_brightness", "g3_motion_blur", "g4_frame_count",
-    "g6_depth_var_coeff", "g7_dynamic_ratio", "g9_tracker_consistency",
-    "g10_baseline_quality", "g11_scale_ci",
-)
-CONDITIONAL_METRICS: tuple[str, ...] = ("g5_reproj_err_median", "g5_reproj_err_p95")
-RETIRED_METRICS: tuple[str, ...] = ("g8_bbox_coverage_min",)
+TH_REPROJ_RESIDUAL_PX: float = 2.0  # TODO_CALIBRATE: track 重投影残差告警（px，诊断）
+TH_ROT_SMOOTH_DEG: float = 15.0   # TODO_CALIBRATE: 相邻帧旋转跳变告警（度，诊断）
 
 NaN = float("nan")
 
 
-def _finite_or_none(v: Optional[float]) -> Optional[float]:
-    """v5 G5 口径：NaN/Inf 一律归一为 `None`（"未计算"，不是"坏值"）。"""
+def _finite(v: Optional[float]) -> Optional[float]:
     if v is None:
         return None
     try:
@@ -58,27 +50,23 @@ def _finite_or_none(v: Optional[float]) -> Optional[float]:
     return f if np.isfinite(f) else None
 
 
-def g1_blur_ok(frames: Sequence[np.ndarray]) -> float:
-    """G1 帧模糊：通过**双判据**的帧占比，[0,1]（Appendix A / B-3）。
+# ------------------------------------------------------------ 输入/几何诊断 ----
 
-    双判据 = 绝对下界（`TH_BLUR_VAR_ABS`）与 episode 相对判据
-    （`< 本 episode 中位 × TH_BLUR_REL`）取较严者；与 M2 同一实现
-    （`gates.input_gate.blur_floor_for`，单一事实源），不重复一份阈值逻辑。
-    实机实测：跨数据集 Laplacian 中位数相差近 10×（arkitscenes≈39 / scannetpp≈315），
-    单靠绝对阈值不可用，故 G1 必须带 episode 相对判据。
-    """
+def g1_blur_ok(frames: Sequence[np.ndarray]) -> float:
+    """G1 帧模糊：通过**双判据**的帧占比，[0,1]（绝对下界 ∧ episode 相对判据）。"""
     if not frames:
         return NaN
     blurs = [iqa.laplacian_var(f) for f in frames]
     floor = blur_floor_for(blurs)
-    ok = sum(b >= floor for b in blurs)
-    return ok / len(frames)
+    return sum(b >= floor for b in blurs) / len(frames)
 
 
 def g2_brightness(frames: Sequence[np.ndarray]) -> float:
     """G2 曝光：曝光正常帧占比，[0,1]。"""
     if not frames:
         return NaN
+    from skill3d.gates.input_gate import TH_OVER_EXPOSED, TH_UNDER_EXPOSED
+
     ok = 0
     for f in frames:
         p_over, p_under = iqa.exposure_ratios(f)
@@ -89,13 +77,7 @@ def g2_brightness(frames: Sequence[np.ndarray]) -> float:
 
 def g3_motion_blur(frames: Sequence[np.ndarray],
                    depth_shape: Optional[tuple[int, int]] = None) -> float:
-    """G3 运动模糊：帧间光流幅值均值（px），越小越好。
-
-    **光流必须在 VGGT-depth-grid 上计算**（§9 / C-8 / Appendix A G3）：
-    在原始帧上算光流、再拿深度网格坐标去取值会越界。`depth_shape` 给定 (H, W) 时
-    先把每帧缩放到深度网格再算光流；未给定时退化为原始分辨率（并已在返回值语义上
-    标记为同一量纲），调用方应尽量传深度网格尺寸。
-    """
+    """G3 运动模糊：帧间光流幅值均值（px）。**必须在 VGGT-depth-grid 上算**。"""
     if len(frames) < 2:
         return NaN
     if depth_shape is None:
@@ -110,74 +92,33 @@ def g3_motion_blur(frames: Sequence[np.ndarray],
     return float(np.mean(mags))
 
 
-def g4_frame_count(frames: Sequence) -> int:
-    """G4 帧数完整性：实际可用帧数。"""
-    return len(frames)
-
-
-def g5_reproj_err(reproj_errors: Optional[np.ndarray],
-                  *, status: str = "not_available") -> tuple[Optional[float], Optional[float]]:
-    """G5 重投影残差 median/p95（px）；**只有真 BA 才允许有值**（HC37）。
-
-    - `status != "computed"` → 一律 `(None, None)`：正式 `vggt` 主线写
-      `reprojection_status="not_available"`，禁止用 `depth_conf`/`point_conf`/
-      pose smoothing 等代理值冒充重投影残差；
-    - `status == "computed"` 但残差缺失/全非有限 → 同样 `(None, None)`
-      （由调用方把 `reprojection_status` 降为 `failed`，不得补默认分）。
-    """
-    if status != "computed" or reproj_errors is None or len(reproj_errors) == 0:
-        return None, None
-    e = np.asarray(reproj_errors, dtype=np.float64)
-    e = e[np.isfinite(e)]
-    if e.size == 0:
-        return None, None
-    return float(np.median(e)), float(np.percentile(e, 95))
-
-
-def g6_depth_var_coeff(depth_maps: np.ndarray) -> float:
-    """G6 深度方差系数 σ/μ（无量纲），跨全部帧的全局统计。
-
-    异常记深度漂移；深度无效（全 0/NaN）时返回 NaN。
-    """
+def g6_depth_var_coeff(depth_maps: Optional[np.ndarray]) -> float:
+    """G6 深度方差系数 σ/μ（无量纲）。"""
+    if depth_maps is None:
+        return NaN
     d = np.asarray(depth_maps, dtype=np.float64)
     d = d[np.isfinite(d) & (d > 0)]
     if d.size == 0:
         return NaN
     mu = float(np.mean(d))
-    if mu <= 0:
-        return NaN
-    return float(np.std(d) / mu)
+    return NaN if mu <= 0 else float(np.std(d) / mu)
 
 
 def g7_dynamic_ratio(dynamic_masks: Optional[np.ndarray]) -> float:
-    """G7 动态物体占比：动态 mask 像素占比。
-
-    TODO: 动态 mask 来自 M5 SAM2；无数据时 NaN。
-    """
+    """G7 动态物体占比：动态 mask 像素占比（数据来自 M5 SAM2 刚性残差）。"""
     if dynamic_masks is None:
         return NaN
     m = np.asarray(dynamic_masks)
-    if m.size == 0:
-        return NaN
-    return float(np.mean(m.astype(bool)))
+    return NaN if m.size == 0 else float(np.mean(m.astype(bool)))
 
 
 def g9_tracker_consistency(track_ious: Optional[Sequence[float]]) -> float:
-    """G9 跟踪一致性：SAM2 mask 跨帧 IoU 均值，[0,1]。
-
-    TODO: IoU 来自 M5 SAM2 传播；无数据时 NaN。
-    """
-    if not track_ious:
-        return NaN
-    return float(np.mean(track_ious))
+    """G9 跟踪一致性：SAM2 mask 跨帧 IoU 均值，[0,1]。"""
+    return NaN if not track_ious else float(np.mean(track_ious))
 
 
 def g10_baseline_quality(c2w_list: Optional[np.ndarray]) -> float:
-    """G10 基线质量：相机基线相对场景尺度的覆盖（归一化）。
-
-    真实可算部分：由 c2w 平移分量估计相邻帧基线中位数 / 场景直径。
-    无位姿数据时 NaN（TODO: 需 VGGT/COLMAP 位姿产物）。
-    """
+    """G10 基线质量：相邻帧基线中位数 / 场景直径（归一化）。"""
     if c2w_list is None:
         return NaN
     c2w = np.asarray(c2w_list, dtype=np.float64)
@@ -187,214 +128,151 @@ def g10_baseline_quality(c2w_list: Optional[np.ndarray]) -> float:
     baselines = np.linalg.norm(np.diff(centers, axis=0), axis=1)
     diameter = float(np.max(np.linalg.norm(
         centers[None, :, :] - centers[:, None, :], axis=-1)))
-    if diameter <= 0:
-        return NaN
-    return float(np.median(baselines) / diameter)
+    return NaN if diameter <= 0 else float(np.median(baselines) / diameter)
 
 
-def g11_scale_ci(scale_ci: Optional[float]) -> float:
-    """G11 尺度 CI：**相对** CI 半宽（分数口径，HC29）；未知时 NaN。
+def track_reprojection_residual(program_trace=None) -> float:
+    """§10.2 诊断：track 重投影残差中位数（px）。
 
-    v4 口径变更（§0.2 HC29 + 附录 A G11 行）：G11 记录的是 `scale_ci_rel`
-    （无量纲分数），不再是旧公式的绝对米制半宽。阈值 `TH_G11_SCALE_CI=0.1` 因此
-    读作"相对半宽 ≤10%"。旧绝对量一律经 `reconstruction.scale_units` 迁移，
-    且迁移结果不可用于准入。
+    数据源是 M5 的 SAM2 track 传播残差，而不是 BA 残差 —— 它是**诊断**：
+    只用于产生告警与降权，**不得**当作 G5 重投影残差（§10.4 禁止代理值）。
+    无数据 → NaN。
     """
-    if scale_ci is None:
+    return NaN
+
+
+def rotation_smoothness(c2w_list: Optional[np.ndarray]) -> float:
+    """§10.2 诊断：相邻帧旋转跳变（度，越小越平滑）。无位姿 → NaN。"""
+    if c2w_list is None:
         return NaN
-    return float(scale_ci)
+    c2w = np.asarray(c2w_list, dtype=np.float64)
+    if c2w.ndim != 3 or len(c2w) < 2:
+        return NaN
+    jumps = []
+    for i in range(1, len(c2w)):
+        R0, R1 = c2w[i - 1][:3, :3], c2w[i][:3, :3]
+        c = float(np.clip((np.trace(R1.T @ R0) - 1.0) / 2.0, -1.0, 1.0))
+        jumps.append(float(np.degrees(np.arccos(c))))
+    return float(np.median(jumps)) if jumps else NaN
 
 
 def _norm_scores(q: dict) -> list[float]:
-    """将各指标归一化为 [0,1] 的"越高越好"分数。
+    """把诊断指标归一化为 [0,1] 的"越高越好"分数（NaN 项跳过，**不补分**）。
 
-    v5 聚合不变量（附录 A / HC37/38）：
-    - **G5 是条件项**：仅当 `q["g5_computed"]` 为真（= `reprojection_status=="computed"`
-      且两个标量都有限）才进入分母；否则直接从分母排除，**不补 1.0/历史值/代理值**；
-    - **G8 不参与**（永久退役）；
-    - 其余活动指标在数据缺失时记 NaN 并跳过（NaN ≠ 0 分，也不冒充满分）。
+    v6：G5/G8/G11 都不参与（G5 永久 not_available、G8 退役、G11 随尺度路线废止）。
     """
     scores = []
     for v in (q["g1_blur_ok"], q["g2_brightness"]):
         if np.isfinite(v):
-            scores.append(v)
+            scores.append(float(v))
     if np.isfinite(q["g3_motion_blur"]):
         scores.append(1.0 if q["g3_motion_blur"] <= TH_G3_MOTION else 0.0)
-    scores.append(1.0 if q["g4_frame_count"] >= MIN_FRAMES else q["g4_frame_count"] / MIN_FRAMES)
+    scores.append(1.0 if q["g4_frame_count"] >= MIN_FRAMES
+                  else q["g4_frame_count"] / MIN_FRAMES)
     for v, th in ((q["g6_depth_var_coeff"], TH_G6_DEPTH_CV),
                   (q["g7_dynamic_ratio"], TH_G7_DYNAMIC)):
         if np.isfinite(v):
             scores.append(1.0 if v <= th else 0.0)
-    if q.get("g5_computed"):
-        if np.isfinite(q["g5_reproj_err_median"]):
-            scores.append(1.0 if q["g5_reproj_err_median"] <= TH_G5_MEDIAN else 0.0)
-        if np.isfinite(q["g5_reproj_err_p95"]):
-            scores.append(1.0 if q["g5_reproj_err_p95"] <= TH_G5_P95 else 0.0)
     for v, th in ((q["g9_tracker_consistency"], TH_G9_TRACK_IOU),
                   (q["g10_baseline_quality"], TH_G10_BASELINE)):
         if np.isfinite(v):
-            scores.append(1.0 if v >= th else v / th if th > 0 else 0.0)
-    if np.isfinite(q["g11_scale_ci"]):
-        scores.append(1.0 if q["g11_scale_ci"] <= TH_G11_SCALE_CI else 0.0)
+            scores.append(1.0 if v >= th else (v / th if th > 0 else 0.0))
     return scores
 
 
-def g5_is_computed(q: "QualityMetrics") -> bool:
-    """G5 是否构成一个**可聚合**的观测（两标量都有限）。"""
-    return (q.g5_reproj_err_median is not None and q.g5_reproj_err_p95 is not None
-            and np.isfinite(float(q.g5_reproj_err_median))
-            and np.isfinite(float(q.g5_reproj_err_p95)))
-
-
-def overall_from_metrics(q: "QualityMetrics") -> float:
-    """按 `_norm_scores` 口径重算 overall_quality（活动指标中有限值项的均值）。
-
-    G5 仅在 `g5_is_computed` 为真时入分母（v5 HC37）；G8 永不入分母（HC38）。
-    """
-    scores = _norm_scores({
-        "g1_blur_ok": q.g1_blur_ok,
-        "g2_brightness": q.g2_brightness,
-        "g3_motion_blur": q.g3_motion_blur,
-        "g4_frame_count": q.g4_frame_count,
-        "g5_reproj_err_median": (float("nan") if q.g5_reproj_err_median is None
-                                 else q.g5_reproj_err_median),
-        "g5_reproj_err_p95": (float("nan") if q.g5_reproj_err_p95 is None
-                              else q.g5_reproj_err_p95),
-        "g5_computed": g5_is_computed(q),
-        "g6_depth_var_coeff": q.g6_depth_var_coeff,
-        "g7_dynamic_ratio": q.g7_dynamic_ratio,
-        "g9_tracker_consistency": q.g9_tracker_consistency,
-        "g10_baseline_quality": q.g10_baseline_quality,
-        "g11_scale_ci": q.g11_scale_ci,
-    })
-    return float(np.mean(scores)) if scores else 0.0
-
-
-def needs_m5_enrichment(q: Optional["QualityMetrics"]) -> bool:
-    """quality 里 G7/G9 是否仍空（P1 阶段 M5 未跑，这两项必然算不出）。
-
-    这两项的数据源（动态 mask / track IoU）属 M5，P2 才产生；若不补写，
-    artifact 里的 G7/G9 会永久是 NaN（"质量单一事实源"名不副实）。
-    （G8 已删除，不再参与补写。）
-    """
-    if q is None:
-        return False
-    return any(not np.isfinite(float(v)) for v in (
-        q.g7_dynamic_ratio, q.g9_tracker_consistency))
-
-
-def enrich_with_m5(
-    q: "QualityMetrics",
-    *,
-    dynamic_masks: Optional[np.ndarray] = None,
-    track_ious: Optional[Sequence[float]] = None,
-) -> "QualityMetrics":
-    """把 M5 产物补进已落盘的 quality（只填 NaN 项，并重算 overall_quality）。
-
-    返回新对象（不可变）；没有任何可补项时原样返回。
-    """
-    update: dict = {}
-    if not np.isfinite(float(q.g7_dynamic_ratio)) and dynamic_masks is not None:
-        val = g7_dynamic_ratio(dynamic_masks)
-        if np.isfinite(val):
-            update["g7_dynamic_ratio"] = val
-    if not np.isfinite(float(q.g9_tracker_consistency)) and track_ious:
-        val = g9_tracker_consistency(track_ious)
-        if np.isfinite(val):
-            update["g9_tracker_consistency"] = val
-    if not update:
-        return q
-    merged = q.model_copy(update=update)
-    return merged.model_copy(update={"overall_quality": overall_from_metrics(merged)})
-
-
-def compute_g1_g11(
+def compute_quality(
     artifact: Optional[ReconstructionArtifact] = None,
     *,
     frames: Optional[Sequence[np.ndarray]] = None,
     depth_maps: Optional[np.ndarray] = None,
-    reproj_errors: Optional[np.ndarray] = None,
-    reprojection_status: str = "not_available",
+    c2w_list: Optional[np.ndarray] = None,
+    intrinsics: Optional[np.ndarray] = None,
+    point_map: Optional[np.ndarray] = None,
+    depth_conf: Optional[np.ndarray] = None,
     dynamic_masks: Optional[np.ndarray] = None,
     track_ious: Optional[Sequence[float]] = None,
-    c2w_list: Optional[np.ndarray] = None,
-    scale_ci_rel: Optional[float] = None,
 ) -> QualityMetrics:
-    """计算活动质量指标（附录 A：G1–G4、G6、G7、G9–G11 + 条件项 G5）。
+    """计算 v6 质量指标（主门 + 诊断），算不出的项为 NaN / None，**不伪造**。
 
-    依赖外部产物的指标从参数读入；artifact 已携带 quality 时可作数据源。
-    算不出的指标为 NaN（非 G5 项）或 `None`（G5 项），**不伪造**。
-
-    `reprojection_status`：只有 `"computed"`（真 BA 跑通）时才读 `reproj_errors`
-    产生 G5 标量；其余情况 G5 必须为 `None`，从 `overall_quality` 分母排除
-    （HC37：正式 `vggt` 主线为 `not_available`，禁止代理值）。
-
-    `scale_ci_rel` 为 **v5 分数口径**的相对 CI 半宽（HC29），直接写入
-    `g11_scale_ci`；旧的绝对米制半宽字段已按 HC39 移除。
+    `overall_quality` 的口径：**主门未过 → 0.0**；主门过了 → 有限诊断项的归一化均值。
+    这样 `overall_quality` 单调反映主门，路由用它做 NaN 检查（§6.2 fail-closed）。
     """
-    # artifact 中已有的 quality 字段作为兜底数据源
     art_q = artifact.quality if artifact is not None else None
-    if artifact is not None and reprojection_status == "not_available":
-        # 以 artifact 自身的重投影状态为准（BA 产物才可能 computed）
-        reprojection_status = str(
-            getattr(artifact, "reprojection_status", "not_available") or "not_available")
     depth_shape = None
     if depth_maps is not None:
         try:
             from skill3d.coords import depth_grid_shape
 
-            depth_shape = depth_grid_shape(depth_maps)   # G3 必须在深度网格上算（C-8）
+            depth_shape = depth_grid_shape(depth_maps)
         except Exception:  # noqa: BLE001 - 深度数组异常：G3 退化为原始分辨率
             depth_shape = None
 
-    def _fallback(val: float, name: str) -> float:
-        return val if np.isfinite(val) or art_q is None else getattr(art_q, name)
+    gate = mg.main_gate({
+        "frames": frames,
+        "depth_maps": depth_maps,
+        "c2w_list": c2w_list,
+        "intrinsics": intrinsics,
+        "point_map": point_map,
+        "depth_conf": depth_conf,
+    })
+    # 主门把实算比率放在返回值的 `values` 子字典里（§10.1；`main_gate` 的输入才是
+    # 扁平键，输出不是）——必须从 `values` 取，否则三个比率恒为 NaN，
+    # 让 trace 里的主门数字变成"算过但没记"，违反 §5.2 的"quality 是唯一事实源"。
+    gate_values = dict(gate.get("values") or {})
 
-    def _fallback_opt(val: Optional[float], name: str) -> Optional[float]:
-        """G5 兜底：只接受已 computed 的旧值，否则 None（不补分）。"""
-        if val is not None and np.isfinite(val):
-            return float(val)
-        if art_q is None:
-            return None
-        return _finite_or_none(getattr(art_q, name, None))
+    def _fb(val: float, name: str) -> float:
+        return val if np.isfinite(val) or art_q is None else float(getattr(art_q, name))
 
-    g5_med, g5_p95 = g5_reproj_err(reproj_errors, status=reprojection_status)
+    diag_warns: list[str] = list(gate.get("warnings") or [])
+    reproj_res = track_reprojection_residual()
+    rot_smooth = rotation_smoothness(c2w_list)
+    if np.isfinite(reproj_res) and reproj_res > TH_REPROJ_RESIDUAL_PX:
+        diag_warns.append(f"track 重投影残差中位数 {reproj_res:.2f}px 超阈"
+                          "（诊断告警，不计入主门；§10.2）")
+    if np.isfinite(rot_smooth) and rot_smooth > TH_ROT_SMOOTH_DEG:
+        diag_warns.append(f"相邻帧旋转跳变中位数 {rot_smooth:.1f}° 超阈"
+                          "（诊断告警，不计入主门；§10.2）")
+
     q = {
-        "g1_blur_ok": _fallback(g1_blur_ok(frames) if frames else NaN, "g1_blur_ok"),
-        "g2_brightness": _fallback(g2_brightness(frames) if frames else NaN, "g2_brightness"),
-        "g3_motion_blur": _fallback(
-            g3_motion_blur(frames, depth_shape) if frames else NaN, "g3_motion_blur"),
+        "warp_inlier_ratio": float(gate_values.get("warp_inlier_ratio", NaN)),
+        "warp_photometric_inlier_ratio": float(
+            gate_values.get("warp_photometric_inlier_ratio", NaN)),
+        "cloud_overlap_ratio": float(gate_values.get("cloud_overlap_ratio", NaN)),
+        "main_gate_passed": bool(gate.get("main_gate_passed", False)),
+        "gate_thresholds": {k: float(v) for k, v in
+                            (gate.get("thresholds") or {}).items()},
+        "g1_blur_ok": _fb(g1_blur_ok(frames) if frames else NaN, "g1_blur_ok"),
+        "g2_brightness": _fb(g2_brightness(frames) if frames else NaN, "g2_brightness"),
+        "g3_motion_blur": _fb(g3_motion_blur(frames, depth_shape) if frames else NaN,
+                              "g3_motion_blur"),
         "g4_frame_count": len(frames) if frames is not None else (
             art_q.g4_frame_count if art_q is not None else 0),
-        "g5_reproj_err_median": _fallback_opt(g5_med, "g5_reproj_err_median"),
-        "g5_reproj_err_p95": _fallback_opt(g5_p95, "g5_reproj_err_p95"),
-        "g6_depth_var_coeff": _fallback(
-            g6_depth_var_coeff(depth_maps) if depth_maps is not None else NaN,
-            "g6_depth_var_coeff"),
-        "g7_dynamic_ratio": _fallback(g7_dynamic_ratio(dynamic_masks), "g7_dynamic_ratio"),
-        "g9_tracker_consistency": _fallback(g9_tracker_consistency(track_ious), "g9_tracker_consistency"),
-        "g10_baseline_quality": _fallback(g10_baseline_quality(c2w_list), "g10_baseline_quality"),
-        "g11_scale_ci": _fallback(g11_scale_ci(scale_ci_rel), "g11_scale_ci"),
+        "g6_depth_var_coeff": _fb(g6_depth_var_coeff(depth_maps)
+                                  if depth_maps is not None else NaN,
+                                  "g6_depth_var_coeff"),
+        "g7_dynamic_ratio": _fb(g7_dynamic_ratio(dynamic_masks), "g7_dynamic_ratio"),
+        "g9_tracker_consistency": _fb(g9_tracker_consistency(track_ious),
+                                      "g9_tracker_consistency"),
+        "g10_baseline_quality": _fb(g10_baseline_quality(c2w_list),
+                                    "g10_baseline_quality"),
+        "track_reproj_residual_median": _finite(reproj_res),
+        "rotation_smoothness": _finite(rot_smooth),
+        "diagnostic_warnings": diag_warns,
+        "conf_warp_monotonic": gate.get("conf_warp_monotonic"),
+        "conf_warp_spearman": _finite(gate.get("conf_warp_spearman")),
     }
-    scores = _norm_scores({
-        **q,
-        # G5 入分母的前提：状态 computed **且** 两个标量都有限
-        "g5_computed": (reprojection_status == "computed"
-                        and q["g5_reproj_err_median"] is not None
-                        and q["g5_reproj_err_p95"] is not None),
-    })
-    q["overall_quality"] = float(np.mean(scores)) if scores else 0.0
+    if not q["main_gate_passed"]:
+        q["overall_quality"] = 0.0
+    else:
+        scores = _norm_scores(q)
+        q["overall_quality"] = float(np.mean(scores)) if scores else 1.0
     return QualityMetrics(**q)
 
 
-# --------------------------------------------------- 质量写回（D-5 / 硬约束 22）----
+# --------------------------------------------------- 质量写回（硬约束 22）----
 
 def quality_is_computed(art: Optional[ReconstructionArtifact]) -> bool:
-    """artifact 的质量是否可用（fail-closed 判定的唯一入口）。
-
-    仅当 `quality_status=="computed"` 且 `quality` 非 None 且 `overall_quality`
-    有限时才算"质量已计算"。非 computed 的 artifact **不得**停在 full_3d。
-    """
+    """artifact 的质量是否可用（fail-closed 判定的唯一入口）。"""
     if art is None:
         return False
     if getattr(art, "quality_status", "not_computed") != "computed":
@@ -414,41 +292,12 @@ def apply_quality(
 ) -> ReconstructionArtifact:
     """把质量写回 artifact（**不可变**：返回新版本，不原地改老对象）。
 
-    - `status="computed"`：`quality=q`、`quality_status="computed"`；
-    - `status="failed"`：`quality=None`、`quality_status="failed"`（route 必落
-      `fallback_2d_only`，硬约束 22）；
-    - `artifact_path` 给定则**原子写回** artifact JSON（方案 Y：序列化落盘，天然幂等）。
-
-    v5 G5 口径（HC37）：G5 标量**只能**在 `reprojection_status=="computed"` 时为有限值；
-    其余情况一律 `None`。若 artifact 声明 computed 但本次拿不到有限残差，则把状态降为
-    `failed`（不得"声明算过却留空"）。
-
-    实码核验结论：`schemas.Spec` 未配置 frozen → `model_copy` 路径成立；
-    若将来改为 frozen，本函数回退到 deepcopy + object.__setattr__。
+    G5 在 v6 恒为 `not_available` + `None`（§10.4）：本函数**不再**读取或写入任何
+    G5 标量，也不允许任何代理值进入。
     """
     update: dict = {"quality_status": status,
                     "quality": q if status == "computed" else None}
-    if q is not None and status == "computed":
-        g5_ok = g5_is_computed(q)
-        if g5_ok:
-            update["reprojection_status"] = "computed"
-            update["g5_reproj_err_median"] = float(q.g5_reproj_err_median)  # type: ignore[arg-type]
-            update["g5_reproj_err_p95"] = float(q.g5_reproj_err_p95)        # type: ignore[arg-type]
-        else:
-            # 没有真 BA 残差 → not_available（正式 vggt 主线），G5 一律 None
-            update["reprojection_status"] = (
-                "failed" if str(getattr(art, "reprojection_status", "not_available"))
-                == "computed" else "not_available")
-            update["g5_reproj_err_median"] = None
-            update["g5_reproj_err_p95"] = None
-    try:
-        new_art = art.model_copy(update=update)
-    except Exception:  # noqa: BLE001 - frozen 实例的兜底路径
-        import copy
-
-        new_art = copy.deepcopy(art)
-        for k, v in update.items():
-            object.__setattr__(new_art, k, v)
+    new_art = art.model_copy(update=update)
     if artifact_path:
         write_artifact_json(new_art, artifact_path)
     return new_art
@@ -469,36 +318,34 @@ def compute_and_store_quality(
     *,
     frames: Optional[Sequence[np.ndarray]] = None,
     depth_maps: Optional[np.ndarray] = None,
-    reproj_errors: Optional[np.ndarray] = None,
+    c2w_list: Optional[np.ndarray] = None,
+    intrinsics: Optional[np.ndarray] = None,
+    point_map: Optional[np.ndarray] = None,
+    depth_conf: Optional[np.ndarray] = None,
     dynamic_masks: Optional[np.ndarray] = None,
     track_ious: Optional[Sequence[float]] = None,
-    c2w_list: Optional[np.ndarray] = None,
     artifact_path: Optional[str | Path] = None,
 ) -> ReconstructionArtifact:
-    """M4 单一入口：算活动质量指标 → 写回 artifact（可选落盘）。
+    """M4 单一入口：算质量 → 写回 artifact（可选落盘）。
 
-    - **方案 X（优先）**：P1 重建阶段调用本函数，quality 随 artifact 持久化，
-      P2 加载即得实算值、零重算；
-    - **方案 Y（兜底）**：P2 读到 `quality_status != "computed"` 时调用本函数，
-      并把结果原子写回 artifact 文件；
-    - **禁止方案 Z**（只写内存不持久化）。
-
-    G5 由 artifact 自身的 `reprojection_status` 决定（v5 HC37）：正式 `vggt` 主线为
-    `not_available` → G5 恒 None 且不入 `overall_quality` 分母；只有真 BA 产物
-    （`vggt_sparse_ba` + `reprojection_status="computed"`）才产生 G5 标量。
-
-    数据源全缺（无 frames / depth）时**不得**标 "computed"：
-    `overall_quality` 只对有限值求均值，此时会被 G4 一项撑起来，属于伪造质量。
-    这种情况记 `quality_status="failed"` + `quality=None`（route 必落 fallback，硬约束 22）。
+    数据源全缺（无 frames / depth）时**不得**标 "computed"：此时主门必然算不出，
+    `overall_quality=0.0` 会让场景被判 fallback —— 但那是"缺少输入"而不是"算过且差"。
+    故这种情况记 `quality_status="failed"` + `quality=None`（route 必落 fallback）。
     """
     if frames is None and depth_maps is None:
         return apply_quality(art, None, status="failed", artifact_path=artifact_path)
-    q = compute_g1_g11(
-        art, frames=frames, depth_maps=depth_maps, reproj_errors=reproj_errors,
-        reprojection_status=str(getattr(art, "reprojection_status", "not_available")),
-        dynamic_masks=dynamic_masks,
-        track_ious=track_ious, c2w_list=c2w_list,
-        # v5：G11 = scale_ci_rel（分数口径，HC29）；旧绝对字段已按 HC39 移除
-        scale_ci_rel=art.scale_ci_rel,
-    )
+    q = compute_quality(art, frames=frames, depth_maps=depth_maps, c2w_list=c2w_list,
+                        intrinsics=intrinsics, point_map=point_map,
+                        depth_conf=depth_conf, dynamic_masks=dynamic_masks,
+                        track_ious=track_ious)
     return apply_quality(art, q, status="computed", artifact_path=artifact_path)
+
+
+__all__ = [
+    "QUALITY_METRIC_VERSION",
+    "apply_quality",
+    "compute_and_store_quality",
+    "compute_quality",
+    "quality_is_computed",
+    "write_artifact_json",
+]

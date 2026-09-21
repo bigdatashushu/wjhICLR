@@ -1,9 +1,17 @@
-"""AST 白名单静态检查（§4 M9 / §9.1）。
+"""AST 白名单静态检查（§4 M9 / §9.1 / v6 §15.1）。
 
 仅允许：白名单库（numpy/scipy/math/statistics）+ REGISTRY 内 Tool 调用
 + 变量赋值/循环/print。
 禁止：import os/socket/subprocess/requests、eval/exec/__import__、
 文件写（.save/.to_csv/open(w)）、访问宿主路径、show/ReturnAnswer 重赋值。
+
+**v6 新增（D7 静态层）**：`ReturnAnswer(...)` 之后再出现任何 Tool 调用 →
+静态拒绝。运行层还有一道（kernel 抛 `AnswerAlreadyGiven`），两层一起保证
+"答后调 Tool"不会退化成 IndexError → 假的"服务故障"。
+
+> 背景 [已实测]：v5 模型自然写出 `if not ids: ReturnAnswer("abstain")` 然后继续
+> `object_centroid(ids[0])` → IndexError → `violation_runtime`，内测方向题全栽在这里。
+> AST 层拦不住的写法（例如把 Tool 存进变量再调用）由运行层兜住。
 
 AST 检查不能替代容器隔离（L2/L3/L4 由 M10 docker 承担）。
 """
@@ -85,6 +93,24 @@ class _WhiteListVisitor(ast.NodeVisitor):
         self.tool_calls: list[str] = []
         self.local_defs: Set[str] = set()
         self.imported_names: Set[str] = set()
+        # §15.1 静态层：ReturnAnswer 之后不得再出现 Tool 调用
+        self._answer_given_at: Optional[int] = None
+
+    def _check_answer_ordering(self, node: ast.AST, tool_name: str) -> None:
+        """`ReturnAnswer` 已调用（同一语句序列中的更早节点）后再调 Tool → 违规。
+
+        保守判定：只要**任一** `ReturnAnswer` 调用的行号早于本次 Tool 调用，即报违规。
+        真正的语义判定（含分支）由运行层 `AnswerAlreadyGiven` 兜住；静态层宁可多报，
+        让模型重生成一个"先算后答"的程序。
+        """
+        if self._answer_given_at is None:
+            return
+        line = getattr(node, "lineno", 0)
+        if line and line > self._answer_given_at:
+            self.violations.append(
+                f"禁止在 ReturnAnswer 之后再调用 Tool: {tool_name}"
+                f"（第 {line} 行 > ReturnAnswer 第 {self._answer_given_at} 行；"
+                "§15.1 静态层）")
 
     # ---- import 白名单 ----
     def visit_Import(self, node: ast.Import) -> None:
@@ -111,8 +137,13 @@ class _WhiteListVisitor(ast.NodeVisitor):
             if name in FORBIDDEN_CALLS:
                 self.violations.append(f"禁止调用危险函数: {name}")
             elif name in self.allowed_tools:
+                self._check_answer_ordering(node, name)
                 self.tool_calls.append(name)
-            elif name in ("show", "ReturnAnswer"):
+            elif name == "ReturnAnswer":
+                # 记录"答案已给"的行号；**不**改成中止语义（§15.1：保留记录/反作弊语义）
+                if self._answer_given_at is None:
+                    self._answer_given_at = getattr(node, "lineno", 0)
+            elif name == "show":
                 pass  # 保留名回调允许调用（仅禁止重赋值）
             elif name in SAFE_BUILTINS or name in self.local_defs or name in self.imported_names:
                 pass
@@ -125,6 +156,7 @@ class _WhiteListVisitor(ast.NodeVisitor):
                 self.violations.append(f"禁止调用危险方法: .{func.attr}")
             elif isinstance(func.value, ast.Name) and func.value.id == "tools":
                 if func.attr in self.allowed_tools:
+                    self._check_answer_ordering(node, func.attr)
                     self.tool_calls.append(func.attr)
                 else:
                     self.violations.append(f"tools 命名空间内未知 Tool: {func.attr}")

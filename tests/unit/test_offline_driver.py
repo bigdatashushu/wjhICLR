@@ -1,8 +1,12 @@
-"""G-28/G-35 离线 FSM driver 单测（§6.2、§8、硬约束 10/11/13/19）。
+"""G-28/G-35 离线 FSM driver 单测（§6.2、§3.4、硬约束 10/11/13/19）。
 
-覆盖：完整状态链、N_min 不足、泄漏硬门、GPT-6 不可用降级、
+覆盖：完整状态链、N_min 不足、泄漏硬门、离线模型不可用降级（认证失败 vs 服务故障）、
 outer 只跑一次、checkpoint 中断恢复、治理消融档。
-mock GPT-6 用注入的 client（`chat()` 返回受控文本），不触网。
+离线模型用注入的 client（`chat()` 返回受控文本），不触网。
+
+v6 变化（§3.4/§20）：离线治理模型从 GPT-6 换成 DeepSeek-V4.1-Flash；失败结局码为
+`service_unavailable` / `offline_auth_error` / `offline_request_error`，三者一律
+QUARANTINE（不切在线链、不用 mock 结果推进 Readiness）。
 """
 
 from __future__ import annotations
@@ -13,10 +17,13 @@ from pathlib import Path
 import pytest
 
 from skill3d.evolution.offline_driver import (
+    FAILURE_OFFLINE_AUTH,
+    FAILURE_SERVICE_UNAVAILABLE,
     GOVERNANCE_MODES,
     OfflineCheckpoint,
     OfflineDriver,
     OfflineDriverConfig,
+    classify_offline_failure,
     load_episode_traces,
     main,
     trace_outcomes,
@@ -28,12 +35,14 @@ from skill3d.trace.store import TraceStore
 
 # ------------------------------------------------------------------ 工具 ----
 
+# v6 §5.8 SkillSpec：题型 + 证据签名（不再是 requires_artifacts/minimum_quality）
 SPEC = json.dumps({
-    "skill_id": "sk-count", "semver": "1.0.0", "task_type": "object_counting",
-    "description": "数对象：用 scene.list_objects() 计数后直接作答",
-    "call_graph_template": "n = len(scene.list_objects())\nReturnAnswer(str(n))",
-    "requires_artifacts": [], "minimum_quality": 0.0,
-    "supported_coordinate_frames": ["world"], "metric_scale_required": False,
+    "skill_id": "sk-count", "version": "1.0.0",
+    "applicable_question_types": ["object_counting"],
+    "required_evidence_signature": {"object_detection": "available"},
+    "skill_family": "counting", "source": "real",
+    "description": "数对象：用 count_objects 计数后直接作答",
+    "call_graph_template": "n = count_objects()\nReturnAnswer(str(n))",
     "validation_assertions": ["n >= 0"],
 })
 
@@ -49,10 +58,10 @@ PATCH = json.dumps({
 })
 
 
-class MockGPT6:
-    """mock GPT-6：`chat()` 按 prompt 类型返回受控文本（绝不触网）。"""
+class MockOffline:
+    """mock 离线强模型：`chat()` 按 prompt 类型返回受控文本（绝不触网）。"""
 
-    model_id = "mock-gpt6"
+    model_id = "mock-deepseek"
 
     def __init__(self, patch_spec: str = SPEC, review_json: str | None = None,
                  revise_json: str = PATCH):
@@ -74,11 +83,83 @@ class MockGPT6:
         return self.patch_spec
 
 
-class FailingGPT6(MockGPT6):
-    def chat(self, prompt: str, system: str | None = None) -> str:
-        from skill3d.governance.gpt6_client import GPT6NotConfiguredError
+class UnconfiguredOffline(MockOffline):
+    """密钥未注入 / 认证被拒（`OfflineNotConfiguredError` ⊂ `OfflineAuthError`）。"""
 
-        raise GPT6NotConfiguredError("mock：未配置（TODO_USER_INPUT）")
+    def chat(self, prompt: str, system: str | None = None) -> str:
+        from skill3d.governance.deepseek_client import OfflineNotConfiguredError
+
+        raise OfflineNotConfiguredError("mock：DEEPSEEK_API_KEY 未设置")
+
+
+class OutageOffline(MockOffline):
+    """服务不可用（超时/限流/5xx 重试耗尽）。"""
+
+    def chat(self, prompt: str, system: str | None = None) -> str:
+        from skill3d.governance.deepseek_client import OfflineServiceUnavailable
+
+        raise OfflineServiceUnavailable("mock：健康检查失败 / 重试耗尽")
+
+
+class FakeDeepSeek(MockOffline):
+    """`DeepSeekClient` 形态的替身：提供 `manifest_fields()`（不触网）。
+
+    故意在返回里塞一个 `api_key`，用来验证"离线模型块绝不落密钥"（§3.4）。
+    """
+
+    provider = "deepseek"
+    model_id = "deepseek-flash"
+    endpoint_hash = "0" * 16 + "abcdef123456"
+    prompt_version = "deepseek-offline-v1"
+
+    def manifest_fields(self) -> dict:
+        return {
+            "offline_model": "DeepSeek-V4.1-Flash", "provider": self.provider,
+            "model_id": self.model_id, "endpoint_hash": self.endpoint_hash,
+            "prompt_version": self.prompt_version,
+            "latency": {"n_calls": 1, "median_s": 12.5},
+            "token_usage": {"total_tokens": 1234},
+            "api_key": "sk-must-never-leak-0123456789",
+        }
+
+
+def test_offline_manifest_block_records_identity_and_strips_secrets(tmp_path):
+    """§19.2/§3.4：离线模型块取自 `manifest_fields()`，且**绝不**含密钥。"""
+    from skill3d.online.eval import offline_manifest_fields
+
+    client = FakeDeepSeek()
+    block = offline_manifest_fields(client)
+    assert block["offline_model"] == "DeepSeek-V4.1-Flash"
+    assert block["provider"] == "deepseek" and block["model_id"] == "deepseek-flash"
+    assert block["endpoint_hash"] and block["latency"]["n_calls"] == 1
+    assert block["invoked"] is True
+    blob = json.dumps(block)
+    assert "sk-must-never-leak" not in blob and "api_key" not in blob
+
+    drv = _driver(tmp_path, offline=client)
+    ckpt = drv.run()
+    dumped = json.dumps(ckpt.offline_model_fields)
+    assert ckpt.offline_model_fields.get("model_id") == "deepseek-flash"
+    assert "sk-must-never-leak" not in dumped
+
+
+def test_classify_offline_failure_policy():
+    """§3.4 归族：认证失败 ≠ 服务故障，但两者都不得降级（结局码可审计）。"""
+    from skill3d.governance.deepseek_client import (
+        OfflineAuthError,
+        OfflineRequestError,
+        OfflineResponseError,
+        OfflineServiceUnavailable,
+    )
+
+    assert classify_offline_failure(OfflineAuthError("401")) == FAILURE_OFFLINE_AUTH
+    assert classify_offline_failure(
+        OfflineServiceUnavailable("503")) == FAILURE_SERVICE_UNAVAILABLE
+    assert classify_offline_failure(OfflineRequestError("400")) == "offline_request_error"
+    assert classify_offline_failure(OfflineResponseError("empty")) == \
+        "offline_request_error"
+    # 未包装的传输层异常也按服务不可用（绝不静默继续）
+    assert classify_offline_failure(TimeoutError("t")) == FAILURE_SERVICE_UNAVAILABLE
 
 
 def _write_traces(trace_dir: Path, n_scenes: int = 4, per_scene: int = 2,
@@ -112,7 +193,7 @@ def _panels(tmp_path) -> dict:
     return {"L1": inner, "L2": inner, "L3": outer}
 
 
-def _driver(tmp_path, *, gpt6=None, n_min=3, mode="mock_light", governance="G0_full",
+def _driver(tmp_path, *, offline=None, n_min=3, mode="mock_light", governance="G0_full",
             traces=True, panels=None) -> OfflineDriver:
     trace_dir = tmp_path / "traces"
     if traces:
@@ -127,7 +208,7 @@ def _driver(tmp_path, *, gpt6=None, n_min=3, mode="mock_light", governance="G0_f
     base = OnlineRunConfig(mode=mode, seed=0, skills=[], trace_dir=str(trace_dir))
     meta = {f"qa-{s}-{k}": ("object_counting", f"scene-{s}")
             for s in range(4) for k in range(2)}
-    return OfflineDriver(cfg, gpt6_client=gpt6, trace_store=TraceStore(str(trace_dir)),
+    return OfflineDriver(cfg, offline_client=offline, trace_store=TraceStore(str(trace_dir)),
                          panels=panels if panels is not None else _panels(tmp_path),
                          base_cfg=base, episode_meta=meta, print_fn=lambda *_: None)
 
@@ -150,7 +231,7 @@ def test_load_episode_traces_empty_when_no_files(tmp_path):
 
 def test_full_chain_reaches_reject_on_mock_light(tmp_path):
     """完整链路：CLUSTER→归纳→LEAKAGE→优化循环→（mock_light 不 promote）。"""
-    drv = _driver(tmp_path, gpt6=MockGPT6())
+    drv = _driver(tmp_path, offline=MockOffline())
     ckpt = drv.run()
     states = [t["to"] for t in ckpt.transitions]
     assert states[0] == OfflineState.GPT6_SYNTHESIZE.value
@@ -158,13 +239,16 @@ def test_full_chain_reaches_reject_on_mock_light(tmp_path):
     assert OfflineState.LOOP_SYNTHESIZE.value in states
     # mock_light 下 delta 恒 0 → L1 不过 → 循环内修订或被 reject/patience
     assert ckpt.state in (OfflineState.REJECT.value, OfflineState.QUARANTINE.value)
-    assert ckpt.candidate_ids and ckpt.gpt6_available
-    # GPT-6 只在离线链被调用（归纳 + 可能的修订 + 审查）
-    assert drv.gpt6.calls and "归纳器" in drv.gpt6.calls[0]
+    assert ckpt.candidate_ids and ckpt.offline_available
+    # 离线模型只在离线链被调用（归纳 + 可能的修订 + 审查）
+    assert drv.offline.calls and "归纳器" in drv.offline.calls[0]
+    # §19.2：离线模型块随 checkpoint 落盘（无密钥）
+    assert ckpt.offline_model_fields.get("model_id") == "mock-deepseek"
+    assert "api_key" not in json.dumps(ckpt.offline_model_fields)
 
 
 def test_checkpoint_persisted_every_step(tmp_path):
-    drv = _driver(tmp_path, gpt6=MockGPT6())
+    drv = _driver(tmp_path, offline=MockOffline())
     ckpt = drv.run()
     p = Path(drv.cfg.checkpoint_path)
     assert p.is_file()
@@ -173,9 +257,18 @@ def test_checkpoint_persisted_every_step(tmp_path):
     assert back.updated_at and back.transitions
 
 
+def test_checkpoint_load_accepts_legacy_gpt6_available_key(tmp_path):
+    """v5 checkpoint 兼容：`gpt6_available` → `offline_available`（§20 已弃用名）。"""
+    p = tmp_path / "legacy.json"
+    p.write_text(json.dumps({"run_id": "r", "state": OfflineState.REJECT.value,
+                             "gpt6_available": False}), encoding="utf-8")
+    ckpt = OfflineCheckpoint.load(p)
+    assert ckpt.offline_available is False and ckpt.gpt6_available is False
+
+
 def test_resume_from_checkpoint_continues(tmp_path):
     """中途中断后 resume：从最后状态继续，不重跑已完成状态。"""
-    drv = _driver(tmp_path, gpt6=MockGPT6())
+    drv = _driver(tmp_path, offline=MockOffline())
     drv.run()
     first = OfflineCheckpoint.load(drv.cfg.checkpoint_path)
 
@@ -185,7 +278,7 @@ def test_resume_from_checkpoint_continues(tmp_path):
         transitions=[], candidate_ids=[], revision_ids=[])
     partial.save(drv.cfg.checkpoint_path)
 
-    drv2 = _driver(tmp_path, gpt6=MockGPT6())
+    drv2 = _driver(tmp_path, offline=MockOffline())
     drv2.cfg.resume = True
     ckpt2 = drv2.run()
     assert ckpt2.run_id == "gen-test"                       # 复用原 run_id
@@ -198,7 +291,7 @@ def test_resume_from_checkpoint_continues(tmp_path):
 
 def test_insufficient_evidence_rejects(tmp_path):
     """跨 scene 样本 < N_min → REJECT，不归纳（§7：禁单题成 Skill）。"""
-    drv = _driver(tmp_path, gpt6=MockGPT6(), n_min=99)
+    drv = _driver(tmp_path, offline=MockOffline(), n_min=99)
     ckpt = drv.run()
     assert ckpt.state == OfflineState.REJECT.value
     assert "insufficient_evidence" in ckpt.termination_reason
@@ -209,23 +302,43 @@ def test_leakage_check_rejects_candidate_with_answer_text(tmp_path):
     """候选含 sample 答案/ID → LEAKAGE_CHECK 拒（硬约束 13/19）。"""
     leaky = json.dumps({**json.loads(SPEC),
                     "description": "对象计数题：先读 ground truth 再作答（泄漏样式）"})
-    drv = _driver(tmp_path, gpt6=MockGPT6(patch_spec=leaky))
+    drv = _driver(tmp_path, offline=MockOffline(patch_spec=leaky))
     ckpt = drv.run()
     assert ckpt.state == OfflineState.REJECT.value
     assert "leakage_detected" in ckpt.termination_reason
 
 
-def test_gpt6_unavailable_quarantines_without_promoting(tmp_path):
-    """GPT-6 不可用 → QUARANTINE，不 promote，且不阻塞（§8）。"""
-    drv = _driver(tmp_path, gpt6=FailingGPT6())
+def test_offline_unconfigured_quarantines_without_promoting(tmp_path):
+    """离线模型认证失败/未配置 → offline_auth_error + QUARANTINE，不 promote（§3.4）。"""
+    drv = _driver(tmp_path, offline=UnconfiguredOffline())
     ckpt = drv.run()
     assert ckpt.state == OfflineState.QUARANTINE.value
-    assert not ckpt.gpt6_available or "gpt6_not_configured" in ckpt.termination_reason
+    assert ckpt.offline_failure_code == FAILURE_OFFLINE_AUTH
+    assert not ckpt.offline_available
     assert not (Path(tmp_path / "skills") / "active_snapshot.json").exists()
 
 
+def test_offline_service_outage_quarantines(tmp_path):
+    """服务故障（超时/限流/5xx）→ service_unavailable + QUARANTINE；不用 mock 顶上。"""
+    drv = _driver(tmp_path, offline=OutageOffline())
+    ckpt = drv.run()
+    assert ckpt.state == OfflineState.QUARANTINE.value
+    assert ckpt.offline_failure_code == FAILURE_SERVICE_UNAVAILABLE
+    assert not ckpt.candidate_ids          # 没有候选：不推进任何 Readiness
+    assert not (Path(tmp_path / "skills") / "active_snapshot.json").exists()
+
+
+def test_missing_offline_client_does_not_fall_back(tmp_path):
+    """未注入客户端 → 走真实 DeepSeekClient：无密钥即 offline_auth_error（不模拟假成功）。"""
+    drv = _driver(tmp_path, offline=None)
+    ckpt = drv.run()
+    assert ckpt.state == OfflineState.QUARANTINE.value
+    assert ckpt.offline_failure_code == FAILURE_OFFLINE_AUTH
+    assert not ckpt.candidate_ids
+
+
 def test_no_traces_means_insufficient(tmp_path):
-    drv = _driver(tmp_path, gpt6=MockGPT6(), traces=False)
+    drv = _driver(tmp_path, offline=MockOffline(), traces=False)
     ckpt = drv.run()
     assert ckpt.state == OfflineState.REJECT.value
     assert "insufficient_evidence" in ckpt.termination_reason
@@ -241,7 +354,7 @@ def test_outer_runs_at_most_once(tmp_path):
     def counting(items, cfg, trace_store=None, llm=None):
         return real(items, cfg, trace_store, llm)
 
-    drv = _driver(tmp_path, gpt6=MockGPT6())
+    drv = _driver(tmp_path, offline=MockOffline())
     # 统计各层测试次数：直接监控 run_candidate_panels 是否可能重复调 L3
     orig = panel_mod.run_candidate_panels
 
@@ -263,7 +376,7 @@ def test_outer_runs_at_most_once(tmp_path):
 
 @pytest.mark.parametrize("gov", GOVERNANCE_MODES)
 def test_governance_ablation_modes_are_accepted(tmp_path, gov):
-    drv = _driver(tmp_path, gpt6=MockGPT6(), governance=gov)
+    drv = _driver(tmp_path, offline=MockOffline(), governance=gov)
     ckpt = drv.run()
     assert ckpt.state in (OfflineState.REJECT.value, OfflineState.QUARANTINE.value,
                           OfflineState.PROMOTE.value)
@@ -272,13 +385,13 @@ def test_governance_ablation_modes_are_accepted(tmp_path, gov):
 
 def test_g1_skips_semantic_review_when_promoting(tmp_path):
     """G1 档（无 review）：即使走到准入，也不产生语义审查记录。"""
-    drv = _driver(tmp_path, gpt6=MockGPT6(), governance="G1_no_review")
-    drv.gpt6 = MockGPT6()
+    drv = _driver(tmp_path, offline=MockOffline(), governance="G1_no_review")
+    drv.offline = MockOffline()
     # 直接驱动到 promote 阶段：伪造 L3 通过 + 准入通过
     drv._candidate_v0 = None  # 无候选 → 不产出
     ckpt = drv.run()
     assert ckpt.state != OfflineState.PROMOTE.value or \
-        "gpt6_semantic_review" in ckpt.skipped_stages
+        "offline_semantic_review" in ckpt.skipped_stages
 
 
 # ------------------------------------------------------------------ PROMOTE 可达性 ----
@@ -318,7 +431,7 @@ def test_promoted_loop_reaches_admission_stage(tmp_path, monkeypatch):
     从未被执行（测试又只用 mock_light 的 REJECT/QUARANTINE 值域，掩盖了该缺陷）。
     """
     _force_promoted_loop(monkeypatch, _passing_paired_outcome())
-    drv = _driver(tmp_path, gpt6=MockGPT6(), n_min=1)
+    drv = _driver(tmp_path, offline=MockOffline(), n_min=1)
     ckpt = drv.run()
 
     hits = [t for t in ckpt.transitions
@@ -336,10 +449,10 @@ def test_promoted_loop_reaches_admission_stage(tmp_path, monkeypatch):
 
 
 def test_promoted_loop_below_min_delta_is_rejected_by_hard_gate(tmp_path, monkeypatch):
-    """硬约束 13：硬门（delta < min_delta）一票否决，GPT-6 建议不能覆盖。"""
+    """硬约束 13：硬门（delta < min_delta）一票否决，离线模型建议不能覆盖。"""
     po = _passing_paired_outcome().model_copy(update={"delta": 0.001, "ci95_lo": 0.0005})
     _force_promoted_loop(monkeypatch, po)
-    drv = _driver(tmp_path, gpt6=MockGPT6(), n_min=1)
+    drv = _driver(tmp_path, offline=MockOffline(), n_min=1)
     ckpt = drv.run()
     assert ckpt.state == OfflineState.REJECT.value
     assert ckpt.termination_reason.startswith("admission_rejected")
@@ -348,7 +461,7 @@ def test_promoted_loop_below_min_delta_is_rejected_by_hard_gate(tmp_path, monkey
 
 def test_similar_to_rejected_candidate_rejects(tmp_path):
     """防重复（§7）：与已 reject 候选高度相似 → 终态必须是 REJECT，不得悬空。"""
-    drv = _driver(tmp_path, gpt6=MockGPT6())
+    drv = _driver(tmp_path, offline=MockOffline())
     drv.archive.add_rejected(SPEC)          # 提前留档同内容候选
     ckpt = drv.run()
     assert ckpt.state == OfflineState.REJECT.value

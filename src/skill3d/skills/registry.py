@@ -2,7 +2,10 @@
 
 语义版本规则（§7）：
 - MAJOR.MINOR.PATCH；
-- requires_artifacts / metric_scale_required 等前置条件变更 → 必须 MAJOR bump；
+- 前置条件变更 → 必须 MAJOR bump。v6 的前置条件是**可检索前提**
+  （`applicable_question_types` / `required_evidence_signature` /
+  `requires_metric_evidence` / `applicable_gate_version`）：改这些字段等于改
+  "这条 Skill 在什么证据状态下会被检索到"，旧轨迹的正例不再适用，故必须 MAJOR；
 - 其他模板/描述变更 → MINOR/PATCH。
 Skill 状态机：draft → shadow → canary → promoted；异常 → quarantined。
 """
@@ -16,8 +19,20 @@ from skill3d.schemas import SkillSpec, SkillState
 
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
-# 前置条件字段：变更必须 MAJOR bump（§7）
-PRECONDITION_FIELDS = ("requires_artifacts", "metric_scale_required")
+# 前置条件字段：变更必须 MAJOR bump（§7）。
+# v6 口径：检索前提 = 题型 + 证据签名（+ 米制 gate 版本，§13.6/§17.1）。
+# 这些字段一变，"这条 Skill 在哪种证据状态下会被选中"就变了 —— 旧轨迹的正例不再
+# 对应同一检索条件，必须 MAJOR bump（否则新旧正例混在同一版本下，§17.2 的分桶失效）。
+# `source` 也列入：real 与 mock_* 的同一 skill_id 若共用一个版本号，主表会把
+# mock 轨迹算成真实贡献（§19.3 synthesis_source 口径）。
+PRECONDITION_FIELDS = (
+    "applicable_question_types",
+    "required_evidence_signature",
+    "requires_metric_evidence",
+    "applicable_gate_version",
+    "skill_family",
+    "source",
+)
 
 # 合法状态转移
 _ALLOWED_TRANSITIONS: dict[str, set[str]] = {

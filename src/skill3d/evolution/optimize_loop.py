@@ -7,7 +7,7 @@ python -m skill3d.evolution.optimize_loop --root-candidate-id <id>
 把 §6.2 离线演进 FSM 与 §7 准入纪律接起来：
 
 ```
-CLUSTER_TRACES → GPT6_SYNTHESIZE → LEAKAGE_CHECK
+CLUSTER_TRACES → GPT6_SYNTHESIZE（离线模型归纳）→ LEAKAGE_CHECK
 → OPTIMIZATION_LOOP { SYNTHESIZE → STATIC_CHECK → TEST(L1→L2→L3) → DIAGNOSE → REVISE }
 → PROMOTE / REJECT / QUARANTINE
 ```
@@ -19,7 +19,9 @@ CLUSTER_TRACES → GPT6_SYNTHESIZE → LEAKAGE_CHECK
   artifact（`reuse_artifact`），mock_light 下两臂用同 seed 的同一合成几何；
 - **准入必须 real**（§5.6b）：`--mode mock_light` 只做管道验证，绝不 promote；
 - 泄漏检查为硬门（硬约束 13/19）：候选 spec_content 含答案/sample id 即拒；
-- GPT-6 不可用（`TODO_USER_INPUT`）→ 候选暂停不 promote，且不得让在线链等待（§8）。
+- 离线强模型（v6 §3.4：DeepSeek-V4.1-Flash）不可用 → 候选暂停不 promote，
+  且不得让在线链等待；认证失败记 `offline_auth_error`、服务故障记
+  `service_unavailable`，一律 quarantine，**不**回退在线链/ mock（§3.4 红线 8）。
 """
 
 from __future__ import annotations
@@ -53,7 +55,13 @@ from skill3d.evolution.panel import (
     run_panel,
     score_of,
 )
-from skill3d.governance.gpt6_client import GPT6NotConfiguredError
+from skill3d.governance.deepseek_client import (
+    DeepSeekClient,
+    OfflineAuthError,
+    OfflineRequestError,
+    OfflineResponseError,
+    OfflineServiceUnavailable,
+)
 from skill3d.memory.consolidation import leakage_scan_text
 from skill3d.online.config import DEFAULT_CONFIG, load_config, load_yaml, paths_from
 from skill3d.online.runner import OnlineRunConfig, run_episode
@@ -158,7 +166,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=0, help="每层面板最多条数（0=全部）")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--recon-dir", default="", help="real 模式：复用既有 artifact 的目录")
-    p.add_argument("--recon-method", default="vggt", choices=["vggt", "dust3r_mast3r", "colmap"])
+    p.add_argument("--recon-method", default="vggt", choices=["vggt"],
+                   help="重建方法；v6 §5.2 受控枚举只有 vggt（colmap/dust3r 基线已废止，§20）")
     p.add_argument("--skill-store", default="data/skill_registry", help="M15 snapshot 存储目录")
     p.add_argument("--active-snapshot", default="", help="active snapshot（只读，用于审计）")
     p.add_argument("--trace-dir", default="", help="离线 trace 目录（默认取 config）")
@@ -301,9 +310,11 @@ def main(argv: list[str] | None = None) -> int:
             return False
 
     def revise_fn(revision: CandidateRevision, feedback: str) -> CandidateRevision:
-        """REVISE：M16 GPT-6 基于反例产新版本（绝不原地改，硬约束 11）。"""
-        from skill3d.governance.gpt6_client import GPT6Client
-        from skill3d.governance.revise_patch import gpt6_revise
+        """REVISE：离线强模型（DeepSeek-V4.1-Flash）基于反例产新版本。
+
+        绝不原地改（硬约束 11）；异常按 §3.4 归族后暂停，不降级为"跳过修订继续 promote"。
+        """
+        from skill3d.governance.revise_patch import revise_from_bundle
 
         bundle = CounterexampleBundle(
             bundle_id=f"bundle-{revision.revision_id}",
@@ -315,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
             gpt6_visible_summary=f"测试反馈（不含答案）: {feedback}",
             generated_at="1970-01-01T00:00:00+00:00",
         )
-        return gpt6_revise(revision, bundle, GPT6Client())
+        return revise_from_bundle(revision, bundle, DeepSeekClient())
 
     archive = CandidateArchive()
     limit = DEFAULT_BUDGET_LIMIT
@@ -327,13 +338,17 @@ def main(argv: list[str] | None = None) -> int:
         run = run_optimization_loop(root, run_test_fn, revise_fn,
                                     static_check_fn=static_check_fn,
                                     archive=archive, budget_limit=limit)
-    except GPT6NotConfiguredError as exc:
-        print(f"\n[paused] GPT-6 不可用（TODO_USER_INPUT）: {exc}\n"
-              "        按 §8 策略：候选暂停/进 shadow，不 promote；在线链不等待 GPT-6。",
-              file=sys.stderr)
+    except (OfflineAuthError, OfflineServiceUnavailable, OfflineRequestError,
+            OfflineResponseError) as exc:
+        from skill3d.evolution.offline_driver import classify_offline_failure
+
+        code = classify_offline_failure(exc)
+        print(f"\n[paused] 离线强模型不可用（{code}）: {exc}\n"
+              "        按 §3.4 策略：候选暂停 / 进 quarantine，不 promote；"
+              "不切在线链、不用 mock 结果推进 Readiness。", file=sys.stderr)
         trace_store.append("optimization_run", {
             "root_candidate_id": root.root_candidate_id, "status": "paused",
-            "termination_reason": "gpt6_not_configured"})
+            "termination_reason": code})
         return 3
 
     print(f"\nOptimizationRun status={run.status} reason={run.termination_reason} "

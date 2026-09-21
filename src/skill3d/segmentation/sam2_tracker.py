@@ -8,9 +8,23 @@ G-19 已核验配置（§7.1）：`sam2==1.1.0` + checkpoint `facebook/sam2.1_hi
 （~33.5M encoder，适合在线），启动时预拉取到本地 cache。
 
 产物去向：
-- `ObjectInstance`（点云/bbox/质心）→ `SceneHandle`（硬约束 17：Tool 只经句柄访问）；
+- `ObjectRecord`（v6 §5.6：点云/bbox/质心 + `track_id`/`duplicate_suspect`/
+  `pointconf_world`/`grounding_status`）→ `SceneHandle`（硬约束 17：Tool 只经句柄访问）；
 - `track_ious`（G9）→ M4 质量门禁；
+- `track_stable_ratio`（§7.1 `track_consensus` 的占比输入）→ M4 证据画像；
 - `dynamic_masks`（G7）→ 重建污染检测（`dynamic_masks_from_rigidity`）。
+
+v6 证据字段（本模块的落点）：
+
+- `track_id`：**跨帧 track 身份** = 产生该对象的 SAM2 传播序号（确定性字符串）。
+  去重合并后，一组里只有幸存代表留在清单中，故 `count_objects`（§9.2
+  "track 共识计数，不数清单长度"）按 `track_id` 去重即得 `n_distinct_tracks`；
+- `duplicate_suspect`：去重**吸收**了 ≥2 条候选（清单长度被高估的直接证据），
+  或去重后仍有两个同类对象的世界质心落在同一容差内（时序不重叠 → 没合并，
+  但"同地同类不同时"仍有重复嫌疑）→ 计数必须降级输出（§7.1 track_consensus）；
+- `pointconf_world`：与 `pointcloud_world` **逐点 1:1 对齐**的 VGGT 逐点置信度 ref。
+  调用方不给 `point_conf` 时写空串（**绝不伪造**置信度，§12.2 软权重来源）；
+- `grounding_status`：场景清单 = `base_list`，逐题补漏 = `question_targeted_fill`。
 """
 
 from __future__ import annotations
@@ -24,11 +38,19 @@ from typing import Optional, Sequence
 import numpy as np
 
 from skill3d.coords import vlm_box_to_pixels
-from skill3d.schemas.reconstruction import ObjectInstance
+from skill3d.schemas.reconstruction import ObjectRecord
 
 # 场景清单缓存版本（改 M5 清单构造逻辑时递增 → 旧缓存自动失效，不会混用口径）
 # v2：`ObjectInstance` 增 `visible_frames`（逐帧可见性题型）→ 旧缓存缺该字段，必须失效
-_INVENTORY_VERSION = "m5-inventory-2"
+# v3：v6 §5.6 字段改名（obj_id/category_name/det_conf）+ 新增 track_id /
+#     duplicate_suspect / pointconf_world / grounding_status → 旧缓存是 v5 口径
+#     （无 track，计数无法做 track 共识），必须失效重算。
+_INVENTORY_VERSION = "m5-inventory-3"
+
+# `track_id` 命名空间（v6 §5.6）：不同 pass 的传播序号会重名（都从 0 起），
+# 前缀把它隔开 —— 否则 `count_objects` 的 track 去重会把两条不同对象算成一条。
+TRACK_PREFIX_BASE_LIST = "trk"      # 场景基础清单（scene 级，可缓存）
+TRACK_PREFIX_QUESTION = "qtrk"      # 逐题补漏（题级，不复用基础清单的 track）
 # VLM **通用清单**问题（与具体题目无关 → 清单可跨 episode 复用/缓存）
 _GENERIC_INVENTORY_QUESTION = (
     "请列出这张室内照片里最主要的物体（家具、门窗、家电、常见物品），"
@@ -286,7 +308,7 @@ def object_prompts_from_handle(handle) -> tuple[list[str], list[list[float]]]:
     for oid in handle.list_objects():
         obj = handle.get_object(oid)
         if len(obj.bbox) == 6:
-            hints.append(str(obj.class_hint))
+            hints.append(str(obj.category_name))
             boxes.append([float(v) for v in obj.bbox])
     return hints, boxes
 
@@ -431,13 +453,16 @@ def _resize_mask_to(mask: np.ndarray, shape: tuple[int, int],
                     transform: Optional[dict] = None) -> np.ndarray:
     """把掩码最近邻缩放到目标 (H, W)（§9 坐标层：SAM2-mask → VGGT-depth-grid）。
 
-    v4/A-8：BA route 的深度网格来自**中心 pad 过的正方形输入**，此时映射是
-    `dst = (src + pad_offset) × scale` 而非纯缩放；`transform` 为该仿射
-    （artifact 的 `grid_transform`）。缺省或非 pad 时与旧行为逐位一致。
+    v6 §20 已废止 BA / 正方形中心 pad 路线 → **唯一正确的映射是纯等比缩放**。
+    `transform` 形参保留只为签名兼容（`bind_masks_for_scene` / runner 仍按旧签名
+    传值），**不再应用 pad 仿射**：pad 形态的深度网格在 v6 不存在 ——
+    `ReconstructionArtifact.grid_transform` 已是 legacy-only 字段（出现即 hard fail），
+    故迁移后调用方只会传 `None`，本函数行为与旧实现的 `None` 分支逐位一致。
     """
     from skill3d.coords import mask_to_grid
 
-    return mask_to_grid(mask, transform, shape=(int(shape[0]), int(shape[1])))
+    del transform          # v6 §20：square-pad 已废止，纯缩放是唯一正确映射
+    return mask_to_grid(mask, None, shape=(int(shape[0]), int(shape[1])))
 
 
 def _to_bool_mask(logits) -> np.ndarray:
@@ -558,6 +583,25 @@ def dynamic_mask_from_rigidity(
 
 # ------------------------------------------------------------------ 绑定世界点云 ----
 
+def _as_point_conf(point_conf, depth_maps: np.ndarray) -> Optional[np.ndarray]:
+    """规整逐点置信度到与 `depth_maps` 同形的 (N,H,W)；不可用 → `None`。
+
+    **不伪造**：形状对不上（旧产物/别的网格上的 conf）一律返回 None，
+    由调用方写空 ref（§12.2：conf 不可用时不得当作 1.0 参与加权）。
+    """
+    if point_conf is None:
+        return None
+    arr = np.asarray(point_conf, dtype=np.float64)
+    d = np.asarray(depth_maps)
+    if d.ndim != 3:
+        return None
+    if arr.ndim == 2 and arr.shape == d.shape[1:]:
+        arr = np.broadcast_to(arr, (d.shape[0], arr.shape[0], arr.shape[1]))
+    if arr.ndim != 3 or arr.shape != d.shape:
+        return None
+    return arr
+
+
 def bind_masks_to_world(
     masks_per_object: Sequence[dict[int, np.ndarray]],
     depth_maps: np.ndarray,
@@ -569,39 +613,54 @@ def bind_masks_to_world(
     out_dir: Optional[str | Path] = None,
     scene_name: str = "scene",
     grid_transform: Optional[dict] = None,
-) -> list[ObjectInstance]:
+    point_conf: Optional[np.ndarray] = None,
+    track_prefix: str = TRACK_PREFIX_BASE_LIST,
+    grounding_status: str = "base_list",
+) -> list[ObjectRecord]:
     """mask × 深度反投影 → 世界坐标点云绑定（numpy 真实实现，§4 M5）。
 
     - masks_per_object: per-object {frame_idx: mask(H,W)}
     - depth_maps: (N,H,W) 逐帧深度（与相机坐标系对齐，正值）
     - c2w_list: (N,4,4) 世界坐标 SE(3)
     - intrinsics: (N,3,3) 或 (3,3) 相机内参
-    - out_dir: 给出时把逐帧 mask 与对象点云落盘并填 `ObjectInstance` 的 ref 字段
+    - out_dir: 给出时把逐帧 mask 与对象点云落盘并填 `ObjectRecord` 的 ref 字段
       （M3 尺度锚定与 M4 覆盖率都需要从 ref 回读对象点云）
+    - point_conf: (N,H,W) 或 (H,W) **逐点** VGGT 置信度（与 `depth_maps` 同网格）。
+      给出时按与点云**同一套有效掩码/同一套下采样下标**取点，落盘 `pointconf_world`
+      并与 `pointcloud_world` 逐点 1:1 对齐；**不给则写空 ref**（不伪造置信度）。
+    - track_prefix: `track_id` 命名空间（基础清单 `trk*` / 逐题补漏 `qtrk*`）；
+      `track_id = f"{track_prefix}{传播序号}"` —— 确定性、可复现，合并组内统一为
+      幸存代表的 track（见 `_dedupe_by_world_centroid`）。
+    - grounding_status: §5.6 的 `base_list` / `question_targeted_fill`。
+
+    `centroid_ref` 留空串：质心已内联在 `centroid_world`（同一批数字不写第二份文件，
+    避免两处事实源漂移），**不写假路径**。
     """
     depth_maps = np.asarray(depth_maps, dtype=np.float64)
     c2w_list = np.asarray(c2w_list, dtype=np.float64)
     intrinsics = np.asarray(intrinsics, dtype=np.float64)
     if intrinsics.ndim == 2:
         intrinsics = np.broadcast_to(intrinsics, (len(c2w_list), 3, 3))
+    pconf = _as_point_conf(point_conf, depth_maps)
 
-    instances: list[ObjectInstance] = []
-    for obj_id, masks in enumerate(masks_per_object):
+    instances: list[ObjectRecord] = []
+    for prop_idx, masks in enumerate(masks_per_object):
         # 有效支撑帧（掩码非空）→ 供"逐帧可见性"类题型程序化作答
         vis_frames = sorted(int(fi) for fi, m in masks.items()
                             if np.asarray(m).any())
-        hint = class_hints[obj_id] if class_hints and obj_id < len(class_hints) else "unknown"
+        hint = class_hints[prop_idx] if class_hints and prop_idx < len(class_hints) else "unknown"
         pts_world_all = []
+        conf_all = []
         for frame_idx, mask in sorted(masks.items()):
             if frame_idx >= len(depth_maps):
                 continue
             depth = depth_maps[frame_idx]
             K = intrinsics[min(frame_idx, len(intrinsics) - 1)]
             c2w = c2w_list[min(frame_idx, len(c2w_list) - 1)]
-            # SAM2 掩码在原始视频分辨率，VGGT 深度在预处理分辨率（518×392 或 BA 的
-            # 518×518 正方形网格）→ 按 §9 仿射映射到深度网格（硬约束：以重建产物为
-            # 几何参考）。**无条件调用**：非 pad 且尺寸相同时 `mask_to_grid` 原样返回，
-            # 而 pad 路径即使在尺寸相同时也必须做仿射（mask 在原始帧系）。
+            # SAM2 掩码在原始视频分辨率，VGGT 深度在预处理分辨率（518×392；v6 §20
+            # 已废止 BA 的 518×518 正方形 pad 网格）→ 按 §9 纯等比最近邻映射到深度
+            # 网格（硬约束：以重建产物为几何参考）。**无条件调用**：尺寸相同时
+            # `mask_to_grid` 原样返回。
             m = _resize_mask_to(np.asarray(mask, dtype=bool), depth.shape, grid_transform)
             vs, us = np.nonzero(m)
             z = depth[vs, us]
@@ -617,35 +676,46 @@ def bind_masks_to_world(
             pts_cam = np.stack([x, y, z, np.ones_like(z)], axis=0)  # (4,M)
             pts_world = (c2w @ pts_cam)[:3].T                        # (M,3)
             pts_world_all.append(pts_world)
+            if pconf is not None:
+                conf_all.append(pconf[frame_idx][vs, us])            # 与 pts 同序同长
 
-        iid = f"obj_{obj_id}"
+        iid = f"obj_{prop_idx}"
+        # v6 §5.6：跨帧 track 身份 = 产生该对象的 SAM2 传播序号（确定性）
+        track_id = f"{track_prefix}{prop_idx}"
         if not pts_world_all:
             # 分割失败 → 该对象标记 unverified（§4 M5 字段 9）
-            instances.append(ObjectInstance(
-                instance_id=iid,
-                class_hint=hint if class_hints else "unverified",
+            instances.append(ObjectRecord(
+                obj_id=iid,
+                category_name=hint if class_hints else "unverified",
+                track_id=track_id,
+                grounding_status=grounding_status,
                 mask_per_frame="",
                 pointcloud_world="",
+                pointconf_world="",          # 无点云 → 无逐点 conf（不伪造）
+                centroid_ref="",
                 centroid_world=[0.0, 0.0, 0.0],
                 bbox=[0.0] * 6,
-                confidence=0.0,
+                det_conf=0.0,
                 visible_frames=vis_frames,
             ))
             continue
 
         pts = np.concatenate(pts_world_all, axis=0)
+        conf_pts = np.concatenate(conf_all, axis=0) if conf_all else None
         if len(pts) > max_points:
             sel = np.random.default_rng(0).choice(len(pts), max_points, replace=False)
             pts = pts[sel]
+            if conf_pts is not None:
+                conf_pts = conf_pts[sel]     # 同一套下标 → 下采样后仍逐点对齐
         centroid = pts.mean(axis=0)
         pmin, pmax = pts.min(axis=0), pts.max(axis=0)
         # 置信度：优先用外部（SAM2 打分），否则按有效帧占比估计
-        if confidences is not None and obj_id < len(confidences):
-            conf = float(confidences[obj_id])
+        if confidences is not None and prop_idx < len(confidences):
+            conf = float(confidences[prop_idx])
         else:
             conf = min(1.0, len(masks) / max(1, len(depth_maps)))
 
-        mask_ref, cloud_ref = "", ""
+        mask_ref, cloud_ref, conf_ref = "", "", ""
         if out_dir is not None:
             d = Path(out_dir)
             d.mkdir(parents=True, exist_ok=True)
@@ -655,15 +725,23 @@ def bind_masks_to_world(
             np.save(mask_path, mask_arr)
             np.save(cloud_path, pts)
             mask_ref, cloud_ref = str(mask_path), str(cloud_path)
+            if conf_pts is not None:
+                conf_path = d / f"{scene_name}_{iid}_pointconf.npy"
+                np.save(conf_path, conf_pts)     # 与 pts 同长（逐点对齐）
+                conf_ref = str(conf_path)
 
-        instances.append(ObjectInstance(
-            instance_id=iid,
-            class_hint=hint,
+        instances.append(ObjectRecord(
+            obj_id=iid,
+            category_name=hint,
+            track_id=track_id,
+            grounding_status=grounding_status,
             mask_per_frame=mask_ref,
             pointcloud_world=cloud_ref,
+            pointconf_world=conf_ref,
+            centroid_ref="",
             centroid_world=centroid.tolist(),
             bbox=(list(pmin) + list(pmax)),
-            confidence=conf,
+            det_conf=conf,
             visible_frames=vis_frames,
         ))
     return instances
@@ -699,7 +777,7 @@ def _inventory_key(scene_name: str, frame_set_hash: str, depth_maps, n_frames: i
 
 
 def _load_inventory(out_dir: Optional[str | Path], scene_name: str,
-                    key: str) -> Optional[tuple[list[ObjectInstance], dict, str]]:
+                    key: str) -> Optional[tuple[list[ObjectRecord], dict, str]]:
     """读场景清单缓存；返回 `(objects, stats_scalars, dynamic_masks_ref)` 或 None。"""
     if not out_dir:
         return None
@@ -708,14 +786,16 @@ def _load_inventory(out_dir: Optional[str | Path], scene_name: str,
         return None
     try:
         payload = json.loads(p.read_text())
-        objects = [ObjectInstance.model_validate(o) for o in payload["objects"]]
+        objects = [ObjectRecord.model_validate(o) for o in payload["objects"]]
     except Exception:  # noqa: BLE001 - 缓存损坏 → 当作未命中重算（不抛错阻断 episode）
         return None
-    # mask/点云 ref 必须仍然存在，否则缓存不可用（防止半写入/清理过的目录）
+    # mask/点云/逐点 conf ref 必须仍然存在，否则缓存不可用（防止半写入/清理过的目录）
     for o in objects:
         if o.mask_per_frame and not Path(o.mask_per_frame).exists():
             return None
         if o.pointcloud_world and not Path(o.pointcloud_world).exists():
+            return None
+        if o.pointconf_world and not Path(o.pointconf_world).exists():
             return None
     stats = dict(payload.get("stats") or {})
     g7_ref = str(payload.get("dynamic_masks_ref") or "")
@@ -728,7 +808,7 @@ def _load_inventory(out_dir: Optional[str | Path], scene_name: str,
 
 
 def _save_inventory(out_dir: Optional[str | Path], scene_name: str, key: str,
-                    objects: Sequence[ObjectInstance], stats: dict,
+                    objects: Sequence[ObjectRecord], stats: dict,
                     dynamic_masks: Optional[np.ndarray]) -> Optional[str]:
     """写场景清单缓存（原子写）；返回 dynamic_masks ref（未给则空串）。"""
     if not out_dir:
@@ -806,7 +886,9 @@ def bind_objects_for_scene(
     frame_set_hash: str = "",
     use_inventory_cache: bool = True,
     seed: Optional[int] = None,
-) -> tuple[list[ObjectInstance], dict, list[str]]:
+    point_conf: Optional[np.ndarray] = None,
+    depth_conf: Optional[np.ndarray] = None,
+) -> tuple[list[ObjectRecord], dict, list[str]]:
     """M5 端到端（在线）：提示 → SAM2 传播 → 世界点云绑定 → G7/G9 统计。
 
     返回 `(objects, stats, notes)`；`stats` 键：`track_ious`(G9)、
@@ -820,6 +902,19 @@ def bind_objects_for_scene(
     - 同一 scene 的多个 episode 看到**同一份对象清单**（id 稳定、可复现）；
     - 检测器一旦不可用不再悄悄让清单塌缩（见 `_detector_boxes`）；
     - 重复跑同一配置（噪声底/多 seed）不必重付 M5 的 GPU 成本。
+
+    v6 证据输入：
+    - `point_conf` / `depth_conf`：与 `depth_maps` 同网格的逐点 VGGT 置信度
+      （`point_conf` 优先；都缺省 → `pointconf_world` 写空串，不伪造），
+      随对象点云逐点落盘供 §12.2 的距离原语做软权重；
+    - 基础清单对象 `grounding_status="base_list"`、`track_id` 前缀 `trk`；
+      逐题补漏对象 `grounding_status="question_targeted_fill"`、前缀 `qtrk`；
+    - `stats["track_stable_ratio"]`：跨帧 track 稳定占比（每条 track 可见帧数/帧集帧数
+      的均值）→ §7.1 `track_consensus`；`count_objects` 依赖它是 available/degraded
+      而不是 unavailable（§7.2：required=unavailable 会直接隐藏该 Tool）。
+
+    注意：`point_conf` 只在**首次**（未命中缓存）计算时落盘 —— 命中缓存直接复用
+    清单与 ref，不会重算/改写（缓存键已含产物形状，换网格即失效重算）。
     """
     from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
 
@@ -827,6 +922,8 @@ def bind_objects_for_scene(
     stats: dict = {}
     if depth_maps is None or c2w_list is None:
         return [], {}, ["M5 跳过：无深度/位姿产物，无法把 mask 反投影到世界系"]
+    if point_conf is None:
+        point_conf = depth_conf          # 兼容两种命名；都缺省 → 不落 conf
 
     n_frames = len(frames)
     # 4 个时间均匀探测帧（D-1）：单帧常常看不到目标物（实测同一视频帧 8/31 有桌子、
@@ -834,7 +931,7 @@ def bind_objects_for_scene(
     probe = sorted({0, n_frames // 3, 2 * n_frames // 3, n_frames - 1}) if n_frames else []
     key = _inventory_key(scene_name, frame_set_hash, depth_maps, n_frames)
 
-    objects: list[ObjectInstance] = []
+    objects: list[ObjectRecord] = []
     cached_stats: dict = {}
     if use_inventory_cache:
         cached = _load_inventory(out_dir, scene_name, key)
@@ -885,21 +982,32 @@ def bind_objects_for_scene(
                                          handle=handle, question=question)
         objects = bind_masks_to_world(masks_per_object, depth_maps, c2w_list, intrinsics,
                                       class_hints=hints or None, out_dir=out_dir,
-                                      scene_name=scene_name, grid_transform=grid_transform)
+                                      scene_name=scene_name, grid_transform=grid_transform,
+                                      point_conf=point_conf,
+                                      track_prefix=TRACK_PREFIX_BASE_LIST,
+                                      grounding_status="base_list")
         # 去重（§3 M5 字段 5）：类别 + 世界质心距离 + 时序重叠三判据
         objects, n_dup, groups = _dedupe_by_world_centroid(
             objects, depth_maps, masks_per_object=masks_per_object)
         kept_masks = _merge_mask_groups(masks_per_object, groups)
+        n_suspect = sum(1 for o in objects if o.duplicate_suspect)
         notes.append(f"M5 场景清单绑定 {len(objects)} 个对象"
-                     f"（SAM2 传播 {len(masks_per_object)} 条，3D 去重 {n_dup} 个）")
+                     f"（SAM2 传播 {len(masks_per_object)} 条，3D 去重 {n_dup} 个，"
+                     f"重复嫌疑 {n_suspect} 个 → count_objects 按 track 共识计数）")
         ious = track_ious_from_masks(kept_masks)
         if ious:
             stats["track_ious"] = ious
+        ratio = track_stable_ratio(objects, n_frames)
+        if ratio is not None:
+            stats["track_stable_ratio"] = ratio
         dyn, dnotes = dynamic_mask_from_rigidity(frames, depth_maps, c2w_list, intrinsics)
         notes.extend(dnotes)
         if dyn.size:
             stats["dynamic_ratio"] = float(dyn.mean())
             stats["dynamic_masks"] = dyn
+        if ratio is not None:
+            notes.append(f"M5 track 稳定占比={ratio:.3f}"
+                         f"（每条 track 可见帧数/帧集帧数的均值 → §7.1 track_consensus）")
         if use_inventory_cache:
             _save_inventory(out_dir, scene_name, key, objects,
                             {k: v for k, v in stats.items() if k != "dynamic_masks"},
@@ -907,6 +1015,11 @@ def bind_objects_for_scene(
     else:
         # 缓存命中：G9/G7 是 scene 级统计，直接复用缓存值（不重算、不回读掩码）——
         # 与首次计算口径完全一致；回读掩码重算会把"全零帧"算进 IoU 对，反而偏。
+        if "track_stable_ratio" not in stats:
+            # 老缓存缺该键（或调用方手写 stats）→ 由清单现算，保证证据不缺项
+            ratio = track_stable_ratio(objects, n_frames)
+            if ratio is not None:
+                stats["track_stable_ratio"] = ratio
         notes.append(f"M5 复用缓存 G7/G9 统计（track_ious="
                      f"{'有' if stats.get('track_ious') else '无'}，"
                      f"dynamic_ratio={'有' if 'dynamic_ratio' in stats else '无'}，"
@@ -917,7 +1030,8 @@ def bind_objects_for_scene(
         sup_objs, sup_stats, sup_note = _bind_question_supplement(
             frames, probe, question, objects, depth_maps, c2w_list, intrinsics,
             grid_transform=grid_transform, out_dir=out_dir, scene_name=scene_name,
-            predictor=predictor, vlm_client=vlm_client, handle=handle, seed=seed)
+            predictor=predictor, vlm_client=vlm_client, handle=handle, seed=seed,
+            point_conf=point_conf)
         if sup_note:
             notes.append(sup_note)
         if sup_objs:
@@ -1019,13 +1133,18 @@ def question_object_names_from_vlm(question: str, client, *,
 
 def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w_list,
                               intrinsics, *, grid_transform, out_dir, scene_name,
-                              predictor, vlm_client, handle, seed: Optional[int] = None
-                              ) -> tuple[list[ObjectInstance], dict, str]:
+                              predictor, vlm_client, handle, seed: Optional[int] = None,
+                              point_conf=None
+                              ) -> tuple[list[ObjectRecord], dict, str]:
     """逐题补漏：只把"清单里还没有"的问题目标物绑进来（不重算已有对象）。
 
     返回 `(新增对象, stats, note)`。判定"已有"用**类别 + 世界质心距离**（与 3D
     去重同源口径），不再对全量对象重跑 SAM2 —— 这是 M5 复用（handoff 优先级 2）
     的关键：同一 scene 的后续 episode 只需为补漏框付 GPU 成本。
+
+    v6：新增对象标 `grounding_status="question_targeted_fill"`（§5.6 / §7.1
+    `object_grounding` 的题级证据）；`track_id` 用 `qtrk*` 命名空间 —— 与基础清单的
+    `trk*` 不重名，否则 `count_objects` 的 track 去重会把两条不同对象并成一条。
     """
     hints: list[str] = []
     boxes: list[list[float]] = []
@@ -1060,7 +1179,10 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
                           handle=handle, question=question)
     cand = bind_masks_to_world(masks, depth_maps, c2w_list, intrinsics,
                                class_hints=hints or None, out_dir=out_dir,
-                               scene_name=scene_name, grid_transform=grid_transform)
+                               scene_name=scene_name, grid_transform=grid_transform,
+                               point_conf=point_conf,
+                               track_prefix=TRACK_PREFIX_QUESTION,
+                               grounding_status="question_targeted_fill")
     cand, n_dup, groups = _dedupe_by_world_centroid(cand, depth_maps,
                                                     masks_per_object=masks)
     d = np.asarray(depth_maps, dtype=np.float64)
@@ -1068,12 +1190,12 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
     tol = 0.15 * (float(np.median(d)) if d.size else 1.0)   # TODO_CALIBRATE：同 3D 去重口径
 
     def _hint(o) -> str:
-        h = str(getattr(o, "class_hint", "") or "").strip().lower()
+        h = str(getattr(o, "category_name", "") or "").strip().lower()
         return "" if h in ("unverified", "unknown") else h
 
-    kept: list[ObjectInstance] = []
+    kept: list[ObjectRecord] = []
     kept_masks: list[dict] = []
-    base_ids = {o.instance_id for o in existing}
+    base_ids = {o.obj_id for o in existing}
     for o, g in zip(cand, groups):
         co = np.asarray(o.centroid_world, dtype=np.float64)
         dup = False
@@ -1092,10 +1214,12 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
     if not kept:
         return [], {}, (f"M5 逐题补漏：{len(boxes)} 个问题目标框均已在场景清单中"
                         f"（复用，不重算）")
-    out: list[ObjectInstance] = []
+    out: list[ObjectRecord] = []
     for i, o in enumerate(kept):
         new_id = f"obj_{len(base_ids) + i}"
-        out.append(o.model_copy(update={"instance_id": new_id}))
+        # obj_id 换成 scene 内唯一的稳定 id；track_id / grounding_status /
+        # duplicate_suspect 原样保留（track 由本次传播产生，`qtrk*` 命名空间）
+        out.append(o.model_copy(update={"obj_id": new_id}))
     stats: dict = {}
     from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
 
@@ -1103,14 +1227,44 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
     if ious:
         stats["track_ious"] = ious
     return out, stats, (f"M5 逐题补漏：问题目标框 {len(boxes)} 个 → 新绑 {len(out)} 个"
-                        f"（{sorted({o.class_hint for o in out})}）")
+                        f"（{sorted({o.category_name for o in out})}）")
+
+
+def track_stable_ratio(objects: Sequence[ObjectRecord],
+                       n_frames: int) -> Optional[float]:
+    """跨帧 track 稳定占比（§7.1 `track_consensus` 的输入；[TODO_CALIBRATE]）。
+
+    定义：每条 track 的存活率 = 该对象在帧集里可见的帧数 / 帧集帧数，再对清单取均值。
+    计数题依赖的是"同一条 track 是否跨帧稳定存在"（`track_id` 的共识），
+    而不是逐帧 IoU —— 后者是 M4 的诊断量，本函数只回答"track 是否够稳"。
+
+    `n_frames <= 0` 或无对象 → `None`（证据侧按 unavailable 处理，**不伪造 1.0**）。
+    """
+    if n_frames <= 0 or not objects:
+        return None
+    vals = [min(1.0, len(set(int(i) for i in (o.visible_frames or []))) / float(n_frames))
+            for o in objects]
+    return float(sum(vals) / len(vals))
+
+
+def _with_dedup_verdict(o, *, suspect: bool, track_id: str):
+    """把 v6 去重结论（`duplicate_suspect` / `track_id`）写回对象。
+
+    优先 `model_copy`（不改动调用方传入的原对象）；鸭子类型替身退回 `setattr`。
+    """
+    updates = {"duplicate_suspect": bool(suspect), "track_id": track_id}
+    if hasattr(o, "model_copy"):
+        return o.model_copy(update=updates)
+    for k, v in updates.items():                        # pragma: no cover - 替身
+        setattr(o, k, v)
+    return o
 
 
 def _dedupe_by_world_centroid(objects, depth_maps, *, masks_per_object=None,
                               rel_tol: float = 0.15):
     """3D 去重（§3 M5 字段 5）：**类别 + 世界质心距离 + 时序重叠**三判据。
 
-    - 类别：`class_hint` 大小写不敏感相等（任一侧为空/unknown 视为通配，不否决）；
+    - 类别：`category_name` 大小写不敏感相等（任一侧为空/unknown 视为通配，不否决）；
     - 质心：距离 < `场景深度中位 × rel_tol`（[TODO_CALIBRATE] 起始参考 0.15）；
     - 时序重叠：两份候选的支撑帧集合有交集（同一时刻同位置才判同一实例；
       支撑帧未知时退化为只看前两条）。
@@ -1118,11 +1272,22 @@ def _dedupe_by_world_centroid(objects, depth_maps, *, masks_per_object=None,
     三判据**同时**满足才合并 —— 只按质心合并会误合并"先后出现在同一位置"的不同物体
     （C-9：单帧常看不到目标，靠多帧提示补齐，故必须区分"同物多帧"与"多物同地"）。
 
-    返回 `(kept_objects, n_dup, groups)`；`groups[k]` 为保留对象 k 吸收的原始下标列表，
+    v6 证据（§5.6 / §7.1 track_consensus）：
+
+    - `track_id`：保留对象的跨帧 track 身份 = **幸存代表的传播身份**（已有则原样保留，
+      缺省时按输入下标补 `trk<idx>`，确定性）。被合并的候选只是代表的同一条 track
+      的重复观测，不构成新 track —— `count_objects` 靠这一点"不数清单长度"；
+    - `duplicate_suspect`：① 该组吸收了 ≥2 条候选（清单长度确定被高估）；
+      ② 去重后仍有两对象**同类且世界质心落在同一容差内**（时序不重叠 → 按纪律
+      不合并，但"同地同类不同时"仍有重复绑定嫌疑）→ 两条都标嫌疑。
+      两条规则的阈值口径与合并判据同源（`rel_tol`），[TODO_CALIBRATE]。
+
+    返回 `(kept_objects, n_dup, groups)`；`groups[k]` 为保留对象 k 吸收的原始下标列表
+    （含代表自身，故 `len(groups[k]) >= 2` ⇔ 发生过合并），
     供调用方在去重后的对象集上重算 G9。
     """
-    if len(objects) <= 1:
-        return list(objects), 0, [[i] for i in range(len(objects))]
+    if not objects:
+        return [], 0, []
     d = np.asarray(depth_maps, dtype=np.float64)
     d = d[np.isfinite(d) & (d > 0)]
     med = float(np.median(d)) if d.size else 1.0
@@ -1135,14 +1300,19 @@ def _dedupe_by_world_centroid(objects, depth_maps, *, masks_per_object=None,
         return set(m.keys()) if hasattr(m, "keys") else set()
 
     def _hint_of(o) -> str:
-        h = str(getattr(o, "class_hint", "") or "").strip().lower()
+        h = str(getattr(o, "category_name", "") or "").strip().lower()
         return "" if h in ("unverified", "unknown") else h
+
+    def _repr_track(o, idx: int) -> str:
+        tid = getattr(o, "track_id", None)
+        return str(tid) if tid else f"{TRACK_PREFIX_BASE_LIST}{idx}"
 
     kept: list = []
     groups: list[list[int]] = []
     group_frames: list[set[int]] = []      # 每个保留组的支撑帧并集（时序重叠判据用）
+    group_track: list[str] = []            # 每个保留组的 track 身份（幸存代表）
     n_dup = 0
-    for idx, o in sorted(enumerate(objects), key=lambda kv: -float(kv[1].confidence)):
+    for idx, o in sorted(enumerate(objects), key=lambda kv: -float(kv[1].det_conf)):
         c = np.asarray(o.centroid_world, dtype=np.float64)
         frames = _frames_of(idx)
         hit = -1
@@ -1166,6 +1336,26 @@ def _dedupe_by_world_centroid(objects, depth_maps, *, masks_per_object=None,
         kept.append(o)
         groups.append([idx])
         group_frames.append(set(frames))
+        group_track.append(_repr_track(o, idx))
+
+    # ---- v6：把去重结论写成证据字段（track_id 统一为组内幸存代表 + 重复嫌疑）----
+    suspect = {k for k, g in enumerate(groups) if len(g) >= 2}
+    # 去重后仍"同类 + 质心过近"的两条（时序不重叠故未合并）→ 都标嫌疑。
+    # 类别为空（unverified/unknown）不参与该判据：那类对象的质心是占位 [0,0,0]。
+    for a in range(len(kept)):
+        ha = _hint_of(kept[a])
+        if not ha:
+            continue
+        ca = np.asarray(kept[a].centroid_world, dtype=np.float64)
+        for b in range(a + 1, len(kept)):
+            if _hint_of(kept[b]) != ha:
+                continue
+            cb = np.asarray(kept[b].centroid_world, dtype=np.float64)
+            if np.linalg.norm(ca - cb) < tol:
+                suspect.add(a)
+                suspect.add(b)
+    kept = [_with_dedup_verdict(o, suspect=k in suspect, track_id=group_track[k])
+            for k, o in enumerate(kept)]
     return kept, n_dup, groups
 
 

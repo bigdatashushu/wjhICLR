@@ -56,6 +56,7 @@ def _out(state="answer", *, verify=True, flags=(), route="full_3d"):
 
 def test_collect_health_rates_and_histogram():
     outs = [_out(), _out("answer_best_effort", flags=["no_tool_fallback"]),
+            # 旧 trace 的 v5 门控 flag（v6 已不再产生，§20；读旧 trace 必须仍识别）
             _out("unavailable", verify=None), _out("unanswerable", flags=["g8_size_reject"])]
     h = collect_health(outs, label="gen-1")
     assert h.n_episodes == 4
@@ -142,10 +143,13 @@ def test_rollback_only_on_rollback_action(tmp_path):
     cand = CandidateRevision(
         revision_id="rev-1", root_candidate_id="cand-1", parent_version=None,
         candidate_type="skill", spec_content=json.dumps({
-            "skill_id": "sk-1", "semver": "1.0.0", "task_type": "object_counting",
-            "description": "d", "call_graph_template": "x", "requires_artifacts": [],
-            "minimum_quality": 0.0, "supported_coordinate_frames": ["world"],
-            "metric_scale_required": False, "validation_assertions": []}),
+            # v6 §5.8 SkillSpec（题型 + 证据签名；v5 的 requires_artifacts /
+            # minimum_quality / metric_scale_required 已废止，§20）
+            "skill_id": "sk-1", "version": "1.0.0",
+            "applicable_question_types": ["object_counting"],
+            "required_evidence_signature": {"object_detection": "available"},
+            "skill_family": "counting", "source": "real",
+            "description": "d", "call_graph_template": "x"}),
         status="promoted", induction_trace_refs=[], evidence_lineage_ref="",
         created_by="human", created_at="1970-01-01T00:00:00+00:00")
     promote(str(store), cand)

@@ -9,8 +9,9 @@
   "v5-no-g8-g5-optional"` + 同 `env_versions` 的 golden；其余一律 hard fail，
   **不得**自动重算、也不得静默比较（HC39）。
 
-旧 golden 只读归档在 `tests/golden/archive_v4/`，其 manifest 标
-`incomparable_with_v5=true`。
+旧 golden 只读归档在 `tests/archive_v5/golden_archive_v4/`，其 manifest 标
+`incomparable_with_v5=true`；v5 golden 本体亦已随 v5 回归测试归档到
+`tests/archive_v5/golden_v5/`（v6 §20：旧 golden 只读，不参与收集）。
 """
 
 from __future__ import annotations
@@ -60,8 +61,8 @@ def load_golden_stats(path: Union[str, Path], *,
     if ver != GOLDEN_VERSION:
         raise GoldenVersionError(
             f"golden_version={ver!r}（需要 {GOLDEN_VERSION!r}）。旧 golden 与 v5 不可比"
-            "（HC39）：请用 tests/golden/v5/make_golden.py 重新生成，"
-            "旧数据只读归档在 tests/golden/archive_v4/")
+            "（HC39）：请用 tests/archive_v5/golden_v5/make_golden.py 重新生成，"
+            "旧数据只读归档在 tests/archive_v5/golden_archive_v4/")
     if data.get("schema_version") != GOLDEN_SCHEMA_VERSION:
         raise GoldenVersionError(
             f"golden schema_version={data.get('schema_version')!r} "
@@ -99,7 +100,7 @@ def write_golden_manifest(path: Union[str, Path], *, artifact_version: str,
         "env_versions": _env_versions(),
         "pip_freeze_hash": _pip_hash(),
         "code_commit": _safe_commit(),
-        "generated_by": "tests/golden/v5/make_golden.py",
+        "generated_by": "tests/archive_v5/golden_v5/make_golden.py",
         "incomparable_with_v5": False,
         "notes": ("v5 golden 由 v5 Schema/pipeline 重新生成：G5 为条件项（本夹具无真 BA → "
                   "None，不入 overall_quality 分母）、不含 G8 字段。"),

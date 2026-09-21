@@ -1,8 +1,11 @@
-"""G-66 多 seed 聚合与统计检验（§16.3、§16 统计检验表）。
+"""G-66 多 seed 聚合与统计检验（v6 §18.2/§18.3/§18.4；v5 章节号为 §16.3）。
 
-论文规范（§16.3）：
-- 所有主表数字 **≥3 seed**，报 mean ± std；
-- paired A/B 报 95% BCa bootstrap CI + Wilcoxon（见 `evolution/paired_score.py`）；
+论文规范（v6 口径）：
+- **噪声底（§18.3）**：同一配置重复 **≥3 seed**，报逐题一致率与 per-task 波动；
+  paper-eligible 需 **≥5 seed**（§18.6）。多副本轮询只用于吞吐、不得用于对比；
+- **样本量三档（§18.2）**：每题型 16/32/32+ 题、3/3/5 seed，二值 SE = 0.5/√N
+  （表与校验在 `evaluation/experiment_protocol.py`；本模块只提供统计内核）；
+- paired A/B 报 95% BCa bootstrap CI + McNemar/Wilcoxon（见 `evolution/paired_score.py`）；
 - 多 seed 均值比较：双样本 t-test 或 Mann-Whitney U；
 - 多方法整体比较：Friedman test + Nemenyi post-hoc；
 - 相关性（重建质量 vs MCA/MRA）：Spearman ρ；
@@ -18,13 +21,15 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass, field
 from itertools import combinations
-from typing import Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
-# 论文规范：主表最少 seed 数（§16.3；不足时明确警告，不静默降级）
+# 噪声底：主表最少 seed 数（§18.3；不足时明确警告，不静默降级）
 MIN_SEEDS_FOR_MAIN_TABLE = 3
-# 显著性水平（§16.3）
+# paper-eligible 最少 seed 数（§18.6：paper ≥5 seed）
+MIN_SEEDS_PAPER_ELIGIBLE = 5
+# 显著性水平（§18.4）
 ALPHA = 0.05
 
 
@@ -119,12 +124,113 @@ def aggregate_runs(runs: Sequence, alpha: float = ALPHA) -> dict[str, SeedAggreg
     return out
 
 
-def check_seed_count(n_seeds: int, min_seeds: int = MIN_SEEDS_FOR_MAIN_TABLE) -> Optional[str]:
-    """seed 数不足时返回警告文本（论文主表必须 ≥3，§16.3）。"""
-    if n_seeds < min_seeds:
-        return (f"仅 {n_seeds} 个 seed < {min_seeds}：不满足论文主表要求（§16.3），"
-                "结论不得进主表")
+def check_seed_count(n_seeds: int, min_seeds: int = MIN_SEEDS_FOR_MAIN_TABLE,
+                     *, paper_eligible: bool = False) -> Optional[str]:
+    """seed 数不足时返回警告文本（不静默降级）。
+
+    - 默认门槛 = 噪声底 **≥3 seed**（§18.3，`MIN_SEEDS_FOR_MAIN_TABLE`）；
+    - `paper_eligible=True` 时门槛抬到 **≥5 seed**（§18.6）。
+    """
+    required = max(min_seeds, MIN_SEEDS_PAPER_ELIGIBLE) if paper_eligible else min_seeds
+    if n_seeds < required:
+        if paper_eligible:
+            return (f"仅 {n_seeds} 个 seed < {required}：不满足 paper-eligible 要求"
+                    f"（§18.6 需 ≥{required} seed），结论不得进主表")
+        return (f"仅 {n_seeds} 个 seed < {required}：不满足论文主表要求"
+                f"（§18.3 噪声底需 ≥{required} seed），结论不得进主表")
     return None
+
+
+def per_question_agreement(per_question: Mapping[str, Sequence[Optional[bool]]]) -> dict:
+    """§18.3 逐题一致率：同一配置多 seed 重复时，逐题结果一致的比例。
+
+    `per_question[qa_id]` = 各 seed 在该题上的二值结果（`None` = 该 seed 未产出）。
+    - 只有**≥2 个 seed** 有结果的题才进分母（1 个 seed 谈不上"一致"，也谈不上不稳定）；
+    - `agreement_rate` 在分母为 0 时返回 `None`（不臆造 0/1）；
+    - 返回 `unanimous_questions` / `split_questions` 便于解释"波动来自哪几题"。
+    """
+    n_questions = len(per_question)
+    observed: dict[str, int] = {}
+    unanimous: list[str] = []
+    split: list[str] = []
+    for qa_id, values in per_question.items():
+        vals = [bool(v) for v in (values or []) if v is not None]
+        if len(vals) < 2:
+            continue
+        observed[str(qa_id)] = len(vals)
+        (unanimous if len(set(vals)) == 1 else split).append(str(qa_id))
+    n_obs = len(observed)
+    return {
+        "n_questions": int(n_questions),
+        "n_questions_observed": n_obs,
+        "n_questions_single_seed": int(n_questions - n_obs),
+        "n_unanimous": len(unanimous),
+        "n_split": len(split),
+        "agreement_rate": (len(unanimous) / n_obs) if n_obs else None,
+        "unanimous_questions": sorted(unanimous),
+        "split_questions": sorted(split),
+        "notes": ([f"{n_questions - n_obs} 题只有 <2 个 seed 结果，不计入一致率分母"
+                   "（不臆造一致）"] if n_questions - n_obs else []),
+    }
+
+
+def per_question_seed_matrix(runs_by_seed: Mapping[Any, Sequence[Any]],
+                            correct_by_qa: Mapping[str, Optional[bool]]
+                            ) -> dict[str, list[Optional[bool]]]:
+    """把"逐 seed 的 episode/trace 列表 + 逐题正确性"整理成 §18.3 的逐题 seed 矩阵。
+
+    `runs_by_seed[seed]` 为该 seed 的 episode/trace 序列（`EpisodeTrace` /
+    `TraceRecord` / 同构对象 / dict 均可，取 `qa_id`（退化到 `episode_id`）作为键）；
+    `correct_by_qa[qa_id]` 为该题的正确性（`None` = 未评，保留为缺失）。
+    返回 `{qa_id: [seed 顺序上的二值结果…]}`，直接喂给 `per_question_agreement`
+    （同一题缺某个 seed 时该位置为 `None`，不臆造）。
+    """
+    def _qa_of(rec: Any) -> str:
+        if isinstance(rec, Mapping):
+            return str(rec.get("qa_id") or rec.get("episode_id") or "")
+        return str(getattr(rec, "qa_id", "") or getattr(rec, "episode_id", "") or "")
+
+    seeds = list(runs_by_seed)
+    matrix: dict[str, list[Optional[bool]]] = {}
+    for recs in runs_by_seed.values():
+        for rec in recs or []:
+            qa_id = _qa_of(rec)
+            if qa_id:
+                matrix.setdefault(qa_id, [None] * len(seeds))
+    for i, seed in enumerate(seeds):
+        for rec in runs_by_seed[seed] or []:
+            qa_id = _qa_of(rec)
+            if not qa_id:
+                continue
+            val = correct_by_qa.get(qa_id)
+            matrix[qa_id][i] = None if val is None else bool(val)
+    return matrix
+
+
+def seed_fluctuation(per_task_scores: Mapping[str, Sequence[float]]) -> dict:
+    """§18.3 per-task 波动：同配置多 seed 下逐题型的均值/极差/离散度。
+
+    返回 `{task: {n_seeds, mean, std, min, max, range, values}}`；
+    分母为 0（该任务在所有 seed 都缺席）时各项为 `None`（不臆造）。
+    """
+    out: dict[str, dict] = {}
+    for task, values in (per_task_scores or {}).items():
+        vals = [float(v) for v in (values or []) if v is not None and np.isfinite(v)]
+        if not vals:
+            out[str(task)] = {"n_seeds": 0, "mean": None, "std": None,
+                              "min": None, "max": None, "range": None, "values": []}
+            continue
+        arr = np.asarray(vals, dtype=float)
+        out[str(task)] = {
+            "n_seeds": int(arr.size),
+            "mean": float(arr.mean()),
+            "std": float(arr.std(ddof=1)) if arr.size > 1 else None,
+            "min": float(arr.min()),
+            "max": float(arr.max()),
+            "range": float(arr.max() - arr.min()),
+            "values": [float(v) for v in arr],
+        }
+    return out
 
 
 # ------------------------------------------------------------------ 效应量 ----

@@ -16,7 +16,7 @@ import json
 import numpy as np
 import pytest
 
-from skill3d.schemas import ObjectInstance
+from skill3d.schemas import ObjectRecord
 from skill3d.segmentation.sam2_tracker import (
     _detector_boxes,
     _inventory_key,
@@ -34,10 +34,10 @@ def _frames(n: int):
     return [rng.integers(0, 255, (H, W, 3), dtype=np.uint8) for _ in range(n)]
 
 
-def _inst(iid="obj_0", hint="chair", centroid=(0.0, 0.0, 3.0)):
-    return ObjectInstance(instance_id=iid, class_hint=hint, mask_per_frame="",
-                          pointcloud_world="", centroid_world=list(centroid),
-                          bbox=[0.0] * 6, confidence=1.0)
+def _inst(iid="obj_0", name="chair", centroid=(0.0, 0.0, 3.0), track_id="trk0"):
+    return ObjectRecord(obj_id=iid, category_name=name, mask_per_frame="",
+                        pointcloud_world="", centroid_world=list(centroid),
+                        bbox=[0.0] * 6, det_conf=1.0, track_id=track_id)
 
 
 # ----------------------------------------------------------------- 缓存 ----
@@ -50,7 +50,8 @@ def test_inventory_cache_roundtrip(tmp_path):
     loaded = _load_inventory(tmp_path, "sc", key)
     assert loaded is not None
     got, stats, g7 = loaded
-    assert [o.instance_id for o in got] == ["obj_0"]
+    assert [o.obj_id for o in got] == ["obj_0"]
+    assert got[0].track_id == "trk0" and got[0].category_name == "chair"
     assert stats["track_ious"] == [0.5] and stats["dynamic_ratio"] == 0.1
     assert g7 == ""
 
@@ -72,6 +73,18 @@ def test_inventory_cache_miss_when_mask_ref_missing(tmp_path):
     payload["objects"][0]["mask_per_frame"] = str(tmp_path / "gone.npy")
     p.write_text(json.dumps(payload))
     assert _load_inventory(tmp_path, "sc", key) is None
+
+
+def test_inventory_cache_miss_when_pointconf_ref_missing(tmp_path):
+    """逐点 conf ref 丢失 → 同样视为未命中（conf 与点云必须成对可用，§12.2）。"""
+    o = _inst()
+    o.pointconf_world = str(tmp_path / "conf.npy")
+    np.save(o.pointconf_world, np.ones(8))
+    key = _inventory_key("sc", "fsh", np.zeros((2, H, W)), 2)
+    _save_inventory(tmp_path, "sc", key, [o], {}, None)
+    assert _load_inventory(tmp_path, "sc", key) is not None      # ref 在 → 命中
+    (tmp_path / "conf.npy").unlink()
+    assert _load_inventory(tmp_path, "sc", key) is None          # ref 没了 → 未命中
 
 
 def test_inventory_cache_corrupt_json_is_a_miss(tmp_path):
@@ -186,8 +199,15 @@ def test_bind_objects_reuses_scene_inventory_cache(tmp_path):
     assert first_calls == 1
     assert calls["n"] == first_calls          # 第二次没有重跑传播
     assert any("缓存命中" in n for n in notes2)
-    assert [o.instance_id for o in objs1] == [o.instance_id for o in objs2]
+    assert [o.obj_id for o in objs1] == [o.obj_id for o in objs2]
+    # v6 §5.6：缓存往返后 track 身份与重复嫌疑原样保留（计数口径跨 episode 稳定）
+    assert [o.track_id for o in objs1] == [o.track_id for o in objs2]
+    assert [o.category_name for o in objs1] == [o.category_name for o in objs2]
+    assert all(o.grounding_status == "base_list" for o in objs2)
     assert stats2.get("dynamic_ratio") == pytest.approx(stats1.get("dynamic_ratio"))
+    # §7.1 track_consensus 的占比输入跨 episode 一致（同一份清单 → 同一证据）
+    assert stats2.get("track_stable_ratio") == pytest.approx(
+        stats1.get("track_stable_ratio"))
 
 
 def test_bind_objects_different_frame_set_does_not_reuse(tmp_path):

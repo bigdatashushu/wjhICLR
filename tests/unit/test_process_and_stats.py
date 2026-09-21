@@ -99,6 +99,8 @@ def test_process_metrics_core_rates():
         _outcome(final_state="unanswerable", error="timeout", verify=False, steps=0),
         _outcome(final_state="answer_best_effort", flags=["no_tool_fallback"]),
         _outcome(final_state="unavailable", verify=None, steps=0),
+        # 旧 trace 的 v5 门控 flag：v6 不再产生（G8 已退役，§20），但**读旧 trace**
+        # 必须仍然识别（`process_metrics` 明确保留该 flag 只为回读历史落盘）
         _outcome(final_state="unanswerable", flags=["g8_size_reject"]),
     ]
     m = aggregate_process_metrics(outs)

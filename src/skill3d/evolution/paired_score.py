@@ -1,12 +1,19 @@
-"""M17 确定性配对评分（§7 统计与复现）：
+"""M17 确定性配对评分（§7 统计与复现 + v6 §18.4 paired A/B 口径）：
 
 - paired **BCa** bootstrap 95% CI（`scipy.stats.bootstrap(paired=True, method="BCa")`，
   `n_resamples=9999`；scipy 不可用/数据退化时回退 numpy 百分位实现，同 seed 可复现）；
+  实际用的方法由 `paired_bootstrap_ci_detailed` 显式回报（不把百分位法说成 BCa）；
+- **McNemar 配对检验**（v6 §18.4：逐题二值结果的首选检验；`mcnemar_test`）——
+  小样本用精确二项检验，大样本用带连续性校正的卡方近似；
 - `scipy.stats.wilcoxon` 符号秩检验；**退化样本**（零方差/完全相同组）返回 `None`
   并标注"退化 → 判为不显著"（§7 / E-2），不得声称有显著差异；
-- 多重比较校正：per-slice p 值按切片数做 **Bonferroni**（§7）；
-- 效应量：**Cliff's delta** 与配对 **Cohen's d**（§7）；
+- 多重比较校正：per-slice p 值按切片数做 **Bonferroni**（§7 / §18.4）；
+- 效应量：**Cliff's delta** 与配对 **Cohen's d**（§7 / §18.4）；
 - `slice_table` 按题型切片；`slice_no_regression` 判定（容忍度 TODO_CALIBRATE）。
+
+v6 §18.4 的完整实验协议（三级隔离 / 样本量三档 / 噪声底 / evidence-state 报告 /
+paper_eligible / 红线 9）在 `skill3d/evaluation/experiment_protocol.py`，本模块只提供
+**统计内核**，不携带任何 split 语义。
 """
 
 from __future__ import annotations
@@ -20,10 +27,30 @@ try:
 except Exception:  # pragma: no cover
     _scipy_stats = None
 
-# §7：paired A/B 用 BCa bootstrap + 9999 次重采样
+# §7/§18.4：paired A/B 用 BCa bootstrap + 9999 次重采样
 N_BOOTSTRAP = 9999
 SLICE_REGRESSION_TOL = 0.01
 WILCOXON_P_THRESHOLD = 0.05
+# §18.4：McNemar 判别对（b+c）少于此数用精确二项检验，否则用卡方近似
+# TODO_CALIBRATE：25 是文献常用的精确/渐近分界，非本系统标定值。
+MCNEMAR_EXACT_MAX_DISCOUNT = 25
+# §18.4：退化样本的固定注记（不得改写为"不显著但已检验"这类含混表述）
+DEGENERATE_NOTE = "退化样本 → 判为不显著"
+
+
+def normalize_p(p) -> float | None:
+    """p 值归一化：`None`/`nan`/`inf` 一律变 `None`（§18.4 退化样本纪律）。
+
+    绝不让 nan 混进论文表格 —— nan 既不"显著"也不"不显著"，它的正确含义是
+    "这个检验在退化样本上没有定义"。
+    """
+    if p is None:
+        return None
+    try:
+        v = float(p)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
 
 
 def _as_paired(scores_a, scores_b) -> tuple[np.ndarray, np.ndarray]:
@@ -45,22 +72,24 @@ def is_degenerate(diffs: np.ndarray) -> bool:
     return bool(np.all(d == d[0]))
 
 
-def paired_bootstrap_ci(scores_a: np.ndarray, scores_b: np.ndarray,
-                        n_resamples: int = N_BOOTSTRAP,
-                        seed: int = 0,
-                        method: str = "BCa") -> tuple[float, float]:
-    """配对 bootstrap 95% CI（对每对差值重采样）。
+def paired_bootstrap_ci_detailed(scores_a: np.ndarray, scores_b: np.ndarray,
+                                 n_resamples: int = N_BOOTSTRAP,
+                                 seed: int = 0,
+                                 method: str = "BCa") -> dict:
+    """配对 bootstrap 95% CI，并**如实回报实际用的方法**（§18.4）。
 
-    首选 `scipy.stats.bootstrap(paired=True, method="BCa")`（§7 口径）；
-    scipy 缺失、BCa 在退化数据上不可解、或样本过少时回退百分位 bootstrap
-    （同样受 `seed` 控制，保证同 seed 逐位可复现）。
+    首选 `scipy.stats.bootstrap(paired=True, method="BCa")`；scipy 缺失、BCa 在退化
+    数据上不可解、或样本过少时回退百分位 bootstrap（同样受 `seed` 控制，同 seed 逐位
+    可复现）。回退时 `method` 字段写明，避免把百分位法当成 BCa 写进论文。
     """
     a, b = _as_paired(scores_a, scores_b)
     n = a.shape[0]
     if n == 0:
-        return float("nan"), float("nan")
-
-    if _scipy_stats is not None and not is_degenerate(b - a) and n >= 3:
+        return {"lo": float("nan"), "hi": float("nan"), "n_pairs": 0,
+                "method": "none(empty)", "degenerate": True,
+                "note": "无配对样本 → CI 未定义"}
+    degenerate = is_degenerate(b - a)
+    if _scipy_stats is not None and not degenerate and n >= 3:
         try:
             res = _scipy_stats.bootstrap(
                 (a, b),
@@ -73,7 +102,9 @@ def paired_bootstrap_ci(scores_a: np.ndarray, scores_b: np.ndarray,
             )
             lo, hi = res.confidence_interval
             if np.isfinite(lo) and np.isfinite(hi):
-                return float(lo), float(hi)
+                return {"lo": float(lo), "hi": float(hi), "n_pairs": int(n),
+                        "method": f"scipy.bootstrap(paired, {method})",
+                        "degenerate": False, "note": ""}
         except Exception:  # noqa: BLE001 - BCa 在退化/并列数据上会抛，按 §7 回退
             pass
 
@@ -83,7 +114,117 @@ def paired_bootstrap_ci(scores_a: np.ndarray, scores_b: np.ndarray,
         idx = rng.integers(0, n, size=n)
         diffs[i] = (b[idx] - a[idx]).mean()
     lo, hi = np.percentile(diffs, [2.5, 97.5])
-    return float(lo), float(hi)
+    note = ""
+    if degenerate:
+        note = (f"{DEGENERATE_NOTE}：差值零方差 → bootstrap 重采样无信息，"
+                f"CI 即点估计，不得据此声称显著（§18.4）")
+    return {"lo": float(lo), "hi": float(hi), "n_pairs": int(n),
+            "method": f"percentile(fallback{'/degenerate' if degenerate else ''})",
+            "degenerate": bool(degenerate), "note": note}
+
+
+def paired_bootstrap_ci(scores_a: np.ndarray, scores_b: np.ndarray,
+                        n_resamples: int = N_BOOTSTRAP,
+                        seed: int = 0,
+                        method: str = "BCa") -> tuple[float, float]:
+    """配对 bootstrap 95% CI 的 `(lo, hi)`（细节见 `paired_bootstrap_ci_detailed`）。"""
+    d = paired_bootstrap_ci_detailed(scores_a, scores_b, n_resamples=n_resamples,
+                                     seed=seed, method=method)
+    return d["lo"], d["hi"]
+
+
+def _binary_arrays(control, treatment) -> tuple[np.ndarray, np.ndarray, int]:
+    """两臂配对二值结果 → (control, treatment, 丢弃的配对数)。
+
+    `None`（或 `nan`）成对丢弃（并计数，报告里如实说明丢弃了多少对）；非二值取值
+    raise（把 MRA 之类的连续值当二值喂进来是调用方 bug，不得静默取整）。
+    """
+    a = np.asarray(list(control), dtype=object).ravel()
+    b = np.asarray(list(treatment), dtype=object).ravel()
+    if a.shape != b.shape:
+        raise ValueError(f"paired 要求两臂等长：{a.shape[0]} vs {b.shape[0]}")
+    keep = [(x, y) for x, y in zip(a, b)
+            if not _is_missing(x) and not _is_missing(y)]
+    dropped = int(a.shape[0] - len(keep))
+    ax = np.array([_to_bit(x) for x, _ in keep], dtype=float)
+    bx = np.array([_to_bit(y) for _, y in keep], dtype=float)
+    return ax, bx, dropped
+
+
+def _is_missing(value) -> bool:
+    """缺结果判定（`None` / `nan` / `pandas.NA` 之类的 NaN 语义值）。"""
+    if value is None:
+        return True
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    try:
+        return bool(math.isnan(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _to_bit(value) -> float:
+    if isinstance(value, (bool, np.bool_)):
+        return float(value)
+    f = float(value)
+    if f not in (0.0, 1.0):
+        raise ValueError(f"McNemar/配对二值检验只接受 0/1/bool，收到 {value!r}")
+    return f
+
+
+def mcnemar_test(control, treatment) -> dict:
+    """McNemar 配对检验（§18.4）。
+
+    `control` = 直答臂逐题二值结果，`treatment` = 程序臂逐题二值结果（按 qa 对齐）。
+    `b` = 程序对有/直答错的判别对（treatment win），`c` = 反向。
+
+    - 判别对 `b+c < MCNEMAR_EXACT_MAX_DISCOUNT` → 精确二项检验（双侧）；
+    - 否则 → 带连续性校正的卡方近似（df=1）；
+    - **完全相同组**（b+c=0）→ `p=None` 且 `degenerate=True`，注记
+      "退化样本 → 判为不显著"：没有判别对时检验没有信息，不得报成"p=1.0 已检验"。
+    """
+    ax, bx, dropped = _binary_arrays(control, treatment)
+    n = int(ax.size)
+    b = int(np.sum((bx == 1.0) & (ax == 0.0)))     # treatment 赢
+    c = int(np.sum((bx == 0.0) & (ax == 1.0)))     # control 赢
+    discount = b + c
+    out: dict = {
+        "n_pairs": n, "n_dropped": dropped, "b": b, "c": c,
+        "n_treatment_win": b, "n_control_win": c, "n_tie": n - discount,
+        "degenerate": bool(discount == 0 or n == 0),
+        "note": "", "method": "", "statistic": None, "p": None,
+    }
+    if discount == 0:
+        out["method"] = "degenerate"
+        out["note"] = DEGENERATE_NOTE + (
+            "：全部配对结果相同（无判别对）→ McNemar 无定义" if n else "：无配对样本")
+        return out
+    if discount < MCNEMAR_EXACT_MAX_DISCOUNT:
+        out["method"] = "exact_binomial"
+        out["p"] = normalize_p(_mcnemar_exact_p(b, c))
+    else:
+        stat = (abs(b - c) - 1.0) ** 2 / discount
+        out["method"] = "chi2_continuity_corrected"
+        out["statistic"] = float(stat)
+        out["p"] = normalize_p(_chi2_sf_df1(max(stat, 0.0)))
+    if out["p"] is None:
+        out["note"] = DEGENERATE_NOTE
+    return out
+
+
+def _mcnemar_exact_p(b: int, c: int) -> float:
+    """精确 McNemar 双侧 p（二项分布 n=b+c, p=0.5 的双侧尾概率）。"""
+    n = b + c
+    if n <= 0:
+        return float("nan")
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / (2.0 ** n)
+    return float(min(1.0, 2.0 * tail))
+
+
+def _chi2_sf_df1(x: float) -> float:
+    """卡方分布（df=1）上尾概率：P(X>x) = erfc(sqrt(x/2))。"""
+    return float(math.erfc(math.sqrt(max(x, 0.0) / 2.0)))
 
 
 def wilcoxon_p(scores_a: np.ndarray, scores_b: np.ndarray) -> float | None:
@@ -98,15 +239,14 @@ def wilcoxon_p(scores_a: np.ndarray, scores_b: np.ndarray) -> float | None:
         return None
     if _scipy_stats is not None:
         try:
-            p = float(_scipy_stats.wilcoxon(diff).pvalue)
-            return None if math.isnan(p) else p
+            return normalize_p(_scipy_stats.wilcoxon(diff).pvalue)
         except ValueError:
             return None
     return _wilcoxon_p_numpy(diff)
 
 
 def bonferroni(p: float | None, n_comparisons: int) -> float | None:
-    """Bonferroni 多重比较校正（§7）：`p_corrected = min(1, p × m)`。
+    """Bonferroni 多重比较校正（§18.4）：`p_corrected = min(1, p × m)`。
 
     退化样本（p=None）保持 None；`n_comparisons` ≤ 1 时原样返回。
     """
@@ -118,7 +258,7 @@ def bonferroni(p: float | None, n_comparisons: int) -> float | None:
 
 
 def cliffs_delta(scores_a: np.ndarray, scores_b: np.ndarray) -> float:
-    """Cliff's delta 效应量（§7）：P(b>a) − P(b<a)，取值 [-1, 1]。
+    """Cliff's delta 效应量（§18.4）：P(b>a) − P(b<a)，取值 [-1, 1]。
 
     |delta| 的经验档位：0.147 小 / 0.33 中 / 0.474 大（Romano et al.）。
     """

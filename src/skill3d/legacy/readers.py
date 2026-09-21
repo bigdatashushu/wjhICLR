@@ -29,6 +29,9 @@ from skill3d.schemas.reconstruction import (
 
 CURRENT_SCHEMA_VERSION = "5.0"
 CURRENT_QUALITY_METRIC_VERSION = "v5-no-g8-g5-optional"
+# v6 当前 Schema（运行时**必须**能加载自己的产物；见 `load_artifact_v5` 注释）
+CURRENT_V6_SCHEMA_VERSION = "6.0"
+CURRENT_V6_QUALITY_METRIC_VERSION = "v6-warp-overlap-no-g5"
 
 # 旧尺度字段（HC29/§10.2）：口径（百分数/分数、全宽/半宽、1σ/kσ）无法自证
 LEGACY_SCALE_FIELDS: tuple[str, ...] = (
@@ -92,9 +95,14 @@ def read_legacy_artifact(path: Union[str, Path]) -> LegacyArtifact:
 def load_artifact_v5(path: Union[str, Path]) -> ReconstructionArtifact:
     """当前 artifact 的唯一加载入口（fail-closed）。
 
-    只有 `schema_version == "5.0"` 的 JSON 才会被反序列化为 v5 artifact；
-    其余一律 hard fail（含旧尺度/G8 字段、缺版本字段、非 v5 版本），
-    错误信息给出可执行建议：用 `skill3d.legacy.readers` 审计并重跑 v5 pipeline。
+    接受 **当前 Schema**（`schema_version == "6.0"` 且
+    `quality_metric_version == "v6-warp-overlap-no-g5"`）；v5 及更早的 JSON
+    一律 hard fail（含旧尺度/G8/BA 字段、缺版本字段、版本不符），错误信息给出
+    可执行建议：用 `skill3d.legacy.readers` 只读审计，并重跑 v6 pipeline。
+
+    > 命名说明：函数名保留 v5 时代的调用点签名（`runner` 的两处加载入口都读它），
+    > 但**判据是当前 Schema** —— v6 迁移后运行时必须能加载自己的产物，
+    > 否则 reuse/frozen artifact 路径（硬约束 18 的 A/B 同源）整条不可用。
     """
     p = Path(path)
     raw = json.loads(p.read_text(encoding="utf-8"))
@@ -102,18 +110,26 @@ def load_artifact_v5(path: Union[str, Path]) -> ReconstructionArtifact:
         raise LegacyArtifactError(source_path=str(p), deprecated_fields=set(),
                                   detail="顶层不是 JSON object")
     detected = raw.get("schema_version")
-    if detected != CURRENT_SCHEMA_VERSION:
+    if detected not in (CURRENT_SCHEMA_VERSION, CURRENT_V6_SCHEMA_VERSION):
         raise LegacyArtifactError(
             source_path=str(p),
             deprecated_fields=detect_deprecated_fields(raw),
-            detail=f"schema_version={detected!r}（需要 {CURRENT_SCHEMA_VERSION!r}）")
+            detail=(f"schema_version={detected!r}（需要 "
+                    f"{CURRENT_V6_SCHEMA_VERSION!r} 或 {CURRENT_SCHEMA_VERSION!r}）"))
     qmv = raw.get("quality_metric_version")
-    if qmv != CURRENT_QUALITY_METRIC_VERSION:
+    if detected == CURRENT_V6_SCHEMA_VERSION:
+        if qmv != CURRENT_V6_QUALITY_METRIC_VERSION:
+            raise LegacyArtifactError(
+                source_path=str(p), deprecated_fields=detect_deprecated_fields(raw),
+                detail=(f"quality_metric_version={qmv!r}"
+                        f"（{CURRENT_V6_SCHEMA_VERSION!r} 需要 "
+                        f"{CURRENT_V6_QUALITY_METRIC_VERSION!r}）"))
+    elif qmv != CURRENT_QUALITY_METRIC_VERSION:
         raise LegacyArtifactError(
             source_path=str(p), deprecated_fields=detect_deprecated_fields(raw),
             detail=(f"quality_metric_version={qmv!r}"
                     f"（需要 {CURRENT_QUALITY_METRIC_VERSION!r}）"))
-    # 到这里才允许进 v5 Schema（其中的 legacy/G5 校验器会继续 fail-closed）
+    # 到这里才允许进 Schema（其中的 legacy/G5 校验器会继续 fail-closed）
     return ReconstructionArtifact.model_validate(raw)
 
 

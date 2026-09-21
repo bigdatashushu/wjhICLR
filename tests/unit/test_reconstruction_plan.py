@@ -1,12 +1,15 @@
 """M3 重建 CLI 的纯逻辑单测（无 GPU / 无数据即可跑）：
 
 - `plan_scene_jobs`：按 scene 归并 episode、已有 artifact 跳过（断点恢复幂等，§4 M21）；
-- artifact JSON 往返：G1–G11 的 NaN 占位必须可无损序列化/回读
+- artifact JSON 往返：主门/诊断项的 NaN 占位必须可无损序列化/回读
   （默认 null 序列化会让 artifact 落盘后读不回来，这里做回归保护）；
+  v6 artifact 只接受 `recon_method="vggt"` 且拒绝 v5 尺度字段（§5.2/§20）；
 - `run_jobs`：无权重/依赖时逐 scene 失败但不崩，状态与 note 落账。
 """
 
 from __future__ import annotations
+
+import json
 
 import numpy as np
 import pytest
@@ -59,19 +62,31 @@ def test_artifact_json_roundtrip_keeps_nan(tmp_path):
     art = ReconstructionArtifact(
         artifact_id="a1", artifact_version="v1", scene_name="s1", recon_method="vggt",
         c2w_list="", intrinsics="", depth_maps="", point_map="", point_conf="",
-        track_list=None, metric_scale=None, scale_known=False,
+        track_list=None,
+        quality_status="computed",
         quality=QualityMetrics(
+            warp_inlier_ratio=nan, warp_photometric_inlier_ratio=nan,
+            cloud_overlap_ratio=nan, main_gate_passed=False,
             g1_blur_ok=nan, g2_brightness=nan, g3_motion_blur=nan, g4_frame_count=32,
-            g5_reproj_err_median=nan, g5_reproj_err_p95=nan, g6_depth_var_coeff=nan,
-            g7_dynamic_ratio=nan, g9_tracker_consistency=nan,
-            g10_baseline_quality=nan, g11_scale_ci=nan, overall_quality=nan),
+            g6_depth_var_coeff=nan, g7_dynamic_ratio=nan, g9_tracker_consistency=nan,
+            g10_baseline_quality=nan, overall_quality=0.0),
         confidence={"per_point_confidence": "", "coverage_count_per_frame": ""},
     )
     p = tmp_path / "art.json"
     p.write_text(art.model_dump_json(), encoding="utf-8")
     back = ReconstructionArtifact.model_validate_json(p.read_text(encoding="utf-8"))
-    assert np.isnan(back.quality.overall_quality)
+    assert back.quality.overall_quality == 0.0                 # 主门未过 → 0.0（§6.2）
+    assert np.isnan(back.quality.warp_inlier_ratio)          # NaN 主门指标无损往返
     assert back.quality.g4_frame_count == 32
+    assert back.recon_method == "vggt" and back.schema_version == "6.0"
+    # G5 固定 not_available + None（BA 已关闭，§10.4）
+    assert back.reprojection_status == "not_available"
+    assert back.g5_reproj_err_median is None and back.g5_reproj_err_p95 is None
+    # v5 的尺度字段落盘后再读回必须 hard fail（Schema 与 legacy 隔离，§5.2/§20）
+    legacy = json.loads(p.read_text(encoding="utf-8"))
+    legacy["scale_known"] = True
+    with pytest.raises(Exception):
+        ReconstructionArtifact.model_validate(legacy)
 
 
 def test_run_jobs_reports_failure_without_crash(tmp_path, monkeypatch):
@@ -108,27 +123,31 @@ def test_run_jobs_passes_one_episode_frames_per_scene(tmp_path, monkeypatch):
     """回归：同 scene 多 episode 来自同一段视频 → 只喂一份 32 帧，不拼接多份。
 
     拼接会把 32×N 帧塞进重建（错误输入），这里用替身捕获真实入参。
+    v6 的"BA 关闭"不再是 `use_ba=False` 参数，而是 `recon_method` 受控枚举只有
+    `vggt`（§5.2/§20）—— 因此这里断言方法名与帧数，并断言产物里没有 legacy 字段。
     """
     import skill3d.reconstruction.run as run_mod
     from skill3d.schemas import ConfidenceMap, QualityMetrics, ReconstructionArtifact
 
-    captured: dict[str, int] = {}
+    captured: dict = {}
     nan = float("nan")
 
     def fake_reconstruct(frames, scene_name, output_dir, method="vggt", **kwargs):
         captured[scene_name] = len(frames)
-        captured["ba_enabled"] = bool(kwargs.get("use_ba", False))
+        captured["method"] = method
+        captured["kwargs"] = sorted(kwargs)
         return ReconstructionArtifact(
             artifact_id="x", artifact_version="x", scene_name=scene_name,
             recon_method="vggt", c2w_list="", intrinsics="", depth_maps="",
-            point_map="", point_conf="", track_list=None, metric_scale=None,
-            scale_known=False,
+            point_map="", point_conf="", track_list=None,
             quality_status="computed",
             quality=QualityMetrics(
-                g1_blur_ok=nan, g2_brightness=nan, g3_motion_blur=nan, g4_frame_count=32,
-                g5_reproj_err_median=nan, g5_reproj_err_p95=nan, g6_depth_var_coeff=nan,
-                g7_dynamic_ratio=nan, g9_tracker_consistency=nan,
-                g10_baseline_quality=nan, g11_scale_ci=nan, overall_quality=nan),
+                warp_inlier_ratio=0.9, warp_photometric_inlier_ratio=0.9,
+                cloud_overlap_ratio=0.9, main_gate_passed=True,
+                g1_blur_ok=nan, g2_brightness=nan, g3_motion_blur=nan,
+                g4_frame_count=32, g6_depth_var_coeff=nan, g7_dynamic_ratio=nan,
+                g9_tracker_consistency=nan, g10_baseline_quality=nan,
+                overall_quality=0.9),
             confidence=ConfidenceMap(per_point_confidence="", coverage_count_per_frame=""),
         )
 
@@ -137,5 +156,10 @@ def test_run_jobs_passes_one_episode_frames_per_scene(tmp_path, monkeypatch):
     jobs = plan_scene_jobs(items, tmp_path, "vggt")
     jobs = run_jobs(jobs, {"scene-a": items}, tmp_path, "vggt", gpus=[0])
     assert captured["scene-a"] == 32          # 只喂一份 32 帧，不拼接
-    assert captured["ba_enabled"] is False    # BA route 默认关闭（§10.1 Conditional Go）
+    assert captured["method"] == "vggt"       # 唯一正式主线（无 BA / 无降级链）
+    assert "use_ba" not in captured["kwargs"]
     assert jobs[0].status == "done"
+    # 落盘产物是 v6 artifact（无 scale_known / g8_* 等 legacy 字段）
+    on_disk = json.loads((tmp_path / "vggt" / "scene-a.json").read_text(encoding="utf-8"))
+    assert on_disk["recon_method"] == "vggt"
+    assert not {"scale_known", "scale_ci_rel", "allowed_metric_tasks"} & set(on_disk)

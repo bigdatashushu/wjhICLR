@@ -25,23 +25,41 @@ from .episode import (
     InputGateVerdict,
     VSIBenchEpisode,
 )
+from .evidence import (
+    ALWAYS_AVAILABLE_CAPABILITIES,
+    CAPABILITIES,
+    CAPABILITY_ORDER,
+    GATE_SUBCONDITIONS,
+    GATE_VERSION,
+    PROFILE_VERSION,
+    QUESTION_CAPABILITIES,
+    SCENE_CAPABILITIES,
+    CapabilityState,
+    EvidenceProfile,
+    MetricEvidenceGateResult,
+    capability_at_least,
+    metric_scale_state_from_gate,
+    worst_state,
+)
 from .reconstruction import (
     LEGACY_ONLY_FIELDS,
     METRIC_TASK_TYPES,
+    QUALITY_METRIC_VERSION,
     ConfidenceMap,
-    ImageGridTransform,
     ObjectInstance,
+    ObjectRecord,
     QualityMetrics,
     ReconstructionArtifact,
-    ScaleAnchorEvidence,
     SceneState,
 )
 from .legacy import LegacyArtifact, LegacyArtifactError
-from .sparse_ba import SparseBAReceipt
+# `SparseBAReceipt`（原 `.sparse_ba`）随 v6 §20 废止 `vggt_sparse_ba` 一并归档到
+# `skill3d/legacy/retired/sparse_ba.py`，不再由 Schemas 导出（Schema 与 legacy 隔离）。
 from .readiness import ExperimentReadiness
 from .tool import ToolCall, ToolResult, ToolSpec
 from .program import ASTCheckResult, EpisodeProgram, ProgramExecutionTrace
 from .skill import (
+    DeepSeekGovernanceDecision,
     RetrievedSkill,
     SkillCandidate,
     SkillGovernanceDecision,
@@ -72,6 +90,7 @@ from .trace import (
     EvolutionGeneration,
     FailureTaxonomy,
     RunManifest,
+    TraceRecord,
 )
 
 __all__ = [name for name in dir() if not name.startswith("_")]

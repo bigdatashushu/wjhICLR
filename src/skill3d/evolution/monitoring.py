@@ -2,7 +2,8 @@
 
 §7.1 G-37/G-39 的学术版处置：**不做常驻监控进程**。跑完实验后用
 CSV/JSONL 日志计算指标，异常时手动/自动调用已有的 `rollback()`；
-必要时离线触发 GPT-6 语义审查（写 `SkillGovernanceDecision`）。
+必要时离线触发语义审查（v6 §3.4：离线模型 = DeepSeek-V4.1-Flash，写
+`DeepSeekGovernanceDecision`，产物为 advisory，不决定 promote/reject）。
 
 监控指标（§8 运行期监控）：成功率 / 几何验证率 / 回退率 / 资源超限 / 答案分布漂移
 （KL 散度，相对上一代）。
@@ -182,11 +183,15 @@ def write_health_report(report: HealthReport, out_path: str | Path) -> Path:
     return out
 
 
-def trigger_review(candidate, gpt6_client, trace_store=None):
-    """G-39：监控异常 → 离线触发 GPT-6 语义审查（写 SkillGovernanceDecision）。"""
+def trigger_review(candidate, offline_client, trace_store=None):
+    """G-39：监控异常 → 离线触发语义审查（写 `DeepSeekGovernanceDecision`，§3.4）。
+
+    产物是 **advisory**（`advisory_only=True`）：它只解释"为什么告警"，**不**决定
+    promote/reject（§3.3：准入由确定性门 + 预注册规则决定）。
+    """
     from skill3d.governance.governance_decision import semantic_review
 
-    decision = semantic_review(candidate, gpt6_client)
+    decision = semantic_review(candidate, offline_client)
     if trace_store is not None:
         trace_store.append("skill_governance_decision", decision.model_dump())
     return decision

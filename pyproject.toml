@@ -43,4 +43,6 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 # legacy/ 为原 Skill-3D 参考代码，不参与新系统测试收集。
-norecursedirs = ["legacy", "third_party", ".git", "build", "dist"]
+# tests/archive_v5/ 为已废止机制的 v5 回归测试与旧 golden（只读历史证据，v6 §20）：
+# 刻意不收集（它们 import 的模块已被移入 skill3d/legacy/retired/，本就不该再跑）。
+norecursedirs = ["legacy", "third_party", ".git", "build", "dist", "tests/archive_v5"]

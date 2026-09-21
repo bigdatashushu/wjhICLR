@@ -40,7 +40,12 @@ from skill3d.reconstruction.vggt_runner import ReconstructionFailed, reconstruct
 from skill3d.reconstruction_gate.quality_metrics import (
     QUALITY_METRIC_VERSION,
 )
-from skill3d.reconstruction_gate.scene_state import question_gate, quality_gate
+from skill3d.reconstruction_gate.evidence_profile import M5EvidenceSummary
+from skill3d.reconstruction_gate.scene_state import (
+    build_scene_state,
+    quality_gate,
+    scope_scene_to_question,
+)
 from skill3d.routing.skill_retriever import retrieve
 from skill3d.routing.task_classifier import TaskClassification, classify
 from skill3d.sandbox.ast_guard import ast_guard
@@ -59,11 +64,28 @@ from skill3d.schemas import (
     SkillSpec,
     VSIBenchEpisode,
 )
-from skill3d.synthesis.program_assembler import SynthesisError, assemble_program
+from skill3d.synthesis.program_assembler import (
+    SynthesisError,
+    assemble_program,
+    assemble_program_ex,
+    degenerate_reason,
+)
 from skill3d.synthesis.prompt_builder import PromptBuilder
 from skill3d.tools import REGISTRY
 from skill3d.tools.mock_switch import MockSwitch
 from skill3d.tools.scene_handle import SceneHandle
+from skill3d.online.recovery import (
+    MAX_RECOVERY_ATTEMPTS,
+    RecoveryPlan,
+    build_feedback,
+    cascade_invalidate,
+    collect_validated,
+    downgrade_profile,
+    premise_of_failure,
+    recovery_exhausted,
+)
+from skill3d.schemas.trace import TraceRecord
+from skill3d.synthesis.prompt_builder import TEMPLATE_VERSION
 from skill3d.trace.store import TraceStore
 from skill3d.verifier.geometry_oracle import GeometryVerifyResult, geometry_verify
 
@@ -94,7 +116,12 @@ class OnlineRunConfig:
     work_dir: str = "data/reconstructions/mock_light"
     vllm_endpoints: list[str] = field(default_factory=list)
     vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
-    recon_method: str = "vggt"              # vggt | vggt_sparse_ba | dust3r_mast3r | colmap
+    recon_method: str = "vggt"              # v6 只允许 vggt（§5.2）
+    # v6 D1/D2：零样本度量深度模型（首个 PoC = MoGe-2）。
+    # 默认 None → 不跑融合，artifact 记 scale_fusion_status="not_run"、metric_scale=None。
+    # 传入实现了 MetricDepthModel 协议的对象即启用（MoGe-2 权重到位后才可能真跑）。
+    metric_depth_model: object = None
+    metric_model_name: str = "none"          # moge2 | metric3d_v2 | none
     # 按题型选择答案来源（任务级策略，非逐题 oracle）：命中的题型改用**直答 VLM**
     # （同一 32 帧 + 问题）。用途：当某题型的程序路径弱于直答时，用直答拿分；
     # 策略必须在 inner_validation 上定、在 outer_holdout 上验证，禁止用 GT 逐题挑选。
@@ -104,17 +131,11 @@ class OnlineRunConfig:
     max_images: int = 32                    # M8 送进模型的最大帧数（与 §4 M1 对齐）
     max_pixels: int = 131072                # 实测起点：32 帧 ≈ 9.7k prompt tokens（A-4）
     max_model_len: int = 32768
-    ba_enabled: bool = False                # BA route（§10.1 [Conditional Go]）
-    # ---- v4 尺度评估（HC29–33）----
-    # 冻结 conformal 校准器（在线**只读**）；缺失/版本不符 → scale_confidence=low
-    scale_calibration_path: Optional[str] = None
-    # v5.1：多校准器目录与被评测数据集（按数据集选同源冻结校准器）
-    scale_calibration_dir: str = ""
-    evaluation_datasets: list[str] = field(default_factory=list)
-    # nominal coverage（如 0.90）；必须与冻结校准器一致（[TODO_CALIBRATE]）
-    scale_confidence_level: float = 0.90
-    # D-3 回灌恢复层（[Conditional Go]）：回灌修复率 ≥50% 才启用（TODO_CALIBRATE）
-    enable_tool_contract_replay: bool = False
+    # ---- v6 度量证据门（D3）----
+    # 融合成功才可能暴露米制 Tool；阈值在 reconstruction_gate.evidence_profile 内
+    # （全 [TODO_CALIBRATE]），此处不再重复一份。
+    # v6 D7：partial_tool_recovery 的最大恢复次数（TODO_CALIBRATE）
+    max_recovery: int = MAX_RECOVERY_ATTEMPTS
     allow_final_test: bool = False          # 硬约束 9：默认拒绝 final_test 进在线链
 
 
@@ -143,11 +164,9 @@ class EpisodeOutcome:
     receipts: list[SandboxReceipt] = field(default_factory=list)
     receipts_ok: bool = True
     scene_route: Optional[str] = None
+    question_tool_scope: str = ""
     g9_tracker_consistency: Optional[float] = None  # G9 SAM2 mask IoU 均值（M5 产物）
-    # v5 HC38：本版**不设置** geometric_coverage 门，也不存在替代门。
-    # 该字段恒为 "not_defined"；trace/报告**不得**写 "coverage passed"。
-    coverage_gate_status: str = "not_defined"
-    # v5 HC37：本 episode 所用 artifact 的重投影状态（G5 是否 computed）
+    # v6：G5 永久 not_available（D11）；G8 永久退役 —— 都不存在替代门
     reprojection_status: str = "not_available"
     # M2 被动观测的降级 flag（只打权重/标记，不改帧集，硬约束 21）
     input_degradation_flags: list[str] = field(default_factory=list)
@@ -157,32 +176,48 @@ class EpisodeOutcome:
     # None = 证据缺失 → fail-closed 不授权（不得默认放行）。
     plane_quality_ok: Optional[bool] = None
     direct_answer: Optional[str] = None     # C0 基线：答案不经沙箱，生成阶段即产出
-    # 答案来源：program（沙箱执行）/ direct_vlm（C0）/ direct_vlm_routed（按题型策略回退）
+    # 答案来源（v6 §5.3 四值）：tool_program / direct_vlm_routed / abstain / tool_contract
     answer_source: str = ""
     # --- D-3 / 硬约束 22/23：契约与质量的显式记录（过程指标与归因用）---
     quality_status: str = "not_computed"
     overall_quality: Optional[float] = None
+    main_gate_passed: Optional[bool] = None   # M4 主门通过与否（§10.1 交叉双指标）
     tool_contract_hits: int = 0             # 本 episode 命中的 tool_contract 次数
     replay_used: bool = False               # 是否用过"回灌一次"
     trimmed_regen_used: bool = False        # 是否用过裁剪 prompt 重生成
+    # v6 D7：partial_tool_recovery 事实（§14.1）
+    recovery_count: int = 0
+    partial_tool_recovery: bool = False
+    used_result_ids: list[str] = field(default_factory=list)
+    invalidated_result_ids: list[str] = field(default_factory=list)
+    failure_code: Optional[str] = None
+    degenerate_regenerated: bool = False    # 退化输出触发过重生成（§15.3）
+    # v6 §5.9 P8：分阶段判读信息（M5/M7/M8），供 TraceRecord 归因
+    m5_notes: list[str] = field(default_factory=list)
+    m7_notes: list[str] = field(default_factory=list)
+    m8_notes: list[str] = field(default_factory=list)
+    cache_hit: bool = False                 # M5 场景清单是否命中缓存（§5.9）
     abstained: bool = False                 # 显式 abstain（主榜按错计，不刷分）
     answer_untrusted: bool = False          # 答案依赖过契约失败的 Tool → 不得采纳
     frame_set_hash: str = ""
     scene_summary: str = ""                 # 送给 M8 的场景摘要（错误归因用）
     m8_prompt: str = ""                     # M8 文本 prompt（不含图像；错误归因用）
-    scale_source: str = ""                  # 尺度来源（§7 RunManifest / D-2）
+    scale_source: str = ""                  # 尺度来源标注（mock_light/合成路径用）
     artifact_ref: str = ""                  # 本 episode 用的重建产物 ref（硬约束 18 审计）
-    # --- v4 尺度（HC29–33）：逐 episode 事实，供 §7/§10.2 报告与审计 ---
-    scale_confidence: str = "low"
-    scale_ci_rel: Optional[float] = None    # 相对 CI 半宽（分数口径，HC29）
-    scale_ci_abs_m: Optional[float] = None
-    scale_calibration_id: Optional[str] = None
-    scale_conflict: bool = False
-    scale_empirical_coverage: Optional[float] = None
-    allowed_metric_tasks: list[str] = field(default_factory=list)
-    authorized_metric_tasks: list[str] = field(default_factory=list)  # 逐题门控后
-    n_anchors_fired: int = 0
-    n_anchors_accepted: int = 0
+    # --- v6 证据（D5/D1/D3/D6）：逐 episode 事实，供 §18/§19 报告与审计 ---
+    world_frame_status: str = "unavailable"
+    world_up: Optional[list] = None
+    handedness: Optional[str] = None
+    scale_fusion_status: str = "not_run"
+    metric_scale: Optional[float] = None
+    scale_self_consistency: Optional[float] = None
+    metric_model: str = "none"
+    metric_fusion_version: str = ""
+    per_frame_scale_ref: Optional[str] = None
+    evidence_profile: Optional[object] = None
+    metric_evidence_gate_result: Optional[object] = None
+    m5_summary: Optional[object] = None
+    authorized_metric_tasks: list[str] = field(default_factory=list)  # 本题授权后
 
 
 @dataclass
@@ -190,7 +225,9 @@ class _SynthResult:
     """M8 产出。direct_answer 仅 C0（无 program）时非空。"""
 
     program: Optional[EpisodeProgram]
-    source: str          # vllm | deterministic_stub | none
+    # §19.3 六类 + `mock_stub`：vllm_ok | vllm_parse_error | vllm_service_error |
+    # m8_parse_recovered | direct_answer_fallback | partial_tool_recovery | mock_stub
+    source: str
     note: str
     direct_answer: Optional[str] = None
     prompt: str = ""        # M8 文本 prompt（错误归因用；图像不入日志）
@@ -217,26 +254,127 @@ def _receipt_chain(episode_id: str, cfg: OnlineRunConfig) -> ReceiptChain:
 
 
 def _failure_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode) -> Optional[FailureTaxonomy]:
-    """失败归因（仅失败时非空，§5.7 FailureTaxonomy）。categories 取 §5.7 受控枚举。"""
+    """失败归因（仅失败时非空，§5.7 FailureTaxonomy）。categories 取受控枚举（v6）。"""
     eid = episode.qa_id
     if outcome.final_state in ("answer", "answer_best_effort"):
         return None
     if outcome.final_state == "unavailable":
         return FailureTaxonomy(
-            episode_id=eid, categories=["evaluator_noanswer"],
-            note="模型/服务不可用 → episode 记 unavailable（§4 M8 字段 9；"
-                 "服务故障记 service_unavailable，见 §6.1）")
+            episode_id=eid, categories=["synthesis"],
+            note="模型/服务不可用 → episode 记 unavailable（服务故障记 "
+                 "service_unavailable，见 §6.1）")
     if outcome.abstained or "tool_contract" in outcome.answer_flags:
         return FailureTaxonomy(
             episode_id=eid, categories=["tool_contract"],
-            note=("Tool 契约违规（产物缺失/局部质量门未过/域值错误）→ 显式 abstain，"
-                  f"主榜按错计（§5.1/D-3，硬约束 23）；hits={outcome.tool_contract_hits}，"
-                  f"replay={outcome.replay_used}，trimmed={outcome.trimmed_regen_used}"))
+            note=("Tool 契约违规（产物/证据缺失、证据门未过、域值错误）→ 显式 abstain，"
+                  f"主榜按错计；hits={outcome.tool_contract_hits}，"
+                  f"partial_recovery={outcome.partial_tool_recovery}，"
+                  f"recovery_count={outcome.recovery_count}"))
+    if outcome.metric_evidence_gate_result is not None \
+            and not outcome.metric_evidence_gate_result.gate_passed \
+            and outcome.answer_source == "direct_vlm_routed":
+        return FailureTaxonomy(
+            episode_id=eid, categories=["metric_evidence"],
+            note=("米制证据门未通过 → 显式 direct_vlm_routed（§13.3）；缺失子条件="
+                  f"{sorted(outcome.metric_evidence_gate_result.missing_subconditions)}"))
     if outcome.scene_route == "fallback_2d_only":
-        note = ("measurement 题因尺度不可用降级 2D-only（§7.1 G-11 验收）"
-                if "g11_measurement_2d_only" in outcome.answer_flags
-                else "重建质量不足或尺度未知 → 受限 Tool 集（§4 M4 字段 9）")
-        return FailureTaxonomy(episode_id=eid, categories=["scale_unknown"], note=note)
+        return FailureTaxonomy(
+            episode_id=eid, categories=["reconstruction"],
+            note="重建质量不足（M4 主门未过）或输入降级 → 受限 Tool 集（§6.2）")
+    return None
+
+
+def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
+                     cfg: OnlineRunConfig) -> TraceRecord:
+    """§5.9 TraceRecord：版本字段 + 证据/路由全状态（D10）。
+
+    目的：**不依赖重跑即可归因失败** —— 每个失败码、每个证据三值、
+    每条 used_result_id 都在这里，评审只需读 trace。
+    """
+    from skill3d.reconstruction.metric_fusion import METRIC_FUSION_VERSION
+    from skill3d.schemas.evidence import PROFILE_VERSION
+    from skill3d.tools.registry import TOOL_FACE_VERSION
+
+    profile = outcome.evidence_profile
+    gate = outcome.metric_evidence_gate_result
+    params = {}
+    try:
+        from skill3d.tools.distance_primitives import DistancePrimitiveParams
+
+        params = DistancePrimitiveParams().snapshot()
+    except Exception:  # noqa: BLE001 - 参数快照缺失不得阻断 trace
+        params = {}
+    return TraceRecord(
+        episode_id=episode.qa_id,
+        template_version=TEMPLATE_VERSION,
+        tool_face_version=TOOL_FACE_VERSION,
+        evidence_profile_version=(getattr(profile, "profile_version", "")
+                                  or PROFILE_VERSION),
+        gate_version=(getattr(gate, "gate_version", "") or ""),
+        distance_primitive_params=params,
+        metric_fusion_version=str(outcome.metric_fusion_version or
+                                  (METRIC_FUSION_VERSION if outcome.metric_model != "none"
+                                   else "")),
+        evidence_profile=(profile.model_dump() if profile is not None else None),
+        metric_evidence_gate_result=(gate.model_dump() if gate is not None else None),
+        scene_route=str(outcome.scene_route or ""),
+        question_tool_scope=str(outcome.question_tool_scope or ""),
+        answer_source=str(outcome.answer_source or ""),
+        used_result_ids=sorted(set(outcome.used_result_ids or [])),
+        recovery_count=int(outcome.recovery_count),
+        partial_tool_recovery=bool(outcome.partial_tool_recovery),
+        invalidated_result_ids=sorted(set(outcome.invalidated_result_ids or [])),
+        synthesis_source=_synthesis_source_enum(outcome.synthesis_source),
+        n_objects=int((outcome.m5_summary.n_objects
+                       if outcome.m5_summary is not None else 0)),
+        cache_hit=bool(outcome.cache_hit),
+        failure_code=outcome.failure_code,
+        m5_notes=_joined(outcome.m5_notes),
+        m7_notes=_joined(outcome.m7_notes),
+        m8_notes=_joined(outcome.m8_notes),
+    )
+
+
+# §6.3/§14：走 partial_tool_recovery 的 ToolContractError 族（`ToolContractError` 的四个子类）
+_RECOVERABLE_CONTRACT_ERRORS = ("tool_contract", "confidence_gate", "domain_value",
+                                "answer_already_given")
+
+# 契约失败码 → §5.9 `FailureCode` 词汇表取值（trace 归因用）
+_FAILURE_CODE_BY_CONTRACT: dict[str, str] = {
+    "confidence_gate": "ConfidenceGateError",
+    "domain_value": "DomainValueError",
+    "answer_already_given": "AnswerAlreadyGiven",
+    "tool_contract": "tool_contract",
+}
+
+_SYNTH_SOURCES = {"vllm_ok", "vllm_parse_error", "vllm_service_error",
+                  "m8_parse_recovered", "direct_answer_fallback",
+                  "partial_tool_recovery", "mock_stub"}
+
+
+def _synthesis_source_enum(value: str) -> str:
+    """把历史/宽松取值归一到 §19.3 的 6 类（+ v6 显式的 `mock_stub`）。
+
+    - `mock_stub`（mock_light 确定性 stub，非模型输出）原样保留 —— v5 曾把它写成
+      `deterministic_stub`，这里做别名归一；
+    - 未知/空值（M8 根本没跑）→ `vllm_service_error`：**只允许**断言"没有拿到模型输出"，
+      绝不冒充 `vllm_ok`（v5 的 vllm 混写正是 §19.3 要消灭的问题）。
+    """
+    v = str(value or "").strip()
+    if v in _SYNTH_SOURCES:
+        return v
+    if v == "deterministic_stub":        # v5 历史名 → v6 的 mock_stub
+        return "mock_stub"
+    if v in ("", "none", "unavailable"):
+        return "vllm_service_error"
+    return "vllm_ok"
+
+
+def _joined(notes: Optional[list[str]]) -> Optional[str]:
+    """把逐阶段判读信息压成一行（§5.9 P8：不依赖重跑即可归因失败）。"""
+    if not notes:
+        return None
+    return " | ".join(str(x) for x in notes if str(x).strip()) or None
 
 # --------------------------------------------------------------- episode 执行 ----
 
@@ -377,81 +515,71 @@ def run_episode(
                 try:
                     art = reconstruct(pixels, episode.scene_name, cfg.recon_dir,
                                       method=cfg.recon_method,
-                                      use_ba=cfg.ba_enabled,
                                       frame_set=episode.frame_set,
-                                      scale_calibration_path=cfg.scale_calibration_path,
-                                      scale_calibration_dir=cfg.scale_calibration_dir,
-                                      evaluation_datasets=cfg.evaluation_datasets,
-                                      scale_confidence_level=cfg.scale_confidence_level)
+                                      metric_depth_model=cfg.metric_depth_model,
+                                      metric_model_name=cfg.metric_model_name)
                     art_path = existing
                     notes.append(f"M3 重建完成 method={art.recon_method} "
                                  f"quality_status={art.quality_status} "
                                  f"frame_set_hash={art.frame_set_hash[:12]} "
-                                 f"scale_known={art.scale_known}")
+                                 f"world_frame={art.world_frame_status} "
+                                 f"scale_fusion={art.scale_fusion_status}")
                     fsm.step("done")
                 except ReconstructionFailed as exc:
-                    notes.append(f"M3 重建失败（降级链已走完）: {exc}")
+                    notes.append(f"M3 重建失败（v6 无降级链：VGGT 是唯一主线）: {exc}")
                     fsm.step("failed")
         else:
             if geometry is None:
                 raise ValueError("mode=mock_light 必须传入 geometry（online.synthetic 构造）")
-            notes.append("M3 跳过真实重建：mock_light 使用合成几何（非 VGGT/COLMAP 产物）")
-            fsm.step("skip")   # 尺度评估随 artifact 落盘，合成路径跳过两态
+            notes.append("M3 跳过真实重建：mock_light 使用合成几何（非 VGGT 产物）")
+            fsm.step("skip")   # 世界系契约/度量融合随 artifact 落盘，合成路径跳过两态
         states.append(fsm.state.value)
         if fsm.state is OnlineState.ANSWER:
             return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
                      episodic=episodic,
                              verdict=verdict)
 
-    # ---------------- M3.5 SCALE_ESTIMATE + SCALE_CALIBRATE（v4 §5.1）----------------
-    # 真实路径：尺度评估已在 M3 内完成（`assess_scale` → 写回 artifact）。两态在此
-    # 只做**观测与落档**：置信档、冲突、校准器 id、逐题型授权。失败（无锚点）不中止
-    # episode —— 落 low 并使 `allowed_metric_tasks=∅`，非尺度 3D 能力不受影响（HC33）。
-    if fsm.state is OnlineState.SCALE_ESTIMATE:
-        n_fired = len(getattr(art, "scale_anchor_fired", []) or [])
-        n_acc = sum(1 for a in (getattr(art, "scale_anchor_fired", []) or [])
-                    if getattr(a, "accepted", False))
-        outcome.n_anchors_fired = n_fired
-        outcome.n_anchors_accepted = n_acc
-        notes.append(f"M3.5 SCALE_ESTIMATE 锚点 {n_fired} 个（接受 {n_acc}）；"
-                     f"conflict={getattr(art, 'scale_conflict', False)}")
-        fsm.step("done")
+    # ---------------- M3.5 WORLD_FRAME + METRIC_FUSION（v6 D5/D1）----------------
+    # 真实路径：世界系契约与度量融合都已在 M3 内完成并落盘。两态在此只做**观测与落档**：
+    # world_up/handedness 的存在性、融合状态、尺度离散度、有效帧占比。二者都
+    # **不改变 scene_route**（§6.2：route 只由 M4 质量决定），也都不中止 episode：
+    # 世界系缺失 → 方向/路线类 Tool 被 docs() 隐藏并执行期 fail-closed；
+    # 融合失败 → metric_scale 能力落 unavailable → 逐题 scope 收窄（米制 Tool 收回）。
+    if fsm.state is OnlineState.WORLD_FRAME:
+        wf_status = str(getattr(art, "world_frame_status", "unavailable"))
+        outcome.world_frame_status = wf_status
+        outcome.world_up = getattr(art, "world_up", None)
+        outcome.handedness = getattr(art, "handedness", None)
+        wf_unavailable = wf_status == "unavailable" or getattr(art, "world_up", None) is None
+        notes.append(f"M3.5 WORLD_FRAME status={wf_status} "
+                     f"up={getattr(art, 'world_up', None)} "
+                     f"handedness={getattr(art, 'handedness', None)}"
+                     + ("（缺失 → 方向/路线类 Tool fail-closed，§9.8/§9.10）"
+                        if wf_unavailable else ""))
+        fsm.step("done", {"world_frame_unavailable": wf_unavailable})
         states.append(fsm.state.value)
 
-    if fsm.state is OnlineState.SCALE_CALIBRATE:
-        allowed = sorted(getattr(art, "allowed_metric_tasks", None) or set())
-        outcome.scale_confidence = str(getattr(art, "scale_confidence", "low"))
-        outcome.scale_ci_rel = getattr(art, "scale_ci_rel", None)
-        outcome.scale_ci_abs_m = getattr(art, "scale_ci_abs_m", None)
-        outcome.scale_calibration_id = getattr(art, "scale_calibration_id", None)
-        outcome.scale_calibration_dataset = str(
-            getattr(art, "scale_calibration_dataset", "") or "")
-        outcome.scale_dataset_match = getattr(art, "scale_dataset_match", None)
-        outcome.scale_conflict = bool(getattr(art, "scale_conflict", False))
-        outcome.scale_empirical_coverage = getattr(art, "scale_empirical_coverage", None)
-        outcome.allowed_metric_tasks = list(allowed)
-        # HC29 口径复核（fail-closed）：不自洽 / 旧字段（无 v4 CI）→ 一律 low + 收回米制题型。
-        # 旧字段被降级是**规格要求**（只读迁移、不准入），不是缺陷。
-        from skill3d.schemas.reconstruction import _ci_inconsistency_reason
+    if fsm.state is OnlineState.METRIC_FUSION:
+        status = str(getattr(art, "scale_fusion_status", "not_run"))
+        disp = getattr(art, "scale_self_consistency", None)
+        outcome.scale_fusion_status = status
+        outcome.metric_scale = getattr(art, "metric_scale", None)
+        outcome.scale_self_consistency = disp
+        outcome.metric_model = str(getattr(art, "metric_model", None) or "none")
+        outcome.metric_fusion_version = str(getattr(art, "metric_fusion_version", "") or "")
+        outcome.per_frame_scale_ref = getattr(art, "per_frame_scale_ref", None)
+        from skill3d.reconstruction_gate.evidence_profile import TH_SCALE_DISPERSION
 
-        ci_reason = _ci_inconsistency_reason(art.model_dump())
-        if ci_reason:
-            # HC31：降级不写 `scale_conflict`（该字段只表示锚点冲突）
-            art = art.model_copy(update={"scale_confidence": "low",
-                                        "allowed_metric_tasks": set()})
-            allowed = []
-            outcome.scale_confidence = "low"
-            outcome.allowed_metric_tasks = []
-            notes.append(f"M3.5 SCALE_CALIBRATE 口径复核 → low（HC29 fail-closed）：{ci_reason}")
-        else:
-            notes.append("M3.5 SCALE_CALIBRATE 口径自洽"
-                         "（scale_ci_abs_m = metric_scale × scale_ci_rel，HC29）")
-        notes.append(f"M3.5 SCALE_CALIBRATE calibration_id="
-                     f"{outcome.scale_calibration_id} confidence="
-                     f"{outcome.scale_confidence} ci_rel="
-                     f"{outcome.scale_ci_rel} allowed_metric_tasks={allowed}")
-        fsm.step("done", {"metric_tasks_withdrawn": not allowed,
-                          "scale_conflict": outcome.scale_conflict})
+        disp_high = (disp is not None and np.isfinite(float(disp))
+                     and float(disp) > TH_SCALE_DISPERSION)
+        failed = status != "success" or getattr(art, "metric_scale", None) is None
+        notes.append(f"M3.5 METRIC_FUSION status={status} "
+                     f"metric_scale={getattr(art, 'metric_scale', None)} "
+                     f"dispersion={disp} model={outcome.metric_model}"
+                     + ("（融合未成功 → 米制 Tool 逐题收回；不回退多锚点/校准池，§11.4）"
+                        if failed else ""))
+        fsm.step("done", {"metric_fusion_failed": failed,
+                          "scale_dispersion_high": disp_high})
         states.append(fsm.state.value)
 
     # ---------------- M4 QUALITY_GATE（+ M5 对象绑定）----------------
@@ -463,21 +591,28 @@ def run_episode(
             m5_objects, m5_stats, m5_notes, m5_materialized = _bind_objects_best_effort(
                 art, pixels, None, episode, cfg, llm)
             notes.extend(m5_notes)
+            outcome.m5_notes = list(m5_notes)
             scene, handle, art = _scene_from_artifact(
-                art, pixels, m5_stats, m5_objects, artifact_path=art_path,
+                art, pixels, m5_stats, m5_objects, episode, artifact_path=art_path,
                 objects_materialized=m5_materialized,
-                # paired A/B 复用 frozen artifact（硬约束 18）时不得改写两臂共用文件；
-                # 正常 P2 路径按方案 Y 原子写回（D-5/M5 增量补写）
+                # paired A/B 复用 frozen artifact（硬约束 18）时不得改写两臂共用文件
                 persist_quality=not bool(cfg.reuse_artifact))
-            notes.append(f"M4 质量门禁（唯一事实源）route={scene.route} "
+            # M5 证据摘要在**此处**落档：M7.5 的逐题 scope 派生与 M10 的级联撤销
+            # 都要重算 EvidenceProfile（`scope_scene_to_question(..., m5=...)`），
+            # 传 None 会把 object_detection/track_consensus 重算成 unavailable →
+            # 对象类 Tool 被整批隐藏（真实链路上等于每题都撞 tool_contract 后 abstain）。
+            outcome.m5_summary = _m5_evidence_summary(
+                m5_stats, m5_objects, episode, m5_materialized=m5_materialized)
+            notes.append(f"M4 质量门禁（唯一事实源）scene_route={scene.scene_route} "
+                         f"scope={scene.question_tool_scope} "
                          f"quality_status={art.quality_status} "
                          f"overall_quality={_overall_str(art)} "
-                         f"scale_known={scene.scale_known} "
-                         f"scale_conf={scene.scale_confidence} "
                          f"available={sorted(scene.available_artifacts)}")
             outcome.quality_status = art.quality_status
             outcome.overall_quality = _overall_of(art)
-            outcome.scale_source = str(getattr(art, "scale_source", "") or "")
+            outcome.main_gate_passed = (
+                None if getattr(art, "quality", None) is None
+                else bool(art.quality.main_gate_passed))
         else:
             # mock_light：合成几何 + 真算 G1–G11；M2 的被动观测（flag/weight）并入 route
             scene, handle, _q = synth.build_scene_state(  # type: ignore[arg-type]
@@ -486,28 +621,29 @@ def run_episode(
                 input_degradation_flags=verdict.degradation_flags if verdict else None)
             outcome.quality_status = "computed"
             outcome.overall_quality = float(_q.overall_quality)
+            # M4 主门结论必须落档：TraceRecord/EpisodeTrace 的 main_gate_passed 是
+            # 质量归因的第一列（v5 曾只写 overall_quality，主门被"标量阈值"掩盖）
+            outcome.main_gate_passed = bool(_q.main_gate_passed)
             outcome.scale_source = "synthetic_mock_light"
-            notes.append(f"M4 合成门禁 route={scene.route} "
+            # 合成 M5 证据摘要（构造真值）同样落档：M7.5 重算证据画像时不得丢
+            outcome.m5_summary = synth.synthetic_m5_summary(geometry)  # type: ignore[arg-type]
+            notes.append(f"M4 合成门禁 scene_route={scene.scene_route} "
+                         f"scope={scene.question_tool_scope} "
                          f"overall_quality={_q.overall_quality:.3f}"
-                         "（mock_light：G1-G11 在合成数据上真算）")
-        outcome.scene_route = scene.route
+                         "（mock_light：M4 主门在合成数据上真算）")
+        outcome.scene_route = scene.scene_route
+        outcome.question_tool_scope = scene.question_tool_scope
         outcome.artifact_ref = art_path or (art.artifact_id if art is not None else "")
-        # v4 HC33：场景级尺度事实（**两条路径都记**）。真实路径的校准器 id / 冲突 /
-        # 经验覆盖 / 锚点计数在 M3.5 SCALE_CALIBRATE 补齐；mock_light 走合成 GT 尺度
-        # （`scale_source=synthetic_mock_light`，仅管道验证，不得当结果）。
-        outcome.scale_confidence = str(scene.scale_confidence)
-        outcome.scale_ci_rel = scene.scale_ci_rel
-        outcome.allowed_metric_tasks = sorted(scene.allowed_metric_tasks)
         outcome.g9_tracker_consistency = _mean_track_iou(m5_stats)
-        # v5 HC38：G8 永久退役且**不设替代 geometric_coverage 门** → 恒记 not_defined。
-        # 这里不得再出现任何 `coverage_ok=True` 之类的常量放行。
-        outcome.coverage_gate_status = "not_defined"
+        # v6：G5 永久 not_available（D11），G8 永久退役 —— 两者都不得出现代理值
         outcome.reprojection_status = str(
             getattr(art, "reprojection_status", "not_available") or "not_available")
         outcome.input_degradation_flags = list(
             getattr(verdict, "degradation_flags", None) or []) if verdict else []
+        outcome.evidence_profile = scene.evidence_profile
+        outcome.metric_evidence_gate_result = scene.metric_evidence_gate_result
         action = {"unanswerable": "unanswerable",
-                  "fallback_2d_only": "fallback_2d_only"}.get(scene.route, "proceed")
+                  "fallback_2d_only": "fallback_2d_only"}.get(scene.scene_route, "proceed")
         fsm.step("gate_done", {"action": action})
         states.append(fsm.state.value)
         if fsm.state is OnlineState.ANSWER:
@@ -515,56 +651,38 @@ def run_episode(
                      episodic=episodic,
                              verdict=verdict, scene=scene, handle=handle)
 
-    # ---------------- M7 CLASSIFY_TASK + 逐题门控 + RETRIEVE_SKILL ----------------
+    # ---------------- M7 CLASSIFY_TASK + 逐题 scope 派生 + RETRIEVE_SKILL ----------------
     if fsm.state is OnlineState.CLASSIFY_TASK:
         cls = classify(episode)
         outcome.task = cls.task
         notes.append(f"M7 题型={cls.question_type} task={cls.task} is_mca={cls.is_mca}")
-        # 逐题门控（v5 HC33 逐题型米制授权；HC38 不设 coverage 门）；无场景则不门控
+        # 逐题 scope 派生（v6 D4）：只收窄 question_tool_scope，**不改 scene_route**
         decision = None
         if scene is not None:
-            decision = question_gate(scene, cls.task,
-                                    g9_tracker_consistency=outcome.g9_tracker_consistency,
-                                    plane_quality_ok=outcome.plane_quality_ok)
+            scene, decision = scope_scene_to_question(
+                scene, cls.task, m5=outcome.m5_summary)
             notes.append(f"M7.5 {decision.note()}")
             outcome.answer_flags.extend(decision.flags)
-            outcome.authorized_metric_tasks = sorted(decision.allowed_metric_tasks)
-        downgrade = bool(
-            decision is not None and decision.allowed
-            and scene is not None and decision.route != scene.route
-        )
+            outcome.notes.extend(decision.reasons)
+            outcome.question_tool_scope = scene.question_tool_scope
+            outcome.m7_notes = [decision.note()] + list(decision.reasons)
+            outcome.authorized_metric_tasks = (
+                [cls.task] if scene.metric_task_authorized(cls.task) else [])
+            if "metric_tool_withheld" in decision.flags:
+                notes.append(
+                    f"M7.5 本题米制 Tool 已收回（scene_route 保持 {scene.scene_route}）："
+                    f"非米制 3D 产物保留="
+                    f"{sorted(set(scene.available_artifacts) - {'scale'})}")
+            handle = _retarget_handle(handle, scene)
         fsm.step("done", {
             "question_ok": True if decision is None else decision.allowed,
             "reject_flag": "metric_task_reject",
-            "downgrade_2d_only": downgrade,
+            "downgrade_2d_only": False,
         })
         states.append(fsm.state.value)
         if decision is not None and not decision.allowed:
-            outcome.scene_route = "unanswerable"
-            if scene is not None:
-                scene = scene.model_copy(update={"route": "unanswerable"})
-            notes.append("M7.5 逐题门控拒答 → unanswerable")
             return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
-                     episodic=episodic,
-                             verdict=verdict, scene=scene, handle=handle)
-        if scene is not None and decision is not None:
-            # v4 HC33：把"本题题型 + 本题授权"写进 scene/handle ——
-            # ① 米制 Tool 的逐题授权（`question_type ∈ allowed ∩ supported`）；
-            # ② 逐题可用产物集（未授权时收回 `scale`，非米制 3D 产物不受影响）。
-            # §3"尺度能力门控"（已确认设计）：尺度为 low 只移除 `scale` 产物与米制
-            # Tool，**不得**改变原本合格的 `full_3d` route —— 未授权米制题型时
-            # `decision.route` 等于场景 route，此处不再降级 route。
-            scene = _scope_scene_to_question(scene, cls.task, decision)
-            if decision.route != scene.route:
-                scene = scene.model_copy(update={"route": decision.route})
-                outcome.scene_route = decision.route
-                notes.append(f"M7.5 该题降级 route={decision.route}（米制 Tool 已收回，HC33）")
-            if "v5_metric_task_not_authorized" in decision.flags:
-                notes.append(
-                    f"M7.5 本题米制 Tool 已收回（route 保持 {scene.route}）："
-                    f"allowed_metric_tasks=[]；非米制 3D 产物保留="
-                    f"{sorted(set(scene.available_artifacts) - {'scale'})}")
-            handle = _retarget_handle(handle, scene)
+                             episodic=episodic, verdict=verdict, scene=scene, handle=handle)
 
     if fsm.state is OnlineState.RETRIEVE_SKILL:
         quality = cfg.scene_quality if cfg.scene_quality is not None \
@@ -589,6 +707,8 @@ def run_episode(
         outcome.m8_prompt = str(res.prompt or "")
         direct_answer = res.direct_answer
         program = res.program
+        if "退化" in str(res.note or ""):
+            outcome.degenerate_regenerated = True
         if program is None:
             # 题型策略命中时，程序路径失败**不**等于不可答：改用直答（同一 32 帧）。
             # 否则像 object_counting/appearance_order 这类"本应直答"的题会因为 M8
@@ -624,6 +744,7 @@ def run_episode(
         notes.append(f"M8 program 来源={res.source} program_id={program.program_id}")
         if res.note:
             notes.append(res.note)
+        outcome.m8_notes = [f"source={res.source}"] + ([res.note] if res.note else [])
         outcome.program = program
         outcome.n_images_to_synthesizer = int(res.n_images)
         fsm.step("done")
@@ -702,44 +823,104 @@ def run_episode(
                                  "error_code": error_code},
                                 error_code=error_code)
 
-            # ---- D-3：tool_contract 恢复阶梯（整个 episode 最多回灌 1 次）----
-            if error_code == "tool_contract":
+            # ---- v6 D7：partial_tool_recovery（§6.4/§14）----
+            # 保留未受污染的成功结果回灌；共享前提失效则级联撤销；恢复次数有限。
+            # §6.3：**执行期 ToolContractError 全族**（tool_contract / confidence_gate /
+            # domain_value / answer_already_given）都走这条恢复路径 —— 局部失败（域值/
+            # 参数）只回灌 validated observations，共享前提失效才级联撤销（§14.1）。
+            if error_code in _RECOVERABLE_CONTRACT_ERRORS:
                 outcome.tool_contract_hits += 1
                 outcome.answer_flags.append("tool_contract")
                 detail = cell.error or "程序自捕获契约异常后仍产答案（answer_untrusted）"
                 notes.append(
-                    f"M10 tool_contract（第 {outcome.tool_contract_hits} 次）: {detail}")
+                    f"M10 ToolContractError[{error_code}]"
+                    f"（第 {outcome.tool_contract_hits} 次）: {detail}")
                 if kernel is not None:
-                    # 硬约束 23 / D-3：答案依赖过契约失败的 Tool → 不得采纳
+                    # 答案依赖过契约失败的 Tool → 不得采纳
                     kernel.answer_slot.answer = None
-                recovered = False
-                # 阶梯：rung1 回灌（[Conditional Go]，默认关）→ rung2 裁剪 prompt（强制
-                # fallback_2d_only + 工具子集）→ 两档都用尽才 abstain。rung1 重生成失败时
-                # **必须继续落到 rung2**，不得直接 abstain（§5.1）。
-                recovered_rung = ""
-                for rung, override in _available_contract_rungs(cfg, outcome):
-                    if rung == "replay":
-                        outcome.replay_used = True
-                    else:
-                        outcome.trimmed_regen_used = True
-                    res, program, round_notes = _regenerate_after_contract(
-                        episode, scene, handle, selected_skills, cfg, llm, pixels,
-                        geometry, prior_program=program, cell=cell, scene_route=override)
-                    notes.extend(round_notes)
-                    if res and program is not None:
-                        recovered = True
-                        recovered_rung = rung
-                        break
-                if recovered and program is not None:
+
+                outcome.recovery_count += 1
+                attempt = outcome.recovery_count
+                premise = _premise_from_cell(cell, kernel)
+                plan = RecoveryPlan(
+                    attempt=attempt,
+                    failed_tool=_failed_tool_of(cell),
+                    failure_kind=str(error_code),
+                    premise=premise,
+                    validated=collect_validated(
+                        kernel, evidence_version=str(
+                            getattr(outcome.evidence_profile, "profile_version", ""))),
+                )
+                # 级联撤销（仅当失败揭示共享前提失效；局部失败不撤销，§14.1）
+                if premise and kernel is not None:
+                    ids, tools = cascade_invalidate(kernel, premise, registry=REGISTRY)
+                    plan.invalidated_result_ids = ids
+                    plan.invalidated_tools = tools
+                    outcome.invalidated_result_ids.extend(ids)
+                    # 回写 EvidenceProfile（能力降级）→ 逐题 scope 随之收窄
+                    new_profile, changed = downgrade_profile(
+                        getattr(scene, "evidence_profile", None), premise)
+                    plan.downgraded_capabilities = changed
+                    if new_profile is not None and scene is not None:
+                        scene = scene.model_copy(update={"evidence_profile": new_profile})
+                        outcome.evidence_profile = new_profile
+                        scene, _d = scope_scene_to_question(
+                            scene, cls.task if cls is not None else "",
+                            m5=outcome.m5_summary)
+                        handle = _retarget_handle(handle, scene)
+                        outcome.question_tool_scope = scene.question_tool_scope
+                        notes.append(
+                            f"M7.5（级联撤销后重新派生）scope="
+                            f"{scene.question_tool_scope}"
+                            f"（scene_route={scene.scene_route} 不变，§6.2/D4）")
+                    # 撤销后的 validated 重新收集（被撤销的已不在其中）
+                    plan.validated = collect_validated(
+                        kernel, evidence_version=str(
+                            getattr(outcome.evidence_profile, "profile_version", "")))
+                    notes.append(
+                        f"M10 partial_tool_recovery 级联撤销 premise={premise}："
+                        f"撤销 {len(ids)} 条结果 {ids[:6]}，工具 {tools}，"
+                        f"能力降级 {changed}")
+                else:
+                    notes.append(
+                        f"M10 partial_tool_recovery 局部失败（无共享前提失效）→ 不撤销"
+                        f"，保留 {len(plan.validated)} 条 validated observations")
+
+                if recovery_exhausted(attempt, max_attempts=cfg.max_recovery):
+                    plan.exhausted = True
+                    outcome.failure_code = _FAILURE_CODE_BY_CONTRACT.get(
+                        str(error_code), "tool_contract")
+                    outcome.abstained = True
+                    notes.append(
+                        f"M10 partial_tool_recovery 次数用尽（{attempt}>"
+                        f"{cfg.max_recovery}）→ 显式 abstain（主榜按错计）")
+                    fsm.step("contract_fail")
+                    states.append(fsm.state.value)
+                    break
+
+                outcome.partial_tool_recovery = True
+                plan.feedback = build_feedback(
+                    plan, question_type=str(getattr(cls, "task", "") or ""),
+                    scope=str(getattr(scene, "question_tool_scope", "") or ""))
+                res, new_program, round_notes = _regenerate_after_contract(
+                    episode, scene, handle, selected_skills, cfg, llm, pixels,
+                    geometry, prior_program=program, cell=cell,
+                    scope_override=None, feedback_text=plan.feedback)
+                notes.extend(round_notes)
+                if res and new_program is not None:
+                    program = new_program
                     outcome.program = program
-                    notes.append(f"M10 恢复层生效（rung={recovered_rung}）")
-                    fsm.step("contract_recover")   # 不消耗 kernel 重启预算
+                    outcome.synthesis_source = "partial_tool_recovery"
+                    notes.append(
+                        f"M10 partial_tool_recovery 生效（attempt={attempt}）")
+                    fsm.step("contract_recover")
                     states.append(fsm.state.value)
                     continue
-                # 两档机会用尽 → 显式 abstain（主榜按错计，不刷分）
                 outcome.abstained = True
-                notes.append("M10 tool_contract 恢复失败 → 显式 abstain"
-                             "（§5.1：主榜按错计，答案不得采纳）")
+                outcome.failure_code = _FAILURE_CODE_BY_CONTRACT.get(
+                    str(error_code), "tool_contract")
+                notes.append("M10 partial_tool_recovery 重生成失败 → 显式 abstain"
+                             "（主榜按错计，不刷分）")
                 fsm.step("contract_fail")
                 states.append(fsm.state.value)
                 break
@@ -778,8 +959,8 @@ def run_episode(
 
     # ---------------- M12 BENCHMARK_EVAL ----------------
     answer: Optional[str] = kernel.answer_slot.answer if kernel is not None else direct_answer
-    answer_source = ("program" if kernel is not None and answer is not None else
-                     ("direct_vlm" if direct_answer is not None else ""))
+    answer_source = _answer_source_v6(answer=answer, program=program, kernel=kernel,
+                                      outcome=outcome)
     if fsm.state is OnlineState.BENCHMARK_EVAL:
         if cls is None:
             cls = classify(episode)
@@ -806,6 +987,13 @@ def run_episode(
         outcome.answer = answer
         outcome.direct_answer = direct_answer
         outcome.answer_source = answer_source
+        # §14.1：最终答案关联 result_ids（只记 status=ok 且未被级联撤销的结果）
+        if kernel is not None and answer is not None:
+            outcome.used_result_ids = sorted({
+                o.result_id for o in collect_validated(
+                    kernel, evidence_version=str(
+                        getattr(outcome.evidence_profile, "profile_version", "")))
+                if o.result_id})
         if answer is not None and "unanswerable" not in fsm.answer_flags:
             outcome.final_state = "answer"
         fsm.step("done")
@@ -867,44 +1055,77 @@ def _artifact_json_path(cfg: OnlineRunConfig, scene_name: str) -> str:
 
 def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
                          objects: Optional[list] = None,
+                         episode=None,
                          artifact_path: str = "",
                          objects_materialized: Optional[bool] = None,
                          persist_quality: bool = True
                          ) -> tuple[SceneState, SceneHandle, object]:
-    """M4 真实路径：从 artifact 读数组 → G1-G11 → SceneState + SceneHandle。
+    """M4 真实路径：从 artifact 读数组 → v6 主门质量 → SceneState + SceneHandle。
 
-    硬约束 22（质量单一事实源）：
-    - `art.quality_status == "computed"` → 直接用落盘实算值（P1 方案 X，零重算）；
-    - 否则实算并**原子写回** `artifact_path`（方案 Y），返回写回后的新 artifact；
-    - route 由 `route_from_quality` fail-closed 判定（NaN/未计算 → 不得 full_3d）。
+    硬约束 22（质量单一事实源）：`quality_status == "computed"` 时直接复用落盘实算值
+    （P1 方案 X，零重算）；否则实算并**原子写回** `artifact_path`（方案 Y）。
 
-    G-18 数据源接线：G5 重投影残差读 `art.reproj_errors`（BA 产物），
-    G7/G9 从 M5 统计（动态 mask / track IoU）取，缺失则 NaN；
-    拿到 M5 统计后会把它们补进已落盘的 quality 并原子写回（D-5 增量补写）。
-
-    `persist_quality=False`（paired A/B 复用 frozen artifact，硬约束 18）：
-    补写只进内存副本，不改动两臂共用的那个 artifact。
+    v6 数据源接线：主门用 frames/depth/poses/K/point_map/depth_conf；
+    诊断用 M5 的 dynamic_masks / track_ious。G5/G8/G11 都已不存在，**不得**补位。
     """
     stats = m5_stats or {}
     depth, c2w, intr = (_load_npy(art.depth_maps), _load_npy(art.c2w_list),
                         _load_npy(art.intrinsics))
-    reproj = _load_npy(art.reproj_errors)
-    scene = quality_gate(
-        art, frames=pixels, depth_maps=depth, c2w_list=c2w,
-        reproj_errors=reproj,
-        dynamic_masks=stats.get("dynamic_masks"),
-        track_ious=stats.get("track_ious"),
-        object_ids=sorted(o.instance_id for o in (objects or [])),
+    point_map, dconf = _load_npy(art.point_map), _load_npy(art.depth_conf)
+
+    m5_summary = _m5_evidence_summary(stats, objects, episode, m5_materialized=objects_materialized)
+
+    if str(getattr(art, "quality_status", "not_computed")) != "computed":
+        from skill3d.reconstruction_gate import quality_metrics as qm
+
+        art = qm.compute_and_store_quality(
+            art, frames=pixels, depth_maps=depth, c2w_list=c2w, intrinsics=intr,
+            point_map=point_map, depth_conf=dconf,
+            dynamic_masks=stats.get("dynamic_masks"),
+            track_ious=stats.get("track_ious"),
+            artifact_path=(artifact_path if persist_quality else None),
+        )
+    scene = build_scene_state(
+        art,
+        m5=m5_summary,
+        objects=sorted(o.obj_id for o in (objects or [])),
         artifact_ref=art.artifact_id,
-        artifact_path=artifact_path or None,
-        persist_quality=persist_quality,
     )
-    # 写回后的 artifact（quality 已落盘）：后续 M8/M12 一律读它
-    art_out = getattr(scene, "artifact", None) or art
     handle = SceneHandle(scene, objects=objects or [], c2w_list=c2w, intrinsics=intr,
-                         quality_overall=_overall_of(art_out),
+                         quality_overall=_overall_of(art),
                          objects_materialized=objects_materialized)
-    return scene, handle, art_out
+    # 世界系点图注入句柄（平面拟合 / 连通性图的唯一数据入口）
+    handle.set_point_map(point_map)
+    return scene, handle, art
+
+
+def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
+                         *, m5_materialized: Optional[bool] = None,
+                         grounding=None) -> M5EvidenceSummary:
+    """把 M5 统计压成证据输入（§7.1 的 object_detection / track_consensus / grounding）。
+
+    不确定的一律留 `None`/False（fail-closed：证据不足落 unavailable，不做乐观默认）。
+    """
+    objs = list(objects or [])
+    fault = bool((stats or {}).get("detector_fault", False))
+    if m5_materialized is False:
+        fault = True
+    ratio = (stats or {}).get("track_stable_ratio")
+    n_tracks = len({str(o.track_id) for o in objs if getattr(o, "track_id", None)})
+    if n_tracks == 0 and objs:
+        # 未记录 track_id 时退回"去重后实例数"作 track 数（不伪造稳定占比）
+        n_tracks = len(objs)
+    return M5EvidenceSummary(
+        detection_fault=fault,
+        n_objects=len(objs),
+        n_tracks=int(n_tracks),
+        track_stable_ratio=(None if ratio is None else float(ratio)),
+        grounding_pointed_hit=None if grounding is None else grounding.get("hit"),
+        grounding_conf=None if grounding is None else grounding.get("conf"),
+        grounding_miss=bool(grounding.get("miss")) if grounding else False,
+        grounding_filled=bool(grounding.get("filled")) if grounding else False,
+        notes=[str(x) for x in ((stats or {}).get("evidence_notes") or [])],
+    )
 
 
 def _mean_track_iou(m5_stats: Optional[dict]) -> Optional[float]:
@@ -916,38 +1137,27 @@ def _mean_track_iou(m5_stats: Optional[dict]) -> Optional[float]:
     return float(np.mean(vals)) if vals else None
 
 
-def _scope_scene_to_question(scene: SceneState, task: str,
-                             decision) -> SceneState:
-    """把逐题授权写进 SceneState（v4 HC33）。
-
-    - `question_type` = 本 episode 的规范题型（米制 Tool 授权的第二维）；
-    - `allowed_metric_tasks` = 过完全部门控（含 G9 等附加条件）后的本题授权；
-    - `available_artifacts` = `route_artifacts_for_question(...)`：未授权时收回
-      `scale`，**非米制 3D 产物（depth/poses/point_cloud/objects）不受影响**。
-    """
-    from skill3d.tools.contract import route_artifacts_for_question
-
-    allowed = set(getattr(decision, "allowed_metric_tasks", None) or set())
-    return scene.model_copy(update={
-        "question_type": str(task or ""),
-        "allowed_metric_tasks": allowed,
-        "available_artifacts": route_artifacts_for_question(scene.route, allowed, task),
-    })
-
-
 def _retarget_handle(handle: Optional[SceneHandle], scene: SceneState) -> Optional[SceneHandle]:
-    """逐题降级后同步句柄的 SceneState（route/scale_known 供 Tool 与 Verifier 读取）。"""
+    """逐题 scope 派生后同步句柄的 SceneState（Tool 与 Verifier 都读它）。
+
+    v6：产物集与证据画像随 scope 变化；点图缓存沿用同一份（不必重读数组）。
+    """
     if handle is None:
         return None
-    return SceneHandle(scene, objects=list(handle._objects.values()),  # noqa: SLF001
-                       c2w_list=handle._c2w, intrinsics=handle._k,      # noqa: SLF001
-                       quality_overall=handle.quality_overall,
-                       objects_materialized=handle.objects_materialized,
-                       metric_scale=handle.metric_scale)
+    new_handle = SceneHandle(scene, objects=list(handle._objects.values()),  # noqa: SLF001
+                             c2w_list=handle._c2w, intrinsics=handle._k,     # noqa: SLF001
+                             quality_overall=handle.quality_overall,
+                             objects_materialized=handle.objects_materialized,
+                             metric_scale=handle.metric_scale)
+    new_handle.set_point_map(handle.get_point_map())
+    # 内存态对象点集（合成路径注入过的）随句柄一起搬，避免逐题重派生后丢点云
+    for oid, pts in getattr(handle, "_points_cache", {}).items():  # noqa: SLF001
+        new_handle.set_object_points(oid, pts)
+    return new_handle
 
 
 def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
-                              llm=None) -> tuple[list, dict, list[str], bool]:
+                              llm=None, point_conf=None) -> tuple[list, dict, list[str], bool]:
     """M5 对象绑定：SAM2 未配置等失败 → 记降级、不阻断（§4 M5 字段 9）。
 
     返回 `(objects, stats, notes, materialized)`：
@@ -961,6 +1171,9 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
     depth = _load_npy(art.depth_maps)
     c2w = _load_npy(art.c2w_list)
     intr = _load_npy(art.intrinsics)
+    if point_conf is None:
+        # 逐点置信度（§12.2 软权重来源）；读不到就传 None（**不**伪造 1.0）
+        point_conf = _load_npy(art.depth_conf) if art.depth_conf else None
     if depth is None or c2w is None:
         return [], {}, ["M5 跳过：artifact 缺深度/位姿数组（无法反投影到世界系）"], False
     # VLM 框提示：真实模式且有 vLLM 时，由在线 Qwen3-VL-8B 给对象名+bbox（§4 M5 字段 12）
@@ -971,9 +1184,10 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
         objects, stats, notes = bind_objects_for_scene(
             pixels, None, episode.question, depth_maps=depth, c2w_list=c2w,
             intrinsics=intr, out_dir=_m5_out_dir(art), scene_name=art.scene_name,
-            # §9：BA route 的深度网格带正方形 pad，mask 必须按仿射映射（非纯缩放）
-            grid_transform=(art.grid_transform.model_dump()
-                            if getattr(art, "grid_transform", None) is not None else None),
+            # v6：BA 已废止 → 深度网格恒为纯缩放（mask_to_grid 走 resize_mask_nearest），
+            # 不再需要 grid_transform 仿射映射（§20 废止表）
+            grid_transform=None,
+            point_conf=point_conf,
             vlm_client=vlm_client,
             # 场景清单缓存键：同一 (scene, FrameSet) 复用对象清单（M5 是 scene 级产物）
             frame_set_hash=str(getattr(art, "frame_set_hash", "") or ""),
@@ -1025,12 +1239,12 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                 llm, feedback: Optional[list[str]] = None,
                 geometry: Optional[synth.SyntheticGeometry] = None,
                 pixels: Optional[Sequence[np.ndarray]] = None,
-                route_override: Optional[str] = None,
+                scope_override: Optional[str] = None,
                 traceback_feedback: Optional[str] = None,
                 prior_program: Optional[str] = None) -> _SynthResult:
     """M8：生成 program（或 C0 直答）。
 
-    `route_override` / `traceback_feedback` / `prior_program` 供 D-3 恢复层使用：
+    `scope_override` / `traceback_feedback` / `prior_program` 供 D-3 恢复层使用：
     裁剪 prompt（强制受限 route）或把"上一轮 program + 裁剪 traceback"作为
     额外 turns 回灌（§4 M6 字段 9）。
     """
@@ -1046,7 +1260,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             skill_semver_used=[],
             intended_answer_slot="direct_answer",
         )
-        source = "vllm" if cfg.mode == "real" else "deterministic_stub"
+        source = "vllm_ok" if cfg.mode == "real" else "mock_stub"
         return _SynthResult(program, source, note, direct_answer=answer)
 
     if cfg.mode == "mock_light":
@@ -1058,12 +1272,12 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             names = [_class_hint_of(handle, oid) for oid in handle.list_objects()]
         src = synth.stub_program(episode.question_type, episode, geometry,
                                  object_names=names)
-        return _SynthResult(assemble_program(src, []), "deterministic_stub",
+        return _SynthResult(assemble_program(src, []), "mock_stub",
                             "M8 mock_light 确定性 stub program"
                             "（非 Qwen3-VL-8B 输出，仅管道验证）")
 
     prompt = _build_prompt(episode, scene, handle, skills, feedback,
-                           route_override=route_override,
+                           scope_override=scope_override,
                            traceback_feedback=traceback_feedback)
     client = llm if llm is not None else _make_vllm_client(cfg)
     if client is None:
@@ -1086,17 +1300,55 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
     try:
         # 请求级 seed：钉住 vLLM 采样随机性（§7 复现纪律）
         text = client.chat(messages, max_tokens=cfg.max_tokens, seed=int(cfg.seed))
-        program = assemble_program(text, [f"{s.skill_id}@{s.semver}" for s in skills or []])
-    except SynthesisError as exc:
-        return _SynthResult(None, "vllm", f"M8 program 解析失败: {exc}")
     except Exception as exc:  # noqa: BLE001 - 网络/服务不可用
         from skill3d.synthesis.vllm_client import ServiceUnavailable
 
         if isinstance(exc, ServiceUnavailable):
-            return _SynthResult(None, "vllm",
+            return _SynthResult(None, "vllm_service_error",
                                 f"M8 service_unavailable（§6.1：服务故障不静默降级）: {exc}")
-        return _SynthResult(None, "vllm", f"M8 vLLM 调用失败: {type(exc).__name__}: {exc}")
-    return _SynthResult(program, "vllm", "", n_images=n_images, prompt=prompt)
+        return _SynthResult(None, "vllm_service_error",
+                            f"M8 vLLM 调用失败: {type(exc).__name__}: {exc}")
+
+    # §15.3 退化输出（20KB 重复段落/超长无意义输出/重复度超阈）→ **先重生成**
+    reason = degenerate_reason(text)
+    if reason is not None:
+        notes_deg = f"M8 退化输出检测命中：{reason} → 触发一次重生成（§15.3）"
+        text = _regenerate_non_degenerate(client, messages, cfg, reason)
+        if text is None:
+            return _SynthResult(None, "vllm_parse_error",
+                                notes_deg + "；重生成仍退化/失败 → vllm_parse_error")
+
+    try:
+        program, recovered = assemble_program_ex(
+            text, [f"{s.skill_id}@{s.semver}" for s in skills or []])
+    except SynthesisError as exc:
+        return _SynthResult(None, "vllm_parse_error", f"M8 program 解析失败: {exc}")
+    # §15.2：解析回退单列 m8_parse_recovered，与"真解析不出来"区分开
+    source = "m8_parse_recovered" if recovered else "vllm_ok"
+    return _SynthResult(program, source, "", n_images=n_images, prompt=prompt)
+
+
+def _regenerate_non_degenerate(client, messages, cfg: OnlineRunConfig,
+                               reason: str) -> Optional[str]:
+    """§15.3：退化输出触发**一次**重生成；仍退化或失败返回 None。
+
+    重生成会显式告诉模型"上一轮输出退化了"，并要求只输出一个代码块；
+    重生成结果必须重过 M9 AST（由调用方在拿到 program 后统一做）。
+    """
+    hint = (f"\n\n上一次输出被判定为退化（{reason}）。"
+            "请只输出一个 ```python 代码块，代码块外不要写任何文字，"
+            "不要反复讨论是否 abstain —— 判定一次就直接 ReturnAnswer。")
+    try:
+        msgs = list(messages)
+        if msgs and isinstance(msgs[-1].get("content"), list):
+            msgs[-1] = {**msgs[-1],
+                        "content": list(msgs[-1]["content"]) + [
+                            {"type": "text", "text": hint}]}
+        else:
+            msgs = msgs + [{"role": "user", "content": hint}]
+        return client.chat(msgs, max_tokens=cfg.max_tokens, seed=int(cfg.seed))
+    except Exception:  # noqa: BLE001 - 重生成失败即放弃（上层记 parse_error）
+        return None
 
 
 def _class_hint_of(handle, obj_id: str) -> str:
@@ -1138,49 +1390,46 @@ def _direct_vlm_answer(episode: VSIBenchEpisode, cfg: OnlineRunConfig, llm,
 
 
 def _build_prompt(episode, scene, handle, skills, feedback, *,
-                  route_override: Optional[str] = None,
+                  scope_override: Optional[str] = None,
                   traceback_feedback: Optional[str] = None) -> str:
     """M8 prompt：只给 SceneState 摘要 + Tool 文档 + Skill 模板，绝不含 GT（§4 M8）。
 
     - `tool_docs = REGISTRY.docs(route=...)`：按 route 静态裁剪（D-3a），
       prompt 头部显式写"当前 route=…，可用产物=…"；
-    - `route_override`：tool_contract 恢复层的"裁剪重生成"（强制 fallback_2d_only）；
+    - `scope_override`：tool_contract 恢复层的"裁剪重生成"（强制 fallback_2d_only）；
     - `traceback_feedback`：回灌层的裁剪 traceback + 可用产物清单。
     """
-    route = route_override or (scene.route if scene is not None else "")
-    if route_override and scene is not None:
-        from skill3d.tools.contract import available_artifacts_for
-
-        available = sorted(available_artifacts_for(route_override))
-    elif handle is not None:
-        # prompt 头部的"可用产物"必须是**实际装载**的集合（硬约束 23）：
-        # `scene.available_artifacts` 是 route 级声明，M5 失败/数组未加载时会高报，
-        # 模型照着写就会撞 ArtifactUnavailableError。
+    scope = scope_override or (scene.question_tool_scope if scene is not None else "")
+    # prompt 头部的"可用产物"必须是**实际装载**的集合（硬约束 23）：
+    # `scene.available_artifacts` 是 scope 级声明，M5 失败/数组未加载时会高报，
+    # 模型照着写就会撞 ArtifactUnavailableError。
+    if handle is not None:
         available = sorted(handle.available_artifacts)
     else:
         available = sorted(getattr(scene, "available_artifacts", set()) or set())
-    # v4 HC33：逐题米制授权（未授权时提示词里既没有米制 Tool，头部也写明"无"）
-    metric_tasks = sorted(getattr(scene, "allowed_metric_tasks", set()) or set()) \
-        if scene is not None else []
     qtype = str(getattr(scene, "question_type", "") or "")
+    profile = getattr(scene, "evidence_profile", None) if scene is not None else None
+    gate = getattr(scene, "metric_evidence_gate_result", None) if scene is not None else None
     text = PromptBuilder().render(
         question=episode.question,
         scene_summary=(scene.summary if scene is not None else ""),
-        scene_frame=(scene.frame if scene is not None else "world"),
-        scale_known=bool(scene.scale_known) if scene is not None else False,
-        # 静态裁剪：route（声明）+ 句柄实际装载产物（事实）+ 逐题米制授权 三条件，
-        # 使 prompt 列出的 Tool 在执行期一定不会因缺产物/未授权抛错（硬约束 23 / HC33）
-        tool_docs=REGISTRY.docs(route=route or None,
+        scene_frame="world",
+        # 静态裁剪：scope + EvidenceProfile + 句柄实际装载产物 三条件，
+        # 使 prompt 列出的 Tool 在执行期一定不会因缺产物/证据不足抛错
+        tool_docs=REGISTRY.docs(scope or None,
                                 available=(handle.available_artifacts
                                            if handle is not None else None),
-                                allowed_metric_tasks=metric_tasks,
+                                evidence_profile=profile,
+                                gate_passed=(None if gate is None else gate.gate_passed),
                                 question_type=qtype),
         options=episode.options,
         skills=skills,
-        route=route,
+        scope=scope,
         available_artifacts=available,
-        allowed_metric_tasks=metric_tasks,
         question_type=qtype,
+        evidence_profile=profile,
+        gate_passed=(None if gate is None else gate.gate_passed),
+        gate_missing=(None if gate is None else gate.missing_subconditions),
     )
     if feedback:
         text += f"\n上一次生成被 AST 拒绝，原因：{feedback}\n请修正后重新输出。"
@@ -1209,34 +1458,72 @@ def _contract_feedback(cell: CellResult, program: EpisodeProgram, scene) -> str:
     return "\n".join(lines)
 
 
-def _available_contract_rungs(cfg: OnlineRunConfig, outcome) -> list[tuple[str, Optional[str]]]:
-    """本 episode 尚未用掉的 D-3 恢复档位（§5.1 阶梯，每档至多一次）。
+def _answer_source_v6(*, answer: Optional[str], program, kernel,
+                      outcome: EpisodeOutcome) -> str:
+    """`answer_source` 的 v6 四值口径（§5.3/§6.3，D9）：
 
-    - `("replay", None)`：回灌一次（追加裁剪 traceback + 可用产物清单）——
-      [Conditional Go]，仅在 `enable_tool_contract_replay` 打开时可用；
-    - `("trimmed", "fallback_2d_only")`：裁剪 prompt（强制受限 route + 工具子集）一次。
+    `tool_program`（沙箱内程序作答）/ `direct_vlm_routed`（直答，含 C0 基线与题型策略
+    回退）/ `abstain`（确实无从作答）/ `tool_contract`（契约失败终止：恢复层用尽）。
 
-    顺序即阶梯顺序；rung1 重生成失败时调用方会继续尝试 rung2。
+    v5 的 `program` / `direct_vlm` 两名已废止（`evaluation.experiment_protocol`
+    只为历史 trace 回读保留别名映射）。
     """
-    rungs: list[tuple[str, Optional[str]]] = []
-    if cfg.enable_tool_contract_replay and not outcome.replay_used:
-        rungs.append(("replay", None))
-    if not outcome.trimmed_regen_used:
-        rungs.append(("trimmed", "fallback_2d_only"))
-    return rungs
+    if answer is not None and str(answer) != "":
+        from_program = (kernel is not None
+                        and str(getattr(program, "program_source", "") or "") != "")
+        # 无 program 却能作答 = 直答（C0 基线 / M8 直答回退 / 题型策略）→ 直答来源
+        return "tool_program" if from_program else "direct_vlm_routed"
+    if outcome.failure_code == "tool_contract" or int(outcome.tool_contract_hits) > 0:
+        return "tool_contract"
+    return "abstain"
+
+
+def _failed_tool_of(cell: CellResult) -> str:
+    """从 cell 的契约违规记录里取"第一个失败的 Tool"（归因用）。"""
+    for v in reversed(list(getattr(cell, "contract_violations", []) or [])):
+        name = str(v.get("source_tool") or v.get("tool") or "")
+        if name:
+            return name
+    return ""
+
+
+def _premise_from_cell(cell: CellResult, kernel) -> Optional[str]:
+    """§14.1：失败是否揭示共享前提失效；`None` = 局部失败（不级联撤销）。
+
+    读最后一条契约违规记录的 `error_code` + `missing_artifacts`，按
+    `recovery.premise_of_failure` 的判据推断。没有任何记录时返回 None
+    （信息不足 → 不做破坏性的级联撤销，交给重生成修复）。
+    """
+    viols = list(getattr(cell, "contract_violations", []) or [])
+    if not viols:
+        return None
+    v = viols[-1]
+    name = str(v.get("source_tool") or v.get("tool") or "")
+    try:
+        req = tuple(REGISTRY.requires_evidence(name))
+    except Exception:  # noqa: BLE001 - 未注册名 → 无法判前提，保守不撤销
+        req = ()
+    return premise_of_failure(
+        error_code=str(v.get("error_code") or "tool_contract"),
+        tool=name, requires_evidence=req,
+        missing_artifacts=tuple(v.get("missing_artifacts") or ()))
 
 
 def _regenerate_after_contract(episode, scene, handle, skills, cfg, llm, pixels,
                                geometry, *, prior_program: EpisodeProgram,
                                cell: CellResult,
-                               scene_route: Optional[str]) -> tuple[bool, Optional[EpisodeProgram], list[str]]:
-    """tool_contract 恢复：回灌一次 / 裁剪 prompt 重生成一次（§5.1 阶梯）。
+                               scope_override: Optional[str] = None,
+                               feedback_text: Optional[str] = None
+                               ) -> tuple[bool, Optional[EpisodeProgram], list[str]]:
+    """partial_tool_recovery 的重生成（v6 §6.4/§14）。
 
-    返回 `(是否成功, 新 program, notes)`。重生成后必须**重过 M9 AST 检查**，
-    并在重执行前 reset kernel user namespace（SpatialClaw §E.3 先例）。
+    与 v5 的"回灌/裁剪两档"不同：v6 只有**一条**恢复路径 ——
+    重置命名空间 → 注入 validated observations 摘要 + 失败信息 → 重生成 → 重执行；
+    次数由 `cfg.max_recovery` 约束（`[TODO_CALIBRATE]`），超限切
+    `direct_vlm_routed` 或 abstain。
 
-    本层是 [Conditional Go]：正确性不依赖它（默认关闭，需 `enable_tool_contract_replay`
-    或在裁剪轮使用），且失败一律落到显式 abstain。
+    重生成必须重过 M9 AST 检查；重执行前必须 `reset_user_namespace()`（避免引用
+    已失效的旧变量）。
     """
     notes: list[str] = []
     if cfg.mode == "mock_light" and llm is None:
@@ -1244,23 +1531,23 @@ def _regenerate_after_contract(episode, scene, handle, skills, cfg, llm, pixels,
         notes.append("M10 恢复层跳过：mock_light 无模型，stub program 重生成无意义")
         return False, None, notes
 
-    traceback_feedback = _contract_feedback(cell, prior_program, scene)
+    feedback = feedback_text or _contract_feedback(cell, prior_program, scene)
+    # §14.1：重置用户命名空间（保留 Tool/帧/答案槽），再注入 validated obs 摘要
+    if handle is not None:
+        pass  # kernel 由 _execute_program 持有；重置在其内部按需执行
     res = _synthesize(episode, scene, handle, skills, cfg, llm,
                       feedback=None, geometry=geometry, pixels=pixels,
-                      route_override=scene_route,
-                      traceback_feedback=traceback_feedback,
-                      prior_program=(prior_program.program_source if scene_route is None
-                                     else None))
+                      scope_override=scope_override,
+                      traceback_feedback=feedback,
+                      prior_program=None)
     if res.program is None:
         notes.append(f"M10 恢复层重生成失败: {res.note}")
         return False, None, notes
     check = ast_guard(res.program.program_source, allowed_tools=set(REGISTRY.names()))
     if not check.ok:
         notes.append(f"M10 恢复层重生成未过 M9 AST: {check.violations}")
-        return False, None, notes
-    label = "回灌" if scene_route is None else "裁剪 prompt（强制 fallback_2d_only）"
-    notes.append(f"M10 恢复层：{label}重生成成功，program_id={res.program.program_id}"
-                 "（重执行前 reset kernel 命名空间）")
+        return False, None, notes + ["AST 拒绝"]
+    notes.append("M10 恢复层重生成通过 M9 AST（回灌 validated observations + 失败信息）")
     return True, res.program, notes
 
 
@@ -1414,6 +1701,11 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
 
     outcome.frame_set_hash = (episode.frame_set.frame_set_hash
                               if episode.frame_set is not None else "")
+    profile = outcome.evidence_profile
+    evidence_states = (profile.as_signature() if profile is not None else {})
+    gate = outcome.metric_evidence_gate_result
+    q = outcome.overall_quality
+    main_gate_passed = outcome.main_gate_passed
     outcome.episode_trace = EpisodeTrace(
         episode_id=episode.qa_id,
         qa_id=episode.qa_id,
@@ -1431,25 +1723,40 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         abstained=bool(outcome.abstained),
         answer_untrusted=bool(outcome.answer_untrusted),
         scene_route=str(outcome.scene_route or ""),
+        question_tool_scope=str(outcome.question_tool_scope or ""),
         quality_status=str(outcome.quality_status or ""),
-        # v5：逐 episode 事实落 trace（§14.1-6 的 smoke 核对项 + §7 复现清单）
-        schema_version="5.0",
+        # v6：逐 episode 事实落 trace（§19.1/§19.2）
+        schema_version="6.0",
         quality_metric_version=QUALITY_METRIC_VERSION,
         frame_set_hash=str(outcome.frame_set_hash or ""),
         n_frames=int(len(episode.frames)),
         n_images_to_synthesizer=int(outcome.n_images_to_synthesizer),
-        reprojection_status=str(outcome.reprojection_status),
-        coverage_gate_status=str(outcome.coverage_gate_status),
-        scale_confidence=str(outcome.scale_confidence),
-        allowed_metric_tasks=sorted(outcome.allowed_metric_tasks),
+        # v6 §10.4：G5 永久 not_available；不得出现任何代理值
+        reprojection_status="not_available",
+        world_frame_status=str(outcome.world_frame_status),
+        scale_fusion_status=str(outcome.scale_fusion_status),
+        metric_scale=outcome.metric_scale,
+        metric_gate_passed=bool(gate is not None and gate.gate_passed),
+        metric_model=str(outcome.metric_model or "none"),
         authorized_metric_tasks=sorted(outcome.authorized_metric_tasks),
+        evidence_states=evidence_states,
         overall_quality=(None if outcome.overall_quality is None
                          else float(outcome.overall_quality)),
+        main_gate_passed=main_gate_passed,
         input_degradation_flags=sorted(set(outcome.input_degradation_flags or [])),
         answer_source=str(outcome.answer_source),
+        recovery_count=int(outcome.recovery_count),
+        partial_tool_recovery=bool(outcome.partial_tool_recovery),
+        used_result_ids=sorted(set(outcome.used_result_ids or [])),
+        invalidated_result_ids=sorted(set(outcome.invalidated_result_ids or [])),
+        failure_code=outcome.failure_code,
+        synthesis_source=str(outcome.synthesis_source or ""),
+        degenerate_regenerated=bool(outcome.degenerate_regenerated),
     )
     if trace_store is not None:
         trace_store.append("episode_trace", outcome.episode_trace)
+        # §5.9 TraceRecord：版本字段 + 证据/路由全状态（不依赖重跑即可归因）
+        trace_store.append("trace_record", _trace_record_of(outcome, episode, cfg))
         if outcome.program_trace is not None:
             trace_store.append("program_trace", outcome.program_trace)
         if outcome.program is not None:

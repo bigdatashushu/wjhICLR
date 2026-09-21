@@ -1,4 +1,9 @@
-"""M6 Mock 三档切换单测（§4 M6 字段 11 / §9.2）。"""
+"""M6 Mock 三档切换单测（§4 M6 字段 11 / §9.2）。
+
+v6 夹具说明：`SceneState` 不再有 `route` / `frame` / `scale_known`（D4/§20），
+改为 `scene_route` × `question_tool_scope`；`euclidean_distance` 是纯算术 Tool
+（`requires_evidence=[]`），任何证据状态下都可用，正好用来测 mock 切换本身。
+"""
 
 import json
 
@@ -7,15 +12,16 @@ import pytest
 
 from skill3d.schemas import SceneState
 from skill3d.tools import MockContaminationError, MockSwitch, SceneHandle, call_tool
+from skill3d.tools.contract import available_artifacts_for
 
 
 def _handle() -> SceneHandle:
     return SceneHandle(
         SceneState(
             artifact_ref="artifact://demo",
-            route="full_3d",
-            frame="world",
-            scale_known=True,
+            scene_route="full_3d",
+            question_tool_scope="full_3d",
+            available_artifacts=set(available_artifacts_for("full_3d")),
             objects=[],
             summary="",
         ),

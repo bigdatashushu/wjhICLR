@@ -4,11 +4,15 @@
 任何状态、任何 prompt 不得出现 GPT-6 调用/verify/重试裁决。
 纯 Python 轻量状态机实现（不依赖 transitions 库）：状态枚举 + 转移表 + guard 函数。
 
-状态链（v4 新增 SCALE_ESTIMATE / SCALE_CALIBRATE，§5.1）：
-INGEST→INPUT_GATE→RECONSTRUCT→SCALE_ESTIMATE(多锚点融合)→SCALE_CALIBRATE(冻结校准器,
-逐题授权)→QUALITY_GATE(写回 artifact)→CLASSIFY_TASK→RETRIEVE_SKILL
-→SYNTHESIZE_PROGRAM→STATIC_CHECK→SANDBOX_EXECUTE→GEOMETRY_VERIFY→BENCHMARK_EVAL
-→ANSWER→LOG_TRACE；失败转移见 §6.3。
+状态链（v6 §6.1）：
+INGEST→INPUT_GATE→RECONSTRUCT(VGGT + 世界系契约 + 度量融合)→WORLD_FRAME(校验 world_up/
+handedness 存在性)→METRIC_FUSION(观测融合状态，定 metric_scale 能力)→QUALITY_GATE(M4
+主门 → scene_route)→CLASSIFY_TASK→RETRIEVE_SKILL→SYNTHESIZE_PROGRAM→STATIC_CHECK
+→SANDBOX_EXECUTE→GEOMETRY_VERIFY→BENCHMARK_EVAL→ANSWER→LOG_TRACE；失败转移见 §6.3。
+
+v6 与 v5 的差异（D4/D5/D1）：v5 的 SCALE_ESTIMATE/SCALE_CALIBRATE（多锚点 + conformal
+校准池）已废止，改为 WORLD_FRAME / METRIC_FUSION 两态：它们**只观测与落档**，
+都不改 `scene_route`（scene_route 只由 M4 质量决定），也都不中止 episode。
 """
 
 from __future__ import annotations
@@ -24,11 +28,12 @@ class OnlineState(str, Enum):
     INGEST = "INGEST"
     INPUT_GATE = "INPUT_GATE"
     RECONSTRUCT = "RECONSTRUCT"
-    # v4 §5.1：尺度估计与校准是**独立状态**，位于重建之后、质量门禁之前。
-    # 两者都不改 route（route 只由质量决定）；它们只产出 ScaleAssessment
-    # （scale/ci_rel/confidence/allowed_metric_tasks），供 M7 逐题授权消费。
-    SCALE_ESTIMATE = "SCALE_ESTIMATE"
-    SCALE_CALIBRATE = "SCALE_CALIBRATE"
+    # v6 D5：世界系契约（world_up + handedness）由 M3 落盘，本态只做**存在性校验**；
+    # 缺失时方向/路线类 Tool fail-closed，但不改 scene_route、不中止 episode。
+    WORLD_FRAME = "WORLD_FRAME"
+    # v6 D1/D2：度量尺度融合状态观测（metric_scale / 离散度 / 有效帧占比）。
+    # 融合失败只让 metric_scale 能力落 unavailable → 逐题 scope 收窄（§6.2）。
+    METRIC_FUSION = "METRIC_FUSION"
     QUALITY_GATE = "QUALITY_GATE"
     CLASSIFY_TASK = "CLASSIFY_TASK"
     RETRIEVE_SKILL = "RETRIEVE_SKILL"
@@ -86,30 +91,33 @@ class OnlineFSM:
 
         elif s is OnlineState.RECONSTRUCT:
             if event == "done":
-                self.state = OnlineState.SCALE_ESTIMATE
+                self.state = OnlineState.WORLD_FRAME
             elif event == "skip":
                 # 复用既有 artifact / mock_light：尺度评估已随 artifact 落盘，跳过两态
                 self.state = OnlineState.QUALITY_GATE
             else:
                 self._to_unanswerable()  # 重建不可恢复
 
-        elif s is OnlineState.SCALE_ESTIMATE:
-            # v4 §5.1：多锚点鲁棒融合（地平面/相机高 + 门/桌/椅等标准物体）。
-            # 失败（无有效锚点/融合非有限）**不**中止 episode：落 low 档并继续。
+        elif s is OnlineState.WORLD_FRAME:
+            # v6 D5：world_up / handedness 由 M3 估计并落盘，本态只做存在性校验。
+            # 缺失 → 方向/路线类 Tool 在 docs() 里被隐藏、执行期 fail-closed；
+            # **不**改变 route（route 只由质量决定），也不中止 episode。
             if event != "done":
                 raise ValueError(f"{s} 不支持事件 {event}")
-            self.state = OnlineState.SCALE_CALIBRATE
+            if ctx.get("world_frame_unavailable"):
+                self.answer_flags.append("world_frame_unavailable")
+            self.state = OnlineState.METRIC_FUSION
 
-        elif s is OnlineState.SCALE_CALIBRATE:
-            # v4 §5.1：冻结 conformal 校准器 + 逐题型授权。
-            # 校准器缺失 / 口径校验失败 / 锚点冲突 / 经验覆盖不足 → confidence=low 且
-            # allowed_metric_tasks=∅；**不得**改变质量合格场景的非尺度 full_3d route。
+        elif s is OnlineState.METRIC_FUSION:
+            # v6 D1/D2：零样本度量深度跨帧融合的状态观测。
+            # 融合失败/未跑 → metric_scale 落 unavailable，逐题 scope 收窄到 full_3d
+            # （米制 Tool 收回）；**不得**把整 episode 降成 2D-only，也不回退多锚点。
             if event != "done":
                 raise ValueError(f"{s} 不支持事件 {event}")
-            if ctx.get("metric_tasks_withdrawn"):
-                self.answer_flags.append("scale_low_metric_tasks_withdrawn")
-            if ctx.get("scale_conflict"):
-                self.answer_flags.append("scale_conflict")
+            if ctx.get("metric_fusion_failed"):
+                self.answer_flags.append("metric_fusion_failed")
+            if ctx.get("scale_dispersion_high"):
+                self.answer_flags.append("scale_dispersion_high")
             self.state = OnlineState.QUALITY_GATE
 
         elif s is OnlineState.QUALITY_GATE:

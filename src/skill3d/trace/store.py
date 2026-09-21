@@ -62,6 +62,11 @@ class TraceStore:
         rows = [json.loads(l) for l in src.read_text(encoding="utf-8").splitlines() if l.strip()]
         if not rows:
             return None
+        # v6：`evidence_states` / `distance_primitive_params` 这类 dict 字段在
+        # "无内容"时是 `{}`，pyarrow 拒绝写"无子字段的 struct" → 归一为 None
+        # （语义等同：空字典与"没有该字段"在 trace 里是同一件事）。
+        rows = [{k: (None if isinstance(v, dict) and not v else v)
+                 for k, v in r.items()} for r in rows]
         table = pa.Table.from_pylist(rows)
         out = Path(out_path) if out_path else src.with_suffix(".parquet")
         pq.write_table(table, out)

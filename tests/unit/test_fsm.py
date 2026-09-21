@@ -12,13 +12,13 @@ def test_online_happy_path_to_log_trace():
     fsm.step("gate_done", {"action": "proceed"})
     assert fsm.state is OnlineState.RECONSTRUCT
     fsm.step("done")
-    # v4 §5.1：重建后先尺度估计/校准（多锚点融合 + 冻结校准器 + 逐题授权），
-    # 再进质量门禁；两态都不改 route
-    assert fsm.state is OnlineState.SCALE_ESTIMATE
-    fsm.step("done")
-    assert fsm.state is OnlineState.SCALE_CALIBRATE
-    fsm.step("done", {"metric_tasks_withdrawn": True, "scale_conflict": False})
-    assert "scale_low_metric_tasks_withdrawn" in fsm.answer_flags
+    # v6 D5/D1：重建后先观测**世界系契约**（world_up/handedness 存在性）与
+    # **度量尺度融合**状态，再进质量门禁；两态都不改 scene_route
+    assert fsm.state is OnlineState.WORLD_FRAME
+    fsm.step("done", {"world_frame_unavailable": False})
+    assert fsm.state is OnlineState.METRIC_FUSION
+    fsm.step("done", {"metric_fusion_failed": False,
+                      "scale_dispersion_high": False})
     assert fsm.state is OnlineState.QUALITY_GATE
     fsm.step("gate_done", {"action": "proceed"})
     assert fsm.state is OnlineState.CLASSIFY_TASK
@@ -38,24 +38,30 @@ def test_online_happy_path_to_log_trace():
 
 
 def test_online_scale_states_do_not_block_on_failure():
-    """v4 §5.1：尺度估计/校准失败**不**中止 episode（只落 low + 收回米制题型）。
+    """v6 §6.2/D4：世界系契约缺失 / 度量融合失败**都不**中止 episode。
 
-    尺度为 low 不得把质量合格场景的非尺度 3D 能力一起砍掉（HC33）。
+    二者只把对应**分项能力**降级（`world_frame` / `metric_scale`），
+    使逐题 `question_tool_scope` 收窄（方向类/米制 Tool 被收回）；
+    `scene_route` 与其余能力（几何/检测/时序/图像）完全不受影响 ——
+    这就是 §7.2"单项失败只收回依赖该证据的工具"。
     """
     fsm = OnlineFSM()
     for ev, ctx in [("episode_ready", {}), ("gate_done", {"action": "proceed"}),
                     ("done", {})]:
         fsm.step(ev, ctx)
-    assert fsm.state is OnlineState.SCALE_ESTIMATE
-    fsm.step("done")
-    fsm.step("done", {"metric_tasks_withdrawn": True, "scale_conflict": True})
+    assert fsm.state is OnlineState.WORLD_FRAME
+    fsm.step("done", {"world_frame_unavailable": True})
+    assert "world_frame_unavailable" in fsm.answer_flags
+    fsm.step("done", {"metric_fusion_failed": True, "scale_dispersion_high": True})
     assert fsm.state is OnlineState.QUALITY_GATE      # 仍在正常链上
-    assert "scale_conflict" in fsm.answer_flags
+    assert "metric_fusion_failed" in fsm.answer_flags
+    assert "scale_dispersion_high" in fsm.answer_flags
     assert "unanswerable" not in fsm.answer_flags
 
 
 def test_online_reconstruct_skip_bypasses_scale_states():
-    """复用 artifact / mock_light：尺度已随 artifact 落盘 → 跳过两态直达质门。"""
+    """复用 artifact / mock_light：世界系契约与度量融合已随 artifact 落盘
+    → 跳过两态直达质量门禁。"""
     fsm = OnlineFSM()
     for ev, ctx in [("episode_ready", {}), ("gate_done", {"action": "proceed"})]:
         fsm.step(ev, ctx)

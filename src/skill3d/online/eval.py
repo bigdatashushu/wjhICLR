@@ -10,9 +10,10 @@ python -m skill3d.online.eval --split test --active-snapshot data/active_snapsho
   program，仅管道验证，§9.2）；
 - 两档 baseline `--baseline`：`C0_direct_vlm`（无 Tool 直答）| `C1_tools_program`（§16.1）；
 - 硬约束 9：`final_test`（或 `--split test`）需显式 `--allow-final-test`，且仅应盲评一次；
-- 硬约束 1：本模块在线，禁止任何 GPT-6 调用。
+- 硬约束 1：本模块在线，禁止任何离线强模型调用（v6 §3.3/§20：离线治理模型为
+  DeepSeek-V4.1-Flash，仅离线；RunManifest 只**登记**其冻结配置，不发起调用）。
 
-结果：控制台汇总 + `EvaluationRun` 落 TraceStore（§5.7）。
+结果：控制台汇总 + `EvaluationRun` 落 TraceStore（§5.7）+ RunManifest（§19.2）。
 """
 
 from __future__ import annotations
@@ -38,7 +39,11 @@ from skill3d.online.config import (
     sandbox_from,
     vllm_from,
 )
-from skill3d.online.runner import OnlineRunConfig, run_split
+from skill3d.online.runner import (
+    MAX_RECOVERY_ATTEMPTS,
+    OnlineRunConfig,
+    run_split,
+)
 from skill3d.skills.registry import load_active_skills
 
 # §13.5 用 `--split test`；本系统的四层切分用 induction/inner/outer/final_test
@@ -92,16 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="episodic 记忆目录（G-26；空=用 config 的 paths.memory_db 同级）")
     p.add_argument("--no-memory", action="store_true", help="关闭在线 episodic 记忆写入")
     p.add_argument("--recon-dir", default="")
-    p.add_argument("--recon-method", default="vggt",
-                   choices=["vggt", "vggt_sparse_ba", "dust3r_mast3r", "colmap"],
-                   help="重建方法；v5 正式主线为 vggt（HC35）")
-    p.add_argument("--sparse-ba", action="store_true",
-                   help="启用 `vggt_sparse_ba` 限定 PoC（未过 §10.1 前启用报错，HC36）")
-    p.add_argument("--scale-calibration", default="",
-                   help="冻结尺度 conformal 校准器 JSON（HC32；缺省取 configs/config.yaml "
-                        "的 scale.calibration_path；不存在 → scale_confidence 恒 low）")
-    p.add_argument("--allow-tool-contract-replay", action="store_true",
-                   help="启用 D-3 回灌恢复层（[Conditional Go]：回灌修复率 >=50%% 才启用）")
+    p.add_argument("--recon-method", default="vggt", choices=["vggt"],
+                   help="重建方法；v6 §5.2 受控枚举只有 vggt（BA 路线与 colmap/dust3r "
+                        "对照基线均已废止并入 legacy/retired）")
+    p.add_argument("--max-recovery", type=int, default=MAX_RECOVERY_ATTEMPTS,
+                   help=("partial_tool_recovery 的最大恢复次数（v6 §14，[TODO_CALIBRATE]）；"
+                         "超限即显式 abstain / direct_vlm_routed。"
+                         "v5 的 --allow-tool-contract-replay 开关已随两档阶梯废止"))
     p.add_argument("--frame-size", default="", help="合成帧尺寸 HxW（默认 480x640，与 VSI-Bench 对齐）")
     p.add_argument("--degrade", default="", choices=["", "blur_all", "blur_some",
                                                      "overexposed_all", "few_frames"],
@@ -125,13 +127,8 @@ def main(argv: list[str] | None = None) -> int:
             os.environ["SKILL3D_DETECTOR_ENDPOINT"] = str(_det)
     except Exception:  # noqa: BLE001 - 配置缺失不阻断
         pass
-    # v5 HC35/36：生产禁用的两条 BA 路径在入口 fail-closed
-    from skill3d.reconstruction.legacy_vggsfm_ba import UnsupportedConfigurationError
-
-    if args.recon_method == "vggt_sparse_ba" or args.sparse_ba:
-        print("[错误] `vggt_sparse_ba` 尚未通过 §10.1 L0→L1→L2，禁止启用（HC36）；"
-              "正式主线继续用 vggt。", file=sys.stderr)
-        return 2
+    # v6 §5.2：`recon_method` 受控枚举只有 `vggt`；旧 BA / colmap / dust3r 路线
+    # 已整体废止（§20），CLI 不再提供开关，也不再 import 已归档模块。
     cfg_yaml = load_config(args.config)
     paths = paths_from(cfg_yaml)
     vllm = vllm_from(cfg_yaml)
@@ -227,17 +224,11 @@ def main(argv: list[str] | None = None) -> int:
         recon_method=args.recon_method,
         direct_answer_tasks={t.strip() for t in args.direct_answer_tasks.split(",")
                              if t.strip()},
-        ba_enabled=False,   # v5 HC35/36：正式评测不带任何 BA（启用请求在 CLI 处报错）
-        # v4 尺度（HC29–33）：冻结校准器路径 + nominal coverage（在线只读）
-        scale_calibration_path=(args.scale_calibration
-                                or (cfg_yaml.get("scale") or {}).get("calibration_path")
-                                or None),
-        # v5.1：多校准器目录 + 被评测数据集（按数据集选同源冻结校准器）
-        scale_calibration_dir=str((cfg_yaml.get("scale") or {}).get("calibration_dir") or ""),
-        evaluation_datasets=list((cfg_yaml.get("scale") or {}).get("evaluation_datasets") or []),
-        scale_confidence_level=float(
-            (cfg_yaml.get("scale") or {}).get("confidence_level", 0.90) or 0.90),
-        enable_tool_contract_replay=bool(args.allow_tool_contract_replay),
+        # v6 §20：BA（官方 VGGSfM / vggt_sparse_ba）与整套"需校准的尺度"路线已废止，
+        # 相关配置项（ba_enabled / scale_calibration_* / scale_confidence_level）不再传入。
+        # v6 §14/D7：partial_tool_recovery 恒开（次数由 --max-recovery 约束），
+        # v5 的 --allow-tool-contract-replay 开关随"回灌/裁剪"两档阶梯一并废止。
+        max_recovery=int(args.max_recovery),
         max_pixels=int(getattr(vllm, "max_pixels", 131072) or 131072),
         max_model_len=int(getattr(vllm, "max_model_len", 32768) or 32768),
         allow_final_test=args.allow_final_test,
@@ -322,20 +313,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - 统计是附加产物，不阻断评测
         print(f"[warn] 过程指标聚合失败: {type(exc).__name__}: {exc}", file=sys.stderr)
 
-    # ---- v4 尺度能力小节（§7：逐题型 MRA/refusal/coverage + 锚点/冲突率，不混主表）----
-    try:
-        from skill3d.evaluation.scale_report import build_scale_report, write_scale_report
-
-        sr = build_scale_report(outcomes)
-        print("\n尺度能力（不混主表；HC29–33）:")
-        for line in sr.format_lines()[1:]:
-            print(line)
-        sr_out = (str(Path(run_cfg.trace_dir) / "scale_report.json")
-                  if run_cfg.trace_dir else "")
-        if sr_out:
-            print(f"  尺度报告已写: {write_scale_report(sr, sr_out)}")
-    except Exception as exc:  # noqa: BLE001 - 附加产物，不阻断评测
-        print(f"[warn] 尺度报告生成失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+    # ---- v6 §20：v4/v5 尺度能力小节（scale_report / 校准池诊断）随校准路线一并废止，
+    #      米制尺度证据改由 reconstruction/metric_fusion.py 的逐帧 receipt 承载。----
 
     # ---- RunManifest（G-67/§16.4 + §7：代码/环境/split/seed/推理参数全记录）----
     manifest_path = _write_manifest(args, cfg_yaml, run, run_cfg, split,
@@ -366,9 +345,109 @@ def _frame_set_summary(items) -> tuple[str, int]:
     return "multi:" + _h.sha256("|".join(uniq).encode()).hexdigest()[:16], len(uniq)
 
 
+def v6_version_fields() -> dict:
+    """§19.2 v6 版本字段（单一定义点：在线评测与离线演进两条链共用同一份口径）。"""
+    from skill3d.reconstruction.metric_fusion import (
+        METRIC_FUSION_VERSION,
+        METRIC_MODEL_NONE,
+    )
+    from skill3d.schemas.evidence import GATE_VERSION, PROFILE_VERSION
+    from skill3d.tools.distance_primitives import DistancePrimitiveParams
+    from skill3d.tools.registry import TOOL_FACE_VERSION
+    from skill3d.synthesis.prompt_builder import TEMPLATE_VERSION
+
+    return {
+        "template_version": TEMPLATE_VERSION,
+        "tool_face_version": TOOL_FACE_VERSION,
+        "evidence_profile_version": PROFILE_VERSION,
+        "gate_version": GATE_VERSION,
+        "metric_model": METRIC_MODEL_NONE,          # 未跑融合时如实标 none
+        "metric_fusion_version": METRIC_FUSION_VERSION,
+        # 距离原语冻结参数（quantile_q / voxel_size / conf_warp_version / n_min）
+        "distance_primitive_params": DistancePrimitiveParams().snapshot(),
+    }
+
+
+# manifest 里绝不允许出现的键/值（§3.4：密钥、Authorization 头、完整环境变量、
+# base URL 本体——只允许 endpoint_hash）。注意 `request_params.endpoint` 只含
+# 哈希与路径，不在禁止之列。
+_FORBIDDEN_MANIFEST_KEYS = frozenset({
+    "api_key", "apikey", "authorization", "auth_header", "bearer",
+    "env", "environ", "base_url",
+})
+
+
+def offline_manifest_fields(offline_client=None) -> dict:
+    """§19.2「离线治理模型字段」：`offline_model`/`provider`/`model_id`/`endpoint_hash`/
+    `prompt_version`/`latency`/`token_usage`。
+
+    - **给了离线客户端**（`DeepSeekClient` 或任何提供 `manifest_fields()` 的对象）→
+      直接取其元数据（只含形状 / 呼号哈希 / 延迟 / token 计数），`invoked=true`；
+    - **没给**（在线链的常态：硬约束 1 禁止在线链接触离线治理模型）→ 如实登记
+      `invoked=false` + 空字段，**不虚构**任何值，也绝不"用 mock 顶上"。
+
+    两条路径都经 `_strip_secrets` 清洗：`api_key` / `authorization` / `base_url` 本体
+    都不落盘（只保留 `endpoint_hash`）。
+
+    注意：本模块**不得 import `skill3d.governance`**（`tests/unit/test_no_gpt6_online.py`
+    的硬约束 1 静态守卫），故这里只做 duck-typing，不引用 `DeepSeekClient` 类型。
+    """
+    if offline_client is not None:
+        if hasattr(offline_client, "manifest_fields"):
+            fields = dict(offline_client.manifest_fields())
+        else:
+            # 替身 / 自定义 transport：只登记它**自报**的身份，不虚构延迟与用量
+            fields = {
+                "offline_model": str(getattr(offline_client, "offline_model_name", "") or ""),
+                "provider": str(getattr(offline_client, "provider", "") or ""),
+                "model_id": str(getattr(offline_client, "model_id", "") or ""),
+                "endpoint_hash": str(getattr(offline_client, "endpoint_hash", "") or ""),
+                "prompt_version": str(getattr(offline_client, "prompt_version", "") or ""),
+                "latency": {}, "token_usage": {},
+            }
+        fields["invoked"] = True
+    else:
+        fields = {
+            "offline_model": "", "provider": "", "model_id": "", "endpoint_hash": "",
+            "prompt_version": "", "latency": {}, "token_usage": {},
+            "invoked": False,
+            "note": ("在线链不调用离线治理模型（硬约束 1 / §3.3）；离线模型身份由离线链"
+                     "（evolution/offline_driver.py）的 RunManifest 登记"),
+        }
+    return _strip_secrets(fields)
+
+
+def _strip_secrets(value, *, _depth: int = 0):
+    """递归剔除密钥类键并做值级兜底（§3.4：绝不落盘 API key/Authorization）。
+
+    键名命中 `_FORBIDDEN_MANIFEST_KEYS` → 丢弃；字符串值若与环境里的
+    `DEEPSEEK_API_KEY` 相同 → 替换为 `***`（双保险，防上游把密钥塞进别的字段）。
+    """
+    secret = os.environ.get("DEEPSEEK_API_KEY", "")
+    if _depth > 6:
+        return "<max_depth>"
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if str(k).lower() in _FORBIDDEN_MANIFEST_KEYS:
+                continue
+            out[str(k)] = _strip_secrets(v, _depth=_depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_strip_secrets(v, _depth=_depth + 1) for v in value]
+    if isinstance(value, str) and secret and secret in value:
+        return "***"
+    return value
+
+
 def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
-                    outcomes=None, items=None):
-    """写 RunManifest（失败不阻断评测：复现信息是附加产物）。"""
+                    outcomes=None, items=None, offline_client=None):
+    """写 RunManifest（失败不阻断评测：复现信息是附加产物）。
+
+    §19.2：模板版本 / tool-face 版本 / EvidenceProfile 版本 / MetricEvidenceGate 版本 /
+    距离原语参数 / 尺度融合版本 + 离线治理模型字段（离线模型只在**离线链**被调用，
+    本函数只登记其冻结配置；绝不写 API key）。
+    """
     from skill3d.infra.version_lock import build_run_manifest, write_run_manifest
 
     try:
@@ -388,27 +467,42 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
         out = args.run_manifest or "data/run_manifest.json"
         vllm_cfg = cfg_yaml.get("vllm") or {}
         fsh, n_fsh = _frame_set_summary(items or [])
-        scale_sources = sorted({str(getattr(o, "scale_source", "") or "")
-                                for o in (outcomes or [])} - {""})
-        cal_ids, cal_hashes, conf_dist, allowed_tasks = _scale_manifest_facts(
-            outcomes, run_cfg)
         from skill3d.evaluation.golden_v5 import golden_versions
         from skill3d.reconstruction_gate.quality_metrics import (
             QUALITY_METRIC_VERSION,
         )
-        from skill3d.reconstruction.sparse_ba import sparse_ba_enabled
 
+        # §19.2 离线治理模型块（无离线客户端 → 只登记冻结配置，invoked=false）
+        offline = offline_manifest_fields(offline_client)
+        # HC39 golden 三元组：**必须带 `golden_` 前缀**。`golden_versions()` 里的
+        # `schema_version` / `quality_metric_version` 是 **golden 夹具**的版本
+        # （v5 golden = 5.0 / v5-no-g8-g5-optional），与本 run 的 v6 口径不同名同义——
+        # 直接展开会把 "6.0 / v6-warp-overlap-no-g5" 覆盖成 golden 的版本号，
+        # 让 RunManifest 谎报本 run 的 schema 口径。
+        golden = golden_versions()
+        golden_fields = {
+            "golden_version": golden.get("golden_version", ""),
+            "golden_schema_version": golden.get("schema_version", ""),
+            "golden_quality_metric_version": golden.get("quality_metric_version", ""),
+        }
         return write_run_manifest(m, out, extra={
-            # ---- v5 版本三元组（HC39：schema/质量口径/golden 必须同时留档）----
-            "schema_version": "5.0",
+            # ---- v6 版本三元组（HC39：schema/质量口径/golden 必须同时留档）----
+            "schema_version": "6.0",
             "quality_metric_version": QUALITY_METRIC_VERSION,
-            **golden_versions(),
-            # ---- v5 HC35–37：主线与 BA 状态（全部默认关闭，启用即报错）----
+            **golden_fields,
+            # ---- §19.2 版本字段（模板 / tool-face / 证据画像 / gate / 距离原语）----
+            **v6_version_fields(),
+            # ---- §19.2 离线治理模型块（扁平键 + 嵌套块双写，便于审计脚本直读）----
+            "offline_model": offline.get("offline_model", ""),
+            "provider": offline.get("provider", ""),
+            "model_id": offline.get("model_id", ""),
+            "endpoint_hash": offline.get("endpoint_hash", ""),
+            "prompt_version": offline.get("prompt_version", ""),
+            "latency": offline.get("latency", {}),
+            "token_usage": offline.get("token_usage", {}),
+            "offline_governance": offline,
+            # ---- v6 §5.2：重建路线受控枚举只有 vggt；BA 与校准尺度路线已废止（§20）----
             "recon_method": str(run_cfg.recon_method),
-            "sparse_ba_enabled": bool(sparse_ba_enabled()),
-            "sparse_ba_frontend": "",
-            "sparse_ba_pair_graph_hash": "",
-            "official_vggsfm_ba_enabled": False,
             "reprojection_status": (
                 "computed" if any(
                     str(getattr(o, "reprojection_status", "")) == "computed"
@@ -423,7 +517,6 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
             "sampling_per_task": int(args.sampling_per_task),
             "sampling_strategy": ("first_n_per_task_by_meta_order"
                                   if args.sampling_per_task else "none"),
-            "gpt6_latency_stats": {},   # 在线链无 GPT-6（HC1）；离线链在此登记
             "run_id": run.run_id, "split": split, "mode": args.mode,
             "baseline": args.baseline, "n_episodes": run.n_episodes,
             "active_snapshot_ref": run.active_snapshot_ref,
@@ -433,63 +526,28 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
             "max_pixels": vllm_cfg.get("max_pixels"),
             "max_model_len": vllm_cfg.get("max_model_len"),
             "vllm_endpoints": list(run_cfg.vllm_endpoints),
-            # §7 / D-6 / A-8 / D-2：帧集身份、BA 开关、尺度来源
+            # §7 / D-6 / A-8 / D-2：帧集身份（v6 不再记录 BA 开关与校准尺度来源）
             "frame_set_hash": fsh,
             "n_distinct_frame_sets": n_fsh,
-            "ba_enabled": bool(getattr(run_cfg, "ba_enabled", False)),
-            "scale_source": ",".join(scale_sources),
-            # ---- v4 HC29–34：尺度校准复现三件套（§7 明文要求留档）----
-            "scale_calibration_id": ",".join(cal_ids),
-            "evaluation_datasets": list(run_cfg.evaluation_datasets),
-            "calibration_split_hash": cal_hashes.get("calibration_split_hash", ""),
-            "excluded_vsibench_scene_hash":
-                cal_hashes.get("excluded_vsibench_scene_hash", ""),
-            "confidence_level": float(getattr(run_cfg, "scale_confidence_level", 0.0) or 0.0),
-            "scale_confidence_distribution": conf_dist,
-            "allowed_metric_tasks_observed": sorted(allowed_tasks),
             "readiness_manifest_ref": str(
                 (cfg_yaml.get("readiness") or {}).get("manifest_path", ""))})
     except Exception as exc:  # noqa: BLE001
         return f"(写失败: {type(exc).__name__}: {exc})"
 
 
-def _scale_manifest_facts(outcomes, run_cfg) -> tuple[list[str], dict, dict, list[str]]:
-    """从 outcomes 与冻结校准器提取 v4 复现事实（§7 / HC32）。
-
-    返回 `(calibration_ids, split_hashes, confidence_distribution, allowed_tasks)`。
-    `split_hashes` 来自**冻结校准器自带的审计清单**（不是临时重算），
-    保证记录的是本次实际使用的那份校准器的隔离证据。
-    """
-    cal_ids = sorted({str(getattr(o, "scale_calibration_id", "") or "")
-                      for o in outcomes or []} - {""})
-    conf_dist: dict = {}
-    for o in outcomes or []:
-        c = str(getattr(o, "scale_confidence", "low") or "low")
-        conf_dist[c] = conf_dist.get(c, 0) + 1
-    allowed = {t for o in outcomes or []
-               for t in (getattr(o, "authorized_metric_tasks", None) or [])}
-    hashes: dict = {}
-    if cal_ids:
-        try:
-            from skill3d.reconstruction.scale_calibration import load_calibrator
-
-            cal = load_calibrator(getattr(run_cfg, "scale_calibration_path", None))
-            if cal.split_audit is not None:
-                hashes = {"calibration_split_hash": cal.split_audit.calibration_split_hash,
-                          "excluded_vsibench_scene_hash":
-                              cal.split_audit.excluded_vsibench_scene_hash}
-        except Exception:  # noqa: BLE001 - 校准器不可用时有 cal_id 却没有哈希
-            hashes = {"calibration_split_hash": "unavailable",
-                      "excluded_vsibench_scene_hash": "unavailable"}
-    return cal_ids, hashes, conf_dist, sorted(allowed)
-
-
 def _apply_skill_ablations(args, skills: list) -> tuple[list, str]:
-    """C2（--skill-spec）/ C5（--inject-wrong-skill）消融注入。
+    """C2（`--skill-spec`）/ C5（`--inject-wrong-skill`）消融注入。scope:
 
-    C5 的"已知错误 Skill"是本系统内置的**故意错误**模板（调用不存在的 Tool 名称 +
-    与题型不符的模板），用于验证：错误 Skill 应被 M9/AST 或 M11/T4 或 retrieval 硬过滤
-    拦住、至少不提升分数（§17.5 #5 可证伪命题）。
+    C5 的"已知错误 Skill"是 v6 形态的**故意错误**模板：
+
+    - 调用不存在的 Tool 名称（`definitely_not_a_registered_tool`）→ M9/AST 应拒；
+    - 声明一条**当前证据状态不可能满足**的证据签名（要求 `metric_scale=available` +
+      gate 版本匹配，而 mock/普通场景的 gate 未过）→ M7 检索硬过滤应拦。
+
+    这样"错误 Skill 被拦住"的可证伪命题（§17.5 #5）在 v6 的两道硬门上都被覆盖：
+    检索（证据签名 / gate 双重 fail-closed，§13.6）与执行（AST/沙箱）。
+    v5 的 `requires_artifacts=["nonexistent_artifact"]` + `minimum_quality` 已随
+    §5.8 的签名化检索一并废止（§20）。
     """
     from skill3d.schemas import SkillSpec
 
@@ -498,24 +556,39 @@ def _apply_skill_ablations(args, skills: list) -> tuple[list, str]:
     if args.skill_spec:
         spec = SkillSpec.model_validate_json(Path(args.skill_spec).read_text(encoding="utf-8"))
         out = [s for s in out if s.skill_id != spec.skill_id] + [spec]
-        ref = f"static:{spec.skill_id}@{spec.semver}"
+        ref = f"static:{spec.skill_id}@{spec.version}"
     if args.inject_wrong_skill:
-        wrong = SkillSpec(
-            skill_id="sk-known-wrong", semver="0.0.1",
-            task_type="object_counting",
-            description="【C5 消融】已知错误模板：调用不存在的 Tool 并返回常数",
-            call_graph_template=(
-                "answer = definitely_not_a_registered_tool(1, 2)\n"
-                "ReturnAnswer(\"42\")"),
-            requires_artifacts=["nonexistent_artifact"],
-            minimum_quality=0.0,
-            supported_coordinate_frames=["world"],
-            metric_scale_required=False,
-            validation_assertions=["never_true()"],
-        )
+        wrong = wrong_skill_spec()
         out = [s for s in out if s.skill_id != wrong.skill_id] + [wrong]
-        ref = (ref + "+" if ref else "") + "wrong:sk-known-wrong@0.0.1"
+        ref = (ref + "+" if ref else "") + f"wrong:{wrong.skill_id}@{wrong.version}"
     return out, ref
+
+
+def wrong_skill_spec():
+    """C5 内置的"已知错误 Skill"（v6 SkillSpec；见 `_apply_skill_ablations` 文档）。
+
+    三处故意错误：① 调用未注册 Tool；② 声明 `metric_scale=available` 且挂了
+    gate 版本（普通场景 gate 未过 → §13.6 检索硬过滤拦下）；③ 断言恒假
+    （`never_true()`）。**只在消融档使用**，绝不进 active snapshot。
+    """
+    from skill3d.schemas import SkillSpec
+    from skill3d.schemas.evidence import GATE_VERSION
+
+    return SkillSpec(
+        skill_id="sk-known-wrong",
+        version="0.0.1",
+        applicable_question_types=["object_counting"],
+        required_evidence_signature={"metric_scale": "available"},
+        requires_metric_evidence=True,
+        applicable_gate_version=GATE_VERSION,
+        skill_family="counting",
+        source="mock_interface",
+        description="【C5 消融】已知错误模板：调用不存在的 Tool 并返回常数",
+        call_graph_template=(
+            "answer = definitely_not_a_registered_tool(1, 2)\n"
+            "ReturnAnswer(\"42\")"),
+        validation_assertions=["never_true()"],
+    )
 
 
 def _fmt(v) -> str:

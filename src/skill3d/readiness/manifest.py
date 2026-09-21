@@ -187,47 +187,53 @@ CURRENT_BASELINE: tuple[tuple[str, bool, bool, bool, bool, tuple[str, ...]], ...
     # capability, implemented, connected, real_poc_verified, paper_eligible, blockers
     ("vggt_feed_forward_mainline", True, True, False, False,
      ("单 episode 跑通；需 ≥3 seed 真实端到端 + 与基线统计比较",)),
-    # ---- v5 HC35：官方 VGGSfM BA 已退出生产（历史失败实验，保留 implemented=true）----
+    # ---- v6 §20：官方 VGGSfM BA 已退出生产（历史失败实验，保留 implemented=true）----
     # 状态纪律：connected/real_poc_verified/paper_eligible 全 false，理由码
-    # `rejected_on_24g_oom`；代码只保留在 reconstruction/legacy_vggsfm_ba/（只读 + 复现）。
+    # `rejected_on_24g_oom`；代码只保留在 skill3d/legacy/retired/legacy_vggsfm_ba/
+    # （只读 + 复现，运行时代码不得 import）。
     ("official_vggsfm_ba", True, False, False, False,
      ("rejected_on_24g_oom（HC35）：官方 VGGSfM tracker 在 predict_tracks 内峰值 ~21–23 GiB "
       "且与输入无关（分辨率 280²–518²、帧数 4–32、query 256–2048 均命中同一峰值），"
       "24 GiB 卡装不下；v5 起不得作为生产 route / 完成条件 / 主结果前置条件。"
-      "历史码与失败 receipt 保留在 reconstruction/legacy_vggsfm_ba/（生产启用请求报 "
-      "UnsupportedConfigurationError）",)),
-    # ---- v5 HC36：唯一允许的新 BA 候选，从四项 false 起步 ----
+      "历史码与失败 receipt 保留在 skill3d/legacy/retired/legacy_vggsfm_ba/（v6 §20 废止，"
+      "任何运行时代码 import 即实现错误）",)),
+    # ---- v6 §20：`vggt_sparse_ba` 已按止损纪律整体废止，替代物为「无」（G5 永久 not_available）----
     ("vggt_sparse_ba", True, False, False, False,
      ("实现进度：pair graph / track merge / receipt / L0 合同测试 + 前端"
       "（SuperPoint 或 ALIKED + LightGlue）与 PyCOLMAP 后端均已落码 → implemented=true；"
       "但 **L1 单 episode 实测 `rejected_on_l1_gate`**：LightGlue 在 pair=(0,1) 断言失败"
-      "（`skip_reason=matching: …`），未产出有限 G5，故 connected/real_poc_verified/"
-      "paper_eligible 全 false，生产开关恒 False（启用即报错）。按 §10.1 止损纪律："
-      "修好该断言后可复跑 L1 一次；仍不过即关闭实验，不得反复扩大范围，"
-      "未过 L2 不得进可选消融行",)),
+      "（`skip_reason=matching: …`），未产出有限 G5。v6 §20 已把该机制整体废止"
+      "（代码归档于 skill3d/legacy/retired/sparse_ba/，无替代物，G5 永久 not_available），"
+      "connected/real_poc_verified/paper_eligible 恒 false",)),
     # ---- v5 HC39：版本隔离基础设施 ----
     ("v5_schema_and_legacy_isolation", True, True, False, False,
      ("Schema 5.0（schema_version/quality_metric_version/reprojection_status/G5 三态）与 "
       "legacy readers 已实现并有负向测试；real_poc_verified 需真实 GPU 端到端产物按 v5 "
       "Schema 落盘后复核",)),
     ("v5_golden", True, True, False, False,
-     ("v5 golden 已由 v5 pipeline 重生成（`tests/golden/v5/`，golden_version=v5-golden-1，"
+     ("v5 golden 已由 v5 pipeline 重生成（原 `tests/golden/v5/`，golden_version=v5-golden-1，"
       "无 G8、G5=None 不入分母），旧 golden 只读归档于 `tests/golden/archive_v4/` 并标 "
       "incomparable_with_v5=true（HC39）；混用旧 golden 有 hard-fail 测试。"
+      "**v6 §20：v5 golden 与 v4 归档均已移入 `tests/archive_v5/`（不参与收集）。**"
       "real_poc_verified 待真实统计对比后推进",)),
     ("scale_recovery", True, True, False, False,
-     ("缺 ARKitScenes 非重叠场景 GT 位姿（TODO_USER_INPUT）→ 无冻结校准器 → "
-      "scale_confidence 恒 low（HC30）；多锚点融合已实现但未标定",)),
+     ("v5 多锚点 + log-scale 融合 + conformal 校准池：缺 ARKitScenes 非重叠场景 GT 位姿"
+      "（TODO_USER_INPUT）→ 无冻结校准器 → 未标定。**v6 §20 已整体废止该路线**，"
+      "替代物为 `reconstruction/metric_fusion.py`（零样本度量深度跨帧融合，[待实验]）；"
+      "本条能力在 v6 仅作历史登记，不再推进 real_poc_verified",)),
     ("metric_tasks_authorization", True, True, False, False,
      ("逐题型授权已接线，但 upper 层（scale_recovery）未达 real_poc_verified，"
-      "故当前恒收回米制题型",)),
+      "故当前恒收回米制题型；v6 改由 MetricEvidenceGate + direct_vlm_routed 显式回退"
+      "（§20 / D3）",)),
     ("tool_contract_replay", True, False, False, False,
      ("仅机制 + 集成测试；无真实 Qwen3-VL-8B 回灌修复率数字（门槛 ≥50%），默认关闭",)),
     ("g5_reprojection_semantics", True, True, False, False,
-     ("HC37：正式 vggt 主线固定 reprojection_status=not_available + G5=None（不聚合、无代理值），"
-      "Schema 层 fail-closed 且有负向测试；待真实主线产物复核",)),
+     ("HC37 / v6 §20：正式 vggt 主线固定 reprojection_status=not_available + G5=None"
+      "（不聚合、无代理值），Schema 层 fail-closed 且有负向测试；待真实主线产物复核",)),
     ("dust3r_mast3r_baseline", False, False, False, False,
-     ("桩：抛「尚未接入真实权重」→ baseline 对比矩阵缺这一档",)),
+     ("v6 §20：DUSt3R/MASt3R 对照重建基线随 `recon_method` 收窄为 `Literal[\"vggt\"]` 一并"
+      "废止（代码归档于 skill3d/legacy/retired/dust32_mast3r_fallback.py），无替代物；"
+      "该项恒 implemented=false、不推进",)),
     ("gsplat_densification", False, False, False, False,
      ("桩：恒 return None",)),
     ("docker_sandbox", False, False, False, False,

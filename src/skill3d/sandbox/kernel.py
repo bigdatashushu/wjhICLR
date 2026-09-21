@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 
 from skill3d.schemas import ToolCall, ToolResult
 from skill3d.tools.contract import (
+    AnswerAlreadyGiven,
     ArtifactUnavailableError,
     ConfidenceGateError,
     DomainValueError,
@@ -32,13 +33,22 @@ DEFAULT_CELL_TIMEOUT_S = 30  # TODO_CALIBRATE
 
 
 class _AnswerSlot:
-    """ReturnAnswer 保留名实现：记录答案。"""
+    """ReturnAnswer 保留名实现：记录答案 + **标记答案已给出**（§15.1 运行层）。
+
+    v6 D7：保留"记录/反作弊"语义（**不**改成中止语义），但一旦被调用，
+    后续任何 Tool 调用都必须抛 `AnswerAlreadyGiven`。
+
+    背景 [已实测]：v5 模型自然写出 `if not ids: ReturnAnswer("abstain")` 然后继续
+    `object_centroid(ids[0])` → IndexError → `violation_runtime`，内测方向题全栽在这里。
+    """
 
     def __init__(self) -> None:
         self.answer: Optional[str] = None
+        self.given: bool = False
 
     def __call__(self, value: Any) -> None:
         self.answer = str(value)
+        self.given = True
 
 
 class _Timeout:
@@ -159,6 +169,18 @@ class RestrictedNamespaceKernel:
         sig = inspect.signature(self._registry.get(name).fn)
 
         def _fn(*args, **kwargs):
+            # §15.1 运行层：ReturnAnswer 之后再调 Tool → 受控 AnswerAlreadyGiven，
+            # 而不是让程序继续跑到 IndexError 崩成假的"服务故障"。
+            if self.answer_slot.given:
+                exc = AnswerAlreadyGiven(
+                    name,
+                    f"Tool {name} 在 ReturnAnswer 之后被调用"
+                    f"（已给出的答案={self.answer_slot.answer!r}）；"
+                    "请改写程序：先算完所有需要的量，最后再 ReturnAnswer（§15.1）",
+                    route=self._scene.scene_route,
+                    args=kwargs if kwargs else {"args": list(args)})
+                self._record_failed_call(name, dict(kwargs), exc)
+                raise exc
             bound = sig.bind(self._scene, *args, **kwargs)
             call_args = {k: v for k, v in bound.arguments.items()
                          if k not in ("handle", "scene")}
@@ -180,30 +202,27 @@ class RestrictedNamespaceKernel:
                 # D-3/硬约束 23：产物缺失等契约违规 → 确定性异常，绝不静默返回假值
                 self._record_failed_call(name, call_args, ArtifactUnavailableError(
                     name, result.missing_artifacts or ["(未标注)"],
-                    route=self._scene.route,
+                    route=self._scene.scene_route,
                     available=result.available_artifacts,
                     args=call_args), result=result)
                 raise ArtifactUnavailableError(
                     name, result.missing_artifacts or ["(未标注)"],
-                    route=self._scene.route,
+                    route=self._scene.scene_route,
                     available=result.available_artifacts,
                     args=call_args)
             if result.error_code == "confidence_gate":
                 exc = ConfidenceGateError(
-                    name, result.error or "局部质量门未过", route=self._scene.route,
+                    name, result.error or "局部质量门未过",
+                    route=self._scene.scene_route,
                     available=result.available_artifacts, args=call_args)
                 self._record_failed_call(name, call_args, exc, result=result)
                 raise exc
             if result.error_code == "domain_value":
                 exc = DomainValueError(
-                    name, result.error or "域值错误", route=self._scene.route,
+                    name, result.error or "域值错误", route=self._scene.scene_route,
                     available=result.available_artifacts, args=call_args)
                 self._record_failed_call(name, call_args, exc, result=result)
                 raise exc
-                self.answer_untrusted = True
-                raise DomainValueError(
-                    name, result.error or "域值错误", route=self._scene.route,
-                    available=result.available_artifacts, args=call_args)
             if result.error is not None:
                 raise RuntimeError(f"Tool {name} 执行失败: {result.error}")
             import json
@@ -234,8 +253,10 @@ class RestrictedNamespaceKernel:
             error, error_code = "cell 执行超时", "timeout"
         except SyntaxError:
             error, error_code = "语法错误", "violation_syntax"
-        except (ArtifactUnavailableError, ConfidenceGateError, DomainValueError) as exc:
-            # 契约违规一律记 tool_contract 桶（§5 FailureTaxonomy 已有该桶）
+        except ToolContractError as exc:
+            # 契约违规一律记 tool_contract 桶（§5 FailureTaxonomy 已有该桶）；
+            # 具体子类（含 ConfidenceGateError / AnswerAlreadyGiven / 基类
+            # ToolContractError 的 scope 违规）在 contract_violations 里逐条留痕。
             error = f"{type(exc).__name__}: {exc}"
             error_code = "tool_contract"
             self.answer_untrusted = True
@@ -267,6 +288,7 @@ class RestrictedNamespaceKernel:
         for name in self._registry.names():
             self._ns[name] = tools_ns.__dict__[name]
         self.answer_slot.answer = None
+        self.answer_slot.given = False
         self.tool_calls = []
         self.tool_results = []
         self.contract_violations = []

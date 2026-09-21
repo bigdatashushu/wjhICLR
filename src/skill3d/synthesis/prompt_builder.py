@@ -12,7 +12,7 @@ from jinja2 import Environment, StrictUndefined
 
 from skill3d.schemas import SkillSpec
 
-TEMPLATE_VERSION = "program_synth_v2"
+TEMPLATE_VERSION = "program_synth_v3"
 
 # program_synth_v2.j2（内联版本化模板）
 #
@@ -24,16 +24,16 @@ TEMPLATE_VERSION = "program_synth_v2"
 #   1. `ReturnAnswer("abstain")` 是合法的最终答案（主榜按错计，不刷分）；
 #   2. 只输出一个代码块，不写长篇解释、不自我辩论；
 #   3. 不存在隐藏全局变量（`objects` 等），对象清单只能用 `list_objects()` 取。
-_PROGRAM_SYNTH_V2 = """你是一名空间推理 Coding Agent。请为下面的题目生成一段 Python program，
+_PROGRAM_SYNTH_V3 = """你是一名空间推理 Coding Agent。请为下面的题目生成一段 Python program，
 通过编排已注册的 Tool 完成推理，最后一行必须调用 ReturnAnswer(答案)。
 
-## 当前可用产物（route 裁剪，只暴露产物齐备的 Tool）
+## 当前可用产物与证据状态（scope + EvidenceProfile 裁剪，只暴露真正可执行的 Tool）
 {{ route_header }}
 
 ## 场景摘要
 {{ scene_summary }}
 
-坐标系: {{ scene_frame }}；尺度已知: {{ scale_known }}
+坐标系: {{ scene_frame }}；本题题型: {{ question_type or "未分类" }}
 
 ## 可用 Tool（只允许调用以下函数）
 {{ tool_docs }}
@@ -67,10 +67,10 @@ NA 题：ReturnAnswer 接受数值。
   再返回选项字母（例：工具返回 `behind`、选项 B 是 "back" → `ReturnAnswer("B")`）。
   题目里的参照系（站在哪、面向谁）必须**从题面读取**，不要自己假设；
   题干说的面向某物体，用 `relative_direction_of(observer=…, facing_at=…, target=…)`。
-- **`ReturnAnswer` 只记录答案，不会中止 program**：写了 `ReturnAnswer(...)` 之后
-  代码仍会继续执行。所以不要用"中途 ReturnAnswer 提前返回"的写法（后面若继续用
-  空列表/未定义变量会直接抛错）。请把答案先算进变量、**在最后一行**只调用一次
-  `ReturnAnswer(变量)`；分支里改写变量，不要提前 return。
+- **`ReturnAnswer` 只记录答案，不会中止 program**，但**答后调 Tool 现在会被硬拦截**
+  （抛 `AnswerAlreadyGiven`）。所以不要用"中途 ReturnAnswer 提前返回"的写法：
+  请把答案先算进变量、**在最后一行**只调用一次 `ReturnAnswer(变量)`；
+  分支里改写变量，不要提前 return，也不要在 `ReturnAnswer` 之后调用任何 Tool。
 - 若当前 route/工具下确实拿不到该量：**直接** `ReturnAnswer("abstain")` 结束。
   `"abstain"` 是合法的最终答案（主榜按错计），**优于**编造数值；
   不要在 program 里反复讨论要不要 abstain —— 判定一次就直接作答。
@@ -96,42 +96,44 @@ class PromptBuilder:
         question: str,
         scene_summary: str,
         scene_frame: str,
-        scale_known: bool,
         tool_docs: str,
         options: Optional[Sequence[str]] = None,
         skills: Optional[Sequence[SkillSpec]] = None,
-        route: str = "",
+        scope: str = "",
         available_artifacts: Optional[Sequence[str]] = None,
         route_header: str = "",
-        allowed_metric_tasks: Optional[Sequence[str]] = None,
         question_type: str = "",
+        evidence_profile=None,
+        gate_passed: Optional[bool] = None,
+        gate_missing: Optional[Sequence[str]] = None,
     ) -> str:
-        """渲染 prompt。注意：签名中刻意不含 ground_truth（§4 M8 字段 7）。
+        """渲染 prompt。签名中刻意不含 ground_truth（§4 M8 字段 7，防泄漏）。
 
-        `route` / `available_artifacts` 会显式写进 prompt 头部（§4 M6 字段 7：
-        "当前 route=…，可用产物=…"），使模型只能编排当前 route 下可用的 Tool，
-        从源头避免"调用了产物缺失的 Tool"这类静默错答。
+        **v6 头部同源纪律**（§5.3）：`route_header` 由调用方从
+        `scene_route` + `question_tool_scope` + `EvidenceProfile` 派生，且与
+        `scene_summary` **同源** —— 杜绝"头部 fallback、摘要 full_3d"的自相矛盾
+        （v5 实测过：12/32 题的 prompt 里只剩 1 个 Tool，头部却说 full_3d）。
 
-        v4 HC33：头部还要写"允许的米制题型=…"——米制 Tool 按题型授权，模型必须
-        知道本题是否放行米制数值，否则会拿相对单位当米制作答。
+        v6 不再有 `scale_known` 这种全局布尔：米制可用性由证据门逐题决定，
+        头部必须写清"米制证据门是否通过 + 缺失哪些子条件"（§13.3）。
         """
         if self.template_version != TEMPLATE_VERSION:
             raise ValueError(f"未知模板版本: {self.template_version}")
-        if not route_header and route:
+        if not route_header and scope:
             from skill3d.tools import REGISTRY
 
             route_header = REGISTRY.docs_header(
-                route, available_artifacts or (),
-                allowed_metric_tasks=allowed_metric_tasks,
-                question_type=question_type)
-        tpl = self._env.from_string(_PROGRAM_SYNTH_V2)
+                scope, available_artifacts or (),
+                question_type=question_type, gate_passed=gate_passed,
+                evidence_profile=evidence_profile, gate_missing=gate_missing)
+        tpl = self._env.from_string(_PROGRAM_SYNTH_V3)
         return tpl.render(
             question=question,
             scene_summary=scene_summary,
             scene_frame=scene_frame,
-            scale_known=scale_known,
             tool_docs=tool_docs,
-            route_header=route_header or "（未声明 route：仅使用不依赖重建产物的 Tool）",
+            route_header=route_header or "（未声明 scope：仅使用不依赖重建产物的 Tool）",
+            question_type=question_type,
             options=list(options) if options else None,
             skills=list(skills) if skills else [],
         )

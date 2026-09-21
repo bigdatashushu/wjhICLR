@@ -1,4 +1,4 @@
-"""§6.2 离线演进 FSM 的真实 driver（G-35）＋ GPT-6 归纳驱动（G-28）。
+"""§6.2 离线演进 FSM 的真实 driver（G-35）＋离线模型归纳驱动（G-28）。
 
 ```bash
 python -m skill3d.evolution.offline_driver --mode real --run-id gen-0001
@@ -15,15 +15,24 @@ CLUSTER_TRACES → GPT6_SYNTHESIZE → LEAKAGE_CHECK
 要点：
 - **每个状态落一次 JSON checkpoint**（`--checkpoint`），中断后 `--resume` 从最后状态继续，
   已完成的 episode 级工作不重跑（§6.2 新增：持久化 + 中断恢复）；
-- **GPT-6 仅离线**：只在 GPT6_SYNTHESIZE 与 REVISE 被调用；不可用时按 §8 策略
-  QUARANTINE（不 promote、不让在线链等待）；本模块不得被在线链 import（硬约束 1/2）；
+- **离线强模型仅离线**（v6 §3.4：DeepSeek-V4.1-Flash / `deepseek-flash`）：只在
+  `GPT6_SYNTHESIZE` 与 REVISE 被调用；不可用时按 §3.4 策略进 `service_unavailable` /
+  QUARANTINE —— **不切在线链、不用 mock 结果推进 Readiness**；本模块不得被在线链
+  import（硬约束 1/2）；
 - **准入必须 real**（§5.6b）：`--mode mock_light` 只做管道验证，不可能 promote；
 - **outer 只跑一次**（硬约束 10），失败即 REJECT，不基于 outer 失败再修订；
 - **候选不可变**（硬约束 11）：REVISE 由 M16 产新 revision（parent 链），driver 不原地改；
-- **LEAKAGE_CHECK 硬门**（硬约束 13/19）：候选 spec_content 含答案/sample id 即拒。
+- **LEAKAGE_CHECK 硬门**（硬约束 13/19）：候选 spec_content 含答案/sample id 即拒；
+- **advisory**（§3.3）：离线模型的文本（归纳/修订/审查）都不构成准入决定 —— promote
+  由确定性门 + 预注册规则决定，`admission.py` 一票否决。
 
 归纳输入纪律：只喂"失败类型/成功失败标签/题型/场景"等**不含答案**的摘要；
 prompt 发送前做泄漏扫描（`build_induction_prompt` 内断言）。
+
+**v5 标识符说明**：`OfflineState.GPT6_SYNTHESIZE` 与事件 `gpt6_unavailable` 是 v5 遗留的
+状态/事件**标识符**（定义在 `fsm/offline_fsm.py`，会序列化进 checkpoint），v6 语义已变为
+"离线模型归纳 / 离线模型不可用"。保留字面量以免历史 checkpoint 不可恢复；代码内不再出现
+GPT-6 客户端。
 """
 
 from __future__ import annotations
@@ -36,7 +45,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from typing import Callable, Optional
 
 from skill3d.adapters.episode_source import (
     EpisodeItem,
@@ -48,7 +57,6 @@ from skill3d.adapters.episode_source import (
 from skill3d.evolution.optimization_loop import (
     DEFAULT_BUDGET_LIMIT,
     CandidateArchive,
-    TestReport,
 )
 from skill3d.evolution.panel import (
     FULL_LEVELS,
@@ -59,7 +67,14 @@ from skill3d.evolution.panel import (
 )
 from skill3d.evolution.firewall import SplitContaminationError
 from skill3d.fsm.offline_fsm import OfflineFSM, OfflineState
-from skill3d.governance.gpt6_client import GPT6Client, GPT6NotConfiguredError
+from skill3d.governance.deepseek_client import (
+    DeepSeekClient,
+    OfflineAuthError,
+    OfflineNotConfiguredError,
+    OfflineRequestError,
+    OfflineResponseError,
+    OfflineServiceUnavailable,
+)
 from skill3d.governance.induce import InsufficientEvidenceError, induce_candidate
 from skill3d.memory.consolidation import leakage_scan_text
 from skill3d.online.config import DEFAULT_CONFIG, load_config, load_yaml, paths_from
@@ -74,6 +89,36 @@ GOVERNANCE_MODES = ("G0_full", "G1_no_review", "G2_no_monitoring")
 # 治理消融对状态链的影响（G-41）：G1 跳归纳后语义审查；G2 跳运行期监控（离线统计）
 _ABLATION_SKIP_REVIEW = {"G1_no_review"}
 _ABLATION_SKIP_MONITORING = {"G2_no_monitoring"}
+
+# ---- §3.4 离线失败的显式结局码（绝不回退在线链 / 绝不用 mock 顶上）----
+FAILURE_SERVICE_UNAVAILABLE = "service_unavailable"   # 超时/限流/5xx 重试耗尽、健康检查失败
+FAILURE_OFFLINE_AUTH = "offline_auth_error"           # 401/403 或 DEEPSEEK_API_KEY 未注入
+FAILURE_OFFLINE_REQUEST = "offline_request_error"     # 其余不可重试的 4xx / 响应不可用
+
+# §3.4 归族 → 结局码（auth 不重试、不降级；服务类失败记 service_unavailable）
+_AUTH_EXCEPTIONS = (OfflineAuthError,)
+
+
+def classify_offline_failure(exc: BaseException) -> str:
+    """§3.4：离线调用异常 → 显式结局码。
+
+    - 认证失败 / 未配置（`OfflineAuthError`，含 `OfflineNotConfiguredError`）
+      → `offline_auth_error`（**不重试、不降级**）；
+    - 服务不可用（`OfflineServiceUnavailable`）→ `service_unavailable`；
+    - 请求/响应问题（`OfflineRequestError` / `OfflineResponseError`）→
+      `offline_request_error`。
+
+    三类结局**一律进 QUARANTINE**（§3.4：不得切入在线链、不得用 mock 结果推进
+    Readiness）；区别只在 reason 码，便于审计"当时是哪种失败"。
+    """
+    if isinstance(exc, _AUTH_EXCEPTIONS):
+        return FAILURE_OFFLINE_AUTH
+    if isinstance(exc, OfflineServiceUnavailable):
+        return FAILURE_SERVICE_UNAVAILABLE
+    if isinstance(exc, (OfflineRequestError, OfflineResponseError)):
+        return FAILURE_OFFLINE_REQUEST
+    # 传输层裸异常（未包装）同样按服务不可用处理，绝不静默继续
+    return FAILURE_SERVICE_UNAVAILABLE
 
 
 @dataclass
@@ -116,11 +161,22 @@ class OfflineCheckpoint:
     transitions: list[dict] = field(default_factory=list)
     candidate_ids: list[str] = field(default_factory=list)
     revision_ids: list[str] = field(default_factory=list)
-    gpt6_available: bool = True
+    # 离线强模型（DeepSeek-V4.1-Flash）是否可用；不可用时终态必为 QUARANTINE
+    offline_available: bool = True
     termination_reason: str = ""
     notes: list[str] = field(default_factory=list)
     skipped_stages: list[str] = field(default_factory=list)
     updated_at: str = ""
+    # §3.4：失败结局码（service_unavailable / offline_auth_error / offline_request_error）
+    offline_failure_code: str = ""
+    # §19.2 离线治理模型块（provider/model_id/endpoint_hash/prompt_version/latency/
+    # token_usage；由 `DeepSeekClient.manifest_fields()` 提供，**绝不含密钥**）
+    offline_model_fields: dict = field(default_factory=dict)
+
+    @property
+    def gpt6_available(self) -> bool:
+        """v5 字段名别名（只读；历史 checkpoint/调用点过渡用）。"""
+        return self.offline_available
 
     def save(self, path: str | Path) -> Path:
         """原子写：先写临时文件再替换，避免中断留下半截 JSON。"""
@@ -136,7 +192,11 @@ class OfflineCheckpoint:
     @classmethod
     def load(cls, path: str | Path) -> "OfflineCheckpoint":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return cls(**data)
+        # v5 checkpoint 兼容：字段名 gpt6_available → offline_available（§20 已弃用名）
+        if "gpt6_available" in data and "offline_available" not in data:
+            data["offline_available"] = bool(data.pop("gpt6_available"))
+        known = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 # ------------------------------------------------------------------ trace 读取 ----
@@ -207,15 +267,33 @@ def trace_outcomes(trace_dir: str) -> dict[str, bool]:
     return ok_of
 
 
+def _offline_manifest_fields(client) -> dict:
+    """§19.2 离线治理模型块（`provider`/`model_id`/`endpoint_hash`/`prompt_version`/
+    `latency`/`token_usage`）。
+
+    清洗口径复用 `online/eval.py::offline_manifest_fields`（单一定义点：两处都不得落
+    密钥 / Authorization / base URL 本体）。拿不到元数据时返回 `{}`——**不虚构**。
+    """
+    if client is None:
+        return {}
+    try:
+        from skill3d.online.eval import offline_manifest_fields
+
+        return offline_manifest_fields(client)
+    except Exception:  # noqa: BLE001 - 元数据是附加审计信息，取不到不阻断离线链
+        return {}
+
+
 # ------------------------------------------------------------------ driver ----
 
 class OfflineDriver:
-    """§6.2 离线 FSM driver（GPT-6 仅在本模块的 GPT6_SYNTHESIZE / REVISE 被调用）。"""
+    """§6.2 离线 FSM driver（离线强模型只在本模块的归纳 / REVISE / 审查被调用）。"""
 
     def __init__(
         self,
         cfg: OfflineDriverConfig,
         *,
+        offline_client=None,
         gpt6_client=None,
         trace_store: Optional[TraceStore] = None,
         panels: Optional[dict[str, list[EpisodeItem]]] = None,
@@ -225,7 +303,9 @@ class OfflineDriver:
         print_fn: Callable[[str], None] = print,
     ) -> None:
         self.cfg = cfg
-        self.gpt6 = gpt6_client
+        # 离线强模型客户端（v6：DeepSeek-V4.1-Flash）。`gpt6_client` 是 v5 形参别名
+        # （过渡期只读；§20 已废止 GPT-6），只做转发。
+        self.offline = offline_client if offline_client is not None else gpt6_client
         self.trace_store = trace_store
         self.panels = panels or {}
         self.base_cfg = base_cfg
@@ -306,26 +386,52 @@ class OfflineDriver:
                 f"< N_min={self.cfg.n_min_cross_scene}（TODO_CALIBRATE）")
         self._advance("clustered", {"cross_scene_ok": cross_ok})
 
-    # ---- GPT6_SYNTHESIZE（G-28）----
+    # ---- GPT6_SYNTHESIZE（G-28；v6：离线模型 = DeepSeek-V4.1-Flash）----
+    def _resolve_offline_client(self):
+        """解析离线客户端：注入优先；否则新建 `DeepSeekClient` 并做**启动前健康检查**。
+
+        §3.4：密钥未注入 → `OfflineNotConfiguredError`（⊂ `OfflineAuthError`，**不重试**）；
+        健康检查（`GET /models`）失败 → `OfflineServiceUnavailable`。两种情况都由调用方
+        记 `offline_auth_error` / `service_unavailable` + QUARANTINE；**不切在线链、不用
+        mock 顶替**。注入的 client（测试 / 自定义 transport）不做健康检查——由注入方负责，
+        避免测试触网。
+        """
+        if self.offline is not None:
+            return self.offline
+        client = DeepSeekClient()
+        if not client.api_key_configured:      # 无密钥：直接归族，不做任何网络尝试
+            raise OfflineNotConfiguredError(
+                f"{client.provider} 离线客户端未配置密钥（只从环境变量注入，§3.4）")
+        client.require_service()   # 失败按其异常类型归族（auth / service_unavailable）
+        self.offline = client
+        return client
+
+    def _record_offline_failure(self, exc: BaseException, where: str) -> str:
+        """§3.4 统一失败处理：登记结局码 + 模型块 + 日志，返回结局码。"""
+        code = classify_offline_failure(exc)
+        self.ckpt.offline_available = False
+        self.ckpt.offline_failure_code = code
+        self.ckpt.termination_reason = f"{code}: {exc}"
+        self._log(f"[{where}] 离线模型不可用（{code}）→ QUARANTINE（§3.4：不切在线链、"
+                  "不用 mock 结果推进 Readiness）: " + str(exc)[:300])
+        return code
+
     def _stage_induce(self) -> bool:
-        client = self.gpt6
-        if client is None:
-            try:
-                client = GPT6Client()
-            except GPT6NotConfiguredError as exc:
-                self.ckpt.gpt6_available = False
-                self.ckpt.termination_reason = f"gpt6_not_configured: {exc}"
-                self._log(f"[GPT6_SYNTHESIZE] GPT-6 不可用 → QUARANTINE（§8：不 promote，"
-                          "在线链不等待）")
-                self._advance("gpt6_unavailable")
-                return True
-        self.ckpt.gpt6_available = True
+        try:
+            client = self._resolve_offline_client()
+        except (OfflineAuthError, OfflineServiceUnavailable, OfflineRequestError,
+                OfflineResponseError) as exc:
+            self._record_offline_failure(exc, "GPT6_SYNTHESIZE")
+            self._advance("gpt6_unavailable")
+            return True
+        self.ckpt.offline_available = True
+        self.ckpt.offline_failure_code = ""
 
         traces = getattr(self, "_traces", [])
         try:
             candidate = induce_candidate(
                 traces, getattr(self, "_task_of", {}), getattr(self, "_scene_of", {}),
-                gpt6_client=client, n_min=self.cfg.n_min_cross_scene)
+                offline_client=client, n_min=self.cfg.n_min_cross_scene)
         except InsufficientEvidenceError as exc:
             self.ckpt.termination_reason = f"insufficient_evidence: {exc}"
             self._log(f"[GPT6_SYNTHESIZE] 样本不足 → REJECT: {exc}")
@@ -334,16 +440,17 @@ class OfflineDriver:
             self.ckpt.state = self.fsm.state.value
             self._save()
             return True
-        except GPT6NotConfiguredError as exc:
-            # GPT-6 端点在调用时才暴露未配置 → 按 §8 暂停（不 promote、不阻塞在线链）
-            self.ckpt.gpt6_available = False
-            self.ckpt.termination_reason = f"gpt6_not_configured: {exc}"
-            self._log(f"[GPT6_SYNTHESIZE] GPT-6 不可用 → QUARANTINE（§8）: {exc}")
+        except (OfflineAuthError, OfflineServiceUnavailable, OfflineRequestError,
+                OfflineResponseError) as exc:
+            # 端点在调用时才暴露不可用 → 按 §3.4 暂停（不 promote、不阻塞在线链）
+            self._record_offline_failure(exc, "GPT6_SYNTHESIZE")
             self._advance("gpt6_unavailable")
             return True
         if candidate is None:
-            # GPT-6 未配置但低风险：不进 promotion（§8）
-            self.ckpt.termination_reason = "gpt6_returned_no_candidate"
+            # 离线模型未配置但低风险：不进 promotion（§3.4）
+            self.ckpt.offline_available = False
+            self.ckpt.offline_failure_code = FAILURE_SERVICE_UNAVAILABLE
+            self.ckpt.termination_reason = "offline_returned_no_candidate"
             self._log("[GPT6_SYNTHESIZE] 未产出 candidate → QUARANTINE")
             self._advance("gpt6_unavailable")
             return True
@@ -351,9 +458,11 @@ class OfflineDriver:
         self._candidate_v0 = candidate
         self.ckpt.candidate_ids.append(candidate.root_candidate_id)
         self.ckpt.revision_ids.append(candidate.revision_id)
+        self.ckpt.offline_model_fields = _offline_manifest_fields(client)
         self._log(f"[GPT6_SYNTHESIZE] candidate_v0 root={candidate.root_candidate_id} "
                   f"revision={candidate.revision_id} "
-                  f"（归纳自 {len(candidate.induction_trace_refs)} 条轨迹）")
+                  f"（归纳自 {len(candidate.induction_trace_refs)} 条轨迹；"
+                  f"离线模型={self.ckpt.offline_model_fields.get('model_id', '?')}）")
         if self.trace_store is not None:
             self.trace_store.append("candidate_revision", candidate.model_dump())
         self._advance("candidate_ready")
@@ -403,8 +512,8 @@ class OfflineDriver:
             return
 
         def revise_fn(rev: CandidateRevision, feedback: str) -> CandidateRevision:
-            """REVISE：M16 GPT-6 基于反例摘要产新版本（绝不原地改，硬约束 11）。"""
-            from skill3d.governance.revise_patch import gpt6_revise
+            """REVISE：离线强模型基于反例摘要产新版本（绝不原地改，硬约束 11）。"""
+            from skill3d.governance.revise_patch import revise_from_bundle
 
             visible = f"测试反馈（不含答案）: {feedback}"
             if ce_summary:
@@ -421,9 +530,10 @@ class OfflineDriver:
             )
             if self.trace_store is not None:
                 self.trace_store.append("counterexample_bundle", bundle.model_dump())
-            client = self.gpt6 or GPT6Client()
-            new_rev = gpt6_revise(rev, bundle, client)
+            client = self.offline or DeepSeekClient()
+            new_rev = revise_from_bundle(rev, bundle, client)
             self.ckpt.revision_ids.append(new_rev.revision_id)
+            self.ckpt.offline_model_fields = _offline_manifest_fields(client)
             self._log(f"[REVISE] 新版本 revision={new_rev.revision_id} "
                       f"parent={new_rev.parent_version}（候选不可变，硬约束 11）")
             return new_rev
@@ -479,9 +589,11 @@ class OfflineDriver:
                 levels=(SIMPLIFIED_LEVELS if self.cfg.simplified_phase_gate
                         else FULL_LEVELS),
             )
-        except GPT6NotConfiguredError as exc:
-            self.ckpt.termination_reason = f"gpt6_not_configured: {exc}"
-            self._log("[OPTIMIZATION_LOOP] 修订需 GPT-6 但不可用 → 暂停（§8）")
+        except (OfflineAuthError, OfflineServiceUnavailable, OfflineRequestError,
+                OfflineResponseError) as exc:
+            # §3.4：修订需要离线强模型；不可用 → 暂停（QUARANTINE），绝不降级为
+            # "没有模型就跳过修订继续 promote"。
+            self._record_offline_failure(exc, "OPTIMIZATION_LOOP")
             self.fsm.state = OfflineState.QUARANTINE
             self.ckpt.state = self.fsm.state.value
             self._save()
@@ -524,22 +636,34 @@ class OfflineDriver:
         if self.trace_store is not None:
             self.trace_store.append("admission_decision", decision.model_dump())
         self._log(f"[准入] promotes={decision.promotes} reason={decision.reason} "
-                  f"（硬门一票否决，GPT-6 建议不可覆盖，硬约束 13）")
+                  f"（确定性硬门一票否决；离线模型建议不可覆盖，§3.3/硬约束 13）")
 
         # 治理消融 G1（G-41）：跳过归纳后语义审查
         if self.cfg.governance in _ABLATION_SKIP_REVIEW:
-            self.ckpt.skipped_stages.append("gpt6_semantic_review")
+            self.ckpt.skipped_stages.append("offline_semantic_review")
             self._log("[治理 G1] 跳过语义审查（消融档，§16.1）")
         elif decision.promotes:
             try:
                 from skill3d.governance.governance_decision import semantic_review
 
-                gov = semantic_review(candidate, self.gpt6 or GPT6Client())
+                client = self.offline or DeepSeekClient()
+                gov = semantic_review(candidate, client)
                 if self.trace_store is not None:
                     self.trace_store.append("skill_governance_decision", gov.model_dump())
-                self._log(f"[治理] 语义审查 decision={gov.decision_id} "
-                          f"risk={gov.semantic_risk}")
-            except Exception as exc:  # noqa: BLE001 - 审查不可用不阻塞硬门结论
+                self.ckpt.offline_model_fields = _offline_manifest_fields(client)
+                # §3.3：审查文本是 advisory（advisory_only=True），**不构成**准入决定
+                self._log(f"[治理] 离线语义审查 decision={gov.decision_id} "
+                          f"risk={gov.semantic_risk} advisory_only={gov.advisory_only}"
+                          "（promote 仍只由确定性门决定）")
+            except (OfflineAuthError, OfflineServiceUnavailable, OfflineRequestError,
+                    OfflineResponseError) as exc:
+                # §3.4：审查不可用 → 记结局码；**硬门结论不受影响**（审查本就是 advisory）
+                code = classify_offline_failure(exc)
+                self.ckpt.offline_failure_code = code
+                self.ckpt.offline_available = False
+                self._log(f"[治理] 离线语义审查不可用（{code}: {exc}）；"
+                          "硬门结论不受影响（§3.3：审查是 advisory，非准入决定）")
+            except Exception as exc:  # noqa: BLE001 - 解析失败等同样不阻塞硬门
                 self._log(f"[治理] 语义审查不可用（{type(exc).__name__}: {exc}）；"
                           "硬门结论不受影响（硬约束 13）")
 
@@ -650,7 +774,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--l1-limit", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--recon-dir", default="")
-    p.add_argument("--recon-method", default="vggt", choices=["vggt", "dust3r_mast3r", "colmap"])
+    p.add_argument("--recon-method", default="vggt", choices=["vggt"],
+                   help="重建方法；v6 §5.2 受控枚举只有 vggt（colmap/dust3r 基线已废止，§20）")
     p.add_argument("--skill-store", default="")
     p.add_argument("--active-snapshot", default="")
     p.add_argument("--n-cross-scene", type=int, default=0)
@@ -737,7 +862,8 @@ def main(argv: list[str] | None = None) -> int:
           f"split={cfg.split} governance={cfg.governance} n_min={cfg.n_min_cross_scene}")
     if cfg.mode != "real":
         print("⚠ mode != real：仅管道验证；准入必须 real（§5.6b）→ 本跑不会 promote")
-    print("⚠ 离线链：GPT-6 只在归纳/修订被调用，绝不进在线链（硬约束 1/2）")
+    print("⚠ 离线链：离线强模型（DeepSeek-V4.1-Flash）只在归纳/修订/审查被调用，"
+          "绝不进在线链（硬约束 1/2；§3.4）")
     print("=" * 78)
 
     try:
@@ -765,16 +891,23 @@ def main(argv: list[str] | None = None) -> int:
                            episode_meta=episode_meta)
     try:
         ckpt = driver.run()
-    except (SplitContaminationError, GPT6NotConfiguredError) as exc:
-        print(f"[错误] {type(exc).__name__}: {exc}", file=sys.stderr)
+    except (SplitContaminationError, OfflineAuthError, OfflineServiceUnavailable,
+            OfflineRequestError, OfflineResponseError) as exc:
+        print(f"[错误] {classify_offline_failure(exc)}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
         return 3
     print(f"\ncheckpoint 已写: {cfg.checkpoint_path}  state={ckpt.state}  "
           f"transitions={len(ckpt.transitions)}")
     print(f"revision 链: {ckpt.revision_ids}")
+    print(f"离线模型: {ckpt.offline_model_fields.get('offline_model', '（未登记）')} "
+          f"model_id={ckpt.offline_model_fields.get('model_id', '（未登记）')} "
+          f"available={ckpt.offline_available} "
+          f"failure_code={ckpt.offline_failure_code or '（无）'}")
 
-    # ---- RunManifest（G-67/§16.4：演进实验同样要记录复现信息）----
+    # ---- RunManifest（G-67/§16.4 + §19.2：演进实验同样要记录复现信息与离线模型块）----
     if args.run_manifest:
         from skill3d.infra.version_lock import build_run_manifest, write_run_manifest
+        from skill3d.online.eval import v6_version_fields
 
         try:
             from skill3d.adapters.split_builder import load_split_config
@@ -790,10 +923,26 @@ def main(argv: list[str] | None = None) -> int:
                 config_path=args.config, repo_dir=".",
                 split_version=split_version, seed=cfg.seed,
                 split_config_path=split_path)
+            offline = dict(ckpt.offline_model_fields or {})
             path = write_run_manifest(m, args.run_manifest, extra={
                 "run_id": ckpt.run_id, "governance": cfg.governance, "mode": cfg.mode,
                 "final_state": ckpt.state, "candidate_ids": ckpt.candidate_ids,
-                "revision_ids": ckpt.revision_ids})
+                "revision_ids": ckpt.revision_ids,
+                "recon_method": cfg.recon_method,
+                **v6_version_fields(),
+                # §19.2 离线治理模型字段（来自 DeepSeekClient.manifest_fields()；
+                # 未发起调用时为空 dict —— 不虚构，也绝不含 API key）
+                "offline_model": offline.get("offline_model", ""),
+                "provider": offline.get("provider", ""),
+                "model_id": offline.get("model_id", ""),
+                "endpoint_hash": offline.get("endpoint_hash", ""),
+                "prompt_version": offline.get("prompt_version", ""),
+                "latency": offline.get("latency", {}),
+                "token_usage": offline.get("token_usage", {}),
+                "offline_governance": offline,
+                "offline_available": ckpt.offline_available,
+                "offline_failure_code": ckpt.offline_failure_code,
+                "checkpoint_path": cfg.checkpoint_path})
             print(f"RunManifest: {path}")
         except Exception as exc:  # noqa: BLE001
             print(f"[warn] RunManifest 写失败（不阻断）: {type(exc).__name__}: {exc}",

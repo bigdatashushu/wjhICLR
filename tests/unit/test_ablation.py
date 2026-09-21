@@ -128,13 +128,18 @@ def _items(tmp_path, n_frames=6):
                                 n_frames=n_frames, frame_size=(64, 96))
 
 
+# v6 §5.8 SkillSpec：错误声明用"证据签名"，不再是 requires_artifacts/minimum_quality。
+# 该模板有三处故意错误：① 调用未注册 Tool；② 声明当前场景**无法满足**的证据签名
+# （要求 world_frame=available，而产物没有 M3 世界系契约）；
+# ③ 断言恒假（never_true()）。
 WRONG_SKILL = json.dumps({
-    "skill_id": "sk-known-wrong", "semver": "0.0.1", "task_type": "object_counting",
-    "description": "C5：已知错误模板（调用不存在的 Tool）",
+    "skill_id": "sk-known-wrong", "version": "0.0.1",
+    "applicable_question_types": ["object_counting"],
+    "required_evidence_signature": {"world_frame": "available"},
+    "skill_family": "counting", "source": "mock_interface",
+    "description": "C5：已知错误模板（调用不存在的 Tool + 声明不可满足的证据签名）",
     "call_graph_template": ("answer = definitely_not_a_registered_tool(1, 2)\n"
                             "ReturnAnswer(\"42\")"),
-    "requires_artifacts": ["nonexistent_artifact"], "minimum_quality": 0.0,
-    "supported_coordinate_frames": ["world"], "metric_scale_required": False,
     "validation_assertions": ["never_true()"],
 })
 
@@ -145,24 +150,45 @@ def _wrong_skill():
     return SkillSpec.model_validate_json(WRONG_SKILL)
 
 
-def test_c5_wrong_skill_is_filtered_by_hard_filter(tmp_path):
-    """C5：错误 Skill 声明了不存在的 artifact → M7 硬过滤必须拦掉（§7 检索硬过滤）。"""
-    from skill3d.reconstruction_gate.scene_state import quality_gate
-    from skill3d.routing.skill_retriever import retrieve
+def _v6_artifact(**kw):
+    """v6 产物构造：**没有**世界系契约（world_frame_status=unavailable）→
+    声明 `world_frame=available` 的 Skill 必然落空（§7.2/§17.1）。"""
     from skill3d.schemas import ConfidenceMap, QualityMetrics, ReconstructionArtifact
 
-    nan = float("nan")
-    art = ReconstructionArtifact(
+    q = QualityMetrics(
+        warp_inlier_ratio=0.9, warp_photometric_inlier_ratio=0.9,
+        cloud_overlap_ratio=0.8, main_gate_passed=True,
+        g1_blur_ok=1.0, g2_brightness=1.0, g3_motion_blur=0.0, g4_frame_count=32,
+        g6_depth_var_coeff=0.1, g7_dynamic_ratio=0.0, g9_tracker_consistency=0.9,
+        g10_baseline_quality=0.5, overall_quality=0.9)
+    base = dict(
         artifact_id="a", artifact_version="v", scene_name="s", recon_method="vggt",
         c2w_list="", intrinsics="", depth_maps="", point_map="", point_conf="",
-        track_list=None, metric_scale=None, scale_known=False,
-        quality=QualityMetrics(g1_blur_ok=nan, g2_brightness=nan, g3_motion_blur=nan,
-                               g4_frame_count=1, g5_reproj_err_median=nan,
-                               g5_reproj_err_p95=nan, g6_depth_var_coeff=nan,
-                               g7_dynamic_ratio=nan, g9_tracker_consistency=nan, g10_baseline_quality=nan,
-                               g11_scale_ci=nan, overall_quality=0.9),
+        track_list=None, quality_status="computed", quality=q,
         confidence=ConfidenceMap(per_point_confidence="", coverage_count_per_frame=""))
-    scene = quality_gate(art)
+    base.update(kw)
+    return ReconstructionArtifact(**base)
+
+
+def test_c5_unknown_capability_declaration_is_rejected_at_construction():
+    """C5：声明不存在的能力（v5 的 `requires_artifacts=["nonexistent_artifact"]` 对应物）
+    在 v6 由**构造期 fail-closed** 拦下（§5.8：签名键必须在 CAPABILITIES 词汇表内）。"""
+    from skill3d.schemas import SkillSpec
+
+    with pytest.raises(Exception, match="未知能力"):
+        SkillSpec.model_validate_json(json.dumps({
+            **json.loads(WRONG_SKILL),
+            "required_evidence_signature": {"nonexistent_artifact": "available"}}))
+
+
+def test_c5_wrong_skill_is_filtered_by_hard_filter(tmp_path):
+    """C5：错误 Skill 的证据签名当前不满足 → M7 硬过滤必须拦掉（§17.1 检索硬条件）。"""
+    from skill3d.reconstruction_gate.scene_state import quality_gate
+    from skill3d.routing.skill_retriever import retrieve
+
+    scene = quality_gate(_v6_artifact())
+    # 场景侧事实：无 M3 世界系契约 → world_frame=unavailable（签名必然落空）
+    assert scene.evidence_state("world_frame") == "unavailable"
     got = retrieve("How many tables?", scene, [_wrong_skill()],
                    question_type="object_counting", scene_quality=0.9)
     assert got == []                                      # 硬过滤拦下，不进入合成阶段
@@ -173,8 +199,7 @@ def test_c5_wrong_skill_program_is_rejected_by_ast(tmp_path):
     from skill3d.sandbox.ast_guard import ast_guard
     from skill3d.tools import REGISTRY
 
-    src = (_wrong_skill().call_graph_template if False else
-           _wrong_skill().call_graph_template)
+    src = _wrong_skill().call_graph_template
     check = ast_guard(src, allowed_tools=set(REGISTRY.names()))
     assert not check.ok
     assert any("definitely_not_a_registered_tool" in v for v in check.violations)
@@ -229,4 +254,6 @@ def test_c5_cli_helper_appends_wrong_skill():
     skills, ref = _apply_skill_ablations(_Args(), [])
     assert [s.skill_id for s in skills] == ["sk-known-wrong"]
     assert ref.startswith("wrong:")
-    assert "nonexistent_artifact" in skills[0].requires_artifacts
+    # v6：错误 Skill 的"不可满足前置条件"由证据签名表达（v5 的 requires_artifacts 已废止）
+    assert skills[0].required_evidence_signature["metric_scale"] == "available"
+    assert skills[0].requires_metric_evidence is True

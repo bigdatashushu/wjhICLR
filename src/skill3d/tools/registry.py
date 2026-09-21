@@ -1,12 +1,18 @@
-"""Tool Registry（§4 M6）：预封装稳定函数注册表（硬约束 14）。
+"""Tool Registry（§4 M6 / v6 §7.2、§17.4）：预封装稳定函数注册表（硬约束 14）。
 
 Tool 是预先封装好的稳定 Python 函数，不是每题生成；
 Coding Agent（Qwen3-VL-8B）只生成编排这些 Tool 的 episode-specific program。
 
-两条纪律（D-3）：
-- 静态裁剪 `docs(route=...)`：只暴露当前 route 下产物齐备的 Tool 文档；
-- 执行期 fail-closed：`call_tool` 在调用实现前校验 `requires_artifacts`，
-  缺失抛 `ArtifactUnavailableError`（见 `tools/contract.py`），绝不静默返回假值。
+v6 三条纪律：
+
+- **注册准入**（§17.4 硬约束 7）：`ToolSpec` 的 `requires_evidence` **无默认值**，
+  不声明就构造不出来；`tolerates_degraded ⊆ requires_evidence`，声明的能力名必须在
+  `schemas.evidence.CAPABILITIES` 词汇表内；
+- **静态裁剪** `docs(question_tool_scope, evidence_profile)`（§7.2/§5.3）：
+  逐 Tool 按证据匹配 + 按 scope 收窄，只暴露当前真正可执行的 Tool 文档；
+- **执行期 fail-closed**（硬约束 23 / §13.2）：`call_tool` 在调用实现前校验
+  产物与证据，缺失抛 `ArtifactUnavailableError`、米制门未过抛 `ConfidenceGateError`，
+  绝不静默返回假值。
 """
 
 from __future__ import annotations
@@ -18,20 +24,28 @@ import time
 from typing import Any, Callable, Iterable, Optional
 
 from skill3d.schemas import ToolResult, ToolSpec
+from skill3d.schemas.evidence import CAPABILITIES, EvidenceProfile
 from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
 from skill3d.schemas.tool import ToolSource
-
-from .contract import (
+from skill3d.tools.contract import (
+    EVIDENCE_METRIC_SCALE,
     KNOWN_ARTIFACTS,
+    SCOPE_FALLBACK_2D_ONLY,
+    SCOPE_FULL_3D,
+    SCOPE_METRIC_ENABLED,
     ToolContractError,
-    available_artifacts_for,
     check_artifact_contract,
+    check_evidence_contract,
     check_metric_task_contract,
-    route_artifacts_for_question,
+    degraded_evidence_flags,
+    evidence_visible,
+    scope_allows,
     tool_allowed,
 )
-from .mock_switch import MockSwitch, request_key
-from .scene_handle import SceneHandle
+from skill3d.tools.mock_switch import MockSwitch, request_key
+from skill3d.tools.scene_handle import SceneHandle
+
+TOOL_FACE_VERSION: str = "tool-face-v6"
 
 
 class ToolNotFoundError(KeyError):
@@ -75,18 +89,38 @@ class ToolRegistry:
                 raise ValueError(
                     f"Tool {spec.name} 声明了未知产物 {sorted(unknown)}；"
                     f"词汇表见 tools.contract.KNOWN_ARTIFACTS")
+            # §17.4 硬约束 7：证据声明必须显式（空列表合法 = 无证据依赖）
+            if spec.requires_evidence is None:
+                raise ValueError(
+                    f"Tool {spec.name} 未声明 requires_evidence"
+                    "（v6 §17.4：无证据声明的 Tool 不得进入注册表）")
+            unknown_ev = set(spec.requires_evidence) - set(CAPABILITIES)
+            if unknown_ev:
+                raise ValueError(
+                    f"Tool {spec.name} 声明了未知证据能力 {sorted(unknown_ev)}；"
+                    f"词汇表见 schemas.evidence.CAPABILITIES")
+            bad_tol = set(spec.tolerates_degraded or []) - set(spec.requires_evidence)
+            if bad_tol:
+                raise ValueError(
+                    f"Tool {spec.name} 的 tolerates_degraded 含未在 requires_evidence "
+                    f"中声明的能力 {sorted(bad_tol)}（§7.2：容忍列表必须是依赖的子集）")
             unknown_tasks = set(spec.supported_metric_tasks) - set(METRIC_TASK_TYPES)
             if unknown_tasks:
                 raise ValueError(
                     f"Tool {spec.name} 声明了未知米制题型 {sorted(unknown_tasks)}；"
                     f"词汇表见 schemas.reconstruction.METRIC_TASK_TYPES")
             if spec.supported_metric_tasks and "scale" not in spec.requires_artifacts:
-                # 米制 Tool 必须显式依赖 scale 产物，否则会在尺度不可用时
-                # 静默给出"相对单位当米制"的假值（硬约束 23 / HC33）
                 raise ValueError(
                     f"Tool {spec.name} 声明了 supported_metric_tasks "
                     f"{spec.supported_metric_tasks}，但 requires_artifacts 未包含 'scale'"
                     "（米制 Tool 必须 fail-closed 依赖尺度产物）")
+            if (EVIDENCE_METRIC_SCALE in spec.requires_evidence
+                    and "scale" not in spec.requires_artifacts):
+                raise ValueError(
+                    f"Tool {spec.name} 的 requires_evidence 含 {EVIDENCE_METRIC_SCALE}，"
+                    "但 requires_artifacts 未包含 'scale'"
+                    "（证据依赖与产物依赖必须一致，否则会出现"
+                    "'证据说可用、产物读不到'的静默错答）")
             self._tools[spec.name] = _RegisteredTool(spec, fn)
             return fn
 
@@ -110,89 +144,101 @@ class ToolRegistry:
     def requires_artifacts(self, name: str) -> list[str]:
         return list(self.get(name).spec.requires_artifacts)
 
+    def requires_evidence(self, name: str) -> list[str]:
+        return list(self.get(name).spec.requires_evidence or [])
+
     def supported_metric_tasks(self, name: str) -> list[str]:
         return list(self.get(name).spec.supported_metric_tasks)
 
-    def names_for_route(self, route: Optional[str] = None,
+    def is_metric_tool(self, name: str) -> bool:
+        return EVIDENCE_METRIC_SCALE in set(self.get(name).spec.requires_evidence or [])
+
+    def names_for_scope(self, scope: Optional[str] = None,
                         available: Optional[Iterable[str]] = None,
                         *,
+                        evidence_profile: Optional[EvidenceProfile] = None,
+                        gate_passed: Optional[bool] = None,
                         allowed_metric_tasks: Optional[Iterable[str]] = None,
                         question_type: str = "") -> list[str]:
-        """当前 route/题型下**可暴露**的 Tool 名（`docs(route)` 的过滤依据）。
+        """当前 scope/证据下**可暴露**的 Tool 名（`docs()` 的过滤依据）。
 
-        `available` 给定时再按"实际装载的产物"收窄（硬约束 23 的执行期判据同源）：
-        route 是**声明**，句柄的 available_artifacts 是**事实**；两者不一致时（例如
-        route=full_3d 但 M5 未产出 objects）以事实为准，避免 prompt 里列出必然
-        抛 `ArtifactUnavailableError` 的 Tool。
+        过滤顺序（任一不满足即隐藏）：
 
-        v4（HC33）：`allowed_metric_tasks` / `question_type` 给定时，进一步裁掉
-        「依赖米制尺度但当前题型未授权」的 Tool —— 与执行期 `check_metric_task_contract`
-        同一判定，保证 prompt 里列出的 Tool 都能真正执行。
+        1. `scope_allows`（§5.3）：`metric_enabled` 才允许米制 Tool；
+           `fallback_2d_only` 只允许不依赖深度/位姿/点云/对象的 Tool；
+        2. 证据匹配（§7.2）：逐 Tool 按 `requires_evidence` / `tolerates_degraded`；
+        3. 实际装载产物（硬约束 23）：`available` 给定时按事实收窄 ——
+           scope 是**声明**，句柄的 available_artifacts 是**事实**；不一致时以事实为准，
+           避免 prompt 里列出必然抛 `ArtifactUnavailableError` 的 Tool。
         """
-        if route is None and available is None and not allowed_metric_tasks \
-                and not question_type:
-            return self.names()
         names = self.names()
-        if route is not None:
+        if scope is not None:
+            names = [n for n in names if scope_allows(self._tools[n].spec, scope)]
+        if evidence_profile is not None:
             names = [n for n in names
-                     if tool_allowed(self._tools[n].spec.requires_artifacts, route)]
+                     if evidence_visible(self._tools[n].spec, evidence_profile)]
         if available is not None:
             avail = set(available)
             names = [n for n in names
                      if set(self._tools[n].spec.requires_artifacts).issubset(avail)]
-        if allowed_metric_tasks is not None or question_type:
-            allowed = {str(t) for t in (allowed_metric_tasks or set())}
-            qt = str(question_type or "")
-            metric_tasks_of = self._tools
-            names = [
-                n for n in names
-                if (not metric_tasks_of[n].spec.supported_metric_tasks)
-                or (bool(qt) and qt in allowed
-                    and qt in set(metric_tasks_of[n].spec.supported_metric_tasks))
-            ]
         return names
 
-    def docs(self, route: Optional[str] = None,
+    def docs(self, scope: Optional[str] = None,
              available: Optional[Iterable[str]] = None,
              *,
+             evidence_profile: Optional[EvidenceProfile] = None,
+             gate_passed: Optional[bool] = None,
              allowed_metric_tasks: Optional[Iterable[str]] = None,
              question_type: str = "") -> str:
-        """只暴露 Tool 文档（名称/描述/参数签名 + 所需产物），绝不暴露答案（§4 M8）。
+        """只暴露 Tool 文档（名称/描述/参数签名 + 所需产物 + 所需证据）。
 
-        `route` 给定时按 `tools.contract.ROUTE_ARTIFACTS` 静态裁剪（D-3a）；
-        关于 route 单调：`docs(full_3d) ⊇ docs(fallback_2d_only)`。
-        `available` 给定时再按实际装载产物收窄（与执行期 fail-closed 判据同源）。
-        `allowed_metric_tasks` / `question_type` 给定时按 HC33 逐题授权收窄。
+        `scope` = `SceneState.question_tool_scope`（§5.3）。关于 scope 单调：
+        `docs(full_3d) ⊆ docs(metric_enabled)` 仅在"多出米制 Tool"的意义上成立，
+        不新增任何非米制工具。
         """
         lines = []
-        for name in self.names_for_route(route, available,
-                                         allowed_metric_tasks=allowed_metric_tasks,
-                                         question_type=question_type):
+        for name in self.names_for_scope(
+                scope, available, evidence_profile=evidence_profile,
+                gate_passed=gate_passed,
+                allowed_metric_tasks=allowed_metric_tasks, question_type=question_type):
             t = self._tools[name]
             sig = inspect.signature(t.fn)
             params = [str(p) for p in list(sig.parameters.values())[1:]]
             needs = ", ".join(t.spec.requires_artifacts) or "无"
-            metric = ("；米制题型=" + ", ".join(t.spec.supported_metric_tasks)
-                      if t.spec.supported_metric_tasks else "")
+            ev = ", ".join(t.spec.requires_evidence or []) or "无"
             lines.append(f"- {name}({', '.join(params)}): {t.spec.description}"
-                         f" [requires_artifacts: {needs}{metric}]")
+                         f" [requires_artifacts: {needs}；requires_evidence: {ev}]")
         return "\n".join(lines)
 
-    def docs_header(self, route: str, available: Iterable[str],
-                    *, allowed_metric_tasks: Optional[Iterable[str]] = None,
-                    question_type: str = "") -> str:
-        """prompt 头部：显式写"当前 route=…，可用产物=…，允许的米制题型=…"（§3 M6）。"""
+    def docs_header(self, scope: str, available: Iterable[str],
+                    *, question_type: str = "",
+                    gate_passed: Optional[bool] = None,
+                    evidence_profile: Optional[EvidenceProfile] = None,
+                    gate_missing: Optional[Iterable[str]] = None) -> str:
+        """prompt 头部：显式写"当前 scope=…、可用产物=…、米制门状态=…"（§5.3/§13.3）。
+
+        与 scene 摘要**同源**（都从 `scene_route` + `question_tool_scope` 派生），
+        杜绝"头部 fallback、摘要 full_3d"自相矛盾（§5.3 不变量）。
+        """
         avail = ", ".join(sorted(available)) or "（无）"
-        allowed = sorted({str(t) for t in (allowed_metric_tasks or set())})
         metric_line = (
-            f"允许的米制题型={', '.join(allowed)}（当前题型={question_type or '未分类'}）"
-            if allowed else
-            f"允许的米制题型=（无）（当前题型={question_type or '未分类'}）"
-            "；依赖米制尺度的 Tool 已被收回，请勿用相对单位冒充米制")
-        return (f"当前 route={route}；可用重建产物={avail}。\n"
-                f"{metric_line}。\n"
-                f"只允许调用下面列出的 Tool；它们所需的产物都已就绪。"
-                f"若某个量在当前 route 下无法获得，请在 program 里直接 abstain，"
+            f"米制证据门已通过；本题题型={question_type or '未分类'}，"
+            f"允许调用上面的米制 Tool。"
+            if gate_passed else
+            f"**米制证据门未通过**（本题题型={question_type or '未分类'}）"
+            + (f"，缺失子条件={sorted(gate_missing)}" if gate_missing else "")
+            + "；依赖米制尺度的 Tool 已被收回，"
+            "严禁用世界单位/相对单位冒充米制数值，"
+            "若题目必须给米制量，请在 program 里直接调用 ReturnAnswer(\"abstain\")。"
+        )
+        ev_line = ""
+        if evidence_profile is not None:
+            ev_line = ("证据画像=" + ", ".join(
+                f"{c}:{evidence_profile.state(c)}" for c in CAPABILITIES) + "。\n")
+        return (f"当前 question_tool_scope={scope}；可用重建产物={avail}。\n"
+                f"{ev_line}{metric_line}\n"
+                f"只允许调用下面列出的 Tool；它们所需的产物与证据都已就绪。"
+                f"若某个量在当前条件下无法获得，请直接 ReturnAnswer(\"abstain\")，"
                 f"不要猜测数值。")
 
     # ---- 参数校验 ----
@@ -222,27 +268,43 @@ class ToolRegistry:
     ) -> ToolResult:
         """validate(args) → **契约校验（fail-closed）** → mock 解析 → 执行 → ToolResult。
 
-        ToolResult 强制带 source 与 sha256 request_digest；
-        契约违规（产物缺失/局部质量门未过/域值错误）写入 `error_code`，
-        由 M10 kernel 归因到 `tool_contract`（D-3，硬约束 23）。
+        v6 双重校验（§13.2）：先按 `question_tool_scope` 收窄，再按 `EvidenceProfile`
+        逐项匹配；两者都过才执行。契约违规（产物/证据缺失、米制门未过、域值错误）
+        写入 `error_code`，由 M10 kernel 归因到 `tool_contract`。
         """
         entry = self.get(name)
         self._validate_args(name, entry.fn, args)
 
-        route = scene.route
+        scope = scene.question_tool_scope
         available = scene.available_artifacts
+        profile = scene.evidence_profile
 
-        # v4 HC33：米制 Tool 的**逐题授权**先于产物可用性判定 —— 授权失败属于
-        # "局部质量门未过"（ConfidenceGateError，§3 M6 明文），不是"产物缺失"。
-        # 授权通过后再按硬约束 23 校验产物；两者都是 ToolContractError 家族，
-        # kernel 统一归因到 `tool_contract` 桶。
+        # ① scope 收窄（§5.3）：scope 之外的工具即便被模型写出也不得执行
+        if not scope_allows(entry.spec, scope):
+            # 归因（§9.12）：scope 违规时把"缺哪些产物"一并写进异常，
+            # 让 M10 的 `tool_contract` 桶能给出可回放的缺失清单（而非一句"越权"）。
+            missing = sorted(set(entry.spec.requires_artifacts) - set(available))
+            raise ToolContractError(
+                name,
+                f"Tool {name} 不在当前 question_tool_scope={scope} 的允许集合内"
+                "（§5.3：逐题只收窄；米制 Tool 需 metric_enabled）",
+                args=args, route=scene.scene_route,
+                missing=missing, available=available)
+
+        # ② 米制 Tool 的逐题授权（v5 HC33 语义的题型维度补充）
         check_metric_task_contract(
             name, entry.spec.supported_metric_tasks,
             scene.allowed_metric_tasks, scene.question_type, args=args)
 
-        # 执行期 fail-closed：缺产物直接抛 ArtifactUnavailableError（不静默返回假值）
+        # ③ 证据契约（§7.2/§13.2 执行期二次校验）
+        check_evidence_contract(
+            name, entry.spec, profile,
+            gate_passed=scene.metric_gate_passed,
+            route=scene.scene_route, args=args)
+
+        # ④ 产物契约：缺产物直接抛 ArtifactUnavailableError（不静默返回假值）
         check_artifact_contract(name, entry.spec.requires_artifacts, available,
-                               route=route, args=args)
+                               route=scene.scene_route, args=args)
 
         switch = mock_switch or MockSwitch()
         fn, source = switch.resolve(
@@ -265,15 +327,22 @@ class ToolRegistry:
             value, error, error_code = None, f"{type(exc).__name__}: {exc}", exc.error_code
             missing = list(exc.missing)
             available = list(exc.available or available)
-        except Exception as exc:  # noqa: BLE001 - 实现内部错误（含未归族的 ValueError）
+        except Exception as exc:  # noqa: BLE001 - 实现内部错误
             value, error = None, f"{type(exc).__name__}: {exc}"
             error_code = _error_code_of(exc)
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
+        degraded = degraded_evidence_flags(entry.spec, profile)
         return ToolResult(
+            result_id=digest[:16],
+            source_tool=name,
             tool=name,
             args=args,
             value=json.dumps(value, default=str),
+            payload=(value if isinstance(value, dict) else None),
+            status=("failed" if error is not None else "ok"),
+            evidence_version=getattr(profile, "profile_version", "") or "",
+            degraded_evidence=degraded,
             source=source,
             request_digest=digest,
             latency_ms=latency_ms,
@@ -297,3 +366,17 @@ def call_tool(
 ) -> ToolResult:
     """§4 M6 伪代码的模块级入口，委托全局 REGISTRY。"""
     return REGISTRY.call_tool(name, args, scene, mode=mode, mock_switch=mock_switch)
+
+
+__all__ = [
+    "REGISTRY",
+    "TOOL_FACE_VERSION",
+    "ToolArgValidationError",
+    "ToolNotFoundError",
+    "ToolRegistry",
+    "call_tool",
+    "SCOPE_FALLBACK_2D_ONLY",
+    "SCOPE_FULL_3D",
+    "SCOPE_METRIC_ENABLED",
+    "tool_allowed",
+]

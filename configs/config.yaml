@@ -43,9 +43,6 @@ sandbox:
   cell_timeout_s: 120                   # TODO_CALIBRATE
   max_regenerate: 3                     # AST 失败有限重生成 TODO_CALIBRATE
 
-# v4 尺度评估（HC29–33）：CI 口径、冻结校准器、逐题型授权
-# 纪律：测试时只读冻结校准器，绝不读取 GT 位姿/深度/逐场景尺度（§10.2）。
-# 标定数据（ARKitScenes 非重叠场景 GT 位姿）未到位 → 无校准器 → 一律 low。
 # M5 检测兜底：本地开放词表检测器（GroundingDINO 服务；确定性 Tool，非 LLM）
 # 规程：VLM 给对象名+bbox 提示为正解；VLM 定位失败时用本检测器兜底，避免对象类 Tool
 # 被整场景收回。留空 = 不启用兜底。
@@ -53,20 +50,10 @@ detection:
   endpoint: http://127.0.0.1:20022     # TODO_USER_INPUT：检测器服务地址（组内服务）
   box_threshold: 0.25                  # TODO_CALIBRATE
 
-scale:
-  confidence_level: 0.90              # [TODO_CALIBRATE] nominal coverage 研究目标
-  # v5.1（用户 2026-09-20 拍板）：标定池"按被评测数据集选择同源非重叠场景"，
-  # 不再绑定 ARKitScenes。多校准器目录约定：<dir>/<dataset>.json（每数据集一份），
-  # 在线按 evaluation_datasets 选用；目录内 calibrator.json 作为跨数据集 fallback
-  # （会记 dataset_match=false，论文需论证覆盖转移）。
-  evaluation_datasets: [scannet, scannetpp]
-  calibration_dir: data/scale_calibration        # TODO_USER_INPUT（需 GT 位姿）
-  # 冻结 conformal 校准器（标定构建期产出，在线只读）。缺失即 scale_confidence=low。
-  calibration_path: data/scale_calibration/calibrator.json   # TODO_USER_INPUT（ARKitScenes GT 位姿）
-  split_audit_manifest: data/scale_calibration/split_audit.json
-  # HC32：按原始 scene/video ID 排除 VSI-Bench 使用的 150 个 ARKitScenes scene
-  vsi_bench_meta: data/vsi_bench_meta/test.jsonl
-  excluded_vsibench_scene_count: 150   # 官方规模（§1.2）；构建期断言
+# v4/v5 的 `scale` 段（冻结 conformal 校准器、标定池、逐题型授权校准）已按 v6 §20
+# 整体废止：v6 放弃一切需要校准的米制尺度路线，改由 reconstruction/metric_fusion.py
+# （零样本度量深度跨帧融合，§11）在推理期产出尺度。该路线的模型卡与阈值属
+# [待实验]/[TODO_CALIBRATE]，PoC 通过前不登记任何默认值（不得给"兜底常量"）。
 
 split_config: configs/vsi_bench_split.yaml
 admission_thresholds: configs/admission_thresholds.yaml
