@@ -188,3 +188,48 @@
    关闭尺度融合支路，系统退纯相对几何（MCA 四题不受影响）。
 3. **阈值标定（§10.6）**：τ_warp / τ_cloud 的最小 PoC 标定，然后按 §18.2 扩样本。
 4. **conf-warp 自检接线**：接上 `compute_quality` 后重新测主门通过率与 `degraded` 分布。
+
+---
+
+## 7. 真实 GPU 端到端实测（M1–M13，v6 全链）
+
+命令（vLLM FP8 单卡 GPU4；VGGT/SAM2 在 GPU3，分卡纪律）：
+
+```bash
+python -m skill3d.online.eval --mode real --source vsi_bench --split inner_validation \
+  --datasets arkitscenes --limit 2 --seed 0 \
+  --vllm-endpoint http://127.0.0.1:8100 --vllm-model qwen3vl-8b-r0 \
+  --recon-dir data/v6_smoke/recon --trace-dir data/v6_smoke/traces2
+```
+
+| 题 | scene | scene_route | M4 主门 | track_consensus | 程序 | 结果 |
+|---|---|---|---|---|---|---|
+| qa 2 | 41069043 | `full_3d` | warp **0.668** / overlap **0.551** → 通过 | `degraded`（碎片化 34%、重复嫌疑 33%） | `count_objects('table')` → `count['count']` | **答 2 = GT 2，MRA 1.00** |
+| qa 12 | 41159572 | `fallback_2d_only` | warp **0.422** / overlap 0.458 → **不通过**（warp 未达 τ=0.5） | `degraded` | 模型直接 `ReturnAnswer("abstain")`（Tool 已被收回） | 按错计（fail-closed 正确） |
+
+**这张表的两条关键证据**：
+
+1. **track 共识计数在真实数据上跑通**：v5 [已实测] 的计数失败根因是"清单既有重复（12）
+   又有漏绑（0）"，v6 改成 `count_objects` 按 `track_id` 共识计数 + `duplicate_suspect`
+   降级标记后，模型用 `count_objects` 直接答对（MRA 1.00）；
+2. **"多指标不得单挑"在真实数据上生效**：qa 12 的 `cloud_overlap=0.458` 单看是**过**的
+   （τ=0.3），但 `warp_inlier=0.422` 未达 τ=0.5 → 主门整体判**不通过**。
+   若按 v5 的单指标思路放行，这个几何不自洽的场景会被当成 `full_3d` 使用。
+
+### 本轮实测修出的三个真实缺陷（均已修 + 加测试）
+
+1. **`degraded` 容忍口径**（见 §2 Phase 0）：`geometry_3d=degraded` 曾隐藏整个 3D Tool 面。
+2. **`track_consensus` 判据口径**：原判据用"物体可见帧率"，实测恒低（0.14–0.19），
+   会把 counting 题的程序路径**结构性掐死**；而 v5 实测的失败根因是重复/碎片化。
+   已改为 `碎片化率 ∧ 重复嫌疑占比`（旧口径保留为诊断 subvalue，改口径前后可直接对比）。
+3. **eval 路径 artifact 未落盘**：现场重算的 scene 只把 artifact 留在内存 → 下次运行
+   重新跑一遍 VGGT（~1 分钟/场景）且 trace 无可审计 artifact。已显式落盘（方案 X 在
+   eval 路径同样成立）。
+
+### 诚实边界
+
+- 2 题 **不是精度结论**，不进主表（§18.6）；这里只主张"链路跑通 + 机制按设计生效"。
+- τ_warp / τ_cloud 仍是**未标定**的起始参考值：qa 12 在 0.422 被判不通过，
+  是过严还是该场景真坏，**只能靠 §10.6 的标定 PoC 回答**，不能靠调阈值。
+- 米制三题在本轮全部走 `direct_vlm_routed`（`metric_scale=unavailable`）——
+  这是 MoGe-2 PoC 未跑的**预期行为**，不是缺陷。

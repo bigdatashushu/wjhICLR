@@ -519,6 +519,20 @@ def run_episode(
                                       metric_depth_model=cfg.metric_depth_model,
                                       metric_model_name=cfg.metric_model_name)
                     art_path = existing
+                    # 真实缺陷（2026-09-21 实测）：eval 路径下 `reconstruct()` 现场重算的
+                    # scene 只把 artifact 留在内存（方案 X 的写回发生在 P1 重建批里），
+                    # 于是 next run 会**重新跑一遍 VGGT**（~1 分钟/场景），且 trace 里
+                    # 没有可审计的 artifact 文件。这里显式落盘，让方案 X 在 eval 路径也成立。
+                    from skill3d.reconstruction_gate.quality_metrics import (
+                        write_artifact_json,
+                    )
+
+                    try:
+                        write_artifact_json(art, art_path)
+                        notes.append(f"M3 artifact 已落盘（方案 X）：{art_path}")
+                    except Exception as exc:  # noqa: BLE001 - 落盘失败不得阻断作答
+                        notes.append(f"[warn] M3 artifact 落盘失败（{exc}）→ "
+                                     "下次会重算，不影响本题作答")
                     notes.append(f"M3 重建完成 method={art.recon_method} "
                                  f"quality_status={art.quality_status} "
                                  f"frame_set_hash={art.frame_set_hash[:12]} "
@@ -608,6 +622,7 @@ def run_episode(
                          f"quality_status={art.quality_status} "
                          f"overall_quality={_overall_str(art)} "
                          f"available={sorted(scene.available_artifacts)}")
+            outcome.scene_summary = str(getattr(scene, "summary", "") or "")
             outcome.quality_status = art.quality_status
             outcome.overall_quality = _overall_of(art)
             outcome.main_gate_passed = (
@@ -619,6 +634,7 @@ def run_episode(
                 geometry, pixels,
                 input_quality_weight=verdict.quality_weight if verdict else 1.0,
                 input_degradation_flags=verdict.degradation_flags if verdict else None)
+            outcome.scene_summary = str(getattr(scene, "summary", "") or "")
             outcome.quality_status = "computed"
             outcome.overall_quality = float(_q.overall_quality)
             # M4 主门结论必须落档：TraceRecord/EpisodeTrace 的 main_gate_passed 是
@@ -665,6 +681,7 @@ def run_episode(
             outcome.answer_flags.extend(decision.flags)
             outcome.notes.extend(decision.reasons)
             outcome.question_tool_scope = scene.question_tool_scope
+            outcome.scene_summary = str(getattr(scene, "summary", "") or "")
             outcome.m7_notes = [decision.note()] + list(decision.reasons)
             outcome.authorized_metric_tasks = (
                 [cls.task] if scene.metric_task_authorized(cls.task) else [])
@@ -1110,16 +1127,23 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
     fault = bool((stats or {}).get("detector_fault", False))
     if m5_materialized is False:
         fault = True
+    tcm = (stats or {}).get("track_consensus") or {}
     ratio = (stats or {}).get("track_stable_ratio")
     n_tracks = len({str(o.track_id) for o in objs if getattr(o, "track_id", None)})
     if n_tracks == 0 and objs:
         # 未记录 track_id 时退回"去重后实例数"作 track 数（不伪造稳定占比）
         n_tracks = len(objs)
+
+    def _opt(v):
+        return None if v is None else float(v)
+
     return M5EvidenceSummary(
         detection_fault=fault,
         n_objects=len(objs),
         n_tracks=int(n_tracks),
         track_stable_ratio=(None if ratio is None else float(ratio)),
+        track_fragmentation_ratio=_opt(tcm.get("track_fragmentation_ratio")),
+        duplicate_suspect_ratio=_opt(tcm.get("duplicate_suspect_ratio")),
         grounding_pointed_hit=None if grounding is None else grounding.get("hit"),
         grounding_conf=None if grounding is None else grounding.get("conf"),
         grounding_miss=bool(grounding.get("miss")) if grounding else False,
@@ -1763,6 +1787,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             # M13 增补：程序源码必须留痕，否则"为什么答错"无法归因（§4 M13）
             trace_store.append("episode_program", {
                 "qa_id": episode.qa_id,
+                "scene_name": episode.scene_name,
                 "task": str(getattr(outcome, "task", "") or ""),
                 "program_id": outcome.program.program_id,
                 "program_source": outcome.program.program_source,

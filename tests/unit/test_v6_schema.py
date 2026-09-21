@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 
 from skill3d.reconstruction_gate.evidence_profile import (
+    M5EvidenceSummary,
     build_evidence_profile,
     evaluate_metric_gate,
     metric_scale_capability,
@@ -540,3 +541,61 @@ def test_metric_tools_never_tolerate_degraded_metric_scale():
         spec = REGISTRY.spec(name)
         if EVIDENCE_METRIC_SCALE in (spec.requires_evidence or []):
             assert EVIDENCE_METRIC_SCALE not in (spec.tolerates_degraded or []), name
+
+
+# ------------------- 10. track_consensus 判据（真实数据口径修正）----
+
+def test_track_consensus_uses_fragmentation_not_visibility():
+    """`track_consensus` 判据 = 碎片化率 ∧ 重复嫌疑占比，**不是**可见帧率。
+
+    真实数据依据（scene 41069043 / arkitscenes）：可见帧率实测只有 0.14–0.19
+    （手持扫描里单个物体本来只在少数帧出现），若拿它当门，`count_objects`
+    会结构性不可用 —— counting 题的程序路径直接消失。而 v5 [已实测] 的计数
+    失败根因是**重复实例**（清单 12 个重复）与**碎片化**。故改口径。
+    """
+    from skill3d.reconstruction_gate.evidence_profile import (
+        TH_TRACK_FRAGMENTATION_DEGRADED,
+        track_capability,
+    )
+
+
+    # 可见帧率很低但 track 干净 → 判 available（旧口径会误判 unavailable）
+    clean = M5EvidenceSummary(n_objects=24, n_tracks=24, track_stable_ratio=0.15,
+                              track_fragmentation_ratio=0.0,
+                              duplicate_suspect_ratio=0.0)
+    assert track_capability(clean)[0] == "available"
+
+    # 碎片化/重复偏高 → degraded（计数可用但需带标记）
+    messy = M5EvidenceSummary(n_objects=24, n_tracks=24, track_stable_ratio=0.19,
+                              track_fragmentation_ratio=0.31,
+                              duplicate_suspect_ratio=0.33)
+    state, notes = track_capability(messy)
+    assert state == "degraded" and notes
+
+    # 碎片化极高 → unavailable（计数不可信）
+    broken = M5EvidenceSummary(n_objects=24, n_tracks=24,
+                               track_fragmentation_ratio=0.8,
+                               duplicate_suspect_ratio=0.6)
+    assert track_capability(broken)[0] == "unavailable"
+
+    # 无统计 → unavailable（不伪造）
+    assert track_capability(M5EvidenceSummary())[0] == "unavailable"
+    assert TH_TRACK_FRAGMENTATION_DEGRADED > 0
+
+
+def test_count_objects_visible_when_track_consensus_degraded():
+    """§9.2：`count_objects` 容忍 track_consensus 降级（带 evidence_degraded 标记）。
+
+    这条是 counting 题程序路径能否存在的前提；degraded 下必须**暴露**而不是隐藏。
+    """
+    import skill3d.tools  # noqa: F401
+
+    from skill3d.tools.registry import REGISTRY
+
+    p = EvidenceProfile(geometry_3d="available", world_frame="available",
+                        metric_scale="available", object_detection="available",
+                        track_consensus="degraded", object_grounding="available")
+    names = REGISTRY.names_for_scope(SCOPE_FULL_3D, evidence_profile=p)
+    assert "count_objects" in names
+    flags = degraded_evidence_flags(REGISTRY.spec("count_objects"), p)
+    assert "evidence_degraded:track_consensus" in flags

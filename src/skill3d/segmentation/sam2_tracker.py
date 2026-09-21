@@ -45,7 +45,7 @@ from skill3d.schemas.reconstruction import ObjectRecord
 # v3：v6 §5.6 字段改名（obj_id/category_name/det_conf）+ 新增 track_id /
 #     duplicate_suspect / pointconf_world / grounding_status → 旧缓存是 v5 口径
 #     （无 track，计数无法做 track 共识），必须失效重算。
-_INVENTORY_VERSION = "m5-inventory-3"
+_INVENTORY_VERSION = "m5-inventory-4"
 
 # `track_id` 命名空间（v6 §5.6）：不同 pass 的传播序号会重名（都从 0 起），
 # 前缀把它隔开 —— 否则 `count_objects` 的 track 去重会把两条不同对象算成一条。
@@ -1000,6 +1000,10 @@ def bind_objects_for_scene(
         ratio = track_stable_ratio(objects, n_frames)
         if ratio is not None:
             stats["track_stable_ratio"] = ratio
+        tcm = track_consensus_metrics(objects, n_propagations=len(masks_per_object),
+                                      n_frames=n_frames)
+        if tcm is not None:
+            stats["track_consensus"] = tcm
         dyn, dnotes = dynamic_mask_from_rigidity(frames, depth_maps, c2w_list, intrinsics)
         notes.extend(dnotes)
         if dyn.size:
@@ -1015,6 +1019,11 @@ def bind_objects_for_scene(
     else:
         # 缓存命中：G9/G7 是 scene 级统计，直接复用缓存值（不重算、不回读掩码）——
         # 与首次计算口径完全一致；回读掩码重算会把"全零帧"算进 IoU 对，反而偏。
+        if "track_consensus" not in stats:
+            tcm = track_consensus_metrics(objects, n_propagations=len(objects),
+                                          n_frames=n_frames)
+            if tcm is not None:
+                stats["track_consensus"] = tcm
         if "track_stable_ratio" not in stats:
             # 老缓存缺该键（或调用方手写 stats）→ 由清单现算，保证证据不缺项
             ratio = track_stable_ratio(objects, n_frames)
@@ -1232,19 +1241,53 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
 
 def track_stable_ratio(objects: Sequence[ObjectRecord],
                        n_frames: int) -> Optional[float]:
-    """跨帧 track 稳定占比（§7.1 `track_consensus` 的输入；[TODO_CALIBRATE]）。
+    """可见帧率均值（**诊断量**，不再是 `track_consensus` 的判据；[TODO_CALIBRATE]）。
 
     定义：每条 track 的存活率 = 该对象在帧集里可见的帧数 / 帧集帧数，再对清单取均值。
-    计数题依赖的是"同一条 track 是否跨帧稳定存在"（`track_id` 的共识），
-    而不是逐帧 IoU —— 后者是 M4 的诊断量，本函数只回答"track 是否够稳"。
 
-    `n_frames <= 0` 或无对象 → `None`（证据侧按 unavailable 处理，**不伪造 1.0**）。
+    **2026-09-21 真实数据修正**：本函数曾是 `track_consensus` 的判据，但实测
+    （scene 41069043）该值只有 0.14–0.19 —— 手持扫描里单个物体本来只在少数帧出现，
+    这个量回答的是"物体可见多久"，**不是**"同一实例是否被跨帧一致地跟成一条 track"。
+    用它当门会让 `count_objects` 结构性不可用（counting 题的程序路径直接没了），
+    而 v5 实测的计数失败根因是**重复实例**（清单 12 个重复）与**碎片化**，
+    不是"可见帧少"。故改为记录为诊断量，判据见 `track_consensus_metrics`。
     """
     if n_frames <= 0 or not objects:
         return None
     vals = [min(1.0, len(set(int(i) for i in (o.visible_frames or []))) / float(n_frames))
             for o in objects]
     return float(sum(vals) / len(vals))
+
+
+def track_consensus_metrics(objects: Sequence[ObjectRecord], *,
+                            n_propagations: int,
+                            n_frames: int) -> Optional[dict]:
+    """`track_consensus` 的判据输入（§7.1；阈值 `[TODO_CALIBRATE]`）。
+
+    两个信号，直接对应 v5 [已实测] 的计数失败模式：
+
+    - `track_fragmentation_ratio` = `n_dup / n_propagations`：SAM2 传播了多少条
+      被 3D 去重合并掉的**碎片**。越高说明同一实例被切成多条 track 越严重；
+    - `duplicate_suspect_ratio` = `n_suspect / n_objects`：去重后仍留在清单里的
+      重复嫌疑对象占比。越高说明"清单长度"越不能当计数答案（v5 实测 12 个重复）。
+
+    同时保留 `track_stable_ratio`（可见帧率）作**诊断**，便于事后比较两种口径。
+
+    `n_propagations <= 0` 或无对象 → `None`（证据侧按 unavailable，**不伪造 0**）。
+    """
+    if n_propagations <= 0 or not objects:
+        return None
+    n_objects = len(objects)
+    n_suspect = sum(1 for o in objects if bool(getattr(o, "duplicate_suspect", False)))
+    n_dup = max(0, int(n_propagations) - n_objects)
+    return {
+        "track_fragmentation_ratio": float(n_dup) / float(n_propagations),
+        "duplicate_suspect_ratio": float(n_suspect) / float(n_objects),
+        "n_propagations": int(n_propagations),
+        "n_objects": int(n_objects),
+        "n_suspect": int(n_suspect),
+        "track_stable_ratio": track_stable_ratio(list(objects), n_frames),
+    }
 
 
 def _with_dedup_verdict(o, *, suspect: bool, track_id: str):

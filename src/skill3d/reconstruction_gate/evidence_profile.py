@@ -33,8 +33,19 @@ from skill3d.schemas.evidence import (
 from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
 
 # ---- 阈值（全部 TODO_CALIBRATE）----
-TH_TRACK_STABLE_RATIO: float = 0.6     # TODO_CALIBRATE: track 稳定占比（available 下限）
-TH_TRACK_MIN_RATIO: float = 0.2        # TODO_CALIBRATE: track 稳定占比（degraded 下限）
+#
+# `track_consensus` 的判据在 2026-09-21 依真实数据改口径（见
+# `sam2_tracker.track_consensus_metrics`）：用**碎片化率**与**重复嫌疑占比**，
+# 而不是"物体可见帧占比"。原因是后者在手持扫描里恒低（实测 0.14–0.19），
+# 会把 counting 题的程序路径结构性掐死，而 v5 [已实测] 的计数失败根因是重复实例。
+# 下面四个阈值都是**未被标定的起始参考值**，必须在自有数据上按 §10.6 标定。
+TH_TRACK_FRAGMENTATION_DEGRADED: float = 0.10    # TODO_CALIBRATE: 碎片化率 → degraded
+TH_TRACK_FRAGMENTATION_UNAVAILABLE: float = 0.50  # TODO_CALIBRATE: 碎片化率 → unavailable
+TH_DUPLICATE_SUSPECT_DEGRADED: float = 0.10       # TODO_CALIBRATE: 重复嫌疑占比 → degraded
+TH_DUPLICATE_SUSPECT_UNAVAILABLE: float = 0.50    # TODO_CALIBRATE: 重复嫌疑占比 → unavailable
+# 旧口径的可见帧率下限（保留作诊断阈值，不再作判据）
+TH_TRACK_STABLE_RATIO: float = 0.6     # TODO_CALIBRATE: 可见帧率（诊断）
+TH_TRACK_MIN_RATIO: float = 0.2        # TODO_CALIBRATE: 可见帧率（诊断）
 TH_DETECTION_SPARSE: int = 3           # TODO_CALIBRATE: 检出对象数低于此视为稀疏
 TH_GROUNDING_MIN_CONF: float = 0.5     # TODO_CALIBRATE: 补绑置信度下限
 TH_SCALE_DISPERSION: float = 0.15      # TODO_CALIBRATE: τ_scale_disp（§13.1 子条件 4）
@@ -53,7 +64,10 @@ class M5EvidenceSummary:
     detection_fault: bool = False          # 检测器服务故障
     n_objects: int = 0                     # 基础清单对象数
     n_tracks: int = 0                      # 去重后 track 数
-    track_stable_ratio: Optional[float] = None  # 稳定 track 占比（跨帧存活）
+    track_stable_ratio: Optional[float] = None  # 可见帧率（诊断量）
+    # v6 判据输入（来自 M5 `stats["track_consensus"]`）
+    track_fragmentation_ratio: Optional[float] = None   # 被去重合并的碎片占比
+    duplicate_suspect_ratio: Optional[float] = None     # 清单里的重复嫌疑占比
     grounding_pointed_hit: Optional[bool] = None  # 题面点名物是否命中
     grounding_conf: Optional[float] = None
     grounding_miss: bool = False           # 明确未命中（grounding_recall_miss）
@@ -215,16 +229,36 @@ def detection_capability(summary: M5EvidenceSummary) -> tuple[CapabilityState, l
 
 
 def track_capability(summary: M5EvidenceSummary) -> tuple[CapabilityState, list[str]]:
-    """§7.1 `track_consensus`：稳定 track 占比高 / 中 / 几乎无 track。"""
-    r = summary.track_stable_ratio
-    if int(summary.n_tracks) <= 0 or r is None or not np.isfinite(float(r)):
+    """§7.1 `track_consensus`：track 能否支撑计数。
+
+    判据 = **碎片化率**（SAM2 传播被 3D 去重合并掉的比例）∧ **重复嫌疑占比**
+    （去重后清单里仍存疑的重复对象比例），二者取最差。理由见模块头阈值注释：
+    "可见帧率"回答的是物体可见多久，与"同一实例是否被一致跟成一条 track"无关。
+
+    阈值全 `[TODO_CALIBRATE]`；无统计 → `unavailable`（**不伪造**）。
+    """
+    if int(summary.n_tracks) <= 0:
         return "unavailable", ["no_track_statistics"]
-    r = float(r)
-    if r >= TH_TRACK_STABLE_RATIO:
-        return "available", []
-    if r >= TH_TRACK_MIN_RATIO:
-        return "degraded", [f"track 稳定占比偏低（{r:.2f}）"]
-    return "unavailable", [f"track 稳定占比过低（{r:.2f}）"]
+    frag, dup = summary.track_fragmentation_ratio, summary.duplicate_suspect_ratio
+    if frag is None and dup is None:
+        return "unavailable", ["no_track_consensus_statistics"]
+    notes: list[str] = []
+    worst = "available"
+    for name, val, th_deg, th_un in (
+            ("碎片化率", frag, TH_TRACK_FRAGMENTATION_DEGRADED,
+             TH_TRACK_FRAGMENTATION_UNAVAILABLE),
+            ("重复嫌疑占比", dup, TH_DUPLICATE_SUSPECT_DEGRADED,
+             TH_DUPLICATE_SUSPECT_UNAVAILABLE)):
+        if val is None or not np.isfinite(float(val)):
+            continue
+        v = float(val)
+        if v >= th_un:
+            worst = "unavailable"
+            notes.append(f"{name}过高（{v:.2f} ≥ {th_un}）→ 计数不可信")
+        elif v >= th_deg and worst != "unavailable":
+            worst = "degraded"
+            notes.append(f"{name}偏高（{v:.2f} ≥ {th_deg}）→ 计数需带降级标记")
+    return worst, notes  # type: ignore[return-value]
 
 
 def grounding_capability(summary: M5EvidenceSummary) -> CapabilityState:
@@ -331,9 +365,19 @@ def build_evidence_profile(
             },
             "object_detection": {"n_objects": int(m5.n_objects),
                                  "warnings": det_warns + list(m5.notes)},
-            "track_consensus": {"n_tracks": int(m5.n_tracks),
-                                "track_stable_ratio": m5.track_stable_ratio,
-                                "warnings": trk_warns},
+            "track_consensus": {
+                "n_tracks": int(m5.n_tracks),
+                "track_fragmentation_ratio": m5.track_fragmentation_ratio,
+                "duplicate_suspect_ratio": m5.duplicate_suspect_ratio,
+                # 旧口径保留作诊断（改口径前后可直接对比）
+                "track_stable_ratio_visibility": m5.track_stable_ratio,
+                "thresholds": {
+                    "fragmentation_degraded": TH_TRACK_FRAGMENTATION_DEGRADED,
+                    "fragmentation_unavailable": TH_TRACK_FRAGMENTATION_UNAVAILABLE,
+                    "duplicate_degraded": TH_DUPLICATE_SUSPECT_DEGRADED,
+                    "duplicate_unavailable": TH_DUPLICATE_SUSPECT_UNAVAILABLE,
+                },
+                "warnings": trk_warns},
             "object_grounding": {
                 "pointed_hit": m5.grounding_pointed_hit,
                 "conf": m5.grounding_conf,
