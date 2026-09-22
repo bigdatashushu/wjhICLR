@@ -278,6 +278,35 @@ def _square_mask():
     return m
 
 
+def test_bind_masks_to_world_persists_mask_at_video_resolution(tmp_path):
+    """回归：SAM2 掩码在**视频分辨率**、深度在**VGGT 网格**时，落盘 mask 不得为全 0。
+
+    2026-09-22 实测缺陷：`_stack_masks` 用 `np.asarray(m).shape == out.shape[1:]`
+    做守卫，尺寸不等就**静默跳过** → 每个对象的 `*_mask.npy` 落盘成整片 0
+    （真实 corpus 7 个 scene、全部 54 个对象的 mask 数组 sum 均为 0），
+    而 `visible_frames` 由未缩放的 mask 算出、依然非空 → 落盘产物与清单自相矛盾。
+    旧测试没抓到是因为它让 mask 与 depth **同尺寸**（都 (H,W)），
+    恰好绕过缩放路径；真实链路里两者从不同尺寸。本测试固定视频分辨率 ≠ 深度网格。
+    """
+    # 掩码 960×1280（视频分辨率），深度网格 480×640 → 必须走等比缩放
+    vid_h, vid_w = 2 * H, 2 * W
+    vid_mask = np.zeros((vid_h, vid_w), dtype=bool)
+    vid_mask[400:520, 600:760] = True          # 对应 _square_mask 的区域
+    masks = [{t: vid_mask.copy() for t in range(2)}]
+    depth = np.full((2, H, W), 3.0)
+    objs = bind_masks_to_world(masks, depth, np.broadcast_to(np.eye(4), (2, 4, 4)), K,
+                               class_hints=["sofa"], out_dir=tmp_path, scene_name="sc")
+    o = objs[0]
+    saved = np.load(o.mask_per_frame)
+    assert saved.shape == (2, H, W)
+    # 缺陷本体：非空掩码被静默丢成 0
+    assert saved.sum() > 0, "落盘 mask 全 0：掩码未按 _resize_mask_to 映射到深度网格"
+    # 与清单自洽：visible_frames 说可见的帧，落盘 mask 必须真的非空
+    assert o.visible_frames == [0, 1]
+    for f in o.visible_frames:
+        assert saved[f].any(), f"frame {f} 在 visible_frames 里但落盘 mask 为空"
+
+
 # ------------------------------------------------------------------ M5 端到端 ----
 
 def test_bind_objects_for_scene_returns_g7_g9_stats(tmp_path):

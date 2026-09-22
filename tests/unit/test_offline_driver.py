@@ -247,6 +247,56 @@ def test_full_chain_reaches_reject_on_mock_light(tmp_path):
     assert "api_key" not in json.dumps(ckpt.offline_model_fields)
 
 
+def test_stop_after_induce_halts_before_outer_consuming_panels(tmp_path):
+    """§18.1 纪律闸：`--stop-after=induce` 跑完归纳即停，**不进入消耗 outer 的面板**。
+
+    背景：LOOP_SYNTHESIZE 的 L3 面板口径就是 `outer_holdout`（`load_panels`），
+    而硬约束 10 规定 outer 只能跑一次。没有这道闸时，"验证归纳链路是否通"
+    与"花掉 one-shot outer"被绑死 → 只能二选一。
+
+    断言口径：看**面板阶段有没有被执行**（spy），不看 transition 日志 ——
+    泄漏门/归纳阶段的 FSM tick 本来就会把状态推进到下一个状态名，
+    日志里出现 `LOOP_SYNTHESIZE` 只说明"状态被推进"，不等于"面板跑过"。
+    """
+    drv = _driver(tmp_path, offline=MockOffline())
+    drv.cfg.stop_after = "induce"
+    ran: list[str] = []
+    drv._stage_optimize = lambda: ran.append("optimize")     # 面板阶段 spy
+    drv._stage_promote = lambda: ran.append("promote")
+    ckpt = drv.run()
+    states = [t["to"] for t in ckpt.transitions]
+    # 归纳（GPT6_SYNTHESIZE，v6 语义 = 离线模型归纳）已执行、候选已产出
+    assert OfflineState.GPT6_SYNTHESIZE.value in states
+    assert ckpt.candidate_ids
+    assert drv.offline.calls, "归纳必须真的调用了离线模型"
+    # 关键断言：面板阶段一次都没跑（= outer 未被消耗）
+    assert ran == [], f"停止后仍执行了下游阶段：{ran}"
+    assert ckpt.termination_reason == "stop_after:induce"
+    # 停在归纳之后的 LEAKAGE_CHECK 状态（尚未跑泄漏门）
+    assert ckpt.state == OfflineState.LEAKAGE_CHECK.value
+
+
+def test_stop_after_leakage_runs_leakage_check_and_stops(tmp_path):
+    """`--stop-after=leakage`：泄漏门**跑过**，然后停（面板阶段仍不跑）。"""
+    drv = _driver(tmp_path, offline=MockOffline())
+    drv.cfg.stop_after = "leakage"
+    ran: list[str] = []
+    drv._stage_optimize = lambda: ran.append("optimize")
+    drv._stage_promote = lambda: ran.append("promote")
+    ckpt = drv.run()
+    assert OfflineState.LEAKAGE_CHECK.value in [t["to"] for t in ckpt.transitions]
+    assert ran == [], f"停止后仍执行了下游阶段：{ran}"
+    assert ckpt.termination_reason == "stop_after:leakage"
+
+
+def test_stop_after_rejects_unknown_state(tmp_path):
+    """未知 `--stop-after` 取值必须显式报错，不得静默跑完整链（否则会烧掉 outer）。"""
+    drv = _driver(tmp_path, offline=MockOffline())
+    drv.cfg.stop_after = "promotee"
+    with pytest.raises(ValueError, match="stop-after"):
+        drv.run()
+
+
 def test_checkpoint_persisted_every_step(tmp_path):
     drv = _driver(tmp_path, offline=MockOffline())
     ckpt = drv.run()

@@ -233,3 +233,102 @@ python -m skill3d.online.eval --mode real --source vsi_bench --split inner_valid
   是过严还是该场景真坏，**只能靠 §10.6 的标定 PoC 回答**，不能靠调阈值。
 - 米制三题在本轮全部走 `direct_vlm_routed`（`metric_scale=unavailable`）——
   这是 MoGe-2 PoC 未跑的**预期行为**，不是缺陷。
+
+---
+
+## 8. 2026-09-22 会话增量（inner 档扩样本 + 三处实测缺陷 + 两处根因纠正）
+
+> 本节由接手会话追加；只写**今天真实跑过/真实复现**的东西，未跑的一律标 `[待实验]`/未完成。
+
+### 8.1 已跑通的（有真实产物）
+
+| 项 | 结果 |
+|---|---|
+| 全量 CPU 测试 | **768 passed / 3 skipped / 0 failed**（与交接基线一致） |
+| inner 档重建（§18.2：16 题/题型） | `inner_validation × scannet+scannetpp` 需要 **24 个 scene**，6 卡分片重建 **全部完成、0 失败**；manifest 合并落盘 `data/v6_scoped/recon_moge2/vggt/manifest.json` |
+| MoGe-2 度量尺度（§11） | 24 scene 中 **23 success / 1 failed**（融合失败即 `metric_scale=None`，按纪律不伪装） |
+| 世界系契约 | `world_frame_status`：**available 14 / degraded 10** |
+| M4 主门 | **3/24 scene 的 `overall_quality=0.000`** → 这些 scene 的全部 3D 题型被收窄为 `fallback_2d_only`（τ 未标定，见 §8.4） |
+| **DeepSeek-V4.1-Flash 真实健康检查** | **通过**：`GET https://api.deepseek.com/models` 返回 `["deepseek-flash","deepseek-v4-pro"]`，规范要求的 `deepseek-flash` **确实存在**、key 有效（`endpoint_hash=a34e2a47…`）。这是该项目**第一次对真实离线模型发出请求**（此前 `run_manifest_offline.json` 的 `provider`/`model_id` 为空串） |
+| inner 档主实验（16 题/题型 × 3 seed × 2 臂） | **已启动**（`scripts/run_inner128_batch.sh`，128 题 × 6 run）。**截至本节写作时仍在跑**，尚无最终数字 → 本报告不预填任何分数 |
+
+### 8.2 本轮修出的真实缺陷（均带回归测试）
+
+1. **`_stack_masks` 尺寸守卫导致掩码产物整片为 0**（`segmentation/sam2_tracker.py`）
+   - 现象：真实 corpus 里**每个**对象的 `*_mask.npy` 数组 `sum()==0`（7 scene、54 对象全中），
+     而清单里的 `visible_frames` 由**未缩放**的掩码算出、依然非空 → **落盘产物与清单自相矛盾**。
+   - 根因：SAM2 掩码在**视频分辨率**（如 960×1280），本函数拿到的 `shape` 是
+     **VGGT 深度网格**（518×392）；旧实现 `if np.asarray(m).shape == out.shape[1:]`
+     尺寸不等就**静默跳过**，于是整片留 0。
+   - 修复：按 `_resize_mask_to`（纯等比最近邻，§20 唯一正确映射）映射后再堆。
+   - 影响面（已核对）：`mask_per_frame` 在 `src/` 内**没有任何其他消费方**
+     （工具/评测/门都不读它）→ **本次缺陷不影响任何分数**，属**产物可审计性**缺陷。
+   - 回归测试 `test_bind_masks_to_world_persists_mask_at_video_resolution`：
+     已实测在**旧实现上失败、新实现上通过**（旧 sum=0 / 新 sum=9600）。
+     旧测试因让 mask 与 depth **同尺寸**而恰好绕过该路径 —— 这是"测试与生产形状不一致"的教训。
+2. **分片重建互相覆盖 manifest**（`reconstruction/run.py`）
+   - 现象：6 个 `--scene-shard` 进程都写同一个 `manifest.json` → 最终只剩最后一个分片的 5 条 job，
+     **整批 24 scene 的 provenance 丢失**。
+   - 修复：分片各写 `manifest_shard<i>of<n>.json`，由 `scripts/recon_inner128.sh` 合并；
+     本轮已完成批次的 `manifest.json` 由磁盘 artifact **重建**，并在文件里显式标注
+     `manifest_origin="rebuilt_from_artifacts"` 与原因（不虚构 `gpu_rank` 等运行期字段）。
+3. **`evaluation_result` 不落原始答案 → 失败无法归因**（`online/runner.py`）
+   - 现象：`predicted=None` 有两种截然不同的原因 —— 模型 abstain（无答案）与
+     模型给了自由文本但抽不出选项字母；旧 trace 两者不可分（实测 qa 2770 属后者，
+     却只留下一只"普通错题"）。
+   - 修复：`evaluation_result` 增落 `answer_text` / `answer_source` / `abstained` / `failure_code`
+     （§19.1「不依赖重跑即可归因失败」）。
+
+### 8.3 两处根因纠正（交接文档里的假设经实测**不成立**）
+
+1. **外观顺序题的瓶颈不是"visible_frames 有空洞"**
+   → 见 `docs/decisions/D-2026-09-22-appearance-order-bottleneck.md`。
+   实测 40 题：`naive_min` 与"首次连续可见段"给出**完全相同的排序（0/40 题不同）**
+   → 该修法是**可证明的空操作**；而 `naive_min` 命中 GT 仅 **5.0%**，
+   4 类别随机命中率 1/24≈4.2% → **该机制在本数据上不携带信号**。
+   真瓶颈是接地召回：**85% 的题在 4 个候选类别里至少缺 1 类、平均缺 1.40 类**。
+2. **route_planning 的失败与 `connectivity_graph` 无关**
+   → 见 `docs/decisions/D-2026-09-22-route-planning-rootcause.md`。
+   在 **177 个真实程序、373 次工具调用**里 `connectivity_graph` 被调用 **0 次**（不可能抛错）。
+   真根因：① 题面用**颜色属性**限定实例（"the blue chair"）而 `list_objects` 只给类别名
+   → 模型无法定位实例 → 主动 abstain（3/4 题）；② 1 题所在 scene 未过 M4 主门
+   → `fallback_2d_only` → 工具面只剩 `euclidean_distance` → 弃答（**fail-closed 正确行为**）。
+
+### 8.4 仍未完成 / 新增 blocker（如实列出）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| inner 档 3-seed 主表数字 | **未出** | 跑批进行中；本轮不预填、不预估 |
+| 噪声底（§18.3） | 工具就位、数字未出 | 新增 `scripts/noise_floor.py`（逐题一致率 + 跨 seed 极差 + 配对前提校验，qa_id 不一致即拒绝）；输出待跑批结束 |
+| **outer_holdout 的消耗** | **未消耗（刻意）** | 离线演进闭环的 L3 面板口径就是 `outer_holdout`（`offline_driver.load_panels`），而 §18.1/硬约束 10 规定 outer **只跑一次**。是否现在就把这一次花掉，属**用户决策**，本会话不动。 |
+| 离线归纳（DeepSeek 真实调用） | **未跑**（数据前置就位中） | 需要 induction split 的**真实轨迹**；induction 重建已在跑（`data/v6_induction/recon`）。health_check 已通过（§8.1）。 |
+| 属性接地（颜色/材质） | 新发现的缺口 | 需 M5 产出实例属性标签；属新能力，须走 §17.4 准入，**不得**在题面字符串上特判 |
+| 门过严的可能性（3/24 scene 判 0） | 未标定 | 只能由 §10.6 标定 PoC 回答，不得调阈值 |
+| §10.3 conf-warp 自检接线（item I） | 仍未接线；**影响面已查明，比原记录更严重** | 见 §8.6 |
+| `AnswerAlreadyGiven` 被归入 `tool_contract` 桶 | 已登记、刻意不改 | "模型本想 abstain"被记成"契约违规"；两者主榜都按错计 → 不影响分数，仅影响失败类型分布分析 |
+
+### 8.6 §10.3 conf 软权重在真实数据上**完全失效**（对原记录的修正）
+
+旧记录写的是"`conf_warp_monotonic` 恒 `None` → **conf 不作过滤**（保守）"，
+并把接线风险表述为"会改变真实路径的**质量分类**"。本轮把整条消费链读完后修正如下：
+
+1. **取值已核实**：24 个真实 artifact 的 `quality.conf_warp_monotonic` **全部为 `None`**。
+2. **消费链**：`geometry_tools.py:400/443` 把 `handle.conf_warp_monotonic` 传给
+   `distance_primitives._conf_weights`；而该函数对 `monotonic is None` 的分支返回
+   **`conf_usage="ignored_unverified"` → 既不加权也不过滤，`point_conf` 被完全不用**。
+3. **真实后果**：M5 逐对象落盘的 `pointconf_world`（每对象 20000 个逐点 VGGT 置信度）
+   在**所有**真实距离计算里**从未被使用**。§10.3/§12.2-2 的"conf 只作软权重"
+   这条纪律在真实数据上不是"保守地降权"，而是**整条机制不生效**。
+4. **接线风险的正确表述**：把自检接上（在 `main_gate` 用 `warp_residual_map`
+   现场算）对**主门判定是中性**的（`conf_weight` 在 `m4_main_gate` 之外**没有任何消费方**，
+   也已核实它不落盘、不进 `overall_quality`）；但它会**改变工具输出**——
+   `monotonic=True` 时 `point_conf` 会第一次真正参与距离加权（`conf_usage="weighted"`），
+   从而改变 `robust_distance` / `extent` 等米制数值。
+   **所以"接线后要重跑"是对的，但原因不是质量分类，而是距离原语数值。**
+5. **本轮不做**：跑批进行中，不在主实验期间改动最安全关键的模块；接线 + 标定登记为下一步。
+
+### 8.5 本轮代码状态的诚实说明
+
+- 3-seed 跑批**启动于** `evaluation_result` 增字段之后、**掩码/分片修复之前**；
+  掩码修复不影响任何分数（§8.2 第 1 条已核对无消费方），故跑批数字与修复后的代码**在分数口径上**一致。
+  跑批的 `RunManifest.code_commit` 记为 `9c2df54`，而工作区含本轮未提交改动 —— 提交后需注意这一对应关系。

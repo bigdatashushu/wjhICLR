@@ -285,7 +285,14 @@ def main(argv: list[str] | None = None) -> int:
     jobs = run_jobs(jobs, items_by_scene, recon_dir, args.method, gpus=gpus,
                     metric_depth_model=_maybe_moge2(args),
                     n_frames=args.n_frames)
-    manifest = Path(recon_dir) / args.method / "manifest.json"
+    # 分片并行时**不得**都写 manifest.json（2026-09-22 实测：6 个 shard 互相覆盖，
+    # 最终只剩最后一个 shard 的 5 条 job → 整批 24 个 scene 的 provenance 丢失）。
+    # 分片各写自己的 manifest，由调用方（scripts/recon_inner128.sh）合并。
+    shard_tag = ""
+    if args.scene_shard:
+        _i, _, _n = args.scene_shard.partition("/")
+        shard_tag = f"_shard{_i}of{_n or 1}"
+    manifest = Path(recon_dir) / args.method / f"manifest{shard_tag}.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(json.dumps({
         "method": args.method, "splits": splits, "recon_dir": recon_dir,

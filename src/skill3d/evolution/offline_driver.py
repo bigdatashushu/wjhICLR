@@ -148,6 +148,24 @@ class OfflineDriverConfig:
     simplified_phase_gate: bool = False
     ablation: str = ""          # E0..E5（§8.3）；空 = E5 等价全开
     resume: bool = False
+    # §18.1 纪律闸：跑到指定状态**之前**停下，用于"只跑归纳半程"而不消耗 outer_holdout。
+    # 取值是 OfflineState 名（cluster / induce / leakage）。
+    # 为什么需要它：下游 LOOP_SYNTHESIZE 的 L3 面板口径就是 outer_holdout
+    #（`load_panels`），而 §18.1 / 硬约束 10 规定 outer **只跑一次**。
+    # 把"归纳→候选→泄漏检查"这段本来不需要 outer 的工作与"花掉 outer"解耦，
+    # 是纪律要求，不是为了方便。
+    stop_after: str = ""
+
+
+# ---- §18.1 纪律闸：`--stop-after` 的状态名映射 ----
+# 语义：**执行完**该状态后停止（该状态本身照跑），不再进入下游状态。
+_STOP_AFTER_STATES: dict[str, OfflineState] = {
+    "cluster": OfflineState.CLUSTER_TRACES,
+    "induce": OfflineState.GPT6_SYNTHESIZE,      # v5 标识符；v6 语义 = 离线模型归纳
+    "leakage": OfflineState.LEAKAGE_CHECK,
+    "loop": OfflineState.LOOP_SYNTHESIZE,        # 进入这里就会跑 panels（含 outer）
+    "promote": OfflineState.PROMOTE,
+}
 
 
 # ------------------------------------------------------------------ checkpoint ----
@@ -349,18 +367,35 @@ class OfflineDriver:
         self._log(f"run_id={self.ckpt.run_id} governance={self.cfg.governance} "
                   f"mode={self.cfg.mode} split={self.cfg.split}")
 
-        if self.fsm.state is OfflineState.CLUSTER_TRACES:
-            self._stage_cluster()
-        if self.fsm.state is OfflineState.GPT6_SYNTHESIZE:
-            if not self._stage_induce():
+        stop_state = _STOP_AFTER_STATES.get(str(self.cfg.stop_after or "").strip().lower())
+        if self.cfg.stop_after and stop_state is None:
+            raise ValueError(f"未知 --stop-after={self.cfg.stop_after!r}"
+                             f"（可选 {sorted(_STOP_AFTER_STATES)}）")
+
+        # 顺序与旧实现一致（每个状态处理完可能改变 self.fsm.state → 下一个 `if` 再判）
+        stages = (
+            (OfflineState.CLUSTER_TRACES, self._stage_cluster, False),
+            (OfflineState.GPT6_SYNTHESIZE, self._stage_induce, True),
+            (OfflineState.LEAKAGE_CHECK, self._stage_leakage_check, True),
+            (OfflineState.LOOP_SYNTHESIZE, self._stage_optimize, False),
+            (OfflineState.PROMOTE, self._stage_promote, False),
+        )
+        for state, stage, gated in stages:
+            if self.fsm.state is not state:
+                continue
+            if gated:
+                if not stage():
+                    return self.ckpt
+            else:
+                stage()
+            if stop_state is state:
+                self.ckpt.termination_reason = f"stop_after:{self.cfg.stop_after}"
+                self._log(
+                    f"[停止] --stop-after={self.cfg.stop_after}：已执行完 {state.value}，"
+                    "不再进入下游 LOOP_SYNTHESIZE/PROMOTE —— **outer_holdout 未被消耗**"
+                    "（§18.1 / 硬约束 10：outer 只跑一次）")
+                self.ckpt.save(self.cfg.checkpoint_path)
                 return self.ckpt
-        if self.fsm.state is OfflineState.LEAKAGE_CHECK:
-            if not self._stage_leakage_check():
-                return self.ckpt
-        if self.fsm.state is OfflineState.LOOP_SYNTHESIZE:
-            self._stage_optimize()
-        if self.fsm.state is OfflineState.PROMOTE:
-            self._stage_promote()
         self._log(f"[结束] 终态={self.fsm.state.value} reason={self.ckpt.termination_reason}")
         return self.ckpt
 
@@ -764,6 +799,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", default="real", choices=list(MODES),
                    help="面板执行模式；准入必须 real（§5.6b）")
     p.add_argument("--split", default="induction", help="归纳轨迹所在 split")
+    p.add_argument("--stop-after", default="",
+                   choices=[""] + sorted(_STOP_AFTER_STATES),
+                   help="§18.1 纪律闸：执行完该状态即停止，不再进入下游。"
+                        "`induce`/`leakage` 用于只跑归纳半程 —— **不加载、不消耗 "
+                        "outer_holdout**（硬约束 10：outer 只跑一次）。"
+                        "留空 = 跑完整状态链（会跑 L3 面板 = outer）。")
     p.add_argument("--panel-source", default="synthetic",
                    choices=["synthetic", "jsonl", "vsi_bench"])
     p.add_argument("--episodes-jsonl", default="")
@@ -855,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
         simplified_phase_gate=args.simplified_phase_gate,
         ablation=args.ablation,
         resume=args.resume,
+        stop_after=args.stop_after,
     )
 
     print("=" * 78)
@@ -866,8 +908,18 @@ def main(argv: list[str] | None = None) -> int:
           "绝不进在线链（硬约束 1/2；§3.4）")
     print("=" * 78)
 
+    # §18.1 纪律闸：`--stop-after=cluster|induce|leakage` 只需要归纳侧 episode 元数据，
+    # **不需要面板**。旧实现无条件 `load_panels(...)`，而面板的 L3 就是 outer_holdout
+    # → 即便只想跑归纳半程，也会去解码整批 outer 视频（读一次 outer 还是其次，
+    # 真正的问题是它把"跑不跑 outer"和"跑不跑归纳"绑在了一起）。
+    # 因此这里按 `--stop-after` 决定要不要装配面板：半程跑**完全不加载 outer**。
     try:
-        panels = load_panels(args, cfg_yaml)
+        if str(cfg.stop_after or "").strip().lower() in ("cluster", "induce", "leakage"):
+            print("[纪律] --stop-after 在半程内 → **不加载 panels**（不读、不跑 "
+                  "outer_holdout；§18.1 硬约束 10）")
+            panels = {}
+        else:
+            panels = load_panels(args, cfg_yaml)
         induction_items = _load_split_items(args, cfg_yaml, cfg.split)
     except EpisodeSourceError as exc:
         print(f"[错误] 面板数据不可用: {exc}", file=sys.stderr)

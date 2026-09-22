@@ -749,11 +749,24 @@ def bind_masks_to_world(
 
 def _stack_masks(masks: dict[int, np.ndarray], n_frames: int,
                  shape: Sequence[int]) -> np.ndarray:
-    """把 per-frame mask 堆成 (N,H,W) uint8（缺帧置 0），便于落盘与 G9 统计。"""
+    """把 per-frame mask 堆成 (N,H,W) uint8（缺帧置 0），便于落盘与 G9 统计。
+
+    **必须按 `_resize_mask_to` 映射到深度网格后再堆**（2026-09-22 实测缺陷）：
+    SAM2 掩码在**原始视频分辨率**，本函数的 `shape` 来自 `depth_maps.shape[1:]`
+    （VGGT 深度网格 518×392）。旧实现写的是 `if np.asarray(m).shape == out.shape[1:]`
+    —— 尺寸不等就**静默跳过**，于是每个对象的 `*_mask.npy` 落盘成**整片 0**
+    （实测 7 个 scene、全部 54 个对象的 mask 数组 sum 均为 0），而清单里的
+    `visible_frames` 由**未缩放的** mask 算出、依然非空 →
+    落盘产物与清单自相矛盾，审计与回读（G9/掩码类复算）全部失真。
+    纯缩放是 v6 §20 的唯一正确映射（square-pad 仿射已废止）。
+    """
     out = np.zeros((n_frames, int(shape[0]), int(shape[1])), dtype=np.uint8)
     for idx, m in masks.items():
-        if 0 <= idx < n_frames and np.asarray(m).shape == out.shape[1:]:
-            out[idx] = np.asarray(m, dtype=np.uint8)
+        if not (0 <= idx < n_frames):
+            continue
+        mm = _resize_mask_to(np.asarray(m, dtype=bool), out.shape[1:])
+        if mm.shape == out.shape[1:]:
+            out[idx] = np.asarray(mm, dtype=np.uint8)
     return out
 
 

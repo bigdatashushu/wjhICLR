@@ -1822,6 +1822,14 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             "ground_truth": episode.ground_truth,
             "correct": outcome.correct,
             "mra_value": outcome.mra_value,
+            # §19.1「不依赖重跑即可归因失败」：`predicted=None` 有两种截然不同的原因——
+            # (a) 模型 abstain（无答案），(b) 模型给了自由文本但抽不出选项字母。
+            # 不落原始答案就分不开这两者（实测 2770 属 (b)，却只留下一只普通错题）。
+            "answer_text": (outcome.answer if outcome.answer is not None
+                            else outcome.direct_answer),
+            "answer_source": str(outcome.answer_source or ""),
+            "abstained": bool(outcome.abstained),
+            "failure_code": outcome.failure_code,
         })
     if episodic is not None:
         _write_episodic_memory(episodic, outcome, episode, trace_store)
