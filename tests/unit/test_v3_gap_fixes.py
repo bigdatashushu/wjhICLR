@@ -212,7 +212,9 @@ def test_exists_in_scene_semantics_and_zero_detection_fail_closed(tmp_path):
                                objects_materialized=True)
     with pytest.raises(ArtifactUnavailableError) as ei:
         REGISTRY.call_tool("exists_in_scene", {"name": "table"}, empty_handle, mode="real")
-    assert ei.value.missing == ["object_detection"]
+    # v6：missing 逐项带原因后缀（`object_detection(unavailable)`）
+    assert len(ei.value.missing) == 1
+    assert ei.value.missing[0].startswith("object_detection")
 
 
 # ------------------------------------------------- Appendix A：G1 / G3 ----

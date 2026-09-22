@@ -572,7 +572,10 @@ def test_relative_direction_of_fails_closed_without_world_up():
         call_tool("relative_direction_of",
                   {"observer_id": "obj_0", "facing_at_id": "obj_1", "target_id": "obj_2"},
                   handle)
-    assert ei.value.missing == ["world_frame"]
+    # v6：missing 逐项带原因后缀（`world_frame(unavailable)`），
+    # 便于归因侧区分"缺几何"与"缺米制"、并正确判级联前提
+    assert len(ei.value.missing) == 1
+    assert ei.value.missing[0].startswith("world_frame")
 
     # ② 第三道保险：证据说可用、但产物里真的没有约定 → domain_value（不猜方向）
     scene2 = scene.model_copy(update={

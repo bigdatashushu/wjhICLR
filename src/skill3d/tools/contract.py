@@ -139,6 +139,23 @@ def tool_allowed(requires_artifacts: Iterable[str], route: str) -> bool:
 
 # ------------------------------------------------- 证据驱动的 Tool 可见性 ----
 
+def evidence_unmet(spec, profile: Optional[EvidenceProfile]) -> list[str]:
+    """逐项列出未达标的能力（`evidence_visible` 的详细版，供归因/级联判前提）。"""
+    out: list[str] = []
+    for cap in (getattr(spec, "requires_evidence", None) or []):
+        if cap not in CAPABILITIES:
+            out.append(cap)
+            continue
+        if profile is None:
+            out.append(cap)
+            continue
+        state = profile.state(cap)
+        tolerates = set(getattr(spec, "tolerates_degraded", None) or [])
+        if state == "unavailable" or (state == "degraded" and cap not in tolerates):
+            out.append(cap)
+    return out
+
+
 def evidence_visible(spec, profile: Optional[EvidenceProfile]) -> bool:
     """§7.2 逐 Tool 判定：`requires_evidence` × `tolerates_degraded`。
 
@@ -290,10 +307,22 @@ def check_evidence_contract(
     否则模型凭记忆写出被隐藏的 Tool 名就能绕过证据门。
     """
     if not evidence_visible(spec, profile):
-        missing = [c for c in (getattr(spec, "requires_evidence", None) or [])
-                   if profile is None or not capability_at_least(
-                       profile.state(c) if c in CAPABILITIES else "unavailable",
-                       "degraded")]
+        # 逐项报出**具体**未达标的能力名（此前统一写 "(证据不足)"，
+        # 导致归因侧无法判断是缺几何还是缺米制，级联撤销还会误判前提 —— 实测踩过）。
+        missing: list[str] = []
+        for cap in (getattr(spec, "requires_evidence", None) or []):
+            if cap not in CAPABILITIES:
+                missing.append(f"{cap}(未知能力)")
+                continue
+            if profile is None:
+                missing.append(f"{cap}(无证据画像)")
+                continue
+            state = profile.state(cap)
+            tolerates = set(getattr(spec, "tolerates_degraded", None) or [])
+            if state == "unavailable":
+                missing.append(f"{cap}(unavailable)")
+            elif state == "degraded" and cap not in tolerates:
+                missing.append(f"{cap}(degraded 且不容忍)")
         raise ArtifactUnavailableError(
             tool, missing or ["(证据不足)"], route=route,
             available=[], args=args)

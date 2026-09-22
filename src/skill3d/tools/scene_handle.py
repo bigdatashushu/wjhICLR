@@ -23,6 +23,7 @@ import numpy as np
 
 from skill3d.schemas import ObjectRecord, SceneState
 
+from .category_match import matches
 from .contract import (
     ARTIFACT_INTRINSICS,
     ARTIFACT_OBJECTS,
@@ -218,18 +219,23 @@ class SceneHandle:
         return [self._objects[oid] for oid in self.list_objects()]
 
     def list_objects_by_name(self, name: str = "") -> list[str]:
-        """按 category_name 子串过滤对象 id（空 = 全部）。大小写不敏感。
+        """按类别名过滤对象 id（空 = 全部）。
+
+        匹配走 `tools.category_match.matches`（归一化分隔符 + 同义词 + 单复数 +
+        词集合交集），**不是**朴素子串比较。真实实测依据：清单里是 `phone` /
+        `trash_can`，题面写 `telephone` / `trash can`，朴素子串匹配两者都返回空 →
+        整类题型 abstain。详见 category_match 模块头。
 
         计数题必须靠这个（`exists_in_scene` 是布尔，拿它当计数器只能得到 0/1）。
         """
-        h = str(name or "").strip().lower()
+        h = str(name or "").strip()
         if not h:
             return self.list_objects()
         out = []
         for oid in self.list_objects():
             obj = self._objects.get(oid)
-            val = str(getattr(obj, "category_name", "") or "").lower()
-            if h in val or (val and val in h):
+            val = str(getattr(obj, "category_name", "") or "")
+            if matches(h, val):
                 out.append(oid)
         return out
 
@@ -238,13 +244,22 @@ class SceneHandle:
         return str(getattr(obj, "category_name", "") or "")
 
     def resolve_object_id(self, name_or_id: str) -> str:
-        """按 obj_id 或 category_name（大小写不敏感）解析对象。"""
+        """按 obj_id、类别名（归一化匹配）或唯一候选解析对象。
+
+        解析顺序：obj_id 精确 → 类别名精确 → 类别名归一化/同义词匹配。
+        归一化匹配命中**多个**时取第一个（obj_id 升序，确定性）——
+        题面只点名一个物体、清单里同类多个时，这是唯一的确定性选择。
+        """
         if name_or_id in self._objects:
             return name_or_id
-        hit = self._by_name.get(name_or_id.lower())
-        if hit is None:
-            raise KeyError(f"对象不存在: {name_or_id}")
-        return hit
+        key = str(name_or_id or "").strip().lower()
+        hit = self._by_name.get(key)
+        if hit is not None:
+            return hit
+        cands = self.list_objects_by_name(name_or_id)
+        if cands:
+            return cands[0]
+        raise KeyError(f"对象不存在: {name_or_id}")
 
     def get_object(self, name_or_id: str) -> ObjectRecord:
         return self._objects[self.resolve_object_id(name_or_id)]

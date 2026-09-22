@@ -1043,6 +1043,8 @@ def bind_objects_for_scene(
             point_conf=point_conf)
         if sup_note:
             notes.append(sup_note)
+        if sup_stats.get("grounding"):
+            stats["grounding"] = dict(sup_stats["grounding"])
         if sup_objs:
             objects = list(objects) + sup_objs
             extra = [float(v) for v in (sup_stats.get("track_ious") or [])]
@@ -1183,7 +1185,13 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
                 boxes.append(b)
                 prompt_list.append((int(fi), len(prompt_list), b))
     if not boxes:
-        return [], {}, ""
+        # v6 证据：题面点名了物体但检测/VLM 一个框都没给出 → **明确未命中**。
+        # 必须报给 EvidenceProfile 的 `object_grounding=unavailable`，
+        # 不能让"没找到"静默退化成"没查"（§7.1 三值判定 + fail-closed）。
+        return [], {"grounding": {"attempted": True, "n_boxes": 0,
+                                  "n_new": 0, "all_present": False,
+                                  "miss": True}}, (
+            "M5 逐题补漏：题面点名物未检出（grounding_recall_miss）")
     masks = track_objects(frames, boxes, predictor, prompts=prompt_list,
                           handle=handle, question=question)
     cand = bind_masks_to_world(masks, depth_maps, c2w_list, intrinsics,
@@ -1221,15 +1229,20 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
             kept_masks.append(_merge_mask_groups(masks, [g])[0])
 
     if not kept:
-        return [], {}, (f"M5 逐题补漏：{len(boxes)} 个问题目标框均已在场景清单中"
-                        f"（复用，不重算）")
+        # v6 证据：题面点名物**已在清单中确认存在**（框都能对上已有对象）→ 命中
+        return [], {"grounding": {"attempted": True, "n_boxes": len(boxes),
+                                  "n_new": 0, "all_present": True}}, (
+            f"M5 逐题补漏：{len(boxes)} 个问题目标框均已在场景清单中"
+            f"（复用，不重算）")
     out: list[ObjectRecord] = []
     for i, o in enumerate(kept):
         new_id = f"obj_{len(base_ids) + i}"
         # obj_id 换成 scene 内唯一的稳定 id；track_id / grounding_status /
         # duplicate_suspect 原样保留（track 由本次传播产生，`qtrk*` 命名空间）
         out.append(o.model_copy(update={"obj_id": new_id}))
-    stats: dict = {}
+    stats: dict = {"grounding": {"attempted": True, "n_boxes": len(boxes),
+                                 "n_new": len(out), "all_present": False,
+                                 "miss": False}}
     from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
 
     ious = track_ious_from_masks(kept_masks)

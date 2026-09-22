@@ -705,5 +705,8 @@ def test_question_supplement_skips_targets_already_in_inventory(tmp_path):
     first, _, _ = _supplement_case(tmp_path, base)
     assert len(first) == 1
     again, stats, note = _supplement_case(tmp_path, base + first)
-    assert again == [] and stats == {}
+    # v6：即使没有新绑对象，也要回传 grounding 证据（题面点名物已确认在清单中）
+    assert again == []
+    assert stats["grounding"]["attempted"] is True
+    assert stats["grounding"]["all_present"] is True
     assert "均已在场景清单中" in note

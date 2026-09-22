@@ -94,8 +94,20 @@ class RecoveryPlan:
 
 def premise_of_failure(*, error_code: str, tool: str,
                        requires_evidence: tuple[str, ...] = (),
-                       missing_artifacts: tuple[str, ...] = ()) -> Optional[str]:
-    """从失败事实推断失效的共享前提；`None` = 局部失败，不做级联（§14.1）。"""
+                       missing_artifacts: tuple[str, ...] = (),
+                       unmet_evidence: tuple[str, ...] = ()) -> Optional[str]:
+    """从失败事实推断失效的共享前提；`None` = 局部失败，不做级联（§14.1）。
+
+    `unmet_evidence`：证据门给出的**逐项未达标能力**（`contract.evidence_unmet`
+    的输出，可能带 `"(degraded 且不容忍)"` 之类的后缀）。**必须优先于产物判据**：
+    实测踩过的坑是"证据缺口"被当成"缺产物"从而一律退成 `geometry_3d`，
+    级联撤销就把 geometry/world_frame/metric_scale 全部无差别降级了。
+    """
+    # 证据缺口优先：取**具体**那个能力作前提（去掉括号后缀）
+    for item in unmet_evidence:
+        cap = str(item).split("(")[0].strip()
+        if cap in _DEPENDENTS:
+            return cap
     if error_code == "confidence_gate":
         if EVIDENCE_METRIC_SCALE in requires_evidence:
             return EVIDENCE_METRIC_SCALE

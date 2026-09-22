@@ -1137,6 +1137,17 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
     def _opt(v):
         return None if v is None else float(v)
 
+    # §7.1 `object_grounding`：M5 逐题补漏的**实际结果**（不是"没查"）
+    g = (stats or {}).get("grounding") or grounding or {}
+    if g.get("attempted"):
+        if g.get("miss") or int(g.get("n_boxes", 0)) <= 0:
+            hit, miss = False, True
+        elif int(g.get("n_new", 0)) > 0 or g.get("all_present"):
+            hit, miss = True, False
+        else:
+            hit, miss = True, False
+    else:
+        hit, miss = None, False      # 未做校验 → 上层按 degraded（不是 available）
     return M5EvidenceSummary(
         detection_fault=fault,
         n_objects=len(objs),
@@ -1144,10 +1155,10 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
         track_stable_ratio=(None if ratio is None else float(ratio)),
         track_fragmentation_ratio=_opt(tcm.get("track_fragmentation_ratio")),
         duplicate_suspect_ratio=_opt(tcm.get("duplicate_suspect_ratio")),
-        grounding_pointed_hit=None if grounding is None else grounding.get("hit"),
-        grounding_conf=None if grounding is None else grounding.get("conf"),
-        grounding_miss=bool(grounding.get("miss")) if grounding else False,
-        grounding_filled=bool(grounding.get("filled")) if grounding else False,
+        grounding_pointed_hit=hit,
+        grounding_conf=_opt(g.get("conf")),
+        grounding_miss=miss,
+        grounding_filled=bool(int(g.get("n_new", 0)) > 0),
         notes=[str(x) for x in ((stats or {}).get("evidence_notes") or [])],
     )
 
@@ -1527,10 +1538,15 @@ def _premise_from_cell(cell: CellResult, kernel) -> Optional[str]:
         req = tuple(REGISTRY.requires_evidence(name))
     except Exception:  # noqa: BLE001 - 未注册名 → 无法判前提，保守不撤销
         req = ()
+    # `missing_artifacts` 里带括号的是**证据项**（如 "metric_scale(degraded 且不容忍)"），
+    # 不带括号且命中产物表的才是**产物项**。两者判据不同，不能混在一起。
+    raw_missing = [str(x) for x in (v.get("missing_artifacts") or ())]
+    unmet = tuple(x for x in raw_missing if "(" in x)
+    arts = tuple(x for x in raw_missing if "(" not in x)
     return premise_of_failure(
         error_code=str(v.get("error_code") or "tool_contract"),
         tool=name, requires_evidence=req,
-        missing_artifacts=tuple(v.get("missing_artifacts") or ()))
+        missing_artifacts=arts, unmet_evidence=unmet)
 
 
 def _regenerate_after_contract(episode, scene, handle, skills, cfg, llm, pixels,

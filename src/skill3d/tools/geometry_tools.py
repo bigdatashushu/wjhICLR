@@ -289,6 +289,8 @@ def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
         source_default="real",
         requires_artifacts=["objects", "scale"],
         requires_evidence=[EV_GEOMETRY, EV_METRIC, EV_DETECTION, EV_GROUNDING],
+        # metric_scale 是唯一不容忍 degraded 的能力（D3 硬契约）；其余容忍
+        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
     )
 )
 def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
@@ -334,6 +336,7 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
         source_default="real",
         requires_artifacts=["point_cloud", "scale"],
         requires_evidence=[EV_GEOMETRY, EV_METRIC],
+        tolerates_degraded=[EV_GEOMETRY],
     )
 )
 def plane_fit_room_size(handle: SceneHandle) -> dict:
@@ -413,6 +416,7 @@ def robust_distance(handle: SceneHandle, reference: str, target: str) -> dict:
         source_default="real",
         requires_artifacts=["point_cloud", "objects", "scale"],
         requires_evidence=[EV_GEOMETRY, EV_METRIC, EV_DETECTION, EV_GROUNDING],
+        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
     )
 )
 def camera_object_distance(handle: SceneHandle, obj_id: str) -> dict:

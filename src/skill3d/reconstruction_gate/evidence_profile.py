@@ -266,9 +266,12 @@ def grounding_capability(summary: M5EvidenceSummary) -> CapabilityState:
     if summary.grounding_miss:
         return "unavailable"
     if summary.grounding_pointed_hit is None:
-        # 未走题面补绑（题目不点具体物件）→ 该能力对该题不适用，
-        # 记为 available（基础清单已覆盖），并在 subvalues 里留痕
-        return "available"
+        # **未做题面点名物校验** → 不得报 available。
+        # 2026-09-21 真实实测：此前这里返回 `available` 是**假阳性** ——
+        # 题面写 "telephone"，清单里是 "phone"，工具实际找不到对象，
+        # 证据画像却说 grounding 可用。改成 degraded（工具仍可用，但答案带
+        # `evidence_degraded` 标记），既不再谎报、也不会把对象类工具一起收回。
+        return "degraded"
     if summary.grounding_pointed_hit:
         conf = summary.grounding_conf
         if conf is not None and np.isfinite(float(conf)) \
