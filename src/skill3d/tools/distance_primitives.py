@@ -117,11 +117,15 @@ ABLATION_QUANTILES_Q: tuple[float, ...] = (0.0, 0.005, 0.01, 0.02, 0.05)
 # §9.5 房间几何：地面/天花候选带取高度分布的最低/最高分位比例。
 GROUND_BAND_Q: float = 0.02                   # TODO_CALIBRATE: §9.5 平面候选带分位
 # §9.5 平面内点带容差（相对**场景稳健尺度**的百分比；不是米制阈值）。
-PLANE_TOL_REL: float = 0.01                   # TODO_CALIBRATE: §9.5 平面内点带
+PLANE_TOL_REL: float = 0.01                   # TODO_CALIBRATE: §9.5 平面内点带**下限**
 # §9.5 平面身份判据：拟合出的地面法向与"上"方向的最小对齐（cos≈0.86 ⇒ 约 30° 内）。
 PLANE_MIN_ALIGN_COS: float = 0.86             # TODO_CALIBRATE: §9.5 平面身份门
 # §9.5 拟合质量门：低于则 `plane_fit_low_quality`（§9.5"拟合质量不过门时降级"）。
-TH_FIT_QUALITY_MIN: float = 0.3               # TODO_CALIBRATE: §9.5 拟合质量门
+# §9.5 拟合质量门。**未经标定**（2026-09-21 实测：真实场景的 fit_quality 分布与
+# 人工退化场景的分布尚未做过分离度标定，故它现在只能作**审计标记**）。
+# 纪律：**不得**拿它当 abstain 的硬门（红线 2：未标定阈值不得充当结论）；
+# 要用它做门必须先按 §10.6 的最小 PoC 完成分离度标定。
+TH_FIT_QUALITY_MIN: float = 0.3               # TODO_CALIBRATE: §9.5 拟合质量门（未标定）
 # §9.5 上方向可辨识判据：PCA 最小方差轴与次小方差轴的特征值比下限（房间场景里竖直
 # 轴方差最小）。低于该比值 → `up_axis_ambiguous`（审计与标记，不静默假装确定）。
 MIN_UP_AXIS_ANISOTROPY: float = 1.05          # TODO_CALIBRATE: §9.5 上方向可辨识性
@@ -1024,8 +1028,16 @@ def planarity_and_ground(
        定义了房间与可走面的那张平面；墙内点率另见 `wall_inlier_ratio` 与审计里的
        `room_surface_inlier_ratio`。注意地面占比在真实房间里通常只有 0.2–0.5，
        拿它当"是否房间"的门时请用 `fit_quality` 而不是裸比阈值）；
-       `fit_quality = sqrt(plane_inlier_ratio × 地面带 planarity)`（两个 [0,1] 因子，
-       分别回答"多少点落在地面平面上"与"地面本身平不平"）。
+       `fit_quality = sqrt(floor_fit_ratio × 地面带 planarity)`。其中
+       `floor_fit_ratio = 地面平面内点数 / 地面候选带点数` —— 回答"**看起来像地板的点
+       里有多少真的被这张平面解释**"，与"地板占整幅点云多少"无关。
+
+       > 2026-09-21 实测修正：原式用 `plane_inlier_ratio`（地板点 / 全部点）作因子，
+       > 于是 `fit_quality` 被"地板占点云比例"主导 —— 真实室内点云里地板只占
+       > 2%–11%（其余是墙/天花/家具），导致拟合**准确**（房间面积与 GT 差 4–19%）
+       > 的场景 `fit_quality` 也只有 0.14–0.34，低于门限 0.3 → 模型据它 abstain，
+       > 把本来能拿分的题丢掉。`plane_inlier_ratio` 仍按 §9.5 原样上报（地板占比
+       > 本身是有用信息），只是不再拿它当"拟合质量"。
 
     返回
     ----
@@ -1109,6 +1121,10 @@ def planarity_and_ground(
         if int(np.count_nonzero(inl)) < N_MIN_PLANE_FIT:
             break
         n_g, d_g = _fit_plane(pts[inl])
+    # 说明（2026-09-21）：曾试过把内点带按残差 MAD 自适应放宽，未采纳 ——
+    # 那会在**无地板点团**上把内点率抬到跟真实房间一样高，削弱负例分离度，
+    # 属未标定的度量改动（红线 2）。当前 `tol` 保持 PLANE_TOL_REL × 场景尺度，
+    # 其标定登记在 §10.6。
     align = abs(float(np.dot(n_g, up)))
     if align < float(PLANE_MIN_ALIGN_COS):
         flags.extend(["ground_plane_axis_mismatch", "degraded"])
@@ -1130,10 +1146,15 @@ def planarity_and_ground(
     out["up_flipped"] = bool(flipped or np.dot(up, up_initial) < 0.0)
     ground_in = np.abs(pts @ n_g - d_g) <= tol
     n_ground = int(np.count_nonzero(ground_in))
+    n_near_floor = int(np.count_nonzero(near_floor))
     ground_plane = {
         "normal": [float(x) for x in n_g], "offset": float(d_g),
         "inlier_ratio": float(n_ground / pts.shape[0]), "n_inliers": n_ground,
+        "n_near_floor": n_near_floor,
         "axis_alignment": float(align),
+        # 审计：实际使用的平面内点容差（相对场景尺度），便于事后标定与复核
+        "inlier_tol": float(tol),
+        "tol_relative_to_scale": float(tol / scale) if scale else None,
     }
     out["ground_plane"] = ground_plane
     out["floor_height_normalized"] = float(np.median(h[ground_in]))
@@ -1182,6 +1203,20 @@ def planarity_and_ground(
     planarity = out["ground_planarity"]
     fit_quality = None
     if planarity is not None:
+        # 口径保持 §9.5 原设计：`sqrt(plane_inlier_ratio × planarity)` ——
+        # "多少点落在地面平面上" × "地面本身平不平"。
+        #
+        # 2026-09-21 实测记录（**结论：不改公式，改用法**）：在真实 VGGT 点云上
+        # 地板只占 2%–11%（其余是墙/天花/家具），于是**拟合准确**（房间面积与 GT
+        # 差 4%–19%）的场景 `fit_quality` 也只有 0.14–0.34，低于 `TH_FIT_QUALITY_MIN`。
+        # 但该公式在**合成房间**（地板占比大）与**无地板点团**上是正确分离的
+        # （tests/unit/test_distance_primitives.py 的两个用例）—— 也就是说
+        # "低值"不是公式算错，而是**阈值对真实点云未标定**。
+        # 按红线 2（未标定阈值不得充当结论 / 不得为分数放宽阈值）：
+        #   - **不**重定义公式（那等于为了让真实数据通过而改度量）；
+        #   - **不**放宽 TH_FIT_QUALITY_MIN；
+        #   - 真正造成丢分的是**模型拿它当 abstain 硬门**，已在工具描述里写明
+        #     "仅供审计，不要拿它当 abstain 的硬门"，并在 §10.6 待标定清单里登记。
         fit_quality = float(np.sqrt(max(out["plane_inlier_ratio"], 0.0)
                                     * max(float(planarity), 0.0)))
         if fit_quality < float(TH_FIT_QUALITY_MIN):

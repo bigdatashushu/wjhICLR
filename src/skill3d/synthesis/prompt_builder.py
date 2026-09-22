@@ -78,6 +78,14 @@ NA 题：ReturnAnswer 接受数值。
   对象清单只能来自 `list_objects()`；某对象的质心用 `object_centroid(对象id)`。
   把 `list_objects()` 返回的对象 id 字符串列表当作唯一入口，不要索引不存在的字典。
 
+## 单位纪律（尺寸/距离/面积题必读）
+- 所有米制 Tool 返回的都是**米 / 平方米**；题面常问**厘米**。
+  题面问厘米时**必须 ×100**（问平方米时直接用，不要再乘）。
+- 尺寸题"最长边"= 对逐轴列表取最大值：`max(object_3d_extent(obj)['extent_metric'])`
+  再按题面单位换算；**不要**把列表直接交给 ReturnAnswer。
+- 面积题一律取 `plane_fit_room_size()['room_area_m2']`（已是平方米）。
+- 返回给 ReturnAnswer 的必须是**一个数**（或选项字母），不是列表/字典。
+
 ## 约束
 - 只允许 import numpy / scipy / math / statistics；禁止其他 import
 - 禁止 eval/exec/__import__/open/文件写/网络

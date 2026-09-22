@@ -280,9 +280,14 @@ def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
 @REGISTRY.register(
     ToolSpec(
         name="object_3d_extent",
-        description=("对象 3D 包围盒边长（世界系归一化单位）与**米制** extent。"
-                     "尺寸题（object_size_estimation）用它；米制值 = 归一化 extent × "
-                     "尺度，面积按平方。缺尺度即 fail-closed（不做近似）"),
+        description=("对象 3D 包围盒边长。返回 dict："
+                     "{'extent_normalized': [dx,dy,dz], 'extent_metric': [dx,dy,dz], "
+                     "'n_valid_points': N, 'degradation_flags': [...]}。"
+                     "**两个 extent 都是逐轴列表（x/y/z 三个数），不是标量。**"
+                     "**单位是米**；若题目问『最长边、以厘米计』，取 "
+                     "`max(object_3d_extent(obj)['extent_metric']) * 100`，"
+                     "把结果（一个数）交给 ReturnAnswer —— 不要直接把列表交出去。"
+                     "缺尺度即 fail-closed（不做近似）"),
         args_schema_ref="obj_id:str",
         returns_schema_ref="dict",
         cost_estimate_ms=5.0,
@@ -327,9 +332,13 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
 @REGISTRY.register(
     ToolSpec(
         name="plane_fit_room_size",
-        description=("拟合地面/墙面 → 房间对角线（归一化）与**米制**面积。"
-                     "房间尺寸题（room_size_estimation）用它。平面拟合质量不过门时"
-                     "降级输出（fit_quality 明确给出）"),
+        description=("拟合地面/墙面 → 房间尺寸。返回 dict："
+                     "{'room_diagonal_normalized': d, 'room_area_m2': A, "
+                     "'plane_inlier_ratio': r, 'fit_quality': q, 'degradation_flags': [...]}。"
+                     "房间面积题一律取 **`result['room_area_m2']`**（单位已是平方米，"
+                     "**不要**再换算）；注意键名是 `room_area_m2`，不是 area_metric / "
+                     "room_size / area。`fit_quality` 是 [0,1] 的拟合质量审计值"
+                     "（真实房间上实测偏低，仅供审计，不要拿它当 abstain 的硬门）"),
         args_schema_ref="",
         returns_schema_ref="dict",
         cost_estimate_ms=50.0,
@@ -407,7 +416,10 @@ def robust_distance(handle: SceneHandle, reference: str, target: str) -> dict:
 @REGISTRY.register(
     ToolSpec(
         name="camera_object_distance",
-        description=("**米制**距离：相机（观察点）到某对象表面的稳健低分位距离（米）。"
+        description=("**米制**距离：相机（观察点）到某对象表面的稳健低分位距离。"
+                     "返回 dict：{'distance_normalized': d, 'distance_metric': D, ...}；"
+                     "**`distance_metric` 的单位是米**，答案取 "
+                     "`result['distance_metric']`（若题目要厘米则 ×100）。"
                      "绝对距离题（object_abs_distance）用它。需要米制尺度；"
                      "尺度不可用时本 Tool 不会出现在可用列表里"),
         args_schema_ref="obj_id:str",

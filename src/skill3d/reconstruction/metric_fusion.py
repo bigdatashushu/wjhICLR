@@ -82,8 +82,9 @@ CONF_SOFT_KEEP_QUANTILE: float = 0.2  # TODO_CALIBRATE: per-frame conf 相对分
 MOGE2_CHECKPOINT: str = "Ruicheng/moge-2-vitl"  # HF repo id
 MOGE2_USE_FP16: bool = True           # §11.2：FP16 ViT-L 约 60ms/帧（文献值，非本系统实测）
 MOGE2_BLACK_LUMA_MAX: int = 12        # TODO_CALIBRATE: 非黑边像素的 luma 下界
-# MoGe 的 `infer(fov_x=...)` 单位按官方文档为**度**。TODO_VERIFY_ON_INSTALL：
-# 本机未安装 `moge`（离线环境），无法核验；装包后按官方 repo/docstring 复核一次，
+# MoGe 的 `infer(fov_x=...)` 单位按官方文档为**度**。**已核验**（2026-09-21：
+# 本机装上 moge 后读 `moge/model/v2.py::MoGeModel.infer` 源码，fov_x 走
+# `torch.deg2rad(fov_x/2)`；实测传入 66.7 时输出 intrinsics 反推 fov 亦为 66.7）；
 # 若单位不一致**只改这一处**（全模块唯一换算点）。
 MOGE2_FOV_UNIT_DEGREES: bool = True
 
@@ -689,14 +690,26 @@ def acceptance_report(
 
 
 def fov_x_deg_from_intrinsics(intrinsics: Optional[np.ndarray],
-                              image_width: int) -> Optional[float]:
+                              image_width: Optional[int] = None) -> Optional[float]:
     """由内参 K 换算水平视场角（度），供 §11.2 的相机对齐使用。
 
-    用 ``fx / W`` 归一化后计算，因此与"K 在哪套分辨率网格"无关：
-    ``fov_x = 2·atan(1 / (2·fx_norm))``。K 非法/非有限/``fx ≤ 0`` → ``None``
+    **优先由主点推**：主点位于图像中心 ⇒ 同一网格内有 ``W = 2·cx``，故
+    ``fov_x = 2·atan(cx / fx)`` —— 只用 K 内部量，**天然与"K 在哪套分辨率网格"
+    无关**，不需要调用方知道图像宽。
+
+    2026-09-21 实测修正（真实 MoGe-2 + 真实 VGGT K）：原实现写成
+    ``fx_norm = fx / W`` 再 ``2·atan(1/(2·fx_norm))``，展开就是 ``2·atan(W/(2·fx))``
+    —— **依赖 W**。而 VGGT 的 K 是**深度网格**（518 宽，cx=259=518/2）的，
+    调用方按**原图**宽（640）传入 ⇒ 得 78.2°，正确值是 66.7°（差 11.5°）。
+    用 MoGe-2 自估 fov 作独立参照实测：自估 68.7°、主点推导 66.7°（差 2°）、
+    原实现 78.2°（差 9.5°）→ 原实现错。深度中位数随之从 1.72 m 变成 1.98 m
+    （尺度差 15%，直接影响米制三题）。
+
+    `image_width` 退化为**兜底**：仅当主点不可用（非有限 / ≤0）时才使用，
+    此时调用方**必须**传入与 K 同一网格的宽度。K 非法 → ``None``
     （**不猜视场角**：宁可让调用方 fail-closed，也不给一个错 K 换算出的 fov）。
     """
-    if intrinsics is None or int(image_width) <= 0:
+    if intrinsics is None:
         return None
     k = np.asarray(intrinsics, dtype=np.float64)
     while k.ndim > 2 and k.shape[0] == 1:   # 去 batch 维 (1,3,3) → (3,3)
@@ -705,11 +718,14 @@ def fov_x_deg_from_intrinsics(intrinsics: Optional[np.ndarray],
         k = k[0]
     if k.shape != (3, 3):
         return None
-    fx = float(k[0, 0])
+    fx, cx = float(k[0, 0]), float(k[0, 2])
     if not np.isfinite(fx) or fx <= 0.0:
         return None
-    fx_norm = fx / float(image_width)
-    return float(np.degrees(2.0 * np.arctan(1.0 / (2.0 * fx_norm))))
+    if np.isfinite(cx) and cx > 0.0:
+        return float(np.degrees(2.0 * np.arctan(cx / fx)))
+    if image_width is None or int(image_width) <= 0:
+        return None
+    return float(np.degrees(2.0 * np.arctan(float(image_width) / (2.0 * fx))))
 
 
 def _to_moge_tensor(rgb: np.ndarray, torch_mod: Any) -> Any:
@@ -776,7 +792,10 @@ class _MoGe2MetricModel:
         """
         torch = self._torch
         img = _to_moge_tensor(rgb, torch)
-        fov_x_deg = fov_x_deg_from_intrinsics(intrinsics, int(img.shape[-1]))
+        # 主点推导（尺度无关）；宽度仅作兜底，且必须是 K 所在网格的宽度。
+        # 注意 `img` 是**原图**分辨率，与 VGGT 深度网格不同 —— 只有主点路径
+        # 才对这个不一致免疫（见 fov_x_deg_from_intrinsics 的实测说明）。
+        fov_x_deg = fov_x_deg_from_intrinsics(intrinsics)
         fov_arg = fov_x_deg
         if fov_arg is not None and not MOGE2_FOV_UNIT_DEGREES:  # pragma: no cover
             fov_arg = float(np.radians(fov_x_deg))

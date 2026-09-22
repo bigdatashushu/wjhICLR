@@ -97,6 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="episodic 记忆目录（G-26；空=用 config 的 paths.memory_db 同级）")
     p.add_argument("--no-memory", action="store_true", help="关闭在线 episodic 记忆写入")
     p.add_argument("--recon-dir", default="")
+    # v6 §11：零样本度量深度跨帧融合（首个 PoC = MoGe-2）。
+    # 默认**关闭**（metric_scale=None + scale_fusion_status="not_run"）——§11 全部
+    # 为 [待实验]，只有显式开启才跑，避免把 PoC 数字混进默认口径。
+    p.add_argument("--moge2", action="store_true",
+                   help="启用 MoGe-2 度量尺度融合（§11.2；需本机有 moge 包与权重）")
+    p.add_argument("--moge2-checkpoint", default="",
+                   help="覆盖 MoGe-2 权重（HF repo id 或本地目录）")
     p.add_argument("--recon-method", default="vggt", choices=["vggt"],
                    help="重建方法；v6 §5.2 受控枚举只有 vggt（BA 路线与 colmap/dust3r "
                         "对照基线均已废止并入 legacy/retired）")
@@ -115,6 +122,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-manifest", default="",
                    help="RunManifest 落盘路径（§16.4 复现 checklist；默认 data/run_manifest.json）")
     return p
+
+
+def _maybe_moge2(args):
+    """`--moge2` 时构造 MoGe-2（懒加载）；否则 None（→ scale_fusion_status=not_run）。
+
+    构造失败**直接抛错**而不是静默关闭融合：静默关闭会把"米制三题全 0 分"
+    误读成几何/工具的问题，而实际是模型没加载上。
+    """
+    if not getattr(args, "moge2", False):
+        return None
+    from skill3d.reconstruction.metric_fusion import make_moge2_model
+
+    ckpt = getattr(args, "moge2_checkpoint", "") or None
+    print(f"[info] 启用 MoGe-2 度量尺度融合（§11 [待实验]）；checkpoint={ckpt or '默认'}")
+    return make_moge2_model(device="cuda", checkpoint=ckpt)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -222,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         vllm_endpoints=list(args.vllm_endpoint),
         vllm_model=args.vllm_model or vllm.model,
         recon_method=args.recon_method,
+        metric_depth_model=_maybe_moge2(args),
         direct_answer_tasks={t.strip() for t in args.direct_answer_tasks.split(",")
                              if t.strip()},
         # v6 §20：BA（官方 VGGSfM / vggt_sparse_ba）与整套"需校准的尺度"路线已废止，

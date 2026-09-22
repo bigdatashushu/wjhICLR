@@ -82,7 +82,7 @@ def plan_scene_jobs(items: Sequence[EpisodeItem], recon_dir: str | Path, method:
 
 def run_jobs(jobs: list[SceneJob], items_by_scene: dict[str, list[EpisodeItem]],
              recon_dir: str | Path, method: str, gpus: Optional[list[int]] = None,
-             n_frames: int = 32) -> list[SceneJob]:
+             n_frames: int = 32, metric_depth_model=None) -> list[SceneJob]:
     """执行场景作业（DP 逻辑分配；重建本身按 §4 M3 主线）。
 
     **M4 前移 P1（方案 X，§2.2）**：重建时顺手算 G1–G11 并写回 artifact，
@@ -103,6 +103,8 @@ def run_jobs(jobs: list[SceneJob], items_by_scene: dict[str, list[EpisodeItem]],
             art = reconstruct(
                 frames, job.scene_name, Path(recon_dir) / method, method=method,
                 frame_set=scene_items[0].episode.frame_set if scene_items else None,
+                metric_depth_model=metric_depth_model,
+                metric_model_name=("moge2" if metric_depth_model is not None else "none"),
             )
         except ReconstructionFailed as exc:
             job.status, job.note = "failed", f"重建失败（降级链已走完）: {exc}"
@@ -161,6 +163,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--split", default="induction,inner_validation,outer_holdout",
                    help="逗号分隔的 split 列表（默认 induction,inner_validation,outer_holdout）")
+    # v6 §11：度量尺度融合开关（默认关；§11 全部 [待实验]）
+    p.add_argument("--moge2", action="store_true",
+                   help="启用 MoGe-2 度量尺度融合（§11.2），artifact 将带 metric_scale")
     p.add_argument("--method", default="vggt", choices=["vggt"],
                    help="重建方法；v6 §5.2 受控枚举只有 vggt（BA / colmap / dust3r 已废止）")
     p.add_argument("--source", default="vsi_bench", choices=["vsi_bench", "jsonl"])
@@ -188,6 +193,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plan-only", action="store_true", help="只打印作业表，不执行重建")
     p.add_argument("--config", default=DEFAULT_CONFIG)
     return p
+
+
+def _maybe_moge2(args):
+    """`--moge2` 时构造 MoGe-2（懒加载）；否则 None（→ scale_fusion_status=not_run）。
+
+    v6 §11 全部为 [待实验]：默认不融合，只有显式开启才跑；构造失败直接抛错
+    （静默关闭会把"米制三题全 0 分"误读成几何问题）。
+    """
+    if not getattr(args, "moge2", False):
+        return None
+    from skill3d.reconstruction.metric_fusion import make_moge2_model
+
+    print("[info] 启用 MoGe-2 度量尺度融合（§11 [待实验]）")
+    return make_moge2_model(device="cuda")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -264,11 +283,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     jobs = run_jobs(jobs, items_by_scene, recon_dir, args.method, gpus=gpus,
+                    metric_depth_model=_maybe_moge2(args),
                     n_frames=args.n_frames)
     manifest = Path(recon_dir) / args.method / "manifest.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(json.dumps({
         "method": args.method, "splits": splits, "recon_dir": recon_dir,
+        "moge2_enabled": bool(getattr(args, "moge2", False)),
         "schema_version": "6.0",
         "quality_metric_version": "v6-m4-main-gate",
         "n_frames": args.n_frames,
