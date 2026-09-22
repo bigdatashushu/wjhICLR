@@ -141,11 +141,15 @@ def _degraded_property(distance_result, *, metric_ok: bool) -> list[str]:
 @REGISTRY.register(
     ToolSpec(
         name="list_objects",
-        description=("列出场景中的对象（自描述）：每项含 obj_id / category_name / "
-                     "visible_frames / track_id。按类别筛选传 category_filter"
-                     "（子串匹配，如 list_objects('chair')）。"
-                     "**obj_id 里不含类别名**，不要用 'chair' in obj_id 这类判断。"
-                     "计数请改用 count_objects（它以 track 共识为准）"),
+        description=("列出场景中的对象，返回一个 **dict 列表**，每项形如 "
+                     "{'obj_id': 'obj_7', 'category_name': 'chair', "
+                     "'visible_frames': [3,4,5], 'track_id': 'trk7', 'det_conf': 0.8, "
+                     "'grounding_status': 'base_list', 'duplicate_suspect': False}。"
+                     "用法照抄：`objs = list_objects('chair')` 后取 "
+                     "`objs[0]['obj_id']`；**列表元素是 dict，不是字符串**"
+                     "（写 `for o in objs: 'chair' in o` 会报错）。"
+                     "**obj_id 里不含类别名**，按类别筛选必须传 category_filter"
+                     "（子串匹配）。计数请改用 count_objects（它以 track 共识为准）"),
         args_schema_ref="category_filter:str=''",
         returns_schema_ref="list[dict]",
         cost_estimate_ms=1.0,
@@ -181,8 +185,11 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
     ToolSpec(
         name="count_objects",
         description=("按类别统计实例数（category_name 子串匹配，如 'chair'）。"
-                     "**以 track 共识为准**（同一物体跨帧只算一次），返回 "
-                     "{count, n_distinct_tracks, duplicate_suspect, evidence_degraded}。"
+                     "**以 track 共识为准**（同一物体跨帧只算一次）。返回一个 dict："
+                     "{'count': 4, 'n_distinct_tracks': 4, 'n_records': 5, "
+                     "'n_without_track': 0, 'duplicate_suspect': False, "
+                     "'evidence_degraded': False}。"
+                     "**答案要取 `result['count']`**，不要把整个 dict 交给 ReturnAnswer。"
                      "计数题必须用它，不要用 exists_in_scene 累加（那是布尔值）"),
         args_schema_ref="category_name:str",
         returns_schema_ref="dict",
@@ -483,7 +490,9 @@ def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str
                      "front/behind/left/right 哪个方向。三个参数都是**对象 id 或类别名**"
                      "（如 'obj_3' / 'whiteboard'），内部取各自质心："
                      "facing 方向 = facing_at 质心 − observer 质心。"
-                     "方向题优先用它，不要自己拼朝向向量"),
+                     "返回 dict：{'direction': 'left', 'world_up_used': [...], "
+                     "'handedness_used': 'right'}；**答案取 `result['direction']`**并把"
+                     "方向词映射到选项字母。方向题优先用它，不要自己拼朝向向量"),
         args_schema_ref="observer_id:str, facing_at_id:str, target_id:str",
         returns_schema_ref="dict",
         cost_estimate_ms=2.0,

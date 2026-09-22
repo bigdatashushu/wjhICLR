@@ -219,18 +219,39 @@ class ToolRegistry:
 
         与 scene 摘要**同源**（都从 `scene_route` + `question_tool_scope` 派生），
         杜绝"头部 fallback、摘要 full_3d"自相矛盾（§5.3 不变量）。
+
+        **2026-09-21 真实实测修正（重要）**：此前的实现**无条件**打印
+        "米制证据门未通过 + 缺失子条件"，连 `object_rel_direction` /
+        `object_rel_distance` 这类**根本不需要米制尺度**的题也照打 —— 而 gate 的
+        `missing_subconditions` 里必然含 `question_type_is_metric`（"本题不是米制题"，
+        这是**设计如此**，不是缺陷）。模型读到"证据门未通过 + 缺失子条件"就直接
+        abstain：实测 4 个 rel_direction 题全部 abstain、4 个 rel_distance 题 3 个
+        abstain，而这两类题的相对几何在比较中会把尺度 s 约掉，**完全不需要米制**。
+
+        修正：只对**米制题型**报米制门状态；非米制题明确写"本题不需要米制尺度"，
+        不让模型把"gate 对本题不适用"误读成"证据不足"。
         """
         avail = ", ".join(sorted(available)) or "（无）"
-        metric_line = (
-            f"米制证据门已通过；本题题型={question_type or '未分类'}，"
-            f"允许调用上面的米制 Tool。"
-            if gate_passed else
-            f"**米制证据门未通过**（本题题型={question_type or '未分类'}）"
-            + (f"，缺失子条件={sorted(gate_missing)}" if gate_missing else "")
-            + "；依赖米制尺度的 Tool 已被收回，"
-            "严禁用世界单位/相对单位冒充米制数值，"
-            "若题目必须给米制量，请在 program 里直接调用 ReturnAnswer(\"abstain\")。"
-        )
+        metric_q = str(question_type or "") in set(METRIC_TASK_TYPES)
+        if not metric_q:
+            metric_line = (
+                f"本题题型={question_type or '未分类'}**不需要米制尺度** ——"
+                "相对距离/方向、路线、外观顺序都在全局尺度 s 下自动约掉 s，"
+                "直接用世界系（归一化单位）的 Tool 作答即可，不要因为"
+                "「米制证据门」的状态而 abstain（那道门只约束米制数值题）。"
+            )
+        elif gate_passed:
+            metric_line = (
+                f"米制证据门已通过（本题题型={question_type}），"
+                "允许调用上面列出的米制 Tool。")
+        else:
+            metric_line = (
+                f"**米制证据门未通过**（本题题型={question_type}）"
+                + (f"，缺失子条件={sorted(gate_missing)}" if gate_missing else "")
+                + "；依赖米制尺度的 Tool 已被收回，"
+                "严禁用世界单位/相对单位冒充米制数值。"
+                "若本题必须给米制量，请在 program 里直接调用 "
+                'ReturnAnswer("abstain")。')
         ev_line = ""
         if evidence_profile is not None:
             ev_line = ("证据画像=" + ", ".join(

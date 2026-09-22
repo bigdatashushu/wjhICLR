@@ -599,3 +599,61 @@ def test_count_objects_visible_when_track_consensus_degraded():
     assert "count_objects" in names
     flags = degraded_evidence_flags(REGISTRY.spec("count_objects"), p)
     assert "evidence_degraded:track_consensus" in flags
+
+
+# ------------- 11. prompt 头部：非米制题不得误导模型 abstain（实测修正）----
+
+def test_docs_header_does_not_scare_non_metric_tasks():
+    """真实实测修正：非米制题不得打印"米制门未通过 + 缺失子条件"。
+
+    依据（2026-09-21，32 题 inner_validation 真实运行）：header 此前**无条件**打印
+    "米制证据门未通过（缺失子条件=[..., 'question_type_is_metric', ...]）"，
+    而 `question_type_is_metric` 对非米制题恒 False 是**设计如此**；模型把它读成
+    "证据不足 → abstain" → 4 个 rel_direction 全 abstain、4 个 rel_distance 3 个
+    abstain，而这两类题的相对几何会把尺度 s 约掉，**根本不需要米制**。
+    """
+    import skill3d.tools  # noqa: F401
+
+    from skill3d.tools.registry import REGISTRY
+
+    p = EvidenceProfile(geometry_3d="degraded", world_frame="degraded",
+                        metric_scale="unavailable", object_detection="available",
+                        track_consensus="degraded", object_grounding="available")
+    for task in ("object_rel_direction", "object_rel_distance", "route_planning",
+                 "obj_appearance_order", "object_counting"):
+        h = REGISTRY.docs_header("full_3d", ["depth", "objects"], question_type=task,
+                                 gate_passed=False, evidence_profile=p,
+                                 gate_missing=["question_type_is_metric",
+                                               "scale_fusion_success"])
+        assert "米制证据门未通过" not in h, task
+        assert "不需要米制尺度" in h, task
+
+    # 米制题仍然必须明确写清门未通过
+    h = REGISTRY.docs_header("full_3d", ["depth", "objects"],
+                             question_type="object_abs_distance", gate_passed=False,
+                             evidence_profile=p, gate_missing=["scale_fusion_success"])
+    assert "米制证据门未通过" in h and "scale_fusion_success" in h
+    # 门通过时也不得再喊"未通过"
+    h2 = REGISTRY.docs_header("full_3d", ["depth", "objects"],
+                              question_type="object_abs_distance", gate_passed=True,
+                              evidence_profile=p)
+    assert "未通过" not in h2 and "已通过" in h2
+
+
+def test_tool_descriptions_expose_return_shape():
+    """工具描述必须给出确切返回结构（实测：模型把 list_objects 的 dict 当字符串用）。
+
+    依据：qa 1905 的程序写 `for obj_id in list_objects(): 'trash' in obj_id.lower()`，
+    而 v6 的 `list_objects` 返回 dict 列表 → 运行期失败 → abstain。描述里必须
+    直接给可照抄的取值方式。
+    """
+    import skill3d.tools  # noqa: F401
+
+    from skill3d.tools.registry import REGISTRY
+
+    d = REGISTRY.spec("list_objects").description
+    assert "category_name" in d and "dict" in d
+    d2 = REGISTRY.spec("count_objects").description
+    assert "result['count']" in d2 or "['count']" in d2
+    d3 = REGISTRY.spec("relative_direction_of").description
+    assert "direction" in d3 and "['direction']" in d3
