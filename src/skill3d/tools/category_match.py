@@ -142,19 +142,31 @@ def normalize(name: str) -> str:
 
 
 def canonical(name: str) -> str:
-    """归一化 + 同义词折叠 + 单复数折叠 → 规范名。"""
+    """归一化 + 单复数折叠 + 同义词折叠 → 规范名。
+
+    **顺序很关键**：必须先折叠单复数再查同义词表，否则 `Sofas`（表里只有
+    `sofa`）与 `telephones`（表里只有 `telephone`）都会漏掉 —— 且 `telephones`
+    会因 `es` 剥离变成 `telephon`，比不折叠更糟。这是实测踩过的顺序 bug。
+    同义词折叠做**一趟**（折叠结果若仍是表里的键再查一次），不递归。
+    """
     s = normalize(name)
     if not s:
         return ""
+    s = _depluralize(s)
     s = SYNONYMS.get(s, s)
-    return _depluralize(s)
+    return SYNONYMS.get(s, s)
 
 
 def _depluralize(s: str) -> str:
-    """简单单复数折叠（不做词干递归）：`books`→`book`、`boxes`→`box`。"""
+    """简单单复数折叠（不做词干递归）：`books`→`book`、`boxes`→`box`。
+
+    `es` 只在**词干以 s/x/z/ch/sh 结尾**时剥离（`boxes`→`box`、`churches`→`church`）；
+    否则只剥 `s`。这条区分是必须的：对 `telephones` 直接剥 `es` 会得到 `telephon`，
+    比不折叠更糟（实测踩过）。
+    """
     out = []
     for w in s.split():
-        if len(w) > 3 and w.endswith("es"):
+        if len(w) > 4 and w.endswith("es") and w[:-2].endswith(("s", "x", "z", "ch", "sh")):
             w = w[:-2]
         elif len(w) > 2 and w.endswith("s") and not w.endswith("ss"):
             w = w[:-1]
