@@ -657,3 +657,81 @@ def test_tool_descriptions_expose_return_shape():
     assert "result['count']" in d2 or "['count']" in d2
     d3 = REGISTRY.spec("relative_direction_of").description
     assert "direction" in d3 and "['direction']" in d3
+
+
+# ------------- 12. §15.1 静态层必须是流敏感的（实测修正）----
+
+def test_ast_guard_allows_guarded_early_abstain():
+    """真实实测修正：静态层原先按行号无条件拒绝，把模型的防御式写法整片拒掉。
+
+    依据（arm3，32 题 inner_validation）：`if not objs: ReturnAnswer("abstain")`
+    → 后续 `list_objects(...)` 被判成"答后调 Tool" → M9 拒绝 → 三次重生成仍是
+    同一风格 → `unanswerable` → 16/32 episode 零分（方向题、计数题等全灭）。
+    这正是 v6 D7 要修的现象，被过度收窄的静态层以另一种方式复现了。
+
+    正确口径（§15.1 双层设计的本意）：静态层只拒**顶层同层**的"答完还继续算"；
+    分支里的 ReturnAnswer 是否真的"答后调 Tool"由运行层 `AnswerAlreadyGiven` 判定。
+    """
+    from skill3d.sandbox.ast_guard import ast_guard
+
+    guarded = (
+        "objs = list_objects('telephone')\n"
+        "if not objs:\n"
+        "    ReturnAnswer(\"abstain\")\n"
+        "pid = objs[0]['obj_id']\n"
+        "objs = list_objects('trash can')\n"
+        "if not objs:\n"
+        "    ReturnAnswer(\"abstain\")\n"
+        "r = relative_direction_of(observer_id=pid, facing_at_id=pid, target_id=pid)\n"
+        "ReturnAnswer(r['direction'])\n"
+    )
+    assert ast_guard(guarded).ok, "防御式早退写法必须通过静态层"
+
+    # 循环体的 ReturnAnswer 同理不参与静态判定
+    looped = (
+        "for n in ['chair', 'table']:\n"
+        "    objs = list_objects(n)\n"
+        "    if not objs:\n"
+        "        ReturnAnswer('abstain')\n"
+        "ReturnAnswer('done')\n"
+    )
+    assert ast_guard(looped).ok
+
+
+def test_ast_guard_rejects_toplevel_answer_then_tool():
+    """顶层"答完还继续算"仍然必须静态拒绝（真正的反例）。"""
+    from skill3d.sandbox.ast_guard import ast_guard
+
+    bad = ("x = list_objects('chair')\n"
+           "ReturnAnswer(len(x))\n"
+           "y = list_objects('table')\n"
+           "ReturnAnswer(len(y))\n")
+    res = ast_guard(bad)
+    assert not res.ok
+    assert any("ReturnAnswer 之后再调用 Tool" in v for v in res.violations)
+
+
+def test_runtime_guard_still_fires_for_guarded_pattern():
+    """静态层放行后，运行层必须仍然兜住"ReturnAnswer 真的执行了又调 Tool"。"""
+    import numpy as np
+
+    from skill3d.schemas import ObjectRecord, SceneState
+    from skill3d.sandbox.kernel import RestrictedNamespaceKernel
+    from skill3d.tools.contract import available_artifacts_for
+    from skill3d.tools.registry import REGISTRY
+    from skill3d.tools.scene_handle import SceneHandle
+    import skill3d.tools  # noqa: F401
+
+    objs = [ObjectRecord(obj_id="obj_0", category_name="chair", mask_per_frame="",
+                         pointcloud_world="", centroid_world=[0, 0, 0],
+                         bbox=[0] * 6, det_conf=0.9)]
+    scene = SceneState(artifact_ref="a", scene_route="full_3d",
+                       question_tool_scope="full_3d",
+                       available_artifacts=available_artifacts_for("full_3d"))
+    handle = SceneHandle(scene, objects=objs, objects_materialized=True)
+    kernel = RestrictedNamespaceKernel(REGISTRY, handle, frames=[np.zeros((4, 4, 3))])
+    # 顶层答后调 Tool → 运行层抛受控 AnswerAlreadyGiven（不是 IndexError/服务故障）
+    cell = kernel.run_cell("ReturnAnswer('abstain')\nlist_objects('chair')\n")
+    assert cell.error_code == "tool_contract"
+    assert any("AnswerAlreadyGiven" in str(v.get("error") or "")
+               for v in (cell.contract_violations or []))

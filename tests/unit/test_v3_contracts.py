@@ -326,13 +326,28 @@ def test_tool_call_after_return_answer_raises_at_runtime():
     assert "AnswerAlreadyGiven" in (cell.error or "")
 
 
-def test_tool_call_after_return_answer_is_rejected_statically():
-    """§15.1 静态层：同一个程序必须被 AST guard 直接拒绝（提交前拦截）。"""
-    result = ast_guard(_RETURN_ANSWER_THEN_TOOL)
-    assert not result.ok
-    assert any("ReturnAnswer 之后再调用 Tool" in v for v in result.violations)
-    # 只把 ReturnAnswer 放在最后 → 通过
+def test_guarded_early_abstain_passes_static_but_fails_runtime():
+    """§15.1 双层设计：静态层只拒**顶层**"答完还继续算"，运行层兜语义。
+
+    2026-09-21 真实实测修正（32 题 inner_validation / arm3）：静态层原先按行号
+    无条件拒绝，把上面这段**防御式写法**（前提不成立才在 if 分支里 abstain）整片
+    拒掉 → M9 拒绝 → 三次重生成仍是同一风格 → `unanswerable` → 16/32 episode 零分
+    （4 个方向题、计数题全灭）。那正是 v6 D7 要修的现象被以另一种方式复现。
+
+    现在的口径：
+    - 静态层：分支/循环里的 ReturnAnswer 不参与行号判定（它不必然执行）；
+    - 运行层：一旦 ReturnAnswer **真的执行**，后续 Tool 调用抛受控
+      `AnswerAlreadyGiven`（见 `test_tool_call_after_return_answer_raises_at_runtime`）。
+    """
+    assert ast_guard(_RETURN_ANSWER_THEN_TOOL).ok, "防御式早退写法必须通过静态层"
+    # 只把 ReturnAnswer 放在最后 → 当然也通过
     assert ast_guard('ids = list_objects()\nReturnAnswer(len(ids))\n').ok
+    # 顶层"答完继续算"仍然必须被静态拒绝
+    top_level_bad = ('ids = list_objects()\nReturnAnswer(len(ids))\n'
+                     'n = count_objects(category_name="chair")\nReturnAnswer(n)\n')
+    res = ast_guard(top_level_bad)
+    assert not res.ok
+    assert any("ReturnAnswer 之后再调用 Tool" in v for v in res.violations)
 
 
 # ------------------------------------- M7 检索：证据签名 + 米制门双重 fail-closed ----
