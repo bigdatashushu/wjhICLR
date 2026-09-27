@@ -32,7 +32,10 @@ TH_BLUR_VAR: float = TH_BLUR_VAR_ABS   # 兼容别名（旧代码引用）
 TH_OVER_EXPOSED: float = 0.05     # TODO_CALIBRATE: p_over > 5% 记曝光异常
 TH_UNDER_EXPOSED: float = 0.05    # TODO_CALIBRATE: p_under > 5% 记曝光异常
 TH_DEGRADED_RATIO: float = 0.25   # TODO_CALIBRATE: 劣化帧占比超此值 → 仅降权（不再删帧）
-MIN_FRAMES: int = 32              # G4 帧数完整性（官方 32 帧；不足 = 输入合法性 hard fail）
+MIN_FRAMES: int = 32              # 名义帧数（§5.2：不足不再判死，见 input_gate 的门策略）
+# v9 §5.1：模糊／曝光／对比度／运动质量诊断**默认关闭**，只在独立诊断实验中启用。
+# M2 的默认职责收窄为"最小输入有效性检查：文件/像素是否存在、可解码、尺寸合法"。
+DIAGNOSTICS_ENABLED_DEFAULT: bool = False
 TH_MOTION: float = 20.0           # TODO_CALIBRATE: G3 帧间光流均值阈值（px）
 # 被打上劣化标记的帧的观测权重（TODO_CALIBRATE；只影响置信度，不影响帧集）
 DEGRADED_FRAME_WEIGHT: float = 0.5
@@ -115,20 +118,33 @@ def input_gate(
     *,
     frame_set: Optional[FrameSet] = None,
     hard_fail_frame_ids: Optional[Sequence[int]] = None,
+    diagnostics: bool = DIAGNOSTICS_ENABLED_DEFAULT,
 ) -> InputGateVerdict:
-    """按 §4 M2 伪代码实现的整体门禁判定（**被动观测**，硬约束 21）。
+    """按 §4 M2 / v9 §5.1 实现的整体门禁判定（**被动观测**，硬约束 21）。
+
+    v9 §5.1："M2 改为**最小输入有效性检查**：文件/像素是否存在、可解码、尺寸合法。
+    模糊、曝光、对比度和运动质量诊断**默认关闭**；可在独立诊断实验中启用，不能删帧、
+    换帧、重排或终止作答。"
+
+    因此 `diagnostics=False`（默认）时只做合法性判定：不计算 blur／曝光／运动，
+    逐帧 `degradation_flags` 为空、`quality_weight` 恒 1.0（"原有 `quality_weight`
+    默认不影响主流程"）。`diagnostics=True` 才恢复完整质量诊断。
 
     - `level=pass` / `locally_degraded`：一律 `action="proceed"`，附带逐帧 flag 与权重；
-    - `level=overall_unusable`：仅输入合法性 hard fail（空帧/尺寸非法/损坏/帧数 <32）
+    - `level=overall_unusable`：仅"一帧可用都没有／全部非法"（§5.2 `input_error`）
       → `action="unanswerable"`，整 episode 记 `unavailable`，不进任何 split。
     """
-    scores = [frame_quality(f) for f in frames]
-    blur_floor = blur_floor_for([b for b, _po, _pu in scores])
+    if diagnostics:
+        scores = [frame_quality(f) for f in frames]
+        blur_floor = blur_floor_for([b for b, _po, _pu in scores])
+    else:
+        scores = [(0.0, 0.0, 0.0) for _ in frames]
+        blur_floor = TH_BLUR_VAR_ABS
 
     all_flags: list[str] = []
     per_frame_flags: list[list[str]] = []
     for b, po, pu in scores:
-        fl = degradation_flags(b, po, pu, blur_floor)
+        fl = degradation_flags(b, po, pu, blur_floor) if diagnostics else []
         per_frame_flags.append(fl)
         all_flags.extend(fl)
     degraded = [i for i, fl in enumerate(per_frame_flags) if fl]
@@ -136,8 +152,9 @@ def input_gate(
     # 输入合法性：显式传入的 hard fail 帧 + 可判定的非法帧
     hard = sorted(set(list(hard_fail_frame_ids or [])) | set(_illegal_frame_ids(frames)))
 
-    # G3 运动模糊：仅当输入为原始图像时可算；只降权（不判死）
-    if frames and not isinstance(frames[0], InputFrame) and len(frames) >= 2:
+    # G3 运动模糊：仅当输入为原始图像时可算；只降权（不判死）。
+    # v9 §5.1：默认关闭 —— 只在独立诊断实验中启用。
+    if diagnostics and frames and not isinstance(frames[0], InputFrame) and len(frames) >= 2:
         try:
             mags = [
                 iqa.motion_score(frames[i - 1], frames[i])  # type: ignore[arg-type]
@@ -167,10 +184,20 @@ def input_gate(
         frame_set_hash=(frame_set.frame_set_hash if frame_set is not None else ""),
     )
 
-    # G4 帧数完整性 + 输入合法性 → 整体不可用（唯一 hard fail 通道）
-    # 先于任何质量统计判定：非法帧连 IQA 都算不出来（空帧/尺寸非法/损坏）
-    if len(frames) < MIN_FRAMES or hard:
+    # 输入合法性 → 整体不可用（唯一 hard fail 通道）。
+    # §5.2 原文："**全部**指定图像缺失或无法解码：`input_error`，记录原因"；
+    # "**部分**帧无法解码，或源视频不足 32 帧但仍有真实可读帧：保留帧身份和缺失
+    # 掩码，使用可读帧继续作答"。因此这里只在"一帧可用都没有 / 全部非法"时判死，
+    # 帧数不足改为 **proceed + input_degraded**（独立报告，不从分母静默删除）。
+    if not frames or (hard and len(hard) >= len(frames)):
+        # 一帧可用都没有 / 全部非法 → §5.2 `input_error`（记录原因，不生成伪答案）
+        common["degradation_flags"] = sorted(set(all_flags) | {"input_degraded"})
         return InputGateVerdict(level="overall_unusable", action="unanswerable", **common)
+    if len(frames) < MIN_FRAMES or hard:
+        # 仍可作答：帧数不足 / 部分帧非法 → 显式降级标记（§5.2 input_degraded），
+        # 帧集本身不动（M2 仍是被动观测）
+        common["degradation_flags"] = sorted(set(all_flags) | {"input_degraded"})
+        return InputGateVerdict(level="locally_degraded", action="proceed", **common)
 
     # 劣化帧占比超阈 → 记 locally_degraded（**只是标签**：帧集不变、不删不补，
     # 权重已按 DEGRADED_FRAME_WEIGHT 下调，供 route 判定与消融使用，硬约束 21）
@@ -183,22 +210,37 @@ def input_gate(
 
 def annotate_frames(frames: Sequence[InputFrame],
                     verdict: InputGateVerdict,
-                    pixels: Optional[Sequence[np.ndarray]] = None) -> list[InputFrame]:
+                    pixels: Optional[Sequence[np.ndarray]] = None,
+                    *,
+                    diagnostics: bool = DIAGNOSTICS_ENABLED_DEFAULT) -> list[InputFrame]:
     """把 M2 观测写回 InputFrame 记录（M1 只给占位，§4 M1 字段 7 注）。
 
     有 `pixels` 时补算真实 IQA 统计；只写统计/flag/权重字段，
     **返回的帧序与帧数不变**（硬约束 21：不删/不换/不补/不重排）。
+
+    v9 §5.1：`diagnostics=False`（默认）时不计算质量统计，逐帧
+    `degradation_flags` 为空、`quality_weight=1.0` —— "原有 `quality_weight`
+    默认不影响主流程"。仅当调用方显式开启独立诊断实验时才写入 IQA 统计。
     """
     if pixels is not None and len(pixels) != len(frames):
         raise ValueError(
             f"帧集与像素数量不一致（{len(frames)} vs {len(pixels)}）："
             "硬约束 21 禁止帧集变更，M2 不得删/补帧"
         )
-    blurs = ([frame_quality(p)[0] for p in pixels] if pixels is not None
-             else [f.blur_var for f in frames])
-    floor = blur_floor_for(blurs)
+    if diagnostics:
+        blurs = ([frame_quality(p)[0] for p in pixels] if pixels is not None
+                 else [f.blur_var for f in frames])
+        floor = blur_floor_for(blurs)
+    else:
+        floor = TH_BLUR_VAR_ABS
     out: list[InputFrame] = []
     for i, fr in enumerate(frames):
+        if not diagnostics:
+            blur, p_over, p_under, fl = 0.0, 0.0, 0.0, []
+            out.append(fr.model_copy(update={
+                "blur_var": 0.0, "overexposed_ratio": 0.0, "underexposed_ratio": 0.0,
+                "degradation_flags": [], "quality_ok": True, "quality_weight": 1.0}))
+            continue
         if pixels is not None:
             blur, p_over, p_under = frame_quality(pixels[i])
         else:

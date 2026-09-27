@@ -21,10 +21,20 @@ import json
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
-from skill3d.schemas.legacy import LegacyArtifact, LegacyArtifactError
+from skill3d.schemas.legacy import (
+    LegacyArtifact,
+    LegacyArtifactError,
+    LegacyEpisodeTrace,
+    LegacyEpisodeTraceError,
+)
 from skill3d.schemas.reconstruction import (
     LEGACY_ONLY_FIELDS,
     ReconstructionArtifact,
+)
+from skill3d.schemas.trace import (
+    EPISODE_TRACE_SCHEMA_VERSION,
+    LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS,
+    EpisodeTrace,
 )
 
 CURRENT_SCHEMA_VERSION = "5.0"
@@ -140,7 +150,67 @@ def assert_runtime_eligible(obj: Any) -> Any:
             source_path=obj.source_path,
             deprecated_fields=set(obj.deprecated_fields),
             detail="legacy 载体 eligible_for_runtime=False / eligible_for_statistics=False")
+    if isinstance(obj, LegacyEpisodeTrace):
+        raise LegacyEpisodeTraceError(
+            source_path=obj.source_path,
+            detected=obj.detected_schema_version,
+            detail="legacy episode trace eligible_for_runtime=False（v9 §17.2）")
     return obj
+
+
+def _load_trace_payload(raw: Any, source_path: str) -> dict:
+    if isinstance(raw, (str, Path)):
+        p = Path(raw)
+        source_path = source_path or str(p)
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise LegacyEpisodeTraceError(
+            source_path=source_path, detected=None, detail="顶层不是 JSON object")
+    return raw
+
+
+def read_legacy_episode_trace(raw: Any, *,
+                              source_path: str = "") -> LegacyEpisodeTrace:
+    """把旧 Schema 的 episode trace 解析为只读审计载体（不猜、不升级）。"""
+    data = _load_trace_payload(raw, source_path)
+    detected = data.get("schema_version")
+    warnings: list[str] = []
+    if detected is None:
+        warnings.append("缺 schema_version → 无法判定口径（不按当前 Schema 解释）")
+    elif str(detected) != str(EPISODE_TRACE_SCHEMA_VERSION):
+        warnings.append(
+            f"schema_version={detected!r} ≠ {EPISODE_TRACE_SCHEMA_VERSION!r} → "
+            "该记录不含 v9 引入的字段；缺字段不等于当时事实不存在，不得混入当前统计")
+    v9_only = ("round_trigger", "finalization_used")
+    missing = [f for f in v9_only if f not in data]
+    if missing:
+        warnings.append(f"缺少 v9 字段 {missing} → 当时未记录这些事实")
+    return LegacyEpisodeTrace(
+        source_path=source_path,
+        detected_schema_version=(str(detected) if detected is not None else None),
+        raw_fields=data,
+        warnings=warnings,
+    )
+
+
+def read_episode_trace(raw: Any, *, source_path: str = "") -> EpisodeTrace:
+    """当前 episode trace 的**唯一**加载入口（fail-closed，v9 §17.2）。
+
+    只有声明当前 Schema 身份（`EPISODE_TRACE_SCHEMA_VERSION`）的记录才被解析为
+    `EpisodeTrace`。旧版本（`LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS`）一律 hard fail
+    并指向 `read_legacy_episode_trace` —— 直接 `model_validate` 旧 JSON 会让
+    缺失字段被默认值静默补齐，把"当时没记"读成"当时不存在"。
+    """
+    data = _load_trace_payload(raw, source_path)
+    detected = data.get("schema_version")
+    if str(detected) != str(EPISODE_TRACE_SCHEMA_VERSION):
+        hint = ("这是历史记录：请用 read_legacy_episode_trace 做只读审计"
+                if str(detected) in LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS
+                else "版本不受支持")
+        raise LegacyEpisodeTraceError(
+            source_path=source_path, detected=(str(detected) if detected is not None else None),
+            detail=f"{hint}（当前需要 {EPISODE_TRACE_SCHEMA_VERSION!r}）")
+    return EpisodeTrace.model_validate(data)
 
 
 def iter_artifact_files(root: Union[str, Path]) -> Iterable[Path]:

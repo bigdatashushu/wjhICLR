@@ -1,0 +1,26 @@
+{
+  "bundle_format": "harness3d-s0-source-bundle/1.0",
+  "bundle_sha256": "70f2da6bd1aee44ed957cd10257d9ffc258ded7f0788a2958dce6f9eed500b3e",
+  "file_count": 18,
+  "source_digests": {
+    "skills/count-scene-objects/SKILL.md": "e16635cec0d5bba6a3048bdcace2cb0fc0db92d05c15a237894be62ee858bb32",
+    "skills/estimate-object-distance/SKILL.md": "29dc5f6f42020d908ebb5a70e139f2cd691c121a472ed7edf6f6c0c5007632ec",
+    "skills/estimate-object-size/SKILL.md": "90a47c91c3761a665b66c0448fd72d41c6698154857e95aa9c355ccb3610b280",
+    "skills/estimate-room-area/SKILL.md": "3794be730076b9ded1bcd72fa9632f7742bcb14d093e6960d736c070cc407367",
+    "skills/infer-route-turns/SKILL.md": "603bb0f171d08544d0b5321426249802e6caa409b21dcf852de21c06b94d27c9",
+    "skills/judge-relative-direction/SKILL.md": "ec13470de3d4eaf1f74da96992847a8d88ff84e6f38ba0aaeec1da318dd18094",
+    "skills/order-first-appearances/SKILL.md": "c9007e87ad465be3efd8b3f0b65564a6f2bee198d177a199c7e0a1deac542fda",
+    "skills/rank-object-distances/SKILL.md": "4f30a39c180c71d3b710f1283c303c0ac3275b17ee4fea04310ea8141919f4a3"
+  },
+  "source_paths": [
+    "skills/count-scene-objects/SKILL.md",
+    "skills/estimate-object-distance/SKILL.md",
+    "skills/estimate-object-size/SKILL.md",
+    "skills/estimate-room-area/SKILL.md",
+    "skills/infer-route-turns/SKILL.md",
+    "skills/judge-relative-direction/SKILL.md",
+    "skills/order-first-appearances/SKILL.md",
+    "skills/rank-object-distances/SKILL.md"
+  ],
+  "source_revision": "c79deab894c5274ab9bd6285b10276084216ed44"
+}

@@ -24,6 +24,7 @@ import numpy as np
 from skill3d.schemas import ObjectRecord, SceneState
 
 from .category_match import matches
+from .image_ledger import ImageLedger
 from .contract import (
     ARTIFACT_INTRINSICS,
     ARTIFACT_OBJECTS,
@@ -77,6 +78,10 @@ class SceneHandle:
         self._conf_cache: dict[str, Optional[np.ndarray]] = {}
         # 世界系点图 (N,H,W,3)（平面拟合/连通性图用；由重建管线注入）
         self._point_map: Optional[np.ndarray] = None
+        # v9 §9.4：主动图像账本（帧集 + 产出/交付/观察三态）。
+        # runner 会用真实配置的 max_images 覆盖；这里给一个安全默认（32 = 服务上限）。
+        self._image_ledger = ImageLedger(episode_id=str(getattr(scene_state, "episode_id", "")
+                                                        or ""))
 
     # ---- 只读元信息 ----
     @property
@@ -130,6 +135,15 @@ class SceneHandle:
     @property
     def metric_gate_passed(self) -> bool:
         return self._state.metric_gate_passed
+
+    @property
+    def metric_evidence_gate_result(self):
+        """题级米制门结果（§6.4 授权收据的 `metric_gate_result` 来源）。
+
+        句柄只暴露状态里已有的门对象；没有门时返回 None，由收据侧记
+        `not_applicable`，**不伪造**一个失败的门。
+        """
+        return getattr(self._state, "metric_evidence_gate_result", None)
 
     @property
     def evidence_profile(self):
@@ -209,6 +223,59 @@ class SceneHandle:
     @property
     def frame_set_hash(self) -> str:
         return str(getattr(self._state, "frame_set_hash", "") or "")
+
+    # ---- v9 §9.4 主动图像：冻结帧集 + episode 图像账本 ----
+    #
+    # 写入口全部是**下划线私有**：`ast_guard` 禁止模型访问下划线属性，因此模型程序
+    # 无法直接改共享状态（§9.4"agent 不能直接修改共享状态"）；只有工具（框架代码）
+    # 能经这些方法产出图像、并入新检出。
+    def _set_frames(self, pixel_ids: Sequence[int], pixels: Sequence[np.ndarray],
+                    source_frame_indices: Optional[Sequence[int]] = None) -> None:
+        """登记本 episode **实际可读**的帧（槽位 → 像素 + 槽位 → 物理源帧号）。
+
+        `pixel_ids` 是**槽位**（0..n-1，模型指帧口径）；`source_frame_indices` 是这些
+        槽位对应的视频物理帧号（审计用，可缺省）。
+        """
+        self._image_ledger.set_frames(pixel_ids, pixels,
+                                      source_frame_indices=source_frame_indices)
+        self._image_ledger.ensure_frame_records()
+
+    def _set_image_ledger(self, ledger) -> None:
+        self._image_ledger = ledger
+
+    @property
+    def _ledger(self):
+        """图像账本本体（框架/工具内部用；模型访问会撞下划线属性禁令）。"""
+        return self._image_ledger
+
+    @property
+    def ledger_view(self) -> dict:
+        """账本的**只读投影**（三态 + 每轮清单 + 统计），供 trace/审计读取。"""
+        return self._image_ledger.to_dict()
+
+    @property
+    def readable_frame_ids(self) -> list[int]:
+        return self._image_ledger.frame_ids
+
+    def has_frames(self) -> bool:
+        return self._image_ledger.has_frames()
+
+    def _add_detected_objects(self, records: Sequence[ObjectRecord]) -> list[str]:
+        """把 `detect_objects` 的新检出并入 episode 对象记录（框架侧，§9.4）。
+
+        返回新增对象 id。**不**改写 EvidenceProfile（不做未授权的证据升级），
+        只让后续工具调用（`list_objects`/`count_objects`/…）能看到这些记录。
+        """
+        added: list[str] = []
+        for rec in records:
+            if rec.obj_id in self._objects:
+                continue
+            self._objects[rec.obj_id] = rec
+            self._by_name.setdefault(rec.category_name.lower(), rec.obj_id)
+            added.append(rec.obj_id)
+        if added:
+            self._objects_materialized = True
+        return added
 
     # ---- 对象访问 ----
     def list_objects(self) -> list[str]:

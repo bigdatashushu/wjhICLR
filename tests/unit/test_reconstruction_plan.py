@@ -159,7 +159,16 @@ def test_run_jobs_passes_one_episode_frames_per_scene(tmp_path, monkeypatch):
     assert captured["method"] == "vggt"       # 唯一正式主线（无 BA / 无降级链）
     assert "use_ba" not in captured["kwargs"]
     assert jobs[0].status == "done"
-    # 落盘产物是 v6 artifact（无 scale_known / g8_* 等 legacy 字段）
-    on_disk = json.loads((tmp_path / "vggt" / "scene-a.json").read_text(encoding="utf-8"))
+    # v9 §5.2：产物按**缓存身份**（源标识 + 帧集内容哈希）命名，不再是纯 scene 名 ——
+    # 用与运行时同一个解析器定位，顺带守住"写方与读方对路径的判断一致"。
+    from skill3d.reconstruction.run import artifact_path as _ap
+
+    path = _ap(tmp_path, "scene-a", "vggt",
+               frame_set=items[0].episode.frame_set)
+    assert path.name != "scene-a.json", "缓存键必须含源标识与帧集哈希（§5.2）"
+    assert path.name.startswith("scene-a__")
+    # 名字里的身份必须与 frame_set 的 cache_identity 一致（可复算、非随意命名）
+    assert path.name == f"scene-a__{items[0].episode.frame_set.cache_identity()[:16]}.json"
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
     assert on_disk["recon_method"] == "vggt"
     assert not {"scale_known", "scale_ci_rel", "allowed_metric_tasks"} & set(on_disk)

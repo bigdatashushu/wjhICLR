@@ -61,6 +61,10 @@ WORLD_FRAME_STATES = ("available", "degraded", "unavailable")
 class M5EvidenceSummary:
     """M5 对象绑定对证据画像的输入（由在线链填充；字段缺失 = 证据不足 → fail-closed）。"""
 
+    # v9 §6.1：`unavailable` 的原因必须区分"**未运行**"与"运行了但失败/零检出"。
+    # 没有这个字段时，"M5 从未跑"会被误报成 `zero_detection_after_retry`
+    # （暗示"重试后仍零检出"，而实际根本没跑过）。
+    m5_ran: bool = False
     detection_fault: bool = False          # 检测器服务故障
     n_objects: int = 0                     # 基础清单对象数
     n_tracks: int = 0                      # 去重后 track 数
@@ -216,8 +220,14 @@ def geometry_capability(
 
 
 def detection_capability(summary: M5EvidenceSummary) -> tuple[CapabilityState, list[str]]:
-    """§7.1 `object_detection`：服务正常+有检出 / 检出稀疏 / 服务故障或零检出。"""
+    """§7.1 `object_detection`：服务正常+有检出 / 检出稀疏 / 服务故障或零检出。
+
+    v9 §6.1：`unavailable` 的三种原因分开 —— **未运行** / 生产者失败 / 成功但零检出
+    （"成功执行但无匹配目标使用明确的空检出状态"）。
+    """
     notes: list[str] = []
+    if not summary.m5_ran:
+        return "unavailable", ["m5_not_run"]
     if summary.detection_fault:
         return "unavailable", ["detector_fault"]
     if int(summary.n_objects) <= 0:
@@ -237,6 +247,8 @@ def track_capability(summary: M5EvidenceSummary) -> tuple[CapabilityState, list[
 
     阈值全 `[TODO_CALIBRATE]`；无统计 → `unavailable`（**不伪造**）。
     """
+    if not summary.m5_ran:
+        return "unavailable", ["m5_not_run"]      # §6.1：未运行 ≠ 运行了没统计
     if int(summary.n_tracks) <= 0:
         return "unavailable", ["no_track_statistics"]
     frag, dup = summary.track_fragmentation_ratio, summary.duplicate_suspect_ratio
@@ -332,7 +344,64 @@ def build_evidence_profile(
             valid_frame_ratio=valid_ratio,
             metric_scale=getattr(artifact, "metric_scale", None))
 
+    # v9 §6.1：登记 `unavailable`/`degraded` 的原因码。原则是**只填代码确知的**：
+    # 说不清是"没跑"还是"跑失败"就留空（= 原因未登记），不猜一个码填上。
+    #
+    # **决策记录（用户 2026-09-27）**：§6.4 的四类（not_run / producer_failed /
+    # invalidated / unsupported）没有"**运行成功但质量门未过**"这一格 —— 例如
+    # "M4 主门未过""world frame 置信低""尺度自洽低于阈值""检出稀疏"。此前这些只能
+    # 留空，审计读到的是"没记原因"，而不是"跑了但不达标"。用户裁定**扩展词表**，
+    # 新增第五值 `quality_gate_not_passed`（见 schemas.evidence.UNAVAILABLE_REASON_CODES），
+    # 与 `producer_failed`（生产者自己出错）严格区分，不得互替。
+    fusion_status = str(getattr(artifact, "scale_fusion_status", "not_run"))
+    quality_computed = (quality_status == "computed"
+                        and overall is not None and np.isfinite(float(overall)))
+    reasons: dict[str, str] = {}
+    if geom != "available":
+        if not quality_computed:
+            reasons["geometry_3d"] = "not_run"          # 质量根本没算 → 生产者未运行
+        elif not main_ok:
+            # 质量真算了、值也有限，只是 M4 主门（warp 内点率/点云重叠率）未过
+            reasons["geometry_3d"] = "quality_gate_not_passed"
+    if metric != "available":
+        if fusion_status == "not_run":
+            reasons["metric_scale"] = "not_run"
+        elif fusion_status == "failed":
+            reasons["metric_scale"] = "producer_failed"
+        elif fusion_status == "success":
+            # 融合成功但六项子条件（route/主门/有限性/自洽）未全过 = 质量门未过
+            reasons["metric_scale"] = "quality_gate_not_passed"
+    if wf != "available" and str(getattr(artifact, "world_frame_status", "")) == "degraded":
+        # `degraded` = 估计器跑出来了但置信低（一致度低／可用帧太少／离竖直远）。
+        # `unavailable` 分不清"从未估计"与"估计失败"，留空（不猜）。
+        reasons["world_frame"] = "quality_gate_not_passed"
+    if det != "available":
+        if not m5.m5_ran:
+            reasons["object_detection"] = "not_run"
+        elif m5.detection_fault:
+            reasons["object_detection"] = "producer_failed"
+        elif int(m5.n_objects) <= 0:
+            # §6.4：成功执行但**无匹配目标** → 明确的空检出状态
+            reasons["object_detection"] = "unsupported"
+        else:
+            # 跑成功了、也有检出，只是低于稀疏阈值 → 质量门未过
+            reasons["object_detection"] = "quality_gate_not_passed"
+    if trk != "available":
+        if not m5.m5_ran:
+            reasons["track_consensus"] = "not_run"
+        elif int(m5.n_tracks) <= 0:
+            reasons["track_consensus"] = "unsupported"      # 跑了但没有可统计的 track
+        elif (m5.track_fragmentation_ratio is not None
+              or m5.duplicate_suspect_ratio is not None):
+            reasons["track_consensus"] = "quality_gate_not_passed"
+    if grd != "available":
+        if m5.grounding_miss:
+            reasons["object_grounding"] = "unsupported"     # 明确未命中（ran, no match）
+        elif m5.grounding_pointed_hit is None:
+            reasons["object_grounding"] = "not_run"         # 题面点名物校验没做
+
     return EvidenceProfile(
+        state_reasons=reasons,
         geometry_3d=geom,
         world_frame=wf,
         metric_scale=metric,

@@ -182,6 +182,7 @@ def downgrade_profile(profile: Optional[EvidenceProfile],
         return None, {}
     changed: dict[str, str] = {}
     update: dict = {}
+    reasons = dict(getattr(profile, "state_reasons", None) or {})
     for cap in _DEPENDENTS.get(str(premise), (str(premise),)):
         cur = profile.state(cap)
         if cur == "available":
@@ -190,6 +191,12 @@ def downgrade_profile(profile: Optional[EvidenceProfile],
         elif cur == "degraded":
             update[cap] = "unavailable"
             changed[cap] = "degraded→unavailable"
+        else:
+            continue
+        # v9 §6.1：被级联撤销的能力记 `invalidated` —— 与"没跑"和"跑失败"区分开
+        reasons[cap] = "invalidated"
+    if update:
+        update["state_reasons"] = reasons
     return (profile.model_copy(update=update) if update else profile), changed
 
 

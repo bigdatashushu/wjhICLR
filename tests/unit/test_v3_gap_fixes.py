@@ -79,7 +79,7 @@ def _artifact(tmp_path) -> ReconstructionArtifact:
 
 def _m5(n_objects: int = 3) -> M5EvidenceSummary:
     """M5 摘要：检测/跟踪都有正常统计（否则 object_detection 会是 unavailable）。"""
-    return M5EvidenceSummary(n_objects=n_objects, n_tracks=n_objects,
+    return M5EvidenceSummary(m5_ran=True, n_objects=n_objects, n_tracks=n_objects,
                              track_stable_ratio=0.9)
 
 

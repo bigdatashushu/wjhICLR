@@ -35,7 +35,9 @@ from skill3d.online.config import (
     DEFAULT_CONFIG,
     load_config,
     load_yaml,
+    active_vision_from,
     paths_from,
+    retrieval_policy_from,
     sandbox_from,
     vllm_from,
 )
@@ -44,7 +46,8 @@ from skill3d.online.runner import (
     OnlineRunConfig,
     run_split,
 )
-from skill3d.skills.registry import load_active_skills
+from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION
+from skill3d.skills.registry import active_snapshot_provenance, load_active_skills
 
 # §13.5 用 `--split test`；本系统的四层切分用 induction/inner/outer/final_test
 _SPLIT_ALIASES = {"test": "final_test", "final": "final_test"}
@@ -67,6 +70,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source", default="synthetic", choices=["synthetic", "vsi_bench", "jsonl"])
     p.add_argument("--episodes-jsonl", default="", help="--source jsonl 时的清单路径")
     p.add_argument("--video-root", default="", help="--source vsi_bench 时的原始视频根目录")
+    p.add_argument("--video-fallback-root", action="append", default=None,
+                   help="§5.2 可重试加载的来源副本根（可重复；缺省用配置 "
+                        "paths.raw_video_fallbacks）")
     p.add_argument("--question-types", default="",
                    help="逗号分隔的题型子集（默认 8 题型）")
     p.add_argument("--direct-answer-tasks", default="",
@@ -107,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recon-method", default="vggt", choices=["vggt"],
                    help="重建方法；v6 §5.2 受控枚举只有 vggt（BA 路线与 colmap/dust3r "
                         "对照基线均已废止并入 legacy/retired）")
-    p.add_argument("--max-recovery", type=int, default=MAX_RECOVERY_ATTEMPTS,
+    p.add_argument("--max-recovery", type=int, default=None,
                    help=("partial_tool_recovery 的最大恢复次数（v6 §14，[TODO_CALIBRATE]）；"
                          "超限即显式 abstain / direct_vlm_routed。"
                          "v5 的 --allow-tool-contract-replay 开关已随两档阶梯废止"))
@@ -141,6 +147,15 @@ def _maybe_moge2(args):
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # v9 §17.1/§18.1：环境依赖先检后跑。缺依赖时 M4 子项会 fail-closed 成
+    # `fallback_2d_only`，把环境故障伪装成场景质量，因此这里直接拒绝启动。
+    from skill3d.env_preflight import RuntimeEnvironmentError, assert_runtime_dependencies
+
+    try:
+        inference_env = assert_runtime_dependencies(context=f"online.eval:{args.mode}")
+    except RuntimeEnvironmentError as exc:
+        print(f"[错误] {exc}", file=sys.stderr)
+        return 2
     # M5 检测器兜底地址：config 里配了就用它（除非环境变量已显式指定）。
     # 纪律：检测器是确定性 Tool（非 LLM），只产出 SAM2 的 box prompt，不参与出答案。
     try:
@@ -155,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
     paths = paths_from(cfg_yaml)
     vllm = vllm_from(cfg_yaml)
     sandbox = sandbox_from(cfg_yaml)
+    active_vision = active_vision_from(cfg_yaml)
 
     split = _SPLIT_ALIASES.get(args.split, args.split)
     if split == "final_test" and not args.allow_final_test:
@@ -169,10 +185,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- active snapshot → 在线只读的 SkillSpec（M15，硬约束 12）----
     snapshot_ref = "genesis"
+    snapshot_manifest_sha256 = ""
     skills, warnings = [], []
     snap_arg = args.active_snapshot or paths.active_snapshot
     if snap_arg:
         skills, warnings, snapshot_ref = load_active_skills(snap_arg)
+        _active_ref, snapshot_manifest_sha256 = active_snapshot_provenance(snap_arg)
     for w in warnings:
         print(f"[warn] {w}", file=sys.stderr)
 
@@ -209,16 +227,44 @@ def main(argv: list[str] | None = None) -> int:
             items = load_jsonl_items(args.episodes_jsonl, split=split, limit=limit)
         else:
             split_cfg = load_yaml(cfg_yaml.get("split_config", "configs/vsi_bench_split.yaml"))
+            # §5.3：抽样算法的 seed／qa_id 清单／hash 与**排除行**都要落盘 ——
+            # "每个预登记 qa_id 必须有结果行；不足 32 帧不能通过 skip 静默消失"。
+            sampling_receipt: dict = {}
+            exclusions: list = []
             items = load_vsi_bench_items(
                 split, split_cfg,
                 video_root=args.video_root or paths.raw_videos,
+                # §5.2"可重试加载"（用户 2026-09-27 裁定：重试 = 换来源/换副本）
+                video_fallback_roots=(args.video_fallback_root
+                                      if args.video_fallback_root is not None
+                                      else paths.raw_video_fallbacks),
                 cache_dir=paths.vsi_bench_meta, limit=limit, seed=args.seed,
                 # v5 修复：vsi_bench 源此前**静默忽略** --question-types（分层子集实验
                 # 会误跑成全量）→ 现在如实传递过滤条件。
                 question_types=qtypes or None,
                 datasets=[d.strip() for d in args.datasets.split(",") if d.strip()] or None,
                 stratified_per_task=int(args.sampling_per_task),
+                # §5.3：抽样口径必须与 seed 绑定，不能靠文件行序
+                sampling_seed=args.seed,
+                exclusions=exclusions,
+                sampling_receipt=sampling_receipt,
             )
+            if exclusions:
+                print(f"[warn] {len(exclusions)} 条预登记 qa_id 未进入本次运行"
+                      f"（已记排除原因，分母保留；§5.3）", file=sys.stderr
+                      )
+                for e in exclusions[:5]:
+                    print(f"        {e['qa_id']} → {e['reason']}", file=sys.stderr)
+            # §5.2 可重试加载：换过来源副本的题必须报出来（副本可能是另一种编码，
+            # 像素与主来源不同；静默使用会让两次 run 不可比）。
+            retries = [r for r in (sampling_receipt.get("source_retries") or [])
+                       if r.get("retried")]
+            if retries:
+                print(f"[warn] {len(retries)} 条使用了**来源副本**（§5.2 可重试加载）："
+                      f"主来源失败后改用镜像/同名副本，已记 source_retried_samples",
+                      file=sys.stderr)
+                for r in retries[:5]:
+                    print(f"        {r['qa_id']} → {r['used_source']}", file=sys.stderr)
     except EpisodeSourceError as exc:
         print(f"[错误] 数据源不可用: {exc}", file=sys.stderr)
         return 1
@@ -233,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         deterministic_replay=args.deterministic_replay,
         active_snapshot_ref=snapshot_ref,
+        active_snapshot_manifest_sha256=snapshot_manifest_sha256,
         skills=skills,
         max_regen=int(sandbox.max_regenerate),
         cell_timeout_s=int(sandbox.cell_timeout_s),
@@ -251,10 +298,25 @@ def main(argv: list[str] | None = None) -> int:
         # 相关配置项（ba_enabled / scale_calibration_* / scale_confidence_level）不再传入。
         # v6 §14/D7：partial_tool_recovery 恒开（次数由 --max-recovery 约束），
         # v5 的 --allow-tool-contract-replay 开关随"回灌/裁剪"两档阶梯一并废止。
-        max_recovery=int(args.max_recovery),
+        max_recovery=(int(args.max_recovery)
+                      if args.max_recovery is not None
+                      else int(cfg_yaml.get("max_retries_per_operation",
+                                           MAX_RECOVERY_ATTEMPTS))),
+        max_retries_per_operation=(int(args.max_recovery)
+                                   if args.max_recovery is not None
+                                   else int(cfg_yaml.get("max_retries_per_operation",
+                                                        MAX_RECOVERY_ATTEMPTS))),
+        input_diagnostics=bool(cfg_yaml.get("input_diagnostics", False)),
+        max_solver_rounds=int(cfg_yaml.get("max_solver_rounds", 6)),
+        finalization_rounds=int(cfg_yaml.get("finalization_rounds", 1)),
         max_pixels=int(getattr(vllm, "max_pixels", 131072) or 131072),
         max_model_len=int(getattr(vllm, "max_model_len", 32768) or 32768),
         allow_final_test=args.allow_final_test,
+        # §13.5：top-k／排序权重／方法上下文上限来自冻结配置（不在代码里另设一份）
+        retrieval_policy=retrieval_policy_from(cfg_yaml),
+        # §9.4：主动图像的声明布局与派生图占位上限
+        image_layout=active_vision.layout,
+        max_derived_images=int(active_vision.max_derived_images),
     )
     if not run_cfg.vllm_endpoints and args.mode == "real":
         print("[warn] mode=real 但未给 --vllm-endpoint：program 生不出来的 episode 会记 "
@@ -341,9 +403,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- RunManifest（G-67/§16.4 + §7：代码/环境/split/seed/推理参数全记录）----
     manifest_path = _write_manifest(args, cfg_yaml, run, run_cfg, split,
+                                    sampling_receipt=locals().get("sampling_receipt"),
+                                    exclusions=locals().get("exclusions"),
                                     outcomes=outcomes, items=items)
     print(f"RunManifest: {manifest_path}（code_commit / pip_freeze_hash / "
           f"checkpoint_sha256 / split_version / seed / inference_env）")
+    # §13.5：检索策略必须"写入配置并冻结" —— 启动时把**实际生效**的版本打出来，
+    # 免得跑了半天才发现用的不是配置里那一份（标签 + 内容摘要一起打）。
+    _rp = run_cfg.retrieval_policy
+    print(f"[info] 检索策略 {_rp.version()}（sha256={_rp.sha256()[:12]}，"
+          f"来源={_rp.source}）：top_k={_rp.top_k} rerank={_rp.rerank} "
+          f"方法上下文上限={_rp.method_context_max_chars} 字符")
     return 0
 
 
@@ -464,7 +534,8 @@ def _strip_secrets(value, *, _depth: int = 0):
 
 
 def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
-                    outcomes=None, items=None, offline_client=None):
+                    outcomes=None, items=None, offline_client=None,
+                    sampling_receipt=None, exclusions=None):
     """写 RunManifest（失败不阻断评测：复现信息是附加产物）。
 
     §19.2：模板版本 / tool-face 版本 / EvidenceProfile 版本 / MetricEvidenceGate 版本 /
@@ -473,6 +544,7 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
     """
     from skill3d.infra.version_lock import build_run_manifest, write_run_manifest
 
+    retriev = retrieval_policy_from(cfg_yaml)
     try:
         from skill3d.adapters.split_builder import load_split_config
 
@@ -508,9 +580,38 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
             "golden_schema_version": golden.get("schema_version", ""),
             "golden_quality_metric_version": golden.get("quality_metric_version", ""),
         }
+        # §5.3：抽样算法／seed／qa_id 清单／hash 与排除行必须落盘 ——
+        # "每个预登记 qa_id 必须有结果行"，且总体分母不得因排除而消失。
+        sampling_fields = {}
+        if sampling_receipt:
+            sampling_fields = {
+                "sampling_strategy": sampling_receipt.get("strategy", ""),
+                "sampling_seed": sampling_receipt.get("seed"),
+                "sampling_per_task_cap": sampling_receipt.get("per_task_cap"),
+                "sampling_n_preregistered": sampling_receipt.get("n_preregistered"),
+                "sampling_scenes": sampling_receipt.get("scenes", []),
+                "sampling_qa_ids": sampling_receipt.get("qa_ids", []),
+                "sampling_qa_id_sha256": sampling_receipt.get("qa_id_sha256", ""),
+            }
+            # §5.2：部分可读样本"独立报告"（仍在分母里，但不得伪称完整 32 帧输入）
+            if sampling_receipt.get("partially_readable"):
+                sampling_fields["partially_readable_samples"] =                     sampling_receipt["partially_readable"]
+            # §5.2 可重试加载：换来源副本的事实（哪些题、用了哪个副本、试过哪些来源）
+            source_retries = list(sampling_receipt.get("source_retries") or [])
+            if source_retries:
+                sampling_fields["source_retried_samples"] = source_retries
+                sampling_fields["n_source_retries"] = sum(
+                    1 for r in source_retries if r.get("retried"))
+        if exclusions is not None:
+            sampling_fields["n_excluded"] = len(exclusions)
+            sampling_fields["exclusions"] = list(exclusions)
+            sampling_fields["denominator_preserved"] = True
         return write_run_manifest(m, out, extra={
-            # ---- v6 版本三元组（HC39：schema/质量口径/golden 必须同时留档）----
-            "schema_version": "6.0",
+            **sampling_fields,
+            # ---- 版本三元组（HC39：schema/质量口径/golden 必须同时留档）----
+            # v9：本 run 的 episode trace 声明当前合同（§17.2），manifest 必须
+            # 与之一致 —— 否则 manifest 说 6.0、trace 说 9.0，又是一处自相矛盾。
+            "schema_version": EPISODE_TRACE_SCHEMA_VERSION,
             "quality_metric_version": QUALITY_METRIC_VERSION,
             **golden_fields,
             # ---- §19.2 版本字段（模板 / tool-face / 证据画像 / gate / 距离原语）----
@@ -552,6 +653,33 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
             # §7 / D-6 / A-8 / D-2：帧集身份（v6 不再记录 BA 开关与校准尺度来源）
             "frame_set_hash": fsh,
             "n_distinct_frame_sets": n_fsh,
+            # §13.5：检索策略必须"写入配置并冻结"，manifest 里同时留人类标签与
+            # 内容摘要 —— 只留标签的话，配置被改过也看不出来。
+            "retrieval_config_version": retriev.version(),
+            "retrieval_config_sha256": retriev.sha256(),
+            "retrieval_config_source": str(retriev.source),
+            "retrieval_top_k": int(retriev.top_k),
+            "retrieval_rerank": bool(retriev.rerank),
+            "retrieval_candidates": int(retriev.candidates),
+            "retrieval_rank_weights": {k: float(retriev.rank_weights[k])
+                                       for k in sorted(retriev.rank_weights)},
+            "retrieval_method_context_max_chars": int(retriev.method_context_max_chars),
+            "retrieval_ranking_rule": str(retriev.ranking_rule),
+            # §13.6：实测交付事实（本 run 里"检索选中"与"已送达模型"各有多少条）
+            "n_retrieval_records": sum(
+                len(getattr(o, "retrieval_records", []) or []) for o in (outcomes or [])),
+            "retrieved_skill_versions": sorted({
+                v for o in (outcomes or [])
+                for v in (getattr(o, "retrieved_skill_versions", []) or [])}),
+            "delivered_skill_versions": sorted({
+                v for o in (outcomes or [])
+                for v in (getattr(o, "delivered_skill_versions", []) or [])}),
+            "declared_selected_skill_versions": sorted({
+                v for o in (outcomes or [])
+                for v in (getattr(o, "declared_selected_skill_versions", []) or [])}),
+            "n_episodes_with_delivered_skills": sum(
+                1 for o in (outcomes or [])
+                if getattr(o, "delivered_skill_versions", None)),
             "readiness_manifest_ref": str(
                 (cfg_yaml.get("readiness") or {}).get("manifest_path", ""))})
     except Exception as exc:  # noqa: BLE001

@@ -86,6 +86,22 @@ class EvidenceProfile(Spec):
     object_grounding: CapabilityState = "unavailable"
     # ---- 生产者子条件实算值（可审计；不参与判定）----
     producer_subvalues: dict[str, dict] = {}
+    # ---- v9 §6.1：`unavailable`/`degraded` 的原因码 ----
+    # 至少区分 not_run / producer_failed / invalidated / unsupported。
+    # 缺省为空 = 原因未登记（不猜）；有值时受词表校验，避免自由字符串漂移。
+    state_reasons: dict[str, str] = {}
+
+    @field_validator("state_reasons")
+    @classmethod
+    def _validate_state_reasons(cls, v: dict[str, str]) -> dict[str, str]:
+        for cap, reason in (v or {}).items():
+            if cap not in CAPABILITIES:
+                raise ValueError(f"state_reasons 含未知能力 {cap!r}")
+            if reason not in UNAVAILABLE_REASON_CODES:
+                raise ValueError(
+                    f"state_reasons[{cap!r}]={reason!r} 不在 §6.1 词表 "
+                    f"{sorted(UNAVAILABLE_REASON_CODES)} 中")
+        return v
 
     @field_validator("temporal", "image_2d")
     @classmethod
@@ -129,6 +145,26 @@ class EvidenceProfile(Spec):
         return {c: self.state(c) for c in CAPABILITIES}
 
 
+# §6.1/§6.4：`unavailable`/`degraded` 的原因码。
+#
+# §6.4 给出四类：`not_run`（未运行）/ `producer_failed`（生产者失败）/
+# `invalidated`（被级联撤销）/ `unsupported`（成功执行但无匹配目标）。
+#
+# **决策记录（用户 2026-09-27）**：规范的四类里**没有**"运行成功但**质量门未过**"
+# 这一类 —— 例如 M4 主门未过（质量真算了、生产者也正常，只是数值不达标）、world
+# frame 退化、尺度自洽低于阈值。此前这类只能留空（= 原因未登记），于是审计看到的
+# 是"没记原因"，而不是"跑了但不达标"。**用户裁定：扩展词表**，新增
+# `quality_gate_not_passed`（第五值），与四类并列。它不是对规范的替换，而是补足
+# 规范未覆盖的一类；`producer_failed` 仍只表示"生产者自己出错"，两者不得互替。
+UNAVAILABLE_REASON_CODES: frozenset[str] = frozenset({
+    "not_run", "producer_failed", "invalidated", "unsupported",
+    "quality_gate_not_passed",
+})
+
+# §8.2 门三态：非米制工具为 not_applicable 且 gate_passed=None
+MetricGateStatus = Literal["pass", "fail", "not_applicable"]
+
+
 class MetricEvidenceGateResult(Spec):
     """§5.5 / §13.1：度量证据门（确定性组件，非 VLM 裁决）。
 
@@ -136,18 +172,33 @@ class MetricEvidenceGateResult(Spec):
     `EvidenceProfile.metric_scale` 的三值，不影响 geometry_3d / object_detection。
     """
 
-    gate_passed: bool
+    # v9 §8.2：`status` 为 pass／fail／not_applicable；非米制工具 not_applicable
+    # 且 `gate_passed=None`，其余与布尔判定一致。
+    gate_passed: Optional[bool]
     gate_version: str
+    status: "MetricGateStatus" = ""
     sub_results: dict[str, bool] = {}
     values: dict[str, float] = {}
     missing_subconditions: list[str] = []
+    invalidated_by: list[str] = []
 
     @model_validator(mode="after")
     def _consistency(self) -> "MetricEvidenceGateResult":
-        """`gate_passed` 必须与 `sub_results` 自洽（全过才真），否则伪造门通过。
+        """`gate_passed`／`status`／`sub_results` 三者必须自洽，否则伪造门通过。
 
-        空 `sub_results` 只在 `gate_passed=False` 时允许（例如"根本没跑融合"）。
+        - `not_applicable` ⟺ `gate_passed is None`（§8.2：不得用默认 False 伪装失败）；
+        - 其余情形 `status` 由 `gate_passed` 派生，且必须与 `sub_results` 全真一致；
+        - 空 `sub_results` 只在"未通过/不适用"时允许（例如"根本没跑融合"）。
         """
+        if not self.status:
+            self.status = ("not_applicable" if self.gate_passed is None
+                           else ("pass" if self.gate_passed else "fail"))
+        if (self.status == "not_applicable") != (self.gate_passed is None):
+            raise ValueError(
+                f"MetricEvidenceGateResult.status={self.status!r} 与 "
+                f"gate_passed={self.gate_passed!r} 不一致（§8.2：not_applicable 对应 None）")
+        if self.gate_passed is None:
+            return self                      # 不适用 → 不参与通过/失败判定
         if self.sub_results:
             all_true = all(bool(v) for v in self.sub_results.values())
             if bool(self.gate_passed) != all_true:

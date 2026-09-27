@@ -54,12 +54,38 @@ def apply_candidate(active: dict, candidate: CandidateRevision) -> dict:
         "spec_content": candidate.spec_content,
         "parent_version": candidate.parent_version,
         "created_by": candidate.created_by,
+        # v9 provenance is audit metadata; spec_content remains the only
+        # runtime payload consumed by the online loader.
+        "source_split": candidate.source_split,
+        "experience_relation": candidate.experience_relation,
+        "source_path": candidate.source_path,
+        "source_sha256": candidate.source_sha256,
+        "generated_spec_path": candidate.generated_spec_path,
+        "generated_sha256": candidate.generated_sha256,
+        "manifest_ref": candidate.manifest_ref,
+        "candidate_record_ref": candidate.candidate_record_ref,
     }
     return new
 
 
-def validate_references(snapshot: dict, known_roots: set[str] | None = None) -> None:
-    """校验新 snapshot 完整性：结构合法 + 引用可解析（parent 链非空）。"""
+def validate_references(snapshot: dict, known_roots: set[str] | None = None,
+                        *, strict_skill_specs: bool = False,
+                        method_context_max_chars: int | None = None) -> None:
+    """校验 snapshot 结构、候选根引用和可选的严格 SkillSpec 内容。
+
+    Historical unit tests exercise this low-level writer with opaque template
+    strings.  Production Skill-library promotion passes ``strict_skill_specs``
+    so an invalid runtime SkillSpec cannot enter the active pointer; the
+    compatibility default keeps the old generic candidate API unchanged.
+
+    v9（§13.5）：严格模式下还做**服务限制**静态检查 —— 完整方法正文超过
+    `method_context_max_chars` 的候选永远无法完整交付（§13.5 禁止截断正文后仍称
+    "完整 Skill 已交付"），因此在发布前拒绝。
+    """
+    from skill3d.skills.delivery import DEFAULT_METHOD_CONTEXT_MAX_CHARS
+
+    limit = int(DEFAULT_METHOD_CONTEXT_MAX_CHARS if method_context_max_chars is None
+                else method_context_max_chars)
     if not snapshot.get("snapshot_id"):
         raise SnapshotValidationError("缺少 snapshot_id")
     entries = snapshot.get("entries")
@@ -74,6 +100,21 @@ def validate_references(snapshot: dict, known_roots: set[str] | None = None) -> 
             raise SnapshotValidationError(
                 f"条目 {rid} 引用未知 root_candidate_id={e['root_candidate_id']}"
             )
+        if strict_skill_specs and e.get("candidate_type") == "skill":
+            try:
+                from skill3d.schemas import SkillSpec
+                spec = SkillSpec.model_validate(json.loads(e["spec_content"]))
+            except Exception as exc:  # noqa: BLE001 - publish must fail closed
+                raise SnapshotValidationError(
+                    f"条目 {rid} 不是合法运行 SkillSpec: {type(exc).__name__}: {exc}"
+                ) from exc
+            from skill3d.skills.library import static_check_skill_spec
+
+            problems = static_check_skill_spec(
+                spec, method_context_max_chars=limit)
+            if problems:
+                raise SnapshotValidationError(
+                    f"条目 {rid} 未通过静态检查（§14.4/§13.5）: {problems}")
 
 
 def _write_pointer_atomic(store_dir: Path, snapshot_id: str) -> None:
@@ -87,7 +128,9 @@ def _write_pointer_atomic(store_dir: Path, snapshot_id: str) -> None:
 
 def promote(store_dir: str | Path, candidate: CandidateRevision,
             known_roots: set[str] | None = None,
-            promotion_log: list | None = None) -> dict:
+            promotion_log: list | None = None,
+            *, strict_skill_specs: bool = False,
+            method_context_max_chars: int | None = None) -> dict:
     """promote(candidate)：原子切换 active snapshot，返回新 snapshot。
 
     validate 失败 → 不切换（抛 SnapshotValidationError，active 保持不变）。
@@ -96,7 +139,9 @@ def promote(store_dir: str | Path, candidate: CandidateRevision,
     store_dir.mkdir(parents=True, exist_ok=True)
     before = read_active_snapshot(store_dir)
     new = apply_candidate(before, candidate)
-    validate_references(new, known_roots=known_roots)  # 失败即不切换
+    validate_references(new, known_roots=known_roots,
+                        strict_skill_specs=strict_skill_specs,
+                        method_context_max_chars=method_context_max_chars)  # 失败即不切换
     _snapshot_path(store_dir, new["snapshot_id"]).write_text(
         json.dumps(new, ensure_ascii=False, indent=2), encoding="utf-8")
     _write_pointer_atomic(store_dir, new["snapshot_id"])

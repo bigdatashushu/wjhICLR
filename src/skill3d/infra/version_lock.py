@@ -62,6 +62,8 @@ def inference_env_versions() -> dict:
     """推理环境版本记录（§16.4：所有主结果必须记录推理环境）。
 
     取 vLLM / torch / transformers 版本；未安装记 "absent"（不虚构版本号）。
+    v9 §17.1：numpy/scipy 同属"环境依赖" —— 它们的版本组合决定 M4 主门与距离
+    原语是否真的可用，只记模型框架会漏掉这一层。
     """
     import importlib
 
@@ -72,6 +74,12 @@ def inference_env_versions() -> dict:
             out[mod] = str(getattr(m, "__version__", "unknown"))
         except Exception:  # noqa: BLE001 - 未安装 → 显式 absent
             out[mod] = "absent"
+    try:
+        from skill3d.env_preflight import describe_environment
+    except Exception:  # noqa: BLE001 - 环境模块不可用不阻断 manifest 落盘
+        return out
+    for k, v in describe_environment().items():
+        out.setdefault(k, v)
     return out
 
 

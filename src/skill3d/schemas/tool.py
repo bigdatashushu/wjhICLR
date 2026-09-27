@@ -76,6 +76,8 @@ class ToolResult(Spec):
     payload: Optional[dict] = None
     # 级联撤销时填入导致失效的 result_id 列表（§14.1）
     invalidated_by: Optional[list[str]] = None
+    # v9 §6.4：本次调用的统一授权收据（含被拒绝的调用 —— 同样要有凭据）
+    authorization: dict = {}
     # 答案来自"降级证据"时的显式标记（§7.2：degraded 但容忍 → 暴露且带标记）
     degraded_evidence: list[str] = []
 

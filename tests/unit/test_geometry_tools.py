@@ -54,6 +54,17 @@ V6_TOOLS = {
     "reproject", "euclidean_distance",
 }
 
+# v7 §9.2 新增：按官方题型口径实现的两个距离工具
+# （相对距离「参照对象→最近候选实例」；绝对距离「两题面对象最近距离/米」）
+V7_TOOLS = V6_TOOLS | {"relative_distance_rank", "object_distance_m"}
+
+# v9 §9.2/§9.4 新增：主动图像与补检工具
+# （`inspect_frames` 从冻结 FrameSet 查看/裁剪真实图片；`detect_objects` 调本地
+#  检测服务补检并如实返回 fault/empty/ok）。§9.4 明文："注册表中存在其他几何工具
+#  不能代替这两项"。因此工具面从 v7 的 16 个扩到 18 个 —— 这是规范要求的扩充，
+#  不是放松"v5 已删 Tool 不得回归"的守卫。
+V9_TOOLS = V7_TOOLS | {"inspect_frames", "detect_objects"}
+
 UP = [0.0, 1.0, 0.0]
 _K = np.array([[[100.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 1.0]]])
 
@@ -177,9 +188,13 @@ def _room_point_map(lo=(-2.0, -1.0, -3.0), hi=(2.0, 1.0, 3.0), n: int = 40) -> n
 
 # ------------------------------------------------------------- 工具面（§8）----
 
-def test_tool_face_is_exactly_the_v6_set():
-    """工具面就是 §8/§9 的 14 个：v5 的 4 个已删除 Tool 不得回归。"""
-    assert set(REGISTRY.names()) == V6_TOOLS
+def test_tool_face_is_exactly_the_v7_plus_v9_set():
+    """工具面 = v6 的 14 个 + v7 §9.2 的 2 个 + v9 §9.2/§9.4 的 2 个主动图像工具。
+
+    本断言**取代**原先的 `== V7_TOOLS`（v9 明确要求 `inspect_frames`/`detect_objects`
+    必须在册，见 `V9_TOOLS` 的注释与 §9.4）：v5 的 4 个已删除 Tool 仍不得回归。
+    """
+    assert set(REGISTRY.names()) == V9_TOOLS
     for gone in ("relative_direction", "object_size_longest_dim",
                  "object_distance_meters", "room_size_m2"):
         assert gone not in REGISTRY
@@ -195,7 +210,7 @@ def test_every_tool_declares_evidence_and_metric_flag_is_derived_from_it():
         assert REGISTRY.is_metric_tool(name) == (EVIDENCE_METRIC_SCALE in declared)
     metric_tools = {n for n in REGISTRY.names() if REGISTRY.is_metric_tool(n)}
     assert metric_tools == {"object_3d_extent", "plane_fit_room_size",
-                            "camera_object_distance"}
+                            "camera_object_distance", "object_distance_m"}
 
 
 def test_metric_tools_only_visible_under_metric_scope():
@@ -473,10 +488,11 @@ def _direction_handle(target_pos, *, world_up=UP, handedness="right"):
     return _handle(scene, objs=objs)
 
 
-def _ask_direction(handle) -> dict:
+def _ask_direction(handle, difficulty: str = "medium") -> dict:
     return json.loads(call_tool(
         "relative_direction_of",
-        {"observer_id": "obj_0", "facing_at_id": "obj_1", "target_id": "obj_2"},
+        {"observer_id": "obj_0", "facing_at_id": "obj_1", "target_id": "obj_2",
+         "difficulty": difficulty},
         handle).value)
 
 
@@ -486,11 +502,17 @@ def test_relative_direction_of_uses_object_reference_frame():
     回归背景：v5 的 `relative_direction` 的 `facing` 是方向向量，模型实测传了对象
     质心（一个点）→ 静默算出与题目无关的方位。v6 用 id 表达"面向某物体"。
     """
-    # 面向 +z：target 在 +x → left；在 -x → right；正前 → front；正后 → behind
+    # 面向 +z：target 在 +x → left；在 -x → right
     assert _ask_direction(_direction_handle((5.0, 0.0, 0.1)))["direction"] == "left"
     assert _ask_direction(_direction_handle((-5.0, 0.0, 0.1)))["direction"] == "right"
-    assert _ask_direction(_direction_handle((0.0, 0.0, 5.0)))["direction"] == "front"
-    assert _ask_direction(_direction_handle((0.0, 0.0, -5.0)))["direction"] == "behind"
+    # v7 §9.3：medium 模板的选项只有 left/right/back —— 正前（夹角 0°）必须判
+    # **左右**，不得返回不在选项集合里的 "front"；正后（180° ≥135°）才是 back。
+    # 正前时左右在数学上未定义（目标落在面朝轴线上）→ 只要求**确定性**且落在
+    # 合法选项集合内（`TH_LATERAL_TIE_EPS` 的平局判据固定为 right）。
+    ahead = _ask_direction(_direction_handle((0.0, 0.0, 5.0)))["direction"]
+    assert ahead in ("left", "right")
+    assert ahead == _ask_direction(_direction_handle((0.0, 0.0, 5.0)))["direction"]
+    assert _ask_direction(_direction_handle((0.0, 0.0, -5.0)))["direction"] == "back"
 
     # 类别名同样可解析（大小写不敏感）
     o0, o1 = _direction_objects()
@@ -501,12 +523,44 @@ def test_relative_direction_of_uses_object_reference_frame():
     assert json.loads(r.value)["direction"] == "left"
 
 
+def test_direction_difficulty_selects_the_official_option_set():
+    """v7 §9.3：三个难度模板的选项集合不同，同一个几何必须给出不同词表下的答案。
+
+    实测依据（inner 档 16 道方向题全部是 medium）：题面写
+    "is the X to my left, right, or back?" —— **没有 front 这个选项**。
+    旧实现一律返回 front/behind/left/right，模型只能把一个不存在的选项硬映射到
+    三个候选之一，是该类题系统性答错的主因之一。
+    """
+    # 正前（夹角 0°）：easy/medium 都给左右；hard 才给 front-*
+    assert _ask_direction(_direction_handle((0.0, 0.0, 5.0)), "easy")["direction"] in ("left", "right")
+    assert _ask_direction(_direction_handle((0.0, 0.0, 5.0)), "hard")["direction"].startswith("front-")
+    # 正后（180°）：medium → back；hard → back-*
+    assert _ask_direction(_direction_handle((0.0, 0.0, -5.0)), "easy")["direction"] in ("left", "right")
+    assert _ask_direction(_direction_handle((0.0, 0.0, -5.0)), "hard")["direction"].startswith("back-")
+    # 明确落在面朝轴线**之外**的目标：三个难度都必须给出确定的、与选项集合一致的答案
+    side_target = _direction_handle((5.0, 0.0, 0.1))          # 基本正右
+    assert _ask_direction(side_target, "easy")["direction"] == "left"
+    assert _ask_direction(side_target, "medium")["direction"] == "left"
+    assert _ask_direction(side_target, "hard")["direction"] == "front-left"
+    # 未知难度 → fail-closed（选项集合未定义，猜不得）。
+    # 注意：工具层的域值错误按 v7 §10.1 写成 `status=failed` 的 ToolResult
+    # （`error_code=domain_value`），**不是**往上抛异常 —— 由 M10 包装层归因。
+    h = _direction_handle((0.0, 0.0, 5.0))
+    bad = call_tool("relative_direction_of",
+                    {"observer_id": "obj_0", "facing_at_id": "obj_1",
+                     "target_id": "obj_2", "difficulty": "impossible"}, h)
+    assert bad.status == "failed"
+    assert bad.error_code == "domain_value"
+    assert "difficulty" in str(bad.error)
+
+
 def test_relative_direction_of_reports_world_contract_used():
     """输出必须自报用了哪套世界系约定（`world_up_used` / `handedness_used`，§9.8）。"""
     out = _ask_direction(_direction_handle((5.0, 0.0, 0.1)))
-    assert set(out) == {"direction", "world_up_used", "handedness_used"}
+    assert set(out) == {"direction", "difficulty", "world_up_used", "handedness_used"}
     assert out["world_up_used"] == pytest.approx(UP)
     assert out["handedness_used"] == "right"
+    assert out["difficulty"] == "medium"          # v7 §9.3：自报用了哪套选项集合
 
 
 def test_relative_direction_handedness_and_up_flip_the_answer():

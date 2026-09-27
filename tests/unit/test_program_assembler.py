@@ -96,16 +96,15 @@ def test_assemble_program_id_is_content_hash_and_stable():
     assert p2.skill_semver_used == []
 
 
-def test_prompt_states_returnanswer_does_not_terminate():
-    """prompt 必须写明 `ReturnAnswer` 不中止执行、且答后调 Tool 会抛 AnswerAlreadyGiven。
+def test_prompt_states_control_interfaces_terminate_and_ban_abstain():
+    """v7 D1/D2/§10.2：prompt 必须写明三个口径。
 
-    回归背景（inner_validation 1501–1504 实测）：模型写
-    `if not ids: ReturnAnswer("abstain")` 之后继续执行 `object_centroid(ids[0])`
-    → IndexError → `violation_runtime`（不是干净的 abstain）。
+    1. `ReturnAnswer` / `YieldObservations` 都是**终结操作**（调用即结束本段）；
+    2. **不得拒答**：`abstain` 不再是合法答案，证据不足只改变求解方式；
+    3. 相对距离/绝对距离的**官方口径**（题面参照对象→候选，而非相机→候选）。
 
-    v6 §15.1：`ReturnAnswer` 保留"记录/反作弊"语义（**不中止**执行），但
-    ① 静态层（AST）禁止答后再调 Tool；② 运行层抛受控 `AnswerAlreadyGiven`。
-    prompt 必须把这两点讲清楚（模型据此改写"先算后答"的 program）。
+    回归背景：v6 prompt 明确写着"`ReturnAnswer("abstain")` 是合法的最终答案"，
+    实测 inner 档 128 题里 32% 走了 abstain → 全部零分。
     """
     from skill3d.synthesis.prompt_builder import TEMPLATE_VERSION, PromptBuilder
     from skill3d.tools import REGISTRY
@@ -116,11 +115,19 @@ def test_prompt_states_returnanswer_does_not_terminate():
         tool_docs=REGISTRY.docs(SCOPE_FULL_3D),
         scope=SCOPE_FULL_3D, question_type="object_rel_direction",
         available_artifacts=["frames", "objects"])
-    assert "不会中止" in text
-    assert "最后一行" in text
-    # §15.1 新指引：答后调 Tool 会被硬拦截，异常名必须写出来
-    assert "AnswerAlreadyGiven" in text
-    assert "ReturnAnswer` 之后调用任何 Tool" in text or "之后再调用工具" in text
+    # v7 §10.2：两个控制接口都必须出现，并写明"终结"语义
+    assert "YieldObservations" in text
+    assert "终结操作" in text
+    # v7 D1：不得拒答 —— prompt 里不能再出现"abstain 是合法答案"这类指引
+    assert "不是合法答案" in text
+    assert "有图必答" in text
+    # v7 §2.2 口径纠错必须写进 prompt（写错口径会系统性答错）
+    assert "参照对象" in text
+    assert "不是相机到对象的距离" in text
+    # v7 §10.2：两种入口写法都必须被明确支持（模型常只 `def solve` 不调用，
+    # host 会代调用 —— prompt 必须写清这一点，否则模型会以为要自己调用）
+    assert "def solve(ctx)" in text
+    assert "host 会自动调用" in text
     # 头部与摘要同源（§5.3）：scope 由调用方传入并透传
     assert f"question_tool_scope={SCOPE_FULL_3D}" in text
     assert TEMPLATE_VERSION

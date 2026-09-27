@@ -24,7 +24,7 @@ from skill3d.evolution.optimization_loop import (
 )
 from skill3d.evolution.paired_score import score_paired
 from skill3d.online.runner import OnlineRunConfig, run_episode
-from skill3d.reconstruction.run import artifact_path
+from skill3d.reconstruction.run import artifact_path, resolve_artifact_path
 from skill3d.schemas import (
     AdmissionDecision,
     CandidateRevision,
@@ -55,7 +55,10 @@ def run_panel(items: Sequence[EpisodeItem], cfg: OnlineRunConfig, trace_store=No
     for it in items:
         item_cfg = cfg
         if cfg.mode == "real" and cfg.recon_dir:
-            p = artifact_path(cfg.recon_dir, it.episode.scene_name, cfg.recon_method)
+            # §5.2：缓存身份含源标识与帧集内容哈希（旧命名产物按 §17.2 沿用）
+            p, _used_legacy = resolve_artifact_path(
+                cfg.recon_dir, it.episode.scene_name, cfg.recon_method,
+                frame_set=getattr(it.episode, "frame_set", None))
             if p.exists():
                 item_cfg = replace(cfg, reuse_artifact=str(p))
         outcomes.append(run_episode(it.episode, it.pixels, item_cfg, geometry=it.geometry,
@@ -159,13 +162,15 @@ def run_candidate_panels(
     `levels` 默认三层；G-31 简化为 `("L1_minimal_slice", "L3_outer_holdout")` 跳过 L2。
     `phase_gate`（M20 PhaseGate）用于阶段串行：面板执行属 "eval" 阶段，重建期不得并行进入。
     """
-    arm_b_cfg = replace(base_cfg, skills=[candidate_skill(root)])
     level_state: PanelLevels = {}
     report = make_level_report(min_delta_mca, min_delta_mra)
 
     def paired(items: Sequence[EpisodeItem], level: str,
                revision: Optional[CandidateRevision] = None) -> PairedOutcome:
         outs_a = run_panel(items, base_cfg, trace_store)
+        # Each revision must be the actual B-arm payload. Keeping a root-bound
+        # config here would make REVISE a no-op while still recording its id.
+        arm_b_cfg = replace(base_cfg, skills=[candidate_skill(revision or root)])
         outs_b = run_panel(items, arm_b_cfg, trace_store)
         po = paired_outcome(f"pair-{level}-{uuid.uuid4().hex[:8]}", outs_a, outs_b,
                             [it.episode.question_type for it in items],
@@ -226,11 +231,18 @@ def run_candidate_panels(
     return run, level_state
 
 
-def admit(root: CandidateRevision, po: PairedOutcome, *, outer_items: Sequence[EpisodeItem],
+def admit(root: CandidateRevision, po: PairedOutcome, *,
+          panel_items: Sequence[EpisodeItem],
           no_leakage: bool, n_min: int, min_delta_mca: float, min_delta_mra: float,
           counterexamples: Optional[list] = None) -> AdmissionDecision:
-    """准入门装配（硬约束 13：硬门一票否决）。"""
-    n_cross_scene = len({it.episode.scene_name for it in outer_items})
+    """准入门装配（硬约束 13：硬门一票否决）。
+
+    §14.3：**候选只在它所属规范题型的固定 inner 面板上准入**，主准入得分在整个
+    该题型面板 P 上计算。因此 `po` 必须来自 inner 面板，`panel_items` 是同一个
+    面板的题目清单（用于跨场景覆盖计数）。`outer_holdout` 的结果是**快照冻结后的
+    独立验证证据**，不作为准入门 —— 用 holdout 选代会让该 holdout 失效。
+    """
+    n_cross_scene = len({it.episode.scene_name for it in panel_items})
     return evaluate_admission(
         candidate_id=root.root_candidate_id,
         paired_outcomes=[po],

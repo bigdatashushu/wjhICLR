@@ -25,6 +25,22 @@ pip install -e . --no-build-isolation        # 本机无网络时加 --no-deps
 pytest                                       # 单测 + 集成测试（无需 GPU / 数据集）
 ```
 
+> **运行环境（必读）**：本项目**必须**用冻结实验环境 `skill3d-exp` 运行：
+>
+> ```bash
+> EXP=/home/cvailab/anaconda3/envs/skill3d-exp/bin/python
+> PYTHONPATH=src $EXP -m pytest tests/ -q     # 全量套件
+> ```
+>
+> base conda env（numpy 1.26.4 + scipy 1.18.0）会**装得上但跑不动**：scipy 自 1.14
+> 起要求 numpy≥2.0，于是 `import scipy.spatial` 抛 `np.long`、`cKDTree` 抛
+> `copy=None`。危险之处是它**不报错退出** —— M4 主门子项 fail-closed 之后
+> `scene_route=fallback_2d_only`，整条链照常跑完，几何与米制能力静默失效，
+> 看起来像"场景质量不够"。为此 `skill3d.online.eval` 启动时先做**行为级**环境
+> 预检（`src/skill3d/env_preflight.py`）：依赖不可用即拒绝启动，不在降级状态下
+> 出结果。不要用测试进程内 NumPy shim 掩盖该问题 —— shim 只能补一个符号，
+> 补不了 ABI。
+
 四条入口（§13.5 + G-35 离线 driver）：
 
 ```bash

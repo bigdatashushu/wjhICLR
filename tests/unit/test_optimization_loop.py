@@ -42,6 +42,7 @@ def test_outer_failure_rejects_without_new_patch():
 def test_inner_iterate_then_promote_parent_chain():
     """L1 失败→修订→新版本→最终 promote；parent_version 链完整（不可变）。"""
     revised: list[CandidateRevision] = []
+    archive = CandidateArchive()
 
     def test_fn(rev, level):
         if rev.revision_id == "rev-0" and level == "L1_minimal_slice":
@@ -54,12 +55,13 @@ def test_inner_iterate_then_promote_parent_chain():
         return new
 
     run = run_optimization_loop(_rev("rev-0", None), test_fn, revise_fn,
-                                budget_limit=_LIMIT)
+                                archive=archive, budget_limit=_LIMIT)
     assert run.status == "promoted"
     assert run.revision_history == ["rev-0", "rev-1"]
     # parent_version 链完整：rev-1 的父是 rev-0，rev-0 无父
     assert revised[0].parent_version == "rev-0"
     assert run.current_revision_id == "rev-1"
+    assert archive.revisions[run.current_revision_id].revision_id == "rev-1"
 
 
 def test_patience_exhaustion_rejects():

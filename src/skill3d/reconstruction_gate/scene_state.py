@@ -190,6 +190,8 @@ def scope_scene_to_question(
     *,
     inputs_finite: bool = True,
     m5: Optional[M5EvidenceSummary] = None,
+    metric_gate_override: Optional[MetricEvidenceGateResult] = None,
+    evidence_profile_override: Optional[EvidenceProfile] = None,
 ) -> tuple[SceneState, QuestionScopeDecision]:
     """逐题派生 `question_tool_scope`（§5.3/§6.3）。
 
@@ -214,9 +216,10 @@ def scope_scene_to_question(
             reasons=["场景门控已判 unanswerable（§6.2）"])
 
     art = getattr(scene, "artifact", None)
-    gate = (make_metric_gate(art, scene_route=scene.scene_route,
-                             question_type=task, inputs_finite=inputs_finite)
-            if art is not None else scene.metric_evidence_gate_result)
+    gate = metric_gate_override or (
+        make_metric_gate(art, scene_route=scene.scene_route,
+                         question_type=task, inputs_finite=inputs_finite)
+        if art is not None else scene.metric_evidence_gate_result)
 
     metric_q = task in METRIC_TASK_TYPES
     scope = question_tool_scope_of(
@@ -227,9 +230,10 @@ def scope_scene_to_question(
         gate_passed=bool(gate is not None and gate.gate_passed),
         metric_question=metric_q)
 
-    profile = (build_evidence_profile(
-        artifact=art, scene_route=scene.scene_route, question_type=task,
-        gate=gate, m5=m5 or M5EvidenceSummary()) if art is not None
+    profile = evidence_profile_override or (
+        build_evidence_profile(
+            artifact=art, scene_route=scene.scene_route, question_type=task,
+            gate=gate, m5=m5 or M5EvidenceSummary()) if art is not None
         else scene.evidence_profile)
 
     flags: list[str] = []

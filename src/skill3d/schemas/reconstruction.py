@@ -371,7 +371,10 @@ class ObjectRecord(Spec):
     centroid_ref: str = ""                # 3D 质心引用（世界系，审计用）
     track_id: Optional[str] = None        # 跨帧 track
     det_conf: float = 0.0
-    grounding_status: Literal["base_list", "question_targeted_fill"] = "base_list"
+    # v9 §9.1/§9.4：第三种来源 = 在线 `detect_objects` 的**工具补检**。
+    # 与 M5 的两种分开记，避免"工具当场补检出来的对象"被误读成 M5 基础清单。
+    grounding_status: Literal["base_list", "question_targeted_fill",
+                              "tool_detection"] = "base_list"
     duplicate_suspect: bool = False       # D6：重复嫌疑（计数降级信号）
     # ---- 运行时产物引用（M5 全量绑定产物；Tool 经 SceneHandle 只读访问）----
     mask_per_frame: str = ""              # mask 数组文件 ref

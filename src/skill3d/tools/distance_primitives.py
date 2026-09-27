@@ -1483,3 +1483,100 @@ def ablation_quantiles(
         "note": ("稳健低分位近似最近点与官方 GT 口径的系统性偏差见本表；"
                  "q 的选择只在 inner 做、outer 冻结（D8/§12.1）"),
     }
+
+
+# ---------------------------------------------------------------------------
+# 实例整合（v7 §9.1/§9.2：计数必须按**实例**去重，不能数清单长度/记录数）
+# ---------------------------------------------------------------------------
+
+def consolidate_instances(
+    point_sets: dict[str, np.ndarray],
+    *,
+    min_overlap: float = 0.30,
+    eps: float = 0.01,
+    max_points: int = 3000,
+) -> dict:
+    """把"同一物理实例被重复检出"的记录合并成簇（并查集）。
+
+    为什么需要它（真实实测）：M5 的 `_dedupe_by_world_centroid` 要求**时序重叠**
+    才合并，因此同一个显示器被 SAM2 分裂成支撑帧互不相交的多条 track 时不会被合并。
+    实测 scene `7b6477cb95`：问 "How many monitor(s)"，GT=5，而清单里有 12 条
+    monitor/tv-monitor 记录，`count_objects` 直接返回 12（MRA=0）。
+
+    判据只用**几何重合**（与帧无关，正好补上时序判据的缺口）：两条记录的点集在
+    `eps` 邻域内**双向**重合比例都 ≥ `min_overlap` → 判为同一实例。
+    该阈值有实测分离度支撑（同一显示器 0.38–0.69，不同对象 ≤0.14）：
+    取 0.30 落在间隙内，两侧各留 >2 倍余量。
+
+    只做**同类别内**的合并由调用方保证（跨类别不合并，避免把桌上的显示器与
+    桌面并成一个）。返回 `{"clusters", "n_clusters", "n_input", "merge_edges"}`，
+    `clusters` 是簇内键的列表（顺序稳定：按输入键序）。
+    """
+    keys = list(point_sets.keys())
+    n = len(keys)
+    if n == 0:
+        return {"clusters": [], "n_clusters": 0, "n_input": 0, "merge_edges": []}
+    if not np.isfinite(eps) or eps <= 0:
+        raise ValueError(f"eps 必须是正的有限值（收到 {eps!r}）")
+    if not (0.0 < float(min_overlap) <= 1.0):
+        raise ValueError(f"min_overlap 必须落在 (0,1]（收到 {min_overlap!r}）")
+
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)      # 保持确定性（小下标为根）
+
+    # 点集降采样：计数只需要"是否重合"，3000 点已足够稳定，且把 O(n²·query) 压住
+    prepped: list[Optional[np.ndarray]] = []
+    for k in keys:
+        a = np.asarray(point_sets[k], dtype=np.float64).reshape(-1, 3)
+        a = a[np.all(np.isfinite(a), axis=1)]
+        if a.shape[0] > max_points:
+            stride = int(np.ceil(a.shape[0] / max_points))
+            a = a[::stride][:max_points]
+        prepped.append(a if a.shape[0] else None)
+
+    from scipy.spatial import cKDTree
+
+    merge_edges: list[dict] = []
+    for i in range(n):
+        ai = prepped[i]
+        if ai is None:
+            continue
+        for j in range(i + 1, n):
+            aj = prepped[j]
+            if aj is None:
+                continue
+            ti, tj = cKDTree(ai), cKDTree(aj)
+            d_ij, _ = tj.query(ai)
+            d_ji, _ = ti.query(aj)
+            ovl_ij = float((d_ij < eps).mean())
+            ovl_ji = float((d_ji < eps).mean())
+            both = min(ovl_ij, ovl_ji)          # 双向：单向高重合可能是包含关系
+            if both >= float(min_overlap):
+                _union(i, j)
+                merge_edges.append({"a": keys[i], "b": keys[j],
+                                    "overlap_ab": round(ovl_ij, 4),
+                                    "overlap_ba": round(ovl_ji, 4)})
+
+    groups: dict[int, list[str]] = {}
+    for idx, k in enumerate(keys):
+        groups.setdefault(_find(idx), []).append(k)
+    clusters = [groups[r] for r in sorted(groups)]
+    return {
+        "clusters": clusters,
+        "n_clusters": len(clusters),
+        "n_input": n,
+        "merge_edges": merge_edges,
+        "min_overlap": float(min_overlap),
+        "eps": float(eps),
+        "method": "bidirectional_nn_pointcloud_overlap_v7",
+    }

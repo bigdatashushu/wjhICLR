@@ -82,6 +82,8 @@ class VLLMClient:
     ) -> None:
         if not endpoints:
             raise ValueError("endpoints 不能为空")
+        # v9 §9.4：最近一次请求的**真实** token 用量（含图像 token）；runner 逐轮落盘
+        self.last_usage: dict = {}
         self._clients = [
             OpenAI(base_url=_normalize_base_url(ep), api_key="EMPTY", timeout=timeout_s)
             for ep in endpoints
@@ -141,6 +143,14 @@ class VLLMClient:
                 raise ServiceUnavailable(f"{name}: {exc}") from exc
             raise
         content = resp.choices[0].message.content
+        # v9 §9.4："实际传入图像、缩放和 token 成本完整记录" —— 服务返回的 usage 是
+        # **真实** token 数（含图像 token），逐请求留在客户端上供 runner 落盘。
+        try:
+            usage = getattr(resp, "usage", None)
+            self.last_usage = (usage.model_dump() if usage is not None
+                               and hasattr(usage, "model_dump") else dict(usage or {}))
+        except Exception:  # noqa: BLE001 - usage 缺失不得影响作答
+            self.last_usage = {}
         if content is None:
             raise RuntimeError("vLLM 返回空 content")
         return content

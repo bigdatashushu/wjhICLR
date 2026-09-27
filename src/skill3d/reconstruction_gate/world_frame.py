@@ -87,6 +87,11 @@ TH_POSE_DUP_ROT_DEG: float = 0.5   # TODO_CALIBRATE: 位姿去重：旋转差（
 TH_POSE_DUP_TRANS: float = 1e-3    # TODO_CALIBRATE: 位姿去重：平移差（VGGT 输出按中位距离归一化 → 场景尺度 ≈ 1）
 TH_UNIT_TOL: float = 1e-3          # 单位向量容差（与 `schemas/reconstruction.py::_world_up_unit` 口径一致）
 TH_FRONT_HALF_ANGLE_DEG: float = 45.0  # TODO_CALIBRATE: front/behind 半角（与 v5 `relative_direction` 口径一致）
+# v7 §9.3：medium 模板的 back 判据 —— 题面自述"要转身至少 135°"（选项只有左右/back）
+TH_BACK_MIN_ANGLE_DEG: float = 135.0
+# 左右平局阈值：|sin θ| 小于它即认为目标落在面朝轴线上（正前/正后），左右未定义 →
+# 取确定性平局判据（right），避免 `-0.0` 的符号让同一几何时左时右
+TH_LATERAL_TIE_EPS: float = 1e-9
 TH_HORIZ_EPS: float = 1e-9         # 水平面投影退化阈值（归一化场景尺度下的绝对阈值）
 
 # ---- 方法标识（进 trace / artifact receipt）----
@@ -453,10 +458,23 @@ def _validated_handedness(handedness: Any) -> str:
 
 
 def direction_of(observer_xyz: Any, facing_xyz: Any, target_xyz: Any, world_up: Any, *,
-                 handedness: Any = "right") -> str:
-    """在**水平面**内判定 target 相对 observer/facing 的方位（§9.8 硬合同）。
+                 handedness: Any = "right", difficulty: str = "medium") -> str:
+    """在**水平面**内判定 target 相对 observer/facing 的方位（§9.8/§9.3 硬合同）。
 
-    返回 `"front" | "behind" | "left" | "right"`。
+    `difficulty` 决定**选项集合**，这是 v7 的关键纠错（§2.2/§9.3）：VSI-Bench 的
+    三个方向难度模板有**不同的选项集合**，不能用一个"front/behind/left/right"
+    覆盖全部模板。实测 inner 档 16 道方向题**全部是 medium**，题面写的是
+    "is the X to my left, right, or back?" —— 选项里**没有 front**；而旧实现
+    在夹角 < 45° 时返回 `"front"`，模型只能硬映射到三个选项之一，系统性答错。
+
+    返回值按难度：
+
+    - `easy`：`"left" | "right"`（题面只给左右两个选项）；
+    - `medium`：`"left" | "right" | "back"`，`|θ| ≥ 135°` → `back`
+      （题面自述 "An object is to my back if I would have to turn at least
+      135 degrees"），其余按左右符号；
+    - `hard`：`"front-left" | "front-right" | "back-left" | "back-right"`
+      四象限（前后按 `|θ| < 90°` 分，左右按符号分）。
 
     几何（与 §9.8 一致）：
     - `f = facing_xyz − observer_xyz`：**facing_xyz 是位置**（`facing_at` 对象的位置，
@@ -464,14 +482,8 @@ def direction_of(observer_xyz: Any, facing_xyz: Any, target_xyz: Any, world_up: 
     - `d = target_xyz − observer_xyz`；`u = world_up`（单位向量）；
     - 先投影到**垂直于 u 的水平面**：`f_h = f − (f·u)u`、`d_h = d − (d·u)u`
       （对倾斜相机/倾斜世界系同样成立，竖直分量不许混进左右判定）。
-
-    判据（显式、可复现）：
-    - `front`：`f_h` 与 `d_h` 夹角 ≤ `TH_FRONT_HALF_ANGLE_DEG`（默认 45°，即
-      `cos ≥ 0.7071`：方向大致同向且横向分量小）；
-    - `behind`：夹角 ≥ 180° − 上述半角（要转身 ≥ 135°，与 v5 口径一致）；
-    - 其余（横向带）→ 左右，**右手系**：`right ⟺ (f_h × d_h)·u < 0`
-      （即 `right = forward × up`）。因 `f_h ⟂ u`、`d_h ⟂ u`，叉积必与 `u` 平行，
-      故该判定无需额外角度容差。
+    - `θ = atan2(d_h·r, d_h·f̂)`，其中 `r = f̂ × u`；**θ>0 表示目标在右侧**。
+      判据也可等价写成 `right ⟺ (f_h × d_h)·u < 0`。
     - **左手系（`handedness="left"`）**：镜像世界里的叉积与物理右手定则反号，
       同一个几何下"物理右侧"对应 `(f_h × d_h)·u > 0`，故判据取反（左右互换）。
 
@@ -479,10 +491,16 @@ def direction_of(observer_xyz: Any, facing_xyz: Any, target_xyz: Any, world_up: 
     猜测结果、也绝不退回"无符号启发式"（例如拿包围盒最小 extent 轴当竖直轴）：
     ① `world_up` 为 None / 非有限 / **非单位**；② `handedness` 缺失或不是
     `"right"`/`"left"`；③ 任一点位非有限或不是 3 向量；④ 水平面内退化
-    （facing 与其竖直方向平行、target 与 observer 重合或只在正上/正下方）。
+    （facing 与其竖直方向平行、target 与 observer 重合或只在正上/正下方）；
+    ⑤ `difficulty` 不是 `easy`/`medium`/`hard` 之一。
     """
     u = _validated_world_up(world_up)
     hand = _validated_handedness(handedness)
+    diff = str(difficulty or "").strip().lower()
+    if diff not in ("easy", "medium", "hard"):
+        raise ValueError(
+            f"difficulty 必须是 'easy'/'medium'/'hard'（收到 {difficulty!r}）"
+            "→ 方向选项集合未定义，fail-closed（不同难度的选项集合不同，猜不得）")
     obs = _as_vec3(observer_xyz, "observer_xyz")
     fac = _as_vec3(facing_xyz, "facing_xyz")
     tgt = _as_vec3(target_xyz, "target_xyz")
@@ -503,15 +521,28 @@ def direction_of(observer_xyz: Any, facing_xyz: Any, target_xyz: Any, world_up: 
     f_hat = f_h / f_norm
     d_hat = d_h / d_norm
 
-    cos_theta = float(np.clip(np.dot(f_hat, d_hat), -1.0, 1.0))
-    cos_half = float(np.cos(np.radians(TH_FRONT_HALF_ANGLE_DEG)))
-    if cos_theta >= cos_half:
-        return "front"
-    if cos_theta <= -cos_half:
-        return "behind"
+    # θ 为水平面内有符号夹角：+ 表示目标在面向的**右侧**（右手系约定）
+    r_hat = np.cross(f_hat, u)
+    sin_t = float(np.dot(d_hat, r_hat))
+    cos_t = float(np.clip(np.dot(d_hat, f_hat), -1.0, 1.0))
+    if hand == "left":
+        sin_t = -sin_t                      # 左手系：左右互换
+    # **平局口径**：目标正好落在面朝轴线上时（`sin_t == 0`，正前/正后都属于这种）
+    # 左右在数学上未定义。真实数据里质心连续取值几乎不会精确命中，但合成用例、
+    # 对称场景与浮点舍入会命中 —— 这里给一个**显式确定性**的平局判据，而不是让
+    # `-0.0` 的符号决定答案（那样同一几何会时左时右，不可复现）。
+    if abs(sin_t) <= TH_LATERAL_TIE_EPS:
+        side = "right"
+    else:
+        side = "right" if sin_t > 0.0 else "left"
+    theta_deg = float(np.degrees(np.arctan2(sin_t, cos_t)))
+    abs_deg = abs(theta_deg)
 
-    triple = float(np.dot(np.cross(f_hat, d_hat), u))
-    if hand == "right":
-        return "right" if triple < 0.0 else "left"
-    # 左手系：坐标系本身是镜像的 → 同一个几何下"物理右侧"对应 triple > 0（左右互换）
-    return "right" if triple > 0.0 else "left"
+    if diff == "easy":
+        # 题面只给左右两个选项 → 一律给左右（不得返回 front/back）
+        return side
+    if diff == "medium":
+        return "back" if abs_deg >= TH_BACK_MIN_ANGLE_DEG else side
+    # hard：四象限（前后按 90° 分，左右按符号分）
+    fb = "front" if abs_deg < 90.0 else "back"
+    return f"{fb}-{side}"

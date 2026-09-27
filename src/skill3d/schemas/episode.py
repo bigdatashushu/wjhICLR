@@ -2,6 +2,8 @@
 
 from typing import Literal, Optional
 
+from pydantic import model_validator
+
 from . import Spec
 
 
@@ -27,6 +29,56 @@ class FrameSet(Spec):
     n_frames: int = 32
     n_total_frames: int = 0
     fps: float = 0.0
+    # ---- v9 §5.2 点名的其余字段（"FrameSet 至少包含"）----
+    # `frame_ids` 是**规划**的采样槽位；`readable_frame_ids` 是其中真正可解码的子集。
+    # 当前实现里解码失败即输入合法性硬失败（硬约束 21），因此正常路径下两者相同；
+    # 一旦按 §5.2"用可读帧继续"放开，这里就是承载"缺失掩码"的地方。
+    # 缺省从 `frame_ids` 补齐（见 validator），保证既有构造点语义不变。
+    schema_version: str = "frame-set/1.0"
+    episode_id: str = ""
+    dataset_id: str = ""
+    video_id: str = ""
+    scene_name: str = ""
+    frame_refs: list[str] = []
+    decode_status: str = "ok"
+    readable_frame_ids: list[int] = []
+    preprocessing_version: str = ""
+
+    @model_validator(mode="after")
+    def _consistency(self) -> "FrameSet":
+        """§5.2：数组字段长度匹配，帧索引唯一且有序；可读帧必须是规划帧的子集。"""
+        if not self.readable_frame_ids:
+            # 未显式给出 = 全部规划帧都可读（当前实现的真实语义）
+            object.__setattr__(self, "readable_frame_ids", list(self.frame_ids))
+        if len(self.source_frame_indices) != len(self.frame_ids):
+            raise ValueError("FrameSet: source_frame_indices 与 frame_ids 长度不匹配")
+        if len(self.timestamps) != len(self.frame_ids):
+            raise ValueError("FrameSet: timestamps 与 frame_ids 长度不匹配")
+        if self.frame_refs and len(self.frame_refs) != len(self.frame_ids):
+            raise ValueError("FrameSet: frame_refs 与 frame_ids 长度不匹配")
+        if len(set(self.frame_ids)) != len(self.frame_ids):
+            raise ValueError("FrameSet: frame_ids 必须唯一")
+        if sorted(self.frame_ids) != list(self.frame_ids):
+            raise ValueError("FrameSet: frame_ids 必须有序（§5.2）")
+        extra = set(self.readable_frame_ids) - set(self.frame_ids)
+        if extra:
+            raise ValueError(f"FrameSet: readable_frame_ids 不在 frame_ids 内: {sorted(extra)}")
+        return self
+
+    def cache_identity(self) -> str:
+        """§5.2：缓存身份必须含**源标识**，不能只看帧索引列表。
+
+        规范原文："源标识及内容校验值参与缓存身份，**禁止仅凭相同的帧索引列表跨视频
+        复用**。" 两个不同视频若采样出相同的 32 个索引，`frame_set_hash` 会相同，
+        因此这里把 dataset／video／scene 身份与内容哈希合成一个缓存键。
+        """
+        import hashlib
+        import json as _json
+
+        return hashlib.sha256(_json.dumps({
+            "dataset_id": self.dataset_id, "video_id": self.video_id,
+            "scene_name": self.scene_name, "frame_set_hash": self.frame_set_hash,
+        }, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 class InputFrame(Spec):

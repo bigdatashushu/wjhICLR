@@ -12,6 +12,8 @@ Skill 状态机：draft → shadow → canary → promoted；异常 → quaranti
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from pathlib import Path
 
@@ -151,12 +153,57 @@ class SkillRegistry:
 
 # ------------------------------------------------------------- active 快照读取 ----
 
-def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], str]:
-    """读 active snapshot（M15 原子指针）→ 已 consolidated 的 SkillSpec 列表。
+def active_snapshot_provenance(path: str | Path) -> tuple[str, str]:
+    """Return ``(snapshot_id, manifest_hash)`` for the active pointer.
 
-    `path` 可为 snapshot 目录或 `active_snapshot.json` 文件（§13.5 CLI 传文件）。
-    返回 `(skills, warnings, snapshot_ref)`；无 active 时返回空列表（空 Skill baseline）。
-    在线链只读 active（硬约束 12：在线只读，写 promote 在离线）。
+    This is metadata-only: the online loader still consumes only inline
+    ``spec_content`` from the promoted snapshot. Missing or malformed
+    provenance is represented as empty strings and never guessed.
+    """
+    from pathlib import Path as _Path
+
+    from .promote_atomic import read_active_snapshot
+
+    p = _Path(path)
+    store_dir = p if p.is_dir() else p.parent
+    pointer = store_dir / "active_snapshot.json"
+    if not pointer.exists():
+        return "genesis", ""
+    try:
+        snap = read_active_snapshot(store_dir)
+    except Exception:  # noqa: BLE001 - provenance must not break online loading
+        return "genesis", ""
+    if not isinstance(snap, dict):
+        return "genesis", ""
+    snapshot_id = str(snap.get("snapshot_id", "genesis"))
+    registered = str(snap.get("manifest_hash", "") or "")
+    if not registered:
+        return snapshot_id, ""
+    # When the library manifest is present, independently recompute its
+    # canonical payload digest. A stale registration is not provenance.
+    manifest_path = store_dir.parent / "manifests" / "library_manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            claimed = str(manifest.pop("manifest_sha256", "") or "")
+            canonical = (json.dumps(manifest, ensure_ascii=False, indent=2,
+                                    sort_keys=True) + "\n").encode("utf-8")
+            computed = hashlib.sha256(canonical).hexdigest()
+        except Exception:  # noqa: BLE001 - malformed provenance is fail-closed
+            return snapshot_id, ""
+        if not claimed or claimed != computed or registered != computed:
+            return snapshot_id, ""
+    return snapshot_id, registered
+
+
+def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], str]:
+    """Read only the promoted inline SkillSpecs from an active snapshot.
+
+    ``path`` may be a snapshot store directory or its ``active_snapshot.json``
+    pointer.  The loader deliberately does not scan ``sources``, generated
+    files, candidates, or future candidates: only the atomically promoted
+    snapshot is eligible for online retrieval.  The three-value return shape
+    is kept for existing online callers.
     """
     import json
     from pathlib import Path as _Path
@@ -166,20 +213,27 @@ def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], st
     p = _Path(path)
     store_dir = p if p.is_dir() else p.parent
     warnings: list[str] = []
-    if not (store_dir / "active_snapshot.json").exists():
-        return [], [f"无 active snapshot（{store_dir}/active_snapshot.json 不存在）→ 空 Skill"], "genesis"
+    pointer = store_dir / "active_snapshot.json"
+    if not pointer.exists():
+        return [], [f"无 active snapshot（{pointer} 不存在）→ 空 Skill"], "genesis"
     try:
         snap = read_active_snapshot(store_dir)
     except Exception as exc:  # noqa: BLE001 - 损坏的指针不应让在线链崩掉
         return [], [f"active snapshot 读取失败: {type(exc).__name__}: {exc}"], "genesis"
+    if not isinstance(snap, dict):
+        return [], ["active snapshot 不是 JSON mapping → 空 Skill"], "genesis"
 
     skills: list[SkillSpec] = []
-    for rid, entry in (snap.get("entries") or {}).items():
-        if entry.get("candidate_type") != "skill":
+    entries = snap.get("entries") or {}
+    if not isinstance(entries, dict):
+        return [], ["active snapshot.entries 不是 mapping → 空 Skill"], "genesis"
+    for rid, entry in entries.items():
+        if not isinstance(entry, dict) or entry.get("candidate_type") != "skill":
             continue
         raw = entry.get("spec_content") or ""
         try:
-            skills.append(SkillSpec.model_validate(json.loads(raw)))
+            parsed = json.loads(raw)
+            skills.append(SkillSpec.model_validate(parsed))
         except Exception as exc:  # noqa: BLE001 - 单条损坏不阻断其余
             warnings.append(f"条目 {rid} 无法解析为 SkillSpec: {type(exc).__name__}: {exc}")
     return skills, warnings, str(snap.get("snapshot_id", "genesis"))

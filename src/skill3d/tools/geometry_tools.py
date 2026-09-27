@@ -47,6 +47,7 @@ from .contract import (
 )
 from .distance_primitives import (
     DistancePrimitiveParams,
+    consolidate_instances,
     object_extent,
     robust_distance_between_pointsets,
     robust_distance_to_reference,
@@ -54,6 +55,11 @@ from .distance_primitives import (
 )
 from .registry import REGISTRY
 from .scene_handle import SceneHandle
+
+# 实例整合的双向点云重合阈值（v7 §9.1）。
+# 实测分离度（scene 7b6477cb95 的 12 条 monitor 记录）：同一实例 0.38–0.69，
+# 不同实例 ≤0.14 → 取 0.30 落在间隙内，两侧各留 >2 倍余量。
+INSTANCE_OVERLAP_THRESHOLD = 0.30
 
 # 证据能力名（§7.1 词汇表；写成常量避免字符串散落）
 EV_GEOMETRY = "geometry_3d"
@@ -75,6 +81,24 @@ def _as_point(p: list[float], name: str) -> np.ndarray:
         raise DomainValueError(
             "argument_check", f"{name} 含 NaN/Inf: {p!r}", args={"name": name})
     return arr
+
+
+def _require_metric(value, tool: str, what: str):
+    """米制 Tool 的**非空米制值**校验（v7 §10.1 fail-closed）。
+
+    实测根因（2026-09-22 真实 smoke）：`object_distance_m` 在点云有效点不足时会让
+    原语返回 `distance_metric=None`，工具于是**静默**回一个 `{'distance_m': None}`。
+    模型照常取键、交给 `ReturnAnswer(None)` → 提交值归一成空串 → 评分解析失败 →
+    等值 0 分，而且**不会**触发恢复/零工具兜底（因为在管线上看这次调用是"成功"的）。
+    宁可让这次调用显式失败（`domain_value`），把 episode 推进到恢复或视觉估计路径。
+    """
+    if value is None or not np.isfinite(float(value)):
+        raise DomainValueError(
+            tool,
+            f"{what} 无法给出有限数值（{value!r}）：通常是该对象的有效 3D 点不足或"
+            "点云被判定为降级。请不要把它当作 0 —— 改用其他可用工具，"
+            "或直接依据图片给出视觉估计并在答案里标明是估计。")
+    return float(value)
 
 
 def _metric_scale_or_fail(handle: SceneHandle, tool: str) -> float:
@@ -118,9 +142,13 @@ def _metric_scale_if_authorized(handle: SceneHandle) -> Optional[float]:
 
 
 def _resolve_reference_xyz(handle: SceneHandle, reference: str, tool: str) -> np.ndarray:
-    """解析`robust_distance` 的参考点：观察点（相机/agent）或某个对象。
+    """解析参考点：观察点（相机/agent）或某个对象。
 
-    §9.6 官方口径：rel_distance 的参考是**观察点**（相机/agent），不是另一个对象。
+    **v7 §2.2 纠错**：`object_rel_distance` 的官方口径是
+    「**题面参照对象** → 各候选对象」，候选类别有多个实例时取最近实例
+    （依据 VSI-Bench 原论文附录 B.1）。观察点（相机）只是**辅助**参考，
+    不得用它替代题面对象间距离。这里保留 `camera`/`observer` 是因为相机量在
+    其他工具与审计里仍需要，但相对距离题请用 `relative_distance_rank`。
     """
     key = str(reference or "").strip().lower()
     if key in ("camera", "observer", "agent", "self", "camera_center", "camera0"):
@@ -185,15 +213,19 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
     ToolSpec(
         name="count_objects",
         description=("按类别统计实例数（category_name 子串匹配，如 'chair'）。"
-                     "**以 track 共识为准**（同一物体跨帧只算一次）。返回一个 dict："
+                     "**以实例共识为准**：先按 track 去重，再按点云几何重合把"
+                     "「同一物体被重复检出」的记录合并（v7 §9.1 三值之二）。"
+                     "返回一个 dict："
                      "{'count': 4, 'n_distinct_tracks': 4, 'n_records': 5, "
-                     "'n_without_track': 0, 'duplicate_suspect': False, "
-                     "'evidence_degraded': False}。"
+                     "'n_geometric_merges': 1, 'n_without_track': 0, "
+                     "'duplicate_suspect': False, 'evidence_degraded': False}。"
                      "**答案要取 `result['count']`**，不要把整个 dict 交给 ReturnAnswer。"
-                     "计数题必须用它，不要用 exists_in_scene 累加（那是布尔值）"),
+                     "计数题必须用它，不要用 exists_in_scene 累加（那是布尔值）。"
+                     "若 count 与你在图片里数出来的明显不符，用 YieldObservations "
+                     "把明细取回来再判断"),
         args_schema_ref="category_name:str",
         returns_schema_ref="dict",
-        cost_estimate_ms=2.0,
+        cost_estimate_ms=40.0,
         source_default="real",
         requires_artifacts=["objects"],
         requires_evidence=[EV_DETECTION, EV_TRACK],
@@ -202,11 +234,14 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
     )
 )
 def count_objects(handle: SceneHandle, category_name: str) -> dict:
-    """track 共识计数（§9.2）——**不数清单长度**。
+    """实例共识计数（§9.2）——**不数清单长度，也不只数 track 数**。
 
-    v5 实测：清单既有重复实例（12）又有漏绑实例（0），直接数长度会系统性错。
-    这里按 `track_id` 去重得到 `n_distinct_tracks`；若同一 track 出现在多条
-    记录里（3D 去重没合干净）→ `duplicate_suspect=True` 并降级提示。
+    v5/v6 实测：清单既有重复实例（同一显示器被分裂成多条 track）又有漏绑实例。
+    只按 `track_id` 去重会漏掉"支撑帧互不相交 → 时序判据不合并"的重复记录：
+    scene `7b6477cb95` 问 "How many monitor(s)"（GT=5）时返回 12。
+
+    v7 在 track 去重之上再加一道**几何重合**整合（与帧无关），
+    阈值有实测分离度支撑（同实例 0.38–0.69 vs 不同实例 ≤0.14）。
     """
     oids = handle.list_objects_by_name(category_name)
     tracks: dict[str, int] = {}
@@ -221,18 +256,52 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
             n_no_track += 1
         if o.duplicate_suspect:
             dup = True
-    n_distinct = len(tracks) + n_no_track
-    dup = dup or any(v > 1 for v in tracks.values())
+    n_track_distinct = len(tracks) + n_no_track
+
+    # ---- v7 §9.1：几何实例整合（补上"时序不重叠 → 不合并"的缺口）----
+    point_sets: dict[str, np.ndarray] = {}
+    merge_error: Optional[str] = None
+    for oid in oids:
+        try:
+            pts = handle.object_points(oid)
+        except Exception as exc:  # noqa: BLE001 - 单条点云缺失不该让计数整体失败
+            merge_error = f"{type(exc).__name__}: {exc}"
+            continue
+        if pts is not None and np.asarray(pts).size:
+            point_sets[oid] = np.asarray(pts, dtype=np.float64)
+    n_geometric_merges = 0
+    if len(point_sets) >= 2:
+        try:
+            cons = consolidate_instances(
+                point_sets,
+                min_overlap=INSTANCE_OVERLAP_THRESHOLD,
+                eps=float(DistancePrimitiveParams().voxel_size))
+            n_geometric_merges = int(cons["n_input"]) - int(cons["n_clusters"])
+            n_final = int(cons["n_clusters"])
+            # 有点云缺失的记录无法参与整合 → 原样计入（宁可高估也不静默丢弃）
+            n_final += len(oids) - len(point_sets)
+        except Exception as exc:  # noqa: BLE001 - 整合失败退化为 track 计数（不报错）
+            merge_error = f"{type(exc).__name__}: {exc}"
+            n_final = n_track_distinct
+    else:
+        n_final = n_track_distinct
+
     profile = handle.evidence_profile
     evidence_degraded = bool(
         profile is not None and profile.state(EV_TRACK) == "degraded")
     return {
-        "count": int(n_distinct),
-        "n_distinct_tracks": int(n_distinct),
+        "count": int(n_final),
+        "n_distinct_tracks": int(n_track_distinct),
         "n_records": len(oids),
+        "n_geometric_merges": int(n_geometric_merges),
         "n_without_track": int(n_no_track),
         "duplicate_suspect": bool(dup),
         "evidence_degraded": evidence_degraded,
+        "instance_consolidation": {
+            "method": "bidirectional_nn_pointcloud_overlap_v7",
+            "min_overlap": float(INSTANCE_OVERLAP_THRESHOLD),
+            "error": merge_error,
+        },
     }
 
 
@@ -304,9 +373,19 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
     pts = handle.object_points(obj.obj_id)
     if pts.shape[0] >= 3:
         res = object_extent(pts, metric_scale=_metric_scale_or_fail(handle, "object_3d_extent"))
+        # v7 §10.1：米制边长缺失（点云降级）→ 显式失败，不能让 None 变成空答案
+        ext_m = res.get("extent_metric")
+        if ext_m is None:
+            raise DomainValueError(
+                "object_3d_extent",
+                f"对象 {obj_id}（{obj.category_name}）的有效 3D 点不足"
+                f"（n_valid={res.get('n_valid_points')}），无法给出米制尺寸。"
+                "请不要把缺失值当作 0 —— 改用其他工具或依据图片给出视觉估计。",
+                args={"obj_id": obj_id})
         return {
             "extent_normalized": res["extent_normalized"],
-            "extent_metric": res["extent_metric"],
+            "extent_metric": ext_m,
+            "extent_longest_metric": res.get("extent_longest_metric"),
             "n_valid_points": int(res["n_valid_points"]),
             "degradation_flags": list(res.get("degradation_flags") or []),
         }
@@ -357,9 +436,11 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
     res = room_size_from_planes(np.asarray(pm, dtype=np.float64).reshape(-1, 3),
                                metric_scale=_metric_scale_or_fail(
                                    handle, "plane_fit_room_size"))
+    area = _require_metric(res.get("room_area_m2"), "plane_fit_room_size",
+                           "房间面积（平方米）")
     return {
         "room_diagonal_normalized": res.get("room_diagonal_normalized"),
-        "room_area_m2": res.get("room_area_m2"),
+        "room_area_m2": area,
         "plane_inlier_ratio": res.get("plane_inlier_ratio"),
         "fit_quality": res.get("fit_quality"),
         "degradation_flags": list(res.get("degradation_flags") or []),
@@ -371,13 +452,13 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
 @REGISTRY.register(
     ToolSpec(
         name="robust_distance",
-        description=("稳健距离：reference 到 target 的**低分位**距离。reference 可写 "
-                     "'camera'/'observer'（观察点）或某个对象 id；target 是对象 id。"
-                     "**相对距离题（object_rel_distance）的官方口径就是"
-                     "「观察点→各候选对象」分别算再比较**，不是对象↔对象距离，"
-                     "也不需要米制尺度（比较中尺度会约掉）。"
-                     "返回 {distance_normalized, distance_metric, quantile_q, "
-                     "voxel_size, n_valid_points, degradation_flags}"),
+        description=("稳健距离：reference 到 target 的**低分位**（近邻）距离。"
+                     "reference 可写 'camera'/'observer'（观察点）**或某个对象 id**；"
+                     "target 是对象 id。返回键："
+                     "{'distance_normalized', 'distance_metric'(米，无米制授权时为 None), "
+                     "'quantile_q', 'voxel_size', 'n_valid_points', 'degradation_flags'}。"
+                     "**相对距离题请改用 `relative_distance_rank`**（它一次比较多个候选，"
+                     "且用的是官方口径「题面参照对象→候选」）"),
         args_schema_ref="reference:str, target:str",
         returns_schema_ref="dict",
         cost_estimate_ms=20.0,
@@ -388,7 +469,7 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
     )
 )
 def robust_distance(handle: SceneHandle, reference: str, target: str) -> dict:
-    """§9.6/§12.3 稳健低分位距离（rel_distance 官方口径，不需米制尺度）。"""
+    """§9.6/§12.3 稳健低分位距离（不依赖米制尺度即可比较远近）。"""
     ref_xyz = _resolve_reference_xyz(handle, reference, "robust_distance")
     tgt = _get_object(handle, target, "robust_distance")
     pts = handle.object_points(tgt.obj_id)
@@ -458,9 +539,14 @@ def camera_object_distance(handle: SceneHandle, obj_id: str) -> dict:
 @REGISTRY.register(
     ToolSpec(
         name="surface_distance_between_objects",
-        description=("两个对象**表面之间**的距离（双向最近邻的低分位，归一化单位）。"
-                     "**注意：它不用于 object_rel_distance 题型的官方口径作答**"
-                     "（那个口径是「观察点→各对象」）。仅在需要对象间距的场景使用"),
+        description=("两个对象**表面之间**的最近距离（双向最近邻的低分位，归一化单位）。"
+                     "**绝对距离题（object_abs_distance）用 `object_distance_m`**；"
+                     "相对距离题用 `relative_distance_rank`。"
+                     "返回键：{'surface_distance_normalized', "
+                     "'surface_distance_metric'（米；无米制授权时 None）, "
+                     "'n_nn_samples', 'n_valid_points', 'quantile_q', 'voxel_size', "
+                     "'degradation_flags'}。兼容别名 `distance_normalized` / "
+                     "`distance_metric` 同时返回，两者是同一个数"),
         args_schema_ref="obj_a:str, obj_b:str",
         returns_schema_ref="dict",
         cost_estimate_ms=30.0,
@@ -487,6 +573,11 @@ def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str
     return {
         "surface_distance_normalized": res.distance_normalized,
         "surface_distance_metric": res.distance_metric,
+        # v7 §10.1 兼容别名：模型在 v6 实测里稳定地按 `distance_metric` 取名取键
+        # （object_abs_distance 的 16 道题里 6 道因此 KeyError 而作废），
+        # 同一份数多给一个键比让模型猜键名更划算。
+        "distance_normalized": res.distance_normalized,
+        "distance_metric": res.distance_metric,
         "n_nn_samples": int(getattr(res, "n_nn_samples", 0) or 0),
         "n_valid_points": int(res.n_valid_points),
         "point_contamination_suspect": (
@@ -497,19 +588,150 @@ def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str
     }
 
 
-# ----------------------------------------------------------------- 方向 ----
+# ------------------------------------------------- 相对距离题（v7 §2.2 口径）----
 
 @REGISTRY.register(
     ToolSpec(
+        name="relative_distance_rank",
+        description=("**相对距离题（object_rel_distance）的官方口径实现**：给定题面"
+                     "**参照对象** reference，以及若干**候选类别** candidates，"
+                     "比较「参照对象 → 各候选」的最近距离，返回排序结果。"
+                     "候选类别有多个实例时**取离参照对象最近的实例**（原论文附录 B.1）。"
+                     "不需要米制尺度（比较中尺度约掉）。"
+                     "参数：reference 是对象 id 或类别名；candidates 是**类别名列表**"
+                     "（如 ['telephone','keyboard']）。"
+                     "返回 {ranking:[{category, distance_normalized, obj_id}...], "
+                     "closest_category, per_candidate:{类别: 最近距离}}（按距离升序）"),
+        args_schema_ref="reference:str, candidate_categories:list[str]",
+        returns_schema_ref="dict",
+        cost_estimate_ms=60.0,
+        source_default="real",
+        requires_artifacts=["point_cloud", "objects"],
+        requires_evidence=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+    )
+)
+def relative_distance_rank(handle: SceneHandle, reference: str,
+                           candidate_categories: list[str]) -> dict:
+    """参照对象 → 候选类别（取最近实例）的距离排序（v7 §2.2）。
+
+    题面形如「which of these objects (a, b, c, d) is the closest to the X?」：
+    X 是参照对象，a/b/c/d 是候选类别。官方口径是「X 到各候选的最近距离」，
+    **不是**相机到候选的距离 —— v6 曾把后者写成官方口径，导致该类题系统性答错。
+    """
+    ref = handle.get_object(_get_object(handle, reference,
+                                        "relative_distance_rank").obj_id)
+    ref_pts = handle.object_points(ref.obj_id)
+    if not isinstance(candidate_categories, (list, tuple)) or not candidate_categories:
+        raise DomainValueError("relative_distance_rank",
+                               "candidate_categories 必须是非空列表（类别名列表）",
+                               args={"candidate_categories": candidate_categories})
+    ranking: list[dict] = []
+    per_candidate: dict[str, object] = {}
+    missing: list[str] = []
+    for cat in candidate_categories:
+        oids = handle.list_objects_by_name(str(cat))
+        if not oids:
+            missing.append(str(cat))
+            continue
+        # 类别有多个实例 → 取离参照对象最近的实例（官方口径）
+        best = None
+        for oid in oids:
+            res = robust_distance_between_pointsets(
+                ref_pts, handle.object_points(oid),
+                metric_scale=_metric_scale_if_authorized(handle),
+                params=DistancePrimitiveParams(),
+                duplicate_suspect=bool(handle.get_object(oid).duplicate_suspect))
+            d = res.distance_normalized
+            if d is None or not np.isfinite(float(d)):
+                continue
+            if best is None or float(d) < float(best[0]):
+                best = (float(d), oid, len(oids))
+        if best is None:
+            missing.append(str(cat))
+            continue
+        per_candidate[str(cat)] = best[0]
+        ranking.append({"category": str(cat), "obj_id": best[1],
+                        "distance_normalized": best[0],
+                        "n_instances_in_category": int(best[2])})
+    ranking.sort(key=lambda r: r["distance_normalized"])
+    return {
+        "reference": {"obj_id": ref.obj_id, "category_name": ref.category_name},
+        "ranking": ranking,
+        "closest_category": ranking[0]["category"] if ranking else None,
+        "per_candidate": per_candidate,
+        "categories_without_detection": missing,
+        "definition": "reference_object_to_nearest_candidate_instance_v7",
+        "quantile_q": DistancePrimitiveParams().quantile_q,
+        "degradation_flags": ([] if not missing else ["category_missing:" +
+                                                     ",".join(missing)]),
+    }
+
+
+@REGISTRY.register(
+    ToolSpec(
+        name="object_distance_m",
+        description=("**绝对距离题（object_abs_distance）用**：题面点名的两个对象之间"
+                     "的最近距离，**单位米**。参数 a、b 是对象 id 或类别名。"
+                     "返回 {'distance_m': D, 'distance_normalized': d, ...}；"
+                     "`distance_m` 单位是米（题面要厘米时 ×100）。**不是**相机到"
+                     "对象的距离。需要米制尺度；尺度不可用时本 Tool 不出现"),
+        args_schema_ref="obj_a:str, obj_b:str",
+        returns_schema_ref="dict",
+        cost_estimate_ms=30.0,
+        source_default="real",
+        requires_artifacts=["point_cloud", "objects", "scale"],
+        requires_evidence=[EV_GEOMETRY, EV_METRIC, EV_DETECTION, EV_GROUNDING],
+        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+    )
+)
+def object_distance_m(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
+    """两对象最近距离（米制）——绝对距离题的官方口径（v7 §4/§9.2）。"""
+    a = _get_object(handle, obj_a, "object_distance_m")
+    b = _get_object(handle, obj_b, "object_distance_m")
+    if a.obj_id == b.obj_id:
+        raise DomainValueError("object_distance_m",
+                               f"obj_a 与 obj_b 是同一对象: {obj_a}",
+                               args={"obj_a": obj_a, "obj_b": obj_b})
+    scale = _metric_scale_or_fail(handle, "object_distance_m")
+    res = robust_distance_between_pointsets(
+        handle.object_points(a.obj_id), handle.object_points(b.obj_id),
+        metric_scale=scale, params=DistancePrimitiveParams(),
+        duplicate_suspect=bool(a.duplicate_suspect or b.duplicate_suspect))
+    d_m = _require_metric(res.distance_metric, "object_distance_m",
+                          f"{a.category_name} 与 {b.category_name} 的最近距离（米）")
+    return {
+        "distance_m": d_m,
+        "distance_normalized": res.distance_normalized,
+        "distance_metric": res.distance_metric,
+        "a": {"obj_id": a.obj_id, "category_name": a.category_name},
+        "b": {"obj_id": b.obj_id, "category_name": b.category_name},
+        "definition": "pointcloud_surface_nearest_quantile",
+        "quantile_q": res.quantile_q,
+        "voxel_size": res.voxel_size,
+        "n_valid_points": int(res.n_valid_points),
+        "degradation_flags": _degraded_property(
+            res, metric_ok=res.distance_metric is not None),
+    }
+
+
+# ----------------------------------------------------------------- 方向 ----
+@REGISTRY.register(
+    ToolSpec(
         name="relative_direction_of",
-        description=("站在 observer 处、**面向 facing_at**，判断 target 在 "
-                     "front/behind/left/right 哪个方向。三个参数都是**对象 id 或类别名**"
-                     "（如 'obj_3' / 'whiteboard'），内部取各自质心："
-                     "facing 方向 = facing_at 质心 − observer 质心。"
-                     "返回 dict：{'direction': 'left', 'world_up_used': [...], "
-                     "'handedness_used': 'right'}；**答案取 `result['direction']`**并把"
-                     "方向词映射到选项字母。方向题优先用它，不要自己拼朝向向量"),
-        args_schema_ref="observer_id:str, facing_at_id:str, target_id:str",
+        description=("站在 observer 处、**面向 facing_at**，判断 target 相对我的方位。"
+                     "参数是**对象 id 或类别名**（如 'obj_3' / 'whiteboard'），内部取"
+                     "各自质心：facing 方向 = facing_at 质心 − observer 质心。"
+                     "`difficulty` **必须按题面难度传**（默认为 medium），因为三个难度的"
+                     "**选项集合不同**："
+                     "easy → 只返回 left/right；"
+                     "medium → left/right/back（转身 ≥135° 才算 back）；"
+                     "hard → front-left/front-right/back-left/back-right。"
+                     "返回 dict {'direction': 'left', 'difficulty': 'medium', "
+                     "'theta_deg': -92.1, 'world_up_used': [...], "
+                     "'handedness_used': 'right'}；**答案取 `result['direction']`**，"
+                     "再按题面选项文本映射到选项字母。方向题优先用它"),
+        args_schema_ref="observer_id:str, facing_at_id:str, target_id:str, difficulty:str='medium'",
         returns_schema_ref="dict",
         cost_estimate_ms=2.0,
         source_default="real",
@@ -521,11 +743,15 @@ def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str
     )
 )
 def relative_direction_of(handle: SceneHandle, observer_id: str,
-                          facing_at_id: str, target_id: str) -> dict:
-    """按对象 id 解析参照系后的相对方位（§9.8）。
+                          facing_at_id: str, target_id: str,
+                          difficulty: str = "medium") -> dict:
+    """按对象 id 解析参照系后的相对方位（§9.3/§9.8）。
 
-    判据 `right ⟺ (f×d)·u < 0`，`u = world_up`。**world_up/handedness 缺失或非法
-    → fail-closed（抛错）**，不退回无符号启发式。
+    选项集合由 `difficulty` 决定（§9.3）：**不得**用一个简化输出覆盖三个模板 ——
+    实测 medium 题面的选项是「left/right/back」，旧实现返回的 `"front"` 不在选项里，
+    模型只能硬猜一个，是该类题系统性答错的主因之一。
+
+    **world_up/handedness 缺失或非法 → fail-closed（抛错）**，不退回无符号启发式。
     """
     obs = handle.object_centroid_world(_get_object(handle, observer_id,
                                                    "relative_direction_of").obj_id)
@@ -536,15 +762,18 @@ def relative_direction_of(handle: SceneHandle, observer_id: str,
     try:
         direction = direction_of(
             observer_xyz=obs, facing_xyz=fac, target_xyz=tgt,
-            world_up=handle.world_up, handedness=handle.handedness)
+            world_up=handle.world_up, handedness=handle.handedness,
+            difficulty=difficulty)
     except ValueError as exc:
         # §9.8：世界系约定缺失/非法 → fail-closed（DomainValueError，不猜）
         raise DomainValueError("relative_direction_of", str(exc),
                                args={"observer_id": observer_id,
                                      "facing_at_id": facing_at_id,
-                                     "target_id": target_id}) from exc
+                                     "target_id": target_id,
+                                     "difficulty": difficulty}) from exc
     return {
         "direction": direction,
+        "difficulty": str(difficulty).strip().lower(),
         "world_up_used": [float(x) for x in handle.world_up],
         "handedness_used": str(handle.handedness),
     }

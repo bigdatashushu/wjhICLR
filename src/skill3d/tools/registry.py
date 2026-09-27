@@ -42,10 +42,15 @@ from skill3d.tools.contract import (
     scope_allows,
     tool_allowed,
 )
+from skill3d.schemas.authorization import ToolAuthorizationReceipt
+from skill3d.tools.contract import authorize_tool_call
 from skill3d.tools.mock_switch import MockSwitch, request_key
 from skill3d.tools.scene_handle import SceneHandle
 
-TOOL_FACE_VERSION: str = "tool-face-v6"
+# v9 §9.2/§9.4：工具面新增 `inspect_frames` / `detect_objects`（主动图像与补检）。
+# 工具面变了就升版本 —— prompt 里列出的 Tool 集合与 trace 的 tool_face_version
+# 必须对得上，否则"这次跑的是哪套工具面"无法回答。
+TOOL_FACE_VERSION: str = "tool-face-v9"
 
 
 class ToolNotFoundError(KeyError):
@@ -249,9 +254,10 @@ class ToolRegistry:
                 f"**米制证据门未通过**（本题题型={question_type}）"
                 + (f"，缺失子条件={sorted(gate_missing)}" if gate_missing else "")
                 + "；依赖米制尺度的 Tool 已被收回，"
-                "严禁用世界单位/相对单位冒充米制数值。"
-                "若本题必须给米制量，请在 program 里直接调用 "
-                'ReturnAnswer("abstain")。')
+                "严禁用世界单位/相对单位冒充米制数值（不要把归一化值当米）。"
+                "**本题仍必须作答**（有图必答）：请改用还能用的非米制 Tool，"
+                "或直接依据你在图片里看到的内容给出**视觉估计**"
+                "（一个带正确单位的数值）；缺失的测量值不是拒答理由。")
         ev_line = ""
         if evidence_profile is not None:
             ev_line = ("证据画像=" + ", ".join(
@@ -259,8 +265,8 @@ class ToolRegistry:
         return (f"当前 question_tool_scope={scope}；可用重建产物={avail}。\n"
                 f"{ev_line}{metric_line}\n"
                 f"只允许调用下面列出的 Tool；它们所需的产物与证据都已就绪。"
-                f"若某个量在当前条件下无法获得，请直接 ReturnAnswer(\"abstain\")，"
-                f"不要猜测数值。")
+                f"若某个量在当前条件下无法用工具获得，就改用还能用的方法，"
+                f"或依据图片给出你的最佳估计 —— **必须给出答案**，不要拒答。")
 
     # ---- 参数校验 ----
     @staticmethod
@@ -286,6 +292,7 @@ class ToolRegistry:
         scene: SceneHandle,
         mode: ToolSource = "real",
         mock_switch: Optional[MockSwitch] = None,
+        episode_id: str = "",
     ) -> ToolResult:
         """validate(args) → **契约校验（fail-closed）** → mock 解析 → 执行 → ToolResult。
 
@@ -299,6 +306,29 @@ class ToolRegistry:
         scope = scene.question_tool_scope
         available = scene.available_artifacts
         profile = scene.evidence_profile
+
+        # §6.4：**同一判定函数**先产出结构化授权决策，再据此决定放行或抛错。
+        # 收据因此与"实际是否执行"同源；下面的四道检查保持原顺序与原错误文案，
+        # 行为不变，只是多了一份可审计凭据。
+        digest = hashlib.sha256(
+            f"{request_key(name, args)}:{scene.state_digest()}".encode()
+        ).hexdigest()
+        decision = authorize_tool_call(
+            name, entry.spec, scope=scope, profile=profile,
+            available_artifacts=available,
+            gate=scene.metric_evidence_gate_result,
+            supported_metric_tasks=entry.spec.supported_metric_tasks,
+            allowed_metric_tasks=scene.allowed_metric_tasks,
+            question_type=scene.question_type, args=args)
+        receipt = ToolAuthorizationReceipt(
+            episode_id=episode_id, tool_id=name, argument_digest=digest,
+            evidence_version=str(getattr(profile, "profile_version", "") or ""),
+            dependency_refs=list(decision.dependency_refs),
+            allowed=bool(decision.allowed),
+            reason_codes=list(decision.reason_codes),
+            metric_gate_result=dict(decision.metric_gate_result),
+            args=dict(args), scene_route=str(scene.scene_route),
+            question_tool_scope=str(scope))
 
         # ① scope 收窄（§5.3）：scope 之外的工具即便被模型写出也不得执行
         if not scope_allows(entry.spec, scope):
@@ -334,10 +364,6 @@ class ToolRegistry:
         # T4 防污染：准入阶段（mode=real）出现 mock_* source 必须抛错
         MockSwitch.assert_admission_clean(source, mode)
 
-        digest = hashlib.sha256(
-            f"{request_key(name, args)}:{scene.state_digest()}".encode()
-        ).hexdigest()
-
         t0 = time.perf_counter()
         error: Optional[str] = None
         error_code: Optional[str] = None
@@ -354,7 +380,9 @@ class ToolRegistry:
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
         degraded = degraded_evidence_flags(entry.spec, profile)
+        receipt = receipt.model_copy(update={"result_id": digest[:16]})
         return ToolResult(
+            authorization=receipt.model_dump(),
             result_id=digest[:16],
             source_tool=name,
             tool=name,

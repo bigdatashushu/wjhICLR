@@ -36,12 +36,17 @@ class TestReport:
 
 @dataclass
 class CandidateArchive:
-    """失败留档：已 reject 候选，防重复（§7 防污染）。"""
+    """失败留档与 revision 索引，防重复并支持最终版本晋升（§7）。"""
 
     rejected_specs: list[str] = field(default_factory=list)
+    revisions: dict[str, CandidateRevision] = field(default_factory=dict)
 
     def add_rejected(self, spec_content: str) -> None:
         self.rejected_specs.append(spec_content)
+
+    def remember(self, revision: CandidateRevision) -> None:
+        self.revisions[revision.revision_id] = revision
+
 
     def similar_rejected(self, spec_content: str,
                          threshold: float = DUP_REJECT_THRESHOLD) -> list[str]:
@@ -89,6 +94,7 @@ def run_optimization_loop(
         return run
 
     current = root
+    archive.remember(root)
     outer_attempted = False  # 硬约束 10：outer 只跑一次
 
     while run.status == "running":
@@ -103,6 +109,7 @@ def run_optimization_loop(
         if static_check_fn is not None and not static_check_fn(current):
             feedback = "static_check_failed"
             current = revise_fn(current, feedback)
+            archive.remember(current)
             run.budget_used.revisions += 1
             run.revision_history.append(current.revision_id)
             run.current_revision_id = current.revision_id
@@ -119,6 +126,7 @@ def run_optimization_loop(
                 archive.add_rejected(current.spec_content)
                 break
             current = revise_fn(current, l1.feedback)
+            archive.remember(current)
             run.budget_used.revisions += 1
             run.revision_history.append(current.revision_id)
             run.current_revision_id = current.revision_id
@@ -134,6 +142,7 @@ def run_optimization_loop(
                 archive.add_rejected(current.spec_content)
                 break
             current = revise_fn(current, l2.feedback)
+            archive.remember(current)
             run.budget_used.revisions += 1
             run.revision_history.append(current.revision_id)
             run.current_revision_id = current.revision_id

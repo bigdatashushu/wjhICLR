@@ -119,6 +119,47 @@ class CandidateRevision(Spec):
     evidence_lineage_ref: str
     created_by: Literal["gpt6_induction", "gpt6_revision", "human"]
     created_at: str
+    # v9 provenance refs are optional for compatibility with historical
+    # in-memory candidates; file-backed library candidates should populate them.
+    source_split: Optional[str] = None
+    experience_relation: Optional[str] = None
+    source_path: Optional[str] = None
+    source_sha256: Optional[str] = None
+    generated_spec_path: Optional[str] = None
+    generated_sha256: Optional[str] = None
+    manifest_ref: Optional[str] = None
+    candidate_record_ref: Optional[str] = None
+
+
+class SkillLibraryCandidate(Spec):
+    """v9 file-backed candidate record, separate from runtime CandidateRevision.
+
+    The record describes why a candidate exists and how it may be validated;
+    ``CandidateRevision.spec_content`` remains the immutable runtime payload
+    used by the existing evolution driver.
+    """
+
+    candidate_id: str
+    operation: str
+    canonical_question_type: str
+    parent_snapshot_id: Optional[str] = None
+    parent_skill_versions: list[str] = []
+    source_trace_refs: list[str] = []
+    source_split: str
+    experience_relation: str
+    hypothesis: str
+    patch: str
+    expected_scope: str
+    expected_effect: str
+    known_risks: str
+    inducer_receipt_ref: Optional[str] = None
+    static_check_ref: Optional[str] = None
+    source_path: Optional[str] = None
+    source_sha256: Optional[str] = None
+    generated_spec_path: Optional[str] = None
+    generated_sha256: Optional[str] = None
+    manifest_ref: Optional[str] = None
+    created_at: str
 
 
 class RevisionExperiment(Spec):

@@ -158,7 +158,11 @@ def extract_program_source_ex(text: str) -> tuple[str, bool]:
     if not _parses(stripped):
         exc = _syntax_error(stripped)
         raise SynthesisError(f"program 语法错误: {exc}") from exc
-    return stripped, True                   # 无围栏 → 也是回退路径
+    # §11.3（规范原文）："无围栏但完整程序**不计**解析恢复。"
+    # 这里既没有截断，也没有丢弃内容，更没有补造答案 —— 只是没写围栏，属正常产出，
+    # 因此返回 False（干净路径）。此前返回 True 会把这类 episode 记成
+    # `m8_parse_recovered`，虚增回退率并低估 `vllm_ok`。
+    return stripped, False
 
 
 def extract_program_source(text: str) -> str:

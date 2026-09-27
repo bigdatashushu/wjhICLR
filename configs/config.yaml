@@ -5,20 +5,69 @@ mode: online  # online | offline_evolution
 
 seed: 0
 
+# v9 execution/evolution starting configuration. These values are recorded
+# for reproducibility; real runtime wiring and calibration remain pending.
+max_solver_rounds: 6
+max_retries_per_operation: 3
+finalization_rounds: 1
+max_evolution_rounds: 2
+candidate_validation_seeds: [0, 1]
+
 paths:
   data_root: data
   vsi_bench_meta: data/vsi_bench_meta
   # 本机实测可用（2026-09-18）：288/288 scene 全覆盖，布局 <root>/<dataset>/<scene>.mp4
   raw_videos: /nas/wangjh/Skill-3D/dataset/VSI-Bench
+  # v9 §5.2"可重试加载"的来源副本（用户 2026-09-27 裁定：重试 = **换来源/换副本**）。
+  # 主来源缺失/不可解码时，按序尝试这些备用根：<fb>/<dataset>/<scene>.mp4（目录式镜像）
+  # 与 <fb>/<dataset>_<scene>.mp4（平铺式镜像）。本机 VSI_videos 是**部分**副本
+  # （274 个文件，未覆盖全部 288 scene），因此只有主来源真的坏掉/缺失时才会用到它。
+  # 用了副本的题会记进 RunManifest 的 source_retried_samples，且 video_id 带来源标签
+  # （副本可能是另一种编码，禁止与主来源共用重建缓存）。
+  raw_video_fallbacks:
+    - /nas/wangjh/Skill-3D/dataset/VSI_videos
   reconstructions: data/reconstructions
   trace_store: data/traces
   memory_db: data/memory_lancedb
-  skill_registry: data/skill_registry
-  active_snapshot: data/active_snapshot.json
+  # v9: one authoritative repository-local Skill library. The registry path
+  # remains as a compatibility alias to the atomic snapshot store.
+  skill_library: skill_library
+  skill_registry: skill_library/snapshots
+  active_snapshot: skill_library/snapshots/active_snapshot.json
 
 frame_sampling:
   n_frames: 32                          # 与 VSI-Bench 官方开源模型对齐
   strategy: uniform
+# M2 质量诊断（模糊／曝光／对比度／运动）：v9 §5.1 要求**默认关闭**，
+# 只在独立诊断实验中开启。默认 1.0 权重不影响主流程（scene_route 不再被 M2 权重左右）。
+input_diagnostics: false
+
+# v9 §13.5 检索策略（P6）：top-k／排序规则／方法上下文上限必须**写入配置并在演化
+# 开始前冻结**，且每次检索的记录里带配置版本（§13.6）。改这里等于改实验自变量，
+# 必须同时改 config_version 标签 —— 不得在运行期按题/按场景临时调整。
+retrieval:
+  config_version: ret-v9-1      # 人类标签；内容摘要另由代码复算并落盘（不可抵赖）
+  top_k: 3                      # §13.5 起始配置（规范允许开发起点取 1；S0 每题型只有 1 条）
+  rerank: true                  # false = 关键词打分（§8.1 "w/o LanceDB reranker" 消融）
+  candidates: 50                # 语义排序的候选池大小
+  rank_weights:                 # 排序规则的完整参数集（未登记键会被拒绝，不静默忽略）
+    semantic: 1.0               # 语义主分权重（rerank=true）
+    keyword: 1.0                # 关键词主分权重（rerank=false）
+    semantic_mix_keyword: 0.0   # 语义路径混入关键词分的权重（0=纯语义）
+  # §13.5"上下文放不下时先减少完整条目"的上限，同时是"超过服务限制的候选在静态
+  # 检查中拒绝"的判据（单条正文超过它的候选永远无法完整交付）。
+  # 依据：32 帧 @max_pixels=131072 ≈ 9.7k prompt tokens，max_model_len=32768，
+  # 留出推理与程序输出余量后给方法上下文的预算。
+  method_context_max_chars: 8000
+
+# v9 §9.4 主动图像（inspect_frames / detect_objects）：图像布局必须**事先声明**。
+# 服务实测：8100 的 vLLM 是 `--limit-mm-per-prompt {"image": 32}`，一个请求最多 32 张图
+# （实测 33 张 → 400 "At most 32 image(s) may be provided in one prompt"）。
+# 因此观察轮用声明布局 `derived_plus_originals_v1`：派生图（裁剪）优先占位，其余名额
+# 按帧序补原帧；被省略的原帧已在更早请求里交付过，被省略的派生图保持 unobserved。
+active_vision:
+  layout: derived_plus_originals_v1
+  max_derived_images: 8        # 单次请求里派生图的占位上限（服务上限内）
 
 vllm:
   model: Qwen/Qwen3-VL-8B-Instruct-FP8  # 实测：BF16(17GB) 与共用卡时 OOM，主线用官方 FP8（9.9GB）

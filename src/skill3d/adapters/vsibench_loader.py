@@ -11,7 +11,7 @@ import hashlib
 import random
 from collections import defaultdict
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, NamedTuple, Optional, Sequence
 
 import numpy as np
 
@@ -27,7 +27,9 @@ from .frame_set import frame_set_hash as _frame_set_hash
 
 __all__ = [
     "N_FRAMES", "SPLIT_RATIOS", "EpisodeUnavailable", "FrameSetError",
-    "load_meta", "sample_uniform_indices", "video_path_for", "build_episode",
+    "VIDEO_CONTAINER_SUFFIXES", "VideoSource", "load_meta",
+    "sample_uniform_indices", "video_id_for", "video_path_for",
+    "video_source_candidates", "build_episode",
     "make_split_config", "assert_final_test_isolation", "split_of",
     "build_frame_set", "_frame_set_hash",
 ]
@@ -79,10 +81,12 @@ def load_meta(cache_dir: Optional[str] = None,
 
 
 def sample_uniform_indices(total_frames: int, n: int = N_FRAMES) -> list[int]:
-    """32 帧时间均匀采样索引（§4 M1）：严格单调递增、唯一、确定性。
+    """时间均匀采样索引（§4 M1）：严格单调递增、唯一、确定性。
 
-    委托 `adapters/frame_set.uniform_frame_ids`（单一事实源）。视频不足 n 帧时抛
-    `FrameSetError`（输入合法性硬失败，硬约束 21 禁止重复帧补齐）。
+    委托 `adapters/frame_set.uniform_frame_ids`（单一事实源）。视频不足 n 帧时按
+    v9 §5.2 返回**全部可用帧**（不重复填充凑数），由 `FrameSet.n_frames` /
+    `decode_status` 与 `input_degraded` 显式记录；只有"一帧都没有"才抛
+    `FrameSetError`。
     """
     return uniform_frame_ids(total_frames, n)
 
@@ -112,6 +116,87 @@ def video_path_for(qa_row: dict, video_root: str | Path) -> Path:
     root = Path(video_root)
     # 起始约定：<root>/<dataset>/<scene_name>.mp4；真实布局待用户确认
     return root / str(qa_row["dataset"]) / f"{qa_row['scene_name']}.mp4"
+
+
+# 视频容器后缀（同一 scene 的**同名副本**可能是另一种编码/容器）
+VIDEO_CONTAINER_SUFFIXES: tuple[str, ...] = (".mp4", ".mkv", ".avi", ".mov", ".webm")
+
+
+class VideoSource(NamedTuple):
+    """一个**来源候选**：视频路径 + 来源标签（标签进 `video_id`，见 §5.2 缓存身份）。"""
+
+    path: Path
+    tag: str          # "" = 主约定（`<root>/<dataset>/<scene>.mp4`）
+    convention: str   # primary | alt_container | mirror_dir | mirror_flat
+
+
+def video_source_candidates(
+    qa_row: dict,
+    video_root: str | Path,
+    fallback_roots: Sequence[str | Path] = (),
+) -> list[VideoSource]:
+    """按优先级返回该 scene 的**来源候选**（§5.2"可重试加载"）。
+
+    规范原文（§5.2）："全部指定图像缺失或无法解码：`input_error`，记录原因；
+    **可重试加载**，不生成伪答案。"
+
+    **决策记录（用户 2026-09-27）**：这里的"重试"指**换来源/换副本**（另一个根目录、
+    镜像目录或同名不同容器的副本），**不是**对同一个文件反复解码 —— 同一文件重解码
+    只会得到同一结果，那等于没重试。因此候选顺序是：
+
+    1. 主约定 `<root>/<dataset>/<scene>.mp4`（现行布局）；
+    2. 同目录其它容器 `<root>/<dataset>/<scene>.<ext>`（同名副本，可能是另一种编码）；
+    3. 每个备用根（`fallback_roots`，来自配置；**默认空**，不隐式启用）：
+       a. `<fb>/<dataset>/<scene>.mp4`（目录式镜像）；
+       b. `<fb>/<dataset>_<scene>.mp4`（平铺式镜像，例如 `<root>/VSI_videos/`）。
+
+    顺序即优先级；按路径去重后返回。**只有主来源失败时才会用到后面的候选**，
+    因此主来源正常时行为与本次改动前逐字一致。
+    """
+    root = Path(video_root)
+    dataset = str(qa_row["dataset"])
+    scene = str(qa_row["scene_name"])
+    out: list[VideoSource] = []
+    seen: set[str] = set()
+
+    def _add(path: Path, tag: str, convention: str) -> None:
+        key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(VideoSource(path=path, tag=tag, convention=convention))
+
+    for i, suffix in enumerate(VIDEO_CONTAINER_SUFFIXES):
+        _add(root / dataset / f"{scene}{suffix}",
+             "" if i == 0 else suffix.lstrip("."),
+             "primary" if i == 0 else "alt_container")
+    for fb in (fallback_roots or ()):
+        fb_root = Path(fb)
+        tag = fb_root.name or str(fb_root)
+        for suffix in VIDEO_CONTAINER_SUFFIXES:
+            _add(fb_root / dataset / f"{scene}{suffix}", tag, "mirror_dir")
+        for suffix in VIDEO_CONTAINER_SUFFIXES:
+            _add(fb_root / f"{dataset}_{scene}{suffix}", tag, "mirror_flat")
+    return out
+
+
+def video_id_for(qa_row: dict, source: VideoSource) -> str:
+    """`video_id`（§5.2 源标识，参与缓存身份）：主来源用原名，副本带来源标签。
+
+    §5.2 明文禁止"仅凭相同的帧索引列表跨视频复用"缓存。**副本可能是另一种编码**
+    （同一 scene、不同字节），所以从副本加载时必须让身份与主来源不同 —— 否则主来源
+    算好的 artifact 会被副本的 episode 直接复用，而两者像素并不相同。
+    主来源保持不变（历史缓存键不失效，§17.2）。
+
+    基准名取**逻辑身份**（`video_id` 字段，缺省 = scene 名，与主约定 `<scene>.mp4`
+    的 stem 一致），而不是副本自己的文件名 —— 平铺镜像的文件名是
+    `<dataset>_<scene>.mp4`，若拿它当基准，身份会连带文件名约定一起变。
+    """
+    base = str(qa_row.get("video_id", "") or qa_row.get("scene_name", "")
+               or Path(source.path).stem)
+    if not source.tag or source.convention == "primary":
+        return base
+    return f"{base}@{source.tag}"
 
 
 def build_episode(

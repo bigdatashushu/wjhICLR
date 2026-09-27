@@ -1,0 +1,1124 @@
+{
+  "bundle_format": "harness3d-s0-source-bundle/1.0",
+  "authored_date": "2026-09-25",
+  "description": "8 task-isolated authored Skill sources; document-based runtime candidates, not production activated",
+  "source_revision": "c79deab894c5274ab9bd6285b10276084216ed44",
+  "file_count": 18,
+  "files": [
+    {
+      "path": "FORMAT.md",
+      "sha256": "008192c8dccef5ed2474c5606963a9ab4a739795c5c25e544eb4727a23f3b018",
+      "content": "# harness3D 初始 S0：文件格式与使用说明\n\n版本：初始方法文件 1.0.0｜日期：2026-09-25｜状态：方法与文档级检查完成，待实际系统验收。\n\n本交付是 harness3D 项目的八个初始方法文件及其导入数据。它不修改个人技能目录，也不修改现有系统源码、active 快照或整份架构文档。\n\n## 保存方案\n\n**每个 Skill 使用独立目录中的 `SKILL.md`；YAML 文件头保存元数据，Markdown 正文保存方法。JSON 由脚本自动导出，作为系统读取和冻结快照的格式。**\n\n这样既能逐个审阅和修订方法，也能保留现有 `SkillSpec` 的结构化字段。当前八个 Skill 的名称和题型一一对应；后续某题型可以有多个方法，仍先做题型硬过滤，再在该分区内排序。\n\n| 文件 | 职责 | 是否手工修改 |\n|---|---|---|\n| `skills/<name>/SKILL.md` | Skill 唯一方法源；元数据、步骤、证据、检查和来源 | 是，修改后重建导出 |\n| `runtime/skill_specs.json` | 八个 SkillSpec 对象组成的数组 | 否 |\n| `runtime/snapshot.json` | S0 候选快照及兼容性信息 | 否；正式接入时按实际 schema 显式适配 |\n| `runtime/source_manifest.json` | 源文件与导出内容的校验值 | 否 |\n| `generation_record.json` | 来源文件身份、本轮设计输入和生成范围 | 变更生成条件时更新 |\n| `SOURCES.md` | 可追溯的资料链接、阅读范围和适配边界 | 变更参考依据时更新 |\n| `scripts/build_s0.py` | 静态校验和确定性导出 | 仅格式版本变更时修改 |\n| `validation/static_checks.json` | 本地格式检查结果；明确未运行项目 | 自动生成 |\n\n这是基于 [Agent Skills 官方规范](https://agentskills.io/specification) 的文件布局。官方规定 `SKILL.md` 使用 YAML 文件头和 Markdown 正文，允许字符串映射形式的 `metadata`。本项目额外定义题型字段及 SkillSpec 转换规则；通用客户端不会自动执行题型硬隔离。\n\n## 八个初始方法\n\n| ID | 规范题型 | 方法 | 源文件 |\n|---|---|---|---|\n| S01 | `object_counting` | 跨帧对象去重计数 | [SKILL.md](skills/count-scene-objects/SKILL.md) |\n| S02 | `object_abs_distance` | 对象间绝对距离估计 | [SKILL.md](skills/estimate-object-distance/SKILL.md) |\n| S03 | `object_rel_distance` | 对象间距离比较与候选排序 | [SKILL.md](skills/rank-object-distances/SKILL.md) |\n| S04 | `object_size_estimation` | 对象最长尺寸估计 | [SKILL.md](skills/estimate-object-size/SKILL.md) |\n| S05 | `room_size_estimation` | 房间边界与面积估计 | [SKILL.md](skills/estimate-room-area/SKILL.md) |\n| S06 | `object_rel_direction` | 指定站位和朝向下的方向判断 | [SKILL.md](skills/judge-relative-direction/SKILL.md) |\n| S07 | `obj_appearance_order` | 目标类别首次出现顺序判断 | [SKILL.md](skills/order-first-appearances/SKILL.md) |\n| S08 | `route_planning` | 沿给定路线判断转向 | [SKILL.md](skills/infer-route-turns/SKILL.md) |\n\nS0 表示整个快照，不是单个 Skill。绝对与相对距离分开存储；路线 Skill 自带必要方向步骤，不依赖跨题型召回 S06。\n\n## 文件头与正文\n\n文件头采用标准字段 `name`、`description`、`metadata`。示意：\n\n```yaml\n---\nname: estimate-object-distance\ndescription: 用于 object_abs_distance 的对象间绝对距离估计。\nmetadata:\n  harness3d-skill-id: \"S02\"\n  harness3d-version: \"1.0.0\"\n  harness3d-question-type: \"object_abs_distance\"\n  harness3d-family: \"metric\"\n  harness3d-source-format: \"1.0\"\n  harness3d-validation: \"document-checked-runtime-pending\"\n---\n```\n\n所有 metadata 值是字符串。`family` 仅用于组织，不能作为跨题型放行依据。不要使用 `allowed-tools` 声明预授权；方法建议不会扩大实际工具面。\n\n正文使用固定中文标题：目标、适用条件、执行约束、证据条件、求解步骤、提交前检查、代码示例、失败教训、局限、答案依据、来源。证据与来源使用可安全解析的 YAML 块，列表使用 Markdown 或 JSON。步骤顺序编号。该固定格式是本包的源格式 v1，新增字段须同步更新转换器并显式版本化。\n\n每个初始方法只有 `image_2d` 为整体硬前提，接受 available/degraded。所需几何、尺度、绑定、跟踪或 world_frame 只写在相应步骤的局部条件中。因此重建失败或缺尺度不会把整条方法检索掉。局部条件是方法提示；每次执行仍由框架根据实际对象和证据版本授权。\n\n## 与现有 SkillSpec 的对应\n\n| 源内容 | 导出字段 |\n|---|---|\n| metadata 中 ID、版本、family、规范题型 | `skill_id`、`version`、`family`、仅含一个题型的 `applicable_question_types` |\n| 目标 | `goal` |\n| 适用条件＋执行约束 | `applicability` |\n| 证据条件 YAML | `hard_requirements`、`evidence_preferences` |\n| 编号步骤 | `steps=[{step_id,instruction}, ...]` |\n| 提交前检查、局限 | `checks`、`limitations` |\n| 示例、教训、依据 JSON | `code_examples`、`failure_lessons`、`supported_answer_bases` |\n| 来源 YAML | `provenance` |\n\n`schema_version=\"8.0\"` 表示按已提供的 v8 目标 SkillSpec 导出，**不表示当前代码已支持这些字段，也不虚构尚未确定的 v9 Schema**。v8 将若干内部字段定义为 dict，当前包给出具体解释：例如 `hard_requirements.image_2d` 是允许的状态列表，`steps` 的对象保存步骤 ID 和指令。接入仓库时须将该结构映射到真实模型，不可只改 schema_version 后静默加载。\n\n先从题目 Adapter 获得已规范化题型；未知原始题型按 Adapter 的显式规则处理，Skill 层不猜别名。先以 `task in applicable_question_types` 精确过滤，再检查整体硬前提，然后才在同题型内按证据适配程度排序。不应先全库 top-k 再丢弃异题型条目。只有一个初始条目时该分区直接使用它；某个几何分支不可用不等于无可用方法。\n\n## 生成、冻结与接入\n\n本版由助手根据本轮决定、v8 文档和已检索公开方法编写。生成记录保存真实可知的信息；精确模型标识不可核验时为 null。未运行轨迹归纳，未加载 benchmark 数据集与标签。公开论文的案例阅读范围如实记录。\n\n在还原的目录中，使用 Python 3.11+ 和 PyYAML 运行：\n\n```bash\npython3 scripts/build_s0.py\npython3 scripts/build_s0.py --check\n```\n\n第二条命令检查文件头、章节、题型唯一性、来源、视觉可用路径与派生文件是否过期。它不是实际检索器或模型/工具闭环的测试。\n\ncoding agent 接入时完成以下操作：\n\n1. 核对实际 `SkillSpec`、工具文档、控制接口与规范题型，显式适配差异；未实现工具保留条件分支，不能伪造能力。\n2. 验证八个题型各命中自己的初始方法；缺尺度、缺绑定和重建失败时视觉路径仍可召回；核查在线模型实际收到方法正文。\n3. 在允许的开发场景完成基本真实运行检查，再发布实验用冻结 S0；不把本包的静态检查收据作为真实运行证据。\n4. S0 冻结后保持对照副本不变，演化复制后修改。修改方法、修复正文、拆分或新增均记录新版本。按本轮决定仅控制轮数及重试次数，不借本包恢复旧版复杂预算或强制沙箱部署要求。\n\nruntime 快照是完整的候选发布描述，`runtime_verified=false`、`production_activation=false`。本包未写系统的 active 指针。正式运行收据和实际仓库版本只能由接入环境补充；若初始化阶段依据答题成败优化方法，应将其计入演化。\n\n## 单文件交付与还原\n\n交付的 `harness3d_s0_bundle.json` 保存全部相对路径、UTF-8 文件内容及 SHA-256，还包含可直接读取的 SkillSpec 数组与候选快照。它是本任务的传输容器；还原后仍以各 `SKILL.md` 为方法唯一编辑源。\n\n将 bundle 放在目标父目录，用下面的标准库脚本还原。目标目录必须不存在；先验证所有路径和内容再写入。不要把 bundle 放入在线模型上下文；在线只加载同题型选中的 Skill。\n\n```python\nimport hashlib, json\nfrom pathlib import Path, PurePosixPath\n\nbundle = json.loads(Path(\"harness3d_s0_bundle.json\").read_text(encoding=\"utf-8\"))\ntarget = Path(\"harness3d-s0\")\nassert not target.exists(), \"目标目录已存在，请换一个新目录\"\nchecked = []\nseen = set()\nfor item in bundle[\"files\"]:\n    p = PurePosixPath(item[\"path\"])\n    assert p.parts and not p.is_absolute() and \"..\" not in p.parts\n    assert \"\\\\\" not in item[\"path\"] and p.as_posix() not in seen\n    seen.add(p.as_posix())\n    data = item[\"content\"].encode(\"utf-8\")\n    assert hashlib.sha256(data).hexdigest() == item[\"sha256\"]\n    checked.append((p, data))\ntarget.mkdir()\nfor p, data in checked:\n    dest = target.joinpath(*p.parts)\n    dest.parent.mkdir(parents=True, exist_ok=True)\n    dest.write_bytes(data)\n```\n\n还原后按上面的 `--check` 命令核验导出；若只需要查看内容，可直接阅读 bundle 中 `skill_specs`。本交付没有真实 benchmark 分数或性能提升声明。\n"
+    },
+    {
+      "path": "SOURCES.md",
+      "sha256": "27cdbb6743258f92df39ae892ecff8bfeda002f4a518a9fbfe16520ea06aad1d",
+      "content": "# S0 参考资料与适配边界\n\n检索与编写日期：2026-09-25。本文只记录生成方法所用资料，不提供可供在线访问的 benchmark 标签、场景标注或原始轨迹。\n\n## 文件格式依据\n\n- **AGENT_SKILLS_SPEC**：[Agent Skills Specification](https://agentskills.io/specification)。采用一个目录一份 `SKILL.md`、YAML 文件头和 Markdown 正文。`name` 与目录一致；`metadata` 使用字符串键值。名称、描述和元数据可先加载，方法正文按检索结果加载。本文档中的项目字段和 JSON 导出约定是 harness3D 的本地设计，不是官方标准规定。\n- 不使用 `allowed-tools` 授予权限。题型硬过滤由 harness3D 检索器实现；工具授权由框架根据当前证据执行。普通 Agent Skills 客户端不会自动理解这些项目约束。\n\n## 方法与任务依据\n\n| ID | 资料与阅读范围 | 采用内容 | 适配边界 |\n|---|---|---|---|\n| VSI | [Thinking in Space](https://arxiv.org/html/2412.14171)，第3节、附录B.1；相对布局参考第6.2节 | 八类任务语义、方向难度、对象距离/尺寸/面积/时间/路线定义 | 只提取公开任务规则及通用布局方法；不导入数据集答案和标注几何 |\n| SKILL3D | [Skill-3D](https://arxiv.org/html/2606.07436)，第3.1–3.2节、附录D | 按证据需求组织工作流，关注边界、跨帧去重与失败条件 | 不复制其库内容、案例答案、工具配置或训练过程；初始失败教训为空 |\n| SKILL3D_PROJECT | [Skill-3D 项目页](https://skill-3d.github.io/)，Qualitative Cases 中 Room Size / Appearance Order | 房间尺度与时间线索的证据组织 | 页面案例仅作方法理解，不纳入初始实例库 |\n| VADAR | [VADAR 官方项目页](https://glab-caltech.github.io/vadar/)，Approach / DFS Method Implementation | 将定位、属性计算、比较等子问题组合成程序 | 不引入动态新增工具权限，不导入另一套模型服务 |\n| THINK3D | [Think3D](https://arxiv.org/html/2601.13029)，Framework Overview / 3D Transformation | 全局与观察者视角转换及观察反馈思想 | 本系统坚持重建前置和冻结帧集；不照搬自主重新重建或新视角渲染 |\n\n这些资料提供方法依据；本文创建的八条方法、视觉替代步骤与具体组织方式是面向本系统的设计，尚无本系统真实得分证明。\n\n## 本地合同与用户决定\n\n- **LOCAL_V8**：本次工作区的《系统架构v8(1).md》。重点使用第4节规范题型、第6节证据与授权、第9节工具合同、第10节程序提交、第13节 SkillSpec。文件 SHA-256 见 `generation_record.json`。\n- **DECISIONS_20260925**：本轮用户确认的 v9 决定，以 `generation_record.json.user_decisions` 保存。与 v8 的预算和执行后端要求冲突时采用本轮决定。v9 全文尚未形成，不虚构正式 v9 Schema。\n- 《问题报告v8.md》《系统现状0924.md》只用于标记接线和实现可能存在的缺口。未访问其指向的实际源码，未将报告中的分数、场景、失败实例或历史参数转为答题规则。\n\n方法内容依据 v8 的目标工具合同编写。具体 payload 字段、工具调用入口、Pydantic 类、运行态枚举和 `hard_requirements` 解释器必须由 coding agent 对实际仓库核验。未接通的工具分支保持条件可选，视觉作答分支独立存在。\n\n## 来源纪律\n\n公开论文阅读过程中接触过作者展示的案例，这是公开文献阅读，不等于完全未见任何潜在 benchmark 示例。当前包不保留案例题号、实体组合、答案常量、坐标或分数；不宣称基础模型从未接触这些数据。\n\n没有使用当前项目的逐题轨迹、标准答案或 GT 几何进行方法归纳。`failure_lessons=[]` 表示尚无实测学习教训；方法中的检查与局限是初始设计知识。之后基于真实成败反馈新增或修订内容，进入正式演化版本。\n"
+    },
+    {
+      "path": "generation_record.json",
+      "sha256": "37a0060324dd4df5919c50f3ebefc38eeaba7a4799edb3b9342d999471b33f7c",
+      "content": "{\n  \"artifact\": \"harness3d-s0\",\n  \"authored_at\": \"2026-09-25\",\n  \"timezone\": \"Asia/Shanghai\",\n  \"author\": \"ChatGPT assistant\",\n  \"exact_model_id\": null,\n  \"model_id_note\": \"会话未提供可核验的精确模型标识，不推测。\",\n  \"generation_mode\": \"assistant-authored from user decisions, attached contracts and public methods\",\n  \"source_format_version\": \"1.0\",\n  \"runtime_target_schema_version\": \"8.0\",\n  \"seed_count\": 8,\n  \"local_sources\": [\n    {\n      \"filename\": \"系统架构v8(1).md\",\n      \"sha256\": \"34b9946818f4dc0239d9c760a966ce9209a2edba3f2fa63da7101bc84436468c\",\n      \"role\": \"target_contract\"\n    },\n    {\n      \"filename\": \"问题报告v8.md\",\n      \"sha256\": \"13cdfd1c3f7c8a25772723a91688ab4590571fb00e299ec07ec44d26be49d948\",\n      \"role\": \"implementation_report_unverified_against_source\"\n    },\n    {\n      \"filename\": \"系统现状0924.md\",\n      \"sha256\": \"72cf6cde24d4b123a8de40b43752451c5cb7f789780f16071ef21a7f99d9d7c9\",\n      \"role\": \"implementation_report_unverified_against_source\"\n    }\n  ],\n  \"user_decisions\": [\n    \"场景产物只读；题级证据由框架管理；工具权限同源派生；按实际依赖撤销并经新证据恢复。\",\n    \"框架提供有限题面目标初始定位；对象不完整也进入求解；分割和跟踪按需。\",\n    \"新观察必须实际进入同一在线 agent 输入；帧冻结；结果产生与模型已观察分别记录。\",\n    \"按求解轮数限制；同一失败操作最多重试3次；最终作答一次且不可重入。\",\n    \"成本报告首次处理成本；沙箱为概念，不要求建设真实隔离后端。\",\n    \"八类规范题型硬隔离，初始各一个 Skill；几何与视觉可在同一 Skill 内分条件处理。\",\n    \"资料依据生成并完成基本检查；基于答题成败改方法计入自演化。\"\n  ],\n  \"prompt_record\": {\n    \"type\": \"authoring_brief_not_verbatim_model_request\",\n    \"text\": \"按本次确认的8题型创建8个项目方法文件。保持题型硬隔离；使用v8工具与SkillSpec目标合同并应用本轮覆盖决定；独立保留视觉作答；不虚构工具权限、真实接口验收、轨迹或成功率；用官方SKILL.md结构保存并生成JSON导入数据。\"\n  },\n  \"data_access\": {\n    \"benchmark_dataset_loaded\": false,\n    \"benchmark_labels_loaded\": false,\n    \"trajectory_induction_used\": false,\n    \"public_paper_case_examples_seen\": true,\n    \"note\": \"阅读公开论文可能看到其展示案例；文件只提取任务规则和通用方法，不复制具体案例实体、题号、答案或坐标。\"\n  },\n  \"validation\": {\n    \"document_and_static_checks\": \"passed\",\n    \"production_registry_check\": \"not_run_repository_not_available\",\n    \"real_model_tool_episode\": \"not_run\",\n    \"benchmark_score\": \"not_measured\",\n    \"experimental_freeze\": \"pending_runtime_acceptance\",\n    \"synthetic_method_application\": \"4 synthetic text-state cases completed; no real images or services\"\n  }\n}\n"
+    },
+    {
+      "path": "requirements.txt",
+      "sha256": "b4603b9468ade4d639d2c6f73b89d50e1fa5d227c73ab15be0382cca478513e6",
+      "content": "PyYAML>=6.0,<7\n"
+    },
+    {
+      "path": "runtime/skill_specs.json",
+      "sha256": "ca5fed3a8ffd0e4314bdd84c7372617c7e4700bba0fb8a67842e87e5781ac1e3",
+      "content": "[\n  {\n    \"schema_version\": \"8.0\",\n    \"skill_id\": \"S01\",\n    \"version\": \"1.0.0\",\n    \"family\": \"counting\",\n    \"applicable_question_types\": [\n      \"object_counting\"\n    ],\n    \"goal\": \"估计题面指定空间中目标类别的独立实体数量，输出 unit=count 的非负整数。\",\n    \"applicability\": \"可使用纯视觉、二维检测/跟踪或获准的几何辅助。目标尚未绑定、检测失败或三维不可用时仍适用；这些状态只改变后续步骤。\\n\\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\\n\\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\\n\\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\\n\\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\",\n    \"hard_requirements\": {\n      \"image_2d\": [\n        \"available\",\n        \"degraded\"\n      ]\n    },\n    \"evidence_preferences\": {\n      \"preferred\": [\n        \"多视角目标候选及覆盖说明\",\n        \"跨帧身份与重复嫌疑\",\n        \"可用时的几何位置一致性\"\n      ],\n      \"local_requirements\": {\n        \"count_objects\": [\n          \"object_detection\",\n          \"track_consensus\"\n        ],\n        \"geometry_assistance\": [\n          \"geometry_3d\",\n          \"相关对象有效绑定\"\n        ]\n      },\n      \"visual_route\": \"利用原图中的外观、相邻物体、固定结构和观察顺序核对实体身份。\"\n    },\n    \"steps\": [\n      {\n        \"step_id\": \"step_01\",\n        \"instruction\": \"从题面确定目标类别、空间范围及同义词；按当前题面语义处理部件与整体，不能把同一件家具的部件重复计入。\"\n      },\n      {\n        \"step_id\": \"step_02\",\n        \"instruction\": \"复用有效候选与覆盖记录；可用时通过 list_objects 查看 category_name、obj_id、visible_frames、track_id 和重复嫌疑。将每条记录视为候选，不把记录条数当作答案。\"\n      },\n      {\n        \"step_id\": \"step_03\",\n        \"instruction\": \"建立题内实例表，记录各候选出现的帧、相邻结构和相似对象。用多个线索合并同一实体的重复观测；两个同款物体在同一帧同时出现时保留为不同实体，不凭外观相似就合并。\"\n      },\n      {\n        \"step_id\": \"step_04\",\n        \"instruction\": \"优先检查会改变计数的未覆盖区域、遮挡后重现和重复 track。若 detect_objects 已获准，仅对目标类别和有用帧补检；需要精细边界或身份关联时，仅使用实际注册的分割/跟踪能力。需看新裁剪时调用 inspect_frames 后 yield。\"\n      },\n      {\n        \"step_id\": \"step_05\",\n        \"instruction\": \"count_objects 获准时读取它的去重结果、覆盖说明和降级标记，与实例表交叉核对。三维位置只作为获准的辅助证据；二维方法可独立继续。服务失败、未运行、健康空检出、截断分别处理。\"\n      },\n      {\n        \"step_id\": \"step_06\",\n        \"instruction\": \"工具与视觉冲突时定位冲突到具体实例，补看最能消除歧义的冻结帧；无法解决时根据覆盖及身份线索选最有依据的整数。计数为零须由观察支持，不能由服务错误推得；随后按共同合同提交。\"\n      }\n    ],\n    \"checks\": [\n      \"同一实体跨帧只计一次；同款多实例没有被误合并。\",\n      \"截断、遮挡和未检查区域没有被当作完整覆盖。\",\n      \"没有用检测故障或空 result payload 推导零计数。\",\n      \"答案是非负整数；依据与实际使用结果一致。\"\n    ],\n    \"code_examples\": [],\n    \"failure_lessons\": [],\n    \"limitations\": [\n      \"有限帧集可能漏掉完全不可见对象。\",\n      \"实例表是当前题的推断，不能把模型推断写成已验证的几何绑定。\"\n    ],\n    \"supported_answer_bases\": [\n      \"visual_estimate\",\n      \"tool_derived\",\n      \"mixed\"\n    ],\n    \"provenance\": {\n      \"origin\": \"document_grounded_seed\",\n      \"source_refs\": [\n        {\n          \"ref\": \"LOCAL_V8\",\n          \"sections\": [\n            \"4\",\n            \"9.1\",\n            \"9.2\",\n            \"10\",\n            \"13\"\n          ]\n        },\n        {\n          \"ref\": \"VSI\",\n          \"sections\": [\n            \"3\",\n            \"B.1\"\n          ],\n          \"use\": \"计数任务定义\"\n        },\n        {\n          \"ref\": \"SKILL3D\",\n          \"sections\": [\n            \"3.1\",\n            \"3.2\",\n            \"Appendix D\"\n          ],\n          \"use\": \"多视角去重与证据组织\"\n        },\n        {\n          \"ref\": \"DECISIONS_20260925\",\n          \"use\": \"八题型硬隔离、简化轮数预算和状态/观察合同\"\n        }\n      ],\n      \"source_trace_refs\": [],\n      \"source_split\": \"not_applicable_no_trajectory_induction\",\n      \"label_access\": false,\n      \"parent_skill_versions\": [],\n      \"candidate_record_ref\": null,\n      \"inducer_config_ref\": \"generation_record.json\",\n      \"validation_decision\": \"document_checked_runtime_pending\"\n    }\n  },\n  {\n    \"schema_version\": \"8.0\",\n    \"skill_id\": \"S02\",\n    \"version\": \"1.0.0\",\n    \"family\": \"metric\",\n    \"applicable_question_types\": [\n      \"object_abs_distance\"\n    ],\n    \"goal\": \"估计两个题面对象之间的最近直接距离，输出 unit=m 的有限非负数值。\",\n    \"applicability\": \"优先使用满足逐工具权限的几何测量；无尺度、绑定待确认或几何失败时保留视觉估计路径。\\n\\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\\n\\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\\n\\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\\n\\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\",\n    \"hard_requirements\": {\n      \"image_2d\": [\n        \"available\",\n        \"degraded\"\n      ]\n    },\n    \"evidence_preferences\": {\n      \"preferred\": [\n        \"两个题面对象的有效实例绑定\",\n        \"一致坐标中的有效对象几何与距离定义\",\n        \"当前有效尺度及米制授权\"\n      ],\n      \"local_requirements\": {\n        \"object_distance_m\": [\n          \"geometry_3d\",\n          \"metric_scale\",\n          \"两个实例有效绑定\",\n          \"当前米制调用获准\"\n        ]\n      },\n      \"visual_route\": \"用同时可见的边界、跨视角布局及合理参照尺寸估计对象间隔。\"\n    },\n    \"steps\": [\n      {\n        \"step_id\": \"step_01\",\n        \"instruction\": \"解析两个对象的角色及消歧描述，明确测量对象间的最近直接距离；不能把参考对象换成相机，也不能默认使用中心距离。\"\n      },\n      {\n        \"step_id\": \"step_02\",\n        \"instruction\": \"核对候选和题级绑定。需要时对相关类别补检、检查局部图像，结合周边物体确认实例；具体工具不可用时依靠原图定位，不虚构 obj_id 或绑定成功状态。\"\n      },\n      {\n        \"step_id\": \"step_03\",\n        \"instruction\": \"若 object_distance_m 对实际两个对象获准，调用后检查 status、有效数值、单位、依赖和距离定义。pointcloud_surface_proxy 与 bbox_nearest_proxy 均为声明过的代理，不能把可见表面代理当成官方标注真值。\"\n      },\n      {\n        \"step_id\": \"step_04\",\n        \"instruction\": \"理解工具已完成的单位转换。只有文档明确返回归一化距离并允许使用同一有效尺度时才做 d_m=s*d_norm；已经是米的值不能再乘尺度。量化阈值、点集清洗和分位数由冻结工具合同决定。\"\n      },\n      {\n        \"step_id\": \"step_05\",\n        \"instruction\": \"检查最近区域是否被遮挡、点集是否混入背景、两对象是否来自一致坐标。结果失效就停止使用并交给框架处理；不要把旧数值手动改成有效，或用视觉猜测恢复米制权限。\"\n      },\n      {\n        \"step_id\": \"step_06\",\n        \"instruction\": \"测量不能支持结论时，比较多个原图视角中的相邻关系与接近边界；结合合理参照物的尺寸范围估计间隔，修正明显的透视和深度差异。参照尺寸属于估计；不要把不同深度上的像素比例直接当米制比例。\"\n      },\n      {\n        \"step_id\": \"step_07\",\n        \"instruction\": \"结合当前可靠证据选取最有依据的数值；跨帧一致性支持估计，但同一误差来源的多次结果不等于独立验证。按米提交，并正确区分测量、视觉估计和混合依据。\"\n      }\n    ],\n    \"checks\": [\n      \"测量的是两个题面对象，不是相机到对象。\",\n      \"距离口径与单位正确，没有中心距离替代最近距离或重复乘尺度。\",\n      \"米制测量的尺度、几何和绑定都仍有效。\",\n      \"视觉参照没有被记录为工具测量或真实尺度。\"\n    ],\n    \"code_examples\": [],\n    \"failure_lessons\": [],\n    \"limitations\": [\n      \"可见表面距离与完整对象包围框距离可能有系统偏差。\",\n      \"完全遮挡的最近边界只能估计，不能宣称精确恢复。\"\n    ],\n    \"supported_answer_bases\": [\n      \"visual_estimate\",\n      \"tool_derived\",\n      \"mixed\"\n    ],\n    \"provenance\": {\n      \"origin\": \"document_grounded_seed\",\n      \"source_refs\": [\n        {\n          \"ref\": \"LOCAL_V8\",\n          \"sections\": [\n            \"4\",\n            \"8\",\n            \"9.2\",\n            \"9.3\",\n            \"10\"\n          ]\n        },\n        {\n          \"ref\": \"VSI\",\n          \"sections\": [\n            \"B.1\"\n          ],\n          \"use\": \"对象间最近距离及米单位\"\n        },\n        {\n          \"ref\": \"SKILL3D\",\n          \"sections\": [\n            \"Appendix D\"\n          ],\n          \"use\": \"边界相关的距离证据\"\n        },\n        {\n          \"ref\": \"VADAR\",\n          \"sections\": [\n            \"Approach\"\n          ],\n          \"use\": \"将定位和计算分解为可组合步骤\"\n        },\n        {\n          \"ref\": \"DECISIONS_20260925\",\n          \"use\": \"八题型硬隔离、简化轮数预算和状态/观察合同\"\n        }\n      ],\n      \"source_trace_refs\": [],\n      \"source_split\": \"not_applicable_no_trajectory_induction\",\n      \"label_access\": false,\n      \"parent_skill_versions\": [],\n      \"candidate_record_ref\": null,\n      \"inducer_config_ref\": \"generation_record.json\",\n      \"validation_decision\": \"document_checked_runtime_pending\"\n    }\n  },\n  {\n    \"schema_version\": \"8.0\",\n    \"skill_id\": \"S03\",\n    \"version\": \"1.0.0\",\n    \"family\": \"relative_geometry\",\n    \"applicable_question_types\": [\n      \"object_rel_distance\"\n    ],\n    \"goal\": \"识别与参照对象最近的候选类别/实例，输出当前题目给定的选项标签，unit=option。\",\n    \"applicability\": \"统一有效相对几何足以支持排序，metric_scale 缺失不屏蔽本 Skill；无法可靠定位或计算时使用视觉布局比较。\\n\\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\\n\\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\\n\\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\\n\\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\",\n    \"hard_requirements\": {\n      \"image_2d\": [\n        \"available\",\n        \"degraded\"\n      ]\n    },\n    \"evidence_preferences\": {\n      \"preferred\": [\n        \"参照对象和各候选实例绑定\",\n        \"同一有效坐标系内的对象间距离\",\n        \"候选类别覆盖与多实例信息\"\n      ],\n      \"local_requirements\": {\n        \"relative_distance_rank\": [\n          \"geometry_3d\",\n          \"参照及候选实例有效绑定\"\n        ]\n      },\n      \"not_required\": [\n        \"metric_scale\"\n      ],\n      \"visual_route\": \"从原图建立局部布局，比较参照物与候选的边界接近程度并考虑深度。\"\n    },\n    \"steps\": [\n      {\n        \"step_id\": \"step_01\",\n        \"instruction\": \"分别整理题面参照对象、候选类别及选项映射。使用当前题目的选项标签，不固定为 A–D，不按对象离相机的远近作答。\"\n      },\n      {\n        \"step_id\": \"step_02\",\n        \"instruction\": \"定位参照实例，并尽可能覆盖每个候选类别的实例。题意按类别比较时，对同类别多实例取与参照对象最近者；缺失类别标为未知，不能直接赋无限距离或从候选中删除。\"\n      },\n      {\n        \"step_id\": \"step_03\",\n        \"instruction\": \"若 relative_distance_rank 对本次实例获准，调用并核对对象间距离定义、候选覆盖和类别聚合规则。若只获得多个归一化距离，只有坐标、尺度因子和距离定义一致时才能直接比较。\"\n      },\n      {\n        \"step_id\": \"step_04\",\n        \"instruction\": \"对最接近的候选重点核查遮挡、点集污染、重复或错误绑定；检查表面距离代理与题面最近点语义是否存在明显偏差。不得因为 metric_scale 缺失而放弃有效相对几何。\"\n      },\n      {\n        \"step_id\": \"step_05\",\n        \"instruction\": \"几何不足时，用同帧共现或跨帧共享结构形成局部布局，判断哪些候选真正邻近参照对象。图像上的二维间隔仅为线索；同时考虑深度、视角和遮挡。优先查看会改变前两名排序的现有帧或裁剪。\"\n      },\n      {\n        \"step_id\": \"step_06\",\n        \"instruction\": \"比较所有合法候选，综合未覆盖候选和残余歧义选最有依据的一项；不要以选项顺序作为通用平局规则。转换成题目原始标签，按共同合同提交。\"\n      }\n    ],\n    \"checks\": [\n      \"参照对象没有变成相机。\",\n      \"同类别多实例按最近者聚合，缺失候选没有被静默排除。\",\n      \"排序使用一致的几何定义和坐标，未要求无关的米制尺度。\",\n      \"答案标签属于本题 options，答案依据包含实际使用的工具结果。\"\n    ],\n    \"code_examples\": [],\n    \"failure_lessons\": [],\n    \"limitations\": [\n      \"候选遗漏可能改变排序；检测到一个实例不证明该类别已覆盖。\",\n      \"相对几何存在非均匀畸变时，尺度无关并不意味着排序可靠。\"\n    ],\n    \"supported_answer_bases\": [\n      \"visual_estimate\",\n      \"tool_derived\",\n      \"mixed\"\n    ],\n    \"provenance\": {\n      \"origin\": \"document_grounded_seed\",\n      \"source_refs\": [\n        {\n          \"ref\": \"LOCAL_V8\",\n          \"sections\": [\n            \"4\",\n            \"9.1\",\n            \"9.2\",\n            \"9.3\"\n          ]\n        },\n        {\n          \"ref\": \"VSI\",\n          \"sections\": [\n            \"B.1\",\n            \"6.2\"\n          ],\n          \"use\": \"参照对象、最近实例聚合与布局比较\"\n        },\n        {\n          \"ref\": \"VADAR\",\n          \"sections\": [\n            \"Approach\"\n          ],\n          \"use\": \"组合定位、属性查询和比较步骤\"\n        },\n        {\n          \"ref\": \"DECISIONS_20260925\",\n          \"use\": \"八题型硬隔离、简化轮数预算和状态/观察合同\"\n        }\n      ],\n      \"source_trace_refs\": [],\n      \"source_split\": \"not_applicable_no_trajectory_induction\",\n      \"label_access\": false,\n      \"parent_skill_versions\": [],\n      \"candidate_record_ref\": null,\n      \"inducer_config_ref\": \"generation_record.json\",\n      \"validation_decision\": \"document_checked_runtime_pending\"\n    }\n  },\n  {\n    \"schema_version\": \"8.0\",\n    \"skill_id\": \"S04\",\n    \"version\": \"1.0.0\",\n    \"family\": \"metric\",\n    \"applicable_question_types\": [\n      \"object_size_estimation\"\n    ],\n    \"goal\": \"估计目标对象的最长物理维度，规范输出 unit=cm 的有限正数。\",\n    \"applicability\": \"有效对象 extent 和尺度可支持测量；只见局部、尺度缺失或几何不可用时仍通过视觉估计完成任务。\\n\\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\\n\\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\\n\\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\\n\\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\",\n    \"hard_requirements\": {\n      \"image_2d\": [\n        \"available\",\n        \"degraded\"\n      ]\n    },\n    \"evidence_preferences\": {\n      \"preferred\": [\n        \"完整对象身份与边界\",\n        \"对象方向及三维 extent 定义\",\n        \"有效米制尺度与遮挡说明\"\n      ],\n      \"local_requirements\": {\n        \"object_3d_extent\": [\n          \"geometry_3d\",\n          \"metric_scale\",\n          \"对象有效绑定\",\n          \"当前米制调用获准\"\n        ]\n      },\n      \"visual_route\": \"结合完整轮廓、多视角、同深度参照物和类别尺寸常识估计最长维。\"\n    },\n    \"steps\": [\n      {\n        \"step_id\": \"step_01\",\n        \"instruction\": \"确定目标实例和题面待测维度；规范任务取长、宽、高中的最大者。分清整个对象、可见部分和附件，避免只测最醒目的局部。\"\n      },\n      {\n        \"step_id\": \"step_02\",\n        \"instruction\": \"选择能显示对象整体和主轴的冻结帧；需要时补检或查看局部与全图的对应关系。结合不同视角识别遮挡、截断、伸展部分和物体朝向。\"\n      },\n      {\n        \"step_id\": \"step_03\",\n        \"instruction\": \"若 object_3d_extent 获准，读取有效维度、最长维、单位、框方向和覆盖说明。以工具已声明的定义计算；相机/世界轴对齐框可能高估旋转物体尺寸，部分点云可能低估完整对象。\"\n      },\n      {\n        \"step_id\": \"step_04\",\n        \"instruction\": \"按实际返回单位转换到题面要求：米到厘米乘 100，已是厘米不重复转换。只有归一化长度才需同一有效尺度；不从图片猜一个尺度填回工具状态。\"\n      },\n      {\n        \"step_id\": \"step_05\",\n        \"instruction\": \"几何不足时，先辨认哪个维度最可能最长，再从完整视角和附近参照物估计量级。参照物须考虑真实尺寸范围和是否处于近似相同深度；类别常识只作估计依据，不能固定“每张桌子都是同一尺寸”。\"\n      },\n      {\n        \"step_id\": \"step_06\",\n        \"instruction\": \"对不同视角的估计差异检查是否来自透视、部件混淆或遮挡，选最有依据的单一数值。答案按要求的单位提交，估计参与结果时标为 visual_estimate 或 mixed。\"\n      }\n    ],\n    \"checks\": [\n      \"回答的是完整目标的最长维，不是像素长度、体积或任意一条边。\",\n      \"框定义、旋转、局部可见性已纳入判断。\",\n      \"没有重复乘尺度或漏掉米/厘米转换。\",\n      \"没有用类别固定常量代替当前图片判断。\"\n    ],\n    \"code_examples\": [],\n    \"failure_lessons\": [],\n    \"limitations\": [\n      \"只有局部表面时，完整尺寸的恢复可能依赖视觉常识。\",\n      \"参照物的尺寸不确定性与透视差异会传递到估计。\"\n    ],\n    \"supported_answer_bases\": [\n      \"visual_estimate\",\n      \"tool_derived\",\n      \"mixed\"\n    ],\n    \"provenance\": {\n      \"origin\": \"document_grounded_seed\",\n      \"source_refs\": [\n        {\n          \"ref\": \"LOCAL_V8\",\n          \"sections\": [\n            \"4\",\n            \"9.2\",\n            \"9.3\"\n          ]\n        },\n        {\n          \"ref\": \"VSI\",\n          \"sections\": [\n            \"B.1\"\n          ],\n          \"use\": \"最长维和厘米单位\"\n        },\n        {\n          \"ref\": \"VADAR\",\n          \"sections\": [\n            \"Approach\"\n          ],\n          \"use\": \"对象维度的定位与计算分解\"\n        },\n        {\n          \"ref\": \"DECISIONS_20260925\",\n          \"use\": \"八题型硬隔离、简化轮数预算和状态/观察合同\"\n        }\n      ],\n      \"source_trace_refs\": [],\n      \"source_split\": \"not_applicable_no_trajectory_induction\",\n      \"label_access\": false,\n      \"parent_skill_versions\": [],\n      \"candidate_record_ref\": null,\n      \"inducer_config_ref\": \"generation_record.json\",\n      \"validation_decision\": \"document_checked_runtime_pending\"\n    }\n  },\n  {\n    \"schema_version\": \"8.0\",\n    \"skill_id\": \"S05\",\n    \"version\": \"1.0.0\",\n    \"family\": \"metric\",\n    \"applicable_question_types\": [\n      \"room_size_estimation\"\n    ],\n    \"goal\": \"估计题目指定空间的平面面积，规范输出 unit=m2 的有限正数。\",\n    \"applicability\": \"可使用授权的平面/边界工具，也可从原图布局估计；缺尺度或平面不可靠时不整体屏蔽本方法。\\n\\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\\n\\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\\n\\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\\n\\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\",\n    \"hard_requirements\": {\n      \"image_2d\": [\n        \"available\",\n        \"degraded\"\n      ]\n    },\n    \"evidence_preferences\": {\n      \"preferred\": [\n        \"房间/多房间范围与连通关系\",\n        \"地面或水平边界的覆盖\",\n        \"尺度与平面拟合质量\"\n      ],\n      \"local_requirements\": {\n        \"plane_fit_room_size\": [\n          \"geometry_3d\",\n          \"metric_scale\",\n          \"当前米制调用获准\"\n        ]\n      },\n      \"visual_route\": \"用墙面连接、门洞、房间转角和尺寸参照建立简化平面布局。\"\n    },\n    \"steps\": [\n      {\n        \"step_id\": \"step_01\",\n        \"instruction\": \"从题面确定单房间还是多房间合并范围，依据帧中的门洞、墙面和相机行进关系区分不同空间；同一空间的重复拍摄只算一次。\"\n      },\n      {\n        \"step_id\": \"step_02\",\n        \"instruction\": \"读取前置重建及覆盖摘要，检查是否有有效水平面和边界。家具遮挡的地面不等于房间缺失面积；地板像素数、墙面面积、房间对角线都不直接等于所问面积。\"\n      },\n      {\n        \"step_id\": \"step_03\",\n        \"instruction\": \"若 plane_fit_room_size 获准，核对返回 area、单位、边界/平面质量及覆盖范围是否与题意一致。可计数对象清单没有 floor 或 wall，不妨碍利用已有结构证据；不能虚构未注册的地面分割调用。\"\n      },\n      {\n        \"step_id\": \"step_04\",\n        \"instruction\": \"处理非矩形和多个区域时，依据可靠边界做分解与并集，避免重叠重复计入；不要将所有可见区域直接取外接矩形/凸包而填满凹口和空间间隔。采用的近似应有视觉依据。\"\n      },\n      {\n        \"step_id\": \"step_05\",\n        \"instruction\": \"理解单位与尺度：归一化面积到平方米需乘 s²，已是平方米不再缩放。尺度或边界失效时撤销依赖测量的使用，由框架管理恢复。\"\n      },\n      {\n        \"step_id\": \"step_06\",\n        \"instruction\": \"几何不足时，根据多个原图视角构建简化平面草图，利用墙段、门洞和家具等参照估计主尺寸；按有依据的矩形或少量区域分解求面积。参照物常识与不可见边界均属于估计，不能作为已验证几何。\"\n      },\n      {\n        \"step_id\": \"step_07\",\n        \"instruction\": \"检查空间范围、重复区域和未观察边界是否主导误差，选取最有依据的单一面积并按平方米提交。没有可靠边界也保留视觉作答，不能把工具失败返回为零面积。\"\n      }\n    ],\n    \"checks\": [\n      \"计算的是所问空间面积，单位为平方米。\",\n      \"长度尺度用于面积时平方，已经是米制面积时不重复处理。\",\n      \"重复拍摄、重叠区域和家具遮挡未引入重复计数或错误扣除。\",\n      \"没有把有限可见地面直接称为完整房间边界。\"\n    ],\n    \"code_examples\": [],\n    \"failure_lessons\": [],\n    \"limitations\": [\n      \"视野未覆盖边界时，面积只能依据部分证据估计。\",\n      \"官方面积构造与本系统拟合代理可能不同，需通过开发集检验偏差。\"\n    ],\n    \"supported_answer_bases\": [\n      \"visual_estimate\",\n      \"tool_derived\",\n      \"mixed\"\n    ],\n    \"provenance\": {\n      \"origin\": \"document_grounded_seed\",\n      \"source_refs\": [\n        {\n          \"ref\": \"LOCAL_V8\",\n          \"sections\": [\n            \"4\",\n            \"9.1\",\n            \"9.2\",\n            \"9.3\"\n          ]\n        },\n        {\n          \"ref\": \"VSI\",\n          \"sections\": [\n            \"B.1\"\n          ],\n          \"use\": \"面积及多房间范围定义\"\n        },\n        {\n          \"ref\": \"SKILL3D_PROJECT\",\n          \"sections\": [\n            \"Qualitative Cases / Room Size\"\n          ],\n          \"use\": \"房间尺度的多证据组织\"\n        },\n        {\n          \"ref\": \"DECISIONS_20260925\",\n          \"use\": \"八题型硬隔离、简化轮数预算和状态/观察合同\"\n        }\n      ],\n      \"source_trace_refs\": [],\n      \"source_split\": \"not_applicable_no_trajectory_induction\",\n      \"label_access\": false,\n      \"parent_skill_versions\": [],\n      \"candidate_record_ref\": null,\n      \"inducer_config_ref\": \"generation_record.json\",\n      \"validation_decision\": \"document_checked_runtime_pending\"\n    }\n  },\n  {\n    \"schema_version\": \"8.0\",\n    \"skill_id\": \"S06\",\n    \"version\": \"1.0.0\",\n    \"family\": \"relative_geometry\",\n    \"applicable_question_types\": [\n      \"object_rel_direction\"\n    ],\n    \"goal\": \"从题面假定观察者的站位和朝向判断目标方向，输出当前题目的合法选项，unit=option。\",\n    \"applicability\": \"保留方向难度与原始选项。几何工具依赖 world_frame，但世界朝向不可用时仍可从图片进行视角推断。\\n\\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\\n\\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\\n\\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\\n\\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\",\n    \"hard_requirements\": {\n      \"image_2d\": [\n        \"available\",\n        \"degraded\"\n      ]\n    },\n    \"evidence_preferences\": {\n      \"preferred\": [\n        \"三个角色的有效实例绑定\",\n        \"一致坐标、world_up 和 handedness\",\n        \"水平朝向与目标位置\"\n      ],\n      \"local_requirements\": {\n        \"relative_direction_of\": [\n          \"geometry_3d\",\n          \"world_frame\",\n          \"相关对象有效绑定\"\n        ]\n      },\n      \"not_required\": [\n        \"metric_scale\"\n      ],\n      \"visual_route\": \"从原图中的物体关系形成局部布局，再转到题面观察者视角。\"\n    },\n    \"steps\": [\n      {\n        \"step_id\": \"step_01\",\n        \"instruction\": \"分别记录 observer、facing_at 和 target 的题面对象，保留 difficulty 与选项集合。这里的“面向某对象”是观察者看向它，不是该家具自身的正面朝向。\"\n      },\n      {\n        \"step_id\": \"step_02\",\n        \"instruction\": \"利用已有绑定或原图确定三个角色；有多个同类实例时按题面描述和周边结构消歧。用实际可用的补检/裁剪获取有帮助的证据，不把检测候选自动升级为有效绑定。\"\n      },\n      {\n        \"step_id\": \"step_03\",\n        \"instruction\": \"若 relative_direction_of 对实际三个实例和难度获准，读取方向、角度与退化信息。若授权环境明确允许对已有有效坐标作纯计算，在统一右手系中，将 observer→facing_at 与 observer→target 投影到以单位上向量 u 为法向的水平面；前者归一化为 f，后者为 d，r=f×u，θ=atan2(d·r,d·f)，正角为右。\"\n      },\n      {\n        \"step_id\": \"step_04\",\n        \"instruction\": \"按题面难度解释角度：easy 判断左右；medium 中 |θ|≥135° 为 back，其余按左右；hard 依据前后和左右分量确定象限。零向量、无可靠上向量或边界歧义时，不能把 atan2(0,0) 或数值符号当成可靠方向；使用受控反馈或视觉判断。\"\n      },\n      {\n        \"step_id\": \"step_05\",\n        \"instruction\": \"几何不可用时，从包含两个或三个角色的原图建立局部布局，利用跨帧共有结构连接关系；在心中把站位对象放到观察原点，朝向面向对象，再判断目标落在哪一侧。不能直接沿用摄像机画面的左右。\"\n      },\n      {\n        \"step_id\": \"step_06\",\n        \"instruction\": \"针对最影响选项的歧义查看冻结帧；仍不确定时按现有证据选择最可能的合法方向。将方向映射为本题选项标签并提交，视觉推断参与则如实记录依据。\"\n      }\n    ],\n    \"checks\": [\n      \"站位、面向和目标没有互换，家具朝向未替代观察者朝向。\",\n      \"difficulty 与 options 来自当前题目，medium 的背后定义没有被 hard 四象限覆盖。\",\n      \"几何计算使用同一有效水平系并处理零向量与边界。\",\n      \"缺尺度不阻塞相对方向；缺 world_frame 不伪造几何授权。\"\n    ],\n    \"code_examples\": [],\n    \"failure_lessons\": [],\n    \"limitations\": [\n      \"接近方向边界时，小的定位误差会改变分类。\",\n      \"有限视角中的视觉布局可能存在镜像或深度歧义。\"\n    ],\n    \"supported_answer_bases\": [\n      \"visual_estimate\",\n      \"tool_derived\",\n      \"mixed\"\n    ],\n    \"provenance\": {\n      \"origin\": \"document_grounded_seed\",\n      \"source_refs\": [\n        {\n          \"ref\": \"LOCAL_V8\",\n          \"sections\": [\n            \"4\",\n            \"6\",\n            \"9.3\"\n          ]\n        },\n        {\n          \"ref\": \"VSI\",\n          \"sections\": [\n            \"B.1\"\n          ],\n          \"use\": \"三类方向难度的题意\"\n        },\n        {\n          \"ref\": \"THINK3D\",\n          \"sections\": [\n            \"3D Transformation\",\n            \"Spatial Reasoning Agent\"\n          ],\n          \"use\": \"全局与观察者视角转换思想；不引入其新视角渲染工具\"\n        },\n        {\n          \"ref\": \"DECISIONS_20260925\",\n          \"use\": \"八题型硬隔离、简化轮数预算和状态/观察合同\"\n        }\n      ],\n      \"source_trace_refs\": [],\n      \"source_split\": \"not_applicable_no_trajectory_induction\",\n      \"label_access\": false,\n      \"parent_skill_versions\": [],\n      \"candidate_record_ref\": null,\n      \"inducer_config_ref\": \"generation_record.json\",\n      \"validation_decision\": \"document_checked_runtime_pending\"\n    }\n  },\n  {\n    \"schema_version\": \"8.0\",\n    \"skill_id\": \"S07\",\n    \"version\": \"1.0.0\",\n    \"family\": \"appearance\",\n    \"applicable_question_types\": [\n      \"obj_appearance_order\"\n    ],\n    \"goal\": \"判断题面各目标类别首次出现的先后顺序，输出当前题目的合法选项，unit=option。\",\n    \"applicability\": \"时间信息可靠时可调用相应工具；若时间工具不可用，仍可依据保留顺序的原始帧进行视觉判断。\\n\\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\\n\\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\\n\\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\\n\\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\",\n    \"hard_requirements\": {\n      \"image_2d\": [\n        \"available\",\n        \"degraded\"\n      ]\n    },\n    \"evidence_preferences\": {\n      \"preferred\": [\n        \"冻结帧的物理身份、顺序和有效时间戳\",\n        \"目标类别在各帧的可见证据\",\n        \"已检查区间与漏检风险\"\n      ],\n      \"local_requirements\": {\n        \"object_visible_frames\": [\n          \"temporal\",\n          \"对象有效绑定\"\n        ]\n      },\n      \"not_required\": [\n        \"geometry_3d\",\n        \"metric_scale\",\n        \"world_frame\"\n      ],\n      \"visual_route\": \"沿原始帧顺序查找类别首次可辨认的出现，并核对相近时段。\"\n    },\n    \"steps\": [\n      {\n        \"step_id\": \"step_01\",\n        \"instruction\": \"列出待排序类别和题目选项，按源帧时间/顺序组织原始图片；重复占位图和缺失帧不能当成新的真实时刻。\"\n      },\n      {\n        \"step_id\": \"step_02\",\n        \"instruction\": \"先查看已提供原图和有效检测/可见帧记录。object_visible_frames 获准时获取实例的递增可见帧；题目问类别时，合并该类别所有已知实例的最早可见证据。\"\n      },\n      {\n        \"step_id\": \"step_03\",\n        \"instruction\": \"对每个类别记录已知最早出现和此前已检查范围。工具首次检出只是当前观测上界；未检测、服务失败和检出为空不能证明此前不存在。\"\n      },\n      {\n        \"step_id\": \"step_04\",\n        \"instruction\": \"优先检查会改变选项顺序的早期帧和相邻区间，使用已注册的检测或 inspect_frames；新裁剪需 yield 后才由模型判断。不得重新采样冻结集合之外的视频帧或恢复不存在的时间戳。\"\n      },\n      {\n        \"step_id\": \"step_05\",\n        \"instruction\": \"用物体局部、遮挡变化及后续清晰视角核对早期疑似出现；不要把后续明确识别时间自动当成首次出现。视觉判断与检测冲突时检查具体帧，不用工具状态取代实际可见性。\"\n      },\n      {\n        \"step_id\": \"step_06\",\n        \"instruction\": \"比较候选顺序与各类别的已知先后约束；同一采样间隔内无法确定先后时，不编造亚帧时间，根据现有可见线索和题目选项选最有依据的完整顺序，再提交合法标签。\"\n      }\n    ],\n    \"checks\": [\n      \"使用源帧顺序，未把布局显示顺序或文件名排序当作时间。\",\n      \"类别的多个实例已按首次出现语义聚合。\",\n      \"工具首次检出没有被当成真实首次出现的无误差证明。\",\n      \"输出与当前 options 对应，不捏造未采样帧。\"\n    ],\n    \"code_examples\": [],\n    \"failure_lessons\": [],\n    \"limitations\": [\n      \"冻结采样可能无法分辨在两个相邻帧之间发生的先后变化。\",\n      \"首次可辨认时间与标注可见性标准可能存在偏差。\"\n    ],\n    \"supported_answer_bases\": [\n      \"visual_estimate\",\n      \"tool_derived\",\n      \"mixed\"\n    ],\n    \"provenance\": {\n      \"origin\": \"document_grounded_seed\",\n      \"source_refs\": [\n        {\n          \"ref\": \"LOCAL_V8\",\n          \"sections\": [\n            \"4\",\n            \"5\",\n            \"9.1\",\n            \"9.2\",\n            \"9.4\"\n          ]\n        },\n        {\n          \"ref\": \"VSI\",\n          \"sections\": [\n            \"B.1\"\n          ],\n          \"use\": \"首次出现语义\"\n        },\n        {\n          \"ref\": \"SKILL3D_PROJECT\",\n          \"sections\": [\n            \"Qualitative Cases / Appearance Order\"\n          ],\n          \"use\": \"按时间组织检测与对象证据\"\n        },\n        {\n          \"ref\": \"DECISIONS_20260925\",\n          \"use\": \"八题型硬隔离、简化轮数预算和状态/观察合同\"\n        }\n      ],\n      \"source_trace_refs\": [],\n      \"source_split\": \"not_applicable_no_trajectory_induction\",\n      \"label_access\": false,\n      \"parent_skill_versions\": [],\n      \"candidate_record_ref\": null,\n      \"inducer_config_ref\": \"generation_record.json\",\n      \"validation_decision\": \"document_checked_runtime_pending\"\n    }\n  },\n  {\n    \"schema_version\": \"8.0\",\n    \"skill_id\": \"S08\",\n    \"version\": \"1.0.0\",\n    \"family\": \"route\",\n    \"applicable_question_types\": [\n      \"route_planning\"\n    ],\n    \"goal\": \"完成题面给定路线中的转向动作，选择正确的动作序列选项，unit=option。\",\n    \"applicability\": \"题面路线和视觉布局均可用于推理；几何与连通性只在当前授权允许时使用。无需跨题型检索方向 Skill。\\n\\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\\n\\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\\n\\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\\n\\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\",\n    \"hard_requirements\": {\n      \"image_2d\": [\n        \"available\",\n        \"degraded\"\n      ]\n    },\n    \"evidence_preferences\": {\n      \"preferred\": [\n        \"起点、初始朝向、途经和终点角色\",\n        \"相邻路段的空间关系\",\n        \"需要判断通行时的实际连通性依据\"\n      ],\n      \"local_requirements\": {\n        \"relative_direction_of\": [\n          \"geometry_3d\",\n          \"world_frame\",\n          \"相关对象有效绑定\"\n        ],\n        \"connectivity_graph\": [\n          \"geometry_3d\",\n          \"world_frame\",\n          \"必要对象有效绑定\"\n        ]\n      },\n      \"not_required\": [\n        \"metric_scale\"\n      ],\n      \"visual_route\": \"从视频布局追踪题目给定的移动过程，逐段更新假想观察者的朝向。\"\n    },\n    \"steps\": [\n      {\n        \"step_id\": \"step_01\",\n        \"instruction\": \"把题面展开为起点、初始面向对象、有序路标、直行指令和转向空位。保留每个选项的完整动作序列；求解指定路线，不自行替换成另一条较短路线。\"\n      },\n      {\n        \"step_id\": \"step_02\",\n        \"instruction\": \"使用原图和有效对象记录确认各路标身份及相邻空间。相同类别路标有歧义时利用题目描述、门洞和周边结构消歧，不能把房间重访当作新路标。\"\n      },\n      {\n        \"step_id\": \"step_03\",\n        \"instruction\": \"从题面初始朝向出发执行一段直行；抵达路标后，当前朝向应继承刚走过路段的行进方向。下一转向相对于该朝向判断，不能所有空位都沿用初始摄像机左右。\"\n      },\n      {\n        \"step_id\": \"step_04\",\n        \"instruction\": \"若相邻位置和水平系有效且获准计算，以当前路段前向 f、上向量 u 和下一路段方向 d 比较左右；右向 r=f×u，d·r 的符号给出侧向，明显反向对应掉头。使用相同规范化坐标并检查零长度/近边界路段；不为路线题照搬方向题 medium 的 135°阈值。\"\n      },\n      {\n        \"step_id\": \"step_05\",\n        \"instruction\": \"只有当前注册工具的参数语义能够表达路线角色时才调用 relative_direction_of。不能把 previous_waypoint 直接当 facing_at，因为它指向来路。connectivity_graph 可用于核查有证据支持的通行关系；对象间欧氏近邻不自动证明可通行。\"\n      },\n      {\n        \"step_id\": \"step_06\",\n        \"instruction\": \"几何不可靠时，在原图布局中逐段想象走到路标并转身，用墙面、门洞、通道和相邻物体核对左右。需要模型查看新的合法裁剪时 yield；每完成一段都更新题内朝向，不把推断写成已验证世界系。\"\n      },\n      {\n        \"step_id\": \"step_07\",\n        \"instruction\": \"将候选动作序列按题面顺序完整演练，检查是否与各直行目标和最终目的地一致。选择最有依据的合法选项；几何/通行证据不足时仍基于图片完成估计，不把路线置信度当成拒答条件。\"\n      }\n    ],\n    \"checks\": [\n      \"每个动作相对到达该路标时的朝向判断。\",\n      \"没有把来路对象当作面向前方的对象。\",\n      \"路线难度没有套用无关的方向题角度阈值。\",\n      \"没有用欧氏距离替代通行依据；结果匹配本题完整动作序列选项。\"\n    ],\n    \"code_examples\": [],\n    \"failure_lessons\": [],\n    \"limitations\": [\n      \"没有明确转弯点或可通行空间时，对象中心组成的折线只能作为路线线索。\",\n      \"方向词的解释必须符合题面，斜向或退化路段可能需要视觉判断。\"\n    ],\n    \"supported_answer_bases\": [\n      \"visual_estimate\",\n      \"tool_derived\",\n      \"mixed\"\n    ],\n    \"provenance\": {\n      \"origin\": \"document_grounded_seed\",\n      \"source_refs\": [\n        {\n          \"ref\": \"LOCAL_V8\",\n          \"sections\": [\n            \"4\",\n            \"9.2\",\n            \"9.3\",\n            \"10\"\n          ]\n        },\n        {\n          \"ref\": \"VSI\",\n          \"sections\": [\n            \"B.1\"\n          ],\n          \"use\": \"给定路线中的转向填空语义\"\n        },\n        {\n          \"ref\": \"THINK3D\",\n          \"sections\": [\n            \"3D Transformation\"\n          ],\n          \"use\": \"观察者与场景视角转换思想\"\n        },\n        {\n          \"ref\": \"DECISIONS_20260925\",\n          \"use\": \"八题型硬隔离、简化轮数预算和状态/观察合同\"\n        }\n      ],\n      \"source_trace_refs\": [],\n      \"source_split\": \"not_applicable_no_trajectory_induction\",\n      \"label_access\": false,\n      \"parent_skill_versions\": [],\n      \"candidate_record_ref\": null,\n      \"inducer_config_ref\": \"generation_record.json\",\n      \"validation_decision\": \"document_checked_runtime_pending\"\n    }\n  }\n]\n"
+    },
+    {
+      "path": "runtime/snapshot.json",
+      "sha256": "367fd178b06667fda03b6b86387f4a80b423c8f454439d72b3198c79d0917d98",
+      "content": "{\n  \"schema_version\": \"8.0\",\n  \"snapshot_id\": \"S0-seed-20260925-v1\",\n  \"parent_snapshot_id\": null,\n  \"generation\": 0,\n  \"skill_versions\": [\n    \"S01@1.0.0\",\n    \"S02@1.0.0\",\n    \"S03@1.0.0\",\n    \"S04@1.0.0\",\n    \"S05@1.0.0\",\n    \"S06@1.0.0\",\n    \"S07@1.0.0\",\n    \"S08@1.0.0\"\n  ],\n  \"manifest_hash\": \"de5ebe2f6c0f228e90b5a5cf4e3244cbf88b2b97ed8e5abe2d9b4e34d60004d6\",\n  \"validation_receipt_refs\": [\n    \"validation/static_checks.json\"\n  ],\n  \"compatibility\": {\n    \"skill_source_format\": \"harness3d-skill-source/1.0\",\n    \"target_skill_schema\": \"v8-document/8.0\",\n    \"tool_contract\": \"v8-document-sections-9-10\",\n    \"retriever\": \"canonical-task-hard-filter-before-ranking\",\n    \"evidence_rules\": \"v8-document-plus-approved-v9-discussion-20260925\",\n    \"runtime_repository_revision\": null,\n    \"runtime_verified\": false,\n    \"production_activation\": false\n  }\n}\n"
+    },
+    {
+      "path": "runtime/source_manifest.json",
+      "sha256": "a931a677fa81586c6b2f69d5d1ffbafe0970127c1b9dd293b8c4811643782dbb",
+      "content": "{\n  \"source_format_version\": \"1.0\",\n  \"entries\": [\n    {\n      \"skill_version\": \"S01@1.0.0\",\n      \"task\": \"object_counting\",\n      \"family\": \"counting\",\n      \"source_path\": \"skills/count-scene-objects/SKILL.md\",\n      \"source_sha256\": \"e16635cec0d5bba6a3048bdcace2cb0fc0db92d05c15a237894be62ee858bb32\",\n      \"spec_sha256\": \"de0e94d32e59f5c64578c8a944aafd97aba87f7662dd1184a340c930d65e68b0\"\n    },\n    {\n      \"skill_version\": \"S02@1.0.0\",\n      \"task\": \"object_abs_distance\",\n      \"family\": \"metric\",\n      \"source_path\": \"skills/estimate-object-distance/SKILL.md\",\n      \"source_sha256\": \"29dc5f6f42020d908ebb5a70e139f2cd691c121a472ed7edf6f6c0c5007632ec\",\n      \"spec_sha256\": \"daa31b47b224ea7749f42111b3fe824d3576ff64b8fd737f9c83c08146bd4c95\"\n    },\n    {\n      \"skill_version\": \"S03@1.0.0\",\n      \"task\": \"object_rel_distance\",\n      \"family\": \"relative_geometry\",\n      \"source_path\": \"skills/rank-object-distances/SKILL.md\",\n      \"source_sha256\": \"4f30a39c180c71d3b710f1283c303c0ac3275b17ee4fea04310ea8141919f4a3\",\n      \"spec_sha256\": \"1c86b877a76036b0bedc032868fd5f2d9b982c162339640e2736862681b761f3\"\n    },\n    {\n      \"skill_version\": \"S04@1.0.0\",\n      \"task\": \"object_size_estimation\",\n      \"family\": \"metric\",\n      \"source_path\": \"skills/estimate-object-size/SKILL.md\",\n      \"source_sha256\": \"90a47c91c3761a665b66c0448fd72d41c6698154857e95aa9c355ccb3610b280\",\n      \"spec_sha256\": \"acd1e9b72f428fb9f3f58091977ef0d6360747643a68ce57e6971abf5f51adcb\"\n    },\n    {\n      \"skill_version\": \"S05@1.0.0\",\n      \"task\": \"room_size_estimation\",\n      \"family\": \"metric\",\n      \"source_path\": \"skills/estimate-room-area/SKILL.md\",\n      \"source_sha256\": \"3794be730076b9ded1bcd72fa9632f7742bcb14d093e6960d736c070cc407367\",\n      \"spec_sha256\": \"a2fdc93370647a469d1f0a2c1a85232703c0c866ba777e2047b80c1d1196af00\"\n    },\n    {\n      \"skill_version\": \"S06@1.0.0\",\n      \"task\": \"object_rel_direction\",\n      \"family\": \"relative_geometry\",\n      \"source_path\": \"skills/judge-relative-direction/SKILL.md\",\n      \"source_sha256\": \"ec13470de3d4eaf1f74da96992847a8d88ff84e6f38ba0aaeec1da318dd18094\",\n      \"spec_sha256\": \"3dbe5a21a78545a9695bbd2b54364491bcbb34fd557919e2a59cad0f4bcc50d7\"\n    },\n    {\n      \"skill_version\": \"S07@1.0.0\",\n      \"task\": \"obj_appearance_order\",\n      \"family\": \"appearance\",\n      \"source_path\": \"skills/order-first-appearances/SKILL.md\",\n      \"source_sha256\": \"c9007e87ad465be3efd8b3f0b65564a6f2bee198d177a199c7e0a1deac542fda\",\n      \"spec_sha256\": \"44bf574e14442f0a07fb2fd48edcb525b73cf5cfec5062d568c3c52949b77333\"\n    },\n    {\n      \"skill_version\": \"S08@1.0.0\",\n      \"task\": \"route_planning\",\n      \"family\": \"route\",\n      \"source_path\": \"skills/infer-route-turns/SKILL.md\",\n      \"source_sha256\": \"603bb0f171d08544d0b5321426249802e6caa409b21dcf852de21c06b94d27c9\",\n      \"spec_sha256\": \"5c03f6ef67d25ea7bd1e5dd01fe92306e98934742ec25ed52bc9a7fa8e519d2c\"\n    }\n  ],\n  \"generation_record_sha256\": \"37a0060324dd4df5919c50f3ebefc38eeaba7a4799edb3b9342d999471b33f7c\",\n  \"sources_document_sha256\": \"27cdbb6743258f92df39ae892ecff8bfeda002f4a518a9fbfe16520ea06aad1d\",\n  \"manifest_hash\": \"de5ebe2f6c0f228e90b5a5cf4e3244cbf88b2b97ed8e5abe2d9b4e34d60004d6\"\n}\n"
+    },
+    {
+      "path": "scripts/build_s0.py",
+      "sha256": "fa57071eb46a9b45809f496ad59b05d5e5a3437b72a808b0a03138401cb0d34a",
+      "content": "#!/usr/bin/env python3\n\"\"\"Validate authored SKILL.md sources and export document-based SkillSpec candidates.\n\nThis is an offline file converter, not a harness3D runtime or an experiment.\nDependency: PyYAML. All paths are resolved from this project directory.\n\"\"\"\nfrom __future__ import annotations\n\nimport argparse\nimport hashlib\nimport json\nfrom pathlib import Path\nimport re\nimport sys\n\nimport yaml\n\nROOT = Path(__file__).resolve().parents[1]\nTASKS = {\n    'S01': ('object_counting', 'counting'),\n    'S02': ('object_abs_distance', 'metric'),\n    'S03': ('object_rel_distance', 'relative_geometry'),\n    'S04': ('object_size_estimation', 'metric'),\n    'S05': ('room_size_estimation', 'metric'),\n    'S06': ('object_rel_direction', 'relative_geometry'),\n    'S07': ('obj_appearance_order', 'appearance'),\n    'S08': ('route_planning', 'route'),\n}\nHEADINGS = ['目标', '适用条件', '执行约束', '证据条件', '求解步骤', '提交前检查',\n            '代码示例', '失败教训', '局限', '答案依据', '来源']\nMETA_KEYS = {'harness3d-skill-id', 'harness3d-version', 'harness3d-question-type',\n             'harness3d-family', 'harness3d-source-format', 'harness3d-validation'}\nSOURCE_IDS = {'LOCAL_V8', 'VSI', 'SKILL3D', 'SKILL3D_PROJECT', 'VADAR',\n              'THINK3D', 'DECISIONS_20260925'}\n\n\nclass UniqueSafeLoader(yaml.SafeLoader):\n    pass\n\n\ndef unique_mapping(loader, node, deep=False):\n    result = {}\n    for key_node, value_node in node.value:\n        key = loader.construct_object(key_node, deep=deep)\n        if key in result:\n            raise ValueError(f'duplicate YAML key: {key}')\n        result[key] = loader.construct_object(value_node, deep=deep)\n    return result\n\n\nUniqueSafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, unique_mapping)\n\n\ndef yload(text):\n    return yaml.load(text, Loader=UniqueSafeLoader)\n\n\ndef require(condition, message):\n    if not condition:\n        raise ValueError(message)\n\n\ndef digest(data: bytes) -> str:\n    return hashlib.sha256(data).hexdigest()\n\n\ndef canonical_bytes(value) -> bytes:\n    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'),\n                      allow_nan=False).encode('utf-8')\n\n\ndef pretty(value) -> str:\n    return json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + '\\n'\n\n\ndef fenced(section, language):\n    blocks = re.findall(rf'^```{language}\\n(.*?)\\n```', section, re.M | re.S)\n    require(len(blocks) == 1, f'expected exactly one {language} block')\n    return yload(blocks[0]) if language == 'yaml' else json.loads(blocks[0])\n\n\ndef bullets(section):\n    values = re.findall(r'^- (.+)$', section, re.M)\n    require(bool(values), 'empty required bullet list')\n    return values\n\n\ndef parse_skill(path):\n    raw = path.read_text(encoding='utf-8')\n    require(raw.startswith('---\\n'), f'{path}: missing frontmatter')\n    parts = raw.split('---\\n', 2)\n    require(len(parts) == 3, f'{path}: unclosed frontmatter')\n    front, body = yload(parts[1]), parts[2].strip()\n    require(set(front) == {'name', 'description', 'metadata'}, f'{path}: unexpected frontmatter')\n    name = front['name']\n    require(isinstance(name, str) and re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', name)\n            and len(name) <= 64 and name == path.parent.name, f'{path}: invalid name')\n    require(isinstance(front['description'], str) and 0 < len(front['description']) <= 1024,\n            f'{path}: invalid description')\n    meta = front['metadata']\n    require(isinstance(meta, dict) and set(meta) == META_KEYS\n            and all(isinstance(v, str) for v in meta.values()), f'{path}: invalid metadata')\n    sid, version = meta['harness3d-skill-id'], meta['harness3d-version']\n    require(sid in TASKS, f'{path}: unknown skill ID')\n    task, family = TASKS[sid]\n    require(meta['harness3d-question-type'] == task and meta['harness3d-family'] == family,\n            f'{path}: task/family mismatch')\n    require(meta['harness3d-source-format'] == '1.0' and version == '1.0.0',\n            f'{path}: unsupported source/seed version')\n    require(len(raw.splitlines()) < 500, f'{path}: Skill too long')\n    chunks = re.split(r'^## (.+)\\n', body, flags=re.M)\n    require(chunks[1::2] == HEADINGS, f'{path}: missing/duplicate/reordered section')\n    sections = dict(zip(chunks[1::2], [s.strip() for s in chunks[2::2]]))\n    evidence = fenced(sections['证据条件'], 'yaml')\n    require(set(evidence) == {'hard_requirements', 'evidence_preferences'}, 'invalid evidence keys')\n    require(evidence['hard_requirements'] == {'image_2d': ['available', 'degraded']},\n            f'{path}: S0 must remain eligible without geometric evidence')\n    require(isinstance(evidence['evidence_preferences'], dict), 'invalid evidence preferences')\n    numbered = re.findall(r'^(\\d+)\\. (.+)$', sections['求解步骤'], re.M)\n    require([int(n) for n, _ in numbered] == list(range(1, len(numbered) + 1))\n            and len(numbered) >= 4, f'{path}: invalid ordered steps')\n    examples = fenced(sections['代码示例'], 'json')\n    lessons = fenced(sections['失败教训'], 'json')\n    require(examples == [] and lessons == [], 'initial package cannot claim unrun code/learned lessons')\n    bases = fenced(sections['答案依据'], 'json')\n    require(bases == ['visual_estimate', 'tool_derived', 'mixed'], 'answer basis mismatch')\n    provenance = fenced(sections['来源'], 'yaml')\n    require(provenance['source_trace_refs'] == [] and provenance['label_access'] is False,\n            'unexpected trajectory/label claim')\n    require(all(s['ref'] in SOURCE_IDS for s in provenance['source_refs']), 'unknown reference')\n    require(all(token in sections['执行约束'] for token in\n                ['YieldObservations', 'ReturnAnswer', 'AnswerPayload', 'finalization']),\n            'missing control contract')\n    spec = {\n        'schema_version': '8.0', 'skill_id': sid, 'version': version, 'family': family,\n        'applicable_question_types': [task], 'goal': sections['目标'],\n        'applicability': sections['适用条件'] + '\\n\\n' + sections['执行约束'],\n        **evidence,\n        'steps': [{'step_id': f'step_{int(n):02}', 'instruction': text} for n, text in numbered],\n        'checks': bullets(sections['提交前检查']), 'code_examples': examples,\n        'failure_lessons': lessons, 'limitations': bullets(sections['局限']),\n        'supported_answer_bases': bases, 'provenance': provenance,\n    }\n    entry = {'skill_version': f'{sid}@{version}', 'task': task, 'family': family,\n             'source_path': path.relative_to(ROOT).as_posix(), 'source_sha256': digest(raw.encode()),\n             'spec_sha256': digest(canonical_bytes(spec))}\n    return spec, entry\n\n\ndef eligible(spec, task, image_state):\n    \"\"\"Only the documented package filter, not the production retriever.\"\"\"\n    return (task in spec['applicable_question_types'] and\n            image_state in spec['hard_requirements']['image_2d'])\n\n\ndef build(check=False):\n    paths = sorted((ROOT / 'skills').glob('*/SKILL.md'))\n    require(len(paths) == 8, 'expected exactly eight S0 source files')\n    parsed = sorted([parse_skill(p) for p in paths], key=lambda item: item[0]['skill_id'])\n    specs, entries = [p[0] for p in parsed], [p[1] for p in parsed]\n    require([s['skill_id'] for s in specs] == list(TASKS), 'missing or duplicate skill ID')\n    require(len({s['applicable_question_types'][0] for s in specs}) == 8, 'task isolation violated')\n    checked = 0\n    for spec in specs:\n        for task, _ in TASKS.values():\n            for state in ['available', 'degraded', 'unavailable']:\n                expected = task == spec['applicable_question_types'][0] and state != 'unavailable'\n                require(eligible(spec, task, state) == expected, 'package retrieval filter failure')\n                checked += 1\n        require(not eligible(spec, 'unknown_task', 'available'), 'unknown task admitted')\n    record_path = ROOT / 'generation_record.json'\n    record = json.loads(record_path.read_text(encoding='utf-8'))\n    require(record['seed_count'] == 8 and record['runtime_target_schema_version'] == '8.0',\n            'generation record mismatch')\n    manifest_payload = {'source_format_version':'1.0', 'entries':entries,\n      'generation_record_sha256':digest(record_path.read_bytes()),\n      'sources_document_sha256':digest((ROOT / 'SOURCES.md').read_bytes())}\n    manifest = {**manifest_payload, 'manifest_hash':digest(canonical_bytes(manifest_payload))}\n    snapshot = {'schema_version':'8.0', 'snapshot_id':'S0-seed-20260925-v1',\n      'parent_snapshot_id':None, 'generation':0, 'skill_versions':[e['skill_version'] for e in entries],\n      'manifest_hash':manifest['manifest_hash'],\n      'validation_receipt_refs':['validation/static_checks.json'],\n      'compatibility':{'skill_source_format':'harness3d-skill-source/1.0',\n        'target_skill_schema':'v8-document/8.0', 'tool_contract':'v8-document-sections-9-10',\n        'retriever':'canonical-task-hard-filter-before-ranking',\n        'evidence_rules':'v8-document-plus-approved-v9-discussion-20260925',\n        'runtime_repository_revision':None, 'runtime_verified':False, 'production_activation':False}}\n    report = {'check_type':'source_format_and_document_contract_only', 'passed':True,\n      'skill_count':8, 'exact_task_coverage':list(task for task,_ in TASKS.values()),\n      'package_filter_cases':checked, 'unknown_task_rejections':8,\n      'checks':['YAML safely parsed with duplicate-key rejection',\n        'required sections and source references', 'single exact task per Skill',\n        'eight-task completeness', 'visual eligibility without geometric hard requirements',\n        'valid answer bases and no fabricated learned lessons', 'deterministic hashes and exports'],\n      'not_run':['production Pydantic/model validation', 'production retriever execution',\n        'registered tool signature verification', 'real visual/model/tool episode', 'benchmark evaluation'],\n      'experimental_freeze':'pending_runtime_acceptance'}\n    outputs = {'runtime/skill_specs.json':specs, 'runtime/source_manifest.json':manifest,\n               'runtime/snapshot.json':snapshot, 'validation/static_checks.json':report}\n    for rel, value in outputs.items():\n        target = ROOT / rel\n        expected = pretty(value)\n        if check:\n            require(target.is_file() and target.read_text(encoding='utf-8') == expected,\n                    f'outdated or missing export: {rel}; run build_s0.py')\n        else:\n            target.parent.mkdir(parents=True, exist_ok=True)\n            target.write_text(expected, encoding='utf-8')\n    print(json.dumps({'passed':True,'mode':'check' if check else 'build', 'skills':8,\n                      'filter_cases':checked, 'production_runtime_tested':False}, ensure_ascii=False))\n\n\nif __name__ == '__main__':\n    parser = argparse.ArgumentParser(description=__doc__)\n    parser.add_argument('--check', action='store_true', help='validate and detect stale JSON exports')\n    args = parser.parse_args()\n    try:\n        build(args.check)\n    except (ValueError, KeyError, TypeError, OSError, yaml.YAMLError) as exc:\n        print(f'ERROR: {exc}', file=sys.stderr)\n        raise SystemExit(1)\n"
+    },
+    {
+      "path": "skills/count-scene-objects/SKILL.md",
+      "sha256": "e16635cec0d5bba6a3048bdcace2cb0fc0db92d05c15a237894be62ee858bb32",
+      "content": "---\nname: count-scene-objects\ndescription: 用于 object_counting：在冻结视频帧中定位目标类别，关联重复观测，检查遗漏并提交非负整数计数。仅在本题型分区召回。\nmetadata:\n  harness3d-skill-id: S01\n  harness3d-version: 1.0.0\n  harness3d-question-type: object_counting\n  harness3d-family: counting\n  harness3d-source-format: '1.0'\n  harness3d-validation: document-checked-runtime-pending\n---\n\n# 跨帧对象去重计数\n\n## 目标\n\n估计题面指定空间中目标类别的独立实体数量，输出 unit=count 的非负整数。\n\n## 适用条件\n\n可使用纯视觉、二维检测/跟踪或获准的几何辅助。目标尚未绑定、检测失败或三维不可用时仍适用；这些状态只改变后续步骤。\n\n## 执行约束\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\n\n## 证据条件\n\n```yaml\nhard_requirements:\n  image_2d:\n  - available\n  - degraded\nevidence_preferences:\n  preferred:\n  - 多视角目标候选及覆盖说明\n  - 跨帧身份与重复嫌疑\n  - 可用时的几何位置一致性\n  local_requirements:\n    count_objects:\n    - object_detection\n    - track_consensus\n    geometry_assistance:\n    - geometry_3d\n    - 相关对象有效绑定\n  visual_route: 利用原图中的外观、相邻物体、固定结构和观察顺序核对实体身份。\n```\n\n## 求解步骤\n\n1. 从题面确定目标类别、空间范围及同义词；按当前题面语义处理部件与整体，不能把同一件家具的部件重复计入。\n\n2. 复用有效候选与覆盖记录；可用时通过 list_objects 查看 category_name、obj_id、visible_frames、track_id 和重复嫌疑。将每条记录视为候选，不把记录条数当作答案。\n\n3. 建立题内实例表，记录各候选出现的帧、相邻结构和相似对象。用多个线索合并同一实体的重复观测；两个同款物体在同一帧同时出现时保留为不同实体，不凭外观相似就合并。\n\n4. 优先检查会改变计数的未覆盖区域、遮挡后重现和重复 track。若 detect_objects 已获准，仅对目标类别和有用帧补检；需要精细边界或身份关联时，仅使用实际注册的分割/跟踪能力。需看新裁剪时调用 inspect_frames 后 yield。\n\n5. count_objects 获准时读取它的去重结果、覆盖说明和降级标记，与实例表交叉核对。三维位置只作为获准的辅助证据；二维方法可独立继续。服务失败、未运行、健康空检出、截断分别处理。\n\n6. 工具与视觉冲突时定位冲突到具体实例，补看最能消除歧义的冻结帧；无法解决时根据覆盖及身份线索选最有依据的整数。计数为零须由观察支持，不能由服务错误推得；随后按共同合同提交。\n\n## 提交前检查\n\n- 同一实体跨帧只计一次；同款多实例没有被误合并。\n- 截断、遮挡和未检查区域没有被当作完整覆盖。\n- 没有用检测故障或空 result payload 推导零计数。\n- 答案是非负整数；依据与实际使用结果一致。\n\n## 代码示例\n\n```json\n[]\n```\n\n本版使用方法说明和计算关系，不提供依赖未知实现的可执行示例。程序入口、工具调用和 AnswerPayload 构造以运行框架实际注入的合同为准。\n\n## 失败教训\n\n```json\n[]\n```\n\n尚无本系统真实轨迹归纳；上面的检查属于初始方法设计，不冒充实测失败经验。\n\n## 局限\n\n- 有限帧集可能漏掉完全不可见对象。\n- 实例表是当前题的推断，不能把模型推断写成已验证的几何绑定。\n\n## 答案依据\n\n```json\n[\"visual_estimate\", \"tool_derived\", \"mixed\"]\n```\n\n## 来源\n\n```yaml\norigin: document_grounded_seed\nsource_refs:\n- ref: LOCAL_V8\n  sections:\n  - '4'\n  - '9.1'\n  - '9.2'\n  - '10'\n  - '13'\n- ref: VSI\n  sections:\n  - '3'\n  - B.1\n  use: 计数任务定义\n- ref: SKILL3D\n  sections:\n  - '3.1'\n  - '3.2'\n  - Appendix D\n  use: 多视角去重与证据组织\n- ref: DECISIONS_20260925\n  use: 八题型硬隔离、简化轮数预算和状态/观察合同\nsource_trace_refs: []\nsource_split: not_applicable_no_trajectory_induction\nlabel_access: false\nparent_skill_versions: []\ncandidate_record_ref: null\ninducer_config_ref: generation_record.json\nvalidation_decision: document_checked_runtime_pending\n```\n"
+    },
+    {
+      "path": "skills/estimate-object-distance/SKILL.md",
+      "sha256": "29dc5f6f42020d908ebb5a70e139f2cd691c121a472ed7edf6f6c0c5007632ec",
+      "content": "---\nname: estimate-object-distance\ndescription: 用于 object_abs_distance：按题面两个对象的最近距离口径，选择有效米制测量或视觉估计，输出米。仅在本题型分区召回。\nmetadata:\n  harness3d-skill-id: S02\n  harness3d-version: 1.0.0\n  harness3d-question-type: object_abs_distance\n  harness3d-family: metric\n  harness3d-source-format: '1.0'\n  harness3d-validation: document-checked-runtime-pending\n---\n\n# 对象间绝对距离估计\n\n## 目标\n\n估计两个题面对象之间的最近直接距离，输出 unit=m 的有限非负数值。\n\n## 适用条件\n\n优先使用满足逐工具权限的几何测量；无尺度、绑定待确认或几何失败时保留视觉估计路径。\n\n## 执行约束\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\n\n## 证据条件\n\n```yaml\nhard_requirements:\n  image_2d:\n  - available\n  - degraded\nevidence_preferences:\n  preferred:\n  - 两个题面对象的有效实例绑定\n  - 一致坐标中的有效对象几何与距离定义\n  - 当前有效尺度及米制授权\n  local_requirements:\n    object_distance_m:\n    - geometry_3d\n    - metric_scale\n    - 两个实例有效绑定\n    - 当前米制调用获准\n  visual_route: 用同时可见的边界、跨视角布局及合理参照尺寸估计对象间隔。\n```\n\n## 求解步骤\n\n1. 解析两个对象的角色及消歧描述，明确测量对象间的最近直接距离；不能把参考对象换成相机，也不能默认使用中心距离。\n\n2. 核对候选和题级绑定。需要时对相关类别补检、检查局部图像，结合周边物体确认实例；具体工具不可用时依靠原图定位，不虚构 obj_id 或绑定成功状态。\n\n3. 若 object_distance_m 对实际两个对象获准，调用后检查 status、有效数值、单位、依赖和距离定义。pointcloud_surface_proxy 与 bbox_nearest_proxy 均为声明过的代理，不能把可见表面代理当成官方标注真值。\n\n4. 理解工具已完成的单位转换。只有文档明确返回归一化距离并允许使用同一有效尺度时才做 d_m=s*d_norm；已经是米的值不能再乘尺度。量化阈值、点集清洗和分位数由冻结工具合同决定。\n\n5. 检查最近区域是否被遮挡、点集是否混入背景、两对象是否来自一致坐标。结果失效就停止使用并交给框架处理；不要把旧数值手动改成有效，或用视觉猜测恢复米制权限。\n\n6. 测量不能支持结论时，比较多个原图视角中的相邻关系与接近边界；结合合理参照物的尺寸范围估计间隔，修正明显的透视和深度差异。参照尺寸属于估计；不要把不同深度上的像素比例直接当米制比例。\n\n7. 结合当前可靠证据选取最有依据的数值；跨帧一致性支持估计，但同一误差来源的多次结果不等于独立验证。按米提交，并正确区分测量、视觉估计和混合依据。\n\n## 提交前检查\n\n- 测量的是两个题面对象，不是相机到对象。\n- 距离口径与单位正确，没有中心距离替代最近距离或重复乘尺度。\n- 米制测量的尺度、几何和绑定都仍有效。\n- 视觉参照没有被记录为工具测量或真实尺度。\n\n## 代码示例\n\n```json\n[]\n```\n\n本版使用方法说明和计算关系，不提供依赖未知实现的可执行示例。程序入口、工具调用和 AnswerPayload 构造以运行框架实际注入的合同为准。\n\n## 失败教训\n\n```json\n[]\n```\n\n尚无本系统真实轨迹归纳；上面的检查属于初始方法设计，不冒充实测失败经验。\n\n## 局限\n\n- 可见表面距离与完整对象包围框距离可能有系统偏差。\n- 完全遮挡的最近边界只能估计，不能宣称精确恢复。\n\n## 答案依据\n\n```json\n[\"visual_estimate\", \"tool_derived\", \"mixed\"]\n```\n\n## 来源\n\n```yaml\norigin: document_grounded_seed\nsource_refs:\n- ref: LOCAL_V8\n  sections:\n  - '4'\n  - '8'\n  - '9.2'\n  - '9.3'\n  - '10'\n- ref: VSI\n  sections:\n  - B.1\n  use: 对象间最近距离及米单位\n- ref: SKILL3D\n  sections:\n  - Appendix D\n  use: 边界相关的距离证据\n- ref: VADAR\n  sections:\n  - Approach\n  use: 将定位和计算分解为可组合步骤\n- ref: DECISIONS_20260925\n  use: 八题型硬隔离、简化轮数预算和状态/观察合同\nsource_trace_refs: []\nsource_split: not_applicable_no_trajectory_induction\nlabel_access: false\nparent_skill_versions: []\ncandidate_record_ref: null\ninducer_config_ref: generation_record.json\nvalidation_decision: document_checked_runtime_pending\n```\n"
+    },
+    {
+      "path": "skills/estimate-object-size/SKILL.md",
+      "sha256": "90a47c91c3761a665b66c0448fd72d41c6698154857e95aa9c355ccb3610b280",
+      "content": "---\nname: estimate-object-size\ndescription: 用于 object_size_estimation：识别完整目标对象，估计其长度、宽度、高度中的最长维，按题面单位输出；规范单位为厘米。\nmetadata:\n  harness3d-skill-id: S04\n  harness3d-version: 1.0.0\n  harness3d-question-type: object_size_estimation\n  harness3d-family: metric\n  harness3d-source-format: '1.0'\n  harness3d-validation: document-checked-runtime-pending\n---\n\n# 对象最长尺寸估计\n\n## 目标\n\n估计目标对象的最长物理维度，规范输出 unit=cm 的有限正数。\n\n## 适用条件\n\n有效对象 extent 和尺度可支持测量；只见局部、尺度缺失或几何不可用时仍通过视觉估计完成任务。\n\n## 执行约束\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\n\n## 证据条件\n\n```yaml\nhard_requirements:\n  image_2d:\n  - available\n  - degraded\nevidence_preferences:\n  preferred:\n  - 完整对象身份与边界\n  - 对象方向及三维 extent 定义\n  - 有效米制尺度与遮挡说明\n  local_requirements:\n    object_3d_extent:\n    - geometry_3d\n    - metric_scale\n    - 对象有效绑定\n    - 当前米制调用获准\n  visual_route: 结合完整轮廓、多视角、同深度参照物和类别尺寸常识估计最长维。\n```\n\n## 求解步骤\n\n1. 确定目标实例和题面待测维度；规范任务取长、宽、高中的最大者。分清整个对象、可见部分和附件，避免只测最醒目的局部。\n\n2. 选择能显示对象整体和主轴的冻结帧；需要时补检或查看局部与全图的对应关系。结合不同视角识别遮挡、截断、伸展部分和物体朝向。\n\n3. 若 object_3d_extent 获准，读取有效维度、最长维、单位、框方向和覆盖说明。以工具已声明的定义计算；相机/世界轴对齐框可能高估旋转物体尺寸，部分点云可能低估完整对象。\n\n4. 按实际返回单位转换到题面要求：米到厘米乘 100，已是厘米不重复转换。只有归一化长度才需同一有效尺度；不从图片猜一个尺度填回工具状态。\n\n5. 几何不足时，先辨认哪个维度最可能最长，再从完整视角和附近参照物估计量级。参照物须考虑真实尺寸范围和是否处于近似相同深度；类别常识只作估计依据，不能固定“每张桌子都是同一尺寸”。\n\n6. 对不同视角的估计差异检查是否来自透视、部件混淆或遮挡，选最有依据的单一数值。答案按要求的单位提交，估计参与结果时标为 visual_estimate 或 mixed。\n\n## 提交前检查\n\n- 回答的是完整目标的最长维，不是像素长度、体积或任意一条边。\n- 框定义、旋转、局部可见性已纳入判断。\n- 没有重复乘尺度或漏掉米/厘米转换。\n- 没有用类别固定常量代替当前图片判断。\n\n## 代码示例\n\n```json\n[]\n```\n\n本版使用方法说明和计算关系，不提供依赖未知实现的可执行示例。程序入口、工具调用和 AnswerPayload 构造以运行框架实际注入的合同为准。\n\n## 失败教训\n\n```json\n[]\n```\n\n尚无本系统真实轨迹归纳；上面的检查属于初始方法设计，不冒充实测失败经验。\n\n## 局限\n\n- 只有局部表面时，完整尺寸的恢复可能依赖视觉常识。\n- 参照物的尺寸不确定性与透视差异会传递到估计。\n\n## 答案依据\n\n```json\n[\"visual_estimate\", \"tool_derived\", \"mixed\"]\n```\n\n## 来源\n\n```yaml\norigin: document_grounded_seed\nsource_refs:\n- ref: LOCAL_V8\n  sections:\n  - '4'\n  - '9.2'\n  - '9.3'\n- ref: VSI\n  sections:\n  - B.1\n  use: 最长维和厘米单位\n- ref: VADAR\n  sections:\n  - Approach\n  use: 对象维度的定位与计算分解\n- ref: DECISIONS_20260925\n  use: 八题型硬隔离、简化轮数预算和状态/观察合同\nsource_trace_refs: []\nsource_split: not_applicable_no_trajectory_induction\nlabel_access: false\nparent_skill_versions: []\ncandidate_record_ref: null\ninducer_config_ref: generation_record.json\nvalidation_decision: document_checked_runtime_pending\n```\n"
+    },
+    {
+      "path": "skills/estimate-room-area/SKILL.md",
+      "sha256": "3794be730076b9ded1bcd72fa9632f7742bcb14d093e6960d736c070cc407367",
+      "content": "---\nname: estimate-room-area\ndescription: 用于 room_size_estimation：识别题面房间或合并空间范围，结合有效平面边界或视觉布局估计面积，输出平方米。\nmetadata:\n  harness3d-skill-id: S05\n  harness3d-version: 1.0.0\n  harness3d-question-type: room_size_estimation\n  harness3d-family: metric\n  harness3d-source-format: '1.0'\n  harness3d-validation: document-checked-runtime-pending\n---\n\n# 房间边界与面积估计\n\n## 目标\n\n估计题目指定空间的平面面积，规范输出 unit=m2 的有限正数。\n\n## 适用条件\n\n可使用授权的平面/边界工具，也可从原图布局估计；缺尺度或平面不可靠时不整体屏蔽本方法。\n\n## 执行约束\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\n\n## 证据条件\n\n```yaml\nhard_requirements:\n  image_2d:\n  - available\n  - degraded\nevidence_preferences:\n  preferred:\n  - 房间/多房间范围与连通关系\n  - 地面或水平边界的覆盖\n  - 尺度与平面拟合质量\n  local_requirements:\n    plane_fit_room_size:\n    - geometry_3d\n    - metric_scale\n    - 当前米制调用获准\n  visual_route: 用墙面连接、门洞、房间转角和尺寸参照建立简化平面布局。\n```\n\n## 求解步骤\n\n1. 从题面确定单房间还是多房间合并范围，依据帧中的门洞、墙面和相机行进关系区分不同空间；同一空间的重复拍摄只算一次。\n\n2. 读取前置重建及覆盖摘要，检查是否有有效水平面和边界。家具遮挡的地面不等于房间缺失面积；地板像素数、墙面面积、房间对角线都不直接等于所问面积。\n\n3. 若 plane_fit_room_size 获准，核对返回 area、单位、边界/平面质量及覆盖范围是否与题意一致。可计数对象清单没有 floor 或 wall，不妨碍利用已有结构证据；不能虚构未注册的地面分割调用。\n\n4. 处理非矩形和多个区域时，依据可靠边界做分解与并集，避免重叠重复计入；不要将所有可见区域直接取外接矩形/凸包而填满凹口和空间间隔。采用的近似应有视觉依据。\n\n5. 理解单位与尺度：归一化面积到平方米需乘 s²，已是平方米不再缩放。尺度或边界失效时撤销依赖测量的使用，由框架管理恢复。\n\n6. 几何不足时，根据多个原图视角构建简化平面草图，利用墙段、门洞和家具等参照估计主尺寸；按有依据的矩形或少量区域分解求面积。参照物常识与不可见边界均属于估计，不能作为已验证几何。\n\n7. 检查空间范围、重复区域和未观察边界是否主导误差，选取最有依据的单一面积并按平方米提交。没有可靠边界也保留视觉作答，不能把工具失败返回为零面积。\n\n## 提交前检查\n\n- 计算的是所问空间面积，单位为平方米。\n- 长度尺度用于面积时平方，已经是米制面积时不重复处理。\n- 重复拍摄、重叠区域和家具遮挡未引入重复计数或错误扣除。\n- 没有把有限可见地面直接称为完整房间边界。\n\n## 代码示例\n\n```json\n[]\n```\n\n本版使用方法说明和计算关系，不提供依赖未知实现的可执行示例。程序入口、工具调用和 AnswerPayload 构造以运行框架实际注入的合同为准。\n\n## 失败教训\n\n```json\n[]\n```\n\n尚无本系统真实轨迹归纳；上面的检查属于初始方法设计，不冒充实测失败经验。\n\n## 局限\n\n- 视野未覆盖边界时，面积只能依据部分证据估计。\n- 官方面积构造与本系统拟合代理可能不同，需通过开发集检验偏差。\n\n## 答案依据\n\n```json\n[\"visual_estimate\", \"tool_derived\", \"mixed\"]\n```\n\n## 来源\n\n```yaml\norigin: document_grounded_seed\nsource_refs:\n- ref: LOCAL_V8\n  sections:\n  - '4'\n  - '9.1'\n  - '9.2'\n  - '9.3'\n- ref: VSI\n  sections:\n  - B.1\n  use: 面积及多房间范围定义\n- ref: SKILL3D_PROJECT\n  sections:\n  - Qualitative Cases / Room Size\n  use: 房间尺度的多证据组织\n- ref: DECISIONS_20260925\n  use: 八题型硬隔离、简化轮数预算和状态/观察合同\nsource_trace_refs: []\nsource_split: not_applicable_no_trajectory_induction\nlabel_access: false\nparent_skill_versions: []\ncandidate_record_ref: null\ninducer_config_ref: generation_record.json\nvalidation_decision: document_checked_runtime_pending\n```\n"
+    },
+    {
+      "path": "skills/infer-route-turns/SKILL.md",
+      "sha256": "603bb0f171d08544d0b5321426249802e6caa409b21dcf852de21c06b94d27c9",
+      "content": "---\nname: infer-route-turns\ndescription: 用于 route_planning：解析题面起点、初始朝向和给定路标，逐段更新朝向并填写转向动作，匹配当前题目的选项。\nmetadata:\n  harness3d-skill-id: S08\n  harness3d-version: 1.0.0\n  harness3d-question-type: route_planning\n  harness3d-family: route\n  harness3d-source-format: '1.0'\n  harness3d-validation: document-checked-runtime-pending\n---\n\n# 沿给定路线判断转向\n\n## 目标\n\n完成题面给定路线中的转向动作，选择正确的动作序列选项，unit=option。\n\n## 适用条件\n\n题面路线和视觉布局均可用于推理；几何与连通性只在当前授权允许时使用。无需跨题型检索方向 Skill。\n\n## 执行约束\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\n\n## 证据条件\n\n```yaml\nhard_requirements:\n  image_2d:\n  - available\n  - degraded\nevidence_preferences:\n  preferred:\n  - 起点、初始朝向、途经和终点角色\n  - 相邻路段的空间关系\n  - 需要判断通行时的实际连通性依据\n  local_requirements:\n    relative_direction_of:\n    - geometry_3d\n    - world_frame\n    - 相关对象有效绑定\n    connectivity_graph:\n    - geometry_3d\n    - world_frame\n    - 必要对象有效绑定\n  not_required:\n  - metric_scale\n  visual_route: 从视频布局追踪题目给定的移动过程，逐段更新假想观察者的朝向。\n```\n\n## 求解步骤\n\n1. 把题面展开为起点、初始面向对象、有序路标、直行指令和转向空位。保留每个选项的完整动作序列；求解指定路线，不自行替换成另一条较短路线。\n\n2. 使用原图和有效对象记录确认各路标身份及相邻空间。相同类别路标有歧义时利用题目描述、门洞和周边结构消歧，不能把房间重访当作新路标。\n\n3. 从题面初始朝向出发执行一段直行；抵达路标后，当前朝向应继承刚走过路段的行进方向。下一转向相对于该朝向判断，不能所有空位都沿用初始摄像机左右。\n\n4. 若相邻位置和水平系有效且获准计算，以当前路段前向 f、上向量 u 和下一路段方向 d 比较左右；右向 r=f×u，d·r 的符号给出侧向，明显反向对应掉头。使用相同规范化坐标并检查零长度/近边界路段；不为路线题照搬方向题 medium 的 135°阈值。\n\n5. 只有当前注册工具的参数语义能够表达路线角色时才调用 relative_direction_of。不能把 previous_waypoint 直接当 facing_at，因为它指向来路。connectivity_graph 可用于核查有证据支持的通行关系；对象间欧氏近邻不自动证明可通行。\n\n6. 几何不可靠时，在原图布局中逐段想象走到路标并转身，用墙面、门洞、通道和相邻物体核对左右。需要模型查看新的合法裁剪时 yield；每完成一段都更新题内朝向，不把推断写成已验证世界系。\n\n7. 将候选动作序列按题面顺序完整演练，检查是否与各直行目标和最终目的地一致。选择最有依据的合法选项；几何/通行证据不足时仍基于图片完成估计，不把路线置信度当成拒答条件。\n\n## 提交前检查\n\n- 每个动作相对到达该路标时的朝向判断。\n- 没有把来路对象当作面向前方的对象。\n- 路线难度没有套用无关的方向题角度阈值。\n- 没有用欧氏距离替代通行依据；结果匹配本题完整动作序列选项。\n\n## 代码示例\n\n```json\n[]\n```\n\n本版使用方法说明和计算关系，不提供依赖未知实现的可执行示例。程序入口、工具调用和 AnswerPayload 构造以运行框架实际注入的合同为准。\n\n## 失败教训\n\n```json\n[]\n```\n\n尚无本系统真实轨迹归纳；上面的检查属于初始方法设计，不冒充实测失败经验。\n\n## 局限\n\n- 没有明确转弯点或可通行空间时，对象中心组成的折线只能作为路线线索。\n- 方向词的解释必须符合题面，斜向或退化路段可能需要视觉判断。\n\n## 答案依据\n\n```json\n[\"visual_estimate\", \"tool_derived\", \"mixed\"]\n```\n\n## 来源\n\n```yaml\norigin: document_grounded_seed\nsource_refs:\n- ref: LOCAL_V8\n  sections:\n  - '4'\n  - '9.2'\n  - '9.3'\n  - '10'\n- ref: VSI\n  sections:\n  - B.1\n  use: 给定路线中的转向填空语义\n- ref: THINK3D\n  sections:\n  - 3D Transformation\n  use: 观察者与场景视角转换思想\n- ref: DECISIONS_20260925\n  use: 八题型硬隔离、简化轮数预算和状态/观察合同\nsource_trace_refs: []\nsource_split: not_applicable_no_trajectory_induction\nlabel_access: false\nparent_skill_versions: []\ncandidate_record_ref: null\ninducer_config_ref: generation_record.json\nvalidation_decision: document_checked_runtime_pending\n```\n"
+    },
+    {
+      "path": "skills/judge-relative-direction/SKILL.md",
+      "sha256": "ec13470de3d4eaf1f74da96992847a8d88ff84e6f38ba0aaeec1da318dd18094",
+      "content": "---\nname: judge-relative-direction\ndescription: 用于 object_rel_direction：绑定站位、面向和目标角色，按 easy/medium/hard 定义判断方向并匹配当前选项。\nmetadata:\n  harness3d-skill-id: S06\n  harness3d-version: 1.0.0\n  harness3d-question-type: object_rel_direction\n  harness3d-family: relative_geometry\n  harness3d-source-format: '1.0'\n  harness3d-validation: document-checked-runtime-pending\n---\n\n# 指定站位和朝向下的方向判断\n\n## 目标\n\n从题面假定观察者的站位和朝向判断目标方向，输出当前题目的合法选项，unit=option。\n\n## 适用条件\n\n保留方向难度与原始选项。几何工具依赖 world_frame，但世界朝向不可用时仍可从图片进行视角推断。\n\n## 执行约束\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\n\n## 证据条件\n\n```yaml\nhard_requirements:\n  image_2d:\n  - available\n  - degraded\nevidence_preferences:\n  preferred:\n  - 三个角色的有效实例绑定\n  - 一致坐标、world_up 和 handedness\n  - 水平朝向与目标位置\n  local_requirements:\n    relative_direction_of:\n    - geometry_3d\n    - world_frame\n    - 相关对象有效绑定\n  not_required:\n  - metric_scale\n  visual_route: 从原图中的物体关系形成局部布局，再转到题面观察者视角。\n```\n\n## 求解步骤\n\n1. 分别记录 observer、facing_at 和 target 的题面对象，保留 difficulty 与选项集合。这里的“面向某对象”是观察者看向它，不是该家具自身的正面朝向。\n\n2. 利用已有绑定或原图确定三个角色；有多个同类实例时按题面描述和周边结构消歧。用实际可用的补检/裁剪获取有帮助的证据，不把检测候选自动升级为有效绑定。\n\n3. 若 relative_direction_of 对实际三个实例和难度获准，读取方向、角度与退化信息。若授权环境明确允许对已有有效坐标作纯计算，在统一右手系中，将 observer→facing_at 与 observer→target 投影到以单位上向量 u 为法向的水平面；前者归一化为 f，后者为 d，r=f×u，θ=atan2(d·r,d·f)，正角为右。\n\n4. 按题面难度解释角度：easy 判断左右；medium 中 |θ|≥135° 为 back，其余按左右；hard 依据前后和左右分量确定象限。零向量、无可靠上向量或边界歧义时，不能把 atan2(0,0) 或数值符号当成可靠方向；使用受控反馈或视觉判断。\n\n5. 几何不可用时，从包含两个或三个角色的原图建立局部布局，利用跨帧共有结构连接关系；在心中把站位对象放到观察原点，朝向面向对象，再判断目标落在哪一侧。不能直接沿用摄像机画面的左右。\n\n6. 针对最影响选项的歧义查看冻结帧；仍不确定时按现有证据选择最可能的合法方向。将方向映射为本题选项标签并提交，视觉推断参与则如实记录依据。\n\n## 提交前检查\n\n- 站位、面向和目标没有互换，家具朝向未替代观察者朝向。\n- difficulty 与 options 来自当前题目，medium 的背后定义没有被 hard 四象限覆盖。\n- 几何计算使用同一有效水平系并处理零向量与边界。\n- 缺尺度不阻塞相对方向；缺 world_frame 不伪造几何授权。\n\n## 代码示例\n\n```json\n[]\n```\n\n本版使用方法说明和计算关系，不提供依赖未知实现的可执行示例。程序入口、工具调用和 AnswerPayload 构造以运行框架实际注入的合同为准。\n\n## 失败教训\n\n```json\n[]\n```\n\n尚无本系统真实轨迹归纳；上面的检查属于初始方法设计，不冒充实测失败经验。\n\n## 局限\n\n- 接近方向边界时，小的定位误差会改变分类。\n- 有限视角中的视觉布局可能存在镜像或深度歧义。\n\n## 答案依据\n\n```json\n[\"visual_estimate\", \"tool_derived\", \"mixed\"]\n```\n\n## 来源\n\n```yaml\norigin: document_grounded_seed\nsource_refs:\n- ref: LOCAL_V8\n  sections:\n  - '4'\n  - '6'\n  - '9.3'\n- ref: VSI\n  sections:\n  - B.1\n  use: 三类方向难度的题意\n- ref: THINK3D\n  sections:\n  - 3D Transformation\n  - Spatial Reasoning Agent\n  use: 全局与观察者视角转换思想；不引入其新视角渲染工具\n- ref: DECISIONS_20260925\n  use: 八题型硬隔离、简化轮数预算和状态/观察合同\nsource_trace_refs: []\nsource_split: not_applicable_no_trajectory_induction\nlabel_access: false\nparent_skill_versions: []\ncandidate_record_ref: null\ninducer_config_ref: generation_record.json\nvalidation_decision: document_checked_runtime_pending\n```\n"
+    },
+    {
+      "path": "skills/order-first-appearances/SKILL.md",
+      "sha256": "c9007e87ad465be3efd8b3f0b65564a6f2bee198d177a199c7e0a1deac542fda",
+      "content": "---\nname: order-first-appearances\ndescription: 用于 obj_appearance_order：按冻结帧真实时间顺序核对目标类别首次可见证据，区分漏检与未出现并选择顺序选项。\nmetadata:\n  harness3d-skill-id: S07\n  harness3d-version: 1.0.0\n  harness3d-question-type: obj_appearance_order\n  harness3d-family: appearance\n  harness3d-source-format: '1.0'\n  harness3d-validation: document-checked-runtime-pending\n---\n\n# 目标类别首次出现顺序判断\n\n## 目标\n\n判断题面各目标类别首次出现的先后顺序，输出当前题目的合法选项，unit=option。\n\n## 适用条件\n\n时间信息可靠时可调用相应工具；若时间工具不可用，仍可依据保留顺序的原始帧进行视觉判断。\n\n## 执行约束\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\n\n## 证据条件\n\n```yaml\nhard_requirements:\n  image_2d:\n  - available\n  - degraded\nevidence_preferences:\n  preferred:\n  - 冻结帧的物理身份、顺序和有效时间戳\n  - 目标类别在各帧的可见证据\n  - 已检查区间与漏检风险\n  local_requirements:\n    object_visible_frames:\n    - temporal\n    - 对象有效绑定\n  not_required:\n  - geometry_3d\n  - metric_scale\n  - world_frame\n  visual_route: 沿原始帧顺序查找类别首次可辨认的出现，并核对相近时段。\n```\n\n## 求解步骤\n\n1. 列出待排序类别和题目选项，按源帧时间/顺序组织原始图片；重复占位图和缺失帧不能当成新的真实时刻。\n\n2. 先查看已提供原图和有效检测/可见帧记录。object_visible_frames 获准时获取实例的递增可见帧；题目问类别时，合并该类别所有已知实例的最早可见证据。\n\n3. 对每个类别记录已知最早出现和此前已检查范围。工具首次检出只是当前观测上界；未检测、服务失败和检出为空不能证明此前不存在。\n\n4. 优先检查会改变选项顺序的早期帧和相邻区间，使用已注册的检测或 inspect_frames；新裁剪需 yield 后才由模型判断。不得重新采样冻结集合之外的视频帧或恢复不存在的时间戳。\n\n5. 用物体局部、遮挡变化及后续清晰视角核对早期疑似出现；不要把后续明确识别时间自动当成首次出现。视觉判断与检测冲突时检查具体帧，不用工具状态取代实际可见性。\n\n6. 比较候选顺序与各类别的已知先后约束；同一采样间隔内无法确定先后时，不编造亚帧时间，根据现有可见线索和题目选项选最有依据的完整顺序，再提交合法标签。\n\n## 提交前检查\n\n- 使用源帧顺序，未把布局显示顺序或文件名排序当作时间。\n- 类别的多个实例已按首次出现语义聚合。\n- 工具首次检出没有被当成真实首次出现的无误差证明。\n- 输出与当前 options 对应，不捏造未采样帧。\n\n## 代码示例\n\n```json\n[]\n```\n\n本版使用方法说明和计算关系，不提供依赖未知实现的可执行示例。程序入口、工具调用和 AnswerPayload 构造以运行框架实际注入的合同为准。\n\n## 失败教训\n\n```json\n[]\n```\n\n尚无本系统真实轨迹归纳；上面的检查属于初始方法设计，不冒充实测失败经验。\n\n## 局限\n\n- 冻结采样可能无法分辨在两个相邻帧之间发生的先后变化。\n- 首次可辨认时间与标注可见性标准可能存在偏差。\n\n## 答案依据\n\n```json\n[\"visual_estimate\", \"tool_derived\", \"mixed\"]\n```\n\n## 来源\n\n```yaml\norigin: document_grounded_seed\nsource_refs:\n- ref: LOCAL_V8\n  sections:\n  - '4'\n  - '5'\n  - '9.1'\n  - '9.2'\n  - '9.4'\n- ref: VSI\n  sections:\n  - B.1\n  use: 首次出现语义\n- ref: SKILL3D_PROJECT\n  sections:\n  - Qualitative Cases / Appearance Order\n  use: 按时间组织检测与对象证据\n- ref: DECISIONS_20260925\n  use: 八题型硬隔离、简化轮数预算和状态/观察合同\nsource_trace_refs: []\nsource_split: not_applicable_no_trajectory_induction\nlabel_access: false\nparent_skill_versions: []\ncandidate_record_ref: null\ninducer_config_ref: generation_record.json\nvalidation_decision: document_checked_runtime_pending\n```\n"
+    },
+    {
+      "path": "skills/rank-object-distances/SKILL.md",
+      "sha256": "4f30a39c180c71d3b710f1283c303c0ac3275b17ee4fea04310ea8141919f4a3",
+      "content": "---\nname: rank-object-distances\ndescription: 用于 object_rel_distance：比较题面参照对象到各候选类别的最近实例距离，选择当前题目的合法选项；不要求米制尺度。\nmetadata:\n  harness3d-skill-id: S03\n  harness3d-version: 1.0.0\n  harness3d-question-type: object_rel_distance\n  harness3d-family: relative_geometry\n  harness3d-source-format: '1.0'\n  harness3d-validation: document-checked-runtime-pending\n---\n\n# 对象间距离比较与候选排序\n\n## 目标\n\n识别与参照对象最近的候选类别/实例，输出当前题目给定的选项标签，unit=option。\n\n## 适用条件\n\n统一有效相对几何足以支持排序，metric_scale 缺失不屏蔽本 Skill；无法可靠定位或计算时使用视觉布局比较。\n\n## 执行约束\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。\n\n## 证据条件\n\n```yaml\nhard_requirements:\n  image_2d:\n  - available\n  - degraded\nevidence_preferences:\n  preferred:\n  - 参照对象和各候选实例绑定\n  - 同一有效坐标系内的对象间距离\n  - 候选类别覆盖与多实例信息\n  local_requirements:\n    relative_distance_rank:\n    - geometry_3d\n    - 参照及候选实例有效绑定\n  not_required:\n  - metric_scale\n  visual_route: 从原图建立局部布局，比较参照物与候选的边界接近程度并考虑深度。\n```\n\n## 求解步骤\n\n1. 分别整理题面参照对象、候选类别及选项映射。使用当前题目的选项标签，不固定为 A–D，不按对象离相机的远近作答。\n\n2. 定位参照实例，并尽可能覆盖每个候选类别的实例。题意按类别比较时，对同类别多实例取与参照对象最近者；缺失类别标为未知，不能直接赋无限距离或从候选中删除。\n\n3. 若 relative_distance_rank 对本次实例获准，调用并核对对象间距离定义、候选覆盖和类别聚合规则。若只获得多个归一化距离，只有坐标、尺度因子和距离定义一致时才能直接比较。\n\n4. 对最接近的候选重点核查遮挡、点集污染、重复或错误绑定；检查表面距离代理与题面最近点语义是否存在明显偏差。不得因为 metric_scale 缺失而放弃有效相对几何。\n\n5. 几何不足时，用同帧共现或跨帧共享结构形成局部布局，判断哪些候选真正邻近参照对象。图像上的二维间隔仅为线索；同时考虑深度、视角和遮挡。优先查看会改变前两名排序的现有帧或裁剪。\n\n6. 比较所有合法候选，综合未覆盖候选和残余歧义选最有依据的一项；不要以选项顺序作为通用平局规则。转换成题目原始标签，按共同合同提交。\n\n## 提交前检查\n\n- 参照对象没有变成相机。\n- 同类别多实例按最近者聚合，缺失候选没有被静默排除。\n- 排序使用一致的几何定义和坐标，未要求无关的米制尺度。\n- 答案标签属于本题 options，答案依据包含实际使用的工具结果。\n\n## 代码示例\n\n```json\n[]\n```\n\n本版使用方法说明和计算关系，不提供依赖未知实现的可执行示例。程序入口、工具调用和 AnswerPayload 构造以运行框架实际注入的合同为准。\n\n## 失败教训\n\n```json\n[]\n```\n\n尚无本系统真实轨迹归纳；上面的检查属于初始方法设计，不冒充实测失败经验。\n\n## 局限\n\n- 候选遗漏可能改变排序；检测到一个实例不证明该类别已覆盖。\n- 相对几何存在非均匀畸变时，尺度无关并不意味着排序可靠。\n\n## 答案依据\n\n```json\n[\"visual_estimate\", \"tool_derived\", \"mixed\"]\n```\n\n## 来源\n\n```yaml\norigin: document_grounded_seed\nsource_refs:\n- ref: LOCAL_V8\n  sections:\n  - '4'\n  - '9.1'\n  - '9.2'\n  - '9.3'\n- ref: VSI\n  sections:\n  - B.1\n  - '6.2'\n  use: 参照对象、最近实例聚合与布局比较\n- ref: VADAR\n  sections:\n  - Approach\n  use: 组合定位、属性查询和比较步骤\n- ref: DECISIONS_20260925\n  use: 八题型硬隔离、简化轮数预算和状态/观察合同\nsource_trace_refs: []\nsource_split: not_applicable_no_trajectory_induction\nlabel_access: false\nparent_skill_versions: []\ncandidate_record_ref: null\ninducer_config_ref: generation_record.json\nvalidation_decision: document_checked_runtime_pending\n```\n"
+    },
+    {
+      "path": "validation/static_checks.json",
+      "sha256": "d728d33f8c7b686f6c1a89e714118171500c9771eb0ffef87ca489534df9f0f9",
+      "content": "{\n  \"check_type\": \"source_format_and_document_contract_only\",\n  \"passed\": true,\n  \"skill_count\": 8,\n  \"exact_task_coverage\": [\n    \"object_counting\",\n    \"object_abs_distance\",\n    \"object_rel_distance\",\n    \"object_size_estimation\",\n    \"room_size_estimation\",\n    \"object_rel_direction\",\n    \"obj_appearance_order\",\n    \"route_planning\"\n  ],\n  \"package_filter_cases\": 192,\n  \"unknown_task_rejections\": 8,\n  \"checks\": [\n    \"YAML safely parsed with duplicate-key rejection\",\n    \"required sections and source references\",\n    \"single exact task per Skill\",\n    \"eight-task completeness\",\n    \"visual eligibility without geometric hard requirements\",\n    \"valid answer bases and no fabricated learned lessons\",\n    \"deterministic hashes and exports\"\n  ],\n  \"not_run\": [\n    \"production Pydantic/model validation\",\n    \"production retriever execution\",\n    \"registered tool signature verification\",\n    \"real visual/model/tool episode\",\n    \"benchmark evaluation\"\n  ],\n  \"experimental_freeze\": \"pending_runtime_acceptance\"\n}\n"
+    },
+    {
+      "path": "validation/synthetic_application.json",
+      "sha256": "b147c7b55add61d9a3903c1ed52baf14fa0f64b9a7b0e47e8986698ec9d3b365",
+      "content": "{\n  \"validation_type\": \"synthetic_text_state_method_application\",\n  \"reviewer\": \"independent assistant subagent\",\n  \"production_runtime_executed\": false,\n  \"real_images_observed\": false,\n  \"benchmark_data_used\": false,\n  \"cases\": [\n    {\n      \"skill_id\": \"S03\",\n      \"condition\": \"统一归一化几何有效、米制尺度缺失；甲类实例距离8和3，乙5，丙7，丁4；K对应甲。\",\n      \"observed_answer\": \"K\",\n      \"basis\": \"tool_derived\",\n      \"assessment\": \"同类取最近实例且未因缺尺度阻塞。\"\n    },\n    {\n      \"skill_id\": \"S06\",\n      \"condition\": \"medium；右手系上向z，observer=(0,0,0), facing=(0,1,0), target=(1,-1,0)；Z对应back。\",\n      \"observed_answer\": \"Z\",\n      \"basis\": \"tool_derived\",\n      \"assessment\": \"精确135度被包含在back范围。\"\n    },\n    {\n      \"skill_id\": \"S08\",\n      \"condition\": \"从(0,0)朝北到(0,2)，再到(2,2)，再到(2,0)；b对应右右。\",\n      \"observed_answer\": \"b\",\n      \"basis\": \"tool_derived\",\n      \"assessment\": \"每段更新行进朝向。\"\n    },\n    {\n      \"skill_id\": \"S01\",\n      \"condition\": \"finalization；检测失败；给定视觉描述同帧两把椅子，下一帧确认一把重现，其他区域未见。\",\n      \"observed_answer\": 2,\n      \"basis\": \"visual_estimate\",\n      \"assessment\": \"没有重复计数、故障计零、重启探索或声称完整覆盖。\"\n    }\n  ],\n  \"scope_note\": \"仅检查文字方法能否在给定合成状态下指导推理；不是原始图像理解、生产检索、Pydantic或工具接线验收。\"\n}\n"
+    }
+  ],
+  "skill_specs": [
+    {
+      "schema_version": "8.0",
+      "skill_id": "S01",
+      "version": "1.0.0",
+      "family": "counting",
+      "applicable_question_types": [
+        "object_counting"
+      ],
+      "goal": "估计题面指定空间中目标类别的独立实体数量，输出 unit=count 的非负整数。",
+      "applicability": "可使用纯视觉、二维检测/跟踪或获准的几何辅助。目标尚未绑定、检测失败或三维不可用时仍适用；这些状态只改变后续步骤。\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。",
+      "hard_requirements": {
+        "image_2d": [
+          "available",
+          "degraded"
+        ]
+      },
+      "evidence_preferences": {
+        "preferred": [
+          "多视角目标候选及覆盖说明",
+          "跨帧身份与重复嫌疑",
+          "可用时的几何位置一致性"
+        ],
+        "local_requirements": {
+          "count_objects": [
+            "object_detection",
+            "track_consensus"
+          ],
+          "geometry_assistance": [
+            "geometry_3d",
+            "相关对象有效绑定"
+          ]
+        },
+        "visual_route": "利用原图中的外观、相邻物体、固定结构和观察顺序核对实体身份。"
+      },
+      "steps": [
+        {
+          "step_id": "step_01",
+          "instruction": "从题面确定目标类别、空间范围及同义词；按当前题面语义处理部件与整体，不能把同一件家具的部件重复计入。"
+        },
+        {
+          "step_id": "step_02",
+          "instruction": "复用有效候选与覆盖记录；可用时通过 list_objects 查看 category_name、obj_id、visible_frames、track_id 和重复嫌疑。将每条记录视为候选，不把记录条数当作答案。"
+        },
+        {
+          "step_id": "step_03",
+          "instruction": "建立题内实例表，记录各候选出现的帧、相邻结构和相似对象。用多个线索合并同一实体的重复观测；两个同款物体在同一帧同时出现时保留为不同实体，不凭外观相似就合并。"
+        },
+        {
+          "step_id": "step_04",
+          "instruction": "优先检查会改变计数的未覆盖区域、遮挡后重现和重复 track。若 detect_objects 已获准，仅对目标类别和有用帧补检；需要精细边界或身份关联时，仅使用实际注册的分割/跟踪能力。需看新裁剪时调用 inspect_frames 后 yield。"
+        },
+        {
+          "step_id": "step_05",
+          "instruction": "count_objects 获准时读取它的去重结果、覆盖说明和降级标记，与实例表交叉核对。三维位置只作为获准的辅助证据；二维方法可独立继续。服务失败、未运行、健康空检出、截断分别处理。"
+        },
+        {
+          "step_id": "step_06",
+          "instruction": "工具与视觉冲突时定位冲突到具体实例，补看最能消除歧义的冻结帧；无法解决时根据覆盖及身份线索选最有依据的整数。计数为零须由观察支持，不能由服务错误推得；随后按共同合同提交。"
+        }
+      ],
+      "checks": [
+        "同一实体跨帧只计一次；同款多实例没有被误合并。",
+        "截断、遮挡和未检查区域没有被当作完整覆盖。",
+        "没有用检测故障或空 result payload 推导零计数。",
+        "答案是非负整数；依据与实际使用结果一致。"
+      ],
+      "code_examples": [],
+      "failure_lessons": [],
+      "limitations": [
+        "有限帧集可能漏掉完全不可见对象。",
+        "实例表是当前题的推断，不能把模型推断写成已验证的几何绑定。"
+      ],
+      "supported_answer_bases": [
+        "visual_estimate",
+        "tool_derived",
+        "mixed"
+      ],
+      "provenance": {
+        "origin": "document_grounded_seed",
+        "source_refs": [
+          {
+            "ref": "LOCAL_V8",
+            "sections": [
+              "4",
+              "9.1",
+              "9.2",
+              "10",
+              "13"
+            ]
+          },
+          {
+            "ref": "VSI",
+            "sections": [
+              "3",
+              "B.1"
+            ],
+            "use": "计数任务定义"
+          },
+          {
+            "ref": "SKILL3D",
+            "sections": [
+              "3.1",
+              "3.2",
+              "Appendix D"
+            ],
+            "use": "多视角去重与证据组织"
+          },
+          {
+            "ref": "DECISIONS_20260925",
+            "use": "八题型硬隔离、简化轮数预算和状态/观察合同"
+          }
+        ],
+        "source_trace_refs": [],
+        "source_split": "not_applicable_no_trajectory_induction",
+        "label_access": false,
+        "parent_skill_versions": [],
+        "candidate_record_ref": null,
+        "inducer_config_ref": "generation_record.json",
+        "validation_decision": "document_checked_runtime_pending"
+      }
+    },
+    {
+      "schema_version": "8.0",
+      "skill_id": "S02",
+      "version": "1.0.0",
+      "family": "metric",
+      "applicable_question_types": [
+        "object_abs_distance"
+      ],
+      "goal": "估计两个题面对象之间的最近直接距离，输出 unit=m 的有限非负数值。",
+      "applicability": "优先使用满足逐工具权限的几何测量；无尺度、绑定待确认或几何失败时保留视觉估计路径。\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。",
+      "hard_requirements": {
+        "image_2d": [
+          "available",
+          "degraded"
+        ]
+      },
+      "evidence_preferences": {
+        "preferred": [
+          "两个题面对象的有效实例绑定",
+          "一致坐标中的有效对象几何与距离定义",
+          "当前有效尺度及米制授权"
+        ],
+        "local_requirements": {
+          "object_distance_m": [
+            "geometry_3d",
+            "metric_scale",
+            "两个实例有效绑定",
+            "当前米制调用获准"
+          ]
+        },
+        "visual_route": "用同时可见的边界、跨视角布局及合理参照尺寸估计对象间隔。"
+      },
+      "steps": [
+        {
+          "step_id": "step_01",
+          "instruction": "解析两个对象的角色及消歧描述，明确测量对象间的最近直接距离；不能把参考对象换成相机，也不能默认使用中心距离。"
+        },
+        {
+          "step_id": "step_02",
+          "instruction": "核对候选和题级绑定。需要时对相关类别补检、检查局部图像，结合周边物体确认实例；具体工具不可用时依靠原图定位，不虚构 obj_id 或绑定成功状态。"
+        },
+        {
+          "step_id": "step_03",
+          "instruction": "若 object_distance_m 对实际两个对象获准，调用后检查 status、有效数值、单位、依赖和距离定义。pointcloud_surface_proxy 与 bbox_nearest_proxy 均为声明过的代理，不能把可见表面代理当成官方标注真值。"
+        },
+        {
+          "step_id": "step_04",
+          "instruction": "理解工具已完成的单位转换。只有文档明确返回归一化距离并允许使用同一有效尺度时才做 d_m=s*d_norm；已经是米的值不能再乘尺度。量化阈值、点集清洗和分位数由冻结工具合同决定。"
+        },
+        {
+          "step_id": "step_05",
+          "instruction": "检查最近区域是否被遮挡、点集是否混入背景、两对象是否来自一致坐标。结果失效就停止使用并交给框架处理；不要把旧数值手动改成有效，或用视觉猜测恢复米制权限。"
+        },
+        {
+          "step_id": "step_06",
+          "instruction": "测量不能支持结论时，比较多个原图视角中的相邻关系与接近边界；结合合理参照物的尺寸范围估计间隔，修正明显的透视和深度差异。参照尺寸属于估计；不要把不同深度上的像素比例直接当米制比例。"
+        },
+        {
+          "step_id": "step_07",
+          "instruction": "结合当前可靠证据选取最有依据的数值；跨帧一致性支持估计，但同一误差来源的多次结果不等于独立验证。按米提交，并正确区分测量、视觉估计和混合依据。"
+        }
+      ],
+      "checks": [
+        "测量的是两个题面对象，不是相机到对象。",
+        "距离口径与单位正确，没有中心距离替代最近距离或重复乘尺度。",
+        "米制测量的尺度、几何和绑定都仍有效。",
+        "视觉参照没有被记录为工具测量或真实尺度。"
+      ],
+      "code_examples": [],
+      "failure_lessons": [],
+      "limitations": [
+        "可见表面距离与完整对象包围框距离可能有系统偏差。",
+        "完全遮挡的最近边界只能估计，不能宣称精确恢复。"
+      ],
+      "supported_answer_bases": [
+        "visual_estimate",
+        "tool_derived",
+        "mixed"
+      ],
+      "provenance": {
+        "origin": "document_grounded_seed",
+        "source_refs": [
+          {
+            "ref": "LOCAL_V8",
+            "sections": [
+              "4",
+              "8",
+              "9.2",
+              "9.3",
+              "10"
+            ]
+          },
+          {
+            "ref": "VSI",
+            "sections": [
+              "B.1"
+            ],
+            "use": "对象间最近距离及米单位"
+          },
+          {
+            "ref": "SKILL3D",
+            "sections": [
+              "Appendix D"
+            ],
+            "use": "边界相关的距离证据"
+          },
+          {
+            "ref": "VADAR",
+            "sections": [
+              "Approach"
+            ],
+            "use": "将定位和计算分解为可组合步骤"
+          },
+          {
+            "ref": "DECISIONS_20260925",
+            "use": "八题型硬隔离、简化轮数预算和状态/观察合同"
+          }
+        ],
+        "source_trace_refs": [],
+        "source_split": "not_applicable_no_trajectory_induction",
+        "label_access": false,
+        "parent_skill_versions": [],
+        "candidate_record_ref": null,
+        "inducer_config_ref": "generation_record.json",
+        "validation_decision": "document_checked_runtime_pending"
+      }
+    },
+    {
+      "schema_version": "8.0",
+      "skill_id": "S03",
+      "version": "1.0.0",
+      "family": "relative_geometry",
+      "applicable_question_types": [
+        "object_rel_distance"
+      ],
+      "goal": "识别与参照对象最近的候选类别/实例，输出当前题目给定的选项标签，unit=option。",
+      "applicability": "统一有效相对几何足以支持排序，metric_scale 缺失不屏蔽本 Skill；无法可靠定位或计算时使用视觉布局比较。\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。",
+      "hard_requirements": {
+        "image_2d": [
+          "available",
+          "degraded"
+        ]
+      },
+      "evidence_preferences": {
+        "preferred": [
+          "参照对象和各候选实例绑定",
+          "同一有效坐标系内的对象间距离",
+          "候选类别覆盖与多实例信息"
+        ],
+        "local_requirements": {
+          "relative_distance_rank": [
+            "geometry_3d",
+            "参照及候选实例有效绑定"
+          ]
+        },
+        "not_required": [
+          "metric_scale"
+        ],
+        "visual_route": "从原图建立局部布局，比较参照物与候选的边界接近程度并考虑深度。"
+      },
+      "steps": [
+        {
+          "step_id": "step_01",
+          "instruction": "分别整理题面参照对象、候选类别及选项映射。使用当前题目的选项标签，不固定为 A–D，不按对象离相机的远近作答。"
+        },
+        {
+          "step_id": "step_02",
+          "instruction": "定位参照实例，并尽可能覆盖每个候选类别的实例。题意按类别比较时，对同类别多实例取与参照对象最近者；缺失类别标为未知，不能直接赋无限距离或从候选中删除。"
+        },
+        {
+          "step_id": "step_03",
+          "instruction": "若 relative_distance_rank 对本次实例获准，调用并核对对象间距离定义、候选覆盖和类别聚合规则。若只获得多个归一化距离，只有坐标、尺度因子和距离定义一致时才能直接比较。"
+        },
+        {
+          "step_id": "step_04",
+          "instruction": "对最接近的候选重点核查遮挡、点集污染、重复或错误绑定；检查表面距离代理与题面最近点语义是否存在明显偏差。不得因为 metric_scale 缺失而放弃有效相对几何。"
+        },
+        {
+          "step_id": "step_05",
+          "instruction": "几何不足时，用同帧共现或跨帧共享结构形成局部布局，判断哪些候选真正邻近参照对象。图像上的二维间隔仅为线索；同时考虑深度、视角和遮挡。优先查看会改变前两名排序的现有帧或裁剪。"
+        },
+        {
+          "step_id": "step_06",
+          "instruction": "比较所有合法候选，综合未覆盖候选和残余歧义选最有依据的一项；不要以选项顺序作为通用平局规则。转换成题目原始标签，按共同合同提交。"
+        }
+      ],
+      "checks": [
+        "参照对象没有变成相机。",
+        "同类别多实例按最近者聚合，缺失候选没有被静默排除。",
+        "排序使用一致的几何定义和坐标，未要求无关的米制尺度。",
+        "答案标签属于本题 options，答案依据包含实际使用的工具结果。"
+      ],
+      "code_examples": [],
+      "failure_lessons": [],
+      "limitations": [
+        "候选遗漏可能改变排序；检测到一个实例不证明该类别已覆盖。",
+        "相对几何存在非均匀畸变时，尺度无关并不意味着排序可靠。"
+      ],
+      "supported_answer_bases": [
+        "visual_estimate",
+        "tool_derived",
+        "mixed"
+      ],
+      "provenance": {
+        "origin": "document_grounded_seed",
+        "source_refs": [
+          {
+            "ref": "LOCAL_V8",
+            "sections": [
+              "4",
+              "9.1",
+              "9.2",
+              "9.3"
+            ]
+          },
+          {
+            "ref": "VSI",
+            "sections": [
+              "B.1",
+              "6.2"
+            ],
+            "use": "参照对象、最近实例聚合与布局比较"
+          },
+          {
+            "ref": "VADAR",
+            "sections": [
+              "Approach"
+            ],
+            "use": "组合定位、属性查询和比较步骤"
+          },
+          {
+            "ref": "DECISIONS_20260925",
+            "use": "八题型硬隔离、简化轮数预算和状态/观察合同"
+          }
+        ],
+        "source_trace_refs": [],
+        "source_split": "not_applicable_no_trajectory_induction",
+        "label_access": false,
+        "parent_skill_versions": [],
+        "candidate_record_ref": null,
+        "inducer_config_ref": "generation_record.json",
+        "validation_decision": "document_checked_runtime_pending"
+      }
+    },
+    {
+      "schema_version": "8.0",
+      "skill_id": "S04",
+      "version": "1.0.0",
+      "family": "metric",
+      "applicable_question_types": [
+        "object_size_estimation"
+      ],
+      "goal": "估计目标对象的最长物理维度，规范输出 unit=cm 的有限正数。",
+      "applicability": "有效对象 extent 和尺度可支持测量；只见局部、尺度缺失或几何不可用时仍通过视觉估计完成任务。\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。",
+      "hard_requirements": {
+        "image_2d": [
+          "available",
+          "degraded"
+        ]
+      },
+      "evidence_preferences": {
+        "preferred": [
+          "完整对象身份与边界",
+          "对象方向及三维 extent 定义",
+          "有效米制尺度与遮挡说明"
+        ],
+        "local_requirements": {
+          "object_3d_extent": [
+            "geometry_3d",
+            "metric_scale",
+            "对象有效绑定",
+            "当前米制调用获准"
+          ]
+        },
+        "visual_route": "结合完整轮廓、多视角、同深度参照物和类别尺寸常识估计最长维。"
+      },
+      "steps": [
+        {
+          "step_id": "step_01",
+          "instruction": "确定目标实例和题面待测维度；规范任务取长、宽、高中的最大者。分清整个对象、可见部分和附件，避免只测最醒目的局部。"
+        },
+        {
+          "step_id": "step_02",
+          "instruction": "选择能显示对象整体和主轴的冻结帧；需要时补检或查看局部与全图的对应关系。结合不同视角识别遮挡、截断、伸展部分和物体朝向。"
+        },
+        {
+          "step_id": "step_03",
+          "instruction": "若 object_3d_extent 获准，读取有效维度、最长维、单位、框方向和覆盖说明。以工具已声明的定义计算；相机/世界轴对齐框可能高估旋转物体尺寸，部分点云可能低估完整对象。"
+        },
+        {
+          "step_id": "step_04",
+          "instruction": "按实际返回单位转换到题面要求：米到厘米乘 100，已是厘米不重复转换。只有归一化长度才需同一有效尺度；不从图片猜一个尺度填回工具状态。"
+        },
+        {
+          "step_id": "step_05",
+          "instruction": "几何不足时，先辨认哪个维度最可能最长，再从完整视角和附近参照物估计量级。参照物须考虑真实尺寸范围和是否处于近似相同深度；类别常识只作估计依据，不能固定“每张桌子都是同一尺寸”。"
+        },
+        {
+          "step_id": "step_06",
+          "instruction": "对不同视角的估计差异检查是否来自透视、部件混淆或遮挡，选最有依据的单一数值。答案按要求的单位提交，估计参与结果时标为 visual_estimate 或 mixed。"
+        }
+      ],
+      "checks": [
+        "回答的是完整目标的最长维，不是像素长度、体积或任意一条边。",
+        "框定义、旋转、局部可见性已纳入判断。",
+        "没有重复乘尺度或漏掉米/厘米转换。",
+        "没有用类别固定常量代替当前图片判断。"
+      ],
+      "code_examples": [],
+      "failure_lessons": [],
+      "limitations": [
+        "只有局部表面时，完整尺寸的恢复可能依赖视觉常识。",
+        "参照物的尺寸不确定性与透视差异会传递到估计。"
+      ],
+      "supported_answer_bases": [
+        "visual_estimate",
+        "tool_derived",
+        "mixed"
+      ],
+      "provenance": {
+        "origin": "document_grounded_seed",
+        "source_refs": [
+          {
+            "ref": "LOCAL_V8",
+            "sections": [
+              "4",
+              "9.2",
+              "9.3"
+            ]
+          },
+          {
+            "ref": "VSI",
+            "sections": [
+              "B.1"
+            ],
+            "use": "最长维和厘米单位"
+          },
+          {
+            "ref": "VADAR",
+            "sections": [
+              "Approach"
+            ],
+            "use": "对象维度的定位与计算分解"
+          },
+          {
+            "ref": "DECISIONS_20260925",
+            "use": "八题型硬隔离、简化轮数预算和状态/观察合同"
+          }
+        ],
+        "source_trace_refs": [],
+        "source_split": "not_applicable_no_trajectory_induction",
+        "label_access": false,
+        "parent_skill_versions": [],
+        "candidate_record_ref": null,
+        "inducer_config_ref": "generation_record.json",
+        "validation_decision": "document_checked_runtime_pending"
+      }
+    },
+    {
+      "schema_version": "8.0",
+      "skill_id": "S05",
+      "version": "1.0.0",
+      "family": "metric",
+      "applicable_question_types": [
+        "room_size_estimation"
+      ],
+      "goal": "估计题目指定空间的平面面积，规范输出 unit=m2 的有限正数。",
+      "applicability": "可使用授权的平面/边界工具，也可从原图布局估计；缺尺度或平面不可靠时不整体屏蔽本方法。\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。",
+      "hard_requirements": {
+        "image_2d": [
+          "available",
+          "degraded"
+        ]
+      },
+      "evidence_preferences": {
+        "preferred": [
+          "房间/多房间范围与连通关系",
+          "地面或水平边界的覆盖",
+          "尺度与平面拟合质量"
+        ],
+        "local_requirements": {
+          "plane_fit_room_size": [
+            "geometry_3d",
+            "metric_scale",
+            "当前米制调用获准"
+          ]
+        },
+        "visual_route": "用墙面连接、门洞、房间转角和尺寸参照建立简化平面布局。"
+      },
+      "steps": [
+        {
+          "step_id": "step_01",
+          "instruction": "从题面确定单房间还是多房间合并范围，依据帧中的门洞、墙面和相机行进关系区分不同空间；同一空间的重复拍摄只算一次。"
+        },
+        {
+          "step_id": "step_02",
+          "instruction": "读取前置重建及覆盖摘要，检查是否有有效水平面和边界。家具遮挡的地面不等于房间缺失面积；地板像素数、墙面面积、房间对角线都不直接等于所问面积。"
+        },
+        {
+          "step_id": "step_03",
+          "instruction": "若 plane_fit_room_size 获准，核对返回 area、单位、边界/平面质量及覆盖范围是否与题意一致。可计数对象清单没有 floor 或 wall，不妨碍利用已有结构证据；不能虚构未注册的地面分割调用。"
+        },
+        {
+          "step_id": "step_04",
+          "instruction": "处理非矩形和多个区域时，依据可靠边界做分解与并集，避免重叠重复计入；不要将所有可见区域直接取外接矩形/凸包而填满凹口和空间间隔。采用的近似应有视觉依据。"
+        },
+        {
+          "step_id": "step_05",
+          "instruction": "理解单位与尺度：归一化面积到平方米需乘 s²，已是平方米不再缩放。尺度或边界失效时撤销依赖测量的使用，由框架管理恢复。"
+        },
+        {
+          "step_id": "step_06",
+          "instruction": "几何不足时，根据多个原图视角构建简化平面草图，利用墙段、门洞和家具等参照估计主尺寸；按有依据的矩形或少量区域分解求面积。参照物常识与不可见边界均属于估计，不能作为已验证几何。"
+        },
+        {
+          "step_id": "step_07",
+          "instruction": "检查空间范围、重复区域和未观察边界是否主导误差，选取最有依据的单一面积并按平方米提交。没有可靠边界也保留视觉作答，不能把工具失败返回为零面积。"
+        }
+      ],
+      "checks": [
+        "计算的是所问空间面积，单位为平方米。",
+        "长度尺度用于面积时平方，已经是米制面积时不重复处理。",
+        "重复拍摄、重叠区域和家具遮挡未引入重复计数或错误扣除。",
+        "没有把有限可见地面直接称为完整房间边界。"
+      ],
+      "code_examples": [],
+      "failure_lessons": [],
+      "limitations": [
+        "视野未覆盖边界时，面积只能依据部分证据估计。",
+        "官方面积构造与本系统拟合代理可能不同，需通过开发集检验偏差。"
+      ],
+      "supported_answer_bases": [
+        "visual_estimate",
+        "tool_derived",
+        "mixed"
+      ],
+      "provenance": {
+        "origin": "document_grounded_seed",
+        "source_refs": [
+          {
+            "ref": "LOCAL_V8",
+            "sections": [
+              "4",
+              "9.1",
+              "9.2",
+              "9.3"
+            ]
+          },
+          {
+            "ref": "VSI",
+            "sections": [
+              "B.1"
+            ],
+            "use": "面积及多房间范围定义"
+          },
+          {
+            "ref": "SKILL3D_PROJECT",
+            "sections": [
+              "Qualitative Cases / Room Size"
+            ],
+            "use": "房间尺度的多证据组织"
+          },
+          {
+            "ref": "DECISIONS_20260925",
+            "use": "八题型硬隔离、简化轮数预算和状态/观察合同"
+          }
+        ],
+        "source_trace_refs": [],
+        "source_split": "not_applicable_no_trajectory_induction",
+        "label_access": false,
+        "parent_skill_versions": [],
+        "candidate_record_ref": null,
+        "inducer_config_ref": "generation_record.json",
+        "validation_decision": "document_checked_runtime_pending"
+      }
+    },
+    {
+      "schema_version": "8.0",
+      "skill_id": "S06",
+      "version": "1.0.0",
+      "family": "relative_geometry",
+      "applicable_question_types": [
+        "object_rel_direction"
+      ],
+      "goal": "从题面假定观察者的站位和朝向判断目标方向，输出当前题目的合法选项，unit=option。",
+      "applicability": "保留方向难度与原始选项。几何工具依赖 world_frame，但世界朝向不可用时仍可从图片进行视角推断。\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。",
+      "hard_requirements": {
+        "image_2d": [
+          "available",
+          "degraded"
+        ]
+      },
+      "evidence_preferences": {
+        "preferred": [
+          "三个角色的有效实例绑定",
+          "一致坐标、world_up 和 handedness",
+          "水平朝向与目标位置"
+        ],
+        "local_requirements": {
+          "relative_direction_of": [
+            "geometry_3d",
+            "world_frame",
+            "相关对象有效绑定"
+          ]
+        },
+        "not_required": [
+          "metric_scale"
+        ],
+        "visual_route": "从原图中的物体关系形成局部布局，再转到题面观察者视角。"
+      },
+      "steps": [
+        {
+          "step_id": "step_01",
+          "instruction": "分别记录 observer、facing_at 和 target 的题面对象，保留 difficulty 与选项集合。这里的“面向某对象”是观察者看向它，不是该家具自身的正面朝向。"
+        },
+        {
+          "step_id": "step_02",
+          "instruction": "利用已有绑定或原图确定三个角色；有多个同类实例时按题面描述和周边结构消歧。用实际可用的补检/裁剪获取有帮助的证据，不把检测候选自动升级为有效绑定。"
+        },
+        {
+          "step_id": "step_03",
+          "instruction": "若 relative_direction_of 对实际三个实例和难度获准，读取方向、角度与退化信息。若授权环境明确允许对已有有效坐标作纯计算，在统一右手系中，将 observer→facing_at 与 observer→target 投影到以单位上向量 u 为法向的水平面；前者归一化为 f，后者为 d，r=f×u，θ=atan2(d·r,d·f)，正角为右。"
+        },
+        {
+          "step_id": "step_04",
+          "instruction": "按题面难度解释角度：easy 判断左右；medium 中 |θ|≥135° 为 back，其余按左右；hard 依据前后和左右分量确定象限。零向量、无可靠上向量或边界歧义时，不能把 atan2(0,0) 或数值符号当成可靠方向；使用受控反馈或视觉判断。"
+        },
+        {
+          "step_id": "step_05",
+          "instruction": "几何不可用时，从包含两个或三个角色的原图建立局部布局，利用跨帧共有结构连接关系；在心中把站位对象放到观察原点，朝向面向对象，再判断目标落在哪一侧。不能直接沿用摄像机画面的左右。"
+        },
+        {
+          "step_id": "step_06",
+          "instruction": "针对最影响选项的歧义查看冻结帧；仍不确定时按现有证据选择最可能的合法方向。将方向映射为本题选项标签并提交，视觉推断参与则如实记录依据。"
+        }
+      ],
+      "checks": [
+        "站位、面向和目标没有互换，家具朝向未替代观察者朝向。",
+        "difficulty 与 options 来自当前题目，medium 的背后定义没有被 hard 四象限覆盖。",
+        "几何计算使用同一有效水平系并处理零向量与边界。",
+        "缺尺度不阻塞相对方向；缺 world_frame 不伪造几何授权。"
+      ],
+      "code_examples": [],
+      "failure_lessons": [],
+      "limitations": [
+        "接近方向边界时，小的定位误差会改变分类。",
+        "有限视角中的视觉布局可能存在镜像或深度歧义。"
+      ],
+      "supported_answer_bases": [
+        "visual_estimate",
+        "tool_derived",
+        "mixed"
+      ],
+      "provenance": {
+        "origin": "document_grounded_seed",
+        "source_refs": [
+          {
+            "ref": "LOCAL_V8",
+            "sections": [
+              "4",
+              "6",
+              "9.3"
+            ]
+          },
+          {
+            "ref": "VSI",
+            "sections": [
+              "B.1"
+            ],
+            "use": "三类方向难度的题意"
+          },
+          {
+            "ref": "THINK3D",
+            "sections": [
+              "3D Transformation",
+              "Spatial Reasoning Agent"
+            ],
+            "use": "全局与观察者视角转换思想；不引入其新视角渲染工具"
+          },
+          {
+            "ref": "DECISIONS_20260925",
+            "use": "八题型硬隔离、简化轮数预算和状态/观察合同"
+          }
+        ],
+        "source_trace_refs": [],
+        "source_split": "not_applicable_no_trajectory_induction",
+        "label_access": false,
+        "parent_skill_versions": [],
+        "candidate_record_ref": null,
+        "inducer_config_ref": "generation_record.json",
+        "validation_decision": "document_checked_runtime_pending"
+      }
+    },
+    {
+      "schema_version": "8.0",
+      "skill_id": "S07",
+      "version": "1.0.0",
+      "family": "appearance",
+      "applicable_question_types": [
+        "obj_appearance_order"
+      ],
+      "goal": "判断题面各目标类别首次出现的先后顺序，输出当前题目的合法选项，unit=option。",
+      "applicability": "时间信息可靠时可调用相应工具；若时间工具不可用，仍可依据保留顺序的原始帧进行视觉判断。\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。",
+      "hard_requirements": {
+        "image_2d": [
+          "available",
+          "degraded"
+        ]
+      },
+      "evidence_preferences": {
+        "preferred": [
+          "冻结帧的物理身份、顺序和有效时间戳",
+          "目标类别在各帧的可见证据",
+          "已检查区间与漏检风险"
+        ],
+        "local_requirements": {
+          "object_visible_frames": [
+            "temporal",
+            "对象有效绑定"
+          ]
+        },
+        "not_required": [
+          "geometry_3d",
+          "metric_scale",
+          "world_frame"
+        ],
+        "visual_route": "沿原始帧顺序查找类别首次可辨认的出现，并核对相近时段。"
+      },
+      "steps": [
+        {
+          "step_id": "step_01",
+          "instruction": "列出待排序类别和题目选项，按源帧时间/顺序组织原始图片；重复占位图和缺失帧不能当成新的真实时刻。"
+        },
+        {
+          "step_id": "step_02",
+          "instruction": "先查看已提供原图和有效检测/可见帧记录。object_visible_frames 获准时获取实例的递增可见帧；题目问类别时，合并该类别所有已知实例的最早可见证据。"
+        },
+        {
+          "step_id": "step_03",
+          "instruction": "对每个类别记录已知最早出现和此前已检查范围。工具首次检出只是当前观测上界；未检测、服务失败和检出为空不能证明此前不存在。"
+        },
+        {
+          "step_id": "step_04",
+          "instruction": "优先检查会改变选项顺序的早期帧和相邻区间，使用已注册的检测或 inspect_frames；新裁剪需 yield 后才由模型判断。不得重新采样冻结集合之外的视频帧或恢复不存在的时间戳。"
+        },
+        {
+          "step_id": "step_05",
+          "instruction": "用物体局部、遮挡变化及后续清晰视角核对早期疑似出现；不要把后续明确识别时间自动当成首次出现。视觉判断与检测冲突时检查具体帧，不用工具状态取代实际可见性。"
+        },
+        {
+          "step_id": "step_06",
+          "instruction": "比较候选顺序与各类别的已知先后约束；同一采样间隔内无法确定先后时，不编造亚帧时间，根据现有可见线索和题目选项选最有依据的完整顺序，再提交合法标签。"
+        }
+      ],
+      "checks": [
+        "使用源帧顺序，未把布局显示顺序或文件名排序当作时间。",
+        "类别的多个实例已按首次出现语义聚合。",
+        "工具首次检出没有被当成真实首次出现的无误差证明。",
+        "输出与当前 options 对应，不捏造未采样帧。"
+      ],
+      "code_examples": [],
+      "failure_lessons": [],
+      "limitations": [
+        "冻结采样可能无法分辨在两个相邻帧之间发生的先后变化。",
+        "首次可辨认时间与标注可见性标准可能存在偏差。"
+      ],
+      "supported_answer_bases": [
+        "visual_estimate",
+        "tool_derived",
+        "mixed"
+      ],
+      "provenance": {
+        "origin": "document_grounded_seed",
+        "source_refs": [
+          {
+            "ref": "LOCAL_V8",
+            "sections": [
+              "4",
+              "5",
+              "9.1",
+              "9.2",
+              "9.4"
+            ]
+          },
+          {
+            "ref": "VSI",
+            "sections": [
+              "B.1"
+            ],
+            "use": "首次出现语义"
+          },
+          {
+            "ref": "SKILL3D_PROJECT",
+            "sections": [
+              "Qualitative Cases / Appearance Order"
+            ],
+            "use": "按时间组织检测与对象证据"
+          },
+          {
+            "ref": "DECISIONS_20260925",
+            "use": "八题型硬隔离、简化轮数预算和状态/观察合同"
+          }
+        ],
+        "source_trace_refs": [],
+        "source_split": "not_applicable_no_trajectory_induction",
+        "label_access": false,
+        "parent_skill_versions": [],
+        "candidate_record_ref": null,
+        "inducer_config_ref": "generation_record.json",
+        "validation_decision": "document_checked_runtime_pending"
+      }
+    },
+    {
+      "schema_version": "8.0",
+      "skill_id": "S08",
+      "version": "1.0.0",
+      "family": "route",
+      "applicable_question_types": [
+        "route_planning"
+      ],
+      "goal": "完成题面给定路线中的转向动作，选择正确的动作序列选项，unit=option。",
+      "applicability": "题面路线和视觉布局均可用于推理；几何与连通性只在当前授权允许时使用。无需跨题型检索方向 Skill。\n\n仅在元数据指定的规范题型分区内检索本方法。读取框架提供的题面、原始冻结帧、当前证据摘要和实际可用工具文档；前置重建已由框架处理，失败也继续求解。\n\n只调用当前注册并获准的工具，按实际参数与返回 Schema 编程。下文工具名来自 v8 目标合同，不代表当前实现已接通。检测不自动证明绑定成功，图像路径不代表已观察。需由模型判断新裁剪或结果歧义时，使用 YieldObservations 交回同一在线 agent；只从冻结帧集选择图片。\n\n框架负责更新题级证据、撤销依赖结果和决定恢复权限；不要直接改状态、阈值或缓存。按剩余求解轮数决定是否继续；同一失败操作最多重试 3 次。finalization 只用已观察的有效证据和原图提交，不再调用探索工具或 yield。\n\n最终通过统一程序入口和 ReturnAnswer 提交 AnswerPayload。tool_derived 仅用于答案可由有效工具结果及明确计算得到的情况；纯图片判断为 visual_estimate；融合工具证据与视觉推断为 mixed。填写实际使用的有效 result_id；有图时证据不足不构成拒答理由。",
+      "hard_requirements": {
+        "image_2d": [
+          "available",
+          "degraded"
+        ]
+      },
+      "evidence_preferences": {
+        "preferred": [
+          "起点、初始朝向、途经和终点角色",
+          "相邻路段的空间关系",
+          "需要判断通行时的实际连通性依据"
+        ],
+        "local_requirements": {
+          "relative_direction_of": [
+            "geometry_3d",
+            "world_frame",
+            "相关对象有效绑定"
+          ],
+          "connectivity_graph": [
+            "geometry_3d",
+            "world_frame",
+            "必要对象有效绑定"
+          ]
+        },
+        "not_required": [
+          "metric_scale"
+        ],
+        "visual_route": "从视频布局追踪题目给定的移动过程，逐段更新假想观察者的朝向。"
+      },
+      "steps": [
+        {
+          "step_id": "step_01",
+          "instruction": "把题面展开为起点、初始面向对象、有序路标、直行指令和转向空位。保留每个选项的完整动作序列；求解指定路线，不自行替换成另一条较短路线。"
+        },
+        {
+          "step_id": "step_02",
+          "instruction": "使用原图和有效对象记录确认各路标身份及相邻空间。相同类别路标有歧义时利用题目描述、门洞和周边结构消歧，不能把房间重访当作新路标。"
+        },
+        {
+          "step_id": "step_03",
+          "instruction": "从题面初始朝向出发执行一段直行；抵达路标后，当前朝向应继承刚走过路段的行进方向。下一转向相对于该朝向判断，不能所有空位都沿用初始摄像机左右。"
+        },
+        {
+          "step_id": "step_04",
+          "instruction": "若相邻位置和水平系有效且获准计算，以当前路段前向 f、上向量 u 和下一路段方向 d 比较左右；右向 r=f×u，d·r 的符号给出侧向，明显反向对应掉头。使用相同规范化坐标并检查零长度/近边界路段；不为路线题照搬方向题 medium 的 135°阈值。"
+        },
+        {
+          "step_id": "step_05",
+          "instruction": "只有当前注册工具的参数语义能够表达路线角色时才调用 relative_direction_of。不能把 previous_waypoint 直接当 facing_at，因为它指向来路。connectivity_graph 可用于核查有证据支持的通行关系；对象间欧氏近邻不自动证明可通行。"
+        },
+        {
+          "step_id": "step_06",
+          "instruction": "几何不可靠时，在原图布局中逐段想象走到路标并转身，用墙面、门洞、通道和相邻物体核对左右。需要模型查看新的合法裁剪时 yield；每完成一段都更新题内朝向，不把推断写成已验证世界系。"
+        },
+        {
+          "step_id": "step_07",
+          "instruction": "将候选动作序列按题面顺序完整演练，检查是否与各直行目标和最终目的地一致。选择最有依据的合法选项；几何/通行证据不足时仍基于图片完成估计，不把路线置信度当成拒答条件。"
+        }
+      ],
+      "checks": [
+        "每个动作相对到达该路标时的朝向判断。",
+        "没有把来路对象当作面向前方的对象。",
+        "路线难度没有套用无关的方向题角度阈值。",
+        "没有用欧氏距离替代通行依据；结果匹配本题完整动作序列选项。"
+      ],
+      "code_examples": [],
+      "failure_lessons": [],
+      "limitations": [
+        "没有明确转弯点或可通行空间时，对象中心组成的折线只能作为路线线索。",
+        "方向词的解释必须符合题面，斜向或退化路段可能需要视觉判断。"
+      ],
+      "supported_answer_bases": [
+        "visual_estimate",
+        "tool_derived",
+        "mixed"
+      ],
+      "provenance": {
+        "origin": "document_grounded_seed",
+        "source_refs": [
+          {
+            "ref": "LOCAL_V8",
+            "sections": [
+              "4",
+              "9.2",
+              "9.3",
+              "10"
+            ]
+          },
+          {
+            "ref": "VSI",
+            "sections": [
+              "B.1"
+            ],
+            "use": "给定路线中的转向填空语义"
+          },
+          {
+            "ref": "THINK3D",
+            "sections": [
+              "3D Transformation"
+            ],
+            "use": "观察者与场景视角转换思想"
+          },
+          {
+            "ref": "DECISIONS_20260925",
+            "use": "八题型硬隔离、简化轮数预算和状态/观察合同"
+          }
+        ],
+        "source_trace_refs": [],
+        "source_split": "not_applicable_no_trajectory_induction",
+        "label_access": false,
+        "parent_skill_versions": [],
+        "candidate_record_ref": null,
+        "inducer_config_ref": "generation_record.json",
+        "validation_decision": "document_checked_runtime_pending"
+      }
+    }
+  ],
+  "snapshot": {
+    "schema_version": "8.0",
+    "snapshot_id": "S0-seed-20260925-v1",
+    "parent_snapshot_id": null,
+    "generation": 0,
+    "skill_versions": [
+      "S01@1.0.0",
+      "S02@1.0.0",
+      "S03@1.0.0",
+      "S04@1.0.0",
+      "S05@1.0.0",
+      "S06@1.0.0",
+      "S07@1.0.0",
+      "S08@1.0.0"
+    ],
+    "manifest_hash": "de5ebe2f6c0f228e90b5a5cf4e3244cbf88b2b97ed8e5abe2d9b4e34d60004d6",
+    "validation_receipt_refs": [
+      "validation/static_checks.json"
+    ],
+    "compatibility": {
+      "skill_source_format": "harness3d-skill-source/1.0",
+      "target_skill_schema": "v8-document/8.0",
+      "tool_contract": "v8-document-sections-9-10",
+      "retriever": "canonical-task-hard-filter-before-ranking",
+      "evidence_rules": "v8-document-plus-approved-v9-discussion-20260925",
+      "runtime_repository_revision": null,
+      "runtime_verified": false,
+      "production_activation": false
+    }
+  },
+  "validation": {
+    "check_type": "source_format_and_document_contract_only",
+    "passed": true,
+    "skill_count": 8,
+    "exact_task_coverage": [
+      "object_counting",
+      "object_abs_distance",
+      "object_rel_distance",
+      "object_size_estimation",
+      "room_size_estimation",
+      "object_rel_direction",
+      "obj_appearance_order",
+      "route_planning"
+    ],
+    "package_filter_cases": 192,
+    "unknown_task_rejections": 8,
+    "checks": [
+      "YAML safely parsed with duplicate-key rejection",
+      "required sections and source references",
+      "single exact task per Skill",
+      "eight-task completeness",
+      "visual eligibility without geometric hard requirements",
+      "valid answer bases and no fabricated learned lessons",
+      "deterministic hashes and exports"
+    ],
+    "not_run": [
+      "production Pydantic/model validation",
+      "production retriever execution",
+      "registered tool signature verification",
+      "real visual/model/tool episode",
+      "benchmark evaluation"
+    ],
+    "experimental_freeze": "pending_runtime_acceptance"
+  }
+}

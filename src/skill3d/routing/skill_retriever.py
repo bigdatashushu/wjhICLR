@@ -36,21 +36,29 @@ from typing import NamedTuple, Optional, Sequence
 
 from skill3d.schemas import RetrievedSkill, SceneState, SkillSpec
 from skill3d.schemas.evidence import CAPABILITIES, EvidenceProfile
+from skill3d.schemas.retrieval import SkillCandidateRecord, SkillRetrievalRecord
+from skill3d.skills.delivery import (
+    skill_body_length,
+    skill_content_sha256,
+    skill_version_key,
+)
 
+from .retrieval_policy import (
+    DEFAULT_CANDIDATES,
+    DEFAULT_RANK_WEIGHTS,
+    DEFAULT_TOP_K,
+    RetrievalPolicy,
+)
 from .task_classifier import TASK_TYPES, canonical_task
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TOP_K = 3        # TODO_CALIBRATE：每题进 prompt 的 Skill 条数
-DEFAULT_CANDIDATES = 50  # TODO_CALIBRATE：向量候选池大小
-
-# Skill 排序权重（§16.1：排序权重在 inner 上选定后**冻结**，outer 只验一次、final 不改）。
-# 全部为模块级常量：在线链里**不得**按题目/按场景临时调参，否则 outer 上验证的策略失效。
-RANK_WEIGHTS: dict[str, float] = {
-    "semantic": 1.0,              # 语义排序主分权重（rerank=True）
-    "keyword": 1.0,               # 关键词主分权重（rerank=False 的消融口径）
-    "semantic_mix_keyword": 0.0,  # 语义路径里混入的关键词分权重（0=纯语义，保持消融可比）
-}  # TODO_CALIBRATE
+# 排序权重（§16.1：排序权重在 inner 上选定后**冻结**，outer 只验一次、final 不改）。
+#
+# v9（§13.5/P6）：真正的冻结来源是 `configs/config.yaml` 的 `retrieval:` 段，经
+# `RetrievalPolicy` 传入检索；这里的模块级常量只是**配置缺省值**（与 yaml 默认一致），
+# 在线链里不得按题目/按场景临时调参。
+RANK_WEIGHTS: dict[str, float] = dict(DEFAULT_RANK_WEIGHTS)
 
 # 允许进入检索的 Skill 状态（§7：未 promoted 的候选不得生效）。
 # registry/active snapshot 已按状态过滤；这里是**防御性二次确认**（duck-typing：若上游把
@@ -59,12 +67,22 @@ _ACTIVE_STATES: tuple[str, ...] = ("promoted", "consolidated")
 
 
 class RetrievalDecision(NamedTuple):
-    """单条 Skill 的检索判定结果（可审计：为什么检索/为什么被拦下）。"""
+    """单条 Skill 的检索判定结果（可审计：为什么检索/为什么被拦下）。
+
+    v9（§13.6"候选及过滤原因"）：除人类可读的 `reason` 外，新增机器可读的
+    `reason_code`（词表见 `schemas.retrieval.CANDIDATE_REASON_CODES`）。此前原因
+    只写进日志，trace 里看不到"这条候选为什么没被选中"。
+    """
 
     ok: bool
     matched_signature: dict[str, str]
     gate_version_matched: Optional[bool]
     reason: str
+    reason_code: str = ""
+
+    def code(self) -> str:
+        """原因码（缺省回落到 hit / 未登记，绝不猜一个具体原因）。"""
+        return str(self.reason_code or ("hit" if self.ok else "unregistered"))
 
 
 def canonical_question_type(value: Optional[str]) -> Optional[str]:
@@ -171,30 +189,41 @@ def retrieval_decision(skill: SkillSpec, scene: SceneState, task_type: str) -> R
 
     `task_type` 必须是**规范题型**（调用方已用 `canonical_question_type` 归一）。
     `hard_filter` 与 `retrieve` 共用本函数，保证"入口判定"与"实际检索"永不分叉。
+    拒绝原因带机器可读 `reason_code`（§13.6"候选及过滤原因"落盘用）。
     """
     signature = matched_evidence_signature(skill, scene)
     if task_type not in skill_question_types(skill):
         return RetrievalDecision(
             False, signature, None,
             f"题型不匹配（题目={task_type}，Skill 适用="
-            f"{sorted(skill_question_types(skill))}）")
+            f"{sorted(skill_question_types(skill))}）",
+            "question_type_mismatch")
     if not evidence_signature_match(skill, scene):
         return RetrievalDecision(
             False, signature, None,
-            f"证据签名不满足（未达标={signature_unmet(skill, scene)}）")
+            f"证据签名不满足（未达标={signature_unmet(skill, scene)}）",
+            "evidence_signature_unmet")
     gate_ok, version_ok = metric_gate_match(skill, scene)
     if not gate_ok:
         gate = getattr(scene, "metric_evidence_gate_result", None)
+        if gate is None:
+            code = "gate_result_missing"
+        elif not bool(gate.gate_passed):
+            code = "metric_gate_not_passed"
+        else:
+            code = "metric_gate_version_mismatch"
         return RetrievalDecision(
             False, signature, version_ok,
             "米制证据门未通过或 gate 版本不匹配"
             f"（Skill 要求={getattr(skill, 'applicable_gate_version', None)}，"
             f"当前={getattr(gate, 'gate_version', None)}，"
-            f"gate_passed={bool(gate is not None and gate.gate_passed)}）")
+            f"gate_passed={bool(gate is not None and gate.gate_passed)}）",
+            code)
     state = getattr(skill, "state", None)
     if state is not None and str(state) not in _ACTIVE_STATES:
-        return RetrievalDecision(False, signature, version_ok, f"状态 {state} 非 active")
-    return RetrievalDecision(True, signature, version_ok, "命中")
+        return RetrievalDecision(False, signature, version_ok,
+                                 f"状态 {state} 非 active", "state_not_active")
+    return RetrievalDecision(True, signature, version_ok, "命中", "hit")
 
 
 def hard_filter(
@@ -303,6 +332,176 @@ def _rank_key(skill: SkillSpec, score: float) -> tuple:
     return (-float(score), f"{skill.skill_id}@{skill.version}")
 
 
+def _rank(
+    question: str,
+    candidates: Sequence[SkillSpec],
+    decisions: Sequence[RetrievalDecision],
+    *,
+    policy: RetrievalPolicy,
+    rerank: bool,
+    embedder=None,
+) -> list[tuple[SkillSpec, RetrievalDecision, float]]:
+    """在硬条件通过的分区内排序（§13.5"在分区内按适用性、证据偏好与相关性排序"）。
+
+    排序权重来自冻结策略 `policy`（不再是模块常量直读）；`rerank=False` 时使用
+    关键词打分（消融"有/无语义排序"，§8.1 的 "Ours w/o LanceDB reranker" 行）。
+    """
+    if not rerank:
+        scores = [policy.weight("keyword") * _keyword_score(question, s)
+                  for s in candidates]
+    else:
+        from skill3d.memory.vector_index import rerank_scores
+
+        docs = [skill_text(s) for s in candidates]
+        try:
+            sem = rerank_scores(question, docs, embedder=embedder)
+        except Exception as exc:  # noqa: BLE001 - reranker 异常不得阻断在线链
+            logger.warning("语义排序失败（退化到关键词打分）: %s", exc)
+            sem = [_keyword_score(question, s) for s in candidates]
+        if len(sem) != len(candidates):
+            logger.warning("语义排序返回 %d 个分数（期望 %d），退化到关键词打分",
+                           len(sem), len(candidates))
+            sem = [_keyword_score(question, s) for s in candidates]
+        w_sem = policy.weight("semantic")
+        w_mix = policy.weight("semantic_mix_keyword")
+        scores = []
+        for s, sc in zip(candidates, sem):
+            total = w_sem * float(sc)
+            if w_mix:
+                total += w_mix * _keyword_score(question, s)
+            scores.append(total)
+
+    return sorted(zip(candidates, decisions, scores),
+                  key=lambda t: _rank_key(t[0], t[2]))
+
+
+def retrieve_ex(
+    question: str,
+    scene: SceneState,
+    skills: Sequence[SkillSpec],
+    question_type: Optional[str] = None,
+    scene_quality: Optional[float] = None,
+    *,
+    policy: Optional[RetrievalPolicy] = None,
+    top_k: Optional[int] = None,
+    rerank: Optional[bool] = None,
+    embedder=None,
+    lancedb_path: str = "",
+    trigger: str = "initial",
+    retrieval_index: int = 1,
+    evidence_version: str = "",
+    snapshot_ref: str = "",
+    snapshot_manifest_sha256: str = "",
+) -> tuple[list[RetrievedSkill], SkillRetrievalRecord]:
+    """§13.5/§13.6：检索 + **完整记录**（候选、过滤原因、分数、选中、配置版本）。
+
+    返回 `(hits, record)`。`hits` 与 `retrieve()` 完全一致（同一排序与截断），
+    `record` 是落盘用的事实：每一次被拒的候选也带原因码与名次 —— 此前这些原因只写进
+    日志，trace 里无从回答"这条 Skill 为什么没被选中"。
+
+    `trigger` 区分初次检索与证据更新后的**同快照**重检索（§13.5）。
+    排序权重 / top-k / 候选池来自冻结策略 `policy`（缺省用 `RetrievalPolicy()` 默认值，
+    并如实记 `config_source="default"`）。
+    """
+    eff_policy = policy or RetrievalPolicy()
+    task_type = canonical_question_type(question_type)
+    # 物化候选序列：下面既要计数（n_skills_offered）又要遍历两遍，生成器会在这里被耗尽
+    skills = list(skills or [])
+    record = SkillRetrievalRecord(
+        retrieval_index=int(retrieval_index),
+        trigger=str(trigger),
+        canonical_question_type=str(task_type or ""),
+        question_type_raw=str(question_type or ""),
+        question_type_known=bool(task_type),
+        evidence_version=str(evidence_version or ""),
+        config_version=eff_policy.version(),
+        config_sha256=eff_policy.sha256(),
+        config_source=str(eff_policy.source),
+        policy=eff_policy.to_dict(),
+        active_snapshot_ref=str(snapshot_ref or ""),
+        active_snapshot_manifest_sha256=str(snapshot_manifest_sha256 or ""),
+        n_skills_offered=len(skills),
+    )
+    rows: dict[str, SkillCandidateRecord] = {}
+
+    def _row(skill: SkillSpec, decision: RetrievalDecision,
+             reason_code: str = "") -> SkillCandidateRecord:
+        return SkillCandidateRecord(
+            skill_id=str(skill.skill_id),
+            version=str(skill.version),
+            skill_version=skill_version_key(skill),
+            canonical_question_type=str(
+                (sorted(skill_question_types(skill)) or [""])[0]),
+            hard_filter_passed=bool(decision.ok),
+            reason_code=reason_code or decision.code(),
+            reason=str(decision.reason or ""),
+            matched_evidence_signature=dict(decision.matched_signature),
+            gate_version_matched=decision.gate_version_matched,
+            content_sha256=skill_content_sha256(skill),
+            content_chars=skill_body_length(skill),
+        )
+
+    if not task_type:
+        # 题型不可知 → 不检索任何 Skill（fail-closed → 空 Skill baseline）。
+        # 候选行照记：这是"为什么一条都没检索"的可审计证据，而不是静默空结果。
+        for s in skills:
+            row = _row(s, RetrievalDecision(False, {}, None, "题型不可知，不检索任何 Skill"),
+                       reason_code="question_type_unknown")
+            rows[row.skill_version] = row
+        record.candidates = list(rows.values())
+        record.delivery_channel = "not_sent"
+        record.delivery_note = "题型不可知：未发出任何 Skill 请求"
+        return [], record
+
+    ranked_all: list[tuple[SkillSpec, RetrievalDecision, float]] = []
+    for s in skills:
+        d = retrieval_decision(s, scene, task_type)
+        row = _row(s, d)
+        rows[row.skill_version] = row
+        if d.ok:
+            ranked_all.append((s, d, 0.0))
+        elif s.requires_metric_evidence:
+            # 米制 Skill 被拦下是可审计事件（§13.6 trace 口径），单独告警
+            logger.info("M7 米制 Skill %s@%s 不可检索：%s（%s）",
+                        s.skill_id, s.version, d.code(), d.reason)
+        else:
+            logger.debug("M7 Skill %s@%s 不可检索：%s（%s）",
+                         s.skill_id, s.version, d.code(), d.reason)
+
+    record.eligible_skill_versions = [r.skill_version for r in rows.values()
+                                      if r.hard_filter_passed]
+    if not ranked_all:
+        record.candidates = list(rows.values())
+        record.delivery_channel = "not_sent"
+        record.delivery_note = "无候选通过硬条件：未发出任何 Skill 请求"
+        return [], record
+
+    use_rerank = eff_policy.rerank if rerank is None else bool(rerank)
+    ranked = _rank(question, [t[0] for t in ranked_all],
+                   [t[1] for t in ranked_all],
+                   policy=eff_policy, rerank=use_rerank, embedder=embedder)
+    k = int(eff_policy.top_k if top_k is None else top_k)
+    for i, (skill, _d, score) in enumerate(ranked, start=1):
+        row = rows[skill_version_key(skill)]
+        row.score = float(score)
+        row.rank = i
+        if i > k:
+            # 硬条件通过但排序未进 top-k（§13.5"选取"的落选者，如实记名次）
+            row.reason_code = "not_selected_top_k"
+            row.reason = f"排序第 {i} 名，top_k={k} 未选中"
+        else:
+            row.selected = True
+            # 检索刚完成，还没有发出任何模型请求 → 未交付（原因：尚无请求）。
+            # 交付与否由 `_record_skill_delivery` 在真正发出请求后改写（§13.6）。
+            row.delivery_reason = "no_model_request"
+    record.candidates = list(rows.values())
+    hits = [_hit(s, sc, d) for s, d, sc in ranked[:k]]
+    record.retrieved_skill_versions = [h.skill_version for h in hits]
+    record.delivery_channel = "not_sent"
+    record.delivery_note = "检索完成，尚未发出模型请求（未交付）"
+    return hits, record
+
+
 def retrieve(
     question: str,
     scene: SceneState,
@@ -320,54 +519,14 @@ def retrieve(
     硬条件（§17.1/§13.6）：题型匹配 ∧ 证据签名匹配 ∧（米制 Skill）gate 通过且版本匹配。
     `rerank=False` 时使用关键词打分（消融"有/无语义排序"，§8.1 的
     "Ours w/o LanceDB reranker" 行）；`scene_quality` 为 v5 兼容形参，不参与判定。
+
+    本函数是 `retrieve_ex` 的**薄封装**（只要命中列表，不留记录）：两条路径共用同一
+    判定与排序，不存在"带记录的一条"与"不带记录的一条"行为分叉。
     """
-    task_type = canonical_question_type(question_type)
-    if not task_type:
-        return []  # 题型不可知 → 不检索任何 Skill（fail-closed → 空 Skill baseline）
-
-    decisions: list[tuple[SkillSpec, RetrievalDecision]] = []
-    for s in skills:
-        d = retrieval_decision(s, scene, task_type)
-        if d.ok:
-            decisions.append((s, d))
-        elif s.requires_metric_evidence:
-            # 米制 Skill 被拦下是可审计事件（§13.6 trace 口径），单独告警
-            logger.info("M7 米制 Skill %s@%s 不可检索：%s",
-                        s.skill_id, s.version, d.reason)
-        else:
-            logger.debug("M7 Skill %s@%s 不可检索：%s", s.skill_id, s.version, d.reason)
-    if not decisions:
-        return []  # 无 Skill 命中 → 上层走空 Skill（baseline direct program generation）
-
-    candidates = [s for s, _ in decisions]
-    hits_decision = [d for _, d in decisions]
-    if not rerank:
-        scores = [RANK_WEIGHTS["keyword"] * _keyword_score(question, s) for s in candidates]
-    else:
-        from skill3d.memory.vector_index import rerank_scores
-
-        docs = [skill_text(s) for s in candidates]
-        try:
-            sem = rerank_scores(question, docs, embedder=embedder)
-        except Exception as exc:  # noqa: BLE001 - reranker 异常不得阻断在线链
-            logger.warning("语义排序失败（退化到关键词打分）: %s", exc)
-            sem = [_keyword_score(question, s) for s in candidates]
-        if len(sem) != len(candidates):
-            logger.warning("语义排序返回 %d 个分数（期望 %d），退化到关键词打分",
-                           len(sem), len(candidates))
-            sem = [_keyword_score(question, s) for s in candidates]
-        w_sem = float(RANK_WEIGHTS["semantic"])
-        w_mix = float(RANK_WEIGHTS["semantic_mix_keyword"])
-        scores = []
-        for s, sc in zip(candidates, sem):
-            total = w_sem * float(sc)
-            if w_mix:
-                total += w_mix * _keyword_score(question, s)
-            scores.append(total)
-
-    ranked = sorted(zip(candidates, hits_decision, scores),
-                    key=lambda t: _rank_key(t[0], t[2]))
-    return [_hit(s, sc, d) for s, d, sc in ranked[:top_k]]
+    hits, _record = retrieve_ex(
+        question, scene, skills, question_type, scene_quality,
+        top_k=top_k, rerank=rerank, embedder=embedder, lancedb_path=lancedb_path)
+    return hits
 
 
 def keyword_only_ranking(question: str, skills: Sequence[SkillSpec]) -> list[str]:

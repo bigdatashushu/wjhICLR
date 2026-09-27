@@ -52,10 +52,17 @@ def test_uniform_frame_ids_are_unique_and_monotonic(total):
     assert ids == sorted(ids) and ids[0] == 0 and ids[-1] == total - 1
 
 
-def test_too_short_video_is_input_legality_hard_fail():
-    """不足 32 帧 → FrameSetError（硬约束 21：禁止重复帧补齐凑数）。"""
+def test_too_short_video_keeps_readable_frames_without_padding():
+    """v9 §5.2 取代硬约束 21：不足 32 帧不再整题判死，改用可读帧继续。
+
+    仍守住硬约束 21 的**实质**：不得重复填充凑数（帧索引必须唯一），也不得静默改
+    采样算法（仍是时间均匀采样）。一帧都没有才抛 `FrameSetError`。
+    """
+    ids = fs.uniform_frame_ids(31, 32)
+    assert len(ids) == 31 and len(set(ids)) == 31, "禁止重复填充凑到 32"
+    assert ids == sorted(ids) and ids == list(range(31))
     with pytest.raises(fs.FrameSetError):
-        fs.uniform_frame_ids(31, 32)
+        fs.uniform_frame_ids(0, 32)
 
 
 def test_frame_set_hash_deterministic_content_addressed():
@@ -90,8 +97,9 @@ def test_m2_never_changes_the_frame_set():
     frames = _frames()
     for i in (2, 5, 9, 20):
         frames[i] = frames[i].model_copy(update={"blur_var": 1.0})
-    verdict = input_gate(frames)
-    out = annotate_frames(frames, verdict)
+    # v9 §5.1：质量诊断默认关闭，本用例验证"诊断开启时 M2 仍不动帧集"→ 显式开启
+    verdict = input_gate(frames, diagnostics=True)
+    out = annotate_frames(frames, verdict, diagnostics=True)
     assert len(out) == len(frames) == 32
     assert [f.frame_idx for f in out] == [f.frame_idx for f in frames]
     assert verdict.degraded_frame_ids == [2, 5, 9, 20]
@@ -104,7 +112,7 @@ def test_m2_never_changes_the_frame_set():
 def test_annotate_frames_rejects_frame_count_mismatch():
     """帧集与像素数量不一致 = 帧集被改动 → 必须报错（硬约束 21）。"""
     with pytest.raises(ValueError):
-        annotate_frames(_frames(32), input_gate(_frames(32)),
+        annotate_frames(_frames(32), input_gate(_frames(32), diagnostics=True),
                         [np.zeros((8, 8, 3), dtype=np.uint8)] * 31)
 
 
@@ -173,7 +181,11 @@ def test_tool_docs_scope_filter_matches_contract_map():
 
     # 产物维度交叉核对（scene_route 侧）：2D-only 暴露的 Tool 所需产物必须 ⊂ 该 route 的产物集
     fallback = set(REGISTRY.names_for_scope(SCOPE_FALLBACK_2D_ONLY))
-    assert fallback == {"euclidean_distance"}          # 纯算术：无产物、无证据依赖
+    # v9 §9.2/§5.2：`fallback_2d_only` 下**必须**仍有视觉路径 —— `inspect_frames`
+    # （只依赖 frames 产物）与 `detect_objects`（服务健康是执行前置条件，不要求已有
+    # 检测成功）都在此 scope 暴露；重建失败只收回 3D 工具，不收回"看原图"的能力。
+    # 本断言**取代**原先的 `== {"euclidean_distance"}`（那时这两个工具还不存在）。
+    assert fallback == {"euclidean_distance", "inspect_frames", "detect_objects"}
     for name in fallback:
         assert set(REGISTRY.requires_artifacts(name)) <= set(
             ROUTE_ARTIFACTS["fallback_2d_only"])
@@ -301,53 +313,60 @@ def test_scene_handle_narrows_available_artifacts_to_loaded_arrays():
 _RETURN_ANSWER_THEN_TOOL = (
     'ids = list_objects(category_filter="spaceship")\n'   # 空清单 → 走"无力回答"分支
     'if not ids:\n'
-    '    ReturnAnswer("abstain")\n'
+    '    ReturnAnswer(0)\n'
     'n = count_objects(category_name="chair")\n'          # 答后调 Tool → 必须受控抛错
     'ReturnAnswer(n)\n'
 )
 
 
-def test_tool_call_after_return_answer_raises_at_runtime():
-    """§15.1 运行层：`ReturnAnswer` 之后再调 Tool → 受控 `AnswerAlreadyGiven`。
+def test_return_answer_terminates_immediately():
+    """v7 §10.2：`ReturnAnswer` 是**终结操作** —— 提交后程序立即结束。
 
-    保留"记录/反作弊"语义（不中止执行）的同时，绝不让程序继续跑到 IndexError
-    崩成假的"服务失败"（v5 实测内测方向题全栽在这里：模型写完
-    `if not ids: ReturnAnswer("abstain")` 后继续 `object_centroid(ids[0])`）。
+    这明确替换 v6 的"只记录但不中止"语义。旧语义下模型必须把所有计算写在
+    `ReturnAnswer` 之前（否则触发 AnswerAlreadyGiven）；新语义下
+    `if not ids: return ReturnAnswer(...)` 这种自然写法直接正确终止。
     """
     scene = _scene("full_3d")
     handle = _handle(scene)
     kernel = RestrictedNamespaceKernel(REGISTRY, handle, frames=[], mode="real")
     cell = kernel.run_cell(_RETURN_ANSWER_THEN_TOOL)
-    # 答案已记录（记录语义保留），但后续 Tool 调用被拦下并按契约违规归因
-    assert cell.answer == "abstain"
-    assert cell.error_code == "tool_contract"
-    assert cell.answer_untrusted is True
-    assert cell.contract_violations[0]["error_code"] == "answer_already_given"
-    assert "AnswerAlreadyGiven" in (cell.error or "")
+    assert cell.terminated == "answer"
+    assert cell.answer == "0"
+    assert cell.error_code is None, "终结不是错误：不得记成 tool_contract"
+    # 答后的 Tool 调用根本没有机会执行（程序已终止）→ 没有工具结果
+    assert kernel.tool_results == [] or all(
+        r.source_tool != "count_objects" for r in kernel.tool_results)
 
 
-def test_guarded_early_abstain_passes_static_but_fails_runtime():
-    """§15.1 双层设计：静态层只拒**顶层**"答完还继续算"，运行层兜语义。
+def test_yield_observations_terminates_and_reports_results():
+    """v7 §10.2/§11.1：`YieldObservations` 结束当前片段、不提交答案。"""
+    scene = _scene("full_3d")
+    handle = _handle(scene)
+    kernel = RestrictedNamespaceKernel(REGISTRY, handle, frames=[], mode="real")
+    cell = kernel.run_cell(
+        'r = count_objects(category_name="chair")\n'
+        'return YieldObservations([r["result_id"]], "需要按实例明细判断")\n')
+    assert cell.terminated == "yield"
+    assert cell.answer is None
+    assert cell.yielded_reason == "需要按实例明细判断"
+    assert len(cell.yielded_result_ids) == 1
 
-    2026-09-21 真实实测修正（32 题 inner_validation / arm3）：静态层原先按行号
-    无条件拒绝，把上面这段**防御式写法**（前提不成立才在 if 分支里 abstain）整片
-    拒掉 → M9 拒绝 → 三次重生成仍是同一风格 → `unanswerable` → 16/32 episode 零分
-    （4 个方向题、计数题全灭）。那正是 v6 D7 要修的现象被以另一种方式复现。
 
-    现在的口径：
-    - 静态层：分支/循环里的 ReturnAnswer 不参与行号判定（它不必然执行）；
-    - 运行层：一旦 ReturnAnswer **真的执行**，后续 Tool 调用抛受控
-      `AnswerAlreadyGiven`（见 `test_tool_call_after_return_answer_raises_at_runtime`）。
+def test_guarded_early_return_passes_static_and_is_terminated_at_runtime():
+    """v7 §10.2：静态层不再需要"答后调 Tool"的行号顺序检查。
+
+    v6 曾在静态层按行号拒绝"顶层 ReturnAnswer 之后还有 Tool 调用"的写法；v7 里
+    `ReturnAnswer`/`YieldObservations` 都是 host 实现的**终结操作**
+    （抛 `BaseException` 子类，`except Exception` 吞不掉），提交后程序根本不会继续，
+    顺序检查因此既无必要、又会误拒模型最自然的防御式写法。
     """
     assert ast_guard(_RETURN_ANSWER_THEN_TOOL).ok, "防御式早退写法必须通过静态层"
-    # 只把 ReturnAnswer 放在最后 → 当然也通过
     assert ast_guard('ids = list_objects()\nReturnAnswer(len(ids))\n').ok
-    # 顶层"答完继续算"仍然必须被静态拒绝
-    top_level_bad = ('ids = list_objects()\nReturnAnswer(len(ids))\n'
-                     'n = count_objects(category_name="chair")\nReturnAnswer(n)\n')
-    res = ast_guard(top_level_bad)
-    assert not res.ok
-    assert any("ReturnAnswer 之后再调用 Tool" in v for v in res.violations)
+    assert ast_guard('ids = list_objects()\nYieldObservations([], "r")\n').ok
+    # 顶层"答完继续算"也通过静态层 —— 运行层保证它不会真的执行第二步
+    top_level = ('ids = list_objects()\nReturnAnswer(len(ids))\n'
+                 'n = count_objects(category_name="chair")\nReturnAnswer(n)\n')
+    assert ast_guard(top_level).ok
 
 
 # ------------------------------------- M7 检索：证据签名 + 米制门双重 fail-closed ----

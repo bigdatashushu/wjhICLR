@@ -25,6 +25,37 @@ from .episode import (
     InputGateVerdict,
     VSIBenchEpisode,
 )
+from .authorization import (
+    DECISION_VERSION,
+    DENIAL_REASON_CODES,
+    UNAVAILABLE_REASON_CODES,
+    AuthorizationDecision,
+    MetricGateStatus,
+    ToolAuthorizationReceipt,
+    gate_result_payload,
+    not_applicable_gate,
+)
+from .answer import (
+    ADAPTER_VERSION_LEGACY_SHORT_FORM,
+    CANONICAL_UNIT_BY_QUESTION_TYPE,
+    DERIVATION_OPS,
+    AnswerBasis,
+    AnswerPayload,
+    AnswerUnit,
+    AttributionLedger,
+    AttributionVerification,
+    EpisodeStatus,
+    parse_answer_payload,
+    verify_attribution,
+)
+from .data_access import (
+    ACCESS_PURPOSES,
+    COMPONENT_ROLES,
+    DATA_SPLITS,
+    REFUSAL_REASON_CODES,
+    DataAccessRecord,
+    utcnow_iso,
+)
 from .evidence import (
     ALWAYS_AVAILABLE_CAPABILITIES,
     CAPABILITIES,
@@ -53,6 +84,16 @@ from .reconstruction import (
     SceneState,
 )
 from .legacy import LegacyArtifact, LegacyArtifactError
+from .retrieval import (
+    CANDIDATE_REASON_CODES,
+    DELIVERY_CHANNELS,
+    DELIVERY_STATES,
+    RETRIEVAL_RECORD_SCHEMA_VERSION,
+    RETRIEVAL_TRIGGERS,
+    SkillCandidateRecord,
+    SkillRetrievalRecord,
+    short_method_summary,
+)
 # `SparseBAReceipt`（原 `.sparse_ba`）随 v6 §20 废止 `vggt_sparse_ba` 一并归档到
 # `skill3d/legacy/retired/sparse_ba.py`，不再由 Schemas 导出（Schema 与 legacy 隔离）。
 from .readiness import ExperimentReadiness
@@ -71,6 +112,7 @@ from .evolution import (
     BudgetLimit,
     BudgetUsage,
     CandidateRevision,
+    SkillLibraryCandidate,
     CounterexampleBundle,
     CounterexampleCase,
     EnvironmentSnapshot,

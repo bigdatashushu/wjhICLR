@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import sys
 import uuid
@@ -79,7 +80,14 @@ from skill3d.governance.induce import InsufficientEvidenceError, induce_candidat
 from skill3d.memory.consolidation import leakage_scan_text
 from skill3d.online.config import DEFAULT_CONFIG, load_config, load_yaml, paths_from
 from skill3d.online.runner import OnlineRunConfig
-from skill3d.schemas import CandidateRevision, CounterexampleBundle, EpisodeTrace
+from skill3d.schemas import (
+    CandidateRevision,
+    CounterexampleBundle,
+    DataAccessRecord,
+    EpisodeTrace,
+    PairedOutcome,
+    utcnow_iso,
+)
 from skill3d.trace.store import TraceStore
 
 MODES = ("real", "mock_light")
@@ -137,8 +145,8 @@ class OfflineDriverConfig:
     seed: int = 0
     traces_glob: str = ""
     trace_dir: str = "data/traces"
-    skill_store: str = "data/skill_registry"
-    active_snapshot: str = "data/active_snapshot.json"
+    skill_store: str = "skill_library/snapshots"
+    active_snapshot: str = "skill_library/snapshots/active_snapshot.json"
     recon_dir: str = "data/reconstructions"
     recon_method: str = "vggt"
     checkpoint_path: str = "data/offline_runs/latest.json"
@@ -179,12 +187,26 @@ class OfflineCheckpoint:
     transitions: list[dict] = field(default_factory=list)
     candidate_ids: list[str] = field(default_factory=list)
     revision_ids: list[str] = field(default_factory=list)
+    current_revision_id: str = ""
+    # Resume-safe lineage: IDs alone cannot reconstruct the final payload for
+    # an atomic promote after process restart.
+    revision_payloads: dict[str, dict] = field(default_factory=dict)
+    # §14.3：准入证据来自 **inner 面板**（`admission_outcome`）；
+    # `l3_outcome` 是 outer_holdout 的独立验证证据，**不作为准入门**。
+    admission_outcome: Optional[dict] = None
+    l3_outcome: Optional[dict] = None
     # 离线强模型（DeepSeek-V4.1-Flash）是否可用；不可用时终态必为 QUARANTINE
     offline_available: bool = True
     termination_reason: str = ""
     notes: list[str] = field(default_factory=list)
     skipped_stages: list[str] = field(default_factory=list)
     updated_at: str = ""
+    # §17.1「数据访问」行：每次真实读取落一条（split／用途／角色／运行身份／
+    # 输入清单 hash／时间；归纳侧还带 label_access 与拒收账本）
+    data_access: list[dict] = field(default_factory=list)
+    # §14.1 硬隔离的拒收账本：逐条记 `{episode_id, reason}`，供审计复核
+    # "哪些材料被挡在归纳之外"（不进入任何归纳 prompt）
+    refused_traces: list[dict] = field(default_factory=list)
     # §3.4：失败结局码（service_unavailable / offline_auth_error / offline_request_error）
     offline_failure_code: str = ""
     # §19.2 离线治理模型块（provider/model_id/endpoint_hash/prompt_version/latency/
@@ -361,7 +383,24 @@ class OfflineDriver:
         """跑完整状态链；返回终态 checkpoint（幂等：可从中断处 resume）。"""
         if self.cfg.resume and Path(self.cfg.checkpoint_path).is_file():
             self.ckpt = OfflineCheckpoint.load(self.cfg.checkpoint_path)
+            self.archive = CandidateArchive()
+            for rid, payload in self.ckpt.revision_payloads.items():
+                try:
+                    self.archive.revisions[rid] = CandidateRevision.model_validate(payload)
+                except Exception:  # noqa: BLE001 - corrupt lineage blocks promote later
+                    self._log(f"[resume] revision payload 无法恢复: {rid}")
             self.fsm.state = OfflineState(self.ckpt.state)
+            if self.ckpt.admission_outcome:
+                try:
+                    self._admission = PairedOutcome.model_validate(
+                        self.ckpt.admission_outcome)
+                except Exception:  # noqa: BLE001 - corrupt outcome blocks promote
+                    self._log("[resume] 准入面板结果无法恢复，拒绝后续 promote")
+            if self.ckpt.l3_outcome:
+                try:
+                    self._l3 = PairedOutcome.model_validate(self.ckpt.l3_outcome)
+                except Exception:  # noqa: BLE001 - corrupt evidence is not a gate
+                    self._log("[resume] L3 验证证据无法恢复（不影响准入判定）")
             self._log(f"[resume] 从 {self.ckpt.state} 恢复 run_id={self.ckpt.run_id}")
 
         self._log(f"run_id={self.ckpt.run_id} governance={self.cfg.governance} "
@@ -491,8 +530,11 @@ class OfflineDriver:
             return True
 
         self._candidate_v0 = candidate
+        self.archive.remember(candidate)
         self.ckpt.candidate_ids.append(candidate.root_candidate_id)
         self.ckpt.revision_ids.append(candidate.revision_id)
+        self.ckpt.current_revision_id = candidate.revision_id
+        self.ckpt.revision_payloads[candidate.revision_id] = candidate.model_dump()
         self.ckpt.offline_model_fields = _offline_manifest_fields(client)
         self._log(f"[GPT6_SYNTHESIZE] candidate_v0 root={candidate.root_candidate_id} "
                   f"revision={candidate.revision_id} "
@@ -567,7 +609,10 @@ class OfflineDriver:
                 self.trace_store.append("counterexample_bundle", bundle.model_dump())
             client = self.offline or DeepSeekClient()
             new_rev = revise_from_bundle(rev, bundle, client)
+            self.archive.remember(new_rev)
             self.ckpt.revision_ids.append(new_rev.revision_id)
+            self.ckpt.current_revision_id = new_rev.revision_id
+            self.ckpt.revision_payloads[new_rev.revision_id] = new_rev.model_dump()
             self.ckpt.offline_model_fields = _offline_manifest_fields(client)
             self._log(f"[REVISE] 新版本 revision={new_rev.revision_id} "
                       f"parent={new_rev.parent_version}（候选不可变，硬约束 11）")
@@ -621,8 +666,7 @@ class OfflineDriver:
                 min_delta_mra=self.cfg.min_delta_mra,
                 revise_fn=revise_fn, static_check_fn=static_check_fn, archive=arc,
                 budget_limit=limit, print_fn=self.print,
-                levels=(SIMPLIFIED_LEVELS if self.cfg.simplified_phase_gate
-                        else FULL_LEVELS),
+                levels=self._admission_safe_levels(),
             )
         except (OfflineAuthError, OfflineServiceUnavailable, OfflineRequestError,
                 OfflineResponseError) as exc:
@@ -634,15 +678,24 @@ class OfflineDriver:
             self._save()
             return
         self._opt_run, self._level_state = run, level_state
+        self.ckpt.current_revision_id = run.current_revision_id
         if self.trace_store is not None:
             self.trace_store.append("optimization_run", run.model_dump())
         self._log(f"[OPTIMIZATION_LOOP] status={run.status} reason={run.termination_reason} "
                   f"revisions={run.budget_used.revisions} rollouts={run.budget_used.rollouts}")
 
         # 映射到 FSM 终态（outer 只跑一次，硬约束 10）
+        #
+        # §14.3：**准入消费 inner 面板**（L2 = 该题型完整 inner），
+        # L3 = outer_holdout 的结果只作为快照冻结后的独立验证证据落盘，
+        # 不参与晋升判定 —— 用 holdout 选代会让它不再是 holdout。
+        l2 = level_state.get("L2")
         l3 = level_state.get("L3")
-        if run.status == "promoted" and l3 is not None:
-            self._l3 = l3[0]
+        if l3 is not None:
+            self.ckpt.l3_outcome = l3[0].model_dump()
+        if run.status == "promoted" and l2 is not None:
+            self._admission = l2[0]
+            self.ckpt.admission_outcome = self._admission.model_dump()
             self._advance("pass")
         else:
             self.ckpt.termination_reason = f"optimization_{run.status}: {run.termination_reason}"
@@ -651,19 +704,50 @@ class OfflineDriver:
             self.ckpt.state = self.fsm.state.value
             self._save()
 
+    def _admission_safe_levels(self) -> tuple[str, ...]:
+        """§14.3：准入必须在**该题型的完整 inner 面板**上判定。
+
+        G-31 的"简化阶段门"会跳过 L2（完整 inner），但准入不能因此没有准入证据 ——
+        缺 L2 时晋升会以 `no_admission_panel_outcome` 拒绝。因此这里保留简化意图
+        （L1 仍是最小切片预筛），但**始终保留 L2**，并明确记一条说明，
+        而不是让一次真实演化跑到最后才发现没有准入面板。
+        """
+        if not self.cfg.simplified_phase_gate:
+            return FULL_LEVELS
+        self._log("[配置] simplified_phase_gate=True：L1 仍为最小切片预筛，但按 §14.3 "
+                  "保留 L2（完整 inner）作为准入门 —— outer 不作为准入门")
+        return FULL_LEVELS
+
     # ---- 准入 + PROMOTE ----
     def _stage_promote(self) -> None:
-        candidate = getattr(self, "_candidate_v0", None)
-        l3 = getattr(self, "_l3", None)
-        if candidate is None or l3 is None:
-            self.ckpt.termination_reason = "no_outer_outcome"
+        run = getattr(self, "_opt_run", None)
+        revision_id = (getattr(run, "current_revision_id", "")
+                       if run is not None else self.ckpt.current_revision_id)
+        candidate = getattr(self.archive, "revisions", {}).get(revision_id)
+        # Compatibility for injected panel doubles that return a promoted run
+        # without exercising the archive. This is only a no-revision case;
+        # optimized runs must resolve their final payload from the archive.
+        root = getattr(self, "_candidate_v0", None)
+        if (candidate is None and root is not None and run is not None
+                and len(list(getattr(run, "revision_history", []))) == 1):
+            candidate = root
+        admission_po = getattr(self, "_admission", None)
+        if candidate is None:
+            self.ckpt.termination_reason = "missing_final_revision"
+            self.fsm.state = OfflineState.REJECT
+            self.ckpt.state = self.fsm.state.value
+            self._save()
+            return
+        if admission_po is None:
+            # §14.3：没有 inner 面板结果就不能准入（缺的是**准入证据**，不是 outer）
+            self.ckpt.termination_reason = "no_admission_panel_outcome"
             self.fsm.state = OfflineState.REJECT
             self.ckpt.state = self.fsm.state.value
             self._save()
             return
 
         decision = admit(
-            candidate, l3, outer_items=self.panels.get("L3", []),
+            candidate, admission_po, panel_items=self.panels.get("L2", []),
             no_leakage=getattr(self, "_no_leakage", False),
             n_min=self.cfg.n_min_cross_scene,
             min_delta_mca=self.cfg.min_delta_mca, min_delta_mra=self.cfg.min_delta_mra,
@@ -721,7 +805,8 @@ class OfflineDriver:
         log: list = []
         from skill3d.skills.promote_atomic import promote as promote_fn
 
-        snap = promote_fn(self.cfg.skill_store, promoted, promotion_log=log)
+        snap = promote_fn(self.cfg.skill_store, promoted, promotion_log=log,
+                          strict_skill_specs=True)
         if self.trace_store is not None:
             self.trace_store.append("promotion", log[-1] if log else snap)
         self._log(f"[promote] 原子切换 snapshot_before="
@@ -854,6 +939,7 @@ def _load_split_items(args, cfg_yaml: dict, split: str) -> list[EpisodeItem]:
     split_cfg = load_yaml(cfg_yaml.get("split_config", "configs/vsi_bench_split.yaml"))
     return load_vsi_bench_items(split, split_cfg,
                                 video_root=args.video_root or paths.raw_videos,
+                                video_fallback_roots=paths.raw_video_fallbacks,
                                 cache_dir=paths.vsi_bench_meta, limit=limit,
                                 seed=args.seed)
 

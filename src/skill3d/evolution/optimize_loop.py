@@ -106,6 +106,7 @@ def _load_items(args, split: str, cfg_yaml: dict) -> list[EpisodeItem]:
     split_cfg = load_yaml(cfg_yaml.get("split_config", "configs/vsi_bench_split.yaml"))
     return load_vsi_bench_items(split, split_cfg,
                                 video_root=args.video_root or paths.raw_videos,
+                                video_fallback_roots=paths.raw_video_fallbacks,
                                 cache_dir=paths.vsi_bench_meta, limit=limit,
                                 seed=args.seed)
 
@@ -168,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recon-dir", default="", help="real 模式：复用既有 artifact 的目录")
     p.add_argument("--recon-method", default="vggt", choices=["vggt"],
                    help="重建方法；v6 §5.2 受控枚举只有 vggt（colmap/dust3r 基线已废止，§20）")
-    p.add_argument("--skill-store", default="data/skill_registry", help="M15 snapshot 存储目录")
+    p.add_argument("--skill-store", default="skill_library/snapshots", help="v9 Skill library snapshot 存储目录")
     p.add_argument("--active-snapshot", default="", help="active snapshot（只读，用于审计）")
     p.add_argument("--trace-dir", default="", help="离线 trace 目录（默认取 config）")
     p.add_argument("--admission-config", default="configs/admission_thresholds.yaml")
@@ -247,11 +248,13 @@ def main(argv: list[str] | None = None) -> int:
         trace_dir=args.trace_dir or paths.trace_store,
         active_snapshot_ref=active_snapshot,
     )
-    arm_b_cfg = replace(base_cfg, skills=[cand_skill])
-
     # ---- 逐层 paired A/B（同一批 episode、同一 artifact/合成几何 → 硬约束 18）----
-    def paired(items: list[EpisodeItem], level: str) -> tuple[PairedOutcome, list, list]:
+    def paired(items: list[EpisodeItem], level: str,
+               revision: CandidateRevision) -> tuple[PairedOutcome, list, list]:
         outs_a = run_panel(items, base_cfg, trace_store)
+        # Bind the current revision for every test level; a root-bound config
+        # would silently evaluate the same Skill after REVISE.
+        arm_b_cfg = replace(base_cfg, skills=[_candidate_skill(revision)])
         outs_b = run_panel(items, arm_b_cfg, trace_store)
         po = _paired_outcome(f"pair-{level}-{uuid.uuid4().hex[:8]}", base_cfg,
                              outs_a, outs_b, [it.episode.question_type for it in items],
@@ -289,15 +292,15 @@ def main(argv: list[str] | None = None) -> int:
 
     def run_test_fn(revision: CandidateRevision, level: str) -> TestReport:
         if level == "L1_minimal_slice":
-            po, a, b = paired(l1_items, "L1")
+            po, a, b = paired(l1_items, "L1", revision)
             level_state["L1"] = (po, a, b)
             return level_report(po, min_delta=False, minimal=True)
         if level == "L2_full_inner":
-            po, a, b = paired(inner, "L2")
+            po, a, b = paired(inner, "L2", revision)
             level_state["L2"] = (po, a, b)
             return level_report(po, min_delta=True, minimal=False)
         if level == "L3_outer_holdout":
-            po, a, b = paired(outer, "L3")
+            po, a, b = paired(outer, "L3", revision)
             level_state["L3"] = (po, a, b)
             return level_report(po, min_delta=True, minimal=False)
         raise ValueError(f"未知层级: {level}")
@@ -385,12 +388,15 @@ def main(argv: list[str] | None = None) -> int:
               "请用 --mode real 复跑（需真实面板与共享 artifact）。", file=sys.stderr)
         return 3
 
-    promoted = root.model_copy(update={
-        "status": "promoted",
-        "revision_id": root.revision_id,
-    })
+    final_revision = getattr(archive, "revisions", {}).get(run.current_revision_id)
+    if final_revision is None:
+        print(f"[错误] 找不到最终 revision={run.current_revision_id}，拒绝 promote",
+              file=sys.stderr)
+        return 1
+    promoted = final_revision.model_copy(update={"status": "promoted"})
     promotion_log: list = []
-    snap = promote(store_dir, promoted, promotion_log=promotion_log)
+    snap = promote(store_dir, promoted, promotion_log=promotion_log,
+                   strict_skill_specs=True)
     print(f"[promote] 原子切换完成：snapshot_before={promotion_log[-1]['snapshot_before']} "
           f"→ snapshot_after={snap['snapshot_id']}（旧 snapshot 保留，可回滚，硬约束 12）")
     trace_store.append("promotion", promotion_log[-1] if promotion_log else snap)

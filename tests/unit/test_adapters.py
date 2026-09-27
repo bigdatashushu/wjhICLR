@@ -41,10 +41,18 @@ def test_sample_uniform_indices_strictly_monotonic_uniform():
     assert idx[0] == 0 and idx[-1] <= 999
 
 
-def test_sample_uniform_indices_short_video_is_hard_fail():
-    """视频不足 32 帧 → 输入合法性硬失败（硬约束 21 禁止重复帧补齐）。"""
+def test_sample_uniform_indices_short_video_uses_all_available_frames():
+    """v9 §5.2 取代硬约束 21 的"不足 32 帧即硬失败"。
+
+    规范原文："源视频不足 32 帧但仍有真实可读帧：保留帧身份和缺失掩码，使用可读帧
+    继续作答；**不重复填充或偷偷改采样**。" 因此这里返回全部可用帧（唯一、有序），
+    而不是抛错；只有"一帧都没有"才是输入错误。
+    """
+    ids = vl.sample_uniform_indices(total_frames=10, n=32)
+    assert ids == list(range(10)), "应使用全部可用帧，不重复填充"
+    assert len(set(ids)) == len(ids) and ids == sorted(ids)
     with pytest.raises(vl.FrameSetError):
-        vl.sample_uniform_indices(total_frames=10, n=32)
+        vl.sample_uniform_indices(total_frames=0, n=32)
 
 
 def test_frame_set_hash_is_deterministic_and_content_addressed():

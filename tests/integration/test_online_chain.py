@@ -125,13 +125,15 @@ def test_same_seed_is_byte_identical(items, tmp_path):
     assert dump("a") == dump("b")
 
 
-def test_input_gate_blur_all_downgrades_then_abstains_on_tool_contract(tmp_path):
-    """M2 全帧模糊 → 只降权 + route 降级 → Tool fail-closed → abstain（§6.4/§14）。
+def test_blur_default_does_not_change_the_main_flow(tmp_path):
+    """v9 §5.1：模糊诊断**默认关闭**，`quality_weight` 默认不影响主流程。
 
-    v6 语义（硬约束 21）：M2 不再删帧；质量权重拉低 route 到 fallback_2d_only，
-    此时需要 3D 产物的 Tool 必须抛 ArtifactUnavailableError（不静默返回 False），
-    partial_tool_recovery 用尽 → 显式 abstain（`answer_source="tool_contract"`），
-    且主榜按错计（MRA=0，不刷分）。
+    规范原文："模糊、曝光、对比度和运动质量诊断默认关闭；可在独立诊断实验中启用，
+    不能删帧、换帧、重排或终止作答。原有 `quality_weight` 默认不影响主流程。"
+
+    此前 M2 的 `quality_weight` 会被乘进合成质量（`runner` → `synthetic`），从而把
+    `scene_route` 拉成 `fallback_2d_only` —— 那正是"影响主流程"。关闭诊断后权重恒 1.0，
+    模糊输入按 §5.2 的"只要结构有效且能解码就不能被判为没有图片"正常作答。
     """
     items = load_synthetic_items("inner_validation", question_types=["room_size_estimation"],
                                  frame_size=FRAME_SIZE, degrade="blur_all",
@@ -145,23 +147,49 @@ def test_input_gate_blur_all_downgrades_then_abstains_on_tool_contract(tmp_path)
     assert n_before == 32 and len(items[0].pixels) == 32
     assert len(items[0].episode.frames) == 32
     assert any("M2 被动观测" in n and "不" not in n[:2] for n in out.notes)
-    # route 降级 + 契约 fail-closed + 显式 abstain
+    # 诊断关闭 → 无质量 flag、权重 1.0、路由不被 M2 左右
+    assert out.episode_trace.input_degradation_flags == []
+    assert out.scene_route != "fallback_2d_only", "M2 权重不得再拉低路由"
+    assert out.final_state == "answer" and out.answer not in (None, "")
+    assert out.episode_trace.failure is None
+    assert "forced_answer" not in out.answer_flags
+
+
+def test_diagnostic_experiment_blur_all_still_answers(tmp_path):
+    """§5.1 的"独立诊断实验"入口：显式开启诊断后仍必须作答（不拒答）。
+
+    同时守住 P0 的 trace 诚实性回归：收口答案的**程序来源**仍是 mock_stub，
+    不得冒充 `vllm_ok`；轮次原因分开记在 `finalization_used` / `round_trigger`。
+    """
+    items = load_synthetic_items("inner_validation", question_types=["room_size_estimation"],
+                                 frame_size=FRAME_SIZE, degrade="blur_all",
+                                 out_dir=str(tmp_path / "obj"))
+    cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"),
+                          memory_dir="", input_diagnostics=True)
+    out = run_episode(items[0].episode, items[0].pixels, cfg, geometry=items[0].geometry)
+
+    assert out.episode_trace.input_degradation_flags, "诊断开启后应有质量 flag"
     assert out.scene_route == "fallback_2d_only"
-    assert out.abstained and out.tool_contract_hits >= 1
-    assert "tool_contract" in out.answer_flags
-    assert out.episode_trace.failure.categories == ["tool_contract"]
-    assert out.final_state == "unanswerable" and out.answer is None
-    assert out.answer_source == "tool_contract"          # §6.3：契约失败终止单列
-    assert out.mra_value == pytest.approx(0.0)          # 主榜按错计，不刷分
+    assert out.tool_contract_hits >= 1
+    assert out.final_state == "answer" and out.answer not in (None, "")
+    assert out.answer_source == "tool_program"
+    assert "forced_answer" in out.answer_flags
+    assert out.mra_value is not None
+    assert out.episode_trace.failure is None
+    # P0 回归锁：mock 收口答案不得冒充真实模型输出
+    assert out.episode_trace.synthesis_source == "mock_stub"
+    assert out.episode_trace.finalization_used is True
+    assert out.episode_trace.round_trigger in ("finalize", "error_recovery")
 
 
 def test_input_gate_blur_some_keeps_all_frames_and_answers(tmp_path):
-    """M2 局部低质 → 打 flag + 降权后继续；帧数/帧序不变（硬约束 21）。"""
+    """诊断实验中 M2 局部低质 → 打 flag + 降权后继续；帧数/帧序不变（硬约束 21）。"""
     items = load_synthetic_items("inner_validation", question_types=["room_size_estimation"],
                                  frame_size=FRAME_SIZE, degrade="blur_some",
                                  out_dir=str(tmp_path / "obj"))
+    # v9 §5.1：诊断默认关闭 → 本用例属"独立诊断实验"，显式开启
     cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"),
-                          memory_dir="")
+                          memory_dir="", input_diagnostics=True)
     out = run_episode(items[0].episode, items[0].pixels, cfg, geometry=items[0].geometry)
     assert len(items[0].pixels) == 32                   # 没删帧
     assert out.final_state == "answer"

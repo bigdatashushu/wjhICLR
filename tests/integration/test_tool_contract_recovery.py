@@ -7,8 +7,8 @@
 - (b) **共享前提失效级联撤销**：缺 `poses`/`depth` 这类共享前提 → 撤销依赖它的既有结果、
   记录 `invalidated_result_ids`、把 EvidenceProfile 对应能力降级、并重新派生
   `question_tool_scope`；
-- (c) **恢复次数有限**：由 `cfg.max_recovery` 约束（模型调用次数 = max_recovery + 1），
-  用尽 → 显式 abstain（主榜按错计）；
+- (c) **恢复次数有限**：由 `cfg.max_recovery` 约束，之后最多一次零工具终结作答；
+  不再重入恢复环，执行失败记 `run_error`（主榜按错计）；
 - (d) **契约污染过的答案永不采纳**：program 自捕获 ToolContractError 后仍 ReturnAnswer
   → 答案作废，`answer_untrusted=True`，不得进分。
 
@@ -217,19 +217,43 @@ ALWAYS_FAIL = ('uv = reproject([0.0, 0.0, 1.0], 0)\n'
 
 
 @pytest.mark.parametrize("max_recovery", [0, 1, 2])
-def test_recovery_attempts_bounded_then_abstain(tmp_path, episode_item, max_recovery):
-    """恢复重试 ≤ `cfg.max_recovery`（调用次数 = max_recovery + 1）→ 用尽即 abstain。"""
-    client = _FakeClient([ALWAYS_FAIL])          # 每轮都返回同一个必失败的 program
+def test_recovery_attempts_bounded_then_zero_tool_answer(tmp_path, episode_item, max_recovery):
+    """恢复次数有界；用尽后只调用一次零工具终结程序。"""
+    direct = 'ReturnAnswer("3.0")\n'
+    client = _FakeClient([ALWAYS_FAIL] * (max_recovery + 1) + [direct])
     cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=False),
                max_recovery=max_recovery)
     out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
 
-    assert len(client.calls) == max_recovery + 1          # 有界：不无限重试
+    assert len(client.calls) == max_recovery + 2
     assert out.recovery_count == max_recovery + 1
-    assert out.abstained is True and out.final_state == "unanswerable"
-    assert out.answer is None and out.answer_source == "tool_contract"
-    assert out.mra_value == pytest.approx(0.0)            # 主榜按错计，不刷分
-    assert out.episode_trace.failure.categories == ["tool_contract"]
+    assert out.final_state == "answer" and out.answer == "3.0"
+    assert out.answer_source == "tool_program"
+    assert "forced_answer" in out.answer_flags
+    assert out.mra_value is not None
+    assert out.episode_trace.failure is None
+    assert out.program_trace.calls == []
+
+
+def test_caught_forced_tool_call_is_not_retried(tmp_path, episode_item):
+    """finalization 通过 ctx 别名调用工具也会被运行时禁止，且不会重试。"""
+    forced_with_caught_tool_call = (
+        "def solve(ctx):\n"
+        "    try:\n"
+        "        ctx.tools.reproject([0.0, 0.0, 1.0], 0)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    return ReturnAnswer('3.0')\n"
+    )
+    client = _FakeClient([ALWAYS_FAIL, forced_with_caught_tool_call])
+    cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=False), max_recovery=0)
+    out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
+
+    assert len(client.calls) == 2
+    assert out.final_state == "run_error"
+    assert out.answer is None
+    assert out.mra_value == pytest.approx(0.0)
+    assert out.episode_trace.failure.categories == ["run_error"]
 
 
 # --------------------------------------------- (d) 契约污染过的答案不采纳 ----
@@ -244,19 +268,19 @@ SNEAKY_CATCH = (
 )
 
 
-def test_answer_depending_on_contract_failed_tool_is_never_scored(tmp_path,
-                                                                 episode_item):
-    """程序自捕获 ToolContractError 后仍 ReturnAnswer → 答案作废、不得进分（§14/硬约束 23）。"""
+def test_answer_after_caught_contract_error_is_preserved(tmp_path, episode_item):
+    """自捕获工具异常后的预测可保留，但必须记录契约违规并保守归因。"""
     client = _FakeClient([SNEAKY_CATCH])
     cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=False), max_recovery=0)
     out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
 
     assert out.answer_untrusted is True
-    assert out.answer is None                             # 自捕获后的答案一律作废
-    assert out.answer_source == "tool_contract"
-    assert out.abstained is True and out.final_state == "unanswerable"
-    assert out.mra_value == pytest.approx(0.0)            # 绝不把 "0.0" 当有效答案进分
-    assert "tool_contract" in out.answer_flags
+    assert out.answer == "0.0"
+    assert out.answer_source == "tool_program"
+    assert out.final_state == "answer"
+    assert out.mra_value is not None
+    assert "tool_contract_observed" in out.answer_flags
+    assert out.tool_contract_hits == 0
 
 
 def test_validated_observation_is_not_replayed_after_invalidation(tmp_path,

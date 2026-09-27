@@ -50,11 +50,39 @@ class SceneJob:
     gpu_rank: Optional[int] = None
     note: str = ""
     artifact: Optional[ReconstructionArtifact] = None
+    # v9 §5.2：缓存身份来源（源标识 + 帧集内容哈希）
+    frame_set: Optional[object] = None
 
 
-def artifact_path(recon_dir: str | Path, scene_name: str, method: str) -> Path:
-    """artifact 落盘约定：<recon_dir>/<method>/<scene>.json + 同名 .npy 数组。"""
-    return Path(recon_dir) / method / f"{scene_name}.json"
+def artifact_path(recon_dir: str | Path, scene_name: str, method: str, *,
+                  frame_set=None) -> Path:
+    """artifact 落盘约定：`<recon_dir>/<method>/<scene>.json` + 同名 .npy 数组。
+
+    v9 §5.2："源标识及内容校验值参与缓存身份，**禁止仅凭相同的帧索引列表跨视频复用**。"
+    —— 这正是指向纯 scene 名的问题：两个数据集里同名 scene、或同 scene 换了视频/帧集时
+    会互相顶用。传入 `frame_set` 时文件名改用其 `cache_identity()`（源标识 + 帧集内容
+    哈希）前 16 位；不传则保持历史命名（供迁移期的旧缓存读取）。
+    """
+    if frame_set is None:
+        return Path(recon_dir) / method / f"{scene_name}.json"
+    return Path(recon_dir) / method / f"{scene_name}__{frame_set.cache_identity()[:16]}.json"
+
+
+def resolve_artifact_path(recon_dir: str | Path, scene_name: str, method: str, *,
+                          frame_set=None) -> tuple[Path, bool]:
+    """定位可复用的 artifact → `(路径, 是否复用旧命名)`（§17.2 迁移）。
+
+    优先用缓存身份路径；若它不存在但**历史命名**的文件在，就复用它并返回
+    `used_legacy=True` —— 这样切缓存键不会让已重算好的旧产物凭空失效（那会改变
+    对比基线并白烧一遍重建），同时把"这是旧命名产物"如实告诉调用方。
+    """
+    fresh = artifact_path(recon_dir, scene_name, method, frame_set=frame_set)
+    if fresh.exists() or frame_set is None:
+        return fresh, False
+    legacy = artifact_path(recon_dir, scene_name, method)
+    if legacy.exists():
+        return legacy, True
+    return fresh, False
 
 
 def plan_scene_jobs(items: Sequence[EpisodeItem], recon_dir: str | Path, method: str,
@@ -66,13 +94,16 @@ def plan_scene_jobs(items: Sequence[EpisodeItem], recon_dir: str | Path, method:
         key = ep.scene_name
         job = by_scene.get(key)
         if job is None:
-            by_scene[key] = SceneJob(scene_name=key, split=ep.split, n_episodes=1,
+            by_scene[key] = SceneJob(
+                scene_name=key, split=ep.split, n_episodes=1,
+                frame_set=getattr(ep, "frame_set", None),
                                      video_path=it.video_path)
         else:
             job.n_episodes += 1
     jobs = sorted(by_scene.values(), key=lambda j: (j.split, j.scene_name))
     for job in jobs:
-        p = artifact_path(recon_dir, job.scene_name, method)
+        p, _used_legacy = resolve_artifact_path(
+            recon_dir, job.scene_name, method, frame_set=job.frame_set)
         if p.exists() and not force:
             job.status = "skipped"
             job.artifact_ref = str(p)
@@ -112,7 +143,8 @@ def run_jobs(jobs: list[SceneJob], items_by_scene: dict[str, list[EpisodeItem]],
         except Exception as exc:  # noqa: BLE001 - 依赖/显存等运行时错误
             job.status, job.note = "failed", f"{type(exc).__name__}: {exc}"
             continue
-        out = artifact_path(recon_dir, job.scene_name, method)
+        out = artifact_path(recon_dir, job.scene_name, method,
+                            frame_set=getattr(job, "frame_set", None))
         out.parent.mkdir(parents=True, exist_ok=True)
         # 方案 X（§4 M4 / §2.2）：M4 前移到 P1 —— 质量随 artifact 一起落盘。
         # v6 主线只有 vggt，其质量已在 run_vggt 内部算过（此处为零重算的兜底补齐）。
@@ -241,6 +273,7 @@ def main(argv: list[str] | None = None) -> int:
                 part = load_vsi_bench_items(
                     split, split_cfg,
                     video_root=args.video_root or paths.raw_videos,
+                    video_fallback_roots=paths.raw_video_fallbacks,
                     cache_dir=paths.vsi_bench_meta, limit=args.limit or None,
                     n_frames=args.n_frames,
                     question_types=qtypes or None,

@@ -41,3 +41,36 @@ class LegacyArtifactError(RuntimeError):
             "不兼容混写，legacy 数据不得进入运行时/准入/统计）。"
             "请用 skill3d.legacy.readers 做只读审计，并从原始帧重跑 v5 pipeline 生成新产物。"
             + (f" 细节：{detail}" if detail else ""))
+
+
+class LegacyEpisodeTrace(Spec):
+    """旧 Schema 的 EpisodeTrace **只读审计载体**（v9 §17.2）。
+
+    旧 episode trace 保留自己的版本身份：6.0 的记录里没有 v9 才引入的字段，
+    那不是"当时该事实不存在"，而是"当时没记这个事实"。因此**不得**把它
+    `model_validate` 成当前 `EpisodeTrace` —— 缺失字段会被默认值静默填满，
+    审计时无法区分两种情况。
+
+    `eligible_for_runtime` 恒为 `False`：旧 trace 不能作为当前运行的证据。
+    """
+
+    source_path: str
+    detected_schema_version: Optional[str] = None
+    raw_fields: dict[str, object]
+    warnings: list[str]
+    eligible_for_runtime: Literal[False] = False
+
+
+class LegacyEpisodeTraceError(RuntimeError):
+    """当前读取入口遇到不可识别的 trace 版本 → hard fail（不猜、不静默升级）。"""
+
+    def __init__(self, *, source_path: str, detected: Optional[str],
+                 detail: str = "") -> None:
+        self.source_path = source_path
+        self.detected_schema_version = detected
+        self.detail = detail
+        super().__init__(
+            f"拒绝加载 episode trace {source_path}："
+            f"schema_version={detected!r} 不受当前读取入口支持。"
+            "请用 skill3d.legacy.readers.read_legacy_episode_trace 做只读审计。"
+            + (f" 细节：{detail}" if detail else ""))

@@ -45,7 +45,7 @@ from skill3d.schemas.reconstruction import ObjectRecord
 # v3：v6 §5.6 字段改名（obj_id/category_name/det_conf）+ 新增 track_id /
 #     duplicate_suspect / pointconf_world / grounding_status → 旧缓存是 v5 口径
 #     （无 track，计数无法做 track 共识），必须失效重算。
-_INVENTORY_VERSION = "m5-inventory-4"
+_INVENTORY_VERSION = "m5-inventory-5"
 
 # `track_id` 命名空间（v6 §5.6）：不同 pass 的传播序号会重名（都从 0 起），
 # 前缀把它隔开 —— 否则 `count_objects` 的 track 去重会把两条不同对象算成一条。
@@ -72,6 +72,18 @@ _ENV_CONFIG = "SKILL3D_SAM2_CONFIG"
 _ENV_ALLOW_DOWNLOAD = "SKILL3D_ALLOW_HF_DOWNLOAD"
 
 # VSI-Bench 问题文本中的常见物体名词（确定性提示词抽取，非 VLM；VLM 路径见 docstring）
+#
+# v7 扩表（2026-09-22，真实实测根因）：旧表只有 40 条，而 VSI-Bench 问题实际点名
+# 的类别里有相当一部分不在表内 → GroundingDINO 根本不会被问到它们 → 清单缺失 →
+# **题面点名的物体解析失败**。实测 inner 档 16 道 rel_direction 有 13 道因此拿不到
+# 参照物（'power strip'/'ceiling light'/'coat rack'/'paper bag'/'exhaust fan'
+# 都不在表内），计数题里 'ceiling light'(GT=4)/'heater'(GT=2)/'bucket'(GT=2)
+# 全部返回 0。这类失败会同时打穿 rel_direction / rel_distance /
+# appearance_order / 计数 / 尺寸 / 绝对距离六类题型，是工具臂最上游的瓶颈。
+#
+# 取值口径：用**单数、小写**的规范名，且尽量与 `tools.category_match.SYNONYMS`
+# 的规范值对齐（例如问题里的 "telephone" 规范为 "phone"、"ceiling light" 规范为
+# "ceiling lamp"），这样检测器产出的标签能直接被题面匹配到。
 OBJECT_VOCABULARY: tuple[str, ...] = (
     "sofa", "couch", "chair", "table", "desk", "bed", "door", "doorway",
     "cabinet", "counter", "countertop", "stool", "shelf", "lamp", "plant",
@@ -79,6 +91,18 @@ OBJECT_VOCABULARY: tuple[str, ...] = (
     "toilet", "bathtub", "mirror", "painting", "window", "rug", "pillow",
     "box", "bottle", "cup", "bowl", "book", "bag", "basket", "trash",
     "nightstand", "dresser", "wardrobe", "bench",
+    # 注：**故意不收 `wall`/`floor`/`ceiling`** —— 它们的 mask 覆盖整个视野，
+    # 单条 SAM2 传播实测比普通物体慢一个数量级（1.4 it/s vs 13 it/s），
+    # 而 inner 档只有 2 道题提到 wall。确实需要时由**逐题补漏**按题面名词补检，
+    # 不必让每个场景都为它付传播成本。
+    # ---- v7 新增：VSI-Bench 高频点名但旧表缺失的类别 ----
+    "phone", "ceiling lamp", "suitcase", "keyboard", "mouse", "power strip",
+    "laptop", "computer", "computer tower", "printer", "whiteboard", "clock",
+    "heater", "fan", "pan", "pot", "cutting board", "bookshelf", "bookcase",
+    "coat rack", "paper bag", "backpack", "bucket", "column",
+    "pen", "tray", "water bottle", "coffee maker", "doorknob", "drawer",
+    "camera", "hanger", "shower", "board", "speaker", "projector", "blinds",
+    "curtain", "towel", "blanket", "vase",
 )
 
 # G7 刚性残差阈值（px）：观测光流与自运动预测光流之差超此值记为动态（TODO_CALIBRATE）
@@ -846,9 +870,92 @@ def _save_inventory(out_dir: Optional[str | Path], scene_name: str, key: str,
     return g7_ref
 
 
+# 基础清单的检测框上限（按检测置信度取最高的 N 条；[TODO_CALIBRATE]）。
+# 依据：M5 成本 ≈ 线性于 SAM2 传播条数（单条实测 2–25 s），未截断时单场景
+# 可达 83 条 → 单场景 25 min。截断后 24 个场景才可跑。
+# 截断**不丢题面物体**：逐题补漏会按题面名词补检（见 _bind_question_supplement）。
+MAX_BASE_DETECTIONS = 24
+
+# 单框面积占比上限：超过它的框按"场景尺度表面"处理，不进基础清单（[TODO_CALIBRATE]）。
+# 依据：这类框（wall/floor/大面积台面）的 mask 覆盖整个视野，SAM2 传播实测
+# 1.4 it/s（普通物体 13–31 it/s），是单场景耗时的主要来源；而它们几乎从不是
+# VSI-Bench 题面要点（inner 档只有 2 道题提到 wall，且都能用视觉估计作答）。
+# 需要时仍可由**逐题补漏**按题面名词补检，不受此上限约束。
+MAX_BOX_AREA_FRACTION = 0.45
+
+
+def _frame_hw(frames) -> Optional[tuple[int, int]]:
+    """探测帧的 (H, W)；取不到返回 None（此时面积过滤自动失效，不丢框）。"""
+    try:
+        a = np.asarray(frames[0])
+        return int(a.shape[0]), int(a.shape[1])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cap_detections(det, notes: list, frame_hw=None,
+                    cap: int = MAX_BASE_DETECTIONS,
+                    max_area_frac: float = MAX_BOX_AREA_FRACTION) -> list:
+    """把检测框按置信度截断到 `cap` 条（跨探测帧统一排序，保留高置信的）。
+
+    `det` 的元素是 `(frame_idx, label, box, conf)`；没有置信度时按**输入顺序**
+    截断（保证确定性，且不会因缺字段丢框）。
+    """
+    items = list(det or [])
+    if not items:
+        return items
+
+    def _conf(it):
+        # 四元组 (fi, label, box, conf) → 置信度；否则视为并列（保持原序）
+        return float(it[3]) if len(it) >= 4 and isinstance(it[3], (int, float)) else 1.0
+
+    # ① 场景尺度表面过滤：大框既慢又不是题面要点，交给逐题补漏按需补检
+    kept_idx = [i for i, it in enumerate(items)
+                if _box_area_fraction(it, frame_hw) <= max_area_frac]
+    n_dropped_area = len(items) - len(kept_idx)
+    if not kept_idx:                       # 全是超大框 → 不能清空，退回原集合
+        kept_idx = list(range(len(items)))
+        n_dropped_area = 0
+    items = [items[i] for i in kept_idx]
+
+    # ② 按置信度截断
+    if len(items) <= cap:
+        out = items
+    elif any(len(it) >= 4 and isinstance(it[3], (int, float)) for it in items):
+        order = sorted(range(len(items)), key=lambda i: (-_conf(items[i]), i))
+        out = [items[i] for i in sorted(order[:cap])]
+    else:
+        out = items[:cap]
+
+    notes.append(f"M5 检测框过滤 {len(kept_idx) + n_dropped_area} → {len(out)} 条"
+                 f"（先按面积占比 ≤{max_area_frac} 丢掉 {n_dropped_area} 个场景尺度"
+                 f"表面，再按置信度截断到 MAX_BASE_DETECTIONS={cap}；"
+                 "题面点名的物体由逐题补漏按需补检）")
+    return out
+
+
+def _box_area_fraction(item, frame_hw) -> float:
+    """框面积占整帧比例（无法判断时返回 0，即"不丢框"）。"""
+    if not frame_hw:
+        return 0.0
+    try:
+        h, w = float(frame_hw[0]), float(frame_hw[1])
+        box = item[2]
+        x0, y0, x1, y1 = (float(v) for v in box[:4])
+    except Exception:  # noqa: BLE001 - 结构不符即不参与过滤
+        return 0.0
+    if h <= 0 or w <= 0:
+        return 0.0
+    return max(0.0, (x1 - x0)) * max(0.0, (y1 - y0)) / (h * w)
+
+
 def _detector_boxes(frames: Sequence[np.ndarray], probe: Sequence[int],
-                    text_prompt: str, notes: list[str]) -> list[tuple[int, str, list[float]]]:
-    """检测器探测（**失败要出声**）：返回 `(frame_idx, label, box)` 列表。
+                    text_prompt: str, notes: list[str]) -> list[tuple[int, str, list[float], float]]:
+    """检测器探测（**失败要出声**）：返回 `(frame_idx, label, box, conf)` 列表。
+
+    置信度随框一起返回：基础清单要按它截断（`_cap_detections`），
+    否则无法在"保留最有把握的物体"和"控制 SAM2 传播成本"之间做取舍。
+    
 
     历史缺陷（2026-09-21 实测）：`ovd.detect` 在服务不可用/超时时**静默返回 `[]`**，
     调用方只在"新增了框"时才记 note → 检测器整段不可用时对象清单悄悄退化成
@@ -860,13 +967,16 @@ def _detector_boxes(frames: Sequence[np.ndarray], probe: Sequence[int],
 
     if not ovd.available() or not text_prompt:
         return []
-    out: list[tuple[int, str, list[float]]] = []
+    out: list[tuple[int, str, list[float], float]] = []
     for attempt in (1, 2):
         out = []
         for fi in probe:
             for d in ovd.detect(frames[fi], text_prompt):
                 x0, y0, x1, y1 = d.bbox_xyxy
-                out.append((int(fi), d.label or "object", [x0, y0, x1, y1]))
+                out.append((int(fi), d.label or "object", [x0, y0, x1, y1],
+                            # 缺 confidence 的检测器实现（含测试替身）按并列处理，
+                            # 不因此丢框 —— 置信度只用于截断排序，不是硬前提
+                            float(getattr(d, "confidence", 1.0))))
         if out:
             if attempt > 1:
                 notes.append("M5 检测器首次整轮零检测 → 重试后恢复")
@@ -941,7 +1051,11 @@ def bind_objects_for_scene(
     n_frames = len(frames)
     # 4 个时间均匀探测帧（D-1）：单帧常常看不到目标物（实测同一视频帧 8/31 有桌子、
     # 帧 0/16/24 没有）。
-    probe = sorted({0, n_frames // 3, 2 * n_frames // 3, n_frames - 1}) if n_frames else []
+    # v7 成本控制：探测帧从 4 帧降到 2 帧（首帧 + 中帧）。
+    # 依据：单次检测服务调用实测 **42–59 s**（GroundingDINO，82 类词表），
+    # 4 帧 × 24 场景 = 67 min 只是基础检测。2 帧仍能给每帧 ~14 个检出，
+    # 基础清单足够；题面点名的物体由逐题补漏单独保证（见那条路径的成本优化）。
+    probe = sorted({0, n_frames // 2}) if n_frames else []
     key = _inventory_key(scene_name, frame_set_hash, depth_maps, n_frames)
 
     objects: list[ObjectRecord] = []
@@ -974,13 +1088,20 @@ def bind_objects_for_scene(
                              f"（{sorted(set(inv_hints))[:8]}）")
         text_prompt = ovd_prompt_full_vocabulary()
         det = _detector_boxes(frames, probe, text_prompt, notes)
-        for (fi, label, b) in det:
+        # v7 成本控制：基础清单按检测置信度**截断**。
+        # 为什么安全：M5 的成本几乎线性于 SAM2 传播条数（实测单条 2–25 s），
+        # 而未截断时一个场景可达 80+ 条 → 单场景 25 min，24 个场景不可接受。
+        # 截断不会漏掉题目要用的物体：**逐题补漏**（`_bind_question_supplement`）
+        # 会按题面名词再用确定性检测器补检一次，那是"按需付费"。
+        det = _cap_detections(det, notes, _frame_hw(frames))
+        for (fi, label, b, _conf) in det:
             hints.append(label)
             boxes.append(b)
             prompt_list.append((fi, len(prompt_list), b))
         if det:
             notes.append(f"M5 检测器（全词表 {len(OBJECT_VOCABULARY)} 类）在 {len(probe)} 个"
-                         f"探测帧给出 {len(det)} 个框（{sorted(set(h for _, h, _ in det))[:8]}）")
+                         f"探测帧给出 {len(det)} 个框"
+                         f"（{sorted(set(h for _, h, _b, _c in det))[:8]}）")
         if not boxes:
             h_hints, h_boxes = object_prompts_from_handle(handle)
             if h_boxes:
@@ -1103,8 +1224,10 @@ def _vlm_inventory_pass(frames: Sequence[np.ndarray], probe: Sequence[int], vlm_
     boxes: list[list[float]] = []
     used: list[int] = []
     for fi in probe:
+        # 目标数下调（12 → 8，v7 成本控制）：基础清单只需覆盖"常见物体"，
+        # 题面点名的物体由逐题补漏保证；成本随框数线性增长。
         h, b = box_prompts_from_vlm(frames, _GENERIC_INVENTORY_QUESTION, vlm_client,
-                                    frame_idx=fi, max_objects=12, seed=seed)
+                                    frame_idx=fi, max_objects=8, seed=seed)
         for hi, bi in zip(h, b):
             hints.append(hi)
             boxes.append(bi)
@@ -1155,6 +1278,49 @@ def question_object_names_from_vlm(question: str, client, *,
     return out[:max_names]
 
 
+def ovd_boxes_for_nouns(frames: Sequence[np.ndarray], probe: Sequence[int],
+                        nouns: Sequence[str], *,
+                        box_threshold: Optional[float] = None
+                        ) -> tuple[list[str], list[list[float]],
+                                   list[tuple[int, int, list[float]]]]:
+    """用**确定性检测器**（GroundingDINO）按给定名词在探测帧上定位。
+
+    为什么必须有这条路（2026-09-22 真实实测，根因）：逐题补漏此前**只**走
+    `box_prompts_from_vlm`，而本模块 `open_vocab_detector` 的文件头已记录该 8B 模型
+    "纯文本列举能说出物体名，一旦要求输出 0–1000 JSON bbox 就返回 `[]`"。
+    后果实测：inner 档 16 道 rel_direction 里 **13 道**因为题面点名的参照物
+    （power strip / ceiling light / coat rack / paper bag / exhaust fan）
+    没能进清单而整题作废；计数题里 ceiling light(GT=4)、heater(GT=2)、
+    bucket(GT=2) 全部返回 0。检测器是确定性的、且本就以"问题名词"为输入，
+    用它做补漏比让 VLM 吐框可靠得多。
+
+    返回 `(class_hints, boxes, prompt_list)`；`boxes` 是**像素**框
+    （与 `box_prompts_from_vlm` 的返回口径一致），`prompt_list` 为
+    `(frame_idx, box_index, box)` 三元组，供 SAM2 逐帧提示。
+    """
+    from skill3d.segmentation import open_vocab_detector as ovd
+
+    hints: list[str] = []
+    boxes: list[list[float]] = []
+    prompt_list: list[tuple[int, int, list[float]]] = []
+    prompt = ovd_prompt_from_nouns(nouns)
+    if not prompt or not ovd.available():
+        return hints, boxes, prompt_list
+    thr = (ovd.DEFAULT_BOX_THRESHOLD if box_threshold is None else float(box_threshold))
+    for fi in probe:
+        idx = int(fi)
+        if idx < 0 or idx >= len(frames):
+            continue
+        for d in ovd.detect(frames[idx], prompt, box_threshold=thr):
+            box = [float(v) for v in d.bbox_xyxy]
+            if box[2] - box[0] < 2 or box[3] - box[1] < 2:
+                continue
+            hints.append(normalize_hint(d.label))
+            boxes.append(box)
+            prompt_list.append((idx, len(prompt_list), box))
+    return hints, boxes, prompt_list
+
+
 def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w_list,
                               intrinsics, *, grid_transform, out_dir, scene_name,
                               predictor, vlm_client, handle, seed: Optional[int] = None,
@@ -1176,18 +1342,49 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
     # ① 定向：先把题面点名的物体抽出来，再逐探测帧"只找这些物体"
     #    （通用问法提示实测会漏掉题目要用的目标物 → 程序只能 abstain）
     named = question_object_names_from_vlm(question, vlm_client, seed=seed)
+    if not named:
+        # VLM 不可用 → 退回确定性词表抽取（够用作检测器提示）
+        named = object_prompts_from_question(question)
+    # v7 成本控制（关键）：题面点名的物体**已经全在清单里** → 直接跳过检测。
+    # 依据：一次检测服务调用实测 42–59 s，而绝大多数题目的物体在场景基础清单里
+    # 已经有了（v6 的补漏是"先检测再判重"，等于每次都白付一次最贵的调用）。
+    # 语义不变：只有"确实缺物体"时才去检测，`all_present=True` 的申报口径与原来一致。
+    if named and existing:
+        from skill3d.tools.category_match import matches
+
+        def _present(n: str) -> bool:
+            return any(matches(n, str(getattr(o, "category_name", "") or ""))
+                       for o in existing)
+        if all(_present(n) for n in named):
+            return [], {"grounding": {"attempted": True, "n_boxes": 0, "n_new": 0,
+                                      "all_present": True, "skipped_detection": True}}, (
+                f"M5 逐题补漏：题面物体 {named} 均已在场景清单中（跳过检测调用）")
+        # 只对**确实缺的**名词做检测：检测耗时随类目数增长，而已经绑好的物体
+        # 不需要再检一遍（语义不变，检出后仍会按质心判重，不会重复绑定）。
+        missing_names = [n for n in named if not _present(n)]
+        if missing_names:
+            named = missing_names
     if named:
-        ask = ("请在这张室内照片中定位以下物体（能看到几个就报几个，看不到的不要报）："
-               + "、".join(named)
-               + '。严格只输出 JSON 数组：[{"name": "物体名", "bbox": [x0,y0,x1,y1]}]，'
-                 "坐标用 0-1000 归一化整数；若一个都看不到，输出 []。不要解释。")
-        for fi in probe:
-            f_hints, f_boxes = box_prompts_from_vlm(frames, ask, vlm_client,
-                                                    frame_idx=fi, max_objects=8, seed=seed)
-            for h, b in zip(f_hints, f_boxes):
-                hints.append(h)
-                boxes.append(b)
-                prompt_list.append((int(fi), len(prompt_list), b))
+        # ①-a 确定性检测器（首选）：GroundingDINO 的定位是可靠的，
+        #     且直接吃"问题名词"，正是补漏需要的输入。
+        ovd_hints, ovd_boxes, ovd_prompt = ovd_boxes_for_nouns(frames, probe, named)
+        if ovd_boxes:
+            hints.extend(ovd_hints)
+            boxes.extend(ovd_boxes)
+            prompt_list.extend(ovd_prompt)
+        # ①-b VLM 框（次选）：仅在检测器没给出任何框时尝试（定位不稳，见模块头）
+        if not boxes:
+            ask = ("请在这张室内照片中定位以下物体（能看到几个就报几个，看不到的不要报）："
+                   + "、".join(named)
+                   + '。严格只输出 JSON 数组：[{"name": "物体名", "bbox": [x0,y0,x1,y1]}]，'
+                     "坐标用 0-1000 归一化整数；若一个都看不到，输出 []。不要解释。")
+            for fi in probe:
+                f_hints, f_boxes = box_prompts_from_vlm(frames, ask, vlm_client,
+                                                        frame_idx=fi, max_objects=8, seed=seed)
+                for h, b in zip(f_hints, f_boxes):
+                    hints.append(h)
+                    boxes.append(b)
+                    prompt_list.append((int(fi), len(prompt_list), b))
     # ② 兜底：定向提示没抽到名字/没给框时，退回原来的"与问题相关"通用提示
     if not boxes:
         for fi in probe:

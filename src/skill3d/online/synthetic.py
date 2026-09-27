@@ -1025,6 +1025,7 @@ def synthetic_m5_summary(geometry: SyntheticGeometry) -> M5EvidenceSummary:
     它只影响 mock 管道的 Tool 可见性，**不构成任何检测/跟踪能力的证据**。
     """
     return M5EvidenceSummary(
+        m5_ran=True,          # §6.1：合成路径同样"运行过 M5"（真值是构造的，不是检测）
         detection_fault=False,
         n_objects=len(geometry.objects),
         n_tracks=len(geometry.objects),

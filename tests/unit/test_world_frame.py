@@ -175,16 +175,23 @@ def test_flip_pose_bundle_about_horizontal_axis_flips_direction_answer():
     assert ans_up != ans_a
 
 
-def test_front_behind_are_invariant_under_world_flip_but_lateral_swaps():
-    """世界倒置只互换左右：front/behind 不受影响（判据与手性/上方向无关）。"""
+def test_front_back_are_invariant_under_world_flip_while_lateral_swaps():
+    """世界倒置只互换左右：前后分区不受影响（判据与手性/上方向无关）。
+
+    v7 §9.3：`front`/`back` 只在 **hard** 四象限模板里作为前缀出现；
+    medium 模板的选项集合是 left/right/back，故这里用 hard 断言前后分区。
+    """
     upright, flipped = _level_bundle(8), [_rot180_world_x(c) for c in _level_bundle(8)]
     u1 = estimate_world_frame(upright).world_up
     u2 = estimate_world_frame(flipped).world_up
     args = ((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
-    assert direction_of(*args, (0.0, 0.0, 2.0), u1) == "front"
-    assert direction_of(*args, (0.0, 0.0, 2.0), u2) == "front"
-    assert direction_of(*args, (0.0, 0.0, -2.0), u1) == "behind"
-    assert direction_of(*args, (0.0, 0.0, -2.0), u2) == "behind"
+    for u in (u1, u2):
+        assert direction_of(*args, (0.0, 0.0, 2.0), u, difficulty="hard").startswith("front")
+        assert direction_of(*args, (0.0, 0.0, -2.0), u, difficulty="hard").startswith("back")
+        # medium：正前（0°）判左右（左右未定义 → 只要求落在合法选项内且确定）、
+        # 正后（180°）判 back —— 与模板选项集合一致
+        assert direction_of(*args, (0.0, 0.0, 2.0), u, difficulty="medium") in ("left", "right")
+        assert direction_of(*args, (0.0, 0.0, -2.0), u, difficulty="medium") == "back"
 
 
 # ------------------------------------------------------------- 3. 退化输入处理 ----
@@ -319,9 +326,12 @@ def test_left_handed_world_frame_swaps_left_and_right():
     args = ((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (2.0, 0.0, 0.0))
     assert direction_of(*args, u, handedness="right") == "right"
     assert direction_of(*args, u, handedness="left") == "left"
-    # front/behind 与手性无关
+    # 前后分区与手性无关（hard 模板下看 front-/back- 前缀）
     assert direction_of((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 0.0, 3.0), u,
-                        handedness="left") == "front"
+                        handedness="left", difficulty="hard").startswith("front-")
+    # medium 只有三个选项：正前（0°）落进左右，绝不能返回 "front"
+    assert direction_of((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 0.0, 3.0), u,
+                        handedness="left", difficulty="medium") in ("left", "right")
 
 
 @pytest.mark.parametrize("bad_up", [
@@ -332,6 +342,26 @@ def test_direction_of_fails_closed_on_bad_world_up(bad_up):
     """world_up 缺失/非有限/非单位 → 抛 ValueError（§9.8：不退回无符号启发式）。"""
     with pytest.raises(ValueError):
         direction_of((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (2.0, 0.0, 0.0), bad_up)
+
+
+def test_direction_of_accepts_case_insensitive_difficulty():
+    """难度大小写不敏感（模型常写 "Medium"）：归一化后正常求解。"""
+    assert direction_of((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (2.0, 0.0, 0.0),
+                        [0.0, 1.0, 0.0], difficulty="Medium") == "left"
+    assert direction_of((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (2.0, 0.0, 0.0),
+                        [0.0, 1.0, 0.0], difficulty="  HARD ") == "back-left"
+
+
+@pytest.mark.parametrize("bad_diff", [None, "", "impossible", 1, "easyy", "medium-ish"])
+def test_direction_of_fails_closed_on_unknown_difficulty(bad_diff):
+    """难度未知 → 抛 ValueError（§9.3：选项集合由难度决定，缺它就只能猜）。
+
+    大小写不敏感是**有意**的（`"Medium"` 归一为 `medium`，模型常写成大写）；
+    真正的未知取值仍然 fail-closed。
+    """
+    with pytest.raises(ValueError):
+        direction_of((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (2.0, 0.0, 0.0),
+                     [0.0, 1.0, 0.0], difficulty=bad_diff)
 
 
 @pytest.mark.parametrize("bad_hand", [None, "Right", "RIGHT", "unknown", 1, "", "left_handed"])

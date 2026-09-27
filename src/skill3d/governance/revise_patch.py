@@ -107,6 +107,14 @@ def new_revision_from_patch(current: CandidateRevision, patch: GPT6Patch) -> Can
         evidence_lineage_ref=current.evidence_lineage_ref,
         created_by=CREATED_BY_OFFLINE_REVISION,  # type: ignore[arg-type]
         created_at=datetime.now(timezone.utc).isoformat(),
+        source_split=current.source_split,
+        experience_relation=current.experience_relation,
+        source_path=current.source_path,
+        source_sha256=current.source_sha256,
+        generated_spec_path=current.generated_spec_path,
+        generated_sha256=current.generated_sha256,
+        manifest_ref=current.manifest_ref,
+        candidate_record_ref=current.candidate_record_ref,
     )
 
 

@@ -50,7 +50,7 @@ def test_blurred_frames_marked_degraded():
     bad_ids = [3, 7, 11]
     for i in bad_ids:
         frames[i] = _blurred_frame(seed=i)
-    verdict = input_gate(frames)
+    verdict = input_gate(frames, diagnostics=True)
     for i in bad_ids:
         assert i in verdict.degraded_frame_ids
     # 3/32 未超 TH_DEGRADED_RATIO → 仍 pass
@@ -67,7 +67,7 @@ def test_locally_degraded_only_flags_and_downweights():
     frames = [_mk_input_frame(blur=500.0) for _ in range(MIN_FRAMES)]
     for i in range(0, 16):  # 50% 劣化
         frames[i] = _mk_input_frame(blur=10.0)
-    verdict = input_gate(frames)
+    verdict = input_gate(frames, diagnostics=True)
     assert verdict.level == "locally_degraded"
     assert verdict.action == "proceed"
     assert len(verdict.degraded_frame_ids) == 16
@@ -79,34 +79,52 @@ def test_locally_degraded_only_flags_and_downweights():
 def test_all_degraded_still_proceeds_with_low_weight():
     """全帧劣化也**不是** hard fail：只降权（输入合法性才是唯一 hard fail 通道）。"""
     frames = [_mk_input_frame(blur=1.0) for _ in range(MIN_FRAMES)]
-    verdict = input_gate(frames)
+    verdict = input_gate(frames, diagnostics=True)
     assert verdict.level == "locally_degraded"
     assert verdict.action == "proceed"
     assert verdict.quality_weight == pytest.approx(0.5)
     assert len(verdict.degraded_frame_ids) == MIN_FRAMES
 
 
-def test_illegal_frames_are_hard_fail():
-    """输入合法性（空帧 / 尺寸非法）→ overall_unusable + unanswerable（§4 M2）。"""
+def test_partial_illegal_frames_proceed_as_input_degraded():
+    """v9 §5.2：**部分**帧无法解码 → 保留帧身份、用可读帧继续作答。
+
+    规范把"全部缺失或无法解码"与"部分帧无法解码"分开处理：前者 `input_error`，
+    后者继续作答并标 `input_degraded`（独立报告，不从分母静默删除）。非法帧仍逐条
+    记在 `hard_fail_frame_ids` 里，不静默丢弃。
+    """
     frames = [np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(MIN_FRAMES)]
     frames[7] = np.zeros((0, 0, 3), dtype=np.uint8)      # 空帧
-    verdict = input_gate(frames)
+    verdict = input_gate(frames, diagnostics=True)
+    assert verdict.action == "proceed"
+    assert "input_degraded" in verdict.degradation_flags
+    assert 7 in verdict.hard_fail_frame_ids, "非法帧必须留痕，不静默丢弃"
+
+
+def test_all_illegal_frames_are_input_error():
+    """v9 §5.2：**全部**指定图像缺失或无法解码 → `input_error`（不生成伪答案）。"""
+    frames = [np.zeros((0, 0, 3), dtype=np.uint8) for _ in range(MIN_FRAMES)]
+    verdict = input_gate(frames, diagnostics=True)
     assert verdict.level == "overall_unusable"
     assert verdict.action == "unanswerable"
-    assert 7 in verdict.hard_fail_frame_ids
 
 
-def test_insufficient_frames_unanswerable():
-    """G4 帧数不足 32 → 输入合法性 hard fail（§10 G4）。"""
+def test_insufficient_frames_proceed_as_input_degraded():
+    """v9 §5.2：源视频不足 32 帧但仍有可读帧 → 继续作答并标 `input_degraded`。
+
+    此前这里要求 `unanswerable`（硬约束 21）；按 v9 改为继续，但**不得**伪称完整
+    32 帧输入 —— 降级标记就是这条不伪称的实现。
+    """
     frames = [_mk_input_frame(blur=500.0) for _ in range(MIN_FRAMES - 1)]
-    verdict = input_gate(frames)
-    assert verdict.level == "overall_unusable"
-    assert verdict.action == "unanswerable"
+    verdict = input_gate(frames, diagnostics=True)
+    assert verdict.action == "proceed"
+    assert "input_degraded" in verdict.degradation_flags
+    assert verdict.n_frames == MIN_FRAMES - 1, "帧数如实记录，不伪称 32"
 
 
 def test_overexposed_frame_degraded():
     """曝光异常帧（p_over>5%）被标 degraded（§10 G2）。"""
     frames = [_mk_input_frame(blur=500.0) for _ in range(MIN_FRAMES)]
     frames[5] = _mk_input_frame(blur=500.0, p_over=0.2)
-    verdict = input_gate(frames)
+    verdict = input_gate(frames, diagnostics=True)
     assert 5 in verdict.degraded_frame_ids

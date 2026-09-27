@@ -412,3 +412,82 @@ _ERROR_CODE_BY_CLASS: Mapping[str, str] = {
     "domain_value": "domain_value",
     "answer_already_given": "answer_already_given",
 }
+
+
+# --------------------------------------------------- §6.4 单一授权判定函数 ----
+
+def authorize_tool_call(
+    tool: str,
+    spec,
+    *,
+    scope: str = "",
+    profile: Optional[EvidenceProfile] = None,
+    available_artifacts: Iterable[str] = (),
+    gate: Optional[object] = None,
+    supported_metric_tasks: Sequence[str] = (),
+    allowed_metric_tasks: Iterable[str] = (),
+    question_type: str = "",
+    args: Optional[dict] = None,
+    tools_enabled: bool = True,
+) -> "AuthorizationDecision":
+    """§6.4：**唯一**的授权判定函数，产出结构化决策（允许与否 + 原因码）。
+
+    它按既有顺序执行与执行期相同的检查（作用域 → 证据 → 米制题级 → 产物），
+    但**不抛异常**，而是把失败折成 `reason_codes`。调用方据此生成
+    `ToolAuthorizationReceipt`，再决定是否把异常抛给生成程序 —— 因此"收据"与
+    "实际是否放行"必然同源，不会出现事后拼凑的通过凭据。
+
+    §6.4：实参涉及的具体对象仍需执行前检查 —— 对象绑定失败（`domain_value`）
+    同样进原因码，而不是只报"工具不可见"。
+    """
+    from skill3d.schemas.authorization import AuthorizationDecision, gate_result_payload
+
+    gate_payload, gate_applicable = gate_result_payload(gate)
+    metric_required = ARTIFACT_SCALE in set(
+        getattr(spec, "requires_artifacts", None) or []) or (
+        ARTIFACT_SCALE in (getattr(spec, "requires_evidence", None) or []))
+    deps = sorted(set(getattr(spec, "requires_artifacts", None) or []) |
+                  set(getattr(spec, "requires_evidence", None) or []))
+    reasons: list[str] = []
+    missing: list[str] = []
+
+    if not tools_enabled:
+        reasons.append("tools_disabled")
+
+    if scope and not scope_allows(spec, scope):
+        reasons.append("scope_denied")
+
+    if not evidence_visible(spec, profile):
+        reasons.append("tool_contract")
+        for cap in (getattr(spec, "requires_evidence", None) or []):
+            if cap not in CAPABILITIES:
+                missing.append(f"{cap}(未知能力)")
+            elif profile is None:
+                missing.append(f"{cap}(无证据画像)")
+            elif profile.state(cap) == "unavailable":
+                missing.append(f"{cap}(unavailable)")
+            elif profile.state(cap) == "degraded" and cap not in set(
+                    getattr(spec, "tolerates_degraded", None) or []):
+                missing.append(f"{cap}(degraded 且不容忍)")
+
+    need = set(getattr(spec, "requires_artifacts", None) or [])
+    absent = sorted(need - set(available_artifacts))
+    if absent:
+        reasons.append("tool_contract")
+        missing.extend(f"{a}(产物缺失)" for a in absent)
+
+    if metric_required and supported_metric_tasks and allowed_metric_tasks:
+        allowed = set(allowed_metric_tasks)
+        if not (set(supported_metric_tasks) & allowed):
+            reasons.append("confidence_gate")
+
+    allowed = not reasons
+    return AuthorizationDecision(
+        allowed=allowed,
+        reason_codes=sorted(set(reasons)) if not allowed else ["allowed"],
+        dependency_refs=deps,
+        missing_refs=sorted(set(missing)),
+        metric_gate_result=(gate_payload if metric_required
+                            else {"status": "not_applicable", "gate_passed": None}),
+        metric_gate_applicable=bool(metric_required and gate_applicable),
+    )

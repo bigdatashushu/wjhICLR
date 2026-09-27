@@ -20,17 +20,39 @@ DEFAULT_CONFIG = "configs/config.yaml"
 _FALLBACK: dict[str, Any] = {
     "mode": "online",
     "seed": 0,
+    "max_solver_rounds": 6,
+    "max_retries_per_operation": 3,
+    "finalization_rounds": 1,
+    "max_evolution_rounds": 2,
+    "candidate_validation_seeds": [0, 1],
     "paths": {
         "data_root": "data",
         "vsi_bench_meta": "data/vsi_bench_meta",
         "raw_videos": "data/raw_videos",
+        "raw_video_fallbacks": [],
         "reconstructions": "data/reconstructions",
         "trace_store": "data/traces",
         "memory_db": "data/memory_lancedb",
-        "skill_registry": "data/skill_registry",
-        "active_snapshot": "data/active_snapshot.json",
+        "skill_library": "skill_library",
+        "skill_registry": "skill_library/snapshots",
+        "active_snapshot": "skill_library/snapshots/active_snapshot.json",
     },
     "frame_sampling": {"n_frames": 32, "strategy": "uniform"},
+    # v9 §13.5 检索策略缺省（与 configs/config.yaml 的 `retrieval:` 段一致）。
+    # 缺键时用默认值跑，但检索记录里的 `config_source` 会记 "default" ——
+    # 缺省值不会被冒充成"已冻结配置"。
+    "retrieval": {
+        "config_version": "ret-v9-1",
+        "top_k": 3,
+        "rerank": True,
+        "candidates": 50,
+        "rank_weights": {
+            "semantic": 1.0,
+            "keyword": 1.0,
+            "semantic_mix_keyword": 0.0,
+        },
+        "method_context_max_chars": 8000,
+    },
     "vllm": {
         "model": "Qwen/Qwen3-VL-8B-Instruct-FP8",
         "quantization": "none",
@@ -53,6 +75,8 @@ _FALLBACK: dict[str, Any] = {
         "cell_timeout_s": 120,
         "max_regenerate": 3,
     },
+    # v9 §9.4 主动图像布局（缺键时的默认，与 configs/config.yaml 一致）
+    "active_vision": {"layout": "derived_plus_originals_v1", "max_derived_images": 8},
     "split_config": "configs/vsi_bench_split.yaml",
     "admission_thresholds": "configs/admission_thresholds.yaml",
     # v6 §20：v4/v5 的 `scale` 段（冻结 conformal 校准器 / 标定池 / 逐题型授权校准）
@@ -123,11 +147,15 @@ class PathSettings:
     data_root: str = "data"
     vsi_bench_meta: str = "data/vsi_bench_meta"
     raw_videos: str = "data/raw_videos"
+    # §5.2"可重试加载"的来源副本根（用户 2026-09-27 裁定：重试 = 换来源/换副本）。
+    # 缺省空 = 只尝试主目录里的同名副本，不隐式启用任何镜像。
+    raw_video_fallbacks: list[str] = field(default_factory=list)
     reconstructions: str = "data/reconstructions"
     trace_store: str = "data/traces"
     memory_db: str = "data/memory_lancedb"
-    skill_registry: str = "data/skill_registry"
-    active_snapshot: str = "data/active_snapshot.json"
+    skill_library: str = "skill_library"
+    skill_registry: str = "skill_library/snapshots"
+    active_snapshot: str = "skill_library/snapshots/active_snapshot.json"
 
 
 @dataclass
@@ -156,3 +184,28 @@ def vllm_from(cfg: dict) -> VLLMSettings:
 
 def sandbox_from(cfg: dict) -> SandboxSettings:
     return SandboxSettings(**(cfg.get("sandbox") or {}))
+
+
+@dataclass
+class ActiveVisionSettings:
+    """§9.4 主动图像的声明布局（图像上限内怎么装图）。"""
+
+    layout: str = "derived_plus_originals_v1"
+    max_derived_images: int = 8
+
+
+def active_vision_from(cfg: dict) -> ActiveVisionSettings:
+    data = dict((cfg or {}).get("active_vision") or {})
+    return ActiveVisionSettings(
+        layout=str(data.get("layout", "derived_plus_originals_v1")),
+        max_derived_images=int(data.get("max_derived_images", 8)))
+
+
+def retrieval_policy_from(cfg: dict):
+    """§13.5：读冻结的检索策略（top-k／排序权重／方法上下文上限）。
+
+    唯一读取点是这里 —— 检索策略不得在运行期按题/按场景临时构造。
+    """
+    from skill3d.routing.retrieval_policy import retrieval_policy_from_config
+
+    return retrieval_policy_from_config(cfg)

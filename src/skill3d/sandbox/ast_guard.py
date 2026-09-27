@@ -30,7 +30,14 @@ from skill3d.tools.registry import REGISTRY
 ALLOWED_MODULES = frozenset({"numpy", "scipy", "math", "statistics"})
 
 # 保留名：禁止 program 重赋值（§4 M10 字段 5）
-RESERVED_NAMES = frozenset({"show", "ReturnAnswer", "tools", "scene", "frames"})
+RESERVED_NAMES = frozenset(
+    {"show", "ReturnAnswer", "YieldObservations", "AnswerPayload", "tools", "scene",
+     "frames"})
+
+# 控制接口与答案合同构造器（§10.1/§10.2）：不属 Tool 面，不受证据门过滤。
+# `AnswerPayload` 必须在这里 —— 否则 §10.2 的规范示例
+# `ReturnAnswer(AnswerPayload(...))` 会被静态检查判为"未定义函数调用"而拒掉。
+CONTROL_INTERFACE_NAMES = frozenset({"ReturnAnswer", "YieldObservations", "AnswerPayload"})
 
 # 禁止调用的内建/危险函数名
 FORBIDDEN_CALLS = frozenset(
@@ -93,47 +100,10 @@ class _WhiteListVisitor(ast.NodeVisitor):
         self.tool_calls: list[str] = []
         self.local_defs: Set[str] = set()
         self.imported_names: Set[str] = set()
-        # §15.1 静态层：**顶层** ReturnAnswer 之后不得再出现 Tool 调用
-        self._answer_given_at: Optional[int] = None
-        # 块嵌套深度：ReturnAnswer 在分支/循环里给出**不算**"答后再算"
+        # 块嵌套深度（仅用于把"函数体内定义"与模块顶层区分开）
         self._block_depth: int = 0
 
-    def _check_answer_ordering(self, node: ast.AST, tool_name: str) -> None:
-        """`ReturnAnswer` 之后再调 Tool → 违规（**仅顶层同层判定**）。
-
-        2026-09-21 真实实测（32 题 inner_validation，arm3）：原先按"行号先后"
-        无条件判定，把模型最自然的**防御式写法**整片拒掉：
-
-        ```python
-        objs = list_objects('telephone')
-        if not objs:
-            ReturnAnswer("abstain")     # 在 if 分支里
-        phone_id = objs[0]['obj_id']
-        objs = list_objects('trash can')  # 被判成"答后调 Tool"
-        ```
-
-        实测后果：16/32 episode 在 M9 被拒 → 三次重生成都写同一风格 → FSM 转
-        `unanswerable` → 4 个方向题、计数题等**全部零分**，而这正是 D7 要修的
-        "内测方向题全栽在这里"。把 §15.1 的原意（防止 ReturnAnswer 之后继续跑
-        Tool 导致 IndexError 崩成假服务故障）实现成"无条件按行号拒绝"是过度收窄。
-
-        现在的判据（保守但不过度）：
-        - 只有 **模块顶层同一层**（`_block_depth == 0`）先 `ReturnAnswer` 后调
-          Tool 才报违规 —— 那才是"答完还继续算"的真反例；
-        - ReturnAnswer 在 `if`/`for`/`while`/`try`/函数体内时，是否真的"答后调
-          Tool"由**运行层** `AnswerAlreadyGiven` 精确判定（§15.1 双层设计的本意）。
-        """
-        if self._answer_given_at is None or self._block_depth > 0:
-            return
-        line = getattr(node, "lineno", 0)
-        if line and line > self._answer_given_at:
-            self.violations.append(
-                f"禁止在 ReturnAnswer 之后再调用 Tool: {tool_name}"
-                f"（第 {line} 行 > 顶层 ReturnAnswer 第 {self._answer_given_at} 行；"
-                "§15.1 静态层。若本意是「某个前提不成立才 abstain」，"
-                "请把 ReturnAnswer 放进 if 分支里）")
-
-    # ---- 块深度维护（判断 ReturnAnswer 是否在分支/循环/函数体内）----
+    # ---- 块深度维护（判断调用是否在分支/循环/函数体内）----
     def _visit_block(self, node: ast.AST) -> None:
         self._block_depth += 1
         try:
@@ -179,13 +149,14 @@ class _WhiteListVisitor(ast.NodeVisitor):
             if name in FORBIDDEN_CALLS:
                 self.violations.append(f"禁止调用危险函数: {name}")
             elif name in self.allowed_tools:
-                self._check_answer_ordering(node, name)
                 self.tool_calls.append(name)
-            elif name == "ReturnAnswer":
-                # 记录**顶层**"答案已给"的行号；分支里的 ReturnAnswer 不参与静态判定
-                # （§15.1：保留记录/反作弊语义，不做中止语义）
-                if self._answer_given_at is None and self._block_depth == 0:
-                    self._answer_given_at = getattr(node, "lineno", 0)
+            elif name in CONTROL_INTERFACE_NAMES:
+                # v7 §10.2：控制接口是 host 实现的终结操作，运行层（kernel 抛
+                # ControlTerminate）确定性保证"提交/让出后不再继续"，因此静态层
+                # 不再需要"答后调 Tool"的行号顺序检查。
+                # v9 §10.1：`AnswerPayload` 是答案合同构造器（纯数据），同样放行 ——
+                # 否则规范自己的 `ReturnAnswer(AnswerPayload(...))` 示例会被拒。
+                pass
             elif name == "show":
                 pass  # 保留名回调允许调用（仅禁止重赋值）
             elif name in SAFE_BUILTINS or name in self.local_defs or name in self.imported_names:
@@ -199,7 +170,6 @@ class _WhiteListVisitor(ast.NodeVisitor):
                 self.violations.append(f"禁止调用危险方法: .{func.attr}")
             elif isinstance(func.value, ast.Name) and func.value.id == "tools":
                 if func.attr in self.allowed_tools:
-                    self._check_answer_ordering(node, func.attr)
                     self.tool_calls.append(func.attr)
                 else:
                     self.violations.append(f"tools 命名空间内未知 Tool: {func.attr}")
@@ -243,6 +213,54 @@ class _WhiteListVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+class _TopLevelReturnFinder(ast.NodeVisitor):
+    """在**函数体之外**寻找 `return`（不进入函数/lambda 体）。
+
+    注意：`ast.parse` 在 Python 3.11 上**接受**模块顶层的 `return`
+    （"return outside function" 是 `compile()` 阶段才报的 SyntaxError），
+    所以不能靠 `except SyntaxError` 判断，必须走 AST。
+    """
+
+    def __init__(self) -> None:
+        self.found = False
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:      # 不深入函数体
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_Return(self, node: ast.Return) -> None:
+        self.found = True
+
+
+def normalize_program_source(code: str) -> str:
+    """把**顶层 `return`** 包进函数体，使两种推荐写法都能通过（v7 §10.2）。
+
+    v7 推荐 `def solve(ctx): ... return ReturnAnswer(...)`，但实测模型也经常直接
+    写**顶层** `return ReturnAnswer(...)`。那在 Python 里无法 `compile`
+    （"return outside function"），会让一个本来正确的程序整题作废 —— 纯属接口损失。
+
+    仅当模块顶层（函数体之外）真的出现 `return` 时才包装；包装后的函数体与模块体
+    局部作用域一致，对程序语义无影响（生成的程序不依赖跨 cell 的全局重绑定）。
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    finder = _TopLevelReturnFinder()
+    for node in tree.body:
+        finder.visit(node)
+    if not finder.found:
+        return code
+    indented = "\n".join(("    " + ln) if ln.strip() else ln
+                         for ln in code.splitlines())
+    return f"def __episode_entry__():\n{indented}\n\n__episode_entry__()\n"
+
+
 def ast_guard(
     program: str,
     allowed_tools: Optional[Set[str]] = None,
@@ -250,9 +268,10 @@ def ast_guard(
     """AST 白名单 + 正则二次扫描，返回 ASTCheckResult。"""
     tools = allowed_tools if allowed_tools is not None else set(REGISTRY.names())
 
-    # 正则二次扫描
+    # 正则二次扫描（在**原文**上做：包装只是语法适配，不改变文本里出现的调用）
     regex_hits = [p.pattern for p in _REGEX_BLACKLIST if p.search(program)]
 
+    program = normalize_program_source(program)
     try:
         tree = ast.parse(program)
     except SyntaxError as exc:

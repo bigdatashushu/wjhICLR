@@ -560,20 +560,20 @@ def test_track_consensus_uses_fragmentation_not_visibility():
 
 
     # 可见帧率很低但 track 干净 → 判 available（旧口径会误判 unavailable）
-    clean = M5EvidenceSummary(n_objects=24, n_tracks=24, track_stable_ratio=0.15,
+    clean = M5EvidenceSummary(m5_ran=True, n_objects=24, n_tracks=24, track_stable_ratio=0.15,
                               track_fragmentation_ratio=0.0,
                               duplicate_suspect_ratio=0.0)
     assert track_capability(clean)[0] == "available"
 
     # 碎片化/重复偏高 → degraded（计数可用但需带标记）
-    messy = M5EvidenceSummary(n_objects=24, n_tracks=24, track_stable_ratio=0.19,
+    messy = M5EvidenceSummary(m5_ran=True, n_objects=24, n_tracks=24, track_stable_ratio=0.19,
                               track_fragmentation_ratio=0.31,
                               duplicate_suspect_ratio=0.33)
     state, notes = track_capability(messy)
     assert state == "degraded" and notes
 
     # 碎片化极高 → unavailable（计数不可信）
-    broken = M5EvidenceSummary(n_objects=24, n_tracks=24,
+    broken = M5EvidenceSummary(m5_ran=True, n_objects=24, n_tracks=24,
                                track_fragmentation_ratio=0.8,
                                duplicate_suspect_ratio=0.6)
     assert track_capability(broken)[0] == "unavailable"
@@ -698,21 +698,29 @@ def test_ast_guard_allows_guarded_early_abstain():
     assert ast_guard(looped).ok
 
 
-def test_ast_guard_rejects_toplevel_answer_then_tool():
-    """顶层"答完还继续算"仍然必须静态拒绝（真正的反例）。"""
+def test_ast_guard_accepts_toplevel_answer_then_tool_now_that_answer_terminates():
+    """v7 §10.2：控制接口改成终结语义后，静态层的顺序检查被**运行层**取代。
+
+    `ReturnAnswer` 立即抛 `ControlTerminate`（`BaseException` 子类，生成程序用
+    `except Exception` 吞不掉），因此"答完还继续算"在运行层就不可达，
+    静态层不再需要按行号拒绝——这样模型的防御式写法也不会被误拒。
+    """
     from skill3d.sandbox.ast_guard import ast_guard
 
-    bad = ("x = list_objects('chair')\n"
+    src = ("x = list_objects('chair')\n"
            "ReturnAnswer(len(x))\n"
            "y = list_objects('table')\n"
            "ReturnAnswer(len(y))\n")
-    res = ast_guard(bad)
-    assert not res.ok
-    assert any("ReturnAnswer 之后再调用 Tool" in v for v in res.violations)
+    assert ast_guard(src).ok, "静态层不再做顺序判定（由终结语义在运行层保证）"
 
 
-def test_runtime_guard_still_fires_for_guarded_pattern():
-    """静态层放行后，运行层必须仍然兜住"ReturnAnswer 真的执行了又调 Tool"。"""
+def test_runtime_guard_still_fires_when_terminate_signal_is_swallowed():
+    """即使生成程序吞掉终结信号，答后调 Tool 仍被拦成受控 `AnswerAlreadyGiven`。
+
+    v7 §10.2 的第一道保证是 `ControlTerminate`；本用例覆盖第二道：
+    程序用 `except BaseException: pass` 强行吞掉信号后继续跑时，
+    运行层的工具包装必须继续拦截，而不是让它跑成 IndexError/假服务故障。
+    """
     import numpy as np
 
     from skill3d.schemas import ObjectRecord, SceneState
@@ -730,8 +738,26 @@ def test_runtime_guard_still_fires_for_guarded_pattern():
                        available_artifacts=available_artifacts_for("full_3d"))
     handle = SceneHandle(scene, objects=objs, objects_materialized=True)
     kernel = RestrictedNamespaceKernel(REGISTRY, handle, frames=[np.zeros((4, 4, 3))])
-    # 顶层答后调 Tool → 运行层抛受控 AnswerAlreadyGiven（不是 IndexError/服务故障）
-    cell = kernel.run_cell("ReturnAnswer('abstain')\nlist_objects('chair')\n")
-    assert cell.error_code == "tool_contract"
+    # 正常写法：ReturnAnswer 立即终结，后续 Tool 根本不会执行
+    cell = kernel.run_cell("ReturnAnswer(3)\nlist_objects('chair')\n")
+    assert cell.terminated == "answer"
+    assert cell.answer == "3"
+    assert cell.error_code is None
+    assert not (cell.contract_violations or [])
+
+    # 恶意/防御式写法：吞掉终结信号后继续调 Tool → 运行层兜住
+    cell2 = kernel.run_cell(
+        "try:\n"
+        "    ReturnAnswer(3)\n"
+        "except BaseException:\n"
+        "    pass\n"
+        "list_objects('chair')\n")
+    assert cell2.error_code == "tool_contract"
     assert any("AnswerAlreadyGiven" in str(v.get("error") or "")
-               for v in (cell.contract_violations or []))
+               for v in (cell2.contract_violations or []))
+
+    kernel.set_tools_enabled(False)
+    cell3 = kernel.run_cell("list_objects('chair')\n")
+    assert cell3.error_code == "tool_contract"
+    assert any("finalization" in str(v.get("error") or "")
+               for v in (cell3.contract_violations or []))
