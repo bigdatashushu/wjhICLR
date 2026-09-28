@@ -10,8 +10,10 @@ driver（G-35）与候选级 CLI（§13.5）需要同一套面板语义，避免
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
 from skill3d.adapters.episode_source import EpisodeItem
@@ -26,11 +28,16 @@ from skill3d.evolution.paired_score import score_paired
 from skill3d.online.runner import OnlineRunConfig, run_episode
 from skill3d.reconstruction.run import artifact_path, resolve_artifact_path
 from skill3d.schemas import (
+    DECISION_CONDITION_KEYS,
     AdmissionDecision,
+    CampaignDecision,
     CandidateRevision,
     PairedOutcome,
+    PairedPanelReceipt,
+    SkillEvaluationBinding,
     SkillSpec,
 )
+from skill3d.skills.delivery import skill_content_sha256
 
 PanelLevels = dict[str, tuple[PairedOutcome, list, list]]
 
@@ -253,3 +260,219 @@ def admit(root: CandidateRevision, po: PairedOutcome, *,
         min_delta_required=min_delta_mca if po.metric == "accuracy" else min_delta_mra,
         n_min=n_min,
     )
+
+
+# =====================================================================================
+# v10 §8.2 / §8.6：固定注入的父 / 候选配对效果评测
+# =====================================================================================
+
+def fixed_injection_binding(arm: str, spec: SkillSpec) -> SkillEvaluationBinding:
+    """§8.2：为一条被评测 Skill 生成固定注入绑定（正文 hash 即该臂的身份）。"""
+    if arm not in ("parent", "candidate"):
+        raise ValueError(f"arm 只能是 parent/candidate，收到 {arm!r}")
+    key = f"{spec.skill_id}@{spec.version}"
+    return SkillEvaluationBinding(
+        mode="fixed_skill_evaluation",
+        arm=arm,  # type: ignore[arg-type]
+        skill_id=str(spec.skill_id),
+        skill_version=key,
+        content_sha256=skill_content_sha256(spec),
+        bypassed_component="retrieval_selection",
+    )
+
+
+def delivered_sha_of(outcome, version_key: str) -> str:
+    """从 episode 的检索记录里取"该版本实际交付的正文 hash"（没有则空串）。"""
+    for record in (getattr(outcome, "retrieval_records", None) or []):
+        payload = (record.model_dump(mode="json") if hasattr(record, "model_dump")
+                   else dict(record))
+        sha = (payload.get("delivered_content_sha256") or {}).get(version_key, "")
+        if sha:
+            return str(sha)
+    return ""
+
+
+def _run_error_of(outcome) -> bool:
+    status = str(getattr(outcome, "episode_status", "") or "")
+    if status:
+        return status == "run_error"
+    return str(getattr(outcome, "final_state", "")) == "run_error"
+
+
+def _valid_answer_of(outcome) -> bool:
+    """§8.6-3 的"合法答案"：框架解析出合法答案载荷（或 C0 直答文本）。"""
+    if _run_error_of(outcome):
+        return False
+    if getattr(outcome, "answer_payload", None) is not None:
+        return True
+    return bool(str(getattr(outcome, "direct_answer", "") or ""))
+
+
+def run_fixed_skill_evaluation(
+    *,
+    campaign_id: str,
+    generation: int,
+    seed: int,
+    panel_id: str,
+    items: Sequence[EpisodeItem],
+    parent_spec: SkillSpec,
+    candidate_spec: SkillSpec,
+    base_cfg: OnlineRunConfig,
+    trace_store=None,
+    llm=None,
+    print_fn: Callable[[str], None] = print,
+) -> tuple[PairedPanelReceipt, dict]:
+    """§8.2 A/B：A 固定注入父 Skill、B 固定注入候选 Skill（同一批题目与 artifact）。
+
+    规范原文（§8.2）："每次模型请求只包含该臂被评测的一条完整 Skill。除该 Skill 的
+    版本和正文外，A/B 的题目、FrameSet、基础 artifact、工具、权限、模型、提示词
+    公共部分、求解轮数、重试规则和 seed 必须一致。"
+
+    返回 `(receipt, 原始两臂 outcome)`；`receipt` 里逐题记录了得分、run_error、
+    合法答案与**两臂正文 hash**（§16.2 要求核对），供 `decide_promotion` 判定。
+    """
+    binding_a = fixed_injection_binding("parent", parent_spec)
+    binding_b = fixed_injection_binding("candidate", candidate_spec)
+    if binding_a.skill_id != binding_b.skill_id:
+        raise ValueError(
+            f"父 / 候选不同谱系：{binding_a.skill_id} vs {binding_b.skill_id}（§7.2）")
+    if not items:
+        raise ValueError("固定注入评测需要非空 inner 子面板（§8.5）")
+
+    cfg_a = replace(base_cfg, skills=[parent_spec], evaluation_binding=binding_a)
+    cfg_b = replace(base_cfg, skills=[candidate_spec], evaluation_binding=binding_b)
+    outs_a = run_panel(items, cfg_a, trace_store, llm=llm)
+    outs_b = run_panel(items, cfg_b, trace_store, llm=llm)
+    # 硬约束 18/21：逐 episode 断言两臂同 artifact 同 frame_set_hash
+    from skill3d.skills.paired_ab import assert_paired_outcomes_share_artifact
+
+    assert_paired_outcomes_share_artifact(outs_a, outs_b)
+
+    scores_a = [score_of(o) for o in outs_a]
+    scores_b = [score_of(o) for o in outs_b]
+    per_item: list[dict] = []
+    for item, oa, ob in zip(items, outs_a, outs_b):
+        per_item.append({
+            "qa_id": str(item.episode.qa_id),
+            "scene_id": str(item.episode.scene_name),
+            "score_a": float(score_of(oa)),
+            "score_b": float(score_of(ob)),
+            "final_state_a": str(getattr(oa, "final_state", "")),
+            "final_state_b": str(getattr(ob, "final_state", "")),
+            "run_error_a": _run_error_of(oa),
+            "run_error_b": _run_error_of(ob),
+            "valid_answer_a": _valid_answer_of(oa),
+            "valid_answer_b": _valid_answer_of(ob),
+            "delivered_sha_a": delivered_sha_of(oa, binding_a.skill_version),
+            "delivered_sha_b": delivered_sha_of(ob, binding_b.skill_version),
+        })
+    n = float(len(per_item))
+    body_a = sum(1 for r in per_item
+                 if r["delivered_sha_a"] == binding_a.content_sha256)
+    body_b = sum(1 for r in per_item
+                 if r["delivered_sha_b"] == binding_b.content_sha256)
+    receipt = PairedPanelReceipt(
+        campaign_id=campaign_id, generation=int(generation), seed=int(seed),
+        panel_id=str(panel_id), n_items=len(per_item),
+        arm_a_skill_version=binding_a.skill_version,
+        arm_b_skill_version=binding_b.skill_version,
+        arm_a_content_sha256=binding_a.content_sha256,
+        arm_b_content_sha256=binding_b.content_sha256,
+        mean_a=sum(scores_a) / n, mean_b=sum(scores_b) / n,
+        delta=sum(scores_b) / n - sum(scores_a) / n,
+        n_run_error_a=sum(1 for r in per_item if r["run_error_a"]),
+        n_run_error_b=sum(1 for r in per_item if r["run_error_b"]),
+        valid_answer_rate_a=sum(1 for r in per_item if r["valid_answer_a"]) / n,
+        valid_answer_rate_b=sum(1 for r in per_item if r["valid_answer_b"]) / n,
+        delivered_a=body_a, delivered_b=body_b, per_item=per_item,
+        panel_hash=_panel_hash(items),
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    print_fn(f"[固定注入 A/B] seed={seed} n={receipt.n_items} "
+             f"父={receipt.mean_a:.4f} 候选={receipt.mean_b:.4f} "
+             f"delta={receipt.delta:+.4f} run_error {receipt.n_run_error_a}→"
+             f"{receipt.n_run_error_b} 正文入请求 {body_a}/{body_b}（n={receipt.n_items}）")
+    return receipt, {"a": outs_a, "b": outs_b}
+
+
+def _panel_hash(items: Sequence[EpisodeItem]) -> str:
+    """面板清单 hash（§8.5：面板清单、scene、qa_id、seed 在看结果前冻结）。"""
+    keys = [f"{it.episode.qa_id}:{it.episode.scene_name}" for it in items]
+    return hashlib.sha256("\n".join(sorted(keys)).encode("utf-8")).hexdigest()
+
+
+def decide_promotion(receipts: Sequence[PairedPanelReceipt], *,
+                     required_seeds: Sequence[int],
+                     candidate_delivered_eligible: bool = True,
+                     same_episode_and_artifacts: bool = True,
+                     content_and_experience_eligible: bool = True,
+                     strict_improvement: bool = True) -> CampaignDecision:
+    """§8.6 + §13：双 seed 固定注入结果的确定性准入判定。
+
+    规范原文（§13）："候选在两个固定 seed 上分别满足以下条件才 promote：1. 整个对应
+    inner 子面板得分严格提高；2. `run_error` 数量不增加；3. 合法答案率不下降；
+    4. 候选至少真实交付一次；…… 任一 seed 持平、下降、候选零交付或运行错误增加，
+    则 reject。"
+    """
+    by_seed = {int(r.seed): r for r in receipts}
+    per_seed: dict[str, dict] = {}
+    checks: dict[str, bool] = {k: True for k in DECISION_CONDITION_KEYS}
+    reasons: list[str] = []
+    missing = [s for s in required_seeds if int(s) not in by_seed]
+    if missing:
+        checks["same_episode_and_artifacts"] = False
+        reasons.append(f"缺少 seed {missing} 的固定注入结果（§8.6：两个 seed 均必须满足）")
+    for seed in required_seeds:
+        r = by_seed.get(int(seed))
+        if r is None:
+            continue
+        improved = (r.mean_b > r.mean_a) if strict_improvement else (r.mean_b >= r.mean_a)
+        row = {
+            "mean_a": r.mean_a, "mean_b": r.mean_b, "delta": r.delta,
+            "panel_score_strictly_improved": improved,
+            "run_error_not_increased": r.n_run_error_b <= r.n_run_error_a,
+            "valid_answer_rate_not_decreased": (
+                r.valid_answer_rate_b >= r.valid_answer_rate_a),
+            "candidate_delivered_at_least_once": r.delivered_b > 0,
+            "both_arms_body_entered_request": (
+                r.delivered_a == r.n_items and r.delivered_b == r.n_items),
+            "n_run_error_a": r.n_run_error_a, "n_run_error_b": r.n_run_error_b,
+            "valid_answer_rate_a": r.valid_answer_rate_a,
+            "valid_answer_rate_b": r.valid_answer_rate_b,
+            "delivered_a": r.delivered_a, "delivered_b": r.delivered_b,
+            "n_items": r.n_items,
+        }
+        per_seed[str(seed)] = row
+        for key in ("panel_score_strictly_improved", "run_error_not_increased",
+                    "valid_answer_rate_not_decreased",
+                    "candidate_delivered_at_least_once",
+                    "both_arms_body_entered_request"):
+            if not row[key]:
+                checks[key] = False
+                reasons.append(f"seed {seed}: {key}=False")
+        if not r.arm_b_content_sha256 or r.arm_a_content_sha256 == r.arm_b_content_sha256:
+            checks["no_schema_or_permission_violation"] = False
+            reasons.append(f"seed {seed}: 两臂正文 hash 相同或缺失（§8.3 禁止 A/B 同源）")
+    checks["same_episode_and_artifacts"] = bool(
+        checks["same_episode_and_artifacts"] and same_episode_and_artifacts)
+    checks["no_schema_or_permission_violation"] = bool(
+        checks["no_schema_or_permission_violation"])
+    checks["content_and_experience_eligible"] = bool(content_and_experience_eligible)
+    checks["candidate_delivered_at_least_once"] = bool(
+        checks["candidate_delivered_at_least_once"] and candidate_delivered_eligible)
+    if not content_and_experience_eligible:
+        reasons.append("候选内容 / 来源 / 经验资格未通过（§13-6）")
+    if not same_episode_and_artifacts:
+        reasons.append("A/B 未使用同一 episode / FrameSet / artifact / 配置（§13-5）")
+    promote = bool(checks and all(checks.values()))
+    if promote:
+        reasons = []  # 全部满足：不保留"某条件为假"的误导性说明
+    elif not reasons:
+        reasons.append("存在未满足的准入条件")
+    first = next(iter(receipts), None)
+    return CampaignDecision(
+        campaign_id=str(first.campaign_id) if first is not None else "",
+        generation=int(first.generation) if first is not None else 0,
+        candidate_id="",
+        promote=promote, conditions=checks, per_seed=per_seed, reasons=reasons,
+        created_at=datetime.now(timezone.utc).isoformat())

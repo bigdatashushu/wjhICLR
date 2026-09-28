@@ -54,6 +54,26 @@ CANDIDATE_REASON_CODES: frozenset[str] = frozenset({
     "gate_result_missing",         # 米制 Skill：连 gate 结果都没有（无法证明可用）
     "state_not_active",            # 未 promoted/consolidated 的候选不得生效
     "not_selected_top_k",          # 硬条件通过但排序未进 top-k
+    # v10 §5.3-2：同一谱系内已选择另一版本（每题对同一 skill_id 最多交付一个版本）
+    "lineage_version_not_selected",
+    # v10 §8.2：候选效果评测的**固定注入**（跳过检索选择，但不跳过适用性校验）
+    "fixed_injection_selected",
+    "fixed_injection_not_applicable",
+})
+
+# 版本选择模式（§5.3-7 要求"版本选择原因"落盘；§8.2 要求固定注入可区分）
+SELECTION_MODES: frozenset[str] = frozenset({
+    "retrieval",                 # 正常检索选择
+    "fixed_skill_evaluation",    # §8.2 固定注入（只能用于候选效果评测）
+})
+
+# 谱系内版本选择的原因（§5.3-7："检索分数、稳定 tie-break 和版本选择原因必须落盘"）
+VERSION_SELECTION_REASONS: frozenset[str] = frozenset({
+    "single_eligible_version",     # 该谱系只有一个可检索版本
+    "score_tie_break_stable_key",  # 分数并列 → 稳定键（skill_id@version 升序）
+    "higher_ranking_score",        # 分数更高
+    "model_selected_from_summaries",   # §8.4 两阶段：模型按摘要选择
+    "deterministic_fallback",      # §8.4：模型选择不可用 → 确定性回落（如实记录）
 })
 
 # 交付状态（§13.6；与 skills.delivery.DELIVERY_REASON_CODES 同源，此处做记录侧校验）
@@ -171,6 +191,22 @@ class SkillRetrievalRecord(Spec):
     dropped_for_context: list[dict] = []          # §13.5 因上下文上限整条丢弃
     method_summaries: list[dict] = []             # §13.6 每轮短方法摘要
     usage_clues: list[dict] = []                  # §13.6 可观察的程序使用线索
+    # ---- v10 §5.3 / §8.4：谱系内版本选择与固定注入 ----
+    # `lineage_selections` 逐谱系记录：候选版本、分数、稳定 tie-break 与**选择原因**
+    # （§5.3-7："检索分数、稳定 tie-break 和版本选择原因必须落盘"）。
+    lineage_selections: list[dict] = []
+    # §8.2：固定注入的显式标记（该模式只能用于候选效果评测）。
+    evaluation_binding: Optional[dict] = None
+    # §8.4：选择阶段与执行阶段**分别**记录请求 hash（固定注入时为每个臂的正文身份）。
+    selection_request_sha256: str = ""
+    selection_response_sha256: str = ""
+    # `not_sent`（未发出请求）与 `delivered`（正文进了请求）都不改这两条之外的语义。
+
+    @property
+    def selection_mode(self) -> str:
+        """本记录的 Skill 输入方式：正常检索 / 候选效果评测固定注入（§8.2）。"""
+        return ("fixed_skill_evaluation" if self.evaluation_binding
+                else "retrieval")
 
     @field_validator("trigger")
     @classmethod
@@ -263,6 +299,98 @@ class SkillRetrievalRecord(Spec):
         })
         if usage_clues:
             self.usage_clues.extend(dict(c) for c in usage_clues)
+
+    # ---- v10 §5.3 / §8.4 ----
+
+    def record_lineage_selection(self, lineage: str, selected_version: str,
+                                 candidates: list[dict], reason: str) -> None:
+        """登记一个谱系的版本选择事实（§5.3-7：分数、tie-break、原因必须落盘）。"""
+        if reason not in VERSION_SELECTION_REASONS:
+            raise ValueError(
+                f"未知版本选择原因 {reason!r}；词表={sorted(VERSION_SELECTION_REASONS)}")
+        versions = [str(c.get("skill_version", "")) for c in candidates]
+        if selected_version not in versions:
+            raise ValueError(
+                f"选中版本 {selected_version} 不在谱系 {lineage} 的候选 {versions} 中")
+        if any(str(c.get("skill_version")) == selected_version and
+               not c.get("hard_filter_passed", True) for c in candidates):
+            raise ValueError("选中了未过硬条件的版本")
+        self.lineage_selections.append({
+            "lineage": lineage,
+            "selected_version": selected_version,
+            "reason": reason,
+            "candidates": candidates,
+            # §5.3-6：版本号大小**不**参与打分；这里显式记下本次使用的排序口径。
+            "ranking_policy": "score_desc_then_stable_key",
+        })
+
+    def select_version_in_lineage(self, lineage: str, version: str, *,
+                                  source: str, request_sha256: str = "",
+                                  response_sha256: str = "") -> None:
+        """把一个谱系的选定版本改成 `version`（§8.4 两阶段选择的第二阶段）。
+
+        调用方（在线链）负责发出选择请求；这里只改**记录**与 `selected` 标记，
+        并核对新版本确实在该谱系的候选里、且没有同时选中两个版本。
+        """
+        if source not in VERSION_SELECTION_REASONS:
+            raise ValueError(
+                f"未知版本选择原因 {source!r}；词表={sorted(VERSION_SELECTION_REASONS)}")
+        slot = None
+        for entry in self.lineage_selections:
+            if entry.get("lineage") == lineage:
+                slot = entry
+                break
+        if slot is None:
+            raise ValueError(f"谱系 {lineage} 没有登记过版本选择，不能改写")
+        versions = [str(c.get("skill_version", "")) for c in slot.get("candidates", [])]
+        if version not in versions:
+            raise ValueError(
+                f"选定版本 {version} 不在谱系 {lineage} 的候选 {versions} 中")
+        previous = str(slot.get("selected_version", ""))
+        slot["selected_version"] = str(version)
+        slot["reason"] = str(source)
+        slot["reselected_from"] = previous
+        if request_sha256:
+            self.selection_request_sha256 = str(request_sha256)
+        if response_sha256:
+            self.selection_response_sha256 = str(response_sha256)
+        # `selected` 标记跟着走：同谱系只能有一个版本被选中/交付（§5.3-1）。
+        for row in self.candidates:
+            if row.skill_id != lineage:
+                continue
+            row.selected = (row.skill_version == version)
+            if not row.selected and row.delivered:
+                raise ValueError(
+                    f"版本 {row.skill_version} 已交付，不能在同一记录里改选其他版本")
+            if row.selected:
+                row.delivery_reason = "no_model_request"
+        self.retrieved_skill_versions = sorted(
+            str(e.get("selected_version")) for e in self.lineage_selections
+            if e.get("selected_version"))
+        self.delivered_skill_versions = [v for v in self.delivered_skill_versions
+                                         if v in set(self.retrieved_skill_versions)]
+        self.delivered_content_sha256 = {
+            k: v for k, v in self.delivered_content_sha256.items()
+            if k in set(self.retrieved_skill_versions)}
+
+    def mark_fixed_injection(self, binding) -> None:
+        """§8.2：登记"本次 Skill 输入是固定注入"（不得伪装成正常检索命中）。"""
+        payload = (binding.model_dump(mode="json") if hasattr(binding, "model_dump")
+                   else dict(binding))
+        if payload.get("mode") != "fixed_skill_evaluation":
+            raise ValueError(
+                f"固定注入标记的 mode 必须是 fixed_skill_evaluation：{payload.get('mode')!r}")
+        if self.evaluation_binding is not None:
+            raise ValueError("一次检索只能有一个固定注入标记")
+        self.evaluation_binding = payload
+        versions = {str(payload.get("skill_version", ""))}
+        if versions == {""}:
+            raise ValueError("固定注入标记缺少 skill_version")
+        for row in self.candidates:
+            if row.skill_version in versions:
+                row.reason_code = ("fixed_injection_selected"
+                                   if row.hard_filter_passed
+                                   else "fixed_injection_not_applicable")
 
 
 def short_method_summary(skill, *, max_chars: int = 120) -> str:

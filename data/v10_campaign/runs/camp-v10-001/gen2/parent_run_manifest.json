@@ -1,0 +1,71 @@
+{
+  "campaign_id": "camp-v10-001",
+  "code_commit": "aa5810f2177dcc5b190a3fb66cf3b9bfca4932c5",
+  "created_at": "2026-09-28T07:09:19.819962+00:00",
+  "episodes": [
+    {
+      "qa_id": "2514",
+      "scene_id": "fb5a96b1a2"
+    },
+    {
+      "qa_id": "82",
+      "scene_id": "45261121"
+    },
+    {
+      "qa_id": "2569",
+      "scene_id": "f9f95681fd"
+    },
+    {
+      "qa_id": "150",
+      "scene_id": "47429922"
+    },
+    {
+      "qa_id": "4466",
+      "scene_id": "scene0684_01"
+    },
+    {
+      "qa_id": "57",
+      "scene_id": "42899685"
+    },
+    {
+      "qa_id": "76",
+      "scene_id": "44358536"
+    },
+    {
+      "qa_id": "4417",
+      "scene_id": "scene0621_00"
+    }
+  ],
+  "generation": 2,
+  "manifest_hash": "61259a20580170f8bf3d0490972cd448a6a67cc5d6316b07c4a77b7db4708046",
+  "mode": "real",
+  "n_items": 8,
+  "panel_hash": "ab7179e2421295ce1337fca97a97775038f76975caf02112febb52a5951366ea",
+  "qa_ids": [
+    "2514",
+    "82",
+    "2569",
+    "150",
+    "4466",
+    "57",
+    "76",
+    "4417"
+  ],
+  "retrieval_policy_sha256": "4b497fdbcc8c1b19b1407129205d7d3a4bfbbd98e0bb9b504df2d228a94193fa",
+  "retrieval_policy_version": "ret-v9-1",
+  "run_id": "camp-v10-001-g2-learning",
+  "seed": 0,
+  "skills_loaded": [
+    "S01@1.0.0",
+    "S02@1.0.0",
+    "S03@1.0.0",
+    "S04@1.0.0",
+    "S05@1.0.0",
+    "S06@1.0.0",
+    "S07@1.0.0",
+    "S08@1.0.0"
+  ],
+  "snapshot_id": "S0-seed-20260925-v1",
+  "split": "induction",
+  "trace_dir": "data/v10_campaign/runs/camp-v10-001/traces/gen2/learning"
+}

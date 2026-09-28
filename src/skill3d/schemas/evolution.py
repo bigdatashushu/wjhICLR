@@ -1,8 +1,18 @@
-"""§5.6 演进 Schema（含 §5.6b EvolutionSandboxSpec、M20 GPUJob）。"""
+"""§5.6 演进 Schema（含 §5.6b EvolutionSandboxSpec、M20 GPUJob）+ v10 演化合同。
+
+v10 增补（§5.4 / §7.2 / §8.2 / §11.2 / §14.1）：`SkillCandidate`（完整候选）、
+`SkillEvaluationBinding`（固定注入标记）、`EvolutionCampaign`（两代唯一调度入口）
+与四类代际收据。这些对象是 v10 演化链的**合同**，不是可选审计字段。
+
+命名说明：v5 的 `schemas/skill.py::SkillCandidate`（只有 `spec_content` 字符串、
+无父版本、无谱系）已被 §7.2 的完整候选取代，改名为 `SkillCandidateV5`（仅历史
+数据在读时解释）；包级 `SkillCandidate` 现在指向本模块的 v10 定义。
+"""
 
 from typing import Literal, Optional
 
 from . import Spec
+from .skill import SkillSpec
 
 BranchRole = Literal["baseline", "memory_only", "skill_only",
                      "candidate", "old_version", "error_adversarial"]
@@ -238,3 +248,327 @@ class GPUJob(Spec):
     gpu_rank: int
     role: Literal["reconstruct", "vllm", "eval"]
     paired_unit_id: str
+
+
+# =====================================================================================
+# v10：候选 / 效果评测 / 两代 campaign 合同（§5.4、§7.2、§8.2、§10.1、§11.2、§14.1）
+# =====================================================================================
+
+# §11.1 状态机的显式状态名（与 §11.1 原文逐字一致；顺序即流转顺序）。
+EVOLUTION_STATES: tuple[str, ...] = (
+    "INIT",
+    "RUN_PARENT_LEARNING",
+    "BUILD_EXPERIENCE_BUNDLE",
+    "GENERATE_CANDIDATE",
+    "STATIC_VALIDATE",
+    "BUILD_CANDIDATE_SNAPSHOT",
+    "RUN_INNER_SEED_0",
+    "RUN_INNER_SEED_1",
+    "DECIDE",
+    "PUBLISH_OR_REJECT",
+    "VERIFY_POST_PUBLISH_USE",
+    "NEXT_GENERATION",
+    "COMPLETE",
+)
+EvolutionStateValue = Literal[
+    "INIT", "RUN_PARENT_LEARNING", "BUILD_EXPERIENCE_BUNDLE", "GENERATE_CANDIDATE",
+    "STATIC_VALIDATE", "BUILD_CANDIDATE_SNAPSHOT", "RUN_INNER_SEED_0",
+    "RUN_INNER_SEED_1", "DECIDE", "PUBLISH_OR_REJECT", "VERIFY_POST_PUBLISH_USE",
+    "NEXT_GENERATION", "COMPLETE",
+]
+
+# 候选来源（`SkillCandidate.inducer_receipt_ref` 指向的收据类型）。
+CANDIDATE_OPERATIONS: tuple[str, ...] = ("revise",)
+
+# §5.4 静态检查项（名字必须是**稳定标识**，收据里逐项落盘）。
+STATIC_CHECK_KEYS: tuple[str, ...] = (
+    "json_parseable",
+    "schema_extra_forbid",
+    "skill_id_matches_parent",
+    "version_bump_legal",
+    "single_canonical_question_type",
+    "method_body_deliverable",
+    "tools_known",
+    "no_leakage",
+    "parent_hash_matches",
+    "diff_nonempty_and_consistent",
+)
+
+# §8.6 / §13 逐 seed 判定条件（名字稳定，decision.json 里逐项落盘）。
+DECISION_CONDITION_KEYS: tuple[str, ...] = (
+    "panel_score_strictly_improved",
+    "run_error_not_increased",
+    "valid_answer_rate_not_decreased",
+    "no_schema_or_permission_violation",
+    "both_arms_body_entered_request",
+    "candidate_delivered_at_least_once",
+    "same_episode_and_artifacts",
+    "content_and_experience_eligible",
+)
+
+
+class SkillCandidate(Spec):
+    """§7.2：离线归纳器产出的**完整候选**（不是自由文本增量）。
+
+    规范原文（§5.4）："候选修订必须产生完整合法 `SkillSpec`，禁止把自由文本直接
+    拼接到序列化 JSON 后。" 因此 `full_skill_spec` 是解析后的完整值对象，
+    `structured_diff` 是框架对父 / 子做的字段差分（供审计，不参与运行）。
+    """
+
+    candidate_id: str
+    campaign_id: str
+    generation: int
+    operation: Literal["revise"]
+    parent_snapshot_id: str
+    parent_skill_version: str          # skill_id@version
+    candidate_skill_version: str       # skill_id@version
+    canonical_question_type: str
+    hypothesis: str = ""
+    expected_effect: str = ""
+    known_risks: list[str] = []
+    full_skill_spec: SkillSpec
+    structured_diff: list[dict] = []
+    source_experience_bundle_ref: str = ""
+    inducer_receipt_ref: str = ""
+
+    def model_post_init(self, __context) -> None:  # noqa: D105
+        parent_id, _, parent_ver = self.parent_skill_version.partition("@")
+        cand_id, _, cand_ver = self.candidate_skill_version.partition("@")
+        if not parent_ver or not cand_ver:
+            raise ValueError(
+                "父 / 候选技能版本必须是 skill_id@version 形式："
+                f"{self.parent_skill_version!r} → {self.candidate_skill_version!r}")
+        if parent_id != cand_id:
+            raise ValueError(
+                f"候选不得跨谱系：父={parent_id} 候选={cand_id}（§7.2 operation=revise）")
+        if parent_id != self.full_skill_spec.skill_id:
+            raise ValueError(
+                f"候选 SkillSpec.skill_id={self.full_skill_spec.skill_id} 与父谱系 "
+                f"{parent_id} 不一致")
+        if cand_ver != self.full_skill_spec.version:
+            raise ValueError(
+                f"candidate_skill_version={cand_ver} 与 full_skill_spec.version="
+                f"{self.full_skill_spec.version} 不一致")
+        if self.canonical_question_type not in self.full_skill_spec.applicable_question_types:
+            raise ValueError(
+                f"canonical_question_type={self.canonical_question_type} 不在候选声明的"
+                f"题型 {self.full_skill_spec.applicable_question_types} 内（§8.5）")
+        if not self.structured_diff:
+            raise ValueError("structured_diff 为空（§5.4：diff 必须非空且与候选内容一致）")
+
+    @property
+    def skill_id(self) -> str:
+        return self.full_skill_spec.skill_id
+
+    @property
+    def version(self) -> str:
+        return self.full_skill_spec.version
+
+
+class SkillEvaluationBinding(Spec):
+    """§8.2：固定注入的显式标记（只能用于候选效果评测）。
+
+    规范原文（§8.2）："该模式只能用于候选效果评测，不能用于 learning 经验采集、
+    发布后运行或最终系统成绩。" 因此这个对象的存在本身就是"这一跑不是正常检索"的
+    证据 —— 它必须落进 trace，且不允许被改写成正常检索命中。
+    """
+
+    mode: Literal["fixed_skill_evaluation"]
+    arm: Literal["parent", "candidate"]
+    skill_id: str
+    skill_version: str
+    content_sha256: str
+    bypassed_component: Literal["retrieval_selection"]
+
+    def model_post_init(self, __context) -> None:  # noqa: D105
+        if self.skill_version != f"{self.skill_id}@{self.skill_version.split('@')[-1]}":
+            raise ValueError(f"skill_version 必须是 skill_id@version：{self.skill_version!r}")
+        if not self.content_sha256:
+            raise ValueError("固定注入必须带正文 hash（§16.2：核对两臂正文 hash）")
+
+
+class StaticValidationReceipt(Spec):
+    """§14.1 `static_validation.json`：Schema、工具、泄漏、版本、长度检查。"""
+
+    candidate_id: str
+    campaign_id: str = ""
+    generation: int = 0
+    checks: dict[str, bool] = {}
+    problems: list[str] = []
+    passed: bool = False
+    created_at: str = ""
+
+    def model_post_init(self, __context) -> None:  # noqa: D105
+        unknown = sorted(set(self.checks) - set(STATIC_CHECK_KEYS))
+        if unknown:
+            raise ValueError(f"未知静态检查项 {unknown}；词表={list(STATIC_CHECK_KEYS)}")
+        if self.passed and self.problems:
+            raise ValueError("passed=True 但 problems 非空（不能一边通过一边有问题）")
+        if self.passed and not all(self.checks.values()):
+            raise ValueError(
+                "passed=True 但存在未通过检查项："
+                f"{sorted(k for k, v in self.checks.items() if not v)}")
+
+
+class PairedPanelReceipt(Spec):
+    """§14.1 `paired_seed_{0,1}.json`：同一 inner 子面板的父 / 候选逐题配对结果。
+
+    两臂的 `content_sha256` 是**固定注入的正文身份**：§16.2 要求核对两臂正文 hash
+    与真实请求一致。`n_run_error` / 合法答案率 / 交付覆盖是 §8.6 与 §13 的判定输入。
+    """
+
+    campaign_id: str
+    generation: int
+    seed: int
+    panel_id: str
+    panel_hash: str = ""
+    n_items: int = 0
+    arm_a_skill_version: str = ""
+    arm_b_skill_version: str = ""
+    arm_a_content_sha256: str = ""
+    arm_b_content_sha256: str = ""
+    mean_a: float = 0.0
+    mean_b: float = 0.0
+    delta: float = 0.0
+    n_run_error_a: int = 0
+    n_run_error_b: int = 0
+    valid_answer_rate_a: float = 0.0
+    valid_answer_rate_b: float = 0.0
+    delivered_a: int = 0
+    delivered_b: int = 0
+    per_item: list[dict] = []
+    created_at: str = ""
+
+
+class CampaignDecision(Spec):
+    """§14.1 `decision.json`：promote/reject 及**每一项条件**。"""
+
+    campaign_id: str
+    generation: int
+    candidate_id: str
+    promote: bool
+    conditions: dict[str, bool] = {}
+    per_seed: dict[str, dict] = {}
+    reasons: list[str] = []
+    created_at: str = ""
+
+    def model_post_init(self, __context) -> None:  # noqa: D105
+        unknown = sorted(set(self.conditions) - set(DECISION_CONDITION_KEYS))
+        if unknown:
+            raise ValueError(
+                f"未知准入条件 {unknown}；词表={list(DECISION_CONDITION_KEYS)}")
+        if self.promote and not all(self.conditions.values()):
+            raise ValueError(
+                "promote=True 但存在未满足条件："
+                f"{sorted(k for k, v in self.conditions.items() if not v)}"
+                "（§13：任一 seed 持平/下降/零交付/运行错误增加 → reject）")
+
+
+class PromotionReceipt(Spec):
+    """§14.1 `promotion.json`：快照切换、父子关系和 manifest hash。"""
+
+    campaign_id: str
+    generation: int
+    candidate_id: str
+    skill_version: str
+    snapshot_before: str
+    snapshot_after: str
+    manifest_hash_before: str = ""
+    manifest_hash_after: str = ""
+    parent_snapshot_id: str | None = None
+    competing_versions: list[str] = []
+    historical_versions: list[str] = []
+    rollback_ref: str = ""             # 父快照文件路径（§10.1-8 保存父快照供回滚）
+    created_at: str = ""
+
+
+class PostPublishUseReceipt(Spec):
+    """§14.1 `post_publish_use.json`：新快照 / 新版本**实际**检索与交付证明。
+
+    规范原文（§10.2）："不满足以上条件时，状态只能是 `promoted_not_observed`，
+    不能开始下一代归纳。"
+    """
+
+    campaign_id: str
+    generation: int
+    snapshot_id: str
+    new_skill_version: str
+    episodes_run: int = 0
+    retrieved: bool = False
+    delivered: bool = False
+    delivered_content_sha256: str = ""
+    snapshot_content_sha256: str = ""
+    request_content_sha256_match: bool = False
+    experience_event_refs: list[str] = []
+    status: Literal["observed", "promoted_not_observed"] = "promoted_not_observed"
+    created_at: str = ""
+
+    def model_post_init(self, __context) -> None:  # noqa: D105
+        if self.status == "observed" and not (self.retrieved and self.delivered):
+            raise ValueError(
+                "status=observed 但 retrieved/delivered 未同时成立（§10.2："
+                "发布后必须证明新版本被检索且真实交付）")
+        if self.status == "observed" and not self.request_content_sha256_match:
+            raise ValueError(
+                "status=observed 但请求正文 hash 与快照内容不一致（§10.2）")
+
+
+class RejectionReceipt(Spec):
+    """§14.1 `promotion.json` 的 **reject** 形态（保留 Sn 快照，不动 active 指针）。
+
+    与 `PromotionReceipt` 分开是刻意的：reject 时**没有**新快照、没有 manifest 变化，
+    用一个"字段留空"的 promote 收据表示拒绝会让"到底发布没发布"变得含糊。
+    两种形态在 `promotion.json` 里以 `outcome` 字段区分（`promoted` / `rejected`）。
+    """
+
+    outcome: Literal["rejected"] = "rejected"
+    campaign_id: str
+    generation: int
+    candidate_id: str
+    reasons: list[str] = []
+    snapshot_before: str = ""
+    created_at: str = ""
+
+
+class EvolutionCampaign(Spec):
+    """§11.2：两代演化的唯一调度入口。"""
+
+    campaign_id: str
+    target_question_type: str
+    target_skill_id: str
+    max_generations: int
+    current_generation: int
+    initial_snapshot_id: str
+    current_parent_snapshot_id: str
+    state: str
+    generation_receipt_refs: list[str] = []
+    final_snapshot_id: str | None = None
+    completion_status: Literal[
+        "running", "completed_two_generations",
+        "completed_with_rejection", "blocked", "failed"
+    ] = "running"
+
+    def model_post_init(self, __context) -> None:  # noqa: D105
+        if self.state not in EVOLUTION_STATES:
+            raise ValueError(
+                f"未知 campaign 状态 {self.state!r}；词表={list(EVOLUTION_STATES)}")
+        if self.current_generation < 0 or self.max_generations < 1:
+            raise ValueError("current_generation/max_generations 非法")
+
+
+__all__ = [
+    "CANDIDATE_OPERATIONS",
+    "DECISION_CONDITION_KEYS",
+    "EVOLUTION_STATES",
+    "STATIC_CHECK_KEYS",
+    "CampaignDecision",
+    "EvolutionCampaign",
+    "EvolutionStateValue",
+    "PairedPanelReceipt",
+    "PostPublishUseReceipt",
+    "PromotionReceipt",
+    "RejectionReceipt",
+    "SkillCandidate",
+    "SkillEvaluationBinding",
+    "StaticValidationReceipt",
+]

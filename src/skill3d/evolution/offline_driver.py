@@ -76,7 +76,10 @@ from skill3d.governance.deepseek_client import (
     OfflineResponseError,
     OfflineServiceUnavailable,
 )
-from skill3d.governance.induce import InsufficientEvidenceError, induce_candidate
+from skill3d.governance.induce import (
+    InsufficientEvidenceError,
+    induce_candidate_legacy_v9,
+)
 from skill3d.memory.consolidation import leakage_scan_text
 from skill3d.online.config import DEFAULT_CONFIG, load_config, load_yaml, paths_from
 from skill3d.online.runner import OnlineRunConfig
@@ -503,7 +506,11 @@ class OfflineDriver:
 
         traces = getattr(self, "_traces", [])
         try:
-            candidate = induce_candidate(
+            # v9 路径的归纳语义（按题型聚合、产出无父版本的 draft）**不**满足
+            # v10 §5.2/§7.2（候选必须有父版本、必须完整 SkillSpec）。v10 的两代演化
+            # 走 `evolution/campaign.py` + `governance.induce.induce_candidate_from_bundle`；
+            # v9 driver 保留旧语义只为让历史实验链仍可运行。
+            candidate = induce_candidate_legacy_v9(
                 traces, getattr(self, "_task_of", {}), getattr(self, "_scene_of", {}),
                 offline_client=client, n_min=self.cfg.n_min_cross_scene)
         except InsufficientEvidenceError as exc:

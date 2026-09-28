@@ -1,0 +1,74 @@
+[凭据] 从 /nas/wangjh/Skill-3D/.env.deepseekv4pro.local 注入 3 个环境变量（值不显示、不落盘）
+[面板冻结] data/v10_campaign/runs/camp-v10-001/panels.json
+  learning n=8 scenes=8
+  inner_g0 n=6 inner_g1 n=6 互不重叠=True
+  post_publish n=2
+  配置：max_evolution_rounds=2 candidate_validation_seeds=[0, 1] top_k=3 method_context_max_chars=8000
+[Skill 库] 复制 4 项 → data/v10_campaign/library
+[离线模型] provider=deepseek model=deepseek-flash endpoint_hash=a34e2a4708ed1c61008a151688838dcf1c44d4e7f08054633e72ba7c0b16cfc1
+[在线模型] 1 个 endpoint 就绪（model=qwen3vl-8b-r0）
+[camp-v10-001] 从 checkpoint 恢复 state=GENERATE_CANDIDATE generation=3
+===== generation 1: parent snapshot=S0-seed-20260925-v1 skill=S01@1.0.0 =====
+[camp-v10-001] RUN_PARENT_LEARNING generation=1
+[camp-v10-001] 复用已完成的 learning 运行 run_id=camp-v10-001-g1-learning（不重复消费面板）
+[camp-v10-001] BUILD_EXPERIENCE_BUNDLE generation=1
+[camp-v10-001] 复用经验包 bundle-62440ed6d7b5ce21a75c eligible=4
+[camp-v10-001] GENERATE_CANDIDATE generation=1
+[camp-v10-001] 复用候选 cand-45bf111fa315 → S01@1.1.0
+[camp-v10-001] STATIC_VALIDATE generation=1
+[camp-v10-001] 复用静态检查 passed=True
+[camp-v10-001] BUILD_CANDIDATE_SNAPSHOT generation=1
+[camp-v10-001] RUN_INNER_SEED_0 generation=1
+[camp-v10-001] 复用 seed 0 面板结果 delta=-0.0667
+[camp-v10-001] RUN_INNER_SEED_1 generation=1
+[camp-v10-001] 复用 seed 1 面板结果 delta=-0.0667
+[camp-v10-001] DECIDE generation=1
+[camp-v10-001] 复用决定 promote=False
+[camp-v10-001] PUBLISH_OR_REJECT generation=1
+[camp-v10-001] 复用 reject 记录（未发布）
+[camp-v10-001] VERIFY_POST_PUBLISH_USE generation=1
+[camp-v10-001] 复用发布后验证 status=promoted_not_observed
+[camp-v10-001] NEXT_GENERATION generation=1
+[camp-v10-001] 第 1 代 reject：下一代将基于父版本的新经验重试（§11.3）
+===== generation 2: parent snapshot=S0-seed-20260925-v1 skill=S01@1.0.0 =====
+[camp-v10-001] RUN_PARENT_LEARNING generation=2
+[camp-v10-001] 复用已完成的 learning 运行 run_id=camp-v10-001-g2-learning（不重复消费面板）
+[camp-v10-001] BUILD_EXPERIENCE_BUNDLE generation=2
+[camp-v10-001] 复用经验包 bundle-4d2a3b420ee48706acc5 eligible=4
+[camp-v10-001] GENERATE_CANDIDATE generation=2
+[camp-v10-001] 复用候选 cand-808cf4f1a925 → S01@1.1.0
+[camp-v10-001] STATIC_VALIDATE generation=2
+[camp-v10-001] 复用静态检查 passed=True
+[camp-v10-001] BUILD_CANDIDATE_SNAPSHOT generation=2
+[camp-v10-001] RUN_INNER_SEED_0 generation=2
+[camp-v10-001] 复用 seed 0 面板结果 delta=-0.1667
+[camp-v10-001] RUN_INNER_SEED_1 generation=2
+[camp-v10-001] 复用 seed 1 面板结果 delta=-0.1667
+[camp-v10-001] DECIDE generation=2
+[camp-v10-001] 复用决定 promote=False
+[camp-v10-001] PUBLISH_OR_REJECT generation=2
+[camp-v10-001] 复用 reject 记录（未发布）
+[camp-v10-001] VERIFY_POST_PUBLISH_USE generation=2
+[camp-v10-001] 复用发布后验证 status=promoted_not_observed
+[camp-v10-001] NEXT_GENERATION generation=2
+[camp-v10-001] 第 2 代 reject：下一代将基于父版本的新经验重试（§11.3）
+[camp-v10-001] COMPLETE status=completed_with_rejection 两代都未晋升：闭环跑通但未实现版本积累（§17.2）
+
+==============================================================================
+{
+  "campaign_id": "camp-v10-001",
+  "target_question_type": "object_counting",
+  "target_skill_id": "S01",
+  "max_generations": 1,
+  "current_generation": 2,
+  "initial_snapshot_id": "S0-seed-20260925-v1",
+  "current_parent_snapshot_id": "S0-seed-20260925-v1",
+  "state": "COMPLETE",
+  "generation_receipt_refs": [
+    "data/v10_campaign/runs/camp-v10-001/gen1",
+    "data/v10_campaign/runs/camp-v10-001/gen2"
+  ],
+  "final_snapshot_id": "S0-seed-20260925-v1",
+  "completion_status": "completed_with_rejection"
+}
+收据目录: data/v10_campaign/runs/camp-v10-001

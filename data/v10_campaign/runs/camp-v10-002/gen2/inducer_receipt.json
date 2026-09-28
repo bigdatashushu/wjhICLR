@@ -1,0 +1,36 @@
+{
+  "bundle_id": "bundle-f2f401f90e7716be8939",
+  "campaign_id": "camp-v10-002",
+  "candidate_id": "cand-72770e01830f",
+  "created_at": "2026-09-28T12:20:40.753704+00:00",
+  "generation": 2,
+  "offline_model": {
+    "endpoint_hash": "a34e2a4708ed1c61008a151688838dcf1c44d4e7f08054633e72ba7c0b16cfc1",
+    "latency": {
+      "max_s": 28.599,
+      "median_s": 27.198,
+      "n_attempts": 2,
+      "n_calls": 2,
+      "n_failures": 0,
+      "n_retries": 0,
+      "p95_s": 28.599,
+      "total_s": 54.395
+    },
+    "model_id": "deepseek-flash",
+    "offline_model": "DeepSeek-V4.1-Flash",
+    "prompt_version": "deepseek-offline-v1",
+    "provider": "deepseek",
+    "token_usage": {
+      "completion_tokens": 11752,
+      "n_calls_with_usage": 2,
+      "n_calls_without_usage": 0,
+      "prompt_tokens": 4392,
+      "total_tokens": 16144
+    }
+  },
+  "parent_skill_version": "S01@1.0.0",
+  "prompt_chars": 5013,
+  "prompt_ref": "inducer_prompt.txt",
+  "prompt_sha256": "95d3d3d31d568c4be794b5c7ff5075bcdffbb0298021a489aece2b579e9f606b",
+  "prompt_version": "induce-v10.0"
+}

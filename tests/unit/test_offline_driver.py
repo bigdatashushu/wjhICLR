@@ -51,11 +51,33 @@ PATCH = json.dumps({
     "patch_type": "add_assertion",
     "affected_task_types": ["object_counting"],
     "affected_skills": ["sk-count"],
-    "patch_content": "assert n >= 0  # 修订：计数非负",
+    "patch_content": json.dumps({"validation_assertions": ["n >= 0", "计数非负（修订）"]}),
     "rationale": "反例显示负数计数",
     "expected_improvement": "+2pp",
     "risk_notes": "低",
 })
+
+
+def _full_spec_response(prompt: str) -> str:
+    """v10 §5.4：修订器必须输出**完整候选 SkillSpec**（取代 v9 的 `# PATCH` 文本追加）。
+
+    规范原文（§5.4）："候选修订必须产生完整合法 `SkillSpec`，禁止把自由文本直接拼接
+    到序列化 JSON 后。" 因此这个离线模型替身从修订 prompt 里取出当前完整 SkillSpec，
+    做一次 MINOR 级修改（加一条断言）再整体返回。
+    """
+    body = prompt.split("## 当前 SkillSpec", 1)[1].split("\n## ", 1)[0].strip()
+    spec = json.loads(body)
+    major, minor, _patch = (int(p) for p in str(spec["version"]).split("."))
+    spec["version"] = f"{major}.{minor + 1}.0"
+    spec["validation_assertions"] = list(spec.get("validation_assertions") or []) + [
+        "n >= 0  # 修订：计数非负"]
+    return json.dumps({
+        "spec": spec,
+        "hypothesis": "反例显示负数计数",
+        "expected_effect": "+2pp",
+        "known_risks": ["低"],
+        "diff_summary": "加一条非负断言",
+    }, ensure_ascii=False)
 
 
 class MockOffline:
@@ -64,11 +86,12 @@ class MockOffline:
     model_id = "mock-deepseek"
 
     def __init__(self, patch_spec: str = SPEC, review_json: str | None = None,
-                 revise_json: str = PATCH):
+                 revise_json: str | None = None):
         self.patch_spec = patch_spec
         self.review_json = review_json or json.dumps({
             "review_summary": "语义风险低", "semantic_risk": "low",
             "generalization_notes": "可跨场景泛化"})
+        # `revise_json=None` → 按 prompt 里的当前 spec 现算完整候选（v10 契约）
         self.revise_json = revise_json
         self.calls: list[str] = []
 
@@ -77,7 +100,7 @@ class MockOffline:
         if "语义审查器" in prompt:
             return self.review_json
         if "修订器" in prompt:                 # revise_patch.build_revision_prompt
-            return self.revise_json
+            return self.revise_json or _full_spec_response(prompt)
         if "归纳器" in prompt:                 # induce.build_induction_prompt
             return self.patch_spec
         return self.patch_spec

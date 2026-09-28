@@ -1,0 +1,52 @@
+{
+  "behavior_summary": {
+    "answer_correct_rate": null,
+    "mra_mean": 0.3375,
+    "n_abstain": 0,
+    "n_answer_correct": 0,
+    "n_answer_graded": 0,
+    "n_answer_wrong": 0,
+    "n_declared_in_program": 0,
+    "n_delivered_not_used": 0,
+    "n_eligible": 4,
+    "n_mra_graded": 8,
+    "n_partial_tool_recovery": 0,
+    "n_retrieved_not_delivered": 0,
+    "n_run_error": 0,
+    "n_template_tool_overlap": 4,
+    "n_usage_supported": 4,
+    "run_error_rate": 0.0
+  },
+  "bundle_id": "bundle-62440ed6d7b5ce21a75c",
+  "campaign_id": "camp-v10-001",
+  "canonical_question_type": "object_counting",
+  "eligible_experience_refs": [
+    "exp-682b1c36c0a51cde81eb",
+    "exp-817198aa5e600fdc51f4",
+    "exp-9a2125c473ddf1c6bf46",
+    "exp-afc5c208781f803deb71"
+  ],
+  "excluded_experience_refs": [
+    "exp-639c09c3f0fc66689cfa",
+    "exp-75e20678ffe769b121af",
+    "exp-a9b01b3a35e94999a4bb",
+    "exp-d0f07c480a67b43f4098"
+  ],
+  "exclusion_summary": {
+    "delivered_but_no_usage_clue": 4
+  },
+  "failure_count": 0,
+  "failure_summary": {
+    "by_category": {},
+    "by_failure_code": {},
+    "n_without_failure": 4
+  },
+  "generation": 1,
+  "parent_skill_id": "S01",
+  "parent_skill_version": "1.0.0",
+  "parent_snapshot_id": "S0-seed-20260925-v1",
+  "scene_count": 4,
+  "schema_version": "1.0",
+  "source_manifest_hash": "61259a20580170f8bf3d0490972cd448a6a67cc5d6316b07c4a77b7db4708046",
+  "success_count": 0
+}

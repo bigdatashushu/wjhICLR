@@ -1,0 +1,55 @@
+{
+  "campaign": {
+    "campaign_id": "camp-v10-002",
+    "completion_status": "completed_with_rejection",
+    "current_generation": 2,
+    "current_parent_snapshot_id": "S0-seed-20260925-v1",
+    "final_snapshot_id": "S0-seed-20260925-v1",
+    "generation_receipt_refs": [
+      "data/v10_campaign/runs/camp-v10-002/gen1",
+      "data/v10_campaign/runs/camp-v10-002/gen2"
+    ],
+    "initial_snapshot_id": "S0-seed-20260925-v1",
+    "max_generations": 2,
+    "state": "COMPLETE",
+    "target_question_type": "object_counting",
+    "target_skill_id": "S01"
+  },
+  "completion_note": "两代都未晋升：闭环跑通但未实现版本积累（§17.2）",
+  "internal": {
+    "generation": 2,
+    "receipts": {
+      "1": [
+        "parent_run_manifest.json",
+        "experience_events.jsonl",
+        "experience_bundle.json",
+        "inducer_receipt.json",
+        "inducer_prompt.txt",
+        "candidate.json",
+        "static_validation.json",
+        "candidate_snapshot.json",
+        "paired_seed_0.json",
+        "paired_seed_1.json",
+        "decision.json",
+        "promotion.json",
+        "post_publish_use.json"
+      ],
+      "2": [
+        "parent_run_manifest.json",
+        "experience_events.jsonl",
+        "experience_bundle.json",
+        "inducer_receipt.json",
+        "inducer_prompt.txt",
+        "candidate.json",
+        "static_validation.json",
+        "candidate_snapshot.json",
+        "paired_seed_0.json",
+        "paired_seed_1.json",
+        "decision.json",
+        "promotion.json",
+        "post_publish_use.json"
+      ]
+    }
+  },
+  "stop_reason": ""
+}

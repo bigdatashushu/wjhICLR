@@ -1,0 +1,14 @@
+{
+  "active_pointer_created": true,
+  "benchmark_score": "not_measured",
+  "bundle_verified": true,
+  "check_type": "s0_skill_library_static_import",
+  "generated_specs_validated": true,
+  "library_format": "harness3d-skill-library/1.0",
+  "question_type_count": 8,
+  "real_model_tool_episode": "not_run",
+  "runtime_verified": false,
+  "snapshot_id": "S0-seed-20260925-v1",
+  "source_count": 8,
+  "status": "passed"
+}

@@ -43,11 +43,50 @@ def test_prompt_scan_blocks_ground_truth():
 
 
 def test_induction_prompt_contains_no_ground_truth():
-    # 正常归纳 prompt（只含失败类型摘要与输入特征）应通过扫描
-    prompt = build_induction_prompt(
-        failure_summaries=["perception", "coordinate"],
-        input_features=["abs_dist", "rel_direction"])
-    scan_prompt_for_leakage(prompt)  # 不抛异常即通过
+    """v10 §7.1 取代 v9 的 `build_induction_prompt(failure_summaries, input_features)`。
+
+    规范原文（§7.1）——离线归纳器每次只收到："父 Skill 完整 `SkillSpec`；父版本的
+    ExperienceBundle；允许使用的失败摘要和行为摘要；当前 ToolSpec 摘要；候选输出
+    Schema；禁止泄漏和禁止修改项。"
+
+    因此归纳 prompt 现在由**父 Skill + 经验包摘要 + 工具名清单**构成；本测试断言
+    该 prompt 依然不含 ground truth / sample id / 答案（扫描不抛异常即通过）。
+    """
+    from skill3d.evolution.experience import (
+        EpisodeEvidence, build_experience_bundle, build_experience_events,
+    )
+    from skill3d.schemas import SkillSpec
+
+    parent = SkillSpec(skill_id="S01", version="1.0.0",
+                       applicable_question_types=["object_counting"],
+                       skill_family="counting", description="数对象",
+                       call_graph_template="n = detect_objects(img)\nReturnAnswer(str(n))")
+    record = {
+        "retrieval_index": 1,
+        "candidates": [{"skill_version": "S01@1.0.0", "hard_filter_passed": True,
+                        "selected": True, "reason_code": "hit", "delivered": True,
+                        "delivery_reason": "delivered"}],
+        "delivered_content_sha256": {"S01@1.0.0": "sha"},
+        "usage_clues": [{"skill_version": "S01@1.0.0", "declared_in_program": True}],
+    }
+    evidence = [
+        EpisodeEvidence(episode_id=f"e{i}", scene_id=f"s{i}", split="learning",
+                        snapshot_id="S0", trace={"retrieval_records": [record]},
+                        answer_correct=(i % 2 == 0), failure_categories=("perception",),
+                        outcome_ref=f"evaluation_result:e{i}")
+        for i in range(4)
+    ]
+    events = build_experience_events(campaign_id="C", generation=1,
+                                     parent_snapshot_id="S0",
+                                     skills=["S01@1.0.0"], episodes=evidence)
+    bundle = build_experience_bundle(
+        campaign_id="C", generation=1, parent_snapshot_id="S0",
+        parent_skill_key="S01@1.0.0", canonical_question_type="object_counting",
+        events=events)
+    prompt = build_induction_prompt(parent, bundle, ["detect_objects"])
+    scan_prompt_for_leakage(prompt)          # 不抛异常即通过
+    assert "e0" not in prompt and "s0" not in prompt     # sample / scene id 不进 prompt
+    assert "S01" in prompt and '"failure_summary"' in prompt  # 父身份与失败摘要进了
 
 
 def test_final_test_dir_not_mounted():

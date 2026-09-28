@@ -480,23 +480,68 @@ def retrieve_ex(
     ranked = _rank(question, [t[0] for t in ranked_all],
                    [t[1] for t in ranked_all],
                    policy=eff_policy, rerank=use_rerank, embedder=embedder)
-    k = int(eff_policy.top_k if top_k is None else top_k)
     for i, (skill, _d, score) in enumerate(ranked, start=1):
         row = rows[skill_version_key(skill)]
         row.score = float(score)
         row.rank = i
+
+    # ---- v10 §5.3：先按谱系分组，谱系内选一个版本，top_k 针对**方法谱系** ----
+    #
+    # 规范原文（§5.3）："2. 检索先按题型过滤，再按谱系分组，最后在谱系内选版本；
+    # 3. `top_k` 针对方法谱系，而不是任意版本条目；6. 不允许通过版本号大小直接获得
+    # 排序加分；7. 检索分数、稳定 tie-break 和版本选择原因必须落盘。"
+    #
+    # `ranked` 已按 (分数降序, `skill_id@version` 升序) 排序，因此谱系的先后由组内
+    # **最高分**版本决定（谱系排序），组内第一项即该谱系的代表版本 —— 版本号本身
+    # 不参与打分，只在分数并列时作稳定 tie-break。
+    grouped: dict[str, list[tuple[SkillSpec, RetrievalDecision, float]]] = {}
+    lineage_order: list[str] = []
+    for item in ranked:
+        lin = str(item[0].skill_id)
+        if lin not in grouped:
+            lineage_order.append(lin)
+        grouped.setdefault(lin, []).append(item)
+
+    k = int(eff_policy.top_k if top_k is None else top_k)
+    selected_versions: list[str] = []
+    hits: list[RetrievedSkill] = []
+    for i, lin in enumerate(lineage_order, start=1):
+        group = grouped[lin]
+        rep_skill, rep_decision, rep_score = group[0]
+        rep_key = skill_version_key(rep_skill)
+        others = [skill_version_key(s) for s, _d, _sc in group[1:]]
         if i > k:
-            # 硬条件通过但排序未进 top-k（§13.5"选取"的落选者，如实记名次）
-            row.reason_code = "not_selected_top_k"
-            row.reason = f"排序第 {i} 名，top_k={k} 未选中"
-        else:
-            row.selected = True
-            # 检索刚完成，还没有发出任何模型请求 → 未交付（原因：尚无请求）。
-            # 交付与否由 `_record_skill_delivery` 在真正发出请求后改写（§13.6）。
-            row.delivery_reason = "no_model_request"
+            for skill, _d, _sc in group:
+                row = rows[skill_version_key(skill)]
+                row.reason_code = "not_selected_top_k"
+                row.reason = f"谱系 {lin} 排序第 {i} 名，top_k={k} 未选中"
+            continue
+        # 谱系入选：代表版本被选中，同谱系其余版本记"已选择另一版本"（§5.3-1）。
+        row = rows[rep_key]
+        row.selected = True
+        row.delivery_reason = "no_model_request"   # 尚无模型请求 → 未交付
+        selected_versions.append(rep_key)
+        for other in others:
+            orow = rows[other]
+            orow.reason_code = "lineage_version_not_selected"
+            orow.reason = (
+                f"谱系 {lin} 内已选择 {rep_key}（每题对同一 skill_id 最多交付一个版本，"
+                "§5.3-1）")
+        reason = ("single_eligible_version" if len(group) == 1 else
+                  "score_tie_break_stable_key"
+                  if any(r[2] == rep_score for r in group[1:]) else "higher_ranking_score")
+        record.record_lineage_selection(
+            lin, rep_key,
+            candidates=[{"skill_version": skill_version_key(s),
+                         "score": float(sc),
+                         "rank": int(rows[skill_version_key(s)].rank or 0),
+                         "hard_filter_passed": bool(d.ok)}
+                        for s, d, sc in group],
+            reason=reason)
+        hits.append(_hit(rep_skill, rep_score, rep_decision))
+
     record.candidates = list(rows.values())
-    hits = [_hit(s, sc, d) for s, d, sc in ranked[:k]]
-    record.retrieved_skill_versions = [h.skill_version for h in hits]
+    record.retrieved_skill_versions = list(selected_versions)
     record.delivery_channel = "not_sent"
     record.delivery_note = "检索完成，尚未发出模型请求（未交付）"
     return hits, record

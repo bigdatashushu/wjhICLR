@@ -1,0 +1,15 @@
+{
+  "campaign_id": "camp-v10-001",
+  "created_at": "2026-09-28T06:57:21.772356+00:00",
+  "delivered": false,
+  "delivered_content_sha256": "",
+  "episodes_run": 0,
+  "experience_event_refs": [],
+  "generation": 1,
+  "new_skill_version": "S01@1.1.0",
+  "request_content_sha256_match": false,
+  "retrieved": false,
+  "snapshot_content_sha256": "",
+  "snapshot_id": "S0-seed-20260925-v1",
+  "status": "promoted_not_observed"
+}

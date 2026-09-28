@@ -49,7 +49,11 @@ from skill3d.reconstruction_gate.scene_state import (
     scope_scene_to_question,
 )
 from skill3d.routing.retrieval_policy import RetrievalPolicy
-from skill3d.routing.skill_retriever import canonical_question_type, retrieve_ex
+from skill3d.routing.skill_retriever import (
+    canonical_question_type,
+    retrieval_decision,
+    retrieve_ex,
+)
 from skill3d.routing.task_classifier import TaskClassification, classify
 from skill3d.sandbox.ast_guard import ast_guard, normalize_program_source
 from skill3d.sandbox.kernel import CellResult, RestrictedNamespaceKernel
@@ -71,7 +75,14 @@ from skill3d.schemas import (
     verify_attribution,
 )
 from skill3d.schemas.image_ledger import LAYOUT_DERIVED_PLUS_ORIGINALS
-from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
+from skill3d.schemas.retrieval import SkillCandidateRecord
+from skill3d.skills.delivery import (
+    SkillDeliveryPlan,
+    plan_delivery,
+    skill_body_length,
+    skill_content_sha256,
+    skill_version_key,
+)
 from skill3d.schemas.evidence import CAPABILITIES
 from skill3d.synthesis.program_assembler import (
     SynthesisError,
@@ -169,6 +180,13 @@ class OnlineRunConfig:
     # v9 §9.4：主动图像的声明布局（派生图占位上限；图像上限 = max_images）
     image_layout: str = LAYOUT_DERIVED_PLUS_ORIGINALS
     max_derived_images: int = 8
+    # v10 §8.2：候选效果评测的**固定注入**标记。非 None 时本 episode 的 Skill 输入
+    # 完全由该绑定决定（跳过检索选择），且记录里带 `evaluation_binding`；
+    # 该模式只能用于候选效果评测（不得用于 learning 经验采集 / 发布后运行 / 最终成绩）。
+    evaluation_binding: Optional[object] = None
+    # v10 §8.4：正常检索的版本选择模式。`model` = 两阶段选择（模型按摘要选版本，
+    # 失败时确定性回落并如实记录）；`deterministic` = 只用检索排序（消融 / mock 用）。
+    version_selection: str = "model"
 
     def __post_init__(self) -> None:
         # New v9 fields are authoritative when explicitly supplied. Historical
@@ -194,6 +212,21 @@ class OnlineRunConfig:
         # the v9 fields the normalized source of truth.
         self.max_agent_rounds = self.max_solver_rounds
         self.reserve_final_rounds = self.finalization_rounds
+        # v10 §8.2：固定注入臂必须恰好一条完整 Skill —— 多于一条就等于"同时提供多个
+        # Skill"，§8.3 明确禁止；零条等于"空 Skill 基线"，同样禁止（EV-03）。
+        if self.evaluation_binding is not None:
+            if len(self.skills) != 1:
+                raise ValueError(
+                    "evaluation_binding 要求恰好注入一条完整 Skill（§8.2），"
+                    f"收到 {len(self.skills)} 条")
+            binding = self.evaluation_binding
+            version = str(getattr(binding, "skill_version", "")
+                          or (binding or {}).get("skill_version", ""))
+            spec = self.skills[0]
+            if version != f"{spec.skill_id}@{spec.version}":
+                raise ValueError(
+                    f"固定注入绑定的版本 {version!r} 与被注入的 Skill "
+                    f"{spec.skill_id}@{spec.version} 不一致（§8.2）")
 
 
 @dataclass
@@ -309,10 +342,17 @@ class EpisodeOutcome:
     authorized_metric_tasks: list[str] = field(default_factory=list)  # 本题授权后
 
 
+class FixedSkillInjectionError(RuntimeError):
+    """v10 §8.2：固定注入的评测臂无效（Skill 未过硬条件 / 注入条数不等于 1）。
+
+    评测臂无效必须**吵出来**：静默跑成"无 Skill 基线"会让 A/B 比较失去意义
+    （v10 §1.2 EV-03 正是这个错）。
+    """
+
+
 @dataclass
 class _SynthResult:
     """M8 产出。direct_answer 仅 C0（无 program）时非空。"""
-
     program: Optional[EpisodeProgram]
     # §19.3 六类 + `mock_stub`：vllm_ok | vllm_parse_error | vllm_service_error |
     # m8_parse_recovered | direct_answer_fallback | partial_tool_recovery | mock_stub
@@ -548,16 +588,195 @@ def _evidence_state_snapshot(scene) -> tuple[dict, dict]:
     return states, dict(getattr(profile, "state_reasons", None) or {})
 
 
+def _fixed_injection_retrieval(episode, scene, cfg: OnlineRunConfig,
+                               outcome: EpisodeOutcome, *, trigger: str = "initial",
+                               retrieval_index: int = 1) -> list[SkillSpec]:
+    """§8.2 固定注入臂：跳过**检索选择**，不跳过适用性 / 长度 / 权限 / Schema 校验。
+
+    规范原文（§8.2）："评测目标 Skill 时跳过检索选择，但不跳过 Skill 的适用性、
+    内容长度、工具权限和 Schema 校验"；§8.3 禁止"A 使用空 Skill、B 使用候选 Skill"。
+
+    因此这里：
+
+    - 把被评测 Skill 的硬条件判定（题型 / 证据签名 / 米制 gate / 状态）**照跑一遍**：
+      不通过就抛 `FixedSkillInjectionError`（评测臂无效要吵出来，不能静默退化成
+      "无 Skill 基线" —— 那正是 v10 EV-03 的错）；
+    - 记录里显式写 `evaluation_binding`，候选行原因码是 `fixed_injection_*`，
+      **不得**写成 `hit`（§8.3：不得把固定注入记录成正常检索命中）。
+    """
+    skills = list(cfg.skills or [])
+    if len(skills) != 1:
+        raise FixedSkillInjectionError(
+            f"固定注入臂必须恰好一条完整 Skill，收到 {len(skills)} 条"
+            "（§8.2：每次模型请求只包含该臂被评测的一条完整 Skill）")
+    skill = skills[0]
+    task_type = canonical_question_type(getattr(episode, "question_type", ""))
+    decision = retrieval_decision(skill, scene, task_type or "")
+    row = SkillCandidateRecord(
+        skill_id=str(skill.skill_id),
+        version=str(skill.version),
+        skill_version=skill_version_key(skill),
+        canonical_question_type=str(task_type or ""),
+        hard_filter_passed=bool(decision.ok),
+        reason_code=("fixed_injection_selected" if decision.ok
+                     else "fixed_injection_not_applicable"),
+        reason=("§8.2 固定注入（跳过检索选择，适用性校验通过）" if decision.ok
+                else f"§8.2 固定注入的 Skill 未通过适用性校验: {decision.reason}"),
+        matched_evidence_signature=dict(decision.matched_signature),
+        gate_version_matched=decision.gate_version_matched,
+        content_sha256=skill_content_sha256(skill),
+        content_chars=skill_body_length(skill),
+        delivered=False,
+        delivery_reason="not_selected" if not decision.ok else "no_model_request",
+    )
+    record = SkillRetrievalRecord(
+        retrieval_index=int(retrieval_index),
+        trigger=str(trigger),
+        canonical_question_type=str(task_type or ""),
+        question_type_raw=str(getattr(episode, "question_type", "") or ""),
+        question_type_known=bool(task_type),
+        evidence_version=str(
+            getattr(getattr(scene, "evidence_profile", None), "profile_version", "") or ""),
+        config_version=cfg.retrieval_policy.version(),
+        config_sha256=cfg.retrieval_policy.sha256(),
+        config_source=str(cfg.retrieval_policy.source),
+        policy=cfg.retrieval_policy.to_dict(),
+        active_snapshot_ref=str(cfg.active_snapshot_ref or ""),
+        active_snapshot_manifest_sha256=str(cfg.active_snapshot_manifest_sha256 or ""),
+        n_skills_offered=1,
+        candidates=[row],
+        eligible_skill_versions=([row.skill_version] if decision.ok else []),
+        retrieved_skill_versions=([row.skill_version] if decision.ok else []),
+        delivery_channel="not_sent",
+        delivery_note="§8.2 固定注入：等待模型请求，尚未交付",
+    )
+    if decision.ok:
+        row.selected = True
+    record.mark_fixed_injection(cfg.evaluation_binding)
+    states, reasons = _evidence_state_snapshot(scene)
+    record.evidence_states = states
+    record.evidence_state_reasons = reasons
+    outcome.retrieval_records.append(record)
+    outcome.retrieved_skills = (
+        [_hit_from_decision(skill, decision).model_dump()] if decision.ok else [])
+    outcome.selected_skill_semvers = ([skill_version_key(skill)] if decision.ok else [])
+    outcome.retrieved_skill_versions = list(record.retrieved_skill_versions)
+    if not decision.ok:
+        raise FixedSkillInjectionError(
+            "§8.2 固定注入的 Skill 未通过适用性校验，评测臂无效"
+            f"（{skill_version_key(skill)}: {decision.reason}）")
+    return [skill]
+
+
+def _hit_from_decision(skill: SkillSpec, decision) -> RetrievedSkill:
+    """固定注入臂的 `RetrievedSkill` 记录（硬条件通过；排序分数不适用）。"""
+    return RetrievedSkill(
+        skill_id=str(skill.skill_id),
+        skill_version=skill_version_key(skill),
+        score=1.0,
+        hard_filter_passed=True,
+        matched_evidence_signature=dict(decision.matched_signature),
+        gate_version_matched=decision.gate_version_matched,
+    )
+
+
+def _version_selection_prompt(episode, record, lineage_entry: dict,
+                              skills_by_key: dict) -> str:
+    """§8.4 第一阶段之后的**选择请求**文本（只含短摘要，不含任何 Skill 正文）。"""
+    from skill3d.schemas.retrieval import short_method_summary
+
+    lineage = str(lineage_entry.get("lineage", ""))
+    lines = [
+        "你在为一道 3D 场景问答题选择**方法谱系内的一个版本**。",
+        "下面是该谱系当前可用的版本及其短摘要（不含完整方法正文）：",
+    ]
+    for cand in lineage_entry.get("candidates") or []:
+        key = str(cand.get("skill_version", ""))
+        spec = skills_by_key.get(key)
+        summary = short_method_summary(spec, max_chars=200) if spec is not None else "（摘要缺失）"
+        lines.append(f"- {key}：{summary}")
+    lines += [
+        f"题目：{episode.question}"
+        if hasattr(episode, "question") else "题目：（未提供）",
+        "只依据上面的摘要选择**一个**版本。",
+        '输出严格 JSON：{"selected_skill_version": "<skill_id@version>"}',
+        "不要输出任何其他文本。",
+    ]
+    return "\n".join(lines)
+
+
+def _select_version_with_model(episode, record, cfg: OnlineRunConfig, outcome,
+                               llm) -> None:
+    """§8.4 两阶段选择的第二阶段：由**在线模型**依据摘要选定一个版本。
+
+    规范原文（§8.4）："2. 在线模型只根据候选摘要选择一条 `selected_skill_version`；
+    3. 框架重建后续上下文，只放入被选版本的完整正文；4. 未选版本不进入后续模型上下文。
+    …… 选择阶段与执行阶段分别记录请求 hash；只有第二阶段实际发送的完整正文才记
+    `delivered`。"
+
+    - 只在同一谱系存在 **>1 个可选版本**时才发起选择请求（单版本无选择可言）；
+    - 模型返回不可解析 / 不在候选里的版本 → **不猜**：保留确定性排序结果，并把这次
+      选择请求与响应 hash 一起落盘（失败也要可审计）；
+    - 这里只改**记录**：完整正文仍由后续合成步骤按被选版本装入请求（第二阶段的
+      执行请求 hash 与交付 hash 由 `SkillRetrievalRecord.add_delivery` 记）。
+    """
+    import hashlib
+
+    multi = [e for e in (record.lineage_selections or [])
+             if len(e.get("candidates") or []) > 1]
+    if not multi:
+        return
+    skills_by_key = {f"{s.skill_id}@{s.version}": s for s in (cfg.skills or [])}
+    prompt = _version_selection_prompt(episode, record, multi[0], skills_by_key)
+    record.selection_request_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    try:
+        response = llm.chat([{"role": "user", "content": prompt}], max_tokens=256)
+    except Exception as exc:  # noqa: BLE001 - 选择请求失败不得阻断在线链
+        record.delivery_note = (f"{record.delivery_note}；§8.4 版本选择请求失败"
+                                f"（{type(exc).__name__}）→ 保留确定性排序结果").strip("；")
+        outcome.m7_notes.append(f"§8.4 版本选择请求失败：{type(exc).__name__}: {exc}")
+        return
+    record.selection_response_sha256 = hashlib.sha256(
+        str(response).encode("utf-8")).hexdigest()
+    chosen = ""
+    try:
+        payload = json.loads(str(response).strip().strip("`"))
+        chosen = str(payload.get("selected_skill_version", "") or "")
+    except Exception:  # noqa: BLE001 - 解析失败 → 确定性回落（如实记录）
+        chosen = ""
+    allowed = {str(c.get("skill_version")) for c in (multi[0].get("candidates") or [])}
+    if chosen and chosen in allowed:
+        record.select_version_in_lineage(
+            str(multi[0]["lineage"]), chosen, source="model_selected_from_summaries")
+        outcome.m7_notes.append(
+            f"§8.4 两阶段选择：模型从 {len(allowed)} 个版本中选了 {chosen}")
+    else:
+        record.select_version_in_lineage(
+            str(multi[0]["lineage"]), str(multi[0]["selected_version"]),
+            source="deterministic_fallback")
+        outcome.m7_notes.append(
+            f"§8.4 两阶段选择：模型未给出合法版本（{chosen!r}）→ 确定性回落 "
+            f"{multi[0]['selected_version']}")
+
+
 def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: EpisodeOutcome,
                           *, trigger: str = "initial",
-                          scene_quality: Optional[float] = None) -> list[SkillSpec]:
+                          scene_quality: Optional[float] = None,
+                          llm=None) -> list[SkillSpec]:
     """§13.5/§13.6：检索一次并把**完整记录**落进 outcome；返回可用 SkillSpec 列表。
 
     `trigger="evidence_update"` 是 §13.5 的"证据更新后可在**同一快照**中重检索，
     更新实际交付记录"——重检索只换输入证据，**不**发布新库（`cfg.skills` 不变），
     因此本函数没有重新加载快照的路径。
+
+    v10 §8.2：`cfg.evaluation_binding` 非空时走**固定注入**分支（候选效果评测），
+    该分支不做检索选择，也不得把记录写成正常命中的形态。
+    v10 §8.4：正常检索路径在同谱系存在多版本时追加一次**选择请求**（两阶段选择）。
     """
     index = len(outcome.retrieval_records) + 1
+    if cfg.evaluation_binding is not None:
+        return _fixed_injection_retrieval(episode, scene, cfg, outcome,
+                                          trigger=trigger, retrieval_index=index)
     states, reasons = _evidence_state_snapshot(scene)
     retrieved, record = retrieve_ex(
         episode.question, scene, cfg.skills,  # type: ignore[arg-type]
@@ -572,13 +791,17 @@ def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: Episode
     record.evidence_states = states
     record.evidence_state_reasons = reasons
     by_key = {f"{s.skill_id}@{s.semver}": s for s in cfg.skills}
-    selected = [by_key[r.skill_semver] for r in retrieved if r.skill_semver in by_key]
-    record.retrieved_skill_versions = [r.skill_semver for r in retrieved]
+    # §8.4 两阶段选择：同谱系多版本竞争时由在线模型按**摘要**选定一个版本
+    # （只在 real 模式且有真实模型客户端时发起；mock_light 保持确定性选择）。
+    if cfg.version_selection == "model" and cfg.mode == "real" and llm is not None:
+        _select_version_with_model(episode, record, cfg, outcome, llm)
+    selected = [by_key[key] for key in record.retrieved_skill_versions
+                if key in by_key]
     outcome.retrieval_records.append(record)
     outcome.retrieved_skills = [r.model_dump() for r in retrieved]
     outcome.selected_skill_semvers = [f"{s.skill_id}@{s.semver}" for s in selected]
-    outcome.skill_mapping_misses = [r.skill_semver for r in retrieved
-                                    if r.skill_semver not in by_key]
+    outcome.skill_mapping_misses = [key for key in record.retrieved_skill_versions
+                                    if key not in by_key]
     return selected
 
 
@@ -1165,7 +1388,8 @@ def run_episode(
         quality = cfg.scene_quality if cfg.scene_quality is not None \
             else (handle.quality_overall if handle is not None else None)
         selected_skills = _retrieve_for_episode(
-            episode, scene, cfg, outcome, trigger="initial", scene_quality=quality)
+            episode, scene, cfg, outcome, trigger="initial", scene_quality=quality,
+            llm=llm)
         outcome.retrieved_skill_versions = list(
             outcome.retrieval_records[-1].retrieved_skill_versions)
         notes.extend(_retrieval_summary_lines(outcome.retrieval_records[-1]))
@@ -1554,7 +1778,8 @@ def run_episode(
                     # "在当前证据下哪些方法可检索、哪些被选中"。
                     if changed:
                         selected_skills = _retrieve_for_episode(
-                            episode, scene, cfg, outcome, trigger="evidence_update")
+                            episode, scene, cfg, outcome, trigger="evidence_update",
+                            llm=llm)
                         record = outcome.retrieval_records[-1]
                         outcome.retrieved_skill_versions = list(
                             record.retrieved_skill_versions)

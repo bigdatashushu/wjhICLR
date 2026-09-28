@@ -1,0 +1,12 @@
+{
+  "campaign_id": "camp-v10-002",
+  "candidate_id": "cand-72770e01830f",
+  "created_at": "2026-09-28T12:24:41.226287+00:00",
+  "generation": 2,
+  "outcome": "rejected",
+  "reasons": [
+    "seed 0: panel_score_strictly_improved=False",
+    "seed 1: panel_score_strictly_improved=False"
+  ],
+  "snapshot_before": "S0-seed-20260925-v1"
+}

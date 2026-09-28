@@ -1,0 +1,90 @@
+{
+  "campaign_id": "camp-v10-002",
+  "code_state": {
+    "commit": "c2da26ffed153be0358366b70686790bd3eb5d70",
+    "dirty_worktree": true,
+    "sources": {
+      "scripts/run_evolution_campaign.py": "71a73a81e6806ec0b0022d81bdaac9a84b617efa11fdd8faa9676f20a672f844",
+      "src/skill3d/evolution/campaign.py": "6888228dd4783a7d79fe4a3919b0e2a56280a7904b4723e257809af97694038b",
+      "src/skill3d/evolution/experience.py": "9f4e28f14d82c317bc3a39ac1758f1e5c6ed8332282bc06f4aae6f005fa9aae1",
+      "src/skill3d/evolution/panel.py": "c4b041381bdf52f539cc17a4dba07499e39c05f4bc2d16cf49abc2b2d0030142",
+      "src/skill3d/governance/induce.py": "cd0c1747d4cfa0a8a5ce0929f655c8e640f9159b509dc02354f484ec5d3aa051",
+      "src/skill3d/governance/revise_patch.py": "3e622045edb4239472c56d2f388a9ff47cfee35e5814982bffc833ec4633332f",
+      "src/skill3d/online/runner.py": "ea3bcbfdc54df0d005810cdca76f2e4afefb3ec91d2664d0288e919ec4f110f2",
+      "src/skill3d/routing/skill_retriever.py": "1646d35c5ef9a6605d7c3b5237422418dca6ea37ddd113058e1e232bd75fe82f",
+      "src/skill3d/schemas/evolution.py": "e7aaeff9337b767fd4790982feadcb421f7db493b933c23f97c7885888fa1420",
+      "src/skill3d/schemas/experience.py": "3d330dfee97b463cc43960db5afc38352eaaa1945490895c5a7c32678975decc",
+      "src/skill3d/schemas/retrieval.py": "86d76e145236b778eb85793c29f14ffb1a2b5780bbaba9e11ac6ee7223a9e2c3",
+      "src/skill3d/skills/promote_atomic.py": "b167f32e29f93d25f3dc505e301b7de67e7986b8a51deea6c192c13733b04413",
+      "src/skill3d/skills/registry.py": "2dd49be93f0cdb22f6b53f069098eadc89cbf9550bc1ecbc0255a30046ae27cc"
+    },
+    "sources_sha256": "8165e4b9fbdee74d85f7516f4f95d1b56ba18cfc1e64bef5e93ebde99680ff25"
+  },
+  "created_at": "2026-09-28T12:20:14.619556+00:00",
+  "episodes": [
+    {
+      "qa_id": "2514",
+      "scene_id": "fb5a96b1a2"
+    },
+    {
+      "qa_id": "82",
+      "scene_id": "45261121"
+    },
+    {
+      "qa_id": "2569",
+      "scene_id": "f9f95681fd"
+    },
+    {
+      "qa_id": "150",
+      "scene_id": "47429922"
+    },
+    {
+      "qa_id": "4466",
+      "scene_id": "scene0684_01"
+    },
+    {
+      "qa_id": "57",
+      "scene_id": "42899685"
+    },
+    {
+      "qa_id": "76",
+      "scene_id": "44358536"
+    },
+    {
+      "qa_id": "4417",
+      "scene_id": "scene0621_00"
+    }
+  ],
+  "generation": 2,
+  "manifest_hash": "61259a20580170f8bf3d0490972cd448a6a67cc5d6316b07c4a77b7db4708046",
+  "mode": "real",
+  "n_items": 8,
+  "panel_hash": "ab7179e2421295ce1337fca97a97775038f76975caf02112febb52a5951366ea",
+  "qa_ids": [
+    "2514",
+    "82",
+    "2569",
+    "150",
+    "4466",
+    "57",
+    "76",
+    "4417"
+  ],
+  "retrieval_policy_sha256": "4b497fdbcc8c1b19b1407129205d7d3a4bfbbd98e0bb9b504df2d228a94193fa",
+  "retrieval_policy_version": "ret-v9-1",
+  "run_id": "camp-v10-002-g2-learning",
+  "seed": 0,
+  "skills_loaded": [
+    "S01@1.0.0",
+    "S02@1.0.0",
+    "S03@1.0.0",
+    "S04@1.0.0",
+    "S05@1.0.0",
+    "S06@1.0.0",
+    "S07@1.0.0",
+    "S08@1.0.0"
+  ],
+  "snapshot_id": "S0-seed-20260925-v1",
+  "split": "induction",
+  "trace_dir": "data/v10_campaign/runs/camp-v10-002/traces/gen2/learning"
+}

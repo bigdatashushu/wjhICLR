@@ -204,11 +204,16 @@ def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], st
     files, candidates, or future candidates: only the atomically promoted
     snapshot is eligible for online retrieval.  The three-value return shape
     is kept for existing online callers.
+
+    v10 §5.3-5：同一谱系最多两个在线竞争版本，第三个晋升时最旧版本转
+    ``historical`` —— 历史版本**仍在快照里**（供审计与回滚），但不参加新 episode 的
+    检索，所以这里必须跳过 ``state == "historical"`` 的条目。S0 与 v9 的快照没有该
+    字段，缺省即"在线"（不猜、不改写历史快照）。
     """
     import json
     from pathlib import Path as _Path
 
-    from .promote_atomic import read_active_snapshot
+    from .promote_atomic import ENTRY_STATE_HISTORICAL, read_active_snapshot
 
     p = _Path(path)
     store_dir = p if p.is_dir() else p.parent
@@ -229,6 +234,9 @@ def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], st
         return [], ["active snapshot.entries 不是 mapping → 空 Skill"], "genesis"
     for rid, entry in entries.items():
         if not isinstance(entry, dict) or entry.get("candidate_type") != "skill":
+            continue
+        if entry.get("state") == ENTRY_STATE_HISTORICAL:
+            warnings.append(f"条目 {rid} 为 historical（§5.3-5）：保留但不参加检索")
             continue
         raw = entry.get("spec_content") or ""
         try:

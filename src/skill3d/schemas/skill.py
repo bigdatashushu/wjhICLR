@@ -111,7 +111,15 @@ class SkillSpec(Spec):
         super().__init__(**data)
 
 
-class SkillCandidate(Spec):
+class SkillCandidateV5(Spec):
+    """v5 形状的候选（**历史数据只读解释用**）。
+
+    v10 §7.2 用完整候选 `schemas.evolution.SkillCandidate` 取代了它：这个 v5 形状
+    只有一串 `spec_content`、`parent_version` 可空、没有 campaign/generation/谱系，
+    因此无法支撑"从具体父版本产生合法新版本"的合同。保留本类只为读旧 JSONL / 旧
+    收据时**不静默升格**；新代码一律用 v10 定义。
+    """
+
     candidate_id: str
     root_candidate_id: str
     revision_id: str
@@ -128,6 +136,10 @@ class SkillCandidate(Spec):
     @property
     def gpt6_patch_ref(self) -> Optional[str]:
         return self.offline_patch_ref
+
+
+# v5 名称别名（只读兼容；不得用于 v10 演化链）
+SkillCandidate = SkillCandidateV5
 
 
 class DeepSeekGovernanceDecision(Spec):
@@ -181,6 +193,7 @@ __all__ = [
     "RetrievedSkill",
     "SKILL_FAMILIES",
     "SkillCandidate",
+    "SkillCandidateV5",
     "SkillFamily",
     "SkillGovernanceDecision",
     "SkillSource",

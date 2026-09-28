@@ -1,0 +1,20 @@
+{
+  "campaign_id": "camp-v10-001",
+  "candidate_id": "cand-45bf111fa315",
+  "checks": {
+    "diff_nonempty_and_consistent": true,
+    "json_parseable": true,
+    "method_body_deliverable": true,
+    "no_leakage": true,
+    "parent_hash_matches": true,
+    "schema_extra_forbid": true,
+    "single_canonical_question_type": true,
+    "skill_id_matches_parent": true,
+    "tools_known": true,
+    "version_bump_legal": true
+  },
+  "created_at": "2026-09-28T06:52:47.763675+00:00",
+  "generation": 1,
+  "passed": true,
+  "problems": []
+}
