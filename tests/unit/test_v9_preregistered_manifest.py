@@ -19,6 +19,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 from skill3d.adapters.episode_source import (
     _sample_by_scene,
@@ -119,30 +120,78 @@ def test_loader_exposes_exclusions_and_sampling_receipt_parameters():
     assert "sampling_seed" in params, "抽样口径必须与 seed 绑定"
 
 
-def test_missing_preregistered_qa_ids_are_recorded_with_reasons(tmp_path):
+def test_missing_preregistered_qa_ids_are_recorded_with_reasons(tmp_path, monkeypatch):
     """§5.3：不足 32 帧／视频缺失不得静默消失 —— 每条都要有结果行与原因。"""
-    import numpy as np
-
-    from skill3d.adapters import frame_set as fs
-
-    # 造一个合法 FrameSet（32 帧）用于对比：证明排除项确实带原因而非抛异常
-    fset = fs.build_frame_set(64, n_frames=32, fps=30.0)
-    assert len(fset.frame_ids) == 32
-    assert len(np.zeros(1)) == 1   # 占位，确保 numpy 导入被使用
-
-    # 直接验证排除记录的载体契约（真实视频缺失场景需要数据集，TODO_USER_INPUT）
+    from skill3d.adapters import vsibench_loader
     from skill3d.adapters.episode_source import load_vsi_bench_items as loader
 
+    # 元数据是输入夹具；不下载数据，也不依赖本机恰好存在的官方 meta。
+    monkeypatch.setattr(vsibench_loader, "load_meta", lambda **kwargs: [{
+        "id": "missing-video-qa", "qa_id": "missing-video-qa",
+        "dataset": "scannet", "scene_name": "__no_such_scene__",
+        "question_type": "object_rel_distance", "question": "Which is closest?",
+        "options": ["chair", "table"], "ground_truth": "A",
+    }])
     exclusions: list = []
     receipt: dict = {}
     try:
-        loader("inner_validation", {"inner_validation": ["__no_such_scene__"]},
+        loader("inner_validation", {"inner_validation_scene_ids": ["__no_such_scene__"]},
                video_root=str(tmp_path / "no_videos"), exclusions=exclusions,
                sampling_receipt=receipt)
     except Exception as exc:  # noqa: BLE001 - 无可用 episode 时抛来源错误（预期）
         assert "无可用 episode" in str(exc)
     # 抽样收据即使在无视频时也已生成（清单先于加载冻结，§5.3）
     assert receipt.get("strategy") in ("seeded_scene_stratified", "declared_order")
+    assert receipt["qa_ids"] == ["missing-video-qa"]
+    assert len(exclusions) == 1
+    exclusion = exclusions[0]
+    assert exclusion["status"] == "input_error"
+    assert exclusion["qa_id"] == "missing-video-qa"
+    assert exclusion["scene_name"] == "__no_such_scene__"
+    assert exclusion["reason"] == "video_missing"
+    assert exclusion["question_type"] == "object_rel_distance"
+    assert exclusion["ground_truth"] == "A"
+    assert exclusion["source_attempts"]
+
+
+def test_input_error_is_a_zero_score_result_and_preserves_the_denominator(
+        tmp_path, monkeypatch):
+    from skill3d.adapters import vsibench_loader
+    from skill3d.online.runner import OnlineRunConfig, run_split
+    from skill3d.trace.store import TraceStore
+
+    monkeypatch.setattr(vsibench_loader, "load_meta", lambda **kwargs: [{
+        "id": "missing-video-qa", "qa_id": "missing-video-qa",
+        "dataset": "scannet", "scene_name": "__no_such_scene__",
+        "question_type": "object_rel_distance", "question": "Which is closest?",
+        "options": ["chair", "table"], "ground_truth": "A",
+    }])
+    exclusions: list = []
+    items = load_vsi_bench_items(
+        "inner_validation",
+        {"inner_validation_scene_ids": ["__no_such_scene__"]},
+        video_root=str(tmp_path / "no_videos"),
+        exclusions=exclusions,
+        include_input_errors=True,
+    )
+
+    assert len(items) == 1 and items[0].input_error is not None
+    trace_dir = tmp_path / "traces"
+    outcomes, run = run_split(
+        items,
+        OnlineRunConfig(mode="real", trace_dir=str(trace_dir), memory_dir=""),
+        trace_store=TraceStore(trace_dir),
+    )
+
+    out = outcomes[0]
+    assert out.final_state == out.episode_status == "input_error"
+    assert out.correct is False and out.answer is None
+    assert run.n_episodes == 1 and run.accuracy == 0.0
+    evaluation = json.loads(
+        (trace_dir / "evaluation_result.jsonl").read_text().splitlines()[0])
+    assert evaluation["qa_id"] == "missing-video-qa"
+    assert evaluation["episode_status"] == "input_error"
+    assert evaluation["input_error_reason"] == "video_missing"
 
 
 def test_manifest_records_sampling_and_exclusions_fields():
@@ -151,6 +200,29 @@ def test_manifest_records_sampling_and_exclusions_fields():
     for key in ("sampling_strategy", "sampling_seed", "sampling_qa_ids",
                 "sampling_qa_id_sha256", "exclusions", "denominator_preserved"):
         assert key in src, f"RunManifest 未记录 {key}"
+
+
+def test_denominator_manifest_is_derived_from_actual_result_ids():
+    from skill3d.online.eval import _denominator_fields
+
+    complete = _denominator_fields(
+        [
+            SimpleNamespace(qa_id="ok", episode_status="answered"),
+            SimpleNamespace(qa_id="bad-input", episode_status="input_error"),
+        ],
+        {"qa_ids": ["ok", "bad-input"]},
+        [{"qa_id": "bad-input", "status": "input_error"}],
+    )
+    missing = _denominator_fields(
+        [SimpleNamespace(qa_id="ok", episode_status="answered")],
+        {"qa_ids": ["ok", "bad-input"]},
+        [{"qa_id": "bad-input", "status": "input_error"}],
+    )
+
+    assert complete["denominator_preserved"] is True
+    assert complete["n_input_error"] == 1
+    assert missing["denominator_preserved"] is False
+    assert missing["missing_result_qa_ids"] == ["bad-input"]
 
 
 def test_eval_cli_still_imports_cleanly():

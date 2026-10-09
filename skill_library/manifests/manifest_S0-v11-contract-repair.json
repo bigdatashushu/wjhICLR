@@ -1,0 +1,99 @@
+{
+  "active_by_question_type": {
+    "obj_appearance_order": "S07@1.1.0",
+    "object_abs_distance": "S02@1.1.0",
+    "object_counting": "S01@1.2.0",
+    "object_rel_direction": "S06@1.1.0",
+    "object_rel_distance": "S03@1.1.0",
+    "object_size_estimation": "S04@1.1.0",
+    "room_size_estimation": "S05@1.1.0",
+    "route_planning": "S08@1.2.0"
+  },
+  "entries": [
+    {
+      "content_sha256": "a9b9a422fdfa9cdec1747f8c484ee406169640a1467f81e469f7d51ca8f2abbc",
+      "parent_version": "S01@1.1.0",
+      "question_type": "object_counting",
+      "skill_id": "S01",
+      "skill_version": "S01@1.2.0",
+      "source_ref": "versions/S01/1.2.0/count-scene-objects/SKILL.md",
+      "state": "active",
+      "version": "1.2.0"
+    },
+    {
+      "content_sha256": "a1004bfa6ff53c430aafc98cbc657491eaca2fa460177fa103f8a83bf4c45c98",
+      "parent_version": null,
+      "question_type": "object_abs_distance",
+      "skill_id": "S02",
+      "skill_version": "S02@1.1.0",
+      "source_ref": "versions/S02/1.1.0/estimate-object-distance/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    {
+      "content_sha256": "c85e8cadc39b2d447d06d8ea08cc62e7a62581cd7b3f089fce133e9c0da8239d",
+      "parent_version": null,
+      "question_type": "object_rel_distance",
+      "skill_id": "S03",
+      "skill_version": "S03@1.1.0",
+      "source_ref": "versions/S03/1.1.0/rank-object-distances/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    {
+      "content_sha256": "752c81103283a360b992776d1113029aca7ddd9e4995a7b55c6ab684da0239cd",
+      "parent_version": null,
+      "question_type": "object_size_estimation",
+      "skill_id": "S04",
+      "skill_version": "S04@1.1.0",
+      "source_ref": "versions/S04/1.1.0/estimate-object-size/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    {
+      "content_sha256": "628a5606ce78ac9446bdc64bdbe57888286ece01da21c6d1436b62201fd56516",
+      "parent_version": null,
+      "question_type": "room_size_estimation",
+      "skill_id": "S05",
+      "skill_version": "S05@1.1.0",
+      "source_ref": "versions/S05/1.1.0/estimate-room-area/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    {
+      "content_sha256": "2f71b79eea7832e24832d00f8cd7e2c5b9f0277db30c494f59796e4e6737894e",
+      "parent_version": null,
+      "question_type": "object_rel_direction",
+      "skill_id": "S06",
+      "skill_version": "S06@1.1.0",
+      "source_ref": "versions/S06/1.1.0/judge-relative-direction/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    {
+      "content_sha256": "81299ef053778b14dc5eb8b74952c3c7b4ad85850bb19cc998e97d102f2dc3fb",
+      "parent_version": null,
+      "question_type": "obj_appearance_order",
+      "skill_id": "S07",
+      "skill_version": "S07@1.1.0",
+      "source_ref": "versions/S07/1.1.0/order-first-appearances/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    {
+      "content_sha256": "56bb062613a5da3084f0cedc4f81480e243f3fbe1f806f081244e6ac0705654f",
+      "parent_version": "S08@1.1.0",
+      "question_type": "route_planning",
+      "skill_id": "S08",
+      "skill_version": "S08@1.2.0",
+      "source_ref": "versions/S08/1.2.0/infer-route-turns/SKILL.md",
+      "state": "active",
+      "version": "1.2.0"
+    }
+  ],
+  "generation": 0,
+  "library_format": "harness3d-skill-library/2.0",
+  "manifest_sha256": "17894d3ad29661aa2f79f545549ffa66f703ca20605b92b8506f2c6062fa2381",
+  "parent_snapshot_id": "S0-v11-format-migration",
+  "snapshot_id": "S0-v11-contract-repair"
+}

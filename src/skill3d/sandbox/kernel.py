@@ -54,7 +54,7 @@ class ControlTerminate(BaseException):
 
 
 class AnswerTerminate(ControlTerminate):
-    """`ReturnAnswer(...)` 立即结束本轮与 episode（v7 §10.2）。"""
+    """`ReturnAnswer(...)` 立即结束当前片段；host 验收后才结束本题。"""
     kind = "answer"
 
 
@@ -587,6 +587,12 @@ class RestrictedNamespaceKernel:
     # ---- 状态重置（回灌重执行前必须重注入，§4 M6 字段 9）----
     def set_tools_enabled(self, enabled: bool) -> None:
         self._tools_enabled = bool(enabled)
+
+    def retarget_scene(self, scene: SceneHandle) -> None:
+        """恢复后使用更新的题级授权；保留本 episode 的工具账本。"""
+        self._scene = scene
+        self._ns["scene"] = scene
+        self.answer_slot._question_type = str(scene.question_type or "")
 
     def reset_user_namespace(self) -> None:
         """清空用户命名空间并重注入保留名（保留 Tool/帧/答案槽）。

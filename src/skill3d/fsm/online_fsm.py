@@ -70,6 +70,15 @@ class OnlineFSM:
         ctx = ctx or {}
         s = self.state
 
+        # v11 driver 的预算退出与恢复边：不经评分也必须正常落盘。
+        if event == "solver_failed" and s not in TERMINAL:
+            self.state = OnlineState.ANSWER
+            return self.state
+        if event == "resynthesize" and s in (
+                OnlineState.STATIC_CHECK, OnlineState.SANDBOX_EXECUTE):
+            self.state = OnlineState.SYNTHESIZE_PROGRAM
+            return self.state
+
         if s is OnlineState.INGEST:
             # guard: split ok（final_test 永不进在线链）
             if event == "episode_ready" and ctx.get("split_ok", True):
@@ -187,7 +196,7 @@ class OnlineFSM:
                 self.state = OnlineState.BENCHMARK_EVAL
             elif event == "reject":
                 self.answer_flags.append("geometry_rejected")
-                self.state = OnlineState.BENCHMARK_EVAL
+                self.state = OnlineState.SYNTHESIZE_PROGRAM
 
         elif s is OnlineState.BENCHMARK_EVAL:
             if event == "done":

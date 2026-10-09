@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from skill3d.online import synthetic as syn
+from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
 
 
 def _run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -45,7 +46,8 @@ def test_online_eval_writes_traces(tmp_path):
              "--trace-dir", str(trace_dir), "--seed", "0",
              # 记忆与 RunManifest 也落在 tmp，避免污染仓库工作目录
              "--memory-dir", str(tmp_path / "mem"),
-             "--run-manifest", str(tmp_path / "run_manifest.json"))
+             "--run-manifest", str(tmp_path / "run_manifest.json"),
+             "--frame-size", "120x160")
     assert r.returncode == 0, r.stderr
     assert "EvaluationRun" in r.stdout
     for topic in ("episode_trace", "evaluation_run", "online_run", "trace_record"):
@@ -53,17 +55,62 @@ def test_online_eval_writes_traces(tmp_path):
         assert p.is_file() and p.read_text(encoding="utf-8").strip(), topic
     rec = json.loads((trace_dir / "online_run.jsonl").read_text(encoding="utf-8").splitlines()[0])
     assert rec["mode"] == "mock_light"
+    assert rec["template_version"] == PROMPT_TEMPLATE_VERSION
     assert "不构成任何精度结论" in rec["note"]
     # §19.3：mock 路径的 program 来源显式标 mock_stub（v5 的 deterministic_stub 已废止）
     assert "mock_stub" in r.stdout
     trec = json.loads((trace_dir / "trace_record.jsonl").read_text(
         encoding="utf-8").splitlines()[0])
     assert trec["synthesis_source"] == "mock_stub"
+    assert trec["template_version"] == PROMPT_TEMPLATE_VERSION
     # §6.2：route 由真算的 M4 主门给出（合成 bundle 必须真的过门，不得绕过）
     assert trec["scene_route"] == "full_3d"
     assert trec["evidence_profile"]["geometry_3d"] == "available"
     # RunManifest 落在指定路径（§19.2）
     assert (tmp_path / "run_manifest.json").is_file()
+    manifest = json.loads((tmp_path / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["template_version"] == PROMPT_TEMPLATE_VERSION
+
+
+def test_online_eval_writes_input_error_row_and_preserves_denominator(tmp_path):
+    episodes = tmp_path / "episodes.jsonl"
+    episodes.write_text(json.dumps({
+        "qa_id": "missing-input",
+        "scene_name": "missing-scene",
+        "dataset": "scannet",
+        "question_type": "object_rel_distance",
+        "question": "Which object is closest?",
+        "options": ["chair", "table"],
+        "ground_truth": "A",
+        "split": "inner_validation",
+        "frame_paths": [str(tmp_path / "missing.png")],
+    }) + "\n", encoding="utf-8")
+    trace_dir = tmp_path / "traces"
+    manifest_path = tmp_path / "run_manifest.json"
+
+    result = _run(
+        "skill3d.online.eval",
+        "--split", "inner_validation",
+        "--source", "jsonl",
+        "--episodes-jsonl", str(episodes),
+        "--mode", "mock_light",
+        "--trace-dir", str(trace_dir),
+        "--memory-dir", str(tmp_path / "memory"),
+        "--run-manifest", str(manifest_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    evaluation = json.loads(
+        (trace_dir / "evaluation_result.jsonl").read_text().splitlines()[0])
+    run = json.loads((trace_dir / "evaluation_run.jsonl").read_text().splitlines()[0])
+    manifest = json.loads(manifest_path.read_text())
+    assert evaluation["qa_id"] == "missing-input"
+    assert evaluation["episode_status"] == "input_error"
+    assert evaluation["correct"] is False
+    assert run["n_episodes"] == 1 and run["accuracy"] == 0.0
+    assert manifest["n_input_error"] == 1
+    assert manifest["denominator_preserved"] is True
+    assert manifest["missing_result_qa_ids"] == []
 
 
 def test_online_eval_blocks_final_test_without_flag(tmp_path):
@@ -115,9 +162,8 @@ def test_reconstruction_blocks_final_test(tmp_path):
     assert "硬约束 9" in r.stderr
 
 
-def test_optimize_loop_pauses_without_offline_model(tmp_path):
-    """§3.4：离线强模型（DeepSeek-V4.1-Flash）不可用 → 候选暂停不 promote（退出码 3），
-    且不写入 active 快照。密钥未注入 → 记 `offline_auth_error`（不重试、不降级为 mock）。"""
+def test_legacy_optimize_loop_is_disabled_under_current_protocol(tmp_path):
+    """The pre-v11 optimizer must fail before running an old SkillSpec online."""
     spec = {
         "skill_id": "sk-room-size", "version": "1.0.0",
         "applicable_question_types": ["room_size_estimation"],
@@ -139,12 +185,7 @@ def test_optimize_loop_pauses_without_offline_model(tmp_path):
              "--panel-source", "synthetic", "--l1-limit", "1", "--limit", "1",
              "--seed", "0", "--skill-store", str(store),
              "--trace-dir", str(tmp_path / "traces"))
-    assert r.returncode == 3, (r.stdout, r.stderr)
-    assert "离线强模型不可用" in r.stderr
-    assert "offline_auth_error" in r.stderr      # §3.4 结局码可审计（非"模型答得不好"）
-    assert "准入必须 real" in r.stdout
-    # 未 promote：没有任何 active 指针写入（硬约束 12）
+    assert r.returncode == 2, (r.stdout, r.stderr)
+    assert "当前 v11 在线协议下停用" in r.stderr
     assert not (store / "active_snapshot.json").exists()
-    # 泄漏检查与面板产物留档
-    assert (tmp_path / "traces" / "leakage_check.jsonl").is_file()
-    assert (tmp_path / "traces" / "paired_outcome.jsonl").is_file()
+    assert not (tmp_path / "traces").exists()

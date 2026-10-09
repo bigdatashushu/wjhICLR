@@ -61,7 +61,7 @@ FailureCode = Literal[
     "grounding_recall_miss", "detector_fault", "ConfidenceGateError",
     "AnswerAlreadyGiven", "DomainValueError", "metric_evidence_gate_failed",
     "m4_main_gate_failed", "world_frame_unavailable", "ast_violation",
-    "degenerate_output_regenerated", "service_unavailable", "unknown",
+    "degenerate_output_regenerated", "service_unavailable", "input_error", "unknown",
 ]
 
 
@@ -70,8 +70,44 @@ class FailureTaxonomy(Spec):
     categories: list[Literal[
         "perception", "reconstruction", "coordinate", "tool_contract", "run_error",
         "program_syntax", "verifier_reject", "evaluator_noanswer",
-        "metric_evidence", "world_frame", "synthesis"]]
+        "metric_evidence", "world_frame", "synthesis", "input_error"]]
     note: str
+
+
+class EpisodeInputTrace(Spec):
+    """M13 structured episode input, including scorer-only reference answer."""
+
+    qa_id: str
+    scene_id: str
+    dataset: str
+    question_type: str
+    question_text: str
+    options: list[str] = []
+    reference_answer: str
+    source_split: Literal[
+        "induction", "inner_validation", "outer_holdout", "final_test"
+    ]
+    frame_set_hash: str = ""
+
+
+class EvaluationResultTrace(Spec):
+    """M12 result joined with episode/program traces by ``qa_id``."""
+
+    qa_id: str
+    question_type: str
+    task: str
+    is_mca: bool
+    predicted: Optional[str]
+    ground_truth: str
+    correct: Optional[bool]
+    mra_value: Optional[float]
+    answer_text: Optional[str]
+    answer_source: str
+    episode_status: str
+    input_error_reason: str = ""
+    derivation_replay: dict = {}
+    abstained: bool = False
+    failure_code: Optional[str] = None
 
 
 class TraceRecord(Spec):
@@ -81,7 +117,9 @@ class TraceRecord(Spec):
     active_snapshot_manifest_sha256: str = ""
     # ---- 版本字段（D10）----
     template_version: str = ""
+    execution_protocol_version: str = ""
     tool_face_version: str = ""
+    tool_docs_version: str = ""
     evidence_profile_version: str = ""
     gate_version: str = ""
     distance_primitive_params: dict = {}      # quantile_q / voxel_size / conf_warp_version
@@ -92,6 +130,7 @@ class TraceRecord(Spec):
     scene_route: str = ""
     question_tool_scope: str = ""
     answer_source: str = ""
+    input_error_reason: str = ""
     used_result_ids: list[str] = []
     recovery_count: int = 0
     partial_tool_recovery: bool = False
@@ -112,6 +151,7 @@ class TraceRecord(Spec):
     # 不是模型自称；核验问题在 `attribution["problems"]`。
     answer_basis: str = ""
     answer: dict = {}
+    derivation_replay: dict = {}
     # §12 六字段台账 + 保守降级记录（declared/verified/ignored 三分离）
     attribution: dict = {}
     # §6.4：每次实际调用的授权收据（allowed 与被拒绝的原因码都在）
@@ -201,6 +241,7 @@ class EpisodeTrace(Spec):
     evidence_states: dict[str, str] = {}
     input_degradation_flags: list[str] = []
     answer_source: str = ""
+    input_error_reason: str = ""
     # v6 D7：partial recovery 事实（§14.1）
     recovery_count: int = 0
     partial_tool_recovery: bool = False
@@ -218,6 +259,7 @@ class EpisodeTrace(Spec):
     episode_status: str = ""
     answer_basis: str = ""
     answer: dict = {}
+    derivation_replay: dict = {}
     attribution: dict = {}
     authorization_receipts: list[dict] = []
     # v9 §17.1「检索与 Round」层：轮数 / yield 次数 / 逐轮引用 / 预算快照
@@ -292,6 +334,7 @@ class RunManifest(Spec):
     quality_metric_version: str = ""
     template_version: str = ""
     tool_face_version: str = ""
+    tool_docs_version: str = ""
     evidence_profile_version: str = ""
     gate_version: str = ""
     metric_model: str = "none"
@@ -314,7 +357,9 @@ class RunManifest(Spec):
 
 __all__ = [
     "AnswerSourceValue",
+    "EpisodeInputTrace",
     "EpisodeTrace",
+    "EvaluationResultTrace",
     "EvaluationRun",
     "EvolutionGeneration",
     "FailureCode",

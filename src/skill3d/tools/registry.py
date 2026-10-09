@@ -46,11 +46,12 @@ from skill3d.schemas.authorization import ToolAuthorizationReceipt
 from skill3d.tools.contract import authorize_tool_call
 from skill3d.tools.mock_switch import MockSwitch, request_key
 from skill3d.tools.scene_handle import SceneHandle
+from skill3d.tools.docs_v11 import DESCRIPTIONS, TOOL_DOCS_VERSION
 
 # v9 §9.2/§9.4：工具面新增 `inspect_frames` / `detect_objects`（主动图像与补检）。
 # 工具面变了就升版本 —— prompt 里列出的 Tool 集合与 trace 的 tool_face_version
 # 必须对得上，否则"这次跑的是哪套工具面"无法回答。
-TOOL_FACE_VERSION: str = "tool-face-v9"
+TOOL_FACE_VERSION: str = "tool-face-v11.1"
 
 
 class ToolNotFoundError(KeyError):
@@ -211,7 +212,7 @@ class ToolRegistry:
             params = [str(p) for p in list(sig.parameters.values())[1:]]
             needs = ", ".join(t.spec.requires_artifacts) or "无"
             ev = ", ".join(t.spec.requires_evidence or []) or "无"
-            lines.append(f"- {name}({', '.join(params)}): {t.spec.description}"
+            lines.append(f"- {name}({', '.join(params)}): {DESCRIPTIONS[name]}"
                          f" [requires_artifacts: {needs}；requires_evidence: {ev}]")
         return "\n".join(lines)
 
@@ -239,34 +240,19 @@ class ToolRegistry:
         avail = ", ".join(sorted(available)) or "（无）"
         metric_q = str(question_type or "") in set(METRIC_TASK_TYPES)
         if not metric_q:
-            metric_line = (
-                f"本题题型={question_type or '未分类'}**不需要米制尺度** ——"
-                "相对距离/方向、路线、外观顺序都在全局尺度 s 下自动约掉 s，"
-                "直接用世界系（归一化单位）的 Tool 作答即可，不要因为"
-                "「米制证据门」的状态而 abstain（那道门只约束米制数值题）。"
-            )
+            metric_line = f"本题题型={question_type or '未分类'}；米制证据门不适用。"
         elif gate_passed:
-            metric_line = (
-                f"米制证据门已通过（本题题型={question_type}），"
-                "允许调用上面列出的米制 Tool。")
+            metric_line = f"本题题型={question_type}；米制证据门已通过。"
         else:
-            metric_line = (
-                f"**米制证据门未通过**（本题题型={question_type}）"
-                + (f"，缺失子条件={sorted(gate_missing)}" if gate_missing else "")
-                + "；依赖米制尺度的 Tool 已被收回，"
-                "严禁用世界单位/相对单位冒充米制数值（不要把归一化值当米）。"
-                "**本题仍必须作答**（有图必答）：请改用还能用的非米制 Tool，"
-                "或直接依据你在图片里看到的内容给出**视觉估计**"
-                "（一个带正确单位的数值）；缺失的测量值不是拒答理由。")
-        ev_line = ""
-        if evidence_profile is not None:
-            ev_line = ("证据画像=" + ", ".join(
-                f"{c}:{evidence_profile.state(c)}" for c in CAPABILITIES) + "。\n")
+            metric_line = (f"本题题型={question_type}；米制证据门未通过；"
+                           f"缺失子条件={sorted(gate_missing or [])}。")
+        evidence = ("证据画像=" + ", ".join(
+            f"{c}:{evidence_profile.state(c)}" for c in CAPABILITIES) + "。\n"
+            if evidence_profile is not None else "")
         return (f"当前 question_tool_scope={scope}；可用重建产物={avail}。\n"
-                f"{ev_line}{metric_line}\n"
-                f"只允许调用下面列出的 Tool；它们所需的产物与证据都已就绪。"
-                f"若某个量在当前条件下无法用工具获得，就改用还能用的方法，"
-                f"或依据图片给出你的最佳估计 —— **必须给出答案**，不要拒答。")
+                f"{evidence}{metric_line}\n工具文档版本={TOOL_DOCS_VERSION}。"
+                "以下工具已按 scope、证据与实际产物筛选；"
+                "对象绑定、参数及具体数值有效性在调用时检查。")
 
     # ---- 参数校验 ----
     @staticmethod

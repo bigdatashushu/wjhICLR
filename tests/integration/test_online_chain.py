@@ -173,7 +173,7 @@ def test_diagnostic_experiment_blur_all_still_answers(tmp_path):
     assert out.tool_contract_hits >= 1
     assert out.final_state == "answer" and out.answer not in (None, "")
     assert out.answer_source == "tool_program"
-    assert "forced_answer" in out.answer_flags
+    assert "finalization" in out.answer_flags
     assert out.mra_value is not None
     assert out.episode_trace.failure is None
     # P0 回归锁：mock 收口答案不得冒充真实模型输出
@@ -263,6 +263,7 @@ def test_real_mode_without_vllm_is_unavailable_not_fake(items, tmp_path):
     out = run_episode(it.episode, it.pixels, cfg, geometry=it.geometry)
     assert out.states == FULL_CHAIN[:-1] + ["LOG_TRACE"] or "SYNTHESIZE_PROGRAM" in out.states
     assert out.final_state == "unavailable"
+    assert out.episode_status == "run_error"
     assert out.answer is None
     assert out.synthesis_source == "none"
     # v6 归因：M8 拿不到模型输出 → `synthesis`（v5 的 evaluator_noanswer 已随口径更新）
@@ -292,14 +293,28 @@ def test_trace_store_records_all_topics(items, tmp_path):
     cfg = OnlineRunConfig(mode="mock_light", memory_dir="")
     it = next(i for i in items if i.episode.question_type == "room_size_estimation")
     run_episode(it.episode, it.pixels, cfg, geometry=it.geometry, trace_store=store)
-    for topic in ("episode_trace", "program_trace", "geometry_check", "evaluation_result",
-                  "trace_record"):
+    for topic in (
+        "episode_input",
+        "episode_trace",
+        "program_trace",
+        "geometry_check",
+        "evaluation_result",
+        "trace_record",
+    ):
         p = tmp_path / "traces" / f"{topic}.jsonl"
         assert p.is_file() and p.read_text(encoding="utf-8").strip(), f"缺 topic {topic}"
     # 在线只写不读：trace 内容不得回灌进在线链（由构造保证：runner 不读 store）
     rec = json.loads((tmp_path / "traces" / "episode_trace.jsonl").read_text(
         encoding="utf-8").splitlines()[0])
     assert rec["qa_id"] == it.episode.qa_id
+    episode_input = json.loads(
+        (tmp_path / "traces" / "episode_input.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert episode_input["question_text"] == it.episode.question
+    assert episode_input["reference_answer"] == it.episode.ground_truth
+    assert episode_input["source_split"] == it.episode.split
     # §5.9：TraceRecord 必含版本字段与证据/路由全状态（不依赖重跑即可归因）
     trec = json.loads((tmp_path / "traces" / "trace_record.jsonl").read_text(
         encoding="utf-8").splitlines()[0])

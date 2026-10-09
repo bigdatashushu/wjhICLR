@@ -1052,7 +1052,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- RunManifest（G-67/§16.4 + §19.2：演进实验同样要记录复现信息与离线模型块）----
     if args.run_manifest:
         from skill3d.infra.version_lock import build_run_manifest, write_run_manifest
-        from skill3d.online.eval import v6_version_fields
+        from skill3d.online.eval import current_version_fields
 
         try:
             from skill3d.adapters.split_builder import load_split_config
@@ -1074,7 +1074,7 @@ def main(argv: list[str] | None = None) -> int:
                 "final_state": ckpt.state, "candidate_ids": ckpt.candidate_ids,
                 "revision_ids": ckpt.revision_ids,
                 "recon_method": cfg.recon_method,
-                **v6_version_fields(),
+                **current_version_fields(),
                 # §19.2 离线治理模型字段（来自 DeepSeekClient.manifest_fields()；
                 # 未发起调用时为空 dict —— 不虚构，也绝不含 API key）
                 "offline_model": offline.get("offline_model", ""),

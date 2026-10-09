@@ -153,6 +153,8 @@ def cascade_invalidate(kernel, premise: str, *,
     ids: list[str] = []
     tools: list[str] = []
     for r in getattr(kernel, "tool_results", []) or []:
+        if r.status != "ok" or r.invalidated_by:
+            continue
         name = str(getattr(r, "source_tool", "") or getattr(r, "tool", ""))
         try:
             req = set(registry.requires_evidence(name))
@@ -175,9 +177,22 @@ def cascade_invalidate(kernel, premise: str, *,
     return ids, tools
 
 
+def invalidate_results(kernel, result_ids: list[str], *, reason: str) -> list[str]:
+    """撤销已定位的局部结果，不推测它们与其他调用的共享依赖。"""
+    wanted = set(result_ids)
+    invalidated = []
+    for index, result in enumerate(kernel.tool_results):
+        if result.result_id in wanted and result.status == "ok" and not result.invalidated_by:
+            kernel.tool_results[index] = result.model_copy(
+                update={"invalidated_by": [reason]})
+            invalidated.append(result.result_id)
+    return invalidated
+
+
 def downgrade_profile(profile: Optional[EvidenceProfile],
-                      premise: str) -> tuple[Optional[EvidenceProfile], dict[str, str]]:
-    """把失效前提对应的能力降级（`available → degraded → unavailable`，§14.1）。"""
+                      premise: str, *, confirmed_invalid: bool = False
+                      ) -> tuple[Optional[EvidenceProfile], dict[str, str]]:
+    """降级失效前提；M11 确证无效时直接收回对应能力。"""
     if profile is None:
         return None, {}
     changed: dict[str, str] = {}
@@ -185,7 +200,10 @@ def downgrade_profile(profile: Optional[EvidenceProfile],
     reasons = dict(getattr(profile, "state_reasons", None) or {})
     for cap in _DEPENDENTS.get(str(premise), (str(premise),)):
         cur = profile.state(cap)
-        if cur == "available":
+        if confirmed_invalid and cur != "unavailable":
+            update[cap] = "unavailable"
+            changed[cap] = f"{cur}→unavailable"
+        elif cur == "available":
             update[cap] = "degraded"
             changed[cap] = "available→degraded"
         elif cur == "degraded":
@@ -201,7 +219,7 @@ def downgrade_profile(profile: Optional[EvidenceProfile],
 
 
 def build_feedback(plan: RecoveryPlan, *, question_type: str,
-                   scope: str) -> str:
+                   scope: str, require_answer: bool = False) -> str:
     """恢复用的回灌文本（§14.1 第 5 条）：失败信息 + validated observations 摘要。"""
     lines = [
         "上一轮 program 执行失败，请改写后重新输出**一个** ```python 代码块。",
@@ -221,10 +239,13 @@ def build_feedback(plan: RecoveryPlan, *, question_type: str,
         lines.extend(o.summary() for o in plan.validated)
     else:
         lines.append("\n当前没有任何可信的既有观测，请从 Tool 重新开始。")
+    ending = (
+        "请使用仍有效的观察或原图给出最佳答案；视觉估计如实标记为 visual_estimate，"
+        "不要提交 abstain。" if require_answer else
+        "若确实拿不到答案，直接 `ReturnAnswer(\"abstain\")`（主榜按错计，优于编造）。")
     lines.append(
         f"\n当前 question_tool_scope={scope}，本题题型={question_type}。"
-        "只允许调用 prompt 里列出的 Tool；若确实拿不到答案，"
-        "直接 `ReturnAnswer(\"abstain\")`（主榜按错计，优于编造）。")
+        "只允许调用 prompt 里列出的 Tool；" + ending)
     lines.append("注意：`ReturnAnswer` 之后**不得**再调用任何 Tool（会抛 "
                  "AnswerAlreadyGiven）。")
     return "\n".join(lines)
@@ -251,6 +272,7 @@ __all__ = [
     "cascade_invalidate",
     "collect_validated",
     "downgrade_profile",
+    "invalidate_results",
     "premise_of_failure",
     "recovery_exhausted",
 ]

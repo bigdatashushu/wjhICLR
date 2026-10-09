@@ -132,7 +132,7 @@ def input_gate(
 
     - `level=pass` / `locally_degraded`：一律 `action="proceed"`，附带逐帧 flag 与权重；
     - `level=overall_unusable`：仅"一帧可用都没有／全部非法"（§5.2 `input_error`）
-      → `action="unanswerable"`，整 episode 记 `unavailable`，不进任何 split。
+      → `action="unanswerable"` 终止求解，由 runner 生成 `input_error` 零分结果行。
     """
     if diagnostics:
         scores = [frame_quality(f) for f in frames]

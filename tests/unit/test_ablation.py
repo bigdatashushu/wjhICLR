@@ -128,26 +128,25 @@ def _items(tmp_path, n_frames=6):
                                 n_frames=n_frames, frame_size=(64, 96))
 
 
-# v6 §5.8 SkillSpec：错误声明用"证据签名"，不再是 requires_artifacts/minimum_quality。
-# 该模板有三处故意错误：① 调用未注册 Tool；② 声明当前场景**无法满足**的证据签名
-# （要求 world_frame=available，而产物没有 M3 世界系契约）；
-# ③ 断言恒假（never_true()）。
 WRONG_SKILL = json.dumps({
-    "skill_id": "sk-known-wrong", "version": "0.0.1",
-    "applicable_question_types": ["object_counting"],
-    "required_evidence_signature": {"world_frame": "available"},
-    "skill_family": "counting", "source": "mock_interface",
-    "description": "C5：已知错误模板（调用不存在的 Tool + 声明不可满足的证据签名）",
-    "call_graph_template": ("answer = definitely_not_a_registered_tool(1, 2)\n"
-                            "ReturnAnswer(\"42\")"),
-    "validation_assertions": ["never_true()"],
+    "skill_id": "S01",
+    "version": "999.0.0",
+    "question_type": "object_counting",
+    "skill_md": (
+        "---\n"
+        "name: known-wrong-counting\n"
+        "description: Deliberately invalid C5 method for contract testing.\n"
+        "---\n"
+        "# Invalid method\n"
+        "Call `definitely_not_a_registered_tool(1, 2)` and return `42`.\n"
+    ),
 })
 
 
 def _wrong_skill():
-    from skill3d.schemas import SkillSpec
+    from skill3d.schemas import SkillSpecV11
 
-    return SkillSpec.model_validate_json(WRONG_SKILL)
+    return SkillSpecV11.model_validate_json(WRONG_SKILL)
 
 
 def _v6_artifact(**kw):
@@ -170,28 +169,25 @@ def _v6_artifact(**kw):
     return ReconstructionArtifact(**base)
 
 
-def test_c5_unknown_capability_declaration_is_rejected_at_construction():
-    """C5：声明不存在的能力（v5 的 `requires_artifacts=["nonexistent_artifact"]` 对应物）
-    在 v6 由**构造期 fail-closed** 拦下（§5.8：签名键必须在 CAPABILITIES 词汇表内）。"""
-    from skill3d.schemas import SkillSpec
+def test_c5_legacy_fields_are_rejected_at_construction():
+    """Current methods reject fields from the retired JSON SkillSpec."""
+    from skill3d.schemas import SkillSpecV11
 
-    with pytest.raises(Exception, match="未知能力"):
-        SkillSpec.model_validate_json(json.dumps({
+    with pytest.raises(Exception, match="Extra inputs"):
+        SkillSpecV11.model_validate_json(json.dumps({
             **json.loads(WRONG_SKILL),
-            "required_evidence_signature": {"nonexistent_artifact": "available"}}))
+            "required_evidence_signature": {"world_frame": "available"}}))
 
 
-def test_c5_wrong_skill_is_filtered_by_hard_filter(tmp_path):
-    """C5：错误 Skill 的证据签名当前不满足 → M7 硬过滤必须拦掉（§17.1 检索硬条件）。"""
+def test_c5_wrong_skill_uses_current_deterministic_lookup(tmp_path):
+    """The current C5 method participates through the same one-per-task lookup."""
     from skill3d.reconstruction_gate.scene_state import quality_gate
     from skill3d.routing.skill_retriever import retrieve
 
     scene = quality_gate(_v6_artifact())
-    # 场景侧事实：无 M3 世界系契约 → world_frame=unavailable（签名必然落空）
-    assert scene.evidence_state("world_frame") == "unavailable"
     got = retrieve("How many tables?", scene, [_wrong_skill()],
                    question_type="object_counting", scene_quality=0.9)
-    assert got == []                                      # 硬过滤拦下，不进入合成阶段
+    assert [hit.skill_version for hit in got] == ["S01@999.0.0"]
 
 
 def test_c5_wrong_skill_program_is_rejected_by_ast(tmp_path):
@@ -199,7 +195,7 @@ def test_c5_wrong_skill_program_is_rejected_by_ast(tmp_path):
     from skill3d.sandbox.ast_guard import ast_guard
     from skill3d.tools import REGISTRY
 
-    src = _wrong_skill().call_graph_template
+    src = 'answer = definitely_not_a_registered_tool(1, 2)\nReturnAnswer("42")'
     check = ast_guard(src, allowed_tools=set(REGISTRY.names()))
     assert not check.ok
     assert any("definitely_not_a_registered_tool" in v for v in check.violations)
@@ -229,7 +225,7 @@ def test_c5_wrong_skill_does_not_improve_score(tmp_path):
 
 
 def test_c2_static_skill_injection_via_cli_helper(tmp_path):
-    """C2：`--skill-spec` 注入手写 SkillSpec（无归纳）→ 进入 skills 列表。"""
+    """C2 accepts only a complete SkillSpecV11."""
     from skill3d.online.eval import _apply_skill_ablations
 
     spec_path = tmp_path / "spec.json"
@@ -240,7 +236,7 @@ def test_c2_static_skill_injection_via_cli_helper(tmp_path):
         inject_wrong_skill = False
 
     skills, ref = _apply_skill_ablations(_Args(), [])
-    assert len(skills) == 1 and skills[0].skill_id == "sk-known-wrong"
+    assert len(skills) == 1 and skills[0].skill_id == "S01"
     assert ref.startswith("static:")
 
 
@@ -252,8 +248,7 @@ def test_c5_cli_helper_appends_wrong_skill():
         inject_wrong_skill = True
 
     skills, ref = _apply_skill_ablations(_Args(), [])
-    assert [s.skill_id for s in skills] == ["sk-known-wrong"]
+    assert [s.skill_id for s in skills] == ["S01"]
     assert ref.startswith("wrong:")
-    # v6：错误 Skill 的"不可满足前置条件"由证据签名表达（v5 的 requires_artifacts 已废止）
-    assert skills[0].required_evidence_signature["metric_scale"] == "available"
-    assert skills[0].requires_metric_evidence is True
+    assert skills[0].question_type == "object_counting"
+    assert "definitely_not_a_registered_tool" in skills[0].skill_md

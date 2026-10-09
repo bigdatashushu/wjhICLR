@@ -78,7 +78,7 @@ def build_snapshot(
     `prompt_version` 为空串时取在线合成模板版本，并与 tool-face 版本、离线模型身份
     （`offline_client.manifest_fields()`）一起合成环境指纹（见模块 docstring）。
     """
-    from skill3d.synthesis.prompt_builder import TEMPLATE_VERSION
+    from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
     from skill3d.tools.registry import TOOL_FACE_VERSION
 
     episode_set_hash = hashlib.sha256(
@@ -90,7 +90,7 @@ def build_snapshot(
         memory_snapshot_ref=memory_snapshot_ref,
         skill_registry_snapshot_ref=skill_registry_snapshot_ref,
         prompt_version=compose_prompt_version(
-            prompt_version or TEMPLATE_VERSION,
+            prompt_version or PROMPT_TEMPLATE_VERSION,
             tool_face_version=TOOL_FACE_VERSION, offline_client=offline_client),
         code_commit=code_commit,
         split_pointer=split_pointer,  # type: ignore[arg-type]

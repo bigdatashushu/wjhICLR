@@ -21,6 +21,8 @@ Tool 被 fail-closed 收回**（计数、相对方向、路线规划、外观顺
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
+from contextvars import ContextVar
 import os
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -30,6 +32,26 @@ import numpy as np
 DEFAULT_ENDPOINT = os.environ.get("SKILL3D_DETECTOR_ENDPOINT", "")
 DEFAULT_BOX_THRESHOLD = 0.25   # TODO_CALIBRATE
 DEFAULT_TIMEOUT_S = 120
+_failure_sink: ContextVar[Optional[list[str]]] = ContextVar("detector_failure_sink", default=None)
+
+
+@contextmanager
+def capture_detector_failures():
+    """Observe actual failures per evaluation run, including M5's caught errors."""
+    failures: list[str] = []
+    token = _failure_sink.set(failures)
+    try:
+        yield failures
+    finally:
+        _failure_sink.reset(token)
+
+
+def _failed(message: str) -> list:
+    detect.last_error = message
+    sink = _failure_sink.get()
+    if sink is not None:
+        sink.append(message)
+    return []
 
 
 @dataclass
@@ -63,8 +85,7 @@ def detect(frame: np.ndarray, prompt: str, *,
     ep = (endpoint or detector_endpoint()).rstrip("/")
     detect.last_error = ""
     if not ep or not prompt.strip() or frame is None:
-        detect.last_error = "endpoint 未配置 / prompt 为空 / frame 为 None"
-        return []
+        return _failed("endpoint 未配置 / prompt 为空 / frame 为 None")
     import cv2
     import requests
 
@@ -76,18 +97,19 @@ def detect(frame: np.ndarray, prompt: str, *,
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                           [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not ok:
-        detect.last_error = "JPEG 编码失败"
-        return []
+        return _failed("JPEG 编码失败")
     try:
         resp = requests.post(
             f"{ep}/infer",
             json={"image": base64.b64encode(buf.tobytes()).decode("ascii"),
                   "text_prompt": prompt, "box_threshold": float(box_threshold)},
             timeout=timeout_s)
+        resp.raise_for_status()
         data = resp.json()
     except Exception as exc:  # noqa: BLE001 - 服务不可用 → 降级（不阻断 episode）
-        detect.last_error = f"{type(exc).__name__}: {exc}"
-        return []
+        return _failed(f"{type(exc).__name__}: {exc}")
+    if data.get("success") is False:
+        return _failed(str(data.get("error") or "detector returned success=false"))
     out: list[Detection] = []
     h, w = img.shape[0], img.shape[1]
     for d in (data.get("detections") or []):

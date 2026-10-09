@@ -45,8 +45,8 @@ CANONICAL_UNIT_BY_QUESTION_TYPE: dict[str, AnswerUnit] = {
     "obj_appearance_order": "option",
 }
 
-# §12 登记的可重放操作。**不执行其中的任意代码**：这里只有名字，实际重放能力由
-# 评估侧实现；本模块只负责"名字必须在册"这一层校验。
+# §12 登记的可重放操作。**不执行其中的任意代码**：本模块负责静态词表校验，
+# 确定性解释与答案比对由 `verifier.derivation` 实现并在 M11 调用。
 DERIVATION_OPS: frozenset[str] = frozenset({
     "field",        # 字段提取
     "convert",      # 单位/尺度换算
@@ -76,6 +76,8 @@ class AnswerPayload(Spec):
 
     def derivation_inputs(self) -> list[str]:
         raw = (self.derivation or {}).get("input_result_ids") or []
+        if not isinstance(raw, list):
+            return []
         return [str(x) for x in raw]
 
     def problems(self) -> list[str]:
@@ -85,9 +87,20 @@ class AnswerPayload(Spec):
             op = self.derivation_op()
             if op not in DERIVATION_OPS:
                 out.append(f"derivation.op={op!r} 不在登记操作 {sorted(DERIVATION_OPS)} 中")
+            missing_keys = {
+                "op", "input_result_ids", "parameters",
+            } - set(self.derivation)
+            if missing_keys:
+                out.append(f"derivation 缺少字段 {sorted(missing_keys)}")
             extra = set(self.derivation) - {"op", "input_result_ids", "parameters"}
             if extra:
                 out.append(f"derivation 含未登记键 {sorted(extra)}")
+            raw_inputs = self.derivation.get("input_result_ids")
+            if not isinstance(raw_inputs, list) or not raw_inputs or not all(
+                    isinstance(value, str) and value for value in raw_inputs):
+                out.append("derivation.input_result_ids 必须是非空字符串列表")
+            if not isinstance(self.derivation.get("parameters"), dict):
+                out.append("derivation.parameters 必须是对象")
             missing = sorted(set(self.derivation_inputs()) - set(self.used_result_ids))
             if missing:
                 out.append(f"derivation 引用了未在 used_result_ids 声明的结果 {missing}")

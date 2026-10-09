@@ -18,9 +18,6 @@ import urllib.error
 import urllib.request
 from typing import Optional, Sequence
 
-from openai import OpenAI
-
-
 def _normalize_base_url(endpoint: str) -> str:
     """把 endpoint 归一化为 OpenAI 兼容 base_url（保留末尾 /v1，去掉多余斜杠）。"""
     ep = str(endpoint).strip().rstrip("/")
@@ -80,6 +77,8 @@ class VLLMClient:
         *,
         check_on_init: bool = False,
     ) -> None:
+        from openai import OpenAI
+
         if not endpoints:
             raise ValueError("endpoints 不能为空")
         # v9 §9.4：最近一次请求的**真实** token 用量（含图像 token）；runner 逐轮落盘

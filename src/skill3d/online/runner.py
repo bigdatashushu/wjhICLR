@@ -45,7 +45,6 @@ from skill3d.reconstruction_gate.quality_metrics import (
 from skill3d.reconstruction_gate.evidence_profile import M5EvidenceSummary
 from skill3d.reconstruction_gate.scene_state import (
     build_scene_state,
-    quality_gate,
     scope_scene_to_question,
 )
 from skill3d.routing.retrieval_policy import RetrievalPolicy
@@ -59,17 +58,19 @@ from skill3d.sandbox.ast_guard import ast_guard, normalize_program_source
 from skill3d.sandbox.kernel import CellResult, RestrictedNamespaceKernel
 from skill3d.sandbox.receipt import ReceiptChain, SandboxReceipt, verify_chain
 from skill3d.schemas import (
+    EpisodeInputTrace,
     EpisodeProgram,
     EpisodeTrace,
+    EvaluationResultTrace,
     EvaluationRun,
     FailureTaxonomy,
+    InputErrorRecord,
     InputGateVerdict,
-    InputFrame,
     ProgramExecutionTrace,
     RetrievedSkill,
     SceneState,
     SkillRetrievalRecord,
-    SkillSpec,
+    SkillSpecV11,
     VSIBenchEpisode,
     parse_answer_payload,
     verify_attribution,
@@ -90,8 +91,12 @@ from skill3d.synthesis.program_assembler import (
     assemble_program_ex,
     degenerate_reason,
 )
-from skill3d.synthesis.prompt_builder import PromptBuilder
+from skill3d.synthesis.prompt_builder import (
+    PROMPT_TEMPLATE_VERSION,
+    PromptBuilder,
+)
 from skill3d.tools import REGISTRY
+from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.mock_switch import MockSwitch
 from skill3d.tools.scene_handle import SceneHandle
 from skill3d.online.recovery import (
@@ -101,19 +106,31 @@ from skill3d.online.recovery import (
     cascade_invalidate,
     collect_validated,
     downgrade_profile,
+    invalidate_results,
     premise_of_failure,
-    recovery_exhausted,
 )
 from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION, TraceRecord
-from skill3d.synthesis.prompt_builder import TEMPLATE_VERSION
 from skill3d.trace.store import TraceStore
-from skill3d.verifier.geometry_oracle import GeometryVerifyResult, geometry_verify
+from skill3d.verifier.derivation import replay_derivation
+from skill3d.verifier.geometry_oracle import (
+    GeometryIssue,
+    GeometryVerifyResult,
+    geometry_verify,
+)
 
 from . import synthetic as synth
+from .submission import (
+    EXECUTION_PROTOCOL_VERSION,
+    accepted_result_ids,
+    invalid_reference_issues,
+    rejected_submission,
+    submission_scope,
+)
 
 # 确定性重放模式下的固定时间基准（§4 M8/M17 字节级一致；真实实验不启用）
 _REPLAY_EPOCH = 0.0
 _Path_ = Path
+RuntimeSkillSpec = SkillSpecV11
 
 
 @dataclass
@@ -125,7 +142,7 @@ class OnlineRunConfig:
     seed: int = 0
     deterministic_replay: bool = False      # 同 seed 字节级一致（时间/id 取确定性占位）
     active_snapshot_ref: str = "genesis"
-    skills: list[SkillSpec] = field(default_factory=list)
+    skills: list[RuntimeSkillSpec] = field(default_factory=list)
     scene_quality: Optional[float] = None
     max_regen: int = 3                      # TODO_CALIBRATE（configs/config.yaml）
     # v9 §5.1：M2 质量诊断默认关闭；仅独立诊断实验开启（开启后 quality_weight 参与
@@ -145,10 +162,6 @@ class OnlineRunConfig:
     # 传入实现了 MetricDepthModel 协议的对象即启用（MoGe-2 权重到位后才可能真跑）。
     metric_depth_model: object = None
     metric_model_name: str = "none"          # moge2 | metric3d_v2 | none
-    # 按题型选择答案来源（任务级策略，非逐题 oracle）：命中的题型改用**直答 VLM**
-    # （同一 32 帧 + 问题）。用途：当某题型的程序路径弱于直答时，用直答拿分；
-    # 策略必须在 inner_validation 上定、在 outer_holdout 上验证，禁止用 GT 逐题挑选。
-    direct_answer_tasks: set[str] = field(default_factory=set)
     reuse_artifact: Optional[str] = None    # 复用既有 artifact JSON（硬约束 18：A/B 同源）
     max_tokens: int = 4096
     max_images: int = 32                    # M8 送进模型的最大帧数（与 §4 M1 对齐）
@@ -157,18 +170,11 @@ class OnlineRunConfig:
     # ---- v6 度量证据门（D3）----
     # 融合成功才可能暴露米制 Tool；阈值在 reconstruction_gate.evidence_profile 内
     # （全 [TODO_CALIBRATE]），此处不再重复一份。
-    # v6 D7 compatibility input. When supplied, it maps to the v9 bounded
-    # per-operation retry budget below.
-    max_recovery: Optional[int] = None
-    # ---- v9 solver budget ----
     # 总求解轮次包括最终作答轮；finalization 只保留收口轮次。工具调用不再
     # 维护独立总预算，工具是否可用由题级授权、证据和沙箱契约共同决定。
     max_solver_rounds: Optional[int] = None
     max_retries_per_operation: Optional[int] = None
     finalization_rounds: Optional[int] = None
-    # v7 constructor compatibility. New callers should use the v9 names above.
-    max_agent_rounds: Optional[int] = None
-    reserve_final_rounds: Optional[int] = None
     # Content-addressed provenance for the active skill snapshot. The human
     # readable ref remains separate so pointer movement cannot hide lineage.
     active_snapshot_manifest_sha256: str = ""
@@ -184,34 +190,23 @@ class OnlineRunConfig:
     # 完全由该绑定决定（跳过检索选择），且记录里带 `evaluation_binding`；
     # 该模式只能用于候选效果评测（不得用于 learning 经验采集 / 发布后运行 / 最终成绩）。
     evaluation_binding: Optional[object] = None
-    # v10 §8.4：正常检索的版本选择模式。`model` = 两阶段选择（模型按摘要选版本，
-    # 失败时确定性回落并如实记录）；`deterministic` = 只用检索排序（消融 / mock 用）。
-    version_selection: str = "model"
-
     def __post_init__(self) -> None:
-        # New v9 fields are authoritative when explicitly supplied. Historical
-        # aliases only fill omitted fields, preserving old fixtures without
-        # allowing stale aliases to override current config.
-        solver_rounds = (self.max_solver_rounds if self.max_solver_rounds is not None
-                         else (self.max_agent_rounds if self.max_agent_rounds is not None
-                               else 6))
-        final_rounds = (self.finalization_rounds if self.finalization_rounds is not None
-                        else (self.reserve_final_rounds
-                              if self.reserve_final_rounds is not None else 1))
+        legacy = [type(skill).__name__ for skill in self.skills
+                  if not isinstance(skill, SkillSpecV11)]
+        if legacy:
+            raise ValueError(
+                "当前在线协议只接受 SkillSpecV11；历史 SkillSpec 请在对应 Git 提交运行"
+                f"（收到 {legacy}）")
+        solver_rounds = self.max_solver_rounds if self.max_solver_rounds is not None else 6
+        final_rounds = self.finalization_rounds if self.finalization_rounds is not None else 1
         retry_budget = (self.max_retries_per_operation
                         if self.max_retries_per_operation is not None
-                        else (self.max_recovery if self.max_recovery is not None
-                              else MAX_RECOVERY_ATTEMPTS))
+                        else MAX_RECOVERY_ATTEMPTS)
         self.max_solver_rounds = max(1, int(solver_rounds))
         self.finalization_rounds = max(0, min(
             int(final_rounds), self.max_solver_rounds - 1
         ))
         self.max_retries_per_operation = max(0, int(retry_budget))
-        self.max_recovery = self.max_retries_per_operation
-        # Keep historical attributes observable for old callers while making
-        # the v9 fields the normalized source of truth.
-        self.max_agent_rounds = self.max_solver_rounds
-        self.reserve_final_rounds = self.finalization_rounds
         # v10 §8.2：固定注入臂必须恰好一条完整 Skill —— 多于一条就等于"同时提供多个
         # Skill"，§8.3 明确禁止；零条等于"空 Skill 基线"，同样禁止（EV-03）。
         if self.evaluation_binding is not None:
@@ -230,13 +225,27 @@ class OnlineRunConfig:
 
 
 @dataclass
+class PreparedObjectBinding:
+    """Frozen M5 input supplied by a paired driver; consumed as an episode-local copy.
+
+    File references must already point at this episode's private artifact tree.
+    The ordinary online path still runs M5 when this argument is absent.
+    """
+
+    objects: list = field(default_factory=list)
+    stats: dict = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    materialized: bool = False
+
+
+@dataclass
 class EpisodeOutcome:
     """单 episode 的完整结果（供评测聚合与审计）。"""
 
     qa_id: str
     scene_name: str
     question_type: str
-    final_state: str                        # answer | run_error | unanswerable | unavailable | answer_best_effort
+    final_state: str                        # answer | input_error | run_error | unavailable
     answer: Optional[str]
     predicted: Optional[str]
     is_mca: bool
@@ -270,6 +279,7 @@ class EpisodeOutcome:
     answer_source: str = ""
     # v9 §10.1：规范 episode 终态（answered/input_error/run_error），由 final_state 显式映射
     episode_status: str = ""
+    input_error_reason: str = ""
     # v9 §12：答案载荷、核验后的 basis、框架核验台账（声明/核实/忽略三分离）
     answer_payload: Optional[Any] = None
     answer_basis: str = ""
@@ -292,6 +302,7 @@ class EpisodeOutcome:
     # v9 §17.1「检索与 Round」层：逐轮事实（序号/触发/程序文本与哈希/本轮观测）。
     # 单个 `program_trace` 只保留最后一轮，无法回答"早先轮次做了什么"。
     rounds: list[dict] = field(default_factory=list)
+    static_check_errors: list[str] = field(default_factory=list)
     # v9 §6.4：本 episode 每次实际调用的授权收据（含被拒绝的调用）
     authorization_receipts: list[dict] = field(default_factory=list)
     # v9 §12.2：本 episode 最后一轮的触发原因（initial/observation/error_recovery/finalize）。
@@ -359,6 +370,7 @@ class _SynthResult:
     source: str
     note: str
     direct_answer: Optional[str] = None
+    response_text: str = ""  # 模型原始回复；不得用解析后的 program_source 回填
     prompt: str = ""        # M8 文本 prompt（错误归因用；图像不入日志）
     # HC26：实际送进模型的多模态图像数（必须等于统一 FrameSet 帧数；0 表示纯文本，
     # 在 real 模式下不允许）。trace 落该值，便于事后核对"没有静默丢帧"。
@@ -392,6 +404,11 @@ def _failure_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode) -> Optional[F
     eid = episode.qa_id
     if outcome.final_state in ("answer", "answer_best_effort"):
         return None
+    if outcome.final_state == "input_error":
+        return FailureTaxonomy(
+            episode_id=eid, categories=["input_error"],
+            note=("输入缺失或全部图像不可读；未请求模型，按 0 分保留在评测分母；"
+                  f"reason={outcome.input_error_reason!r}"))
     if outcome.final_state == "run_error":
         return FailureTaxonomy(
             episode_id=eid, categories=["run_error"],
@@ -447,8 +464,10 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
         episode_id=episode.qa_id,
         active_snapshot_manifest_sha256=str(
             cfg.active_snapshot_manifest_sha256 or ""),
-        template_version=TEMPLATE_VERSION,
+        template_version=PROMPT_TEMPLATE_VERSION,
+        execution_protocol_version=EXECUTION_PROTOCOL_VERSION,
         tool_face_version=TOOL_FACE_VERSION,
+        tool_docs_version=TOOL_DOCS_VERSION,
         evidence_profile_version=(getattr(profile, "profile_version", "")
                                   or PROFILE_VERSION),
         gate_version=(getattr(gate, "gate_version", "") or ""),
@@ -461,6 +480,7 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
         scene_route=str(outcome.scene_route or ""),
         question_tool_scope=str(outcome.question_tool_scope or ""),
         answer_source=str(outcome.answer_source or ""),
+        input_error_reason=str(outcome.input_error_reason or ""),
         used_result_ids=sorted(set(outcome.used_result_ids or [])),
         recovery_count=int(outcome.recovery_count),
         partial_tool_recovery=bool(outcome.partial_tool_recovery),
@@ -472,6 +492,9 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
         answer_basis=str(outcome.answer_basis or ""),
         answer=(outcome.answer_payload.model_dump()
                 if outcome.answer_payload is not None else {}),
+        derivation_replay=(
+            dict(outcome.verify.derivation_replay)
+            if outcome.verify is not None else {}),
         attribution=(outcome.attribution.model_dump()
                      if outcome.attribution is not None else {}),
         authorization_receipts=[dict(r) for r in (outcome.authorization_receipts or [])],
@@ -508,14 +531,6 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
 _RECOVERABLE_CONTRACT_ERRORS = ("tool_contract", "confidence_gate", "domain_value",
                                 "answer_already_given")
 
-# 契约失败码 → §5.9 `FailureCode` 词汇表取值（trace 归因用）
-_FAILURE_CODE_BY_CONTRACT: dict[str, str] = {
-    "confidence_gate": "ConfidenceGateError",
-    "domain_value": "DomainValueError",
-    "answer_already_given": "AnswerAlreadyGiven",
-    "tool_contract": "tool_contract",
-}
-
 _SYNTH_SOURCES = {"vllm_ok", "vllm_parse_error", "vllm_service_error",
                   "m8_parse_recovered", "direct_answer_fallback",
                   "partial_tool_recovery", "mock_stub"}
@@ -545,7 +560,15 @@ def _synthesis_source_enum(value: str) -> str:
     return ""
 
 
-def _round_record(*, index: int, trigger: str, source: str, program, program_trace) -> dict:
+def _round_record(
+    *,
+    index: int,
+    trigger: str,
+    source: str,
+    program,
+    program_trace,
+    response_text: str = "",
+) -> dict:
     """§17.1 Round 层的逐轮事实（v9 `ProgramRound` 的当前落地子集）。
 
     记录：轮次序号与触发原因、程序来源、实际执行的程序文本与哈希、本轮产生的
@@ -562,10 +585,17 @@ def _round_record(*, index: int, trigger: str, source: str, program, program_tra
         "program_sha256": (hashlib.sha256(source_text.encode("utf-8")).hexdigest()
                            if source_text else ""),
         "program_source": source_text,
+        "response_text": str(response_text),
         "observed_result_ids": [str(getattr(r, "result_id", "") or "")
                                 for r in results if str(getattr(r, "result_id", "") or "")],
         "tool_calls": len(results),
         "error_code": str(getattr(program_trace, "error_code", "") or ""),
+        "service_errors": [
+            {"tool": r.tool, "error": (r.payload or {}).get("error", "service fault")}
+            for r in results
+            if (r.payload or {}).get("status") == "fault"
+            or (r.payload or {}).get("service_healthy") is False
+        ],
     }
 
 
@@ -590,7 +620,7 @@ def _evidence_state_snapshot(scene) -> tuple[dict, dict]:
 
 def _fixed_injection_retrieval(episode, scene, cfg: OnlineRunConfig,
                                outcome: EpisodeOutcome, *, trigger: str = "initial",
-                               retrieval_index: int = 1) -> list[SkillSpec]:
+                               retrieval_index: int = 1) -> list[RuntimeSkillSpec]:
     """§8.2 固定注入臂：跳过**检索选择**，不跳过适用性 / 长度 / 权限 / Schema 校验。
 
     规范原文（§8.2）："评测目标 Skill 时跳过检索选择，但不跳过 Skill 的适用性、
@@ -668,7 +698,7 @@ def _fixed_injection_retrieval(episode, scene, cfg: OnlineRunConfig,
     return [skill]
 
 
-def _hit_from_decision(skill: SkillSpec, decision) -> RetrievedSkill:
+def _hit_from_decision(skill: SkillSpecV11, decision) -> RetrievedSkill:
     """固定注入臂的 `RetrievedSkill` 记录（硬条件通过；排序分数不适用）。"""
     return RetrievedSkill(
         skill_id=str(skill.skill_id),
@@ -680,98 +710,18 @@ def _hit_from_decision(skill: SkillSpec, decision) -> RetrievedSkill:
     )
 
 
-def _version_selection_prompt(episode, record, lineage_entry: dict,
-                              skills_by_key: dict) -> str:
-    """§8.4 第一阶段之后的**选择请求**文本（只含短摘要，不含任何 Skill 正文）。"""
-    from skill3d.schemas.retrieval import short_method_summary
-
-    lineage = str(lineage_entry.get("lineage", ""))
-    lines = [
-        "你在为一道 3D 场景问答题选择**方法谱系内的一个版本**。",
-        "下面是该谱系当前可用的版本及其短摘要（不含完整方法正文）：",
-    ]
-    for cand in lineage_entry.get("candidates") or []:
-        key = str(cand.get("skill_version", ""))
-        spec = skills_by_key.get(key)
-        summary = short_method_summary(spec, max_chars=200) if spec is not None else "（摘要缺失）"
-        lines.append(f"- {key}：{summary}")
-    lines += [
-        f"题目：{episode.question}"
-        if hasattr(episode, "question") else "题目：（未提供）",
-        "只依据上面的摘要选择**一个**版本。",
-        '输出严格 JSON：{"selected_skill_version": "<skill_id@version>"}',
-        "不要输出任何其他文本。",
-    ]
-    return "\n".join(lines)
-
-
-def _select_version_with_model(episode, record, cfg: OnlineRunConfig, outcome,
-                               llm) -> None:
-    """§8.4 两阶段选择的第二阶段：由**在线模型**依据摘要选定一个版本。
-
-    规范原文（§8.4）："2. 在线模型只根据候选摘要选择一条 `selected_skill_version`；
-    3. 框架重建后续上下文，只放入被选版本的完整正文；4. 未选版本不进入后续模型上下文。
-    …… 选择阶段与执行阶段分别记录请求 hash；只有第二阶段实际发送的完整正文才记
-    `delivered`。"
-
-    - 只在同一谱系存在 **>1 个可选版本**时才发起选择请求（单版本无选择可言）；
-    - 模型返回不可解析 / 不在候选里的版本 → **不猜**：保留确定性排序结果，并把这次
-      选择请求与响应 hash 一起落盘（失败也要可审计）；
-    - 这里只改**记录**：完整正文仍由后续合成步骤按被选版本装入请求（第二阶段的
-      执行请求 hash 与交付 hash 由 `SkillRetrievalRecord.add_delivery` 记）。
-    """
-    import hashlib
-
-    multi = [e for e in (record.lineage_selections or [])
-             if len(e.get("candidates") or []) > 1]
-    if not multi:
-        return
-    skills_by_key = {f"{s.skill_id}@{s.version}": s for s in (cfg.skills or [])}
-    prompt = _version_selection_prompt(episode, record, multi[0], skills_by_key)
-    record.selection_request_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-    try:
-        response = llm.chat([{"role": "user", "content": prompt}], max_tokens=256)
-    except Exception as exc:  # noqa: BLE001 - 选择请求失败不得阻断在线链
-        record.delivery_note = (f"{record.delivery_note}；§8.4 版本选择请求失败"
-                                f"（{type(exc).__name__}）→ 保留确定性排序结果").strip("；")
-        outcome.m7_notes.append(f"§8.4 版本选择请求失败：{type(exc).__name__}: {exc}")
-        return
-    record.selection_response_sha256 = hashlib.sha256(
-        str(response).encode("utf-8")).hexdigest()
-    chosen = ""
-    try:
-        payload = json.loads(str(response).strip().strip("`"))
-        chosen = str(payload.get("selected_skill_version", "") or "")
-    except Exception:  # noqa: BLE001 - 解析失败 → 确定性回落（如实记录）
-        chosen = ""
-    allowed = {str(c.get("skill_version")) for c in (multi[0].get("candidates") or [])}
-    if chosen and chosen in allowed:
-        record.select_version_in_lineage(
-            str(multi[0]["lineage"]), chosen, source="model_selected_from_summaries")
-        outcome.m7_notes.append(
-            f"§8.4 两阶段选择：模型从 {len(allowed)} 个版本中选了 {chosen}")
-    else:
-        record.select_version_in_lineage(
-            str(multi[0]["lineage"]), str(multi[0]["selected_version"]),
-            source="deterministic_fallback")
-        outcome.m7_notes.append(
-            f"§8.4 两阶段选择：模型未给出合法版本（{chosen!r}）→ 确定性回落 "
-            f"{multi[0]['selected_version']}")
-
-
 def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: EpisodeOutcome,
                           *, trigger: str = "initial",
                           scene_quality: Optional[float] = None,
-                          llm=None) -> list[SkillSpec]:
+                          llm=None) -> list[RuntimeSkillSpec]:
     """§13.5/§13.6：检索一次并把**完整记录**落进 outcome；返回可用 SkillSpec 列表。
 
     `trigger="evidence_update"` 是 §13.5 的"证据更新后可在**同一快照**中重检索，
     更新实际交付记录"——重检索只换输入证据，**不**发布新库（`cfg.skills` 不变），
     因此本函数没有重新加载快照的路径。
 
-    v10 §8.2：`cfg.evaluation_binding` 非空时走**固定注入**分支（候选效果评测），
-    该分支不做检索选择，也不得把记录写成正常命中的形态。
-    v10 §8.4：正常检索路径在同谱系存在多版本时追加一次**选择请求**（两阶段选择）。
+    `cfg.evaluation_binding` 非空时走固定注入分支；普通运行按规范题型确定唯一
+    `SkillSpecV11`。空列表是合法的 B01 baseline。
     """
     index = len(outcome.retrieval_records) + 1
     if cfg.evaluation_binding is not None:
@@ -791,10 +741,6 @@ def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: Episode
     record.evidence_states = states
     record.evidence_state_reasons = reasons
     by_key = {f"{s.skill_id}@{s.semver}": s for s in cfg.skills}
-    # §8.4 两阶段选择：同谱系多版本竞争时由在线模型按**摘要**选定一个版本
-    # （只在 real 模式且有真实模型客户端时发起；mock_light 保持确定性选择）。
-    if cfg.version_selection == "model" and cfg.mode == "real" and llm is not None:
-        _select_version_with_model(episode, record, cfg, outcome, llm)
     selected = [by_key[key] for key in record.retrieved_skill_versions
                 if key in by_key]
     outcome.retrieval_records.append(record)
@@ -805,7 +751,7 @@ def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: Episode
     return selected
 
 
-def _skill_usage_clues(program_source: str, skills: Sequence[SkillSpec],
+def _skill_usage_clues(program_source: str, skills: Sequence[RuntimeSkillSpec],
                        delivered: Sequence[str]) -> list[dict]:
     """§13.6"可观察的程序使用线索"（**机械交叉检查**，不是因果证明）。
 
@@ -826,7 +772,10 @@ def _skill_usage_clues(program_source: str, skills: Sequence[SkillSpec],
         if key not in set(delivered):
             continue
         mentioned = key in text or str(skill.skill_id) in text
-        template = str(getattr(skill, "call_graph_template", "") or "")
+        template = str(
+            getattr(skill, "skill_md", None)
+            or getattr(skill, "call_graph_template", "")
+            or "")
         template_tools = sorted({t for t in REGISTRY.names() if t in template})
         overlap = sorted(set(template_tools) & program_tools)
         out.append({
@@ -841,7 +790,7 @@ def _skill_usage_clues(program_source: str, skills: Sequence[SkillSpec],
 
 
 def _record_skill_delivery(outcome: EpisodeOutcome, delivery: Optional[SkillDeliveryPlan],
-                           *, round_index: int, skills: Sequence[SkillSpec],
+                           *, round_index: int, skills: Sequence[RuntimeSkillSpec],
                            program=None) -> None:
     """§13.5/§13.6：把一次合成的交付事实并进**最近一次**检索记录。
 
@@ -898,7 +847,7 @@ def _episode_status_of(final_state: str) -> str:
     state = str(final_state or "")
     if state in ("answer", "answer_best_effort"):
         return "answered"
-    if state in ("unavailable", "input_error"):
+    if state == "input_error":
         return "input_error"
     return "run_error"
 
@@ -1037,6 +986,8 @@ def _record_first_synthesis(outcome: EpisodeOutcome, res: _SynthResult,
     outcome.first_synthesis = {
         "phase": "first_synthesis",
         "source": str(res.source or ""),
+        "template_version": PROMPT_TEMPLATE_VERSION,
+        "tool_docs_version": TOOL_DOCS_VERSION,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         if prompt else "",
         "prompt_present": bool(prompt),
@@ -1069,13 +1020,26 @@ def run_episode(
     trace_store: Optional[TraceStore] = None,
     llm=None,
     episodic: Optional[EpisodicMemory] = None,
+    prepared_binding: Optional[PreparedObjectBinding] = None,
+    input_error: Optional[InputErrorRecord] = None,
 ) -> EpisodeOutcome:
     """跑完一条在线链 episode。
 
     llm：可注入的 `synthesis.vllm_client.VLLMClient` 兼容对象（测试用 fake）；
     为 None 且 `mode="real"` 时按 `cfg.vllm_endpoints` 构造；`mock_light` 下不需要。
     """
+    if any(not isinstance(skill, SkillSpecV11) for skill in cfg.skills):
+        raise ValueError(
+            "当前在线协议只接受 SkillSpecV11；运行配置在构造后被注入了旧 SkillSpec")
+    if prepared_binding is not None and not cfg.reuse_artifact:
+        raise ValueError("prepared_binding requires an episode-local reuse_artifact")
     pixels = list(pixels)
+    if input_error is not None:
+        if pixels:
+            raise ValueError("input_error 条目不得同时携带可读像素")
+        if input_error.qa_id != episode.qa_id:
+            raise ValueError(
+                f"input_error.qa_id={input_error.qa_id!r} 与 episode={episode.qa_id!r} 不一致")
     episode_id = episode.qa_id
     states: list[str] = []
     notes: list[str] = []
@@ -1095,6 +1059,11 @@ def run_episode(
         mra_value=None,
         notes=notes,
     )
+    if input_error is not None:
+        outcome.input_error_reason = input_error.reason
+        notes.append(
+            f"M1 input_error={input_error.reason}；所有输入来源均失败，"
+            "不请求模型且保留评测分母")
 
     fsm = OnlineFSM(max_regen=cfg.max_regen)
     states.append(fsm.state.value)
@@ -1114,7 +1083,7 @@ def run_episode(
     handle: Optional[SceneHandle] = None
     verdict: Optional[InputGateVerdict] = None
     retrieved: list[RetrievedSkill] = []
-    selected_skills: list[SkillSpec] = []
+    selected_skills: list[RuntimeSkillSpec] = []
     program: Optional[EpisodeProgram] = None
     program_trace: Optional[ProgramExecutionTrace] = None
     kernel: Optional[RestrictedNamespaceKernel] = None
@@ -1144,7 +1113,12 @@ def run_episode(
         fsm.step("gate_done", {"action": verdict.action})
         states.append(fsm.state.value)
         if fsm.state is OnlineState.ANSWER:
-            notes.append("M2 输入合法性 hard fail → unanswerable（§4 M2 字段 9；"
+            outcome.final_state = "input_error"
+            outcome.failure_code = "input_error"
+            if not outcome.input_error_reason:
+                outcome.input_error_reason = "all_images_unreadable"
+            outcome.input_degradation_flags = list(verdict.degradation_flags)
+            notes.append("M2 输入合法性 hard fail → input_error（§4 M2 字段 9；"
                          f"hard_fail_frames={verdict.hard_fail_frame_ids[:5]}）")
             return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
                      episodic=episodic,
@@ -1286,8 +1260,15 @@ def run_episode(
         m5_materialized = False
         if art is not None:
             # M5 先于 M4 统计：对象绑定产物是 G7/G9 的数据源（G-18 接线）
-            m5_objects, m5_stats, m5_notes, m5_materialized = _bind_objects_best_effort(
-                art, pixels, None, episode, cfg, llm)
+            if prepared_binding is None:
+                m5_objects, m5_stats, m5_notes, m5_materialized = _bind_objects_best_effort(
+                    art, pixels, None, episode, cfg, llm)
+            else:
+                from copy import deepcopy
+
+                binding = deepcopy(prepared_binding)
+                m5_objects, m5_stats = binding.objects, binding.stats
+                m5_notes, m5_materialized = binding.notes, binding.materialized
             notes.extend(m5_notes)
             outcome.m5_notes = list(m5_notes)
             scene, handle, art = _scene_from_artifact(
@@ -1401,576 +1382,43 @@ def run_episode(
         fsm.step("done")
         states.append(fsm.state.value)
 
-    # ---------------- M8 SYNTHESIZE_PROGRAM ----------------
-    static_rounds = 0
-    if fsm.state is OnlineState.SYNTHESIZE_PROGRAM:
-        res = _synthesize(episode, scene, handle, selected_skills, cfg, llm,
-                          feedback=None, geometry=geometry, pixels=pixels)
+    if cfg.baseline == "C0_direct_vlm":
+        res = _synthesize(
+            episode, scene, handle, [], cfg, llm, geometry=geometry, pixels=pixels)
         _record_first_synthesis(outcome, res, scene, cfg)
-        _record_skill_delivery(outcome, res.delivery, round_index=1,
-                               skills=selected_skills, program=res.program)
         outcome.synthesis_source = res.source
         outcome.n_images_to_synthesizer = int(res.n_images)
         outcome.m8_prompt = str(res.prompt or "")
-        direct_answer = res.direct_answer
         program = res.program
-        if "退化" in str(res.note or ""):
-            outcome.degenerate_regenerated = True
-        if program is None:
-            # 题型策略命中时，程序路径失败**不**等于不可答：改用直答（同一 32 帧）。
-            # 否则像 object_counting/appearance_order 这类"本应直答"的题会因为 M8
-            # 解析失败白丢分（实测 32 题里白丢 3 题）。
-            try:
-                _cls_fb = classify(episode)
-            except Exception:  # noqa: BLE001 - 未知题型不触发回退
-                _cls_fb = None
-            if (_cls_fb is not None
-                    and _cls_fb.task in cfg.direct_answer_tasks):
-                d_ans, d_note = _direct_vlm_answer(episode, cfg, llm, pixels=pixels)
-                if d_ans is not None:
-                    program = EpisodeProgram(
-                        program_id=f"droute-{episode.qa_id}",
-                        program_source="",           # 无程序：直答回退（同 C0 语义）
-                        skill_semver_used=[],
-                        intended_answer_slot="direct_answer")
-                    direct_answer = d_ans
-                    outcome.synthesis_source = "direct_answer_fallback"
-                    notes.append(f"M8 程序生成失败 → 题型策略命中，改用直答回退"
-                                 f"（task={_cls_fb.task}）")
-                else:
-                    notes.append(f"M8 程序生成失败且直答回退失败: {d_note[:120]}")
+        direct_answer = res.direct_answer
         if program is None:
             outcome.final_state = "unavailable"
-            outcome.states = list(states)
             notes.append(res.note)
-            notes.append("M8 生成失败 → episode 记 unavailable（§4 M8 字段 9）；"
-                         "起服务：bash scripts/serve_qwen3vl_dp8.sh")
-            return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
-                     episodic=episodic,
-                             verdict=verdict, scene=scene, handle=handle)
-        notes.append(f"M8 program 来源={res.source} program_id={program.program_id}")
-        if res.note:
-            notes.append(res.note)
-        outcome.m8_notes = [f"source={res.source}"] + ([res.note] if res.note else [])
+            return _finalize(
+                outcome, fsm, cfg, episode, states, receipts, trace_store,
+                episodic=episodic, verdict=verdict, scene=scene, handle=handle)
         outcome.program = program
-        outcome.n_images_to_synthesizer = int(res.n_images)
+        notes.append(f"M8 C0 直答来源={res.source}")
         fsm.step("done")
         states.append(fsm.state.value)
-
-    # ---------------- M9 STATIC_CHECK（有限次重生成）----------------
-    while fsm.state is OnlineState.STATIC_CHECK and static_rounds <= cfg.max_regen:
-        static_rounds += 1
-        assert program is not None
-        check = ast_guard(program.program_source, allowed_tools=set(REGISTRY.names()))
-        if check.ok:
-            notes.append(f"M9 AST 通过，Tool 调用={check.allowed_tool_calls}")
-            fsm.step("pass")
-            states.append(fsm.state.value)
-            break
-        notes.append(f"M9 AST 拒绝（第 {static_rounds} 次）: {check.violations}")
-        fsm.step("fail")
+        fsm.step("pass")
         states.append(fsm.state.value)
-        if fsm.state is not OnlineState.SYNTHESIZE_PROGRAM:
-            break  # 重生成次数耗尽 → FSM 已转 unanswerable
-        res = _synthesize(episode, scene, handle, selected_skills, cfg, llm,
-                          feedback=check.violations, geometry=geometry, pixels=pixels)
-        _record_skill_delivery(outcome, res.delivery, round_index=1,
-                               skills=selected_skills, program=res.program)
-        outcome.synthesis_source = res.source
-        program = res.program
-        outcome.program = program
-        outcome.n_images_to_synthesizer = int(res.n_images)
-        if program is None:
-            notes.append(f"M9 重生成失败: {res.note}")
-            break
-        fsm.step("done")
-        states.append(fsm.state.value)
-
-    # ---------------- M10 SANDBOX_EXECUTE（v7 §11 多轮：yield/观察回灌/恢复）----------------
-    if fsm.state is OnlineState.SANDBOX_EXECUTE and program is not None:
-        if program.program_source == "":
-            # §16.1 C0：无 program 可执行（不调沙箱），空 trace 继续走链
-            program_trace = _empty_program_trace(program)
-            notes.append("M10 C0 基线无 program：跳过沙箱执行（空 ProgramExecutionTrace）")
-            fsm.step("ok")
-            states.append(fsm.state.value)
-        agent_rounds = 1          # 已消耗的模型轮次（首轮程序 = 1）
-        max_rounds = max(1, int(cfg.max_solver_rounds))
-        finalization_rounds = max(0, int(cfg.finalization_rounds))
-        finalization = False      # 已达预算边界：只允许提交答案，禁止继续 yield
-        forced_answer_attempted = False
-        while fsm.state is OnlineState.SANDBOX_EXECUTE:
-            wallclock = 0.0
-            if not cfg.deterministic_replay:
-                t0 = time.perf_counter()
-            if kernel is not None and forced_answer_attempted:
-                kernel.set_tools_enabled(False)
-            # §9.4：把"当前求解轮"告诉图像账本 —— 工具在这一轮产出的图按轮记账，
-            # yield 回灌时才能只带**本轮新产出**的派生图（不塞陈图）。
-            if handle is not None:
-                try:
-                    handle._ledger.current_round = int(agent_rounds)  # noqa: SLF001
-                except Exception:  # noqa: BLE001 - 无账本/只读句柄不影响执行
-                    pass
-            kernel, cell, program_trace = _execute_program(
-                episode, program, handle, pixels, cfg, receipts, kernel=kernel)
-            if not cfg.deterministic_replay:
-                wallclock = time.perf_counter() - t0
-            # §17.1「检索与 Round」层：逐轮记录必须落盘。放在**唯一**执行点，
-            # 因此没有哪条 continue/break 分支能漏记（此前只保留最后一轮的
-            # ProgramExecutionTrace，早先轮次的程序与观测无从追溯）。
-            outcome.rounds.append(_round_record(
-                index=agent_rounds, trigger=str(outcome.round_trigger or "initial"),
-                source=str(outcome.synthesis_source or ""), program=program,
-                program_trace=program_trace))
-            outcome.round_trace_refs = [f"round:{r['index']}" for r in outcome.rounds]
-            # 硬约束 23 / §3 M10：程序**自捕获** `ToolContractError` 之后再 ReturnAnswer 时
-            # `cell.error_code` 为空但 `answer_untrusted` 为真。
-            #
-            # v7 §10.1/D1：这**不再**导致答案作废。工具包装层已经把失败写成
-            # `status=failed, payload=None`，生成程序拿不到假的测量值 —— 它只能用
-            # 自己的视觉判断作答。把这类答案丢掉等于对"图片可读"的题目拒答，与
-            # "有图必答"直接冲突。因此保留答案、把契约违规留在事件记录里，并把
-            # 来源保守降级（§12：无法证明完全工具推导 → mixed）。
-            error_code = cell.error_code
-            if forced_answer_attempted and cell.answer_untrusted:
-                error_code = "tool_contract"
-                cell.answer = None
-                if kernel is not None:
-                    kernel.answer_slot.answer = None
-            if error_code is None and cell.answer_untrusted:
-                notes.append("M10 程序自捕获了 Tool 契约异常后仍产答案 → 保留答案"
-                             "（工具层已隔离失败值），契约违规留痕、来源降级，"
-                             "不再作废答案（v7 §10.1/D1）")
-            program_trace = program_trace.model_copy(
-                update={"wallclock_s": wallclock,
-                        "answer_untrusted": bool(cell.answer_untrusted),
-                        "error_code": error_code})
-            outcome.answer_untrusted = bool(cell.answer_untrusted)
-            if cell.answer_untrusted:
-                outcome.answer_flags.append("tool_contract_observed")
-
-            if error_code is None and cell.answer is not None \
-                    and str(cell.answer).strip():
-                receipts.append("cell_run", {"program_id": program.program_id,
-                                             "answer": cell.answer})
-                notes.append(f"M10 执行成功 steps={program_trace.steps}")
-                fsm.step("ok")
-                states.append(fsm.state.value)
-                break
-
-            if error_code is None:
-                receipts.append("cell_run", {"program_id": program.program_id})
-            else:
-                receipts.append("cell_run",
-                                {"program_id": program.program_id,
-                                 "error_code": error_code},
-                                error_code=error_code)
-
-            # ---- v7 §11.1：YieldObservations（成功路径的中途判断）----
-            # 不要求先制造异常：成功结果里的歧义、需要看图像、方法不适用都可使同一
-            # agent 让出本轮，拿到**实际 payload** 后再写下一段程序（§10.2/§11.1）。
-            if error_code is None and cell.terminated == "yield":
-                outcome.yield_count += 1
-                # yield 本身不消耗工具配额之外的东西；轮次与工具调用都计预算。
-                # 这里报"本轮"调用数，故取逐轮视图而不是 episode 账本。
-                n_calls = len(getattr(kernel, "cell_results", []) or [])
-                if forced_answer_attempted:
-                    outcome.final_state = "run_error"
-                    notes.append("M10 finalization 程序再次 yield → run_error，不重入生成")
-                    break
-                if finalization or agent_rounds >= max_rounds - finalization_rounds:
-                    # §11.2：达到继续求解预算边界 → finalization，禁止再 yield。
-                    forced_answer_attempted = True
-                    agent_rounds += 1
-                    notes.append(
-                        f"M10 第 {agent_rounds} 轮 yield 被拒：已达预算边界"
-                        f"（max_solver_rounds={max_rounds}，"
-                        f"finalization_rounds={finalization_rounds}）→ 进入"
-                        f"finalization，只允许提交答案")
-                    forced, forced_src = _forced_answer_with_delivery(
-                        episode, scene, handle, selected_skills, cfg, llm, outcome,
-                        pixels=pixels, geometry=geometry,
-                        round_index=int(agent_rounds) + 1, trigger="finalize")
-                    if forced is not None and not _is_zero_tool_answer_program(forced):
-                        forced = None
-                        forced_src = "zero_tool_contract_violation"
-                    if forced is not None:
-                        program = forced
-                        outcome.program = program
-                        # 程序血统照实记（mock_light 下就是 mock_stub）；"进入收口"
-                        # 这一事实记在 round_trigger/finalization_used，不写进来源。
-                        outcome.synthesis_source = forced_src
-                        outcome.round_trigger = "finalize"
-                        outcome.finalization_used = True
-                        outcome.answer_flags.append("finalization")
-                        finalization = True
-                        agent_rounds += 1
-                        notes.append(f"M10 finalization 生成零工具作答 program"
-                                     f"（{forced_src}）")
-                        continue
-                    outcome.final_state = "run_error"
-                    notes.append(f"M10 finalization 生成失败（{forced_src}）→ run_error")
-                    break
-                obs_feedback = _yield_feedback(cell, kernel, scene, cfg)
-                # v9 §9.4：点名结果里产出的**派生图**（如 inspect_frames 的裁剪）
-                # 随下一次请求一起送进模型 —— 这就是"主动观察回灌"的落点。
-                obs_images = _yield_image_ids(cell, kernel, handle)
-                res = _synthesize(episode, scene, handle, selected_skills, cfg, llm,
-                                  geometry=geometry, pixels=pixels,
-                                  traceback_feedback=obs_feedback,
-                                  prior_program=getattr(program, "program_source", ""),
-                                  observation_image_ids=obs_images,
-                                  round_index=agent_rounds + 1,
-                                  trigger="observation")
-                agent_rounds += 1
-                _record_skill_delivery(outcome, res.delivery, round_index=agent_rounds,
-                                       skills=selected_skills, program=res.program)
-                if obs_images:
-                    notes.append(
-                        f"M10 yield→下一模型请求携带 {len(obs_images)} 张派生图"
-                        f"（§9.4 主动图像）："
-                        f"{res.image_round.get('delivered_image_ids') or obs_images[:3]}")
-                if res.program is None:
-                    notes.append(f"M10 yield 后第 {agent_rounds} 轮生成失败: {res.note}")
-                    break
-                # 新片段必须重过 M9 AST（与首轮同一道闸）
-                check = ast_guard(res.program.program_source,
-                                  allowed_tools=set(REGISTRY.names()))
-                if not check.ok:
-                    notes.append(f"M10 yield 后第 {agent_rounds} 轮 AST 拒绝: "
-                                 f"{check.violations[:3]}")
-                    break
-                program = res.program
-                outcome.program = program
-                outcome.synthesis_source = res.source
-                outcome.round_trigger = "observation"
-                notes.append(
-                    f"M10 yield→观察回灌→第 {agent_rounds} 轮程序"
-                    f"（reason={cell.yielded_reason!r}，"
-                    f"回灌 {len(cell.yielded_result_ids)} 条点名结果，"
-                    f"本轮工具调用 {n_calls}）")
-                # 回灌后必须重建干净命名空间（§11.3：不复用上轮任意 Python 变量）。
-                # 命名空间清空，但 episode 级 tool 账本保留（§17.1 可追溯），
-                # 因此不需要"清空后再塞回去"——那种写法会被下一次 reset 立刻抹掉。
-                if kernel is not None:
-                    kernel.reset_user_namespace()
-                fsm.step("contract_recover")
-                states.append(fsm.state.value)
-                continue
-
-            if forced_answer_attempted and error_code is None and cell.answer is None:
-                outcome.final_state = "run_error"
-                outcome.failure_code = "unknown"
-                notes.append("M10 finalization 未提交答案 → run_error，不再重入")
-                fsm.step("contract_fail")
-                states.append(fsm.state.value)
-                break
-
-            # ---- v6 D7：partial_tool_recovery（§6.4/§14）----
-            # 保留未受污染的成功结果回灌；共享前提失效则级联撤销；恢复次数有限。
-            # §6.3：**执行期 ToolContractError 全族**（tool_contract / confidence_gate /
-            # domain_value / answer_already_given）都走这条恢复路径 —— 局部失败（域值/
-            # 参数）只回灌 validated observations，共享前提失效才级联撤销（§14.1）。
-            if forced_answer_attempted:
-                outcome.failure_code = _FAILURE_CODE_BY_CONTRACT.get(
-                    str(error_code), "unknown")
-                outcome.final_state = "run_error"
-                notes.append("M10 finalization 未提交合法答案 → run_error，不再恢复")
-                fsm.step("contract_fail")
-                states.append(fsm.state.value)
-                break
-
-            if error_code in _RECOVERABLE_CONTRACT_ERRORS:
-                outcome.tool_contract_hits += 1
-                outcome.answer_flags.append("tool_contract")
-                detail = cell.error or "程序自捕获契约异常后仍产答案（answer_untrusted）"
-                notes.append(
-                    f"M10 ToolContractError[{error_code}]"
-                    f"（第 {outcome.tool_contract_hits} 次）: {detail}")
-                if kernel is not None:
-                    # 答案依赖过契约失败的 Tool → 不得采纳
-                    kernel.answer_slot.answer = None
-
-                # §12：恢复轮必须计入求解轮预算。否则"三次重试"可以在每轮之外
-                # 无限追加恢复请求（§11.2 禁止），且 trace 报的轮数会小于实际消耗。
-                agent_rounds += 1
-                if agent_rounds >= max_rounds - finalization_rounds:
-                    forced_answer_attempted = True
-                    outcome.round_trigger = "finalize"
-                    outcome.finalization_used = True
-                    notes.append(
-                        f"M10 第 {agent_rounds} 轮触及预算边界"
-                        f"（max_solver_rounds={max_rounds}，"
-                        f"finalization_rounds={finalization_rounds}）→ 不再恢复，"
-                        "直接零工具收口")
-                    forced, forced_src = _forced_answer_with_delivery(
-                        episode, scene, handle, selected_skills, cfg, llm, outcome,
-                        pixels=pixels, geometry=geometry,
-                        round_index=int(agent_rounds) + 1, trigger="finalize")
-                    if forced is not None and not _is_zero_tool_answer_program(forced):
-                        forced = None
-                        forced_src = "zero_tool_contract_violation"
-                    if forced is not None:
-                        program = forced
-                        outcome.program = program
-                        outcome.synthesis_source = forced_src
-                        outcome.answer_flags.append("forced_answer")
-                        notes.append(f"M10 预算边界收口 → 零工具作答（{forced_src}）")
-                        fsm.step("contract_recover")
-                        states.append(fsm.state.value)
-                        continue
-                    outcome.final_state = "run_error"
-                    notes.append(f"M10 预算边界收口生成失败（{forced_src}）→ run_error")
-                    fsm.step("contract_fail")
-                    states.append(fsm.state.value)
-                    break
-
-                outcome.recovery_count += 1
-                attempt = outcome.recovery_count
-                premise = _premise_from_cell(cell, kernel)
-                plan = RecoveryPlan(
-                    attempt=attempt,
-                    failed_tool=_failed_tool_of(cell),
-                    failure_kind=str(error_code),
-                    premise=premise,
-                    validated=collect_validated(
-                        kernel, evidence_version=str(
-                            getattr(outcome.evidence_profile, "profile_version", ""))),
-                )
-                # 级联撤销（仅当失败揭示共享前提失效；局部失败不撤销，§14.1）
-                if premise and kernel is not None:
-                    ids, tools = cascade_invalidate(kernel, premise, registry=REGISTRY)
-                    plan.invalidated_result_ids = ids
-                    plan.invalidated_tools = tools
-                    outcome.invalidated_result_ids.extend(ids)
-                    # 回写 EvidenceProfile（能力降级）→ 逐题 scope 随之收窄
-                    new_profile, changed = downgrade_profile(
-                        getattr(scene, "evidence_profile", None), premise)
-                    plan.downgraded_capabilities = changed
-                    if new_profile is not None and scene is not None:
-                        scene = scene.model_copy(update={"evidence_profile": new_profile})
-                        invalidated_gate = _invalidate_metric_gate(
-                            getattr(scene, "metric_evidence_gate_result", None), premise)
-                        scene, _d = scope_scene_to_question(
-                            scene, cls.task if cls is not None else "",
-                            m5=outcome.m5_summary,
-                            metric_gate_override=invalidated_gate,
-                            evidence_profile_override=new_profile)
-                        _sync_scene_snapshot(outcome, scene,
-                                             cls.task if cls is not None else "")
-                        handle = _retarget_handle(handle, scene)
-                        notes.append(
-                            f"M7.5（级联撤销后重新派生）scope="
-                            f"{scene.question_tool_scope}"
-                            f"（scene_route={scene.scene_route} 不变，§6.2/D4）")
-                    # 撤销后的 validated 重新收集（被撤销的已不在其中）
-                    plan.validated = collect_validated(
-                        kernel, evidence_version=str(
-                            getattr(outcome.evidence_profile, "profile_version", "")))
-                    notes.append(
-                        f"M10 partial_tool_recovery 级联撤销 premise={premise}："
-                        f"撤销 {len(ids)} 条结果 {ids[:6]}，工具 {tools}，"
-                        f"能力降级 {changed}")
-                    # §13.5：**证据更新后在同一快照中重检索**，更新实际交付记录。
-                    # 能力降级会改变证据签名匹配结果，旧的选中集已不适用；这里不
-                    # 重新加载任何 Skill 库（`cfg.skills` 不变 → 同一快照），只重算
-                    # "在当前证据下哪些方法可检索、哪些被选中"。
-                    if changed:
-                        selected_skills = _retrieve_for_episode(
-                            episode, scene, cfg, outcome, trigger="evidence_update",
-                            llm=llm)
-                        record = outcome.retrieval_records[-1]
-                        outcome.retrieved_skill_versions = list(
-                            record.retrieved_skill_versions)
-                        outcome.selected_skill_semvers = [
-                            f"{s.skill_id}@{s.semver}" for s in selected_skills]
-                        notes.extend(_retrieval_summary_lines(record))
-                        notes.append(
-                            f"M7 证据更新（能力降级 {changed}）→ 同快照重检索："
-                            f"选中 {len(record.retrieved_skill_versions)} 条"
-                            f"（新 evidence_version={record.evidence_version}）")
-                else:
-                    notes.append(
-                        f"M10 partial_tool_recovery 局部失败（无共享前提失效）→ 不撤销"
-                        f"，保留 {len(plan.validated)} 条 validated observations")
-
-                if recovery_exhausted(
-                        attempt, max_attempts=cfg.max_retries_per_operation):
-                    plan.exhausted = True
-                    outcome.failure_code = _FAILURE_CODE_BY_CONTRACT.get(
-                        str(error_code), "tool_contract")
-                    # 恢复耗尽后只允许一次零工具终结程序；不能重新进入可调用工具的恢复环。
-                    forced_answer_attempted = True
-                    forced, forced_src = _forced_answer_with_delivery(
-                        episode, scene, handle, selected_skills, cfg, llm, outcome,
-                        pixels=pixels, geometry=geometry,
-                        round_index=int(agent_rounds) + 1, trigger="finalize")
-                    if forced is not None and not _is_zero_tool_answer_program(forced):
-                        forced = None
-                        forced_src = "zero_tool_contract_violation"
-                    if forced is not None:
-                        program = forced
-                        outcome.program = program
-                        outcome.synthesis_source = forced_src
-                        outcome.round_trigger = "error_recovery"
-                        outcome.finalization_used = True
-                        outcome.answer_flags.append("forced_answer")
-                        notes.append(
-                            f"M10 恢复用尽（{attempt}>{cfg.max_retries_per_operation}）→ 转"
-                            f"零工具视觉作答 program（{forced_src}），不作拒答（v7 D1）")
-                        fsm.step("contract_recover")
-                        states.append(fsm.state.value)
-                        continue
-                    outcome.abstained = False
-                    outcome.final_state = "run_error"
-                    notes.append(
-                        f"M10 partial_tool_recovery 次数用尽（{attempt}>"
-                        f"{cfg.max_retries_per_operation}）且零工具作答生成失败（{forced_src}）"
-                        f"→ 记 run_error（不是「证据不足」）")
-                    fsm.step("contract_fail")
-                    states.append(fsm.state.value)
-                    break
-
-                outcome.partial_tool_recovery = True
-                plan.feedback = build_feedback(
-                    plan, question_type=str(getattr(cls, "task", "") or ""),
-                    scope=str(getattr(scene, "question_tool_scope", "") or ""))
-                _deliveries: list = []
-                res, new_program, round_notes = _regenerate_after_contract(
-                    episode, scene, handle, selected_skills, cfg, llm, pixels,
-                    geometry, prior_program=program, cell=cell,
-                    scope_override=None, feedback_text=plan.feedback,
-                    delivery_sink=_deliveries,
-                    # §9.4：恢复轮同样是真实请求，本轮已产出的裁剪图一并带上
-                    observation_image_ids=_pending_observation_images(handle),
-                    round_index=int(agent_rounds) + 1)
-                notes.extend(round_notes)
-                _record_skill_delivery(
-                    outcome, _deliveries[-1] if _deliveries else None,
-                    round_index=agent_rounds, skills=selected_skills,
-                    program=new_program)
-                if res and new_program is not None:
-                    program = new_program
-                    outcome.program = program
-                    outcome.synthesis_source = "partial_tool_recovery"
-                    outcome.round_trigger = "error_recovery"
-                    notes.append(
-                        f"M10 partial_tool_recovery 生效（attempt={attempt}）")
-                    fsm.step("contract_recover")
-                    states.append(fsm.state.value)
-                    continue
-                outcome.abstained = True
-                outcome.failure_code = _FAILURE_CODE_BY_CONTRACT.get(
-                    str(error_code), "tool_contract")
-                forced_answer_attempted = True
-                forced, forced_src = _forced_answer_with_delivery(
-                    episode, scene, handle, selected_skills, cfg, llm, outcome,
-                    pixels=pixels, geometry=geometry,
-                    round_index=int(agent_rounds) + 1, trigger="error_recovery")
-                if forced is not None and not _is_zero_tool_answer_program(forced):
-                    forced = None
-                    forced_src = "zero_tool_contract_violation"
-                if forced is not None:
-                    program = forced
-                    outcome.program = program
-                    outcome.synthesis_source = forced_src
-                    outcome.round_trigger = "error_recovery"
-                    outcome.finalization_used = True
-                    outcome.answer_flags.append("forced_answer")
-                    outcome.abstained = False
-                    notes.append(
-                        f"M10 partial_tool_recovery 重生成失败 → 转零工具视觉作答"
-                        f"（{forced_src}），不作拒答（v7 D1）")
-                    fsm.step("contract_recover")
-                    states.append(fsm.state.value)
-                    continue
-                outcome.final_state = "run_error"
-                notes.append("M10 partial_tool_recovery 重生成失败，且零工具作答生成"
-                             "失败 → 记 run_error（不是「证据不足」）")
-                fsm.step("contract_fail")
-                states.append(fsm.state.value)
-                break
-
-            notes.append(f"M10 执行错误（第 {fsm.kernel_restart_count + 1} 次）: "
-                         f"{cell.error} / {cell.error_code}")
-            fsm.step("error")
-            states.append(fsm.state.value)
-            if fsm.state is OnlineState.ANSWER:
-                # 两级兜底：no-tool CoT → 正则抽取（§6.1），保证 best-effort 答案。
-                # 注意：tool_contract 触发的 abstain **不走**兜底（答案不可信，§5.1）。
-                best = _best_effort_answer(cell.stdout_tail, llm, episode, cfg,
-                                           pixels=pixels)
-                if best is not None:
-                    cell.answer = best
-                    if kernel is not None:  # 回填 kernel 答案槽，供 M11/M12 读取
-                        kernel.answer_slot.answer = best
-                    outcome.answer_flags.append("no_tool_fallback")
-                    if "unanswerable" in fsm.answer_flags:
-                        outcome.answer_flags.append("unanswerable")
-                        outcome.final_state = "answer_best_effort"
-                    notes.append("M10 两级兜底产出 best-effort 答案（标 no_tool_fallback）")
-                break
+        program_trace = _empty_program_trace(program)
         outcome.program_trace = program_trace
-        # §17.1：本轮到底花了多少轮必须落盘（此前只留在局部变量里）。
-        outcome.agent_rounds = agent_rounds
-
-    # ---------------- v7 D1：有图必答的**单一收口点** ----------------
-    # 无论前面走了哪条失败分支（AST 拒绝、运行时错误、恢复用尽、预算边界），
-    # 只要图片仍然可读，就必须产出一个答案。放在 M10 之后、M11/M12 之前，
-    # 这样比在每个失败分支里各补一次更难漏（实测：只在恢复耗尽处补，会漏掉
-    # `violation_runtime` 这类分支 —— smoke 里 appearance_order 就是这样变成
-    # `unanswerable` 的）。
-    if (kernel is not None and pixels and not forced_answer_attempted
-            and not str(kernel.answer_slot.answer or "").strip()):
-        forced_answer_attempted = True
-        forced, forced_src = _forced_answer_with_delivery(
-            episode, scene, handle, selected_skills, cfg, llm, outcome,
-            pixels=pixels, geometry=geometry,
-            round_index=int(outcome.agent_rounds) + 1, trigger="finalize")
-        if forced is not None and not _is_zero_tool_answer_program(forced):
-            forced = None
-            forced_src = "zero_tool_contract_violation"
-        if forced is not None:
-            kernel.set_tools_enabled(False)
-            kernel, _cell_f, _tr = _execute_program(
-                episode, forced, handle, pixels, cfg, receipts, kernel=kernel)
-            # 收口轮同样要进逐轮记录（它在 while 之外，不能漏）
-            outcome.rounds.append(_round_record(
-                index=int(outcome.agent_rounds) + 1, trigger="finalize",
-                source=str(forced_src or ""), program=forced, program_trace=_tr))
-            outcome.round_trace_refs = [f"round:{r['index']}" for r in outcome.rounds]
-            if str(kernel.answer_slot.answer or "").strip():
-                outcome.program = forced
-                outcome.synthesis_source = forced_src
-                outcome.round_trigger = "finalize"
-                outcome.finalization_used = True
-                notes.append(f"M10b 无答案收口 → 零工具视觉作答成功（{forced_src}）")
-            else:
-                notes.append(f"M10b 零工具作答未产出答案（{forced_src}）")
-        if not str(kernel.answer_slot.answer or "").strip():
-            outcome.final_state = "run_error"
-        if str(kernel.answer_slot.answer or "").strip():
-            outcome.answer_flags.append("forced_answer")
-            # 兜底产出的答案仍要让 FSM 走到评测与落盘
-            if fsm.state not in (OnlineState.GEOMETRY_VERIFY,
-                                 OnlineState.BENCHMARK_EVAL,
-                                 OnlineState.ANSWER):
-                while fsm.state not in (OnlineState.ANSWER,
-                                        OnlineState.LOG_TRACE):
-                    fsm.step("pass")
-                    states.append(fsm.state.value)
-
-    # ---------------- M11 GEOMETRY_VERIFY ----------------
-    if fsm.state is OnlineState.GEOMETRY_VERIFY and program_trace is not None:
-        answer = kernel.answer_slot.answer if kernel is not None else None
-        verify = geometry_verify(program_trace, handle, answer)  # type: ignore[arg-type]
-        outcome.verify = verify
-        notes.append(f"M11 几何校验 passed={verify.passed} checks={verify.checks}")
-        fsm.step("pass" if verify.passed else "reject")
+        notes.append("M9-M11 C0 直答不生成或执行程序，跳过程序与几何验收")
+        fsm.step("ok")
         states.append(fsm.state.value)
-        receipts.append("geometry_verify",
-                        {"passed": verify.passed, "violations": verify.violations})
+        fsm.step("pass")
+        states.append(fsm.state.value)
+    elif fsm.state is OnlineState.SYNTHESIZE_PROGRAM:
+        scene, handle, selected_skills, kernel, program_trace = _solve_program(
+            episode, scene, handle, selected_skills, cfg, llm, outcome, fsm,
+            states, receipts, pixels=pixels, geometry=geometry)
+        program = outcome.program
+        if outcome.final_state == "unavailable":
+            return _finalize(
+                outcome, fsm, cfg, episode, states, receipts, trace_store,
+                episodic=episodic, verdict=verdict, scene=scene, handle=handle)
 
     # ---------------- M12 BENCHMARK_EVAL ----------------
     answer: Optional[str] = kernel.answer_slot.answer if kernel is not None else direct_answer
@@ -1979,16 +1427,6 @@ def run_episode(
     if fsm.state is OnlineState.BENCHMARK_EVAL:
         if cls is None:
             cls = classify(episode)
-        # 任务级策略：该题型配置为直答 → 用**同一 32 帧**重新直答并采纳（记录来源）
-        if (answer is not direct_answer and cls.task in cfg.direct_answer_tasks):
-            d_ans, d_note = _direct_vlm_answer(episode, cfg, llm, pixels=pixels)
-            if d_ans is not None:
-                answer, answer_source = d_ans, "direct_vlm_routed"
-                notes.append(f"M12 题型策略={cls.task} → 改用直答（策略见 "
-                             f"direct_answer_tasks）；program 答案被替换")
-            else:
-                notes.append(f"M12 题型策略={cls.task} → 直答失败，保留 program 答案: "
-                             f"{d_note[:120]}")
         predicted, correct, mra_value = _evaluate(episode, answer, cls)
         outcome.predicted, outcome.correct, outcome.mra_value = predicted, correct, mra_value
         outcome.is_mca = cls.is_mca
@@ -2002,13 +1440,6 @@ def run_episode(
         outcome.answer = answer
         outcome.direct_answer = direct_answer
         outcome.answer_source = answer_source
-        # §14.1：最终答案关联 result_ids（只记 status=ok 且未被级联撤销的结果）
-        if kernel is not None and answer is not None:
-            outcome.used_result_ids = sorted({
-                o.result_id for o in collect_validated(
-                    kernel, evidence_version=str(
-                        getattr(outcome.evidence_profile, "profile_version", "")))
-                if o.result_id})
         # ---- v9 §10.1/§12：答案载荷 + 框架核验的工具归因 ----
         if answer is not None:
             _record_answer_attribution(outcome, episode, kernel, answer)
@@ -2028,20 +1459,294 @@ def run_episode(
 
 # ------------------------------------------------------------------ 各阶段实现 ----
 
-def _frames_with_stats(episode: VSIBenchEpisode, pixels: Sequence[np.ndarray]) -> list[InputFrame]:
-    """（历史入口）用真实 IQA 统计填 InputFrame。
+def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
+                   states, receipts, *, pixels, geometry):
+    """M8–M11 单一循环。每轮最多一次生成请求；所有出口都撤掉未验收的答案。"""
+    kernel = None
+    trace = None
+    feedback = None
+    prior_source = None
+    observation_images: list[str] = []
+    trigger = "initial"
+    retry_counts: dict[str, int] = {}
+    force_next = False
+    unresolved_ids: set[str] = set()
 
-    新代码请用 `gates.input_gate.annotate_frames`（M2 被动观测的单一事实源）；
-    本函数保留为薄封装，语义等价且同样**不改帧集**（硬约束 21）。
-    """
-    from skill3d.gates.input_gate import annotate_frames
+    def step(event):
+        fsm.step(event)
+        states.append(fsm.state.value)
 
-    if pixels and len(pixels) == len(episode.frames):
-        verdict = input_gate(pixels, frame_set=episode.frame_set,
-                            diagnostics=bool(cfg.input_diagnostics))
-        return annotate_frames(episode.frames, verdict, pixels,
-                               diagnostics=bool(cfg.input_diagnostics))
-    return list(episode.frames)
+    def revoke_premise(premise, *, confirmed=False):
+        nonlocal scene, handle, skills
+        ids, _ = cascade_invalidate(kernel, premise, registry=REGISTRY)
+        profile, changed = downgrade_profile(
+            getattr(scene, "evidence_profile", None), premise,
+            confirmed_invalid=confirmed)
+        if profile is not None and scene is not None:
+            scene = scene.model_copy(update={"evidence_profile": profile})
+            scene, _ = scope_scene_to_question(
+                scene, outcome.task, m5=outcome.m5_summary,
+                metric_gate_override=_invalidate_metric_gate(
+                    getattr(scene, "metric_evidence_gate_result", None), premise),
+                evidence_profile_override=profile)
+            _sync_scene_snapshot(outcome, scene, outcome.task)
+            handle = _retarget_handle(handle, scene)
+            if changed:
+                skills = _retrieve_for_episode(
+                    episode, scene, cfg, outcome, trigger="evidence_update", llm=llm)
+                outcome.retrieved_skill_versions = list(
+                    outcome.retrieval_records[-1].retrieved_skill_versions)
+        return ids, changed
+
+    def observations():
+        return [o for o in collect_validated(kernel) if o.result_id not in unresolved_ids]
+
+    for index in range(1, int(cfg.max_solver_rounds) + 1):
+        finalizing = force_next or (
+            index > 1 and index > int(cfg.max_solver_rounds) - int(cfg.finalization_rounds))
+        if finalizing:
+            trigger = "finalize"
+            outcome.finalization_used = True
+            outcome.answer_flags.append("finalization")
+            feedback = (feedback or "") + (
+                "\n这是预算内最后一次作答请求。只允许零工具程序，不得 YieldObservations。"
+                "请依据仍有效的观察或本次原图给出最佳答案；完全依据原图时提交 "
+                "AnswerPayload(value=答案, unit=题型单位, basis='visual_estimate')。"
+                "已撤销的结果与被拒绝的答案不能作为依据。")
+        outcome.agent_rounds = index
+        outcome.round_trigger = trigger
+        # _synthesize 对 v11 不在内部追加退化重试，所有请求都经过这里计数。
+        if finalizing and cfg.mode == "mock_light":
+            forced, source = _forced_answer_program(
+                episode, scene, handle, skills, cfg, llm, pixels=pixels, geometry=geometry)
+            res = _SynthResult(
+                forced,
+                source,
+                "",
+                response_text=str(getattr(forced, "program_source", "") or ""),
+            )
+        else:
+            res = _synthesize(
+                episode, scene, handle, skills, cfg, llm, pixels=pixels, geometry=geometry,
+                traceback_feedback=feedback, prior_program=prior_source,
+                observation_image_ids=observation_images,
+                round_index=index, trigger=trigger)
+        if index == 1:
+            _record_first_synthesis(outcome, res, scene, cfg)
+            outcome.m8_prompt = str(res.prompt or "")
+        _record_skill_delivery(outcome, res.delivery, round_index=index,
+                               skills=skills, program=res.program)
+        outcome.synthesis_source = res.source
+        outcome.n_images_to_synthesizer = int(res.n_images)
+        outcome.m8_notes.append(f"round={index} source={res.source} {res.note}")
+        outcome.program = res.program
+        record = _round_record(index=index, trigger=trigger, source=res.source,
+                               program=res.program, program_trace=None,
+                               response_text=res.response_text)
+        record.update(execution_protocol_version=EXECUTION_PROTOCOL_VERSION,
+                      feedback=feedback or "", executed=False)
+        outcome.rounds.append(record)
+        outcome.round_trace_refs = [f"round:{r['index']}" for r in outcome.rounds]
+        program = res.program
+        failure_key = ""
+        feedback = None
+        observation_images = []
+        if program is None:
+            record["error_code"] = res.source
+            feedback = f"上一轮程序生成失败：{res.note}。请重新输出一个合法 Python 代码块。"
+            failure_key = "synthesis"
+            if res.source in ("none", "vllm_service_error"):
+                outcome.final_state = "unavailable"
+                break
+        else:
+            prior_source = program.program_source
+            step("done")  # SYNTHESIZE_PROGRAM → STATIC_CHECK
+            check = ast_guard(program.program_source, allowed_tools=set(REGISTRY.names()))
+            if not check.ok or (finalizing and not _is_zero_tool_answer_program(program)):
+                problems = list(check.violations) or ["终结程序必须零工具并提交答案"]
+                outcome.static_check_errors.extend(problems)
+                record["error_code"] = "ast_violation"
+                feedback = "上一次生成被 AST 拒绝：" + "; ".join(problems)
+                failure_key = "ast"
+            else:
+                step("pass")
+                if kernel is not None:
+                    kernel.set_tools_enabled(not finalizing)
+                if handle is not None:
+                    handle._ledger.current_round = index  # noqa: SLF001
+                start = time.perf_counter()
+                kernel, cell, trace = _execute_program(
+                    episode, program, handle, pixels, cfg, receipts, kernel=kernel,
+                    tools_enabled=not finalizing)
+                trace = trace.model_copy(update={
+                    "wallclock_s": 0.0 if cfg.deterministic_replay else time.perf_counter() - start,
+                    "answer_untrusted": bool(cell.answer_untrusted)})
+                outcome.program_trace = trace
+                outcome.answer_untrusted = bool(cell.answer_untrusted)
+                record.update(_round_record(
+                    index=index, trigger=trigger, source=res.source,
+                    program=program, program_trace=trace,
+                    response_text=res.response_text))
+                record["executed"] = True
+                record["results"] = [r.model_dump(mode="json") for r in trace.results]
+                receipts.append("cell_run", {"program_id": program.program_id,
+                                             "error_code": cell.error_code})
+                if cell.answer_untrusted:
+                    outcome.answer_flags.append("tool_contract_observed")
+                error = cell.error_code
+                if finalizing and cell.answer_untrusted:
+                    error = "tool_contract"
+                if error is None and str(cell.answer or "").strip():
+                    step("ok")
+                    scope = submission_scope(kernel, trace)
+                    verify = geometry_verify(scope, handle, cell.answer)
+                    reference_issues = invalid_reference_issues(kernel)
+                    if reference_issues:
+                        verify = verify.model_copy(update={
+                            "passed": False,
+                            "checks": {**verify.checks, "invalidated_reference": False},
+                            "violations": list(verify.violations) + ["invalidated_reference"],
+                            "issues": list(verify.issues) + reference_issues})
+                    replay = replay_derivation(
+                        kernel.answer_slot.payload,
+                        kernel.tool_results,
+                        question_type=str(outcome.task or episode.question_type or ""),
+                        options=episode.options,
+                    )
+                    if not replay.passed:
+                        derivation_issues = [
+                            GeometryIssue(
+                                check="derivation_replay",
+                                result_id=issue.result_id,
+                                reason=issue.reason,
+                                invalidate_result=False,
+                            )
+                            for issue in replay.issues
+                        ]
+                        verify = verify.model_copy(update={
+                            "passed": False,
+                            "checks": {**verify.checks, "derivation_replay": False},
+                            "violations": list(dict.fromkeys(
+                                list(verify.violations) + ["derivation_replay"])),
+                            "issues": list(verify.issues) + derivation_issues,
+                            "derivation_replay": replay.model_dump(mode="json"),
+                        })
+                    else:
+                        verify = verify.model_copy(update={
+                            "checks": {**verify.checks, "derivation_replay": True},
+                            "derivation_replay": replay.model_dump(mode="json"),
+                        })
+                    outcome.verify = verify
+                    record["geometry_verify"] = verify.model_dump(mode="json")
+                    record["verification_result_ids"] = [r.result_id for r in scope.results]
+                    receipts.append("geometry_verify", {
+                        "round": index, **verify.model_dump(mode="json")})
+                    outcome.notes.append(
+                        f"M11 round={index} passed={verify.passed} violations={verify.violations}")
+                    if verify.passed:
+                        record["submission_accepted"] = True
+                        outcome.used_result_ids = accepted_result_ids(kernel, scope)
+                        step("pass")
+                        return scene, handle, skills, kernel, trace
+                    record["submission_accepted"] = False
+                    record["rejected_submission"] = rejected_submission(kernel)
+                    # 保存审计后立即清空 answer/payload/given 和用户变量，账本保留。
+                    kernel.reset_user_namespace()
+                    ids = invalidate_results(
+                        kernel, [i.result_id for i in verify.issues
+                                 if i.result_id and i.invalidate_result],
+                        reason=f"M11:round:{index}")
+                    changes = {}
+                    for premise in sorted({i.confirmed_shared_premise for i in verify.issues
+                                           if i.confirmed_shared_premise}):
+                        extra, changed = revoke_premise(premise, confirmed=True)
+                        ids.extend(extra)
+                        changes.update(changed)
+                    record["invalidated_result_ids"] = sorted(set(ids))
+                    record["downgraded_capabilities"] = changes
+                    outcome.invalidated_result_ids.extend(ids)
+                    located_checks = {
+                        i.check for i in verify.issues
+                        if i.result_id and i.invalidate_result
+                    }
+                    unlocated = set(verify.violations) - located_checks
+                    if unlocated - {"derivation_replay"}:
+                        # 归因不足：不猜共享根因，也不把尚未通过验收的结果回灌成可信观察。
+                        unresolved_ids.update(r.result_id for r in scope.results)
+                    feedback = (
+                        "M11 拒绝上一轮提交，答案槽和程序变量已清空；请修正后重新提交。\n"
+                        f"检查失败：{verify.violations}\n"
+                        f"定位事实：{[i.model_dump() for i in verify.issues]}\n"
+                        f"已撤销结果：{sorted(set(ids))}；证据能力变化：{changes}。\n"
+                        "无明确共享根因的失败只作局部处理；未定位结果不当作可信观察。")
+                    failure_key = "geometry_verify"
+                    record["error_code"] = "geometry_rejected"
+                    step("reject")
+                elif error is None and cell.terminated == "yield" and not finalizing:
+                    outcome.yield_count += 1
+                    feedback = _yield_feedback(cell, kernel, scene, cfg)
+                    observation_images = _yield_image_ids(cell, kernel, handle)
+                    trigger = "observation"
+                else:
+                    feedback = f"程序执行失败：{error or 'no_answer'}；{cell.error or '没有提交答案'}"
+                    failure_key = str(error or "no_answer")
+                    record["error_code"] = failure_key
+                    if kernel.answer_slot.given:
+                        record["rejected_submission"] = rejected_submission(kernel)
+                    if error in _RECOVERABLE_CONTRACT_ERRORS:
+                        outcome.tool_contract_hits += 1
+                        outcome.recovery_count += 1
+                        outcome.partial_tool_recovery = True
+                        premise = _premise_from_cell(cell, kernel)
+                        ids, changes = revoke_premise(premise) if premise else ([], {})
+                        outcome.invalidated_result_ids.extend(ids)
+                        record["invalidated_result_ids"] = ids
+                        record["downgraded_capabilities"] = changes
+                        plan = RecoveryPlan(
+                            attempt=retry_counts.get(failure_key, 0) + 1,
+                            failed_tool=_failed_tool_of(cell), failure_kind=str(error),
+                            premise=premise, validated=observations(),
+                            invalidated_result_ids=ids, downgraded_capabilities=changes)
+                        feedback += "\n" + build_feedback(
+                            plan, question_type=outcome.task, scope=outcome.question_tool_scope,
+                            require_answer=True)
+
+        if kernel is not None:
+            kernel.reset_user_namespace()
+        if finalizing:
+            outcome.notes.append(f"M11 终结轮未通过验收（round={index}），不再请求模型")
+            break
+        if feedback and kernel is not None:
+            valid = observations()
+            feedback += "\n仍然有效的既有观察（仅这些结果可复用）：\n" + (
+                "\n".join(o.summary(max_chars=1200) for o in valid) or "无；请依据原图重新判断。")
+            record["recovery_observation_ids"] = [o.result_id for o in valid]
+        if failure_key:
+            retry_counts[failure_key] = retry_counts.get(failure_key, 0) + 1
+            retry_limit = (int(cfg.max_regen) if failure_key in ("ast", "synthesis")
+                           else int(cfg.max_retries_per_operation))
+            exhausted = retry_counts[failure_key] > retry_limit
+            if exhausted and int(cfg.finalization_rounds) <= 0:
+                outcome.notes.append(
+                    f"{failure_key} 重试预算耗尽，且未保留 finalization 轮")
+                break
+            force_next = exhausted
+            trigger = "error_recovery"
+        if feedback:
+            feedback += f"\n剩余模型请求上限：{int(cfg.max_solver_rounds) - index}（含终结轮）。"
+        if fsm.state is not OnlineState.SYNTHESIZE_PROGRAM:
+            step("resynthesize")
+
+    if kernel is not None:
+        kernel.reset_user_namespace()
+    if outcome.final_state != "unavailable":
+        outcome.final_state = "run_error"
+        outcome.failure_code = "unknown"
+    outcome.notes.append(
+        f"当前求解协议结束，无通过验收的答案；已用 "
+        f"{outcome.agent_rounds}/{cfg.max_solver_rounds} 轮")
+    step("solver_failed")
+    return scene, handle, skills, kernel, trace
 
 
 def _load_npy(ref: str):
@@ -2070,21 +1775,6 @@ def _overall_str(art) -> str:
 
 class _ReuseMiss(Exception):
     """内部信号：P1 落盘 artifact 不可复用（不存在 / 帧集不符）→ 走重算分支。"""
-
-
-def _artifact_json_path(cfg: OnlineRunConfig, scene_name: str, *,
-                        frame_set=None) -> str:
-    """P1 落盘的 artifact JSON 路径（方案 Y 原子写回的目标）。
-
-    v9 §5.2：缓存身份含**源标识 + 帧集内容哈希**，不再是纯 scene 名（同名 scene 跨
-    数据集/跨视频会互相顶用）。这里委托 `reconstruction.run.artifact_path` —— 此前
-    本函数与它各写了一份同样的路径约定，是重复定义。旧命名的产物由
-    `resolve_artifact_path` 兜底复用（§17.2 迁移）。
-    """
-    from skill3d.reconstruction.run import artifact_path
-
-    return str(artifact_path(cfg.recon_dir, scene_name, cfg.recon_method,
-                             frame_set=frame_set))
 
 
 def _resolve_existing_artifact(cfg: OnlineRunConfig, episode) -> tuple[str, bool]:
@@ -2311,7 +2001,8 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
             seed=int(cfg.seed),
         )
     except Exception as exc:  # noqa: BLE001 - checkpoint/依赖/传播失败
-        return [], {}, [f"M5 对象绑定不可用（{type(exc).__name__}: {exc}）→ "
+        return [], {"binding_error": f"{type(exc).__name__}: {exc}"}, [
+                        f"M5 对象绑定不可用（{type(exc).__name__}: {exc}）→ "
                         "相关 Tool 查询回退全场景（TODO_USER_INPUT: SAM2 checkpoint，§7.1 G-19）"], False
     return objects, stats, notes, True
 
@@ -2365,17 +2056,6 @@ def _round_dict(ledger, round_index: int) -> dict:
         if r.round_index == int(round_index):
             return r.model_dump()
     return {}
-
-
-def _pending_observation_images(handle) -> list[str]:
-    """当前轮已产出、尚未交付的派生图（收口/恢复轮也要带上，§9.4 不静默丢图）。"""
-    ledger = getattr(handle, "_ledger", None) if handle is not None else None  # noqa: SLF001
-    if ledger is None or not ledger.has_frames():
-        return []
-    try:
-        return list(ledger.pending_derived_images())
-    except Exception:  # noqa: BLE001 - 账本异常不得阻断生成
-        return []
 
 
 def _yield_image_ids(cell: CellResult, kernel, handle) -> list[str]:
@@ -2467,7 +2147,13 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             intended_answer_slot="direct_answer",
         )
         source = "vllm_ok" if cfg.mode == "real" else "mock_stub"
-        return _SynthResult(program, source, note, direct_answer=answer)
+        return _SynthResult(
+            program,
+            source,
+            note,
+            direct_answer=answer,
+            response_text=str(answer or ""),
+        )
 
     if cfg.mode == "mock_light":
         # 有合成几何用合成几何；否则（冻结真实 artifact / golden 重放）用 handle 对象名
@@ -2478,13 +2164,21 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             names = [_class_hint_of(handle, oid) for oid in handle.list_objects()]
         src = synth.stub_program(episode.question_type, episode, geometry,
                                  object_names=names)
-        return _SynthResult(assemble_program(src, []), "mock_stub",
-                            "M8 mock_light 确定性 stub program"
-                            "（非 Qwen3-VL-8B 输出，仅管道验证）")
+        return _SynthResult(
+            assemble_program(src, []),
+            "mock_stub",
+            "M8 mock_light 确定性 stub program"
+            "（非 Qwen3-VL-8B 输出，仅管道验证）",
+            response_text=src,
+        )
 
     prompt, delivery = _build_prompt_ex(episode, scene, handle, skills, feedback,
                                         scope_override=scope_override,
-                                        traceback_feedback=traceback_feedback,
+                                        # 带 prior_program 时反馈作为下一条 user turn 发送；
+                                        # 不再同时复制进首条公共 prompt。
+                                        traceback_feedback=(
+                                            None if prior_program is not None
+                                            else traceback_feedback),
                                         policy=cfg.retrieval_policy)
     client = llm if llm is not None else _make_vllm_client(cfg)
     if client is None:
@@ -2556,15 +2250,13 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         ledger.mark_round_observed(int(round_index),
                                    prompt_tokens=usage.get("prompt_tokens"))
 
-    # §15.3 退化输出（20KB 重复段落/超长无意义输出/重复度超阈）→ **先重生成**
+    # 退化输出由同一个有界求解循环计为一次失败，不在请求函数内暗加重试。
     reason = degenerate_reason(text)
     if reason is not None:
-        notes_deg = f"M8 退化输出检测命中：{reason} → 触发一次重生成（§15.3）"
-        text = _regenerate_non_degenerate(client, messages, cfg, reason)
-        if text is None:
-            return _SynthResult(None, "vllm_parse_error",
-                                notes_deg + "；重生成仍退化/失败 → vllm_parse_error",
-                                prompt=prompt, n_images=n_images, delivery=delivery)
+        return _SynthResult(
+            None, "vllm_parse_error", f"M8 退化输出：{reason}（交由有界求解循环重试）",
+            prompt=prompt, n_images=n_images, delivery=delivery,
+            image_round=_round_dict(ledger, round_index), response_text=text)
 
     try:
         # `skill_semver_used` 承载的是"这一轮**实际交付**给模型的方法集"（v8 以来的
@@ -2574,38 +2266,28 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         program, recovered = assemble_program_ex(
             text, [e.skill_version for e in delivery.entries])
     except SynthesisError as exc:
-        return _SynthResult(None, "vllm_parse_error", f"M8 program 解析失败: {exc}",
-                            prompt=prompt, n_images=n_images, delivery=delivery,
-                            image_round=_round_dict(ledger, round_index))
+        return _SynthResult(
+            None,
+            "vllm_parse_error",
+            f"M8 program 解析失败: {exc}",
+            prompt=prompt,
+            n_images=n_images,
+            delivery=delivery,
+            image_round=_round_dict(ledger, round_index),
+            response_text=text,
+        )
     # §15.2：解析回退单列 m8_parse_recovered，与"真解析不出来"区分开
     source = "m8_parse_recovered" if recovered else "vllm_ok"
-    return _SynthResult(program, source, "", n_images=n_images, prompt=prompt,
-                        delivery=delivery, image_round=_round_dict(ledger, round_index))
-
-
-def _regenerate_non_degenerate(client, messages, cfg: OnlineRunConfig,
-                               reason: str) -> Optional[str]:
-    """§15.3：退化输出触发**一次**重生成；仍退化或失败返回 None。
-
-    重生成会显式告诉模型"上一轮输出退化了"，并要求只输出一个代码块；
-    重生成结果必须重过 M9 AST（由调用方在拿到 program 后统一做）。
-    """
-    hint = (f"\n\n上一次输出被判定为退化（{reason}）。"
-            "请只输出一个 ```python 代码块，代码块外不要写任何文字，"
-            "不要反复讨论、不要在解释里纠结取舍 —— 直接给出你的最佳答案并"
-            "用 ReturnAnswer 提交（有图必答：证据不足只改变求解方式，"
-            "不改变必须作答这一条）。")
-    try:
-        msgs = list(messages)
-        if msgs and isinstance(msgs[-1].get("content"), list):
-            msgs[-1] = {**msgs[-1],
-                        "content": list(msgs[-1]["content"]) + [
-                            {"type": "text", "text": hint}]}
-        else:
-            msgs = msgs + [{"role": "user", "content": hint}]
-        return client.chat(msgs, max_tokens=cfg.max_tokens, seed=int(cfg.seed))
-    except Exception:  # noqa: BLE001 - 重生成失败即放弃（上层记 parse_error）
-        return None
+    return _SynthResult(
+        program,
+        source,
+        "",
+        n_images=n_images,
+        prompt=prompt,
+        delivery=delivery,
+        image_round=_round_dict(ledger, round_index),
+        response_text=text,
+    )
 
 
 def _class_hint_of(handle, obj_id: str) -> str:
@@ -2682,7 +2364,9 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
         available = sorted(handle.available_artifacts)
     else:
         available = sorted(getattr(scene, "available_artifacts", set()) or set())
-    qtype = str(getattr(scene, "question_type", "") or "")
+    raw_qtype = (str(getattr(scene, "question_type", "") or "")
+                 or str(episode.question_type or ""))
+    qtype = canonical_question_type(raw_qtype) or raw_qtype
     profile = getattr(scene, "evidence_profile", None) if scene is not None else None
     gate = getattr(scene, "metric_evidence_gate_result", None) if scene is not None else None
     plan = plan_delivery(
@@ -2714,29 +2398,6 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
     if traceback_feedback:
         text += f"\n{traceback_feedback}"
     return text, plan
-
-
-def _contract_feedback(cell: CellResult, program: EpisodeProgram, scene) -> str:
-    """回灌文本（§4 M6 字段 9）：裁剪后的 traceback + 可用产物清单。
-
-    只给"失败的工具调用 + 缺失产物 + 当前 route 可用产物"，不给整段宿主 traceback
-    （避免把内部路径/实现细节喂进 prompt）。
-    """
-    violations = cell.contract_violations or []
-    lines = ["上一次 program 执行被 Tool 契约拒绝（产物缺失，硬约束 23）："]
-    for v in violations:
-        lines.append(f"- Tool {v.get('tool')} 缺产物 {v.get('missing')}"
-                     f"；route={v.get('route')}；可用产物={v.get('available')}")
-    if not violations:
-        lines.append(f"- {cell.error}")
-    avail = sorted(getattr(scene, "available_artifacts", set()) or set())
-    lines.append(f"当前 route={getattr(scene, 'route', '')}，可用产物={avail}。")
-    # v7 D1：有图必答。工具不可用只改变**求解方式**（改用仍可用的工具，或直接
-    # 依据已看到的图片给出估计），不改变"必须作答"这一条。
-    lines.append("请只用产物的确齐备的 Tool 重写 program；若该量当前无法用工具获得，"
-                 "就依据你在图片里看到的内容直接给出估计并用 ReturnAnswer 提交"
-                 "（缺失的测量值改为视觉估计即可，不要放弃作答）。")
-    return "\n".join(lines)
 
 
 def _answer_source_v6(*, answer: Optional[str], program, kernel,
@@ -2795,58 +2456,6 @@ def _premise_from_cell(cell: CellResult, kernel) -> Optional[str]:
         missing_artifacts=arts, unmet_evidence=unmet)
 
 
-def _regenerate_after_contract(episode, scene, handle, skills, cfg, llm, pixels,
-                               geometry, *, prior_program: EpisodeProgram,
-                               cell: CellResult,
-                               scope_override: Optional[str] = None,
-                               feedback_text: Optional[str] = None,
-                               delivery_sink: Optional[list] = None,
-                               observation_image_ids: Optional[Sequence[str]] = None,
-                               round_index: Optional[int] = None
-                               ) -> tuple[bool, Optional[EpisodeProgram], list[str]]:
-    """partial_tool_recovery 的重生成（v6 §6.4/§14）。
-
-    与 v5 的"回灌/裁剪两档"不同：v6 只有**一条**恢复路径 ——
-    重置命名空间 → 注入 validated observations 摘要 + 失败信息 → 重生成 → 重执行；
-    次数由 `cfg.max_retries_per_operation` 约束（`[TODO_CALIBRATE]`），超限切
-    `direct_vlm_routed` 或 abstain。
-
-    重生成必须重过 M9 AST 检查；重执行前必须 `reset_user_namespace()`（避免引用
-    已失效的旧变量）。
-
-    `delivery_sink`：同 `_forced_answer_program`，恢复轮的方法交付同样要落盘（§13.6）。
-    """
-    notes: list[str] = []
-    if cfg.mode == "mock_light" and llm is None:
-        # mock_light 的 stub program 是确定性的：重生成只会得到同一份 → 直接 abstain
-        notes.append("M10 恢复层跳过：mock_light 无模型，stub program 重生成无意义")
-        return False, None, notes
-
-    feedback = feedback_text or _contract_feedback(cell, prior_program, scene)
-    # §14.1：重置用户命名空间（保留 Tool/帧/答案槽），再注入 validated obs 摘要
-    if handle is not None:
-        pass  # kernel 由 _execute_program 持有；重置在其内部按需执行
-    res = _synthesize(episode, scene, handle, skills, cfg, llm,
-                      feedback=None, geometry=geometry, pixels=pixels,
-                      scope_override=scope_override,
-                      traceback_feedback=feedback,
-                      prior_program=None,
-                      observation_image_ids=observation_image_ids,
-                      round_index=(1 if round_index is None else int(round_index)),
-                      trigger="error_recovery")
-    if delivery_sink is not None:
-        delivery_sink.append(res.delivery)
-    if res.program is None:
-        notes.append(f"M10 恢复层重生成失败: {res.note}")
-        return False, None, notes
-    check = ast_guard(res.program.program_source, allowed_tools=set(REGISTRY.names()))
-    if not check.ok:
-        notes.append(f"M10 恢复层重生成未过 M9 AST: {check.violations}")
-        return False, None, notes + ["AST 拒绝"]
-    notes.append("M10 恢复层重生成通过 M9 AST（回灌 validated observations + 失败信息）")
-    return True, res.program, notes
-
-
 def _make_vllm_client(cfg: OnlineRunConfig):
     if not cfg.vllm_endpoints:
         return None
@@ -2864,7 +2473,8 @@ def _empty_program_trace(program: EpisodeProgram) -> ProgramExecutionTrace:
 
 
 def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, receipts,
-                     kernel: Optional[RestrictedNamespaceKernel] = None):
+                     kernel: Optional[RestrictedNamespaceKernel] = None,
+                     tools_enabled: Optional[bool] = None):
     """M10：建/复用 kernel → 执行 program → 收集 ProgramExecutionTrace（§5.4）。
 
     `kernel` 非空时**先 reset user namespace 再重注入**（SpatialClaw §E.3 先例）：
@@ -2874,6 +2484,8 @@ def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, rec
     if kernel is not None:
         kernel.reset_user_namespace()
         kernel._mock_switch = mock_switch  # noqa: SLF001 - 重注入 mock 句柄
+        if handle is not None:
+            kernel.retarget_scene(handle)
     else:
         kernel = RestrictedNamespaceKernel(
             REGISTRY,
@@ -2885,6 +2497,8 @@ def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, rec
             call_id_factory=_Counter() if cfg.deterministic_replay else None,
             episode_id=str(getattr(episode, "qa_id", "") or ""),
         )
+    if tools_enabled is not None:
+        kernel.set_tools_enabled(tools_enabled)
     receipts.append("sandbox_start", {"episode_id": episode.qa_id, "mode": cfg.mode})
     cell = kernel.run_cell(program.program_source)
     # 逐轮视图：账本跨轮只增不减（§17.1），但本轮 trace 只报本轮产生的调用/结果
@@ -3032,29 +2646,6 @@ def _forced_answer_program(episode: VSIBenchEpisode, scene, handle, skills,
     return res.program, res.source
 
 
-def _forced_answer_with_delivery(episode, scene, handle, skills, cfg, llm, outcome,
-                                 *, pixels=None, geometry=None, round_index=None,
-                                 trigger: str = "finalize"):
-    """`_forced_answer_program` + 交付记录（§13.6）。
-
-    收口轮同样是"一次真实的模型请求"：交付了哪些方法必须落盘，否则 trace 会漏掉
-    最后一轮的方法上下文 —— 而那一轮恰恰是预算耗尽后的最终作答。
-    """
-    sink: list = []
-    rnd = int(round_index if round_index is not None else outcome.agent_rounds)
-    program, source = _forced_answer_program(
-        episode, scene, handle, skills, cfg, llm,
-        pixels=pixels, geometry=geometry, delivery_sink=sink,
-        # §9.4：收口/恢复轮也是真实请求 —— 模型刚裁剪出来的图一并带上，
-        # 否则"要求看某块区域"的让出会在收口时白丢（实测踩过）。
-        observation_image_ids=_pending_observation_images(handle),
-        round_index=rnd, trigger=str(trigger))
-    _record_skill_delivery(
-        outcome, sink[-1] if sink else None,
-        round_index=rnd, skills=skills, program=program)
-    return program, source
-
-
 def _is_zero_tool_answer_program(program: EpisodeProgram) -> bool:
     source = str(getattr(program, "program_source", "") or "")
     check = ast_guard(source, allowed_tools=set())
@@ -3069,38 +2660,6 @@ def _is_zero_tool_answer_program(program: EpisodeProgram) -> bool:
                 for node in calls)
             and not any(isinstance(node.func, ast.Name)
                         and node.func.id == "YieldObservations" for node in calls))
-
-
-def _best_effort_answer(stdout_tail: str, llm, episode: VSIBenchEpisode,
-                        cfg: OnlineRunConfig,
-                        pixels: Optional[Sequence[np.ndarray]] = None) -> Optional[str]:
-    """§6.1 两级兜底：no-tool CoT（需 vLLM）→ 正则抽取。
-
-    **必须带统一 FrameSet 的图像**（实测缺陷，2026-09-20）：此前 real 模式只发文本，
-    模型看不到视频 → 兜底答案是无信息的乱猜，而且它会**覆盖程序里已经算对的工具结果**
-    （实测 chair 题：count_objects 返回 4（=GT），兜底把答案改成 0）。
-    """
-    text = ""
-    client = llm if llm is not None else _make_vllm_client(cfg)
-    if client is not None:
-        try:
-            q = episode.question + "\n只回答答案本身，不要解释。"
-            if episode.options:
-                q += "（只回答选项字母）"
-            expected = (len(episode.frame_set.readable_frame_ids)
-                        if getattr(episode, "frame_set", None) is not None else None)
-            messages = _prompt_messages(q, pixels, cfg, expected_frames=expected)
-            text = client.chat(messages, max_tokens=128)
-        except Exception:  # noqa: BLE001 - 兜底失败即降级到第二级
-            text = ""
-    elif cfg.mode == "mock_light":
-        # mock_light 无模型：用确定性 stub 作为第一级占位（已显式标注）
-        text = synth.stub_direct_answer(episode)
-    if not text:
-        text = stdout_tail
-    if episode.options:
-        return extract_option_letter(text)
-    return text.strip() or None
 
 
 def _evaluate(episode: VSIBenchEpisode, answer: Optional[str], cls: TaskClassification):
@@ -3139,6 +2698,12 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         except Exception:  # noqa: BLE001 - 账本投影失败不得阻断收尾
             outcome.image_ledger = {}
     outcome.answer_flags = list(dict.fromkeys(outcome.answer_flags + list(fsm.answer_flags)))
+    if outcome.final_state == "input_error":
+        outcome.answer_flags = [
+            flag for flag in outcome.answer_flags
+            if flag not in ("unanswerable", "abstain")
+        ]
+        outcome.answer_flags.append("input_error")
     receipts.append("episode_end", {"final_state": outcome.final_state,
                                     "qa_id": episode.qa_id})
     outcome.receipts = receipts.receipts
@@ -3151,6 +2716,10 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         if outcome.final_state == "unanswerable":
             outcome.final_state = "answer"
 
+    if not outcome.task:
+        cls = classify(episode)
+        outcome.task = cls.task
+        outcome.is_mca = cls.is_mca
     if not outcome.is_mca and outcome.mra_value is None and outcome.correct is None:
         cls = classify(episode)
         outcome.is_mca = cls.is_mca
@@ -3177,7 +2746,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
 
     # v3 §4 M6 字段 9 / §5.1：abstain 与 unanswerable **主榜按错计**
     # （MRA=0 / exact_match=0，不刷分）；只有 unavailable（模型/服务不可用）不进分母。
-    if outcome.final_state in ("unanswerable", "abstain", "run_error"):
+    if outcome.final_state in ("unanswerable", "abstain", "run_error", "input_error"):
         cls_wrong = classify(episode)
         outcome.is_mca = cls_wrong.is_mca
         if cls_wrong.is_mca:
@@ -3186,10 +2755,11 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         else:
             outcome.mra_value = 0.0
             outcome.correct = None
-        if outcome.final_state != "run_error":
+        if outcome.final_state not in ("run_error", "input_error"):
             outcome.abstained = True
             if "abstain" not in outcome.answer_flags:
                 outcome.answer_flags.append("abstain")
+    outcome.episode_status = _episode_status_of(outcome.final_state)
 
     outcome.frame_set_hash = (episode.frame_set.frame_set_hash
                               if episode.frame_set is not None else "")
@@ -3239,6 +2809,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         main_gate_passed=main_gate_passed,
         input_degradation_flags=sorted(set(outcome.input_degradation_flags or [])),
         answer_source=str(outcome.answer_source),
+        input_error_reason=str(outcome.input_error_reason or ""),
         recovery_count=int(outcome.recovery_count),
         partial_tool_recovery=bool(outcome.partial_tool_recovery),
         used_result_ids=sorted(set(outcome.used_result_ids or [])),
@@ -3251,6 +2822,9 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         answer_basis=str(outcome.answer_basis or ""),
         answer=(outcome.answer_payload.model_dump()
                 if outcome.answer_payload is not None else {}),
+        derivation_replay=(
+            dict(outcome.verify.derivation_replay)
+            if outcome.verify is not None else {}),
         attribution=(outcome.attribution.model_dump()
                      if outcome.attribution is not None else {}),
         authorization_receipts=[dict(r) for r in (outcome.authorization_receipts or [])],
@@ -3276,6 +2850,17 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             outcome.declared_selected_skill_versions or []),
     )
     if trace_store is not None:
+        trace_store.append("episode_input", EpisodeInputTrace(
+            qa_id=episode.qa_id,
+            scene_id=episode.scene_name,
+            dataset=episode.dataset,
+            question_type=episode.question_type,
+            question_text=episode.question,
+            options=list(episode.options or []),
+            reference_answer=episode.ground_truth,
+            source_split=episode.split,
+            frame_set_hash=str(outcome.frame_set_hash or ""),
+        ))
         trace_store.append("episode_trace", outcome.episode_trace)
         # §5.9 TraceRecord：版本字段 + 证据/路由全状态（不依赖重跑即可归因）
         trace_store.append("trace_record", _trace_record_of(outcome, episode, cfg))
@@ -3289,6 +2874,21 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
                 "task": str(getattr(outcome, "task", "") or ""),
                 "program_id": outcome.program.program_id,
                 "program_source": outcome.program.program_source,
+                "response_text": str(
+                    next(
+                        (
+                            row.get("response_text")
+                            for row in reversed(outcome.rounds)
+                            if row.get("response_text") is not None
+                        ),
+                        "",
+                    )
+                ),
+                "response_texts": [
+                    str(row["response_text"])
+                    for row in outcome.rounds
+                    if row.get("response_text") is not None
+                ],
                 "answer_source": str(outcome.answer_source or ""),
                 "skill_semver_used": list(getattr(outcome.program, "skill_semver_used", []) or []),
                 # §13.6：`skill_semver_used` 是"进过模型请求的方法集"（上下文口径）；
@@ -3303,24 +2903,29 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             })
         if outcome.verify is not None:
             trace_store.append("geometry_check", outcome.verify)
-        trace_store.append("evaluation_result", {
-            "qa_id": episode.qa_id,
-            "question_type": episode.question_type,
-            "task": outcome.task or episode.question_type,
-            "is_mca": outcome.is_mca,
-            "predicted": outcome.predicted,
-            "ground_truth": episode.ground_truth,
-            "correct": outcome.correct,
-            "mra_value": outcome.mra_value,
+        trace_store.append("evaluation_result", EvaluationResultTrace(
+            qa_id=episode.qa_id,
+            question_type=episode.question_type,
+            task=outcome.task or episode.question_type,
+            is_mca=outcome.is_mca,
+            predicted=outcome.predicted,
+            ground_truth=episode.ground_truth,
+            correct=outcome.correct,
+            mra_value=outcome.mra_value,
             # §19.1「不依赖重跑即可归因失败」：`predicted=None` 有两种截然不同的原因——
             # (a) 模型 abstain（无答案），(b) 模型给了自由文本但抽不出选项字母。
             # 不落原始答案就分不开这两者（实测 2770 属 (b)，却只留下一只普通错题）。
-            "answer_text": (outcome.answer if outcome.answer is not None
-                            else outcome.direct_answer),
-            "answer_source": str(outcome.answer_source or ""),
-            "abstained": bool(outcome.abstained),
-            "failure_code": outcome.failure_code,
-        })
+            answer_text=(outcome.answer if outcome.answer is not None
+                         else outcome.direct_answer),
+            answer_source=str(outcome.answer_source or ""),
+            episode_status=str(outcome.episode_status or ""),
+            input_error_reason=str(outcome.input_error_reason or ""),
+            derivation_replay=(
+                dict(outcome.verify.derivation_replay)
+                if outcome.verify is not None else {}),
+            abstained=bool(outcome.abstained),
+            failure_code=outcome.failure_code,
+        ))
     if episodic is not None:
         _write_episodic_memory(episodic, outcome, episode, trace_store)
     return outcome
@@ -3381,8 +2986,16 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
             episodic = EpisodicMemory(path=_episodic_path(cfg))
         except Exception:  # noqa: BLE001 - 记忆是增强项，绝不阻断评测
             episodic = None
-    outcomes = [run_episode(it.episode, it.pixels, cfg, geometry=it.geometry,
-                            trace_store=store, llm=llm, episodic=episodic) for it in items]
+    outcomes = [run_episode(
+        it.episode,
+        it.pixels,
+        cfg,
+        geometry=it.geometry,
+        trace_store=store,
+        llm=llm,
+        episodic=episodic,
+        input_error=getattr(it, "input_error", None),
+    ) for it in items]
 
     mca = [o for o in outcomes if o.is_mca]
     na = [o for o in outcomes if not o.is_mca]
@@ -3434,10 +3047,14 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
         store.append("evaluation_run", run)
         store.append("online_run", {
             "run_id": run.run_id, "mode": cfg.mode, "baseline": cfg.baseline,
+            "template_version": PROMPT_TEMPLATE_VERSION,
+            "execution_protocol_version": EXECUTION_PROTOCOL_VERSION,
+            "tool_docs_version": TOOL_DOCS_VERSION,
             "seed": cfg.seed, "source": getattr(items[0], "source", "unknown"),
             "n_episodes": len(outcomes), "split": run.split,
             "n_unavailable": sum(1 for o in outcomes if o.final_state == "unavailable"),
             "n_unanswerable": sum(1 for o in outcomes if o.final_state == "unanswerable"),
+            "n_input_error": sum(1 for o in outcomes if o.final_state == "input_error"),
             "deterministic_replay": cfg.deterministic_replay,
             "note": ("mock_light/合成数据：仅管道验证，不构成任何精度结论（§9.2）"
                      if cfg.mode != "real" else "real 模式"),

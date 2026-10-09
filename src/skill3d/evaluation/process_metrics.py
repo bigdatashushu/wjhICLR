@@ -43,6 +43,7 @@ class ProcessMetrics:
     n_answer_best_effort: int = 0
     n_unanswerable: int = 0
     n_unavailable: int = 0
+    n_input_error: int = 0
     program_success_rate: Optional[float] = None      # 沙箱执行成功比例
     geometry_pass_rate: Optional[float] = None        # 几何验证通过比例
     fallback_rate: Optional[float] = None             # 走兜底/受限 Tool 集的比例
@@ -159,6 +160,8 @@ def aggregate_process_metrics(
             m.n_answer_best_effort += 1
         elif state == "unavailable":
             m.n_unavailable += 1
+        elif state == "input_error":
+            m.n_input_error += 1
         else:
             m.n_unanswerable += 1
 

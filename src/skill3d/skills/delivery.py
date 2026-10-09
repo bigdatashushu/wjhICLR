@@ -53,9 +53,12 @@ DELIVERY_REASON_CODES: frozenset[str] = frozenset({
 def render_skill_entry(skill: Any) -> str:
     """单条方法的**完整**正文（进 prompt 的唯一形态；不做任何截断）。
 
-    与旧 Jinja 模板逐字一致的三段式：标题行 + 描述 + 模板。此前渲染写法散在模板里，
-    正文 hash 只能"另算一遍"，本函数把它收成单一事实源。
+    v11 Skill 直接返回规范化的完整 ``skill_md``；这个字符串同时用于模型请求与
+    ``content_sha256``。旧 SkillSpec 继续使用历史三段式，保证已有快照可重放。
     """
+    skill_md = getattr(skill, "skill_md", None)
+    if skill_md is not None:
+        return str(skill_md)
     header = f"### {skill.skill_id}@{skill.version} (task_type={skill.task_type})"
     return "\n".join([
         header,
@@ -156,7 +159,8 @@ def plan_delivery(skills: Optional[Sequence[Any]], *,
     规则（按规范原文）：
 
     - 按**传入顺序**（= 检索排序）贪心取完整条目，累计长度含分隔符不得超上限；
-    - 放不下的**整条丢弃**并记录 `context_cap_exceeded`，**绝不截断**正文；
+    - 旧 Skill 放不下时整条丢弃并记录 `context_cap_exceeded`，绝不截断正文；
+    - v11 每题只有一条完整方法，单条放不下表示候选静态准入失效，直接报错；
     - 上限必须为正：`None` 用默认值，非正数 raise（"0 字符预算"与"无上限"是两回事，
       静默当成无上限会让上限形同虚设）。
     """
@@ -169,6 +173,10 @@ def plan_delivery(skills: Optional[Sequence[Any]], *,
         text = render_skill_entry(skill)
         n = len(text)
         sep = 1 if plan.entries else 0        # 条目间的换行分隔符也算进预算
+        if getattr(skill, "skill_md", None) is not None and used + sep + n > limit:
+            raise ValueError(
+                f"v11 Skill {skill_version_key(skill)} 完整正文 {n} 字符超过"
+                f"方法上下文上限 {limit}；必须压缩候选，不能运行时丢弃")
         if used + sep + n <= limit:
             used += sep + n
             plan.entries.append(DeliveredSkill(

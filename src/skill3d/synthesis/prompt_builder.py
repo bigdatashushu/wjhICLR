@@ -1,13 +1,8 @@
-"""Program Synthesizer prompt 构建（§4 M8）：Jinja2 版本化模板。
+"""Current Program Synthesizer prompt contract.
 
-只暴露 Tool 文档与 SkillSpec 模板，绝不暴露 ground_truth（防泄漏）。
-模板字符串内联于本模块，按模板名版本化。
-
-v9 变更（§13.5/§13.6）：方法条目不再在模板里逐字段拼接，而是渲染
-`skills.delivery.SkillDeliveryPlan` 里**已经是最终文本**的条目 —— 这样 prompt 里
-出现的方法正文与 trace 里记的 `delivered_content_sha256` 出自同一个函数，
-"已交付正文 hash"才真的能证明"模型收到的是这段文本"。
-上下文放不下的条目由交付计划**整条**丢弃（§13.5：不得截断后仍称完整交付）。
+Only Tool documentation and complete ``SkillSpecV11`` sources are exposed. Ground
+truth is deliberately absent. Historical prompts are recovered from Git rather
+than selected at runtime.
 """
 
 from __future__ import annotations
@@ -16,127 +11,92 @@ from typing import Optional, Sequence
 
 from jinja2 import Environment, StrictUndefined
 
-from skill3d.schemas import SkillSpec
+from skill3d.schemas import SkillSpecV11
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 
-# program_synth_v8（内联版本化模板）
-#
-# v7→v8 的唯一变更：方法条目走交付计划（§13.5 完整正文 + 上下文上限 + 交付 hash）。
-# 其余口径（v7 的"取消拒答""两个控制接口都是终结操作""相对距离官方口径"）逐字保留。
-TEMPLATE_VERSION = "program_synth_v8"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_2"
 
-# program_synth_v7（内联版本化模板）
-#
-# v6→v7 的三处口径变更（对应《系统架构v7》D1/D2/D4）：
-#   1. **取消拒答**：`ReturnAnswer("abstain")` 不再被接受为终态。有可读图片时，
-#      证据不足只改变**求解方式**（换工具，或直接依据图片做视觉估计），不改变
-#      "必须给出答案"这一条。v6 里 32% 的 episode 走 abstain → 全部零分。
-#   2. **两个控制接口都是终结操作**：`return ReturnAnswer(...)` 立即结束；
-#      `return YieldObservations([...], "理由")` 结束当前片段并把**实际结果**
-#      回灌给同一个模型，由模型写下一段程序。这是 D4"根据执行反馈调整程序"的
-#      实现方式 —— 成功结果里的歧义、需要看新图、方法不适用都可以让出。
-#   3. **相对距离题的官方口径纠正**（v7 §2.2，依据原论文附录 B.1）：
-#      比较**题面参照对象**到各候选对象的距离，不是"观察点→候选"。
-#
-# v5→v6 保留的纪律（不放松任何门）：只输出一个代码块、不自我辩论、
-# 不存在隐藏全局变量、AST 白名单、单位换算。
-_PROGRAM_SYNTH_V3 = """你是一名空间推理 Coding Agent。请为下面的题目生成一段 Python program，
-通过编排已注册的 Tool 完成推理，**并以 `return ReturnAnswer(答案)` 结束**。
 
-## 当前可用产物与证据状态（scope + EvidenceProfile 裁剪，只暴露真正可执行的 Tool）
-{{ route_header }}
+# These definitions are part of the shared task contract, not solving recipes.
+_TASK_DEFINITIONS = {
+    "object_counting": "统计题面指定类别与范围内的对象数量，答案为非负整数。",
+    "object_abs_distance": "估计题面点名的两个对象之间的最近距离，单位按题目要求。",
+    "object_rel_distance": "选择距离题面参照对象最近的候选类别；参照对象不是相机。",
+    "object_size_estimation": "估计目标对象长、宽、高中的最大物理维度，单位按题目要求。",
+    "room_size_estimation": "估计题面指定空间的地面面积，答案单位为平方米。",
+    "object_rel_direction": "判断站在题面指定位置、面向指定对象时目标的方向，答案词表由选项决定。",
+    "obj_appearance_order": "判断题面指定类别在给定视频中的首次出现顺序。",
+    "route_planning": "判断沿题面给定路线行进时的转向，答案为当前选项中的完整动作序列。",
+}
 
-## 场景摘要
-{{ scene_summary }}
+_PROGRAM_SYNTH = """你是一名空间推理 Coding Agent。根据题目、图像和当前可用工具，
+生成并执行一段 Python program，最终通过 `return ReturnAnswer(答案)` 提交。
 
-坐标系: {{ scene_frame }}；本题题型: {{ question_type or "未分类" }}
+## 公共执行规则
+- 只输出一个 ```python 代码块，代码块之外不要写解释。
+- 可以顶层直接写代码，也可以定义 `def solve(ctx): ...`，host 会自动调用该入口。
+- 只允许 import numpy / scipy / math / statistics；禁止其他 import，以及 eval/exec/__import__/open/文件写/网络。
+- 禁止对 show / ReturnAnswer / YieldObservations / AnswerPayload / tools / scene / frames 赋值。
+- `return ReturnAnswer(答案)` 提交暂存答案并立即结束当前程序片段；框架通过几何与有效证据验收后才结束本题。验收失败时撤销提交，反馈检查项、受影响结果及仍有效的观察，由同一模型在剩余预算内修正。
+- `return YieldObservations([result_id, ...], "理由")` 结束本段程序，将点名结果的实际返回值送入下一轮请求；求解轮数和重试次数由框架预算控制。
+- 只能依据实际收到的图像和有效工具观察推理；已失效结果不得继续支持答案。
+- 有图必答：有可读图像时，证据不足可按视觉估计作答，并如实标记依据；`ReturnAnswer("abstain")` 不是合法答案。
+- 工具缺失、失败或无效返回不等于零；不得编造几何、尺度、观察或 result_id。
 
-## 可用 Tool（只允许调用以下函数）
-{{ tool_docs }}
+## 答案载荷与观察接口
+- `AnswerPayload` 已在运行环境中提供，无需 import。完整提交为
+  `return ReturnAnswer(AnswerPayload(value=答案, unit=单位, basis=依据, used_result_ids=[], derivation=None))`。
+  unit 取 option/count/m/cm/m2；basis 取 visual_estimate/tool_derived/mixed。
+  纯视觉估计使用 visual_estimate，used_result_ids 为空且 derivation 为 None；
+  结合视觉与工具使用 mixed，并列出实际使用的结果 ID。
+- tool_derived 还需声明非空 used_result_ids 和 derivation：
+  `{"op": 操作名, "input_result_ids": [实际结果ID], "parameters": {变换参数}}`。
+  op 仅支持 field/convert/count/sort/argmin/option_map，框架会按真实 ToolResult
+  确定性重放并核对答案。参数格式：
+  field=`{"field":"a.b.0"}`；convert=`{"field":"distance_m","from_unit":"m","to_unit":"cm"}`；
+  count=`{"field":"items"}`；argmin 可对一个字典或多个结果取最小值，多个结果需给
+  `labels`；sort 与 argmin 类似，可给 `descending`；option_map=
+  `{"field":"direction","mapping":{"left":"A","right":"B"}}`。
+  参数只能是这些结构化字段，不能放代码或表达式。无法用一个登记操作完整证明答案时，
+  使用 mixed，不得声明 tool_derived。
+- 兼容 `ReturnAnswer(value)`，此时依据保守登记为 mixed。
+  ReturnAnswer 只接受一个参数，不能直接传 basis、unit 等关键字。
+- 工具返回 dict 时，框架附加 `result_id` 字符串；可用
+  `return YieldObservations([result["result_id"]], "理由")` 请求回传。
+  list/数值/bool 返回值不附加 ID；`return YieldObservations([], "理由")`
+  回传本 episode 仍有效的成功工具结果及其 ID；已失效结果不会作为观察回传。
 
-{% if skill_entries %}
-## 参考 Skill 模板（题型级程序合成模板，非答案）
-{% for e in skill_entries %}
-{{ e }}
-{% endfor %}
-{% endif %}
-
-## 题目
+## 当前题目与答案要求
 {{ question }}
-{% if options %}
-选项:
-{% for opt in options %}
-{{ opt }}
-{% endfor %}
-MCA 题：ReturnAnswer 只接受选项字母（如 "A"）。
-{% else %}
-NA 题：ReturnAnswer 接受数值。
+本题题型: {{ question_type or "未分类" }}
+{% if task_definition %}题义: {{ task_definition }}
+{% endif %}{% if options %}选项:
+{% for opt in options %}{{ opt }}
+{% endfor %}MCA 题：提交与选项文本对应的选项字母（如 "A"）。
+{% else %}NA 题：答案值（短写 value 或 AnswerPayload.value）必须为一个有限数值，不得为列表或字典。
 {% endif %}
+题面中的对象角色、空间范围、参照系和要求单位必须保持一致。
+工具的单位、坐标与计算定义以当前接口文档和有效返回为准；近似结果应按其实际定义解释。
+米转厘米乘以 100，面积转换按长度比例的平方进行；已为目标单位的值不再换算。
+缺少有效尺度时不得将归一化几何量冒充米制测量；视觉估计不得冒充工具测量。
 
-## 两个控制接口（都是终结操作，调用即结束本段程序）
-1. `return ReturnAnswer(答案)` —— 提交答案，立即结束本题。
-2. `return YieldObservations([result_id, ...], "理由")` —— **不提交答案**，
-   结束本段程序，把你点名的 Tool 结果的**实际返回值**回灌给你，你再写下一段
-   程序。适用于：结果有歧义需要判断、需要看某张裁剪图、某个方法不适用、
-   或需要先拿到一批数再决定下一步。可以多次让出（受预算限制）。
+## 当前证据状态
+{{ route_header }}
+场景摘要: {{ scene_summary }}
+坐标与尺度的可用性以当前证据状态和工具合同为准。
 
-**有图必答（硬要求）**：图片是可读的，因此**必须给出答案**。
-不要输出 `abstain`、也不要因为工具缺失/证据不足而拒绝作答 ——
-证据不足只改变**求解方式**：换一个还能用的工具，或者直接依据你在图片里
-看到的内容给出**视觉估计**（`basis` 记 `visual_estimate`）。
-`ReturnAnswer("abstain")` 不是合法答案，会被判为违反作答纪律。
-
-## 输出纪律（必须遵守）
-- 只输出**一个** ```python 代码块；代码块之外不要写解释、不要写推理过程。
-- **MCA 题**：工具/中间结果是方向词或类别词时，必须**先与选项文本逐条对应**，
-  再返回选项字母（例：工具返回 `behind`、选项 B 是 "back" → `ReturnAnswer("B")`）。
-  **不要把选项字母硬编码**：先把所有候选都算出来，再按题面给的选项文本匹配。
-- 题目里的参照系（站在哪、面向谁）必须**从题面读取**，不要自己假设。
-- 计算完就立刻 `return ReturnAnswer(...)`，不要再调用任何 Tool。
-- 不要在代码里写"如果不确定就……"的多轮自我辩论；不确定就给最佳估计。
-
-## 题目口径（按题型对照，写错口径会系统性答错）
-- **`object_rel_distance`（相对距离）**：题面问的是「哪个选项**离题面提到的参照
-  对象**最近」。等价做法是：对每个候选类别取它**离参照对象最近的那个实例**，
-  比较这些距离取最小。**不要**改成"相机→候选"距离，也不要改成对象质心距离
-  以外的东西 —— 这是官方口径。
-- **`object_abs_distance`（绝对距离）**：题面**点名的两个对象之间**的最近距离
-  （米）。不是相机到对象的距离。
-- **`object_size_estimation`（尺寸）**：对象**最长边**，题面常问厘米 → 米制值 ×100。
-- **`room_size_estimation`（房间面积）**：平方米，不要再换算。
-- **`object_rel_direction`（相对方向）**：用 `relative_direction_of(
-  observer=站在哪, facing_at=面向谁, target=要判断的对象, difficulty=难度)`。
-  **`difficulty` 必须按题面选项集合传**：题面只有 left/right → `easy`；
-  只有 left/right/back → `medium`；四象限 → `hard`。
-  传错会让工具返回一个**不在选项里**的方向词（例如 medium 题面没有 front），
-  再映射到选项就一定错。**返回的方向词必须能与选项文本逐条对上**。
-- **`obj_appearance_order`（外观顺序）**：按各类别**最早可见帧**排序；
-  若某类别缺少检出，仍要结合选项集合与你在图片里看到的顺序给出最佳答案。
-- **`object_counting`（计数）**：优先 `count_objects`；若它与你在图片里看到的
-  明显不符，用 `YieldObservations` 取回实例明细后判断，**不要直接放弃**。
-
-## 单位纪律（尺寸/距离/面积题必读）
-- 所有米制 Tool 返回的都是**米 / 平方米**；题面常问**厘米**。
-  题面问厘米时**必须 ×100**（问平方米时直接用，不要再乘）。
-- 返回给 ReturnAnswer 的必须是**一个数**（或选项字母），不是列表/字典。
-- **返回值键名以 Tool 文档为准**（例如 `surface_distance_between_objects` 返回
-  `surface_distance_metric`，`count_objects` 返回 `count`）。不确定就先打印一次
-  再取键，或让出观察。
-
-## 约束
-- 只允许 import numpy / scipy / math / statistics；禁止其他 import
-- 禁止 eval/exec/__import__/open/文件写/网络
-- 禁止对 show / ReturnAnswer / YieldObservations / tools / scene / frames 赋值
-- 输出一个 ```python ... ``` 代码块。**两种写法都支持，任选一种**：
-  1. 顶层直接写（推荐，最不容易出错）：最后用 `return ReturnAnswer(答案)`；
-  2. 定义入口 `def solve(ctx): ...`：**host 会自动调用它**，你不需要自己调用。
-  无论哪种写法，都必须真的执行到 `ReturnAnswer` / `YieldObservations`。
-"""
+## 获准工具及接口文档
+{{ tool_docs }}
+只允许调用当前文档列出的工具；签名、返回字段与可用性以该文档为准。
+方法指导不会新增工具权限；具体对象绑定与调用前置条件仍由框架检查。
+{% if skill_entries %}
+## 参考方法
+{% for e in skill_entries %}{{ e }}{% endfor %}{% endif %}"""
 
 
 class PromptBuilder:
-    def __init__(self, template_version: str = TEMPLATE_VERSION) -> None:
-        self.template_version = template_version
+    def __init__(self) -> None:
+        self.template_version = PROMPT_TEMPLATE_VERSION
         self._env = Environment(undefined=StrictUndefined)
 
     def render(
@@ -146,7 +106,7 @@ class PromptBuilder:
         scene_frame: str,
         tool_docs: str,
         options: Optional[Sequence[str]] = None,
-        skills: Optional[Sequence[SkillSpec]] = None,
+        skills: Optional[Sequence[SkillSpecV11]] = None,
         scope: str = "",
         available_artifacts: Optional[Sequence[str]] = None,
         route_header: str = "",
@@ -173,8 +133,6 @@ class PromptBuilder:
         就是计划里的条目 —— 于是"prompt 里的方法正文"与"trace 里的正文 hash"
         必然同源。
         """
-        if self.template_version != TEMPLATE_VERSION:
-            raise ValueError(f"未知模板版本: {self.template_version}")
         if not route_header and scope:
             from skill3d.tools import REGISTRY
 
@@ -185,7 +143,7 @@ class PromptBuilder:
         plan = skill_plan
         if plan is None and skills:
             plan = plan_delivery(skills, max_chars=method_context_max_chars)
-        tpl = self._env.from_string(_PROGRAM_SYNTH_V3)
+        tpl = self._env.from_string(_PROGRAM_SYNTH)
         return tpl.render(
             question=question,
             scene_summary=scene_summary,
@@ -193,6 +151,7 @@ class PromptBuilder:
             tool_docs=tool_docs,
             route_header=route_header or "（未声明 scope：仅使用不依赖重建产物的 Tool）",
             question_type=question_type,
+            task_definition=_TASK_DEFINITIONS.get(question_type, ""),
             options=list(options) if options else None,
             skill_entries=[e.text for e in (plan.entries if plan is not None else [])],
         )

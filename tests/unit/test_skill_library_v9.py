@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from skill3d.schemas import SkillSpec
-from skill3d.skills.registry import load_active_skills
+from skill3d.skills.registry import load_legacy_active_skills as load_active_skills
 from skill3d.skills.source_compiler import (
     SkillSourceError,
     compile_directory,
@@ -106,10 +106,17 @@ def test_source_compiler_rejects_missing_fixed_section(tmp_path):
         compile_skill_source(source)
 
 
-def test_active_pointer_loads_s0_from_directory_and_pointer():
-    directory_skills, directory_warnings, directory_ref = load_active_skills(LIBRARY / "snapshots")
+def test_active_pointer_loads_s0_from_directory_and_pointer(tmp_path):
+    # Keep testing the v9 snapshot independently of the repository's active version.
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    snapshot_name = "snapshot_S0-seed-20260925-v1.json"
+    (store / snapshot_name).write_bytes((LIBRARY / "snapshots" / snapshot_name).read_bytes())
+    (store / "active_snapshot.json").write_text(
+        json.dumps({"snapshot_id": "S0-seed-20260925-v1"}), encoding="utf-8")
+    directory_skills, directory_warnings, directory_ref = load_active_skills(store)
     pointer_skills, pointer_warnings, pointer_ref = load_active_skills(
-        LIBRARY / "snapshots" / "active_snapshot.json")
+        store / "active_snapshot.json")
     assert directory_ref == pointer_ref == "S0-seed-20260925-v1"
     assert directory_warnings == pointer_warnings == []
     assert len(directory_skills) == len(pointer_skills) == 8

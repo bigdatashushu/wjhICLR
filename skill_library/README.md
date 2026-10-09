@@ -1,10 +1,15 @@
-# harness3D v9 Skill Library
+# harness3D Skill Library
 
-This directory is the repository-local Skill library defined by the v9 architecture.
+This directory is the repository-local Skill library. The active snapshot is
+`S0-v11-contract-repair`; the v9 source/compiler artifacts remain available for
+historical checks and rollback.
 
 ## Source of truth
 
-Edit only `skills/<skill-name>/SKILL.md`. Each source has a YAML front matter and the fixed Markdown sections required by source format `1.0`. A source version is immutable after it has entered a released snapshot. A method change creates a new semantic version and a candidate record; it must not overwrite the S0 source.
+Legacy v9 sources live in `skills/<skill-name>/SKILL.md`, with YAML front matter
+and the fixed Markdown sections required by source format `1.0`. Active v11 sources
+live in `versions/` as described below. A released source version is immutable;
+a method change creates a new semantic version and candidate record.
 
 `imports/` contains the verified transport bundle and its receipt. The bundle keeps the original document-level export identity (`schema_version=8.0`); it is not the runtime schema.
 
@@ -25,7 +30,10 @@ The compiler intentionally keeps `image_2d` as the only whole-Skill requirement.
 
 ## Snapshots and candidates
 
-`snapshots/active_snapshot.json` is the only online pointer. The online loader reads only the inline `spec_content` of the pointed immutable snapshot. It never scans `generated/`, `candidates/`, or `candidates/future/`.
+`snapshots/active_snapshot.json` is the only online pointer. The online loader reads
+the pointed immutable snapshot: inline `spec_content` for v9, or verified
+`source_ref` content for v11. It never scans `generated/`, `candidates/`, or
+`candidates/future/`.
 
 - `snapshots/snapshot_<id>.json`: immutable promoted snapshot.
 - `candidates/`: immutable records for real, trace-backed revisions that may be validated.
@@ -33,7 +41,64 @@ The compiler intentionally keeps `image_2d` as the only whole-Skill requirement.
 - `manifests/`: source, generated, compiler, snapshot and validation identities.
 - `validation/`: static import/compile receipts. They do not claim real model/tool execution.
 
-Promotion must use the existing atomic snapshot writer. A rejected candidate leaves the active pointer unchanged; a promoted candidate is loaded only by new episodes. S0 is `S0-seed-20260925-v1` and is a non-empty document/static seed, not a claim of runtime verification, benchmark score, real evolution or E-S0 gain.
+Promotion must use the existing atomic snapshot writer. A rejected candidate leaves the active pointer unchanged; a promoted candidate is loaded only by new episodes. The legacy S0 `S0-seed-20260925-v1` remains available for rollback. Activating the v11 format migration does not claim a benchmark score or Skill evolution gain.
+
+## v11 active snapshot
+
+The v11 path keeps each immutable complete source under
+`versions/<skill_id>/<version>/<name>/SKILL.md`. Runtime identity and the source
+digest live in a schema `runtime-skill-snapshot/2.0` entry; the loader verifies
+the manifest, source path, UTF-8/LF form, and full-source hash before returning
+`SkillSpecV11`. Delivery uses that exact `skill_md` string without recompiling
+or reconstructing sections.
+
+`S0-v11-format-migration` contains the eight v11 `1.1.0` methods, with exactly
+one active method for each canonical question type. The earlier
+`S0-v11-s03-format-migration` snapshot is retained as the S03 vertical migration
+preview. The repository active pointer references `S0-v11-contract-repair`,
+whose parent is the format-migration snapshot. S01/S08 are now 1.2.0 with
+explicit parent-version references; the other six sources remain 1.1.0.
+All previous snapshots and source bytes are preserved. This is a contract-repair
+baseline (generation 0), not an evidence-backed evolution gain.
+
+Build or verify the snapshot with:
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py
+PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py --check
+PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py --profile contract-repair --check
+```
+
+`--profile contract-repair --activate` selects the repaired snapshot through the atomic pointer writer
+after validation. Normal benchmark commands do not change the pointer.
+
+## v11 public prompt
+
+The online runtime has one contract: `program_synth_v11_2`,
+`solver-v11.2-m11-acceptance`, and `tool-docs-v11.1`. These identities are
+recorded in every run but are not selectable through YAML, CLI, or
+`OnlineRunConfig`. B01 and B11 therefore share the same public task definitions,
+unit rules, execution contract, and authorized Tool documentation. B11 appends
+the complete selected Skill source as a method block; B01 appends none.
+
+The control contract documents `AnswerPayload`, real result IDs, pending
+submissions, and M11 rejection/revision. S06 no longer promises a nonexistent
+angle field; visibility docs describe stored frame slots. S01 groups tracks
+before geometric merging; S08 uses horizontal projections and valid
+world-up/handedness metadata from `object_centroid`.
+
+Historical prompt and Tool-document behavior is available only by checking out
+the corresponding Git commit. Current tool behavior remains identified as
+`tool-face-v11.1`.
+
+## v11 paired Skill ablation
+
+`scripts/run_skill_ablation_v11.py` runs B01 (empty delivery) and B11 (the explicit
+`S0-v11-contract-repair` snapshot by default) with the same v11 public prompt and an always-on
+quality gate. It freezes inputs and M5 results, gives each arm private runtime
+and artifact copies, and writes qa_id-paired scores and delivery hashes.
+See [运行命令、隔离合同与输出说明](../docs/skill_ablation_v11.md).
+This entry does not change the active pointer or use v10 fixed injection.
 
 ## Data and provenance rules
 

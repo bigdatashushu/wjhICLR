@@ -23,7 +23,7 @@ import numpy as np
 
 from skill3d.online import synthetic as _synth
 from skill3d.routing.task_classifier import QUESTION_TYPE_VALUES, TASK_TYPES
-from skill3d.schemas import VSIBenchEpisode
+from skill3d.schemas import InputErrorRecord, VSIBenchEpisode
 
 # 8 个规范题型（§4 M7 / §16"8 任务分别准确率"）；合成数据在此 8 类上各造一条
 ALL_TASKS = TASK_TYPES
@@ -42,10 +42,35 @@ class EpisodeItem:
     geometry: Optional[_synth.SyntheticGeometry] = None
     source: str = "vsi_bench"  # vsi_bench | jsonl | synthetic
     video_path: str = ""
+    input_error: Optional[InputErrorRecord] = None
 
 
 class EpisodeSourceError(RuntimeError):
     """数据源不可用（缺 meta / 缺视频 / 缺 datasets 依赖）。"""
+
+
+def _row_id(row: dict) -> str:
+    return str(row.get("qa_id") or row.get("id") or "")
+
+
+def _input_error_record(
+    row: dict,
+    split: str,
+    reason: str,
+    attempts: Sequence[dict] = (),
+) -> InputErrorRecord:
+    return InputErrorRecord(
+        qa_id=_row_id(row),
+        scene_name=str(row.get("scene_name", "") or ""),
+        dataset=str(row.get("dataset", "unknown") or "unknown"),
+        question_type=str(row.get("question_type", "") or ""),
+        question=str(row.get("question", "") or ""),
+        options=list(row["options"]) if row.get("options") else None,
+        ground_truth=str(row.get("ground_truth", "") or ""),
+        split=split,  # type: ignore[arg-type]
+        reason=str(reason),
+        source_attempts=[dict(attempt) for attempt in attempts],
+    )
 
 
 # ------------------------------------------------------------------ synthetic ----
@@ -135,6 +160,7 @@ def load_vsi_bench_items(
     sampling_seed: int = 0,
     exclusions: Optional[list] = None,
     sampling_receipt: Optional[dict] = None,
+    include_input_errors: bool = False,
 ) -> list[EpisodeItem]:
     """从 HF meta + 原始视频装配条目（需 `datasets` 与本地视频，均 TODO_USER_INPUT）。
 
@@ -239,12 +265,26 @@ def load_vsi_bench_items(
     # ---- 第二段：抽帧（`max_per_scene` 只在此处生效）----
     items: list[EpisodeItem] = []
     per_scene: dict[str, int] = {}
-    def _exclude(row: dict, reason: str) -> None:
+    def _exclude(
+        row: dict,
+        reason: str,
+        *,
+        input_failure: bool = False,
+        attempts: Sequence[dict] = (),
+    ) -> Optional[InputErrorRecord]:
         """§5.3："每个预登记 qa_id 必须有结果行；不足 32 帧不能通过 skip 静默消失。"""
+        record = None
+        if input_failure:
+            record = _input_error_record(row, split, reason, attempts)
         if exclusions is not None:
-            exclusions.append({"qa_id": str(row.get("qa_id", "") or ""),
-                               "scene_name": str(row.get("scene_name", "") or ""),
-                               "reason": reason})
+            exclusions.append(
+                record.model_dump(mode="json") if record is not None else {
+                    "status": "excluded",
+                    "qa_id": _row_id(row),
+                    "scene_name": str(row.get("scene_name", "") or ""),
+                    "reason": reason,
+                })
+        return record
 
     for row in selected:
         scene = str(row["scene_name"])
@@ -256,8 +296,20 @@ def load_vsi_bench_items(
         if loaded is None:
             # §5.2："全部指定图像缺失或无法解码：`input_error`，记录原因" —— 换过
             # 所有来源副本之后仍然失败才走到这里，**不生成伪答案**（§5.3 分母保留）。
-            _exclude(row, _source_failure_reason(attempts))
+            failure = _exclude(
+                row,
+                _source_failure_reason(attempts),
+                input_failure=True,
+                attempts=attempts,
+            )
             _record_source_attempts(sampling_receipt, row, attempts, used=None)
+            if include_input_errors and failure is not None:
+                items.append(EpisodeItem(
+                    episode=failure.as_episode(),
+                    pixels=[],
+                    source="vsi_bench",
+                    input_error=failure,
+                ))
             continue
         pixels, planned, missing = loaded["pixels"], loaded["planned"], loaded["missing"]
         total, fps, source = loaded["total"], loaded["fps"], loaded["source"]
@@ -270,7 +322,7 @@ def load_vsi_bench_items(
         # 从副本加载时 `video_id` 带来源标签（`vsibench_loader.video_id_for`）。
         fset = vl.build_frame_set(
             total, n_frames=n_frames, fps=fps,
-            episode_id=str(row.get("qa_id", "") or ""),
+            episode_id=_row_id(row),
             dataset_id=str(row.get("dataset", "") or ""),
             video_id=vl.video_id_for(row, source),
             scene_name=scene,
@@ -282,7 +334,7 @@ def load_vsi_bench_items(
             # `input_degraded` 标记本身由 M2 在帧数不足时自动加上。
             if sampling_receipt is not None:
                 sampling_receipt.setdefault("partially_readable", []).append({
-                    "qa_id": str(row.get("qa_id", "") or ""),
+                    "qa_id": _row_id(row),
                     "n_planned": len(planned), "n_readable": len(readable),
                     "missing_frame_ids": list(missing)})
         episode = _episode_from_row(row, split, pixels, n_frames, frame_set=fset)
@@ -381,7 +433,7 @@ def _record_source_attempts(sampling_receipt: Optional[dict], row: dict,
     if used is not None and len(attempts) <= 1:
         return
     sampling_receipt.setdefault("source_retries", []).append({
-        "qa_id": str(row.get("qa_id", "") or ""),
+        "qa_id": _row_id(row),
         "scene_name": str(row.get("scene_name", "") or ""),
         "primary_source": primary,
         "used_source": str(used or ""),
@@ -419,7 +471,7 @@ def _sample_by_scene(rows: list[dict], *, canon, per_task_cap: int,
             if taken >= per_task_cap:
                 break
             for row in sorted(by_task_scene[task][scene],
-                              key=lambda r: str(r.get("qa_id", ""))):
+                              key=_row_id):
                 if taken >= per_task_cap:
                     break
                 out.append(row)
@@ -432,7 +484,7 @@ def _sampling_receipt(selected: list[dict], *, seed: int, strategy: str,
     """§5.3：抽样算法、scene／qa_id 清单、seed 和 hash 都要落盘。"""
     import hashlib
 
-    qa_ids = [str(r.get("qa_id", "") or "") for r in selected]
+    qa_ids = [_row_id(r) for r in selected]
     scenes = sorted({str(r.get("scene_name", "") or "") for r in selected})
     canon = hashlib.sha256(
         "\n".join(qa_ids).encode("utf-8")).hexdigest()
@@ -477,7 +529,7 @@ def _episode_from_row(row: dict, split: str, pixels: Sequence[np.ndarray],
             "fps": float(row.get("fps") or 0.0),
         }
     return VSIBenchEpisode(
-        qa_id=str(row["id"]),
+        qa_id=_row_id(row),
         scene_name=str(row["scene_name"]),
         dataset=str(row["dataset"]),
         question_type=str(row["question_type"]),
@@ -501,6 +553,8 @@ def load_jsonl_items(
     split: Optional[str] = None,
     *,
     limit: Optional[int] = None,
+    exclusions: Optional[list] = None,
+    include_input_errors: bool = False,
 ) -> list[EpisodeItem]:
     """读本系统约定格式的预抽帧清单（见模块 docstring）。"""
     import cv2
@@ -509,6 +563,7 @@ def load_jsonl_items(
     if not p.is_file():
         raise EpisodeSourceError(f"episodes jsonl 不存在: {p}")
     items: list[EpisodeItem] = []
+    matched = 0
     for lineno, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
         if not line:
@@ -519,30 +574,68 @@ def load_jsonl_items(
             raise EpisodeSourceError(f"{p}:{lineno} 缺字段 {missing}")
         if split is not None and rec["split"] != split:
             continue
+        if limit is not None and matched >= limit:
+            break
+        matched += 1
         frame_paths = list(rec["frame_paths"])
         pixels = []
-        for fp in frame_paths:
+        readable: list[int] = []
+        attempts: list[dict] = []
+        for index, fp in enumerate(frame_paths):
             img = cv2.imread(str(fp), cv2.IMREAD_COLOR)
             if img is None:
-                raise EpisodeSourceError(f"{p}:{lineno} 帧读取失败: {fp}")
+                attempts.append({"source": str(fp), "result": "unreadable"})
+                continue
+            attempts.append({"source": str(fp), "result": "used"})
+            readable.append(index)
             pixels.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        row = {
+            "id": rec["qa_id"],
+            "qa_id": rec["qa_id"],
+            "scene_name": rec["scene_name"],
+            "dataset": rec.get("dataset", "unknown"),
+            "question_type": rec["question_type"],
+            "question": rec["question"],
+            "options": rec.get("options"),
+            "ground_truth": rec["ground_truth"],
+        }
+        if not pixels:
+            failure = _input_error_record(
+                row, rec["split"], "all_frames_unreadable", attempts)
+            if exclusions is not None:
+                exclusions.append(failure.model_dump(mode="json"))
+            if include_input_errors:
+                items.append(EpisodeItem(
+                    episode=failure.as_episode(),
+                    pixels=[],
+                    source="jsonl",
+                    input_error=failure,
+                ))
+            continue
+        frame_set = None
+        if len(readable) != len(frame_paths):
+            from .frame_set import build_frame_set
+
+            frame_set = build_frame_set(
+                len(frame_paths),
+                n_frames=len(frame_paths),
+                source_frame_indices=list(rec.get("source_frame_indices")
+                                          or range(len(frame_paths))),
+                episode_id=str(rec["qa_id"]),
+                dataset_id=str(rec.get("dataset", "unknown")),
+                video_id=str(p.resolve()),
+                scene_name=str(rec["scene_name"]),
+                frame_refs=[str(value) for value in frame_paths],
+                readable_frame_ids=readable,
+            )
         episode = _episode_from_row(
-            {
-                "id": rec["qa_id"],
-                "scene_name": rec["scene_name"],
-                "dataset": rec.get("dataset", "unknown"),
-                "question_type": rec["question_type"],
-                "question": rec["question"],
-                "options": rec.get("options"),
-                "ground_truth": rec["ground_truth"],
-            },
+            row,
             rec["split"],
             pixels,
             len(pixels),
+            frame_set=frame_set,
         )
         items.append(EpisodeItem(episode=episode, pixels=pixels, source="jsonl"))
-        if limit is not None and len(items) >= limit:
-            break
     if not items:
         raise EpisodeSourceError(f"{p} 未匹配到 split={split} 的条目")
     return items
@@ -560,5 +653,10 @@ def write_episode_meta_jsonl(items: Sequence[EpisodeItem], out_path: str | Path)
                 "question_type": ep.question_type, "question": ep.question,
                 "options": ep.options, "split": ep.split, "source": it.source,
                 "n_frames": len(it.pixels),
+                "input_error": ({
+                    "status": it.input_error.status,
+                    "reason": it.input_error.reason,
+                    "source_attempts": it.input_error.source_attempts,
+                } if it.input_error is not None else None),
             }, ensure_ascii=False) + "\n")
     return out

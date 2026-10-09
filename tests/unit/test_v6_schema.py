@@ -626,7 +626,7 @@ def test_docs_header_does_not_scare_non_metric_tasks():
                                  gate_missing=["question_type_is_metric",
                                                "scale_fusion_success"])
         assert "米制证据门未通过" not in h, task
-        assert "不需要米制尺度" in h, task
+        assert "米制证据门不适用" in h, task
 
     # 米制题仍然必须明确写清门未通过
     h = REGISTRY.docs_header("full_3d", ["depth", "objects"],

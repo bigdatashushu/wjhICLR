@@ -30,11 +30,13 @@ v5 的 `requires_artifacts` / `minimum_quality` / `metric_scale_required` / rout
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from typing import NamedTuple, Optional, Sequence
 
-from skill3d.schemas import RetrievedSkill, SceneState, SkillSpec
+from skill3d.schemas import RetrievedSkill, SceneState, SkillSpec, SkillSpecV11
 from skill3d.schemas.evidence import CAPABILITIES, EvidenceProfile
 from skill3d.schemas.retrieval import SkillCandidateRecord, SkillRetrievalRecord
 from skill3d.skills.delivery import (
@@ -101,7 +103,7 @@ def canonical_question_type(value: Optional[str]) -> Optional[str]:
         return None
 
 
-def skill_question_types(skill: SkillSpec) -> set[str]:
+def skill_question_types(skill: SkillSpec | SkillSpecV11) -> set[str]:
     """Skill 声明的适用题型（规范题型集合；无法规范化的条目按原样归一化保留）。"""
     out: set[str] = set()
     for qt in (getattr(skill, "applicable_question_types", None) or []):
@@ -184,13 +186,27 @@ def metric_gate_match(skill: SkillSpec, scene: SceneState) -> tuple[bool, Option
     return bool(gate.gate_passed) and version_ok, version_ok
 
 
-def retrieval_decision(skill: SkillSpec, scene: SceneState, task_type: str) -> RetrievalDecision:
+def retrieval_decision(
+    skill: SkillSpec | SkillSpecV11,
+    scene: SceneState,
+    task_type: str,
+) -> RetrievalDecision:
     """检索判定（§17.1/§13.6 的唯一事实源）：题型 ∧ 签名 ∧ 米制 gate（∧ 状态防御）。
 
     `task_type` 必须是**规范题型**（调用方已用 `canonical_question_type` 归一）。
     `hard_filter` 与 `retrieve` 共用本函数，保证"入口判定"与"实际检索"永不分叉。
     拒绝原因带机器可读 `reason_code`（§13.6"候选及过滤原因"落盘用）。
     """
+    if isinstance(skill, SkillSpecV11):
+        expected = canonical_question_type(skill.question_type) or skill.question_type
+        if task_type != expected:
+            return RetrievalDecision(
+                False, {}, None,
+                f"题型不匹配（题目={task_type}，Skill 适用={[expected]}）",
+                "question_type_mismatch",
+            )
+        return RetrievalDecision(True, {}, None, "v11 题型唯一 active Skill", "hit")
+
     signature = matched_evidence_signature(skill, scene)
     if task_type not in skill_question_types(skill):
         return RetrievalDecision(
@@ -375,10 +391,109 @@ def _rank(
                   key=lambda t: _rank_key(t[0], t[2]))
 
 
+def _retrieve_v11_ex(
+    scene: SceneState,
+    skills: Sequence[SkillSpecV11],
+    *,
+    question_type: Optional[str],
+    trigger: str,
+    retrieval_index: int,
+    evidence_version: str,
+    snapshot_ref: str,
+    snapshot_manifest_sha256: str,
+) -> tuple[list[RetrievedSkill], SkillRetrievalRecord]:
+    """v11 deterministic lookup: canonical question type -> one active method."""
+    task_type = canonical_question_type(question_type)
+    policy = {
+        "mode": "v11_unique_active_by_question_type",
+        "ranking": False,
+        "top_k": None,
+        "version_selection": False,
+    }
+    config_bytes = json.dumps(
+        policy, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    record = SkillRetrievalRecord(
+        retrieval_index=int(retrieval_index),
+        trigger=str(trigger),
+        canonical_question_type=str(task_type or ""),
+        question_type_raw=str(question_type or ""),
+        question_type_known=bool(task_type),
+        partition_policy="v11_unique_active_by_question_type",
+        evidence_version=str(evidence_version or ""),
+        config_version="ret-v11-deterministic-1",
+        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
+        config_source="v11_contract",
+        policy=policy,
+        active_snapshot_ref=str(snapshot_ref or ""),
+        active_snapshot_manifest_sha256=str(snapshot_manifest_sha256 or ""),
+        n_skills_offered=len(skills),
+    )
+    rows: list[SkillCandidateRecord] = []
+    selected: list[SkillSpecV11] = []
+    for skill in skills:
+        decision = retrieval_decision(skill, scene, str(task_type or ""))
+        is_selected = bool(task_type and decision.ok)
+        row = SkillCandidateRecord(
+            skill_id=skill.skill_id,
+            version=skill.version,
+            skill_version=skill_version_key(skill),
+            canonical_question_type=skill.question_type,
+            hard_filter_passed=bool(decision.ok),
+            reason_code=(
+                "question_type_unknown" if not task_type else decision.reason_code
+            ),
+            reason=(
+                "题型不可知，不加载 v11 Skill" if not task_type else decision.reason
+            ),
+            score=(1.0 if is_selected else None),
+            rank=(1 if is_selected else None),
+            selected=is_selected,
+            content_sha256=skill_content_sha256(skill),
+            content_chars=skill_body_length(skill),
+            matched_evidence_signature={},
+            gate_version_matched=None,
+            delivered=False,
+            delivery_reason=("no_model_request" if is_selected else "not_selected"),
+        )
+        rows.append(row)
+        if is_selected:
+            selected.append(skill)
+    if len(selected) > 1:
+        raise ValueError(
+            f"v11 题型 {task_type} 存在多个 active Skill: "
+            f"{[skill_version_key(skill) for skill in selected]}")
+    record.candidates = rows
+    record.eligible_skill_versions = [
+        row.skill_version for row in rows if row.hard_filter_passed
+    ]
+    record.retrieved_skill_versions = [
+        skill_version_key(skill) for skill in selected
+    ]
+    record.delivery_channel = "not_sent"
+    record.delivery_note = (
+        "v11 题型唯一 Skill 已确定，尚未发出模型请求"
+        if selected else
+        "v11 当前题型没有 active Skill，未发出 Skill 请求"
+    )
+    hits = [
+        RetrievedSkill(
+            skill_id=skill.skill_id,
+            skill_version=skill_version_key(skill),
+            score=1.0,
+            hard_filter_passed=True,
+            matched_evidence_signature={},
+            gate_version_matched=None,
+        )
+        for skill in selected
+    ]
+    return hits, record
+
+
 def retrieve_ex(
     question: str,
     scene: SceneState,
-    skills: Sequence[SkillSpec],
+    skills: Sequence[SkillSpec | SkillSpecV11],
     question_type: Optional[str] = None,
     scene_quality: Optional[float] = None,
     *,
@@ -403,10 +518,25 @@ def retrieve_ex(
     排序权重 / top-k / 候选池来自冻结策略 `policy`（缺省用 `RetrievalPolicy()` 默认值，
     并如实记 `config_source="default"`）。
     """
-    eff_policy = policy or RetrievalPolicy()
-    task_type = canonical_question_type(question_type)
     # 物化候选序列：下面既要计数（n_skills_offered）又要遍历两遍，生成器会在这里被耗尽
     skills = list(skills or [])
+    v11_skills = [skill for skill in skills if isinstance(skill, SkillSpecV11)]
+    if v11_skills:
+        if len(v11_skills) != len(skills):
+            raise ValueError("同一次在线运行不能混用旧 SkillSpec 与 SkillSpecV11")
+        return _retrieve_v11_ex(
+            scene,
+            v11_skills,
+            question_type=question_type,
+            trigger=trigger,
+            retrieval_index=retrieval_index,
+            evidence_version=evidence_version,
+            snapshot_ref=snapshot_ref,
+            snapshot_manifest_sha256=snapshot_manifest_sha256,
+        )
+
+    eff_policy = policy or RetrievalPolicy()
+    task_type = canonical_question_type(question_type)
     record = SkillRetrievalRecord(
         retrieval_index=int(retrieval_index),
         trigger=str(trigger),
@@ -550,7 +680,7 @@ def retrieve_ex(
 def retrieve(
     question: str,
     scene: SceneState,
-    skills: Sequence[SkillSpec],
+    skills: Sequence[SkillSpec | SkillSpecV11],
     question_type: Optional[str] = None,
     scene_quality: Optional[float] = None,
     top_k: int = DEFAULT_TOP_K,

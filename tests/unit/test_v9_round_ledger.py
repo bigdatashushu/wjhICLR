@@ -216,12 +216,12 @@ def test_two_consecutive_yields_stay_traceable_and_rounds_are_persisted(tmp_path
 
 
 def test_forced_answer_round_is_recorded_with_finalize_trigger(tmp_path):
-    """收口轮（while 之外）也不能漏记：轮次记录与 finalization 事实一致。"""
+    """预算内收口轮不能漏记：轮次记录与 finalization 事实一致。"""
     art_path, se = _write_v6_artifact(tmp_path)
     programs = _programs()
-    # 预算只够一轮 + 收口：首轮 yield 即触及边界 → 进 finalization
+    # 总预算含首轮与收口轮：首轮 yield 后第二轮进入 finalization。
     client = _ScriptedClient(programs[:1] + programs[2:])
-    cfg = _real_cfg(tmp_path, art_path, max_solver_rounds=1, finalization_rounds=0)
+    cfg = _real_cfg(tmp_path, art_path, max_solver_rounds=2, finalization_rounds=1)
     out = run_episode(se.episode, se.frames, cfg, llm=client)
     trace = out.episode_trace
     assert trace.finalization_used is True, out.notes

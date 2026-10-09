@@ -71,6 +71,7 @@ from skill3d.schemas import (
     CounterexampleBundle,
     PairedOutcome,
     SkillSpec,
+    SkillSpecV11,
 )
 from skill3d.skills.promote_atomic import promote
 from skill3d.trace.store import TraceStore
@@ -201,6 +202,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[错误] 候选 spec_content 不是合法 SkillSpec: {type(exc).__name__}: {exc}",
               file=sys.stderr)
         return 1
+    if not isinstance(cand_skill, SkillSpecV11):
+        print("[错误] 旧 optimize_loop 仅支持历史 SkillSpec，已在当前 v11 在线协议下停用；"
+              "请等待 v11 四阶段演化入口", file=sys.stderr)
+        return 2
 
     trace_store = TraceStore(args.trace_dir or paths.trace_store)
     store_dir = args.skill_store

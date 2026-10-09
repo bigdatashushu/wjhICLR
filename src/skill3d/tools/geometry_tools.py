@@ -244,32 +244,41 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
     阈值有实测分离度支撑（同实例 0.38–0.69 vs 不同实例 ≤0.14）。
     """
     oids = handle.list_objects_by_name(category_name)
-    tracks: dict[str, int] = {}
+    groups: dict[tuple[str, str], list[str]] = {}
     n_no_track = 0
     dup = False
     for oid in oids:
         o = handle.get_object(oid)
         tid = o.track_id
         if tid:
-            tracks[str(tid)] = tracks.get(str(tid), 0) + 1
+            key = ("track", str(tid))
         else:
             n_no_track += 1
+            key = ("object", oid)
+        groups.setdefault(key, []).append(oid)
         if o.duplicate_suspect:
             dup = True
-    n_track_distinct = len(tracks) + n_no_track
+    n_track_distinct = len(groups)
 
-    # ---- v7 §9.1：几何实例整合（补上"时序不重叠 → 不合并"的缺口）----
+    # Track 身份先合并；几何阶段只合并这些组，不能重新拆开同一 track。
     point_sets: dict[str, np.ndarray] = {}
     merge_error: Optional[str] = None
-    for oid in oids:
-        try:
-            pts = handle.object_points(oid)
-        except Exception as exc:  # noqa: BLE001 - 单条点云缺失不该让计数整体失败
-            merge_error = f"{type(exc).__name__}: {exc}"
-            continue
-        if pts is not None and np.asarray(pts).size:
-            point_sets[oid] = np.asarray(pts, dtype=np.float64)
+    for index, members in enumerate(groups.values()):
+        clouds = []
+        for oid in members:
+            try:
+                pts = np.asarray(handle.object_points(oid), dtype=np.float64)
+                if pts.ndim != 2 or pts.shape[1] != 3:
+                    raise ValueError(f"{oid}: point cloud must have shape (N, 3)")
+                pts = pts[np.all(np.isfinite(pts), axis=1)]
+                if len(pts):
+                    clouds.append(pts)
+            except Exception as exc:  # noqa: BLE001 - 缺点云的组仍按 track 计一次
+                merge_error = f"{type(exc).__name__}: {exc}"
+        if clouds:
+            point_sets[str(index)] = np.concatenate(clouds, axis=0)
     n_geometric_merges = 0
+    n_final = n_track_distinct
     if len(point_sets) >= 2:
         try:
             cons = consolidate_instances(
@@ -277,14 +286,11 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
                 min_overlap=INSTANCE_OVERLAP_THRESHOLD,
                 eps=float(DistancePrimitiveParams().voxel_size))
             n_geometric_merges = int(cons["n_input"]) - int(cons["n_clusters"])
-            n_final = int(cons["n_clusters"])
-            # 有点云缺失的记录无法参与整合 → 原样计入（宁可高估也不静默丢弃）
-            n_final += len(oids) - len(point_sets)
+            # 包括没有点云的 track 组；合并数只计算几何阶段减少的组数。
+            n_final = n_track_distinct - n_geometric_merges
         except Exception as exc:  # noqa: BLE001 - 整合失败退化为 track 计数（不报错）
             merge_error = f"{type(exc).__name__}: {exc}"
             n_final = n_track_distinct
-    else:
-        n_final = n_track_distinct
 
     profile = handle.evidence_profile
     evidence_degraded = bool(
@@ -298,7 +304,7 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
         "duplicate_suspect": bool(dup),
         "evidence_degraded": evidence_degraded,
         "instance_consolidation": {
-            "method": "bidirectional_nn_pointcloud_overlap_v7",
+            "method": "track_then_bidirectional_nn_pointcloud_overlap_v11",
             "min_overlap": float(INSTANCE_OVERLAP_THRESHOLD),
             "error": merge_error,
         },
@@ -335,14 +341,27 @@ def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
         raise DomainValueError("object_centroid",
                                f"对象 {obj_id} centroid 含 NaN/Inf: {obj.centroid_world}",
                                args={"obj_id": obj_id})
-    scale = handle.metric_scale
-    metric = (None if scale is None or not np.isfinite(float(scale))
+    scale = _metric_scale_if_authorized(handle)
+    metric = (None if scale is None
               else [float(x) * float(scale) for x in c])
+    # 质心本身不依赖 world_frame；只在证据与实际元数据都有效时附带方向约定。
+    up, handedness = None, None
+    profile = handle.evidence_profile
+    if profile is not None and profile.state(EV_WORLD) in ("available", "degraded"):
+        raw_up, raw_hand = handle.world_up, handle.handedness
+        if raw_up is not None:
+            arr = np.asarray(raw_up, dtype=np.float64)
+            if (arr.shape == (3,) and np.all(np.isfinite(arr))
+                    and np.linalg.norm(arr) > 1e-12 and raw_hand in ("right", "left")):
+                up = [float(x) for x in arr / np.linalg.norm(arr)]
+                handedness = raw_hand
     return {
         "centroid_normalized": [float(x) for x in c],
         "centroid_metric": metric,
         "category_name": obj.category_name,
         "track_id": obj.track_id,
+        "world_up_used": up,
+        "handedness_used": handedness,
     }
 
 

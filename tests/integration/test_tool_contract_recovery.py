@@ -7,7 +7,7 @@
 - (b) **共享前提失效级联撤销**：缺 `poses`/`depth` 这类共享前提 → 撤销依赖它的既有结果、
   记录 `invalidated_result_ids`、把 EvidenceProfile 对应能力降级、并重新派生
   `question_tool_scope`；
-- (c) **恢复次数有限**：由 `cfg.max_recovery` 约束，之后最多一次零工具终结作答；
+- (c) **恢复次数有限**：由 `cfg.max_retries_per_operation` 约束，之后进入终结轮；
   不再重入恢复环，执行失败记 `run_error`（主榜按错计）；
 - (d) **契约污染过的答案永不采纳**：program 自捕获 ToolContractError 后仍 ReturnAnswer
   → 答案作废，`answer_untrusted=True`，不得进分。
@@ -120,7 +120,7 @@ def _cfg(tmp_path, art_path: str, *, max_recovery: int) -> OnlineRunConfig:
     return OnlineRunConfig(mode="real", reuse_artifact=art_path,
                            vllm_endpoints=["http://fake"], deterministic_replay=True,
                            trace_dir=str(tmp_path / "t"), memory_dir="",
-                           max_recovery=max_recovery, max_images=32)
+                           max_retries_per_operation=max_recovery, max_images=32)
 
 
 # ------------------------------------------------------- (a) 局部失败不级联 ----
@@ -183,19 +183,16 @@ def test_shared_premise_failure_cascades_and_downgrades(tmp_path, episode_item):
 
     # 契约失败（ArtifactUnavailableError: poses/intrinsics 缺失）
     assert out.tool_contract_hits == 1 and out.partial_tool_recovery is True
-    # 级联撤销：依赖 geometry_3d 的成功结果被撤销并留痕
-    cascade = [n for n in out.notes
-               if n.startswith("M10 partial_tool_recovery 级联撤销")]
-    assert cascade and "premise=geometry_3d" in cascade[0]
-    assert "plane_fit_room_size" in cascade[0]            # 被撤销的是它产出的结果
-    assert "available→degraded" in cascade[0]
+    # 级联撤销与能力降级写入结构化轮次记录。
+    failed_round = next(r for r in out.rounds if r.get("error_code"))
+    assert failed_round["downgraded_capabilities"]["geometry_3d"] == (
+        "available→degraded")
+    assert failed_round["invalidated_result_ids"]
     assert len(out.invalidated_result_ids) >= 1
     # EvidenceProfile 能力降级（available → degraded），几何/世界系/米制一起降
     assert out.evidence_profile is not None
     assert out.evidence_profile.state("geometry_3d") == "degraded"
     assert out.evidence_profile.state("metric_scale") == "degraded"
-    # 逐题 scope 被**重新派生**（M7.5 在级联撤销后再次执行；留痕可审计）
-    assert any("级联撤销后重新派生" in n for n in out.notes)
     # 降级后的证据画像必须真的把米制 Tool 收回去（§7.2 单项失败只收回依赖它的工具）
     from skill3d.tools import REGISTRY
 
@@ -229,7 +226,7 @@ def test_recovery_attempts_bounded_then_zero_tool_answer(tmp_path, episode_item,
     assert out.recovery_count == max_recovery + 1
     assert out.final_state == "answer" and out.answer == "3.0"
     assert out.answer_source == "tool_program"
-    assert "forced_answer" in out.answer_flags
+    assert "finalization" in out.answer_flags
     assert out.mra_value is not None
     assert out.episode_trace.failure is None
     assert out.program_trace.calls == []

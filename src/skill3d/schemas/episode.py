@@ -109,10 +109,42 @@ class VSIBenchEpisode(Spec):
     question_type: str  # 8 题型官方 10 值之一
     question: str
     options: Optional[list[str]]  # MCA 有，NA 无
-    ground_truth: str  # 仅评测用；GPT-6 在线/离线均不可见
+    # 在线求解不可见；M12 评分和 induction 的离线 Skill 修订可以读取并审计。
+    ground_truth: str
     frames: list[InputFrame]
     split: Literal["induction", "inner_validation", "outer_holdout", "final_test"]
     frame_set: Optional[FrameSet] = None  # M1 冻结的帧集身份（硬约束 21）
+
+
+class InputErrorRecord(Spec):
+    """预登记题目的输入失败事实；不伪造图像，也不从评测分母删除。"""
+
+    status: Literal["input_error"] = "input_error"
+    qa_id: str
+    scene_name: str
+    dataset: str
+    question_type: str
+    question: str
+    options: Optional[list[str]] = None
+    ground_truth: str
+    split: Literal["induction", "inner_validation", "outer_holdout", "final_test"]
+    reason: str
+    source_attempts: list[dict] = []
+
+    def as_episode(self) -> VSIBenchEpisode:
+        """Build metadata-only input; M2 terminates before reconstruction or inference."""
+        return VSIBenchEpisode(
+            qa_id=self.qa_id,
+            scene_name=self.scene_name,
+            dataset=self.dataset,
+            question_type=self.question_type,
+            question=self.question,
+            options=self.options,
+            ground_truth=self.ground_truth,
+            frames=[],
+            split=self.split,
+            frame_set=None,
+        )
 
 
 class DataSplitConfig(Spec):
@@ -130,8 +162,8 @@ class InputGateVerdict(Spec):
 
     M2 不再有"删帧/补帧"动作（旧 `drop_and_refill` 已废弃，硬约束 21）：
     - `level=pass` / `locally_degraded` 一律 `action="proceed"`，只带 flag/weight；
-    - 仅**输入合法性**（无法解码 / 空帧 / 尺寸非法 / 损坏）→ `unanswerable`，
-      这类帧导致整 episode `unavailable`，不进入 split（§4 M1）。
+    - 仅**输入合法性**（无法解码 / 空帧 / 尺寸非法 / 损坏）→ `unanswerable`
+      控制事件；runner 生成 `input_error` 零分结果行并保留在 split 分母。
     """
 
     level: Literal["pass", "locally_degraded", "overall_unusable"]

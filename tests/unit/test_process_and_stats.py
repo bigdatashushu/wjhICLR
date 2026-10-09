@@ -124,6 +124,18 @@ def test_process_metrics_empty_is_none_not_zero():
     assert any("不臆造 0" in n for n in m.notes)
 
 
+def test_process_metrics_report_input_errors_separately():
+    m = aggregate_process_metrics([
+        _outcome(final_state="input_error", correct=False, is_mca=True,
+                 tools=(), verify=None, steps=0),
+    ])
+
+    assert m.n_input_error == 1
+    assert m.n_unavailable == 0
+    assert m.n_unanswerable == 0
+    assert m.coverage == 0.0
+
+
 def test_process_metrics_flags_mock_light():
     outs = [_outcome(source="deterministic_stub") for _ in range(4)]
     m = aggregate_process_metrics(outs)

@@ -94,7 +94,7 @@ from skill3d.skills.promote_atomic import (
 )
 from skill3d.skills.registry import (
     active_snapshot_provenance,
-    load_active_skills,
+    load_legacy_active_skills,
 )
 from skill3d.trace.store import TraceStore
 
@@ -389,7 +389,7 @@ class EvolutionCampaignRunner:
         指认为**上一代晋升的那个版本**；没有晋升记录时（第一代）取谱系内最高版本的
         在线条目（确定性：版本号只用于选父，不参与检索排序，§5.3-6）。
         """
-        skills, warnings, snapshot_id = load_active_skills(self.store_dir)
+        skills, warnings, snapshot_id = load_legacy_active_skills(self.store_dir)
         candidates = [s for s in skills if s.skill_id == self.cfg.target_skill_id]
         if not candidates:
             raise CampaignBlocked(
@@ -424,11 +424,16 @@ class EvolutionCampaignRunner:
 
     # ------------------------------------------------------------------ 主流程
     def run(self) -> EvolutionCampaign:
+        active = read_active_snapshot(self.store_dir)
+        if active.get("schema_version") == "runtime-skill-snapshot/2.0":
+            raise CampaignBlocked(
+                "v10 evolution campaign 不支持当前 SkillSpecV11 快照；"
+                "请等待 v11 四阶段演化迁移，不得用旧 JSON SkillSpec 流程修改 active")
         if self.cfg.resume and self._load_checkpoint():
             self.print(f"[{self.campaign_id}] 从 checkpoint 恢复 state="
                        f"{self._campaign.state} generation={self._generation}")
         else:
-            snap = read_active_snapshot(self.store_dir)
+            snap = active
             self._campaign.initial_snapshot_id = str(snap.get("snapshot_id", ""))
             self._campaign.current_parent_snapshot_id = str(snap.get("snapshot_id", ""))
             self._set_state("INIT", snapshot=self._campaign.initial_snapshot_id)
@@ -565,7 +570,7 @@ class EvolutionCampaignRunner:
         items = self._items("learning", generation)
         run_id = f"{self.campaign_id}-g{generation}-learning"
         cfg = self._base_cfg()
-        skills, warnings, snapshot_id = load_active_skills(self.store_dir)
+        skills, warnings, snapshot_id = load_legacy_active_skills(self.store_dir)
         if snapshot_id != parent_snapshot:
             raise CampaignBlocked(
                 f"learning 运行前的 active 快照 {snapshot_id} ≠ 期望父快照 {parent_snapshot}")
@@ -920,7 +925,7 @@ class EvolutionCampaignRunner:
         items = self._items("post_publish", generation)
         trace_dir = str(self.root / "traces" / f"gen{generation}" / "post_publish")
         snapshot_id, manifest_hash = active_snapshot_provenance(self.store_dir)
-        skills, warnings, loaded_snapshot = load_active_skills(self.store_dir)
+        skills, warnings, loaded_snapshot = load_legacy_active_skills(self.store_dir)
         cfg = _replace_cfg(self._base_cfg(), skills=skills, trace_dir=trace_dir)
         self.runtime.run_learning(items=items, run_cfg=cfg, trace_dir=trace_dir,
                                   llm=self.llm)

@@ -96,14 +96,16 @@ def test_online_static_check_fail_regenerate_limited():
     assert fsm.state is OnlineState.LOG_TRACE
 
 
-def test_online_geometry_reject_still_logs():
+def test_online_geometry_reject_returns_to_solver_then_still_logs():
     fsm = OnlineFSM()
     _to_static_check(fsm)
     for ev in ("pass", "ok"):
         fsm.step(ev)
     fsm.step("reject")  # GEOMETRY_VERIFY 拒绝
     assert "geometry_rejected" in fsm.answer_flags
-    fsm.step("done")
+    assert fsm.state is OnlineState.SYNTHESIZE_PROGRAM
+    fsm.step("solver_failed")  # driver 预算耗尽/恢复失败后，不经评分直接收尾
+    assert fsm.state is OnlineState.ANSWER
     fsm.step("done")
     assert fsm.state is OnlineState.LOG_TRACE
 

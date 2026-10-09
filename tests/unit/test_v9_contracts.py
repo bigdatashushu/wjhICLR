@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
@@ -24,14 +25,11 @@ ROOT = Path(__file__).resolve().parents[2]
 LIBRARY = ROOT / "skill_library"
 
 
-def test_v9_budget_fields_prefer_explicit_values_and_normalize_aliases():
-    old = OnlineRunConfig(max_agent_rounds=3, reserve_final_rounds=2, max_recovery=4)
-    assert (old.max_solver_rounds, old.finalization_rounds,
-            old.max_retries_per_operation) == (3, 2, 4)
-    explicit = OnlineRunConfig(max_solver_rounds=8, finalization_rounds=7,
-                               max_retries_per_operation=1,
-                               max_agent_rounds=2, reserve_final_rounds=0,
-                               max_recovery=9)
+def test_current_budget_fields_are_normalized_without_legacy_aliases():
+    names = {field.name for field in fields(OnlineRunConfig)}
+    assert {"max_agent_rounds", "reserve_final_rounds", "max_recovery"}.isdisjoint(names)
+    explicit = OnlineRunConfig(
+        max_solver_rounds=8, finalization_rounds=7, max_retries_per_operation=1)
     assert (explicit.max_solver_rounds, explicit.finalization_rounds,
             explicit.max_retries_per_operation) == (8, 7, 1)
     bounded = OnlineRunConfig(max_solver_rounds=1, finalization_rounds=99,
@@ -92,7 +90,18 @@ def test_candidate_record_revision_mapping_preserves_lineage(tmp_path: Path):
     assert projected.generated_sha256 == record.generated_sha256
 
 
-def test_active_snapshot_provenance_reads_manifest_digest():
-    snapshot_id, digest = active_snapshot_provenance(LIBRARY / "snapshots")
+def test_active_snapshot_provenance_reads_manifest_digest(tmp_path):
+    # v9 provenance must be independent of which version is active in the workspace.
+    store = tmp_path / "snapshots"
+    store.mkdir()
+    name = "snapshot_S0-seed-20260925-v1.json"
+    (store / name).write_bytes((LIBRARY / "snapshots" / name).read_bytes())
+    (store / "active_snapshot.json").write_text(
+        json.dumps({"snapshot_id": "S0-seed-20260925-v1"}))
+    manifests = tmp_path / "manifests"
+    manifests.mkdir()
+    (manifests / "library_manifest.json").write_bytes(
+        (LIBRARY / "manifests/library_manifest.json").read_bytes())
+    snapshot_id, digest = active_snapshot_provenance(store)
     assert snapshot_id == "S0-seed-20260925-v1"
     assert digest == "61259a20580170f8bf3d0490972cd448a6a67cc5d6316b07c4a77b7db4708046"

@@ -17,7 +17,7 @@ import json
 import re
 from pathlib import Path
 
-from skill3d.schemas import SkillSpec, SkillState
+from skill3d.schemas import SkillSpec, SkillSpecV11, SkillState
 
 _SEMVER_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 
@@ -181,7 +181,18 @@ def active_snapshot_provenance(path: str | Path) -> tuple[str, str]:
         return snapshot_id, ""
     # When the library manifest is present, independently recompute its
     # canonical payload digest. A stale registration is not provenance.
-    manifest_path = store_dir.parent / "manifests" / "library_manifest.json"
+    manifest_ref = str(snap.get("manifest_ref") or "")
+    if manifest_ref:
+        try:
+            from .v11_library import resolve_source_like_ref
+
+            manifest_path = resolve_source_like_ref(store_dir.parent, manifest_ref)
+        except Exception:
+            return snapshot_id, ""
+    else:
+        manifest_path = store_dir.parent / "manifests" / "library_manifest.json"
+    if manifest_ref and not manifest_path.is_file():
+        return snapshot_id, ""
     if manifest_path.is_file():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -196,8 +207,10 @@ def active_snapshot_provenance(path: str | Path) -> tuple[str, str]:
     return snapshot_id, registered
 
 
-def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], str]:
-    """Read only the promoted inline SkillSpecs from an active snapshot.
+def load_legacy_active_skills(
+    path: str | Path,
+) -> tuple[list[SkillSpec | SkillSpecV11], list[str], str]:
+    """Compatibility loader for the disabled v10 campaign and historical tests.
 
     ``path`` may be a snapshot store directory or its ``active_snapshot.json``
     pointer.  The loader deliberately does not scan ``sources``, generated
@@ -227,6 +240,22 @@ def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], st
         return [], [f"active snapshot 读取失败: {type(exc).__name__}: {exc}"], "genesis"
     if not isinstance(snap, dict):
         return [], ["active snapshot 不是 JSON mapping → 空 Skill"], "genesis"
+    snapshot_id = str(snap.get("snapshot_id", "genesis"))
+
+    if snap.get("schema_version") == "runtime-skill-snapshot/2.0":
+        try:
+            from .v11_library import validate_v11_snapshot
+
+            skills = validate_v11_snapshot(snap, library_root=store_dir.parent)
+        except Exception as exc:  # noqa: BLE001 - v11 identity/hash errors fail closed
+            return [], [
+                f"v11 active snapshot 校验失败: {type(exc).__name__}: {exc}"
+            ], snapshot_id
+        provenance_snapshot_id, manifest_hash = active_snapshot_provenance(path)
+        if provenance_snapshot_id != snapshot_id or \
+                manifest_hash != str(snap.get("manifest_hash") or ""):
+            return [], ["v11 active snapshot manifest 校验失败"], snapshot_id
+        return skills, [], snapshot_id
 
     skills: list[SkillSpec] = []
     entries = snap.get("entries") or {}
@@ -244,4 +273,32 @@ def load_active_skills(path: str | Path) -> tuple[list[SkillSpec], list[str], st
             skills.append(SkillSpec.model_validate(parsed))
         except Exception as exc:  # noqa: BLE001 - 单条损坏不阻断其余
             warnings.append(f"条目 {rid} 无法解析为 SkillSpec: {type(exc).__name__}: {exc}")
-    return skills, warnings, str(snap.get("snapshot_id", "genesis"))
+    return skills, warnings, snapshot_id
+
+
+def load_active_skills(
+    path: str | Path,
+) -> tuple[list[SkillSpecV11], list[str], str]:
+    """Load the current v11 active snapshot; reject historical schemas."""
+    from pathlib import Path as _Path
+
+    from .promote_atomic import read_active_snapshot
+
+    p = _Path(path)
+    store_dir = p if p.is_dir() else p.parent
+    pointer = store_dir / "active_snapshot.json"
+    if not pointer.exists():
+        return [], [f"无 active snapshot（{pointer} 不存在）→ 空 Skill"], "genesis"
+    try:
+        snapshot = read_active_snapshot(store_dir)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"active snapshot 读取失败: {type(exc).__name__}: {exc}") from exc
+    schema = str(snapshot.get("schema_version") or "")
+    if schema != "runtime-skill-snapshot/2.0":
+        raise ValueError(
+            "当前在线协议只接受 runtime-skill-snapshot/2.0；"
+            f"收到 {schema or 'missing'}，历史快照请在对应 Git 提交运行")
+    skills, warnings, snapshot_id = load_legacy_active_skills(path)
+    if warnings:
+        raise ValueError("; ".join(warnings))
+    return [skill for skill in skills if isinstance(skill, SkillSpecV11)], [], snapshot_id

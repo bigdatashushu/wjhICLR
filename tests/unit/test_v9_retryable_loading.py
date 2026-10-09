@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,7 @@ from skill3d.adapters.episode_source import (
     _load_from_sources,
     _record_source_attempts,
     _source_failure_reason,
+    load_jsonl_items,
     load_vsi_bench_items,
 )
 
@@ -134,6 +136,61 @@ def test_all_sources_failing_still_reports_an_exclusion_reason():
     assert _source_failure_reason([{"result": "missing"},
                                    {"result": "undecodable"}]) == "video_undecodable"
     assert _source_failure_reason([{"result": "no_frames"}]) == "insufficient_frames"
+
+
+def test_jsonl_all_unreadable_frames_become_input_error_item(tmp_path):
+    manifest = tmp_path / "episodes.jsonl"
+    manifest.write_text(json.dumps({
+        "qa_id": "missing-jsonl",
+        "scene_name": "scene01",
+        "dataset": "scannet",
+        "question_type": "object_counting",
+        "question": "How many chairs?",
+        "options": None,
+        "ground_truth": "2",
+        "split": "inner_validation",
+        "frame_paths": [str(tmp_path / "missing-0.png"),
+                        str(tmp_path / "missing-1.png")],
+    }) + "\n")
+    exclusions = []
+
+    items = load_jsonl_items(
+        manifest,
+        split="inner_validation",
+        exclusions=exclusions,
+        include_input_errors=True,
+    )
+
+    assert len(items) == 1 and items[0].pixels == []
+    assert items[0].input_error.reason == "all_frames_unreadable"
+    assert exclusions[0]["status"] == "input_error"
+    assert len(exclusions[0]["source_attempts"]) == 2
+
+
+def test_jsonl_partial_frames_continue_with_a_missing_mask(tmp_path):
+    import cv2
+
+    frame = tmp_path / "frame.png"
+    cv2.imwrite(str(frame), np.full((12, 16, 3), 127, dtype=np.uint8))
+    manifest = tmp_path / "episodes.jsonl"
+    manifest.write_text(json.dumps({
+        "qa_id": "partial-jsonl",
+        "scene_name": "scene01",
+        "dataset": "scannet",
+        "question_type": "object_counting",
+        "question": "How many chairs?",
+        "options": None,
+        "ground_truth": "2",
+        "split": "inner_validation",
+        "frame_paths": [str(frame), str(tmp_path / "missing.png")],
+    }) + "\n")
+
+    items = load_jsonl_items(manifest, split="inner_validation")
+
+    assert len(items) == 1 and len(items[0].pixels) == 1
+    assert items[0].input_error is None
+    assert items[0].episode.frame_set.decode_status == "partial"
+    assert items[0].episode.frame_set.readable_frame_ids == [0]
 
 
 def test_loader_records_source_retry_in_the_sampling_receipt(tmp_path):

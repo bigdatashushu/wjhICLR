@@ -23,10 +23,10 @@ v6 迁移（§5.2/§5.3/§13/§20）：
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from skill3d.schemas import ProgramExecutionTrace
 from skill3d.tools.scene_handle import SceneHandle
@@ -48,10 +48,26 @@ _METRIC_VALUE_KEYS: dict[str, str] = {
     "surface_distance_between_objects": "surface_distance_metric",
     "object_3d_extent": "extent_metric",
     "object_centroid": "centroid_metric",
+    "object_distance_m": "distance_m",
 }
 
 # 合法手性取值（与 `reconstruction_gate/world_frame.py` 同一词汇表）
 KNOWN_HANDEDNESS: frozenset[str] = frozenset({"right", "left"})
+
+
+class GeometryIssue(BaseModel):
+    """可定位的失败事实；未确证共享前提失效时 premise 必须为空。"""
+
+    model_config = ConfigDict(extra="forbid")
+    check: str
+    tool: str = ""
+    result_id: str = ""
+    reason: str
+    # 计算声明错误不代表输入 ToolResult 本身错误；只有结果级几何失败才应撤销结果。
+    invalidate_result: bool = True
+    confirmed_shared_premise: Optional[Literal[
+        "geometry_3d", "world_frame", "metric_scale", "object_detection"
+    ]] = None
 
 
 class GeometryVerifyResult(BaseModel):
@@ -60,10 +76,12 @@ class GeometryVerifyResult(BaseModel):
     passed: bool
     checks: dict[str, bool]
     violations: list[str]
+    issues: list[GeometryIssue] = Field(default_factory=list)
     # 只读诊断（进 trace，便于"M11 为什么这么判"的事后归因；不参与判定）
     notes: list[str] = []
     metric_evidence_authorized: bool = False
     world_frame_available: bool = False
+    derivation_replay: dict = Field(default_factory=dict)
 
 
 def _iter_tool_values(trace: ProgramExecutionTrace, tool_name: str) -> Iterable[Any]:
@@ -105,16 +123,18 @@ def check_no_negative_distance(trace: ProgramExecutionTrace) -> bool:
     """距离 / 尺寸 / 面积类结果必须非负（确定性，与证据状态无关）。"""
     for name in ("euclidean_distance", "robust_distance", "camera_object_distance",
                  "surface_distance_between_objects", "object_3d_extent",
-                 "plane_fit_room_size"):
+                 "plane_fit_room_size", "object_distance_m"):
         for v in _iter_tool_values(trace, name):
             if _finite_number(v) and float(v) < 0:
                 return False
             if isinstance(v, dict):
                 for key in ("distance_metric", "distance_normalized",
-                            "surface_distance_metric", "room_area_m2",
-                            "room_diagonal_normalized"):
+                            "surface_distance_metric", "surface_distance_normalized",
+                            "distance_m", "room_area_m2", "room_diagonal_normalized",
+                            "extent_metric", "extent_normalized", "extent_longest_metric"):
                     val = v.get(key)
-                    if _finite_number(val) and float(val) < 0:
+                    values = val if isinstance(val, list) else [val]
+                    if any(_finite_number(x) and float(x) < 0 for x in values):
                         return False
     return True
 
@@ -209,13 +229,40 @@ def geometry_verify(
     """§4 M11 伪代码的确定性实现（不调 VLM / 离线治理模型；硬约束 13）。"""
     authorized = metric_evidence_authorized(handle)
     wf_ok = _world_frame_available(handle)
-    checks = {
-        "no_negative_distance": check_no_negative_distance(trace),
-        "unit_consistent": check_unit_consistent(trace, handle),
-        "world_frame": check_world_frame(trace, handle),
-        "inside_bbox": check_inside_bbox(trace, handle),
-        "reprojection": check_reprojection(trace, handle, threshold_px),
+    checks = dict.fromkeys((
+        "no_negative_distance", "unit_consistent", "world_frame",
+        "inside_bbox", "reprojection"), True)
+    issues: list[GeometryIssue] = []
+    reasons = {
+        "no_negative_distance": "距离、尺寸或面积结果含负值",
+        "unit_consistent": "本题无米制授权，但结果包含绝对单位数值",
+        "world_frame": "世界系上方向或手性契约缺失",
+        "inside_bbox": "重投影输入点不在场景包围盒内，或世界系契约缺失",
+        "reprojection": "重投影结果无法通过同一位姿/内参复算",
     }
+    # 逐结果检查：既能精确撤销，也避免单个错误被多条正确重投影的均值掩盖。
+    for result in trace.results:
+        if result.status != "ok" or result.error is not None or result.invalidated_by:
+            continue
+        single = trace.model_copy(update={"results": [result]})
+        row = {
+            "no_negative_distance": check_no_negative_distance(single),
+            "unit_consistent": check_unit_consistent(single, handle),
+            "world_frame": check_world_frame(single, handle),
+            "inside_bbox": check_inside_bbox(single, handle),
+            "reprojection": check_reprojection(single, handle, threshold_px),
+        }
+        for check, passed in row.items():
+            if passed:
+                continue
+            checks[check] = False
+            # 未获本题米制授权不等于全局尺度失效；域值/复算错误也不猜根因。
+            premise = ("world_frame" if not wf_ok and (
+                check == "world_frame" or
+                (check == "inside_bbox" and result.tool == "reproject")) else None)
+            issues.append(GeometryIssue(
+                check=check, tool=result.tool, result_id=result.result_id,
+                reason=reasons[check], confirmed_shared_premise=premise))
     violations = [k for k, v in checks.items() if not v]
     notes = [
         f"metric_evidence_authorized={authorized}"
@@ -228,13 +275,14 @@ def geometry_verify(
     ]
     del answer  # 语义项（T2）在 verifier/t1_t4_checks.py；本模块保持纯几何
     return GeometryVerifyResult(
-        passed=not violations, checks=checks, violations=violations, notes=notes,
+        passed=not violations, checks=checks, violations=violations, issues=issues, notes=notes,
         metric_evidence_authorized=authorized, world_frame_available=wf_ok)
 
 
 __all__ = [
     "BBOX_MARGIN",
     "GeometryVerifyResult",
+    "GeometryIssue",
     "KNOWN_HANDEDNESS",
     "TH_REPROJ_PX",
     "WORLD_FRAME_TOOLS",

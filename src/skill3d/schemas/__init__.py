@@ -22,6 +22,7 @@ from .episode import (
     DataSplitConfig,
     FrameSet,
     InputFrame,
+    InputErrorRecord,
     InputGateVerdict,
     VSIBenchEpisode,
 )
@@ -102,10 +103,14 @@ from .program import ASTCheckResult, EpisodeProgram, ProgramExecutionTrace
 from .skill import (
     DeepSeekGovernanceDecision,
     RetrievedSkill,
+    SkillCandidateV11,
     SkillCandidateV5,
     SkillGovernanceDecision,
     SkillSpec,
+    SkillSpecV11,
     SkillState,
+    normalize_skill_markdown,
+    parse_skill_markdown,
 )
 from .experience import (
     BEHAVIOR_SUMMARY_KEYS,
@@ -149,9 +154,30 @@ from .evolution import (
     PairedOutcome,
     RevisionExperiment,
 )
+from .evolution_v11 import (
+    V11_CAMPAIGN_SCHEMA_VERSION,
+    V11_EVALUATION_SCHEMA_VERSION,
+    V11_EXPERIENCE_SCHEMA_VERSION,
+    V11CampaignCheckpoint,
+    V11CampaignDecision,
+    V11CampaignStatus,
+    V11EvaluationArm,
+    V11ExperienceBundle,
+    V11ExperienceCase,
+    V11PairedEvaluationReceipt,
+    V11PostPublishObservation,
+    V11PostPublishReceipt,
+    V11PublicationReceipt,
+    V11ReceiptRef,
+    V11RevisionAttemptReceipt,
+    V11RevisionProposal,
+    V11StaticValidationReceipt,
+)
 from .memory import MemoryEntry, MemorySnapshot
 from .trace import (
+    EpisodeInputTrace,
     EpisodeTrace,
+    EvaluationResultTrace,
     EvaluationRun,
     EvolutionGeneration,
     FailureTaxonomy,

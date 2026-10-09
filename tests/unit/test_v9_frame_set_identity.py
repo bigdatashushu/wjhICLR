@@ -208,8 +208,8 @@ def test_runner_and_reconstruction_agree_on_the_artifact_path(tmp_path):
     此前两边各写了一份路径约定（`artifact_path` 与 runner 的内联 `f"{scene}.json"`），
     是重复定义；切缓存键会让两边失配，因此这里守住"读方委托写方"。
     """
-    from skill3d.online.runner import _artifact_json_path
-    from skill3d.reconstruction.run import artifact_path
+    from skill3d.online.runner import _resolve_existing_artifact
+    from skill3d.reconstruction.run import resolve_artifact_path
 
     fset = fs.build_frame_set(64, video_id="vid-A", scene_name="s1")
 
@@ -217,5 +217,12 @@ def test_runner_and_reconstruction_agree_on_the_artifact_path(tmp_path):
         recon_dir = str(tmp_path)
         recon_method = "vggt"
 
-    assert _artifact_json_path(_Cfg(), "s1", frame_set=fset) == \
-        str(artifact_path(tmp_path, "s1", "vggt", frame_set=fset))
+    class _Episode:
+        scene_name = "s1"
+        frame_set = fset
+
+    expected, expected_legacy = resolve_artifact_path(
+        tmp_path, "s1", "vggt", frame_set=fset)
+    actual, actual_legacy = _resolve_existing_artifact(_Cfg(), _Episode())
+    assert actual == str(expected)
+    assert actual_legacy is expected_legacy

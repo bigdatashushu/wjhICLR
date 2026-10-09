@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from skill3d.schemas import SkillSpec
-from skill3d.skills.registry import load_active_skills
+from skill3d.skills.registry import load_legacy_active_skills as load_active_skills
 from skill3d.skills.source_compiler import (
     COMPILER_VERSION,
     compile_directory,
@@ -63,13 +63,16 @@ def test_generated_specs_are_strict_runtime_specs() -> None:
 
 def test_s0_active_snapshot_loads_from_directory_and_pointer() -> None:
     store = LIBRARY / "snapshots"
+    expected_ref = json.loads(
+        (store / "active_snapshot.json").read_text(encoding="utf-8")
+    )["snapshot_id"]
     from_directory, warnings, ref = load_active_skills(store)
     from_pointer, pointer_warnings, pointer_ref = load_active_skills(
         store / "active_snapshot.json"
     )
     assert not warnings
     assert not pointer_warnings
-    assert ref == pointer_ref == "S0-seed-20260925-v1"
+    assert ref == pointer_ref == expected_ref
     assert len(from_directory) == len(from_pointer) == 8
     assert {s.skill_id for s in from_directory} == {f"S{i:02d}" for i in range(1, 9)}
 

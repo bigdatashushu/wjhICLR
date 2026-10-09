@@ -46,8 +46,12 @@ from skill3d.online.runner import (
     OnlineRunConfig,
     run_split,
 )
+from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
+from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION
 from skill3d.skills.registry import active_snapshot_provenance, load_active_skills
+from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
+from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 
 # §13.5 用 `--split test`；本系统的四层切分用 induction/inner/outer/final_test
 _SPLIT_ALIASES = {"test": "final_test", "final": "final_test"}
@@ -75,9 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "paths.raw_video_fallbacks）")
     p.add_argument("--question-types", default="",
                    help="逗号分隔的题型子集（默认 8 题型）")
-    p.add_argument("--direct-answer-tasks", default="",
-                   help="逗号分隔的题型：这些题型改用直答 VLM 作答（任务级策略，"
-                        "须在 inner 上定、outer 上验证）。留空 = 全部走程序（默认）")
     p.add_argument("--sampling-per-task", type=int, default=0,
                    help="按题型均匀采样：每题型最多 N 条（与重建批使用同一参数，保证同一样本）")
     p.add_argument("--datasets", default="",
@@ -92,7 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="重放确定性：时间/id/latency 取确定性占位，保证同 seed 字节级一致")
     p.add_argument("--active-snapshot", default="", help="active snapshot 文件或目录（§13.5）")
     p.add_argument("--skill-spec", default="",
-                   help="C2 消融：直接注入手写 SkillSpec JSON（静态人工 Skill，无归纳）")
+                   help="C2 消融：直接注入手写 SkillSpecV11 JSON（静态人工 Skill，无归纳）")
     p.add_argument("--inject-wrong-skill", action="store_true",
                    help="C5 消融：注入已知错误 Skill，观察回退/退化（可证伪 §17.5 #5）")
     p.add_argument("--vllm-endpoint", action="append", default=[],
@@ -113,10 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recon-method", default="vggt", choices=["vggt"],
                    help="重建方法；v6 §5.2 受控枚举只有 vggt（BA 路线与 colmap/dust3r "
                         "对照基线均已废止并入 legacy/retired）")
-    p.add_argument("--max-recovery", type=int, default=None,
-                   help=("partial_tool_recovery 的最大恢复次数（v6 §14，[TODO_CALIBRATE]）；"
-                         "超限即显式 abstain / direct_vlm_routed。"
-                         "v5 的 --allow-tool-contract-replay 开关已随两档阶梯废止"))
+    p.add_argument("--max-retries-per-operation", type=int, default=None,
+                   help="每类失败在有界求解循环中的最大恢复次数")
     p.add_argument("--frame-size", default="", help="合成帧尺寸 HxW（默认 480x640，与 VSI-Bench 对齐）")
     p.add_argument("--degrade", default="", choices=["", "blur_all", "blur_some",
                                                      "overexposed_all", "few_frames"],
@@ -189,8 +188,18 @@ def main(argv: list[str] | None = None) -> int:
     skills, warnings = [], []
     snap_arg = args.active_snapshot or paths.active_snapshot
     if snap_arg:
-        skills, warnings, snapshot_ref = load_active_skills(snap_arg)
+        try:
+            skills, warnings, snapshot_ref = load_active_skills(snap_arg)
+        except ValueError as exc:
+            print(f"[错误] {exc}", file=sys.stderr)
+            return 2
         _active_ref, snapshot_manifest_sha256 = active_snapshot_provenance(snap_arg)
+    legacy = [type(skill).__name__ for skill in skills
+              if not isinstance(skill, SkillSpecV11)]
+    if legacy:
+        print("[错误] 当前在线协议只接受 runtime-skill-snapshot/2.0 与 "
+              f"SkillSpecV11；收到旧格式 {legacy}", file=sys.stderr)
+        return 2
     for w in warnings:
         print(f"[warn] {w}", file=sys.stderr)
 
@@ -209,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 数据源 ----
     qtypes = [q.strip() for q in args.question_types.split(",") if q.strip()]
     limit = args.limit or None
+    sampling_receipt: dict = {}
+    exclusions: list = []
     try:
         if args.source == "synthetic":
             frame_size = (480, 640)
@@ -224,13 +235,17 @@ def main(argv: list[str] | None = None) -> int:
             if not args.episodes_jsonl:
                 print("[错误] --source jsonl 需要 --episodes-jsonl PATH", file=sys.stderr)
                 return 2
-            items = load_jsonl_items(args.episodes_jsonl, split=split, limit=limit)
+            items = load_jsonl_items(
+                args.episodes_jsonl,
+                split=split,
+                limit=limit,
+                exclusions=exclusions,
+                include_input_errors=True,
+            )
         else:
             split_cfg = load_yaml(cfg_yaml.get("split_config", "configs/vsi_bench_split.yaml"))
             # §5.3：抽样算法的 seed／qa_id 清单／hash 与**排除行**都要落盘 ——
             # "每个预登记 qa_id 必须有结果行；不足 32 帧不能通过 skip 静默消失"。
-            sampling_receipt: dict = {}
-            exclusions: list = []
             items = load_vsi_bench_items(
                 split, split_cfg,
                 video_root=args.video_root or paths.raw_videos,
@@ -248,11 +263,12 @@ def main(argv: list[str] | None = None) -> int:
                 sampling_seed=args.seed,
                 exclusions=exclusions,
                 sampling_receipt=sampling_receipt,
+                include_input_errors=True,
             )
             if exclusions:
-                print(f"[warn] {len(exclusions)} 条预登记 qa_id 未进入本次运行"
-                      f"（已记排除原因，分母保留；§5.3）", file=sys.stderr
-                      )
+                print(f"[warn] {len(exclusions)} 条预登记 qa_id 输入不可用"
+                      f"（将生成 input_error 零分结果并保留分母；§5.3）",
+                      file=sys.stderr)
                 for e in exclusions[:5]:
                     print(f"        {e['qa_id']} → {e['reason']}", file=sys.stderr)
             # §5.2 可重试加载：换过来源副本的题必须报出来（副本可能是另一种编码，
@@ -292,18 +308,10 @@ def main(argv: list[str] | None = None) -> int:
         vllm_model=args.vllm_model or vllm.model,
         recon_method=args.recon_method,
         metric_depth_model=_maybe_moge2(args),
-        direct_answer_tasks={t.strip() for t in args.direct_answer_tasks.split(",")
-                             if t.strip()},
         # v6 §20：BA（官方 VGGSfM / vggt_sparse_ba）与整套"需校准的尺度"路线已废止，
         # 相关配置项（ba_enabled / scale_calibration_* / scale_confidence_level）不再传入。
-        # v6 §14/D7：partial_tool_recovery 恒开（次数由 --max-recovery 约束），
-        # v5 的 --allow-tool-contract-replay 开关随"回灌/裁剪"两档阶梯一并废止。
-        max_recovery=(int(args.max_recovery)
-                      if args.max_recovery is not None
-                      else int(cfg_yaml.get("max_retries_per_operation",
-                                           MAX_RECOVERY_ATTEMPTS))),
-        max_retries_per_operation=(int(args.max_recovery)
-                                   if args.max_recovery is not None
+        max_retries_per_operation=(int(args.max_retries_per_operation)
+                                   if args.max_retries_per_operation is not None
                                    else int(cfg_yaml.get("max_retries_per_operation",
                                                         MAX_RECOVERY_ATTEMPTS))),
         input_diagnostics=bool(cfg_yaml.get("input_diagnostics", False)),
@@ -326,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 78)
     print(f"split={split} source={args.source} n_episodes={len(items)} mode={args.mode} "
           f"baseline={args.baseline} active_snapshot={snapshot_ref} "
-          f"skills={len(skills)}")
+          f"skills={len(skills)} template={PROMPT_TEMPLATE_VERSION}")
     if args.mode != "real" or args.source == "synthetic":
         print(BANNER_MOCK if args.mode != "real" else "")
     if split == "final_test":
@@ -374,8 +382,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {o.qa_id:34s} {o.question_type:20s} {o.final_state:20s} "
               f"answer={str(o.answer)[:16]:18s} predicted={str(o.predicted):10s} "
               f"correct={str(o.correct):5s} mra={_fmt(o.mra_value)}")
-    print(f"\ntrace 已写: {run_cfg.trace_dir}（episode_trace / program_trace / "
-          f"geometry_check / evaluation_result / evaluation_run / online_run）")
+    print(f"\ntrace 已写: {run_cfg.trace_dir}（episode_input / episode_trace / "
+          f"program_trace / geometry_check / evaluation_result / evaluation_run / "
+          f"online_run）")
     if run_cfg.memory_dir:
         print(f"episodic 记忆: {run_cfg.memory_dir}（G-26；semantic 不在线写，硬约束 1/2）")
     print(f"synthesis_source 分布: "
@@ -388,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
         pm = aggregate_process_metrics(outcomes)
         print("\n系统可靠性（不混主表）:")
         print(f"  coverage={_fmt(pm.coverage)}  refusal_rate={_fmt(pm.refusal_rate)}  "
-              f"abstain_rate={_fmt(pm.abstain_rate)}")
+              f"abstain_rate={_fmt(pm.abstain_rate)}  input_error={pm.n_input_error}")
         print(f"  coverage-conditioned: MRA={_fmt(pm.coverage_conditioned_mra)}  "
               f"Acc={_fmt(pm.coverage_conditioned_accuracy)}")
         print(f"  tool_contract: episode 率={_fmt(pm.tool_contract_rate)}  "
@@ -438,8 +447,8 @@ def _frame_set_summary(items) -> tuple[str, int]:
     return "multi:" + _h.sha256("|".join(uniq).encode()).hexdigest()[:16], len(uniq)
 
 
-def v6_version_fields() -> dict:
-    """§19.2 v6 版本字段（单一定义点：在线评测与离线演进两条链共用同一份口径）。"""
+def current_version_fields() -> dict:
+    """当前在线合同身份（在线评测与离线清单共用同一份口径）。"""
     from skill3d.reconstruction.metric_fusion import (
         METRIC_FUSION_VERSION,
         METRIC_MODEL_NONE,
@@ -447,11 +456,11 @@ def v6_version_fields() -> dict:
     from skill3d.schemas.evidence import GATE_VERSION, PROFILE_VERSION
     from skill3d.tools.distance_primitives import DistancePrimitiveParams
     from skill3d.tools.registry import TOOL_FACE_VERSION
-    from skill3d.synthesis.prompt_builder import TEMPLATE_VERSION
-
     return {
-        "template_version": TEMPLATE_VERSION,
+        "template_version": PROMPT_TEMPLATE_VERSION,
+        "execution_protocol_version": EXECUTION_PROTOCOL_VERSION,
         "tool_face_version": TOOL_FACE_VERSION,
+        "tool_docs_version": TOOL_DOCS_VERSION,
         "evidence_profile_version": PROFILE_VERSION,
         "gate_version": GATE_VERSION,
         "metric_model": METRIC_MODEL_NONE,          # 未跑融合时如实标 none
@@ -533,6 +542,26 @@ def _strip_secrets(value, *, _depth: int = 0):
     return value
 
 
+def _denominator_fields(outcomes, sampling_receipt, exclusions) -> dict:
+    result_ids = [str(getattr(outcome, "qa_id", "") or "")
+                  for outcome in (outcomes or [])]
+    planned_ids = list((sampling_receipt or {}).get("qa_ids") or result_ids)
+    return {
+        "n_excluded": len(exclusions or []),
+        "exclusions": list(exclusions or []),
+        "n_input_error": sum(
+            1 for outcome in (outcomes or [])
+            if getattr(outcome, "episode_status", "") == "input_error"),
+        "denominator_preserved": (
+            len(result_ids) == len(set(result_ids))
+            and len(planned_ids) == len(set(planned_ids))
+            and set(result_ids) == set(planned_ids)
+        ),
+        "missing_result_qa_ids": sorted(set(planned_ids) - set(result_ids)),
+        "unexpected_result_qa_ids": sorted(set(result_ids) - set(planned_ids)),
+    }
+
+
 def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
                     outcomes=None, items=None, offline_client=None,
                     sampling_receipt=None, exclusions=None):
@@ -603,9 +632,8 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
                 sampling_fields["n_source_retries"] = sum(
                     1 for r in source_retries if r.get("retried"))
         if exclusions is not None:
-            sampling_fields["n_excluded"] = len(exclusions)
-            sampling_fields["exclusions"] = list(exclusions)
-            sampling_fields["denominator_preserved"] = True
+            sampling_fields.update(_denominator_fields(
+                outcomes, sampling_receipt, exclusions))
         return write_run_manifest(m, out, extra={
             **sampling_fields,
             # ---- 版本三元组（HC39：schema/质量口径/golden 必须同时留档）----
@@ -615,7 +643,7 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
             "quality_metric_version": QUALITY_METRIC_VERSION,
             **golden_fields,
             # ---- §19.2 版本字段（模板 / tool-face / 证据画像 / gate / 距离原语）----
-            **v6_version_fields(),
+            **current_version_fields(),
             # ---- §19.2 离线治理模型块（扁平键 + 嵌套块双写，便于审计脚本直读）----
             "offline_model": offline.get("offline_model", ""),
             "provider": offline.get("provider", ""),
@@ -635,9 +663,6 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
                               if d.strip()] or "all",
             "question_type_scope": ([q.strip() for q in args.question_types.split(",")
                                      if q.strip()] or "all"),
-            "direct_answer_tasks": sorted(t.strip()
-                                          for t in args.direct_answer_tasks.split(",")
-                                          if t.strip()),
             "sampling_per_task": int(args.sampling_per_task),
             "sampling_strategy": ("first_n_per_task_by_meta_order"
                                   if args.sampling_per_task else "none"),
@@ -687,58 +712,35 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
 
 
 def _apply_skill_ablations(args, skills: list) -> tuple[list, str]:
-    """C2（`--skill-spec`）/ C5（`--inject-wrong-skill`）消融注入。scope:
-
-    C5 的"已知错误 Skill"是 v6 形态的**故意错误**模板：
-
-    - 调用不存在的 Tool 名称（`definitely_not_a_registered_tool`）→ M9/AST 应拒；
-    - 声明一条**当前证据状态不可能满足**的证据签名（要求 `metric_scale=available` +
-      gate 版本匹配，而 mock/普通场景的 gate 未过）→ M7 检索硬过滤应拦。
-
-    这样"错误 Skill 被拦住"的可证伪命题（§17.5 #5）在 v6 的两道硬门上都被覆盖：
-    检索（证据签名 / gate 双重 fail-closed，§13.6）与执行（AST/沙箱）。
-    v5 的 `requires_artifacts=["nonexistent_artifact"]` + `minimum_quality` 已随
-    §5.8 的签名化检索一并废止（§20）。
-    """
-    from skill3d.schemas import SkillSpec
-
+    """Apply optional C2/C5 ablations using only the current SkillSpecV11."""
     out = list(skills)
     ref = ""
     if args.skill_spec:
-        spec = SkillSpec.model_validate_json(Path(args.skill_spec).read_text(encoding="utf-8"))
-        out = [s for s in out if s.skill_id != spec.skill_id] + [spec]
+        spec = SkillSpecV11.model_validate_json(
+            Path(args.skill_spec).read_text(encoding="utf-8"))
+        out = [s for s in out if s.question_type != spec.question_type] + [spec]
         ref = f"static:{spec.skill_id}@{spec.version}"
     if args.inject_wrong_skill:
         wrong = wrong_skill_spec()
-        out = [s for s in out if s.skill_id != wrong.skill_id] + [wrong]
+        out = [s for s in out if s.question_type != wrong.question_type] + [wrong]
         ref = (ref + "+" if ref else "") + f"wrong:{wrong.skill_id}@{wrong.version}"
     return out, ref
 
 
-def wrong_skill_spec():
-    """C5 内置的"已知错误 Skill"（v6 SkillSpec；见 `_apply_skill_ablations` 文档）。
-
-    三处故意错误：① 调用未注册 Tool；② 声明 `metric_scale=available` 且挂了
-    gate 版本（普通场景 gate 未过 → §13.6 检索硬过滤拦下）；③ 断言恒假
-    （`never_true()`）。**只在消融档使用**，绝不进 active snapshot。
-    """
-    from skill3d.schemas import SkillSpec
-    from skill3d.schemas.evidence import GATE_VERSION
-
-    return SkillSpec(
-        skill_id="sk-known-wrong",
-        version="0.0.1",
-        applicable_question_types=["object_counting"],
-        required_evidence_signature={"metric_scale": "available"},
-        requires_metric_evidence=True,
-        applicable_gate_version=GATE_VERSION,
-        skill_family="counting",
-        source="mock_interface",
-        description="【C5 消融】已知错误模板：调用不存在的 Tool 并返回常数",
-        call_graph_template=(
-            "answer = definitely_not_a_registered_tool(1, 2)\n"
-            "ReturnAnswer(\"42\")"),
-        validation_assertions=["never_true()"],
+def wrong_skill_spec() -> SkillSpecV11:
+    """C5's deliberately invalid counting method in the current Skill format."""
+    return SkillSpecV11(
+        skill_id="S01",
+        version="999.0.0",
+        question_type="object_counting",
+        skill_md=(
+            "---\n"
+            "name: known-wrong-counting\n"
+            "description: Deliberately invalid C5 method for contract testing.\n"
+            "---\n"
+            "# Invalid method\n"
+            "Call `definitely_not_a_registered_tool(1, 2)` and return `42`.\n"
+        ),
     )
 
 

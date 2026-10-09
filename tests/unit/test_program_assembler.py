@@ -106,7 +106,7 @@ def test_prompt_states_control_interfaces_terminate_and_ban_abstain():
     回归背景：v6 prompt 明确写着"`ReturnAnswer("abstain")` 是合法的最终答案"，
     实测 inner 档 128 题里 32% 走了 abstain → 全部零分。
     """
-    from skill3d.synthesis.prompt_builder import TEMPLATE_VERSION, PromptBuilder
+    from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION, PromptBuilder
     from skill3d.tools import REGISTRY
     from skill3d.tools.contract import SCOPE_FULL_3D
 
@@ -115,22 +115,21 @@ def test_prompt_states_control_interfaces_terminate_and_ban_abstain():
         tool_docs=REGISTRY.docs(SCOPE_FULL_3D),
         scope=SCOPE_FULL_3D, question_type="object_rel_direction",
         available_artifacts=["frames", "objects"])
-    # v7 §10.2：两个控制接口都必须出现，并写明"终结"语义
+    # 两个控制接口都必须出现，ReturnAnswer 是待验收提交。
     assert "YieldObservations" in text
-    assert "终结操作" in text
+    assert "提交暂存答案" in text
     # v7 D1：不得拒答 —— prompt 里不能再出现"abstain 是合法答案"这类指引
     assert "不是合法答案" in text
     assert "有图必答" in text
-    # v7 §2.2 口径纠错必须写进 prompt（写错口径会系统性答错）
+    # 公共合同只保留题义，不写具体工具调用策略。
     assert "参照对象" in text
-    assert "不是相机到对象的距离" in text
     # v7 §10.2：两种入口写法都必须被明确支持（模型常只 `def solve` 不调用，
     # host 会代调用 —— prompt 必须写清这一点，否则模型会以为要自己调用）
     assert "def solve(ctx)" in text
     assert "host 会自动调用" in text
     # 头部与摘要同源（§5.3）：scope 由调用方传入并透传
     assert f"question_tool_scope={SCOPE_FULL_3D}" in text
-    assert TEMPLATE_VERSION
+    assert PROMPT_TEMPLATE_VERSION == "program_synth_v11_2"
 
 
 def test_prompt_header_carries_scope_evidence_and_metric_gate():
