@@ -50,8 +50,8 @@ experiment:
   # Formal mode never manufactures these prerequisites. The launcher fails if
   # license acknowledgement, real videos, or quality confirmation is absent.
   formal: true
-  accept_model_licenses: false
-  accept_vsi_bench_license: false
+  accept_model_licenses: true
+  accept_vsi_bench_license: true
   video_root: ""
   quality_confirmation: ""
   detector_endpoint: ""

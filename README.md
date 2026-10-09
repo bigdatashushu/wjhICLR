@@ -1,6 +1,6 @@
-# Skill3D
+# harness3D
 
-Skill3D 是面向 VSI-Bench 的 3D 空间感知 VLM 实验系统。在线链使用本地 Qwen3-VL 生成并执行受限程序，离线链负责 Skill/Memory 的归纳、配对评测、准入、发布和回滚。本 README 是当前仓库状态、v11 协议和最近一次真实实验核查的单一入口；它不把机制测试、缓存存在或历史实验记录写成新的正式结果。
+harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感知 VLM 实验系统。Skill3D 是代码基础，不是当前系统名称。在线链使用本地 Qwen3-VL 生成并执行受限程序，离线链负责 Skill/Memory 的归纳、配对评测、准入、发布和回滚。本 README 是当前仓库状态、v11 协议和最近一次真实实验核查的单一入口；它不把机制测试、缓存存在或历史实验记录写成新的正式结果。
 
 > **当前结论（2026-10-09）**：仓库代码与 v11 启动器已核查，v11 dry-run 已完成，正式 run `v11-s03-seed137` 已按真实入口执行，但在模型许可证门处退出。没有启动 vLLM，没有执行重建、induction、B01/B11 或演化，没有可报告的样本数、分数或 Skill 晋升结果。
 
@@ -8,6 +8,8 @@ Skill3D 是面向 VSI-Bench 的 3D 空间感知 VLM 实验系统。在线链使�
 
 | 项目 | 当前值 |
 |---|---|
+| 系统名称 | `harness3D` |
+| 基础 codebase | `Skill3D` |
 | 仓库 | `/nas/wangjh/harness3d/skill3d_codebase` |
 | 分支 | `main` |
 | Git commit | `a5f9e65be841c876beb8a586f77869b0188086e3` |
