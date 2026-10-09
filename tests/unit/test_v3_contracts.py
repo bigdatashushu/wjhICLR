@@ -167,6 +167,20 @@ def _handle(scene: SceneState) -> SceneHandle:
     return SceneHandle(scene, objects=objs, c2w_list=c2w, intrinsics=k)
 
 
+def test_kernel_exposes_only_read_only_question_context_not_scene_handle():
+    scene = _scene("full_3d", question_type="object_rel_distance")
+    handle = _handle(scene)
+    kernel = RestrictedNamespaceKernel(REGISTRY, handle, frames=[], mode="real")
+
+    public = kernel._ns["scene"]  # noqa: SLF001 - generated namespace contract
+    assert not isinstance(public, SceneHandle)
+    assert public.scene_route == "full_3d"
+    assert public.question_type == "object_rel_distance"
+    assert not hasattr(public, "object_points")
+    assert not hasattr(public, "metric_scale")
+    assert not hasattr(public, "set_point_map")
+
+
 def test_tool_docs_scope_filter_matches_contract_map():
     """属性断言：每个 Tool × 每个 scope 的暴露判定与 `contract.scope_allows` 一致（D-3a）。
 

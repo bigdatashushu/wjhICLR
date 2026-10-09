@@ -295,7 +295,7 @@ def test_policy_read_from_main_config_and_marks_source():
     assert policy.top_k == 3
     assert policy.method_context_max_chars == DELIVERY_DEFAULT_CAP
     assert policy.weight("semantic") == 1.0 and policy.weight("semantic_mix_keyword") == 0.0
-    assert policy.label == "ret-v9-1"
+    assert policy.label == "ret-v11-deterministic-1"
     fallback = retrieval_policy_from_config({})
     assert fallback.source == "default"
 

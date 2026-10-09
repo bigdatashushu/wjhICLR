@@ -10,8 +10,6 @@ seed: 0
 max_solver_rounds: 6
 max_retries_per_operation: 3
 finalization_rounds: 1
-max_evolution_rounds: 2
-candidate_validation_seeds: [0, 1]
 
 paths:
   data_root: data
@@ -42,11 +40,11 @@ frame_sampling:
 # 只在独立诊断实验中开启。默认 1.0 权重不影响主流程（scene_route 不再被 M2 权重左右）。
 input_diagnostics: false
 
-# v9 §13.5 检索策略（P6）：top-k／排序规则／方法上下文上限必须**写入配置并在演化
+# v11 检索策略：top-k／排序规则／方法上下文上限必须**写入配置并在演化
 # 开始前冻结**，且每次检索的记录里带配置版本（§13.6）。改这里等于改实验自变量，
 # 必须同时改 config_version 标签 —— 不得在运行期按题/按场景临时调整。
 retrieval:
-  config_version: ret-v9-1      # 人类标签；内容摘要另由代码复算并落盘（不可抵赖）
+  config_version: ret-v11-deterministic-1  # 人类标签；内容摘要由代码复算并落盘
   top_k: 3                      # §13.5 起始配置（规范允许开发起点取 1；S0 每题型只有 1 条）
   rerank: true                  # false = 关键词打分（§8.1 "w/o LanceDB reranker" 消融）
   candidates: 50                # 语义排序的候选池大小

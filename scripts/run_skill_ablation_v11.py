@@ -39,6 +39,10 @@ def main(argv=None) -> int:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--recon-dir", help="existing P1 reconstruction directory")
     parser.add_argument("--artifacts-json", help="explicit JSON {qa_id: artifact_path}, alternative to --recon-dir")
+    parser.add_argument(
+        "--reconstruction-costs-json",
+        help="optional JSON {qa_id: elapsed_seconds} from the frozen reconstruction stage",
+    )
     parser.add_argument("--expected-qa-ids", help="JSON list of preregistered qa_id values")
     parser.add_argument("--library-root", default=str(DEFAULT_LIBRARY))
     parser.add_argument("--vllm-endpoint", action="append", default=[])
@@ -129,10 +133,16 @@ def main(argv=None) -> int:
                 for it in items if it.input_error is None}
         confirmation = (json.loads(Path(args.quality_confirmation).read_text())
                         if args.quality_confirmation else None)
+        reconstruction_costs = (
+            json.loads(Path(args.reconstruction_costs_json).read_text())
+            if args.reconstruction_costs_json
+            else {}
+        )
         result = run_skill_ablation_v11(
             items, artifact_paths=artifacts, output_dir=root, base_cfg=cfg, seed=seed,
             question_types=tasks, expected_qa_ids=expected, library_root=args.library_root,
-            quality_confirmation=confirmation)
+            quality_confirmation=confirmation,
+            reconstruction_costs=reconstruction_costs)
         (root / "source_receipt.json").write_text(
             json.dumps({"sampling": sampling, "exclusions": exclusions}, ensure_ascii=False, indent=2))
         print(json.dumps(result, ensure_ascii=False, indent=2))

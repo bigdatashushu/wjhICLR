@@ -14,6 +14,7 @@ from skill3d.evolution.campaign_v11 import (
     V11CampaignRunner,
 )
 from skill3d.schemas import (
+    DataAccessRecord,
     V11EvaluationArm,
     V11ExperienceBundle,
     V11ExperienceCase,
@@ -22,6 +23,10 @@ from skill3d.schemas import (
     V11RevisionProposal,
     V11StaticValidationReceipt,
 )
+from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
+from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
+from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
+from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.skills.registry import load_active_skills
 from skill3d.skills.v11_library import (
     build_v11_snapshot,
@@ -103,6 +108,18 @@ class _Callbacks:
             split="learning",
             label_access=True,
             source_run_ref="run:parent-learning",
+            label_access_record=DataAccessRecord(
+                record_id="label-access-campaign-test",
+                at="2026-10-09T00:00:00+00:00",
+                split="induction",
+                purpose="skill_induction",
+                component_role="inducer",
+                run_id="parent-learning",
+                input_manifest_sha256="1" * 64,
+                n_items=2,
+                label_access=True,
+                source_refs=["trace"],
+            ),
             cases=[
                 V11ExperienceCase(
                     case_id="case-alpha",
@@ -189,11 +206,22 @@ class _Callbacks:
             panel_id="panel-object-rel-distance",
             panel_sha256="a" * 64,
             question_type=parent.question_type,
+            seed=kwargs["seed"],
+            request_seed_observed=True,
+            model_id=kwargs["model_id"],
+            model_config_sha256=kwargs["model_config_sha256"],
+            quality_contract_sha256=kwargs["quality_contract_sha256"],
+            solver_config_sha256=kwargs["solver_config_sha256"],
+            template_version=PROMPT_TEMPLATE_VERSION,
+            execution_protocol_version=EXECUTION_PROTOCOL_VERSION,
+            tool_docs_version=TOOL_DOCS_VERSION,
+            tool_face_version=TOOL_FACE_VERSION,
             status="completed",
             formal_result_eligible=True,
             frozen_panel=True,
             independent_arms=True,
             n_pairs=4,
+            result_refs=[f"pair:{index}" for index in range(4)],
             parent=V11EvaluationArm(
                 skill_version=parent_key,
                 content_sha256=parent.content_sha256,
@@ -203,6 +231,8 @@ class _Callbacks:
                 n_scored=4,
                 mean_score=0.5,
                 runtime_error_count=1,
+                program_error_count=1,
+                untrusted_geometry_use_count=0,
                 legal_answer_rate=0.75,
             ),
             candidate=V11EvaluationArm(
@@ -214,6 +244,8 @@ class _Callbacks:
                 n_scored=4,
                 mean_score=self.candidate_score,
                 runtime_error_count=self.candidate_runtime_errors,
+                program_error_count=self.candidate_runtime_errors,
+                untrusted_geometry_use_count=0,
                 legal_answer_rate=self.candidate_legal_answer_rate,
             ),
         )
@@ -246,6 +278,11 @@ def _runner(tmp_path: Path, callbacks: _Callbacks, *, campaign_id="campaign-one"
         library_root=str(library),
         run_root=str(runs),
         max_revision_attempts=3,
+        seed=137,
+        model_id="qwen3vl-test",
+        model_config_sha256="2" * 64,
+        quality_contract_sha256="3" * 64,
+        solver_config_sha256="4" * 64,
     )
     return V11CampaignRunner(
         cfg,
@@ -480,7 +517,19 @@ def test_v11_campaign_blocks_when_post_publish_body_does_not_match(tmp_path):
         tmp_path / "library" / "snapshots"
     )
     assert warnings == []
-    assert [skill.version for skill in skills] == ["1.2.0"]
+    assert [skill.version for skill in skills] == ["1.1.0"]
+    rollback = json.loads(
+        (
+            tmp_path
+            / "runs"
+            / "campaign-one"
+            / "receipts"
+            / "rollback.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert rollback["snapshot_from"] != rollback["snapshot_to"]
+    assert rollback["pointer_after"] == rollback["snapshot_to"]
+    assert rollback["verified"] is True
     receipt = json.loads(
         (
             tmp_path

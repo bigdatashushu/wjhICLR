@@ -35,6 +35,42 @@ PYTHONPATH=src python scripts/run_skill_ablation_v11.py \
   --output-dir data/evaluations/v11-s03-seed137
 ```
 
+### 空机器一键入口
+
+`scripts/bootstrap_and_run_v11.sh` 可在 Linux GPU 机器的空工作目录中完成固定提交拉取、
+隔离 venv、权重复用或固定 revision 下载、逐文件 SHA-256 清单、重建、父版本
+induction 运行和 B01/B11。配置中的 `existing_path` 优先复用当前已验证的 Qwen、
+VGGT、SAM2 缓存，不改名、不移动、不重新下载；仅当该目录不存在时才按仓库 revision
+下载到工作目录。`configs/gpu_experiment_v11.yaml` 固定 Qwen、VGGT、SAM2 及可选
+MoGe-2 的仓库 revision；代码 revision 必须由调用者用 40 位 `CODE_REF` 提供：
+
+```bash
+CODE_REF=<包含本入口的40位Git提交> \
+bash scripts/bootstrap_and_run_v11.sh \
+  --work-dir /data/skill3d-v11 \
+  --config /data/gpu_experiment_v11.yaml
+```
+
+正式运行前必须在外部配置副本中填写真实 `video_root`、与当前
+`--print-quality-contract` 输出匹配的 `quality_confirmation`，并在实际完成许可核对后
+把 `accept_model_licenses` 和 `accept_vsi_bench_license` 设为 `true`。脚本不会下载
+VSI-Bench 视频、伪造许可确认或自动生成质量确认。默认要求两张显存不低于配置下限的
+GPU，Qwen 与 VGGT/SAM2 分卡；任何阶段失败都会留下 `failure.json`，不会继续生成正式
+结论。该入口没有 `final_test` 参数，只运行 `induction` 与 `inner_validation`。
+
+先检查将执行的命令而不下载或启动服务：
+
+```bash
+PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
+  --config configs/gpu_experiment_v11.yaml \
+  --work-dir /tmp/skill3d-v11-check \
+  --run-id dry-run --dry-run
+```
+
+配置 `experiment.run_evolution=true` 后，一键流程会在 B01/B11 之后调用
+`scripts/run_evolution_campaign_v11.py`。此时还必须通过环境变量提供
+`DEEPSEEK_API_KEY`；缺失或健康检查失败会阻断演化，不会以 mock 候选替代。
+
 模型名需与服务实际的 served model name 一致。配对宜使用单个 endpoint；
 请求 seed 会进入准备阶段和两臂的模型请求，但不承诺不同 GPU 批处理调度下逐位复现。
 `--max-solver-rounds`、`--max-retries-per-operation`、`--finalization-rounds`

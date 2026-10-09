@@ -2859,6 +2859,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             options=list(episode.options or []),
             reference_answer=episode.ground_truth,
             source_split=episode.split,
+            label_access=False,
             frame_set_hash=str(outcome.frame_set_hash or ""),
         ))
         trace_store.append("episode_trace", outcome.episode_trace)
@@ -2919,6 +2920,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
                          else outcome.direct_answer),
             answer_source=str(outcome.answer_source or ""),
             episode_status=str(outcome.episode_status or ""),
+            label_access=False,
             input_error_reason=str(outcome.input_error_reason or ""),
             derivation_replay=(
                 dict(outcome.verify.derivation_replay)
@@ -3052,6 +3054,7 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
             "tool_docs_version": TOOL_DOCS_VERSION,
             "seed": cfg.seed, "source": getattr(items[0], "source", "unknown"),
             "n_episodes": len(outcomes), "split": run.split,
+            "label_access": False,
             "n_unavailable": sum(1 for o in outcomes if o.final_state == "unavailable"),
             "n_unanswerable": sum(1 for o in outcomes if o.final_state == "unanswerable"),
             "n_input_error": sum(1 for o in outcomes if o.final_state == "input_error"),

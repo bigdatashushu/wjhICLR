@@ -87,6 +87,7 @@ class EpisodeInputTrace(Spec):
     source_split: Literal[
         "induction", "inner_validation", "outer_holdout", "final_test"
     ]
+    label_access: Literal[False] = False
     frame_set_hash: str = ""
 
 
@@ -104,6 +105,7 @@ class EvaluationResultTrace(Spec):
     answer_text: Optional[str]
     answer_source: str
     episode_status: str
+    label_access: Literal[False] = False
     input_error_reason: str = ""
     derivation_replay: dict = {}
     abstained: bool = False
@@ -131,6 +133,7 @@ class TraceRecord(Spec):
     question_tool_scope: str = ""
     answer_source: str = ""
     input_error_reason: str = ""
+    label_access: Literal[False] = False
     used_result_ids: list[str] = []
     recovery_count: int = 0
     partial_tool_recovery: bool = False
@@ -242,6 +245,7 @@ class EpisodeTrace(Spec):
     input_degradation_flags: list[str] = []
     answer_source: str = ""
     input_error_reason: str = ""
+    label_access: Literal[False] = False
     # v6 D7：partial recovery 事实（§14.1）
     recovery_count: int = 0
     partial_tool_recovery: bool = False

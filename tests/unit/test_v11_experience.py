@@ -56,6 +56,7 @@ def _write_run(store: TraceStore, *, split="induction", mode="real") -> None:
         "template_version": PROMPT_TEMPLATE_VERSION,
         "execution_protocol_version": EXECUTION_PROTOCOL_VERSION,
         "tool_docs_version": TOOL_DOCS_VERSION,
+        "label_access": False,
     })
 
 
@@ -181,6 +182,10 @@ def test_builds_complete_learning_bundle_from_structured_trace(tmp_path):
     assert bundle.source_split == "induction"
     assert bundle.split == "learning"
     assert bundle.label_access is True
+    assert bundle.label_access_record.label_access is True
+    assert bundle.label_access_record.component_role == "inducer"
+    assert bundle.label_access_record.n_items == 2
+    assert bundle.label_access_record.input_manifest_sha256
     assert bundle.source_run_ref == "online_run:learning-run-1"
     assert {case.outcome for case in bundle.cases} == {"success", "failure"}
     by_qa = {case.qa_id: case for case in bundle.cases}

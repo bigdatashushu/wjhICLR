@@ -169,6 +169,7 @@ from .evolution_v11 import (
     V11PostPublishReceipt,
     V11PublicationReceipt,
     V11ReceiptRef,
+    V11RollbackReceipt,
     V11RevisionAttemptReceipt,
     V11RevisionProposal,
     V11StaticValidationReceipt,

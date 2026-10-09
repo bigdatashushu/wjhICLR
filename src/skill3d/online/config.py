@@ -23,8 +23,6 @@ _FALLBACK: dict[str, Any] = {
     "max_solver_rounds": 6,
     "max_retries_per_operation": 3,
     "finalization_rounds": 1,
-    "max_evolution_rounds": 2,
-    "candidate_validation_seeds": [0, 1],
     "paths": {
         "data_root": "data",
         "vsi_bench_meta": "data/vsi_bench_meta",
@@ -38,11 +36,11 @@ _FALLBACK: dict[str, Any] = {
         "active_snapshot": "skill_library/snapshots/active_snapshot.json",
     },
     "frame_sampling": {"n_frames": 32, "strategy": "uniform"},
-    # v9 §13.5 检索策略缺省（与 configs/config.yaml 的 `retrieval:` 段一致）。
+    # v11 检索策略缺省（与 configs/config.yaml 的 `retrieval:` 段一致）。
     # 缺键时用默认值跑，但检索记录里的 `config_source` 会记 "default" ——
     # 缺省值不会被冒充成"已冻结配置"。
     "retrieval": {
-        "config_version": "ret-v9-1",
+        "config_version": "ret-v11-deterministic-1",
         "top_k": 3,
         "rerank": True,
         "candidates": 50,

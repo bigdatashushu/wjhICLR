@@ -9,11 +9,12 @@ from typing import Literal, Optional
 from pydantic import Field, field_validator, model_validator
 
 from . import Spec
+from .data_access import DataAccessRecord
 from .skill import SkillCandidateV11
 
 V11_CAMPAIGN_SCHEMA_VERSION = "skill-evolution-campaign-v11/1.0"
-V11_EXPERIENCE_SCHEMA_VERSION = "skill-experience-bundle-v11/2.0"
-V11_EVALUATION_SCHEMA_VERSION = "skill-paired-evaluation-v11/1.0"
+V11_EXPERIENCE_SCHEMA_VERSION = "skill-experience-bundle-v11/3.0"
+V11_EVALUATION_SCHEMA_VERSION = "skill-paired-evaluation-v11/2.0"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -99,7 +100,7 @@ class V11ExperienceCase(Spec):
 class V11ExperienceBundle(Spec):
     """Parent-version learning evidence consumed by one offline revision."""
 
-    schema_version: Literal["skill-experience-bundle-v11/2.0"] = (
+    schema_version: Literal["skill-experience-bundle-v11/3.0"] = (
         V11_EXPERIENCE_SCHEMA_VERSION
     )
     campaign_id: str
@@ -111,6 +112,7 @@ class V11ExperienceBundle(Spec):
     split: Literal["learning"]
     label_access: Literal[True]
     source_run_ref: str
+    label_access_record: DataAccessRecord
     cases: list[V11ExperienceCase]
 
     @field_validator(
@@ -139,6 +141,17 @@ class V11ExperienceBundle(Spec):
         case_ids = [case.case_id for case in self.cases]
         if len(set(case_ids)) != len(case_ids):
             raise ValueError("经验包 case_id 重复")
+        access = self.label_access_record
+        if (
+            access.split != "induction"
+            or access.purpose != "skill_induction"
+            or access.component_role != "inducer"
+            or access.label_access is not True
+            or access.n_items != len(self.cases)
+            or not access.at
+            or not access.input_manifest_sha256
+        ):
+            raise ValueError("经验包缺少与 cases 一致的真实 induction 标签访问记录")
         for case in self.cases:
             if case.question_type != self.question_type:
                 raise ValueError("经验 case 与经验包 question_type 不一致")
@@ -224,8 +237,10 @@ class V11EvaluationArm(Spec):
     delivered_content_sha256: str
     delivery_observed: bool
     n_scored: int = Field(ge=0)
-    mean_score: Optional[float] = None
+    mean_score: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     runtime_error_count: int = Field(ge=0)
+    program_error_count: int = Field(ge=0)
+    untrusted_geometry_use_count: int = Field(ge=0)
     legal_answer_rate: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
     @field_validator("content_sha256", "delivered_content_sha256")
@@ -237,7 +252,7 @@ class V11EvaluationArm(Spec):
 class V11PairedEvaluationReceipt(Spec):
     """Frozen same-question-type parent/candidate evaluation result."""
 
-    schema_version: Literal["skill-paired-evaluation-v11/1.0"] = (
+    schema_version: Literal["skill-paired-evaluation-v11/2.0"] = (
         V11_EVALUATION_SCHEMA_VERSION
     )
     campaign_id: str
@@ -245,26 +260,68 @@ class V11PairedEvaluationReceipt(Spec):
     panel_id: str
     panel_sha256: str
     question_type: str
+    seed: int
+    request_seed_observed: bool
+    model_id: str
+    model_config_sha256: str
+    quality_contract_sha256: str
+    solver_config_sha256: str
+    template_version: str
+    execution_protocol_version: str
+    tool_docs_version: str
+    tool_face_version: str
     status: Literal["completed", "incomplete"]
     formal_result_eligible: bool
     frozen_panel: bool
     independent_arms: bool
     n_pairs: int = Field(ge=0)
+    result_refs: list[str]
     parent: V11EvaluationArm
     candidate: V11EvaluationArm
 
-    @field_validator("panel_sha256")
+    @field_validator(
+        "panel_sha256",
+        "model_config_sha256",
+        "quality_contract_sha256",
+        "solver_config_sha256",
+    )
     @classmethod
-    def _valid_panel_sha(cls, value: str) -> str:
-        return _require_sha256(value, field_name="panel_sha256")
+    def _valid_evaluation_sha(cls, value: str, info) -> str:
+        return _require_sha256(value, field_name=info.field_name)
+
+    @field_validator(
+        "campaign_id",
+        "evaluation_id",
+        "panel_id",
+        "question_type",
+        "model_id",
+        "template_version",
+        "execution_protocol_version",
+        "tool_docs_version",
+        "tool_face_version",
+    )
+    @classmethod
+    def _required_evaluation_identity(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            raise ValueError("E11 评测身份字段不能为空")
+        return value
 
     @model_validator(mode="after")
     def _counts_fit_panel(self):
+        if len(self.result_refs) != self.n_pairs or len(set(self.result_refs)) != len(
+            self.result_refs
+        ):
+            raise ValueError("result_refs 必须与 n_pairs 一一对应且不得重复")
         for label, arm in (("parent", self.parent), ("candidate", self.candidate)):
             if arm.n_scored > self.n_pairs:
                 raise ValueError(f"{label}.n_scored 超过 n_pairs")
             if arm.runtime_error_count > self.n_pairs:
                 raise ValueError(f"{label}.runtime_error_count 超过 n_pairs")
+            if arm.program_error_count > self.n_pairs:
+                raise ValueError(f"{label}.program_error_count 超过 n_pairs")
+            if arm.untrusted_geometry_use_count > self.n_pairs:
+                raise ValueError(f"{label}.untrusted_geometry_use_count 超过 n_pairs")
         return self
 
 
@@ -305,6 +362,21 @@ class V11PublicationReceipt(Spec):
     @classmethod
     def _valid_hashes(cls, value: str, info) -> str:
         return _require_sha256(value, field_name=info.field_name)
+
+
+class V11RollbackReceipt(Spec):
+    campaign_id: str
+    snapshot_from: str
+    snapshot_to: str
+    pointer_after: str
+    reason: str
+    verified: bool
+
+    @model_validator(mode="after")
+    def _rollback_consistent(self):
+        if self.verified != (self.pointer_after == self.snapshot_to):
+            raise ValueError("回滚 verified 与 pointer_after 不一致")
+        return self
 
 
 class V11PostPublishObservation(Spec):
@@ -419,6 +491,7 @@ __all__ = [
     "V11PostPublishReceipt",
     "V11PublicationReceipt",
     "V11ReceiptRef",
+    "V11RollbackReceipt",
     "V11RevisionAttemptReceipt",
     "V11RevisionProposal",
     "V11StaticValidationReceipt",

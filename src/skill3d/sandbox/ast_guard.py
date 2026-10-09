@@ -57,6 +57,17 @@ SAFE_BUILTINS = frozenset(
     }
 )
 
+# Generated code may inspect only these non-sensitive question-state fields.
+# Geometry, scale, object bindings, and all mutations must go through REGISTRY Tools.
+SAFE_SCENE_ATTRS = frozenset({
+    "frame",
+    "scene_route",
+    "question_tool_scope",
+    "question_type",
+    "summary",
+    "available_artifacts",
+})
+
 # 危险方法/属性（文件写、网络、进程、自省）
 FORBIDDEN_ATTRS = frozenset(
     {
@@ -91,6 +102,31 @@ _REGEX_BLACKLIST = [
         r"/etc/", r"/proc/", r"/root/", r"~/",  # 宿主路径
     ]
 ]
+
+
+def _attribute_path(node: ast.AST) -> tuple[str, ...]:
+    if isinstance(node, ast.Name):
+        return (node.id,)
+    if isinstance(node, ast.Attribute):
+        base = _attribute_path(node.value)
+        return (*base, node.attr) if base else ()
+    return ()
+
+
+def _scene_attribute(path: tuple[str, ...]) -> tuple[str, ...] | None:
+    if path[:1] == ("scene",):
+        return path[1:]
+    if path[:2] == ("ctx", "scene"):
+        return path[2:]
+    return None
+
+
+def _tool_attribute(path: tuple[str, ...]) -> str | None:
+    if len(path) == 2 and path[0] == "tools":
+        return path[1]
+    if len(path) == 3 and path[:2] == ("ctx", "tools"):
+        return path[2]
+    return None
 
 
 class _WhiteListVisitor(ast.NodeVisitor):
@@ -164,20 +200,32 @@ class _WhiteListVisitor(ast.NodeVisitor):
             else:
                 self.violations.append(f"REGISTRY 外未定义函数调用: {name}")
         elif isinstance(func, ast.Attribute):
-            if func.attr.startswith("_"):
+            path = _attribute_path(func)
+            scene_attr = _scene_attribute(path)
+            tool_name = _tool_attribute(path)
+            if scene_attr is not None:
+                self.violations.append(
+                    "禁止调用 scene/ctx.scene 接口；几何、尺度和对象数据只能经 REGISTRY Tool")
+            elif func.attr.startswith("_"):
                 self.violations.append(f"禁止访问下划线属性: {func.attr}")
             elif func.attr in FORBIDDEN_ATTRS:
                 self.violations.append(f"禁止调用危险方法: .{func.attr}")
-            elif isinstance(func.value, ast.Name) and func.value.id == "tools":
-                if func.attr in self.allowed_tools:
-                    self.tool_calls.append(func.attr)
+            elif tool_name is not None:
+                if tool_name in self.allowed_tools:
+                    self.tool_calls.append(tool_name)
                 else:
-                    self.violations.append(f"tools 命名空间内未知 Tool: {func.attr}")
+                    self.violations.append(f"tools 命名空间内未知 Tool: {tool_name}")
         self.generic_visit(node)
 
     # ---- 属性访问（非调用）----
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr.startswith("_"):
+        path = _attribute_path(node)
+        scene_attr = _scene_attribute(path)
+        if scene_attr is not None and scene_attr and (
+                len(scene_attr) != 1 or scene_attr[0] not in SAFE_SCENE_ATTRS):
+            self.violations.append(
+                f"禁止访问 scene 属性: {'.'.join(path)}；只允许 {sorted(SAFE_SCENE_ATTRS)}")
+        elif node.attr.startswith("_"):
             self.violations.append(f"禁止访问下划线属性: {node.attr}")
         self.generic_visit(node)
 
@@ -185,6 +233,9 @@ class _WhiteListVisitor(ast.NodeVisitor):
     def _check_target(self, target: ast.expr) -> None:
         if isinstance(target, ast.Name) and target.id in RESERVED_NAMES:
             self.violations.append(f"禁止重赋值保留名: {target.id}")
+        elif isinstance(target, ast.Attribute) and \
+                _scene_attribute(_attribute_path(target)) is not None:
+            self.violations.append("禁止修改 scene/ctx.scene 只读题级状态")
         elif isinstance(target, (ast.Tuple, ast.List)):
             for elt in target.elts:
                 self._check_target(elt)

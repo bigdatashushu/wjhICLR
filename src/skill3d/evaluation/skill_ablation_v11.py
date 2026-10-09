@@ -25,7 +25,12 @@ from skill3d.online import runner
 from skill3d.online.runner import OnlineRunConfig, PreparedObjectBinding
 from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
 from skill3d.routing.task_classifier import canonical_task, classify
-from skill3d.schemas import ObjectRecord, ReconstructionArtifact
+from skill3d.schemas import (
+    ObjectRecord,
+    ReconstructionArtifact,
+    SkillEvaluationBinding,
+    SkillSpecV11,
+)
 from skill3d.segmentation.open_vocab_detector import capture_detector_failures
 from skill3d.skills.v11_library import (
     _manifest_for,
@@ -307,7 +312,8 @@ def quality_contract() -> dict:
 
 def _common_config(cfg: OnlineRunConfig) -> dict:
     private = {"skills", "active_snapshot_ref", "active_snapshot_manifest_sha256",
-               "trace_dir", "work_dir", "recon_dir", "reuse_artifact", "memory_dir"}
+               "trace_dir", "work_dir", "recon_dir", "reuse_artifact", "memory_dir",
+               "evaluation_binding"}
     value = {f.name: getattr(cfg, f.name) for f in fields(cfg)
              if f.name not in private and f.name != "retrieval_policy"}
     value["retrieval_policy"] = cfg.retrieval_policy.to_dict()
@@ -383,7 +389,26 @@ class _RecordingClient:
             self.store.append("model_requests", row)
 
 
-def _arm_result(out, client, identity, input_hash, config_hash, expected, *, options) -> dict:
+_PROGRAM_ERROR_CODES = frozenset({
+    "ast_violation",
+    "no_answer",
+    "violation_runtime",
+    "violation_syntax",
+    "vllm_parse_error",
+})
+
+
+def _arm_result(
+    out,
+    client,
+    identity,
+    input_hash,
+    config_hash,
+    expected,
+    *,
+    options,
+    reconstruction_cost_s=None,
+) -> dict:
     delivered = {}
     for record in out.retrieval_records:
         data = record.model_dump(mode="json") if hasattr(record, "model_dump") else record
@@ -394,6 +419,7 @@ def _arm_result(out, client, identity, input_hash, config_hash, expected, *, opt
         e for r in out.rounds for e in r.get("service_errors", [])]
     incomplete = bool(service_errors) or out.final_state == "unavailable"
     errors = [r for r in out.rounds if r.get("error_code")]
+    error_codes = {str(row.get("error_code") or "") for row in errors}
     delivery_ok = (all(r["skill_content_sha256"] == expected for r in requests)
                    and (not successful or delivered == expected)
                    and set(out.delivered_skill_versions) == set(delivered))
@@ -412,9 +438,29 @@ def _arm_result(out, client, identity, input_hash, config_hash, expected, *, opt
         "correct": None if incomplete else out.correct,
         "mra_value": None if incomplete else out.mra_value,
         "legal_answer": bool(legal),
-        "program_error": bool(errors or out.static_check_errors
-                              or out.synthesis_source == "vllm_parse_error"),
+        "program_error": bool(
+            error_codes & _PROGRAM_ERROR_CODES
+            or out.static_check_errors
+            or out.synthesis_source == "vllm_parse_error"),
         "runtime_error": out.final_state == "run_error",
+        "tool_contract_error": "tool_contract" in error_codes,
+        "geometry_rejection": "geometry_rejected" in error_codes,
+        "untrusted_geometry_used": bool(
+            out.answer
+            and (
+                out.answer_untrusted
+                or set(out.used_result_ids) & set(out.invalidated_result_ids)
+            )
+        ),
+        "agent_rounds": int(out.agent_rounds),
+        "yield_count": int(out.yield_count),
+        "model_request_count": len(requests),
+        "tool_call_count": sum(
+            len(row.get("results") or []) for row in out.rounds
+        ),
+        "reconstruction_cost_s": (
+            None if reconstruction_cost_s is None else float(reconstruction_cost_s)
+        ),
         "errors": errors, "static_check_errors": out.static_check_errors,
         "service_errors": service_errors,
         "failure_code": out.failure_code, "notes": list(out.notes),
@@ -438,6 +484,9 @@ def _incomplete_row(identity, *, task, is_mca, input_hash, config_hash, errors):
         "metric": "Accuracy" if is_mca else "MRA",
         "answer": None, "score": None, "legal_answer": False,
         "program_error": False, "runtime_error": False, "input_error": False,
+        "tool_contract_error": False, "geometry_rejection": False,
+        "untrusted_geometry_used": False, "agent_rounds": 0, "yield_count": 0,
+        "model_request_count": 0, "tool_call_count": 0, "reconstruction_cost_s": None,
         "input_error_reason": "", "episode_status": "run_error", "delivery_ok": True,
         "delivered_skill_versions": [], "delivered_content_sha256": {},
         "service_errors": errors, "requests": [],
@@ -483,6 +532,22 @@ def summarize_pairs(pairs: Sequence[dict]) -> dict:
     for p in pairs:
         groups.setdefault(p["task"], []).append(p)
     report = {}
+    rate_fields = {
+        "legal_answer_rate": "legal_answer",
+        "program_error_rate": "program_error",
+        "runtime_error_rate": "runtime_error",
+        "input_error_rate": "input_error",
+        "tool_contract_error_rate": "tool_contract_error",
+        "geometry_rejection_rate": "geometry_rejection",
+        "untrusted_geometry_use_rate": "untrusted_geometry_used",
+    }
+    mean_fields = {
+        "mean_agent_rounds": "agent_rounds",
+        "mean_yield_count": "yield_count",
+        "mean_model_requests": "model_request_count",
+        "mean_tool_calls": "tool_call_count",
+        "mean_reconstruction_cost_s": "reconstruction_cost_s",
+    }
     for name, rows in groups.items():
         arms = {}
         for arm in ARMS:
@@ -495,19 +560,34 @@ def summarize_pairs(pairs: Sequence[dict]) -> dict:
                 "n_incomplete": len(records) - len(scored),
                 "Accuracy": mean("score", [r for r in scored if r["metric"] == "Accuracy"]),
                 "MRA": mean("score", [r for r in scored if r["metric"] == "MRA"]),
-                "legal_answer_rate": mean("legal_answer", scored),
-                "program_error_rate": mean("program_error", scored),
-                "runtime_error_rate": mean("runtime_error", scored),
-                "input_error_rate": mean("input_error", scored),
+                **{
+                    output: mean(field, scored)
+                    for output, field in rate_fields.items()
+                },
+                **{
+                    output: mean(
+                        field,
+                        [record for record in records if record.get(field) is not None],
+                    )
+                    for output, field in mean_fields.items()
+                },
             }
         # Never compare two averages based on different available subsets.
         complete = [p for p in rows if p["status"] == "completed"]
         delta = {}
-        for key in ("Accuracy", "MRA", "legal_answer_rate", "program_error_rate",
-                    "runtime_error_rate", "input_error_rate"):
-            metric = key if key in ("Accuracy", "MRA") else None
-            selected = [p for p in complete if metric is None or p["metric"] == metric]
-            field = "score" if metric else key.removesuffix("_rate")
+        delta_fields = {
+            "Accuracy": ("score", "Accuracy"),
+            "MRA": ("score", "MRA"),
+            **{output: (field, None) for output, field in rate_fields.items()},
+            **{output: (field, None) for output, field in mean_fields.items()},
+        }
+        for key, (field, metric) in delta_fields.items():
+            selected = [
+                pair for pair in complete
+                if (metric is None or pair["metric"] == metric)
+                and pair["arms"]["B01"].get(field) is not None
+                and pair["arms"]["B11"].get(field) is not None
+            ]
             delta[key] = (sum(float(p["arms"]["B11"][field]) -
                               float(p["arms"]["B01"][field]) for p in selected) /
                           len(selected) if selected else None)
@@ -535,6 +615,10 @@ def run_skill_ablation_v11(
     library_root: str | Path = DEFAULT_LIBRARY,
     client_factory: Callable[[str, str], object] | None = None,
     quality_confirmation: dict | None = None,
+    reconstruction_costs: Mapping[str, float] | None = None,
+    _fixed_skill_arms: Mapping[str, SkillSpecV11] | None = None,
+    _fixed_arm_snapshot_refs: Mapping[str, str] | None = None,
+    _fixed_arm_manifest_hashes: Mapping[str, str] | None = None,
 ) -> dict:
     """Run frozen S0 Skill on/off with a real runner and optional test clients.
 
@@ -559,6 +643,38 @@ def run_skill_ablation_v11(
         wanted = {canonical_task(t) for t in question_types}
         if not wanted:
             raise PairingError("question_types must not be empty")
+        fixed_pair = _fixed_skill_arms is not None
+        fixed_arms = dict(_fixed_skill_arms or {})
+        if fixed_pair:
+            if set(fixed_arms) != set(ARMS):
+                raise PairingError(
+                    f"fixed Skill arms must be exactly {list(ARMS)}")
+            if len(wanted) != 1:
+                raise PairingError("fixed Skill evaluation requires one question type")
+            for arm, spec in fixed_arms.items():
+                if not isinstance(spec, SkillSpecV11):
+                    raise PairingError(f"{arm}: fixed arm is not SkillSpecV11")
+                if spec.question_type not in wanted:
+                    raise PairingError(
+                        f"{arm}: Skill question_type {spec.question_type!r} "
+                        f"does not match panel {sorted(wanted)}")
+            snapshot_refs = dict(_fixed_arm_snapshot_refs or {})
+            manifest_hashes = dict(_fixed_arm_manifest_hashes or {})
+            if set(snapshot_refs) != set(ARMS) or set(manifest_hashes) != set(ARMS):
+                raise PairingError(
+                    "fixed Skill evaluation requires snapshot ref/hash for both arms")
+            if any(not value for value in snapshot_refs.values()):
+                raise PairingError("fixed arm snapshot refs must not be empty")
+            if any(
+                len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+                for value in manifest_hashes.values()
+            ):
+                raise PairingError(
+                    "fixed arm manifest hashes must be lowercase sha256 values")
+        else:
+            snapshot_refs = {}
+            manifest_hashes = {}
         all_items = _index([{"qa_id": it.episode.qa_id, "item": it} for it in items])
         chosen = {q: r["item"] for q, r in all_items.items()
                   if canonical_task(r["item"].episode.question_type) in wanted}
@@ -567,6 +683,16 @@ def run_skill_ablation_v11(
         _same_ids(expected, chosen, "question panel")
         if not chosen:
             raise PairingError("empty question panel")
+        costs = {
+            str(key): float(value)
+            for key, value in (reconstruction_costs or {}).items()
+        }
+        if set(costs) - set(expected):
+            raise PairingError(
+                f"reconstruction costs contain unexpected qa_ids: "
+                f"{sorted(set(costs) - set(expected))}")
+        if any(not math.isfinite(value) or value < 0.0 for value in costs.values()):
+            raise PairingError("reconstruction costs must be finite non-negative seconds")
         runnable = {q for q, item in chosen.items() if item.input_error is None}
         if runnable - set(artifact_paths):
             raise PairingError(
@@ -579,20 +705,50 @@ def run_skill_ablation_v11(
         common = _common_config(cfg)
         config_hash = _hash(common)
         library = Path(library_root).resolve()
-        snapshot = json.loads((library / f"snapshots/snapshot_{snapshot_id}.json").read_text())
-        if snapshot.get("snapshot_id") != snapshot_id:
-            raise PairingError("wrong frozen S0 snapshot")
-        specs = validate_v11_snapshot(
-            snapshot, library_root=library,
-            method_context_max_chars=cfg.retrieval_policy.method_context_max_chars)
-        skill_manifest = json.loads(resolve_source_like_ref(library, snapshot["manifest_ref"]).read_text())
-        payload = {k: v for k, v in skill_manifest.items() if k != "manifest_sha256"}
-        if payload != _manifest_for(snapshot) or canonical_json_sha256(payload) != \
-                snapshot.get("manifest_hash") or skill_manifest.get("manifest_sha256") != snapshot.get("manifest_hash"):
-            raise PairingError("frozen Skill manifest mismatch")
-        by_task = {s.question_type: s for s in specs}
-        if wanted - set(by_task):
-            raise PairingError(f"missing frozen Skills: {sorted(wanted - set(by_task))}")
+        if fixed_pair:
+            specs = list(fixed_arms.values())
+            identities_by_arm = {
+                arm: {
+                    "skill_version": f"{spec.skill_id}@{spec.version}",
+                    "content_sha256": spec.content_sha256,
+                    "snapshot_ref": snapshot_refs[arm],
+                    "manifest_sha256": manifest_hashes[arm],
+                }
+                for arm, spec in fixed_arms.items()
+            }
+            fixed_identity_sha = _hash(identities_by_arm)
+            snapshot = {
+                "schema_version": "fixed-skill-pair-v11/1.0",
+                "snapshot_id": f"E11-{fixed_identity_sha[:20]}",
+                "manifest_hash": fixed_identity_sha,
+                "arms": identities_by_arm,
+            }
+            skill_manifest = {
+                "schema_version": "fixed-skill-pair-manifest-v11/1.0",
+                "manifest_sha256": fixed_identity_sha,
+                "arms": identities_by_arm,
+            }
+            by_task = {}
+        else:
+            snapshot = json.loads(
+                (library / f"snapshots/snapshot_{snapshot_id}.json").read_text())
+            if snapshot.get("snapshot_id") != snapshot_id:
+                raise PairingError("wrong frozen S0 snapshot")
+            specs = validate_v11_snapshot(
+                snapshot, library_root=library,
+                method_context_max_chars=cfg.retrieval_policy.method_context_max_chars)
+            skill_manifest = json.loads(
+                resolve_source_like_ref(library, snapshot["manifest_ref"]).read_text())
+            payload = {k: v for k, v in skill_manifest.items()
+                       if k != "manifest_sha256"}
+            if payload != _manifest_for(snapshot) or canonical_json_sha256(payload) != \
+                    snapshot.get("manifest_hash") or skill_manifest.get(
+                        "manifest_sha256") != snapshot.get("manifest_hash"):
+                raise PairingError("frozen Skill manifest mismatch")
+            by_task = {s.question_type: s for s in specs}
+            if wanted - set(by_task):
+                raise PairingError(
+                    f"missing frozen Skills: {sorted(wanted - set(by_task))}")
         quality = quality_contract()
         confirmed = bool(quality_confirmation and quality_confirmation.get("confirmed") is True
                          and quality_confirmation.get("sha256") == quality["sha256"]
@@ -617,10 +773,13 @@ def run_skill_ablation_v11(
         code_root = Path(runner.__file__).parents[1]
         manifest.update({
             "qa_ids": expected, "question_types": sorted(wanted),
+            "evaluation_mode": (
+                "fixed_parent_candidate" if fixed_pair else "skill_ablation"),
             "common_config": common, "config_sha256": config_hash,
             "inputs": identities, "snapshot": snapshot, "skill_manifest": skill_manifest,
             "quality_contract": quality, "quality_confirmation": quality_confirmation,
             "quality_confirmation_status": "confirmed" if confirmed else "unconfirmed",
+            "reconstruction_costs_s": dict(sorted(costs.items())),
             "client_mode": "injected" if client_factory else "vllm",
             "source_sha256": {str(p.relative_to(code_root)): _file_hash(p)
                               for p in sorted(code_root.rglob("*.py"))},
@@ -687,10 +846,22 @@ def run_skill_ablation_v11(
         for q in expected:
             item = chosen[q]
             task = canonical_task(item.episode.question_type)
-            spec = by_task[task]
             if item.input_error is not None:
                 input_hash = identities[q]["sha256"]
                 for arm in ARMS:
+                    spec = fixed_arms[arm] if fixed_pair else (
+                        by_task[task] if arm == "B11" else None)
+                    binding = (
+                        SkillEvaluationBinding(
+                            mode="fixed_skill_evaluation",
+                            arm="parent" if arm == "B01" else "candidate",
+                            skill_id=spec.skill_id,
+                            skill_version=f"{spec.skill_id}@{spec.version}",
+                            content_sha256=spec.content_sha256,
+                            bypassed_component="retrieval_selection",
+                        )
+                        if fixed_pair and spec is not None else None
+                    )
                     arm_root = root / "arms" / arm / hashlib.sha256(q.encode()).hexdigest()
                     identity = {
                         "experiment_id": experiment_id,
@@ -701,11 +872,15 @@ def run_skill_ablation_v11(
                     trace = _BoundTrace(arm_root / "trace", identity)
                     arm_cfg = replace(
                         copy.deepcopy(cfg),
-                        skills=copy.deepcopy(specs) if arm == "B11" else [],
+                        skills=[copy.deepcopy(spec)] if spec is not None else [],
                         reuse_artifact=None,
-                        active_snapshot_ref=snapshot_id if arm == "B11" else "none",
+                        active_snapshot_ref=(
+                            snapshot_refs[arm] if fixed_pair
+                            else snapshot_id if arm == "B11" else "none"),
                         active_snapshot_manifest_sha256=(
-                            snapshot["manifest_hash"] if arm == "B11" else ""),
+                            manifest_hashes[arm] if fixed_pair
+                            else snapshot["manifest_hash"] if arm == "B11" else ""),
+                        evaluation_binding=binding,
                         trace_dir=str(trace.root),
                         recon_dir=str(arm_root / "artifacts"),
                         work_dir=str(arm_root / "work"),
@@ -726,8 +901,11 @@ def run_skill_ablation_v11(
                         identity,
                         input_hash,
                         config_hash,
-                        {},
+                        ({
+                            f"{spec.skill_id}@{spec.version}": spec.content_sha256
+                        } if spec is not None else {}),
                         options=item.episode.options,
+                        reconstruction_cost_s=costs.get(q),
                     )
                     row["initial_tree_sha256"] = None
                     _write(arm_root / "result.json", row)
@@ -746,6 +924,19 @@ def run_skill_ablation_v11(
             input_hash = _hash({"original": identities[q]["sha256"],
                                 "prepared": prepared[q]["sha256"]})
             for arm in ARMS:
+                spec = fixed_arms[arm] if fixed_pair else (
+                    by_task[task] if arm == "B11" else None)
+                binding = (
+                    SkillEvaluationBinding(
+                        mode="fixed_skill_evaluation",
+                        arm="parent" if arm == "B01" else "candidate",
+                        skill_id=spec.skill_id,
+                        skill_version=f"{spec.skill_id}@{spec.version}",
+                        content_sha256=spec.content_sha256,
+                        bypassed_component="retrieval_selection",
+                    )
+                    if fixed_pair and spec is not None else None
+                )
                 arm_root = root / "arms" / arm / frozen.name
                 local = arm_root / "artifacts"
                 _clone_tree(frozen, local)
@@ -755,10 +946,17 @@ def run_skill_ablation_v11(
                 identity = {"experiment_id": experiment_id, "arm": arm, "qa_id": q,
                             "run_id": f"{experiment_id}:{arm}:{q}"}
                 trace = _BoundTrace(arm_root / "trace", identity)
-                arm_cfg = replace(copy.deepcopy(cfg), skills=copy.deepcopy(specs) if arm == "B11" else [],
+                arm_cfg = replace(copy.deepcopy(cfg),
+                                  skills=[copy.deepcopy(spec)] if spec is not None else [],
                                   reuse_artifact=str(local / "artifact.json"),
-                                  active_snapshot_ref=snapshot_id if arm == "B11" else "none",
-                                  active_snapshot_manifest_sha256=snapshot["manifest_hash"] if arm == "B11" else "",
+                                  active_snapshot_ref=(
+                                      snapshot_refs[arm] if fixed_pair
+                                      else snapshot_id if arm == "B11" else "none"),
+                                  active_snapshot_manifest_sha256=(
+                                      manifest_hashes[arm] if fixed_pair
+                                      else snapshot["manifest_hash"]
+                                      if arm == "B11" else ""),
+                                  evaluation_binding=binding,
                                   trace_dir=str(trace.root), recon_dir=str(local),
                                   work_dir=str(arm_root / "work"))
                 if _hash(_common_config(arm_cfg)) != config_hash:
@@ -768,6 +966,7 @@ def run_skill_ablation_v11(
                     row = _incomplete_row(
                         identity, task=task, is_mca=classify(item.episode).is_mca,
                         input_hash=input_hash, config_hash=config_hash, errors=prepare_errors[q])
+                    row["reconstruction_cost_s"] = costs.get(q)
                 else:
                     try:
                         with capture_detector_failures() as detection_errors:
@@ -779,8 +978,11 @@ def run_skill_ablation_v11(
                         llm.failures.extend(detection_errors)
                         row = _arm_result(
                             out, llm, identity, input_hash, config_hash,
-                            {f"{spec.skill_id}@{spec.version}": spec.content_sha256} if arm == "B11" else {},
-                            options=item.episode.options)
+                            ({
+                                f"{spec.skill_id}@{spec.version}": spec.content_sha256
+                            } if spec is not None else {}),
+                            options=item.episode.options,
+                            reconstruction_cost_s=costs.get(q))
                     except Exception as exc:
                         row = _incomplete_row(
                             identity, task=task, is_mca=classify(item.episode).is_mca,
@@ -833,3 +1035,47 @@ def run_skill_ablation_v11(
                                "error": manifest["error"], "formal_result_eligible": False})
         _write(summary_path, failed_summary)
         raise
+
+
+def run_skill_pair_evaluation_v11(
+    items: Sequence[EpisodeItem],
+    *,
+    artifact_paths: Mapping[str, str | Path],
+    output_dir: str | Path,
+    base_cfg: OnlineRunConfig,
+    seed: int,
+    parent: SkillSpecV11,
+    candidate: SkillSpecV11,
+    parent_snapshot_ref: str,
+    parent_manifest_sha256: str,
+    candidate_snapshot_ref: str,
+    candidate_manifest_sha256: str,
+    expected_qa_ids: Sequence[str] | None = None,
+    client_factory: Callable[[str, str], object] | None = None,
+    quality_confirmation: dict | None = None,
+    reconstruction_costs: Mapping[str, float] | None = None,
+) -> dict:
+    """Run E11 with explicit parent/candidate fixed injection on frozen inputs."""
+    if parent.question_type != candidate.question_type:
+        raise PairingError("parent and candidate question_type must match")
+    return run_skill_ablation_v11(
+        items,
+        artifact_paths=artifact_paths,
+        output_dir=output_dir,
+        base_cfg=base_cfg,
+        seed=seed,
+        question_types=[parent.question_type],
+        expected_qa_ids=expected_qa_ids,
+        client_factory=client_factory,
+        quality_confirmation=quality_confirmation,
+        reconstruction_costs=reconstruction_costs,
+        _fixed_skill_arms={"B01": parent, "B11": candidate},
+        _fixed_arm_snapshot_refs={
+            "B01": parent_snapshot_ref,
+            "B11": candidate_snapshot_ref,
+        },
+        _fixed_arm_manifest_hashes={
+            "B01": parent_manifest_sha256,
+            "B11": candidate_manifest_sha256,
+        },
+    )

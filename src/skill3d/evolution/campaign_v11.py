@@ -22,6 +22,7 @@ from typing import Callable, TypeVar
 from pydantic import BaseModel
 
 from skill3d.memory.consolidation import leakage_scan_text
+from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
 from skill3d.schemas import (
     SkillCandidateV11,
     SkillSpecV11,
@@ -33,6 +34,7 @@ from skill3d.schemas import (
     V11PostPublishReceipt,
     V11PublicationReceipt,
     V11ReceiptRef,
+    V11RollbackReceipt,
     V11RevisionAttemptReceipt,
     V11RevisionProposal,
     V11StaticValidationReceipt,
@@ -55,6 +57,9 @@ from skill3d.skills.v11_library import (
     validate_v11_snapshot,
     write_v11_snapshot,
 )
+from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
+from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
+from skill3d.tools.registry import TOOL_FACE_VERSION
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _CALL_RE = re.compile(r"(?<![.\w])([a-z][a-z0-9_]{2,})\s*\(")
@@ -85,6 +90,11 @@ class V11CampaignConfig:
     run_root: str = "data/evolution/runs_v11"
     max_revision_attempts: int = 3
     method_context_max_chars: int = DEFAULT_METHOD_CONTEXT_MAX_CHARS
+    seed: int = 0
+    model_id: str = ""
+    model_config_sha256: str = ""
+    quality_contract_sha256: str = ""
+    solver_config_sha256: str = ""
     resume: bool = True
 
     def resolved_id(self) -> str:
@@ -631,6 +641,11 @@ class V11CampaignRunner:
             candidate=candidate.model_copy(deep=True),
             experience=bundle.model_copy(deep=True),
             question_type=self.cfg.question_type,
+            seed=int(self.cfg.seed),
+            model_id=self.cfg.model_id,
+            model_config_sha256=self.cfg.model_config_sha256,
+            quality_contract_sha256=self.cfg.quality_contract_sha256,
+            solver_config_sha256=self.cfg.solver_config_sha256,
             idempotency_key=f"{self.campaign_id}:evaluate",
         )
         receipt = _coerce(V11PairedEvaluationReceipt, value)
@@ -681,6 +696,33 @@ class V11CampaignRunner:
             "question_type_matches": (
                 evaluation.question_type == self.cfg.question_type
             ),
+            "seed_matches": (
+                evaluation.seed == int(self.cfg.seed)
+                and evaluation.request_seed_observed
+            ),
+            "model_identity_matches": (
+                bool(self.cfg.model_id)
+                and evaluation.model_id == self.cfg.model_id
+                and evaluation.model_config_sha256
+                == self.cfg.model_config_sha256
+            ),
+            "quality_contract_matches": (
+                bool(self.cfg.quality_contract_sha256)
+                and evaluation.quality_contract_sha256
+                == self.cfg.quality_contract_sha256
+            ),
+            "solver_config_matches": (
+                bool(self.cfg.solver_config_sha256)
+                and evaluation.solver_config_sha256
+                == self.cfg.solver_config_sha256
+            ),
+            "protocol_identity_matches": (
+                evaluation.template_version == PROMPT_TEMPLATE_VERSION
+                and evaluation.execution_protocol_version
+                == EXECUTION_PROTOCOL_VERSION
+                and evaluation.tool_docs_version == TOOL_DOCS_VERSION
+                and evaluation.tool_face_version == TOOL_FACE_VERSION
+            ),
             "evaluation_completed": evaluation.status == "completed",
             "formal_result_eligible": evaluation.formal_result_eligible,
             "frozen_panel": evaluation.frozen_panel,
@@ -710,6 +752,13 @@ class V11CampaignRunner:
             ),
             "runtime_errors_nonincreasing": (
                 ca.runtime_error_count <= pa.runtime_error_count
+            ),
+            "program_errors_nonincreasing": (
+                ca.program_error_count <= pa.program_error_count
+            ),
+            "no_untrusted_geometry_use": (
+                pa.untrusted_geometry_use_count == 0
+                and ca.untrusted_geometry_use_count == 0
             ),
             "legal_answer_rate_nondecreasing": (
                 pa.legal_answer_rate is not None
@@ -985,6 +1034,49 @@ class V11CampaignRunner:
         self._record_receipt(key, receipt)
         return receipt
 
+    def _rollback_failed_publication(
+        self,
+        publication: V11PublicationReceipt,
+        *,
+        reason: str,
+    ) -> V11RollbackReceipt:
+        """Rollback only when the active pointer still names this campaign's candidate."""
+        with publish_lock(self.store_dir):
+            active = read_active_snapshot(self.store_dir)
+            active_id = str(active.get("snapshot_id") or "")
+            if active_id != publication.snapshot_after:
+                raise V11CampaignBlocked(
+                    "发布后校验失败，但 active pointer 已离开本 campaign 候选；"
+                    "拒绝覆盖其他发布")
+            parent = read_snapshot(self.store_dir, publication.snapshot_before)
+            if parent.get("schema_version") != V11_SNAPSHOT_SCHEMA:
+                raise V11CampaignBlocked("回滚目标不是 v11 快照")
+            manifest_path = resolve_source_like_ref(
+                self.library_root,
+                str(parent.get("manifest_ref") or ""),
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            write_v11_snapshot(
+                self.library_root,
+                parent,
+                manifest,
+                activate=True,
+                method_context_max_chars=int(self.cfg.method_context_max_chars),
+            )
+            pointer_after = str(
+                read_active_snapshot(self.store_dir).get("snapshot_id") or ""
+            )
+        receipt = V11RollbackReceipt(
+            campaign_id=self.campaign_id,
+            snapshot_from=publication.snapshot_after,
+            snapshot_to=publication.snapshot_before,
+            pointer_after=pointer_after,
+            reason=reason,
+            verified=pointer_after == publication.snapshot_before,
+        )
+        self._record_receipt("rollback", receipt)
+        return receipt
+
     def run(self) -> V11CampaignCheckpoint:
         """Run or resume one campaign through reject, promote, or blocked."""
         parent, _snapshot = self._initialize()
@@ -1030,6 +1122,20 @@ class V11CampaignRunner:
         post = self._verify_post_publish(candidate, publication)
         if not post.verified:
             reason = f"发布后新 learning 验证失败: {post.problems}"
+            try:
+                rollback = self._rollback_failed_publication(
+                    publication,
+                    reason=reason,
+                )
+            except Exception as exc:
+                reason = (
+                    f"{reason}；自动回滚失败: {type(exc).__name__}: {exc}"
+                )
+            else:
+                if not rollback.verified:
+                    reason = f"{reason}；自动回滚未验证"
+                else:
+                    self.checkpoint.published_snapshot_id = ""
             self._block(reason)
             raise V11CampaignBlocked(reason)
         self.checkpoint.decision = "promote"

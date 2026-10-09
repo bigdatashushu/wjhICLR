@@ -13,6 +13,7 @@ from skill3d.evaluation.mra import parse_numeric_answer
 from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
 from skill3d.routing.task_classifier import canonical_task
 from skill3d.schemas import (
+    DataAccessRecord,
     EpisodeInputTrace,
     EpisodeTrace,
     EvaluationResultTrace,
@@ -20,6 +21,7 @@ from skill3d.schemas import (
     SkillSpecV11,
     V11ExperienceBundle,
     V11ExperienceCase,
+    utcnow_iso,
 )
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
@@ -175,6 +177,41 @@ def _case_id(
     return "case-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
 
 
+def _json_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _all_tool_observations(
+    trace: EpisodeTrace,
+    program_trace: ProgramExecutionTrace | None,
+) -> list[dict]:
+    """Collect every round's ToolResult once, including pre-final observations."""
+    candidates: list[dict] = []
+    for round_row in trace.rounds:
+        for result in round_row.get("results") or []:
+            if isinstance(result, dict):
+                candidates.append(dict(result))
+    if program_trace is not None:
+        candidates.extend(
+            result.model_dump(mode="json") for result in program_trace.results
+        )
+    observations: list[dict] = []
+    seen: set[str] = set()
+    for row in candidates:
+        identity = str(row.get("result_id") or "") or _json_sha256(row)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        observations.append(row)
+    return observations
+
+
 def build_v11_experience_bundle_from_trace_store(
     trace_dir: str | Path,
     *,
@@ -185,6 +222,7 @@ def build_v11_experience_bundle_from_trace_store(
     require_real: bool = True,
 ) -> V11ExperienceBundle:
     """Join v11 induction topics and return complete evidence for the reviser."""
+    access_started_at = utcnow_iso()
     root = Path(trace_dir)
     online_rows = _read_jsonl(root / "online_run.jsonl")
     if len(online_rows) != 1:
@@ -194,6 +232,9 @@ def build_v11_experience_bundle_from_trace_store(
         raise V11ExperienceBuildError("v11 Skill 修订只接受 split=induction")
     if require_real and str(online.get("mode") or "") != "real":
         raise V11ExperienceBuildError("正式 Skill 修订经验必须来自 mode=real")
+    if online.get("label_access") is not False:
+        raise V11ExperienceBuildError(
+            "在线求解 run 必须显式记录 label_access=false")
     expected_protocol = {
         "template_version": PROMPT_TEMPLATE_VERSION,
         "execution_protocol_version": EXECUTION_PROTOCOL_VERSION,
@@ -248,6 +289,16 @@ def build_v11_experience_bundle_from_trace_store(
         raise V11ExperienceBuildError(
             f"trace 混入非 induction episode: {bad_splits}"
         )
+    bad_label_rows = sorted(
+        qa_id
+        for qa_id in inputs
+        if inputs[qa_id].get("label_access") is not False
+        or evaluations[qa_id].get("label_access") is not False
+        or traces[qa_id].get("label_access") is not False
+    )
+    if bad_label_rows:
+        raise V11ExperienceBuildError(
+            f"在线 trace 的 label_access 必须显式为 false: {bad_label_rows}")
     if online.get("n_episodes") is not None and int(online["n_episodes"]) != len(inputs):
         raise V11ExperienceBuildError(
             "online_run.n_episodes 与 episode_input 行数不一致"
@@ -384,11 +435,7 @@ def build_v11_experience_bundle_from_trace_store(
             response_text=response_text,
             response_texts=response_texts,
             program_source=program_source,
-            tool_observations=(
-                [row.model_dump(mode="json") for row in program_trace.results]
-                if program_trace is not None
-                else []
-            ),
+            tool_observations=_all_tool_observations(trace, program_trace),
             model_answer=_answer_text(result.answer_text),
             reference_answer=episode_input.reference_answer,
             score=score,
@@ -397,6 +444,41 @@ def build_v11_experience_bundle_from_trace_store(
             trace_ref=f"{run_ref}:qa:{qa_id}",
         ))
 
+    access_manifest = [
+        {
+            "qa_id": qa_id,
+            "episode_input_sha256": _json_sha256(inputs[qa_id]),
+            "evaluation_result_sha256": _json_sha256(evaluations[qa_id]),
+        }
+        for qa_id in selected_ids
+    ]
+    access_record = DataAccessRecord(
+        record_id=(
+            "label-access-"
+            + _json_sha256({
+                "campaign_id": campaign_id,
+                "run_ref": run_ref,
+                "parent": parent_key,
+                "qa_ids": selected_ids,
+            })[:20]
+        ),
+        at=access_started_at,
+        split="induction",
+        purpose="skill_induction",
+        component_role="inducer",
+        run_id=str(online.get("run_id") or ""),
+        input_manifest_sha256=_json_sha256(access_manifest),
+        n_items=len(cases),
+        label_access=True,
+        source_refs=[
+            str(root / "episode_input.jsonl"),
+            str(root / "evaluation_result.jsonl"),
+            str(root / "episode_trace.jsonl"),
+            str(root / "episode_program.jsonl"),
+            str(root / "program_trace.jsonl"),
+        ],
+        notes=["只读取题目级答案与评分；未授权读取 GT 三维标注"],
+    )
     return V11ExperienceBundle(
         campaign_id=campaign_id,
         parent_snapshot_id=parent_snapshot_id,
@@ -407,6 +489,7 @@ def build_v11_experience_bundle_from_trace_store(
         split="learning",
         label_access=True,
         source_run_ref=run_ref,
+        label_access_record=access_record,
         cases=cases,
     )
 

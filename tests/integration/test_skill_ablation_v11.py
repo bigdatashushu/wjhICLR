@@ -14,7 +14,12 @@ from skill3d.adapters.episode_source import EpisodeItem, load_synthetic_items
 from skill3d.evaluation import skill_ablation_v11 as ab
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.reconstruction_gate.quality_metrics import compute_quality
-from skill3d.schemas import ConfidenceMap, InputErrorRecord, ReconstructionArtifact
+from skill3d.schemas import (
+    ConfidenceMap,
+    InputErrorRecord,
+    ReconstructionArtifact,
+    SkillSpecV11,
+)
 from skill3d.segmentation import sam2_tracker
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -143,6 +148,86 @@ def test_real_runner_seed_skill_geometry_and_recomputed_summary(panel, tmp_path)
         rec = json.loads(path.read_text().splitlines()[0])
         assert rec["arm"] in ab.ARMS and rec["qa_id"] == item.episode.qa_id
     assert (artifact.parent / "stale_m5_cache.json").exists()
+
+
+def test_e11_fixed_parent_candidate_injection_is_auditable(panel, tmp_path):
+    item, artifact, _ = panel
+    source = (
+        ROOT
+        / "skill_library"
+        / "versions"
+        / "S03"
+        / "1.1.0"
+        / "rank-object-distances"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    parent = SkillSpecV11(
+        skill_id="S03",
+        version="1.1.0",
+        question_type="object_rel_distance",
+        skill_md=source,
+    )
+    candidate = SkillSpecV11(
+        skill_id="S03",
+        version="1.2.0",
+        question_type="object_rel_distance",
+        skill_md=source.replace(
+            "重点核查会改变前两名的错误绑定",
+            "优先核查会改变前两名的错误绑定",
+            1,
+        ),
+    )
+    clients = {}
+
+    def factory(arm, qa_id):
+        client = FakeClient(['ReturnAnswer("A")\n'])
+        clients[(arm, qa_id)] = client
+        return client
+
+    root = tmp_path / "e11"
+    result = ab.run_skill_pair_evaluation_v11(
+        [item],
+        artifact_paths={item.episode.qa_id: artifact},
+        output_dir=root,
+        base_cfg=OnlineRunConfig(
+            mode="real",
+            seed=0,
+            max_solver_rounds=3,
+            max_retries_per_operation=0,
+        ),
+        seed=137,
+        parent=parent,
+        candidate=candidate,
+        parent_snapshot_ref="parent-snapshot",
+        parent_manifest_sha256="a" * 64,
+        candidate_snapshot_ref="candidate:fixed",
+        candidate_manifest_sha256="b" * 64,
+        client_factory=factory,
+    )
+    pair = json.loads(
+        (root / "paired_results.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+
+    assert result["status"] == "completed"
+    left, right = pair["arms"]["B01"], pair["arms"]["B11"]
+    assert left["delivered_skill_versions"] == ["S03@1.1.0"]
+    assert right["delivered_skill_versions"] == ["S03@1.2.0"]
+    assert left["first_common_request_sha256"] == right["first_common_request_sha256"]
+    assert parent.skill_md in clients[("B01", item.episode.qa_id)].calls[0][0][0][
+        "content"
+    ][0]["text"]
+    assert candidate.skill_md in clients[("B11", item.episode.qa_id)].calls[0][0][0][
+        "content"
+    ][0]["text"]
+    bindings = {}
+    for arm in ab.ARMS:
+        trace = next((root / "arms" / arm).rglob("episode_trace.jsonl"))
+        record = json.loads(trace.read_text(encoding="utf-8").splitlines()[0])
+        retrieval = record["retrieval_records"][0]
+        bindings[arm] = retrieval["evaluation_binding"]
+        assert retrieval["candidates"][0]["reason_code"] == "fixed_injection_selected"
+    assert bindings["B01"]["arm"] == "parent"
+    assert bindings["B11"]["arm"] == "candidate"
 
 
 def test_state_observation_namespace_and_disk_are_isolated(panel, tmp_path, monkeypatch):

@@ -273,6 +273,29 @@ def _evidence_version_of(scene: Any) -> str:
     return str(getattr(profile, "profile_version", "") or "")
 
 
+@dataclass(frozen=True)
+class QuestionContextView:
+    """Generated-code view of question state; never exposes geometry or mutators."""
+
+    frame: str
+    scene_route: str
+    question_tool_scope: str
+    question_type: str
+    summary: str
+    available_artifacts: tuple[str, ...]
+
+
+def _question_context_view(scene: SceneHandle) -> QuestionContextView:
+    return QuestionContextView(
+        frame=str(scene.frame),
+        scene_route=str(scene.scene_route),
+        question_tool_scope=str(scene.question_tool_scope),
+        question_type=str(scene.question_type),
+        summary=str(scene.summary),
+        available_artifacts=tuple(sorted(scene.available_artifacts)),
+    )
+
+
 class RestrictedNamespaceKernel:
     """in-process 持久 kernel：跨 cell 变量存活。"""
 
@@ -325,9 +348,10 @@ class RestrictedNamespaceKernel:
         for name in tool_registry.names():
             tools_ns.__dict__[name] = self._make_tool_fn(name)
 
+        public_scene = _question_context_view(scene)
         self._ns: dict[str, Any] = {
             "frames": frames or [],
-            "scene": scene,
+            "scene": public_scene,
             "tools": tools_ns,
             "show": self._show,
             "ReturnAnswer": self.answer_slot,
@@ -359,7 +383,7 @@ class RestrictedNamespaceKernel:
         if not callable(entry):
             return None
         ctx = types.SimpleNamespace(
-            scene=self._scene,
+            scene=self._ns["scene"],
             tools=self._ns.get("tools"),
             frames=self._ns.get("frames", []),
         )
@@ -591,7 +615,7 @@ class RestrictedNamespaceKernel:
     def retarget_scene(self, scene: SceneHandle) -> None:
         """恢复后使用更新的题级授权；保留本 episode 的工具账本。"""
         self._scene = scene
-        self._ns["scene"] = scene
+        self._ns["scene"] = _question_context_view(scene)
         self.answer_slot._question_type = str(scene.question_type or "")
 
     def reset_user_namespace(self) -> None:
