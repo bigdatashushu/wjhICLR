@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from skill3d.adapters.episode_source import load_synthetic_items
 from skill3d.evaluation.skill_ablation_v11 import quality_contract
 from skill3d.evolution import adapters_v11 as adapters
@@ -84,6 +86,7 @@ class _OfflineClient:
 
 class _Experience:
     parent_snapshot_id = "snapshot-parent"
+    cases = []
 
     def model_dump(self, **_kwargs):
         return {
@@ -127,6 +130,25 @@ def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_pa
     assert "Which object is closest?" not in audit
     assert "reference_answer" not in audit
     assert str(audit_path) in proposal.source_run_ref
+    assert "Current Tool interfaces" in client.calls[0][0][1]["content"]
+    repeated = reviser(
+        campaign_id="campaign-test", parent=_parent(), experience=_Experience(),
+        attempt=1, static_feedback=[], idempotency_key="campaign-test:revise:1")
+    assert repeated == proposal
+    assert len(client.calls) == 1
+
+
+def test_invalid_offline_response_is_recorded_and_not_requested_again(tmp_path):
+    client = _OfflineClient("not JSON")
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    for _ in range(2):
+        with pytest.raises(adapters.V11RevisionFormatError):
+            reviser(
+                campaign_id="bad", parent=_parent(), experience=_Experience(),
+                attempt=1, static_feedback=[], idempotency_key="bad:revise:1")
+    assert len(client.calls) == 1
+    exchange = json.loads((tmp_path / "bad/revision_01.exchange.json").read_bytes())
+    assert exchange["text"] == "not JSON"
 
 
 def _pair_row(seed: int, parent: SkillSpecV11, candidate: SkillSpecV11) -> dict:
@@ -160,7 +182,7 @@ def _pair_row(seed: int, parent: SkillSpecV11, candidate: SkillSpecV11) -> dict:
     }
 
 
-def test_paired_evaluator_recomputes_strict_receipt_from_pair_rows(tmp_path):
+def test_paired_evaluator_rejects_cache_without_actual_panel(tmp_path):
     seed = 17
     parent = _parent()
     candidate = _candidate()
@@ -199,27 +221,15 @@ def test_paired_evaluator_recomputes_strict_receipt_from_pair_rows(tmp_path):
         library_root=tmp_path / "library",
     )
 
-    receipt = evaluator(
-        campaign_id="campaign-test",
-        parent=parent,
-        candidate=candidate,
-        experience=_Experience(),
-        question_type=parent.question_type,
-        seed=seed,
-        model_id=cfg.vllm_model,
-        model_config_sha256=model_identity["sha256"],
-        quality_contract_sha256=contract["sha256"],
-        solver_config_sha256=solver_identity["sha256"],
-        idempotency_key="campaign-test:evaluate",
-    )
-
-    assert receipt.status == "completed"
-    assert receipt.request_seed_observed
-    assert receipt.parent.mean_score == 0.0
-    assert receipt.candidate.mean_score == 1.0
-    assert receipt.parent.delivery_observed
-    assert receipt.candidate.delivery_observed
-    assert not receipt.formal_result_eligible
+    with pytest.raises(adapters.V11AdapterError, match="panel"):
+        evaluator(
+            campaign_id="campaign-test", parent=parent, candidate=candidate,
+            experience=_Experience(), question_type=parent.question_type, seed=seed,
+            model_id=cfg.vllm_model, model_config_sha256=model_identity["sha256"],
+            quality_contract_sha256=contract["sha256"],
+            solver_config_sha256=solver_identity["sha256"],
+            idempotency_key="campaign-test:evaluate",
+        )
 
 
 def test_post_publish_verifier_uses_normal_active_loading(
@@ -251,7 +261,7 @@ def test_post_publish_verifier_uses_normal_active_loading(
 
     def fake_run_episode(_episode, _pixels, cfg, **_kwargs):
         seen.append(cfg)
-        return SimpleNamespace()
+        return SimpleNamespace(final_state="answer", rounds=[])
 
     monkeypatch.setattr(adapters.runner, "run_episode", fake_run_episode)
     monkeypatch.setattr(

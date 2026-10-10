@@ -1,6 +1,10 @@
 # harness3D
 
-harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感知 VLM 实验系统。Skill3D 是代码基础，不是当前系统名称。在线链使用本地 Qwen3-VL 生成并执行受限程序，离线链负责 Skill/Memory 的归纳、配对评测、准入、发布和回滚。本 README 是当前仓库状态、v11 协议和最近一次真实实验核查的单一入口；它不把机制测试、缓存存在或历史实验记录写成新的正式结果。
+harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感知 VLM 实验系统。Skill3D 是代码基础，不是当前系统名称。在线链使用本地 Qwen3-VL 生成并执行受限程序，离线链按采集、修订、评测、发布四阶段更新完整 Skill。当前实现以[系统架构 v11](系统架构v11.md)为准；本文保留的服务器核查路径和资源状态是历史记录。
+
+当前 checkout 已删除原 Skill-3D 副本、退役 BA/标定实现、v9/v10 演化与发布链、向量检索和 Memory 平台。历史实现通过对应 Git 提交复现。VSI-Bench 数据读取、split、帧集、VGGT/MoGe-2 重建、SAM2 分割、质量门及已有数据产物保持原实现。
+
+在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
 
 > **当前结论（2026-10-09）**：仓库代码与 v11 启动器已核查，v11 dry-run 已完成，正式 run `v11-s03-seed137` 已按真实入口执行，但在模型许可证门处退出。没有启动 vLLM，没有执行重建、induction、B01/B11 或演化，没有可报告的样本数、分数或 Skill 晋升结果。
 
@@ -12,8 +16,8 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 | 基础 codebase | `Skill3D` |
 | 仓库 | `/nas/wangjh/harness3d/skill3d_codebase` |
 | 分支 | `main` |
-| Git commit | `a5f9e65be841c876beb8a586f77869b0188086e3` |
-| 工作树 | 已核查为干净 |
+| 服务器核查时 Git commit | `a5f9e65be841c876beb8a586f77869b0188086e3`（当前代码请执行 `git rev-parse HEAD` 核对） |
+| 服务器核查时工作树 | 当时已核查为干净 |
 | 报告日期 | 2026-10-09 |
 | v11 默认配置 | `configs/gpu_experiment_v11.yaml` |
 | v11 运行器 | `scripts/run_gpu_experiment_v11.py` |
@@ -52,13 +56,13 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 - **M4 质量门**：质量结果为单一事实源；无效、缺失、非有限质量值必须 fail-closed。
 - **M5 对象绑定**：SAM2 分割、跨帧传播、世界坐标对象合并和对象清单。
 - **M6 工具**：只通过 SceneState/产物合同访问重建结果；缺产物不能静默返回 `False` 或 `0`。
-- **M7 路由与检索**：题型识别、Skill 硬过滤、确定性检索和版本化交付。
+- **M7 方法查找**：按规范题型查找唯一 active Skill，校验源文件与 hash 后完整交付。
 - **M8 程序合成**：同一 FrameSet 的图像与文本共同发送给 Qwen，不得静默退化成纯文本。
 - **M9/M10 执行**：AST 白名单、受限沙箱/持久 kernel、执行 receipt 和哈希链。
 - **M11 校验**：确定性程序/几何校验，不引入第二个 VLM 充当裁判。
 - **M12 评测**：Accuracy、官方 MRA 和过程可靠性指标；失败不从分母删除。
 - **M13 Trace**：JSONL 轨迹、运行参数、输入身份和结果收据。
-- **M14-M21 离线链**：Memory/Skill 巩固、候选修订、泄漏门、配对评分、准入、发布、监控和回滚。
+- **离线更新**：完整 induction 经验、完整 SKILL.md 修订、父/候选配对评测、原子发布与失败回滚。
 
 ### 离线演化链
 
@@ -368,12 +372,6 @@ d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678
 
 该文件只确认合同身份和已有验证证据，不改变代码门限。缺文件、SHA 不匹配、`confirmed` 不是 `true` 或缺少 `evidence_ref` 时，不能声称 `formal_result_eligible=true`。本次没有这样的确认文件，因此本次没有正式结果资格。
 
-Readiness 的语义仍是单调的：
-
-```text
-implemented ⊂ connected ⊂ real_poc_verified ⊂ paper_eligible
-```
-
 机制已实现或合同测试通过，不代表真实 GPU、真实视频、真实模型和完整质量合同已经闭合，也不代表可以写入论文主表。
 
 ## 10. 本次 v11 实验审计记录
@@ -447,7 +445,7 @@ GPUExperimentError: formal run requires experiment.accept_model_licenses=true
 
 1. 在线链绝不调用 GPT-6；强模型只属于离线归纳治理链。
 2. 正式 run 必须从干净、固定 commit 的 checkout 启动。
-3. Qwen 与 VGGT/SAM2/BA 必须分卡；不能因为显存不足而同卡运行。
+3. Qwen 与 VGGT/SAM2 必须分卡；不能因为显存不足而同卡运行。
 4. 全链路使用固定 32 帧和同一帧身份；M2 不能偷偷替换或删除帧。
 5. 质量结果必须有明确状态；缺失、NaN、合同不匹配时 fail-closed。
 6. Tool 缺产物必须抛出结构化错误，不能静默返回零值。
@@ -512,7 +510,6 @@ configs/
   config.yaml                    运行时主配置
   gpu_experiment_v11.yaml        v11 启动器默认配置
   vsi_bench_split.yaml           VSI-Bench 分层配置
-  admission_thresholds.yaml      准入阈值
 scripts/
   run_gpu_experiment_v11.py     v11 dry-run/正式入口
   bootstrap_and_run_v11.sh      固定 commit 的隔离 bootstrap 入口
@@ -530,11 +527,13 @@ src/skill3d/
   verifier/                      M11 确定性校验
   evaluation/                    Accuracy、MRA、v11 配对评分
   trace/                         Trace Store
-  memory/、skills/、governance/、evolution/ 离线治理与演化
-  readiness/                     Experiment Readiness Gate
+  skills/                        完整方法加载、交付与原子发布
+  governance/                    离线模型客户端
+  evolution/                     v11 四阶段更新与真实执行适配
 docs/skill_ablation_v11.md       v11 B01/B11 详细合同
-legacy/                          旧 Skill-3D 代码，仅作参考
 ```
+
+`src/skill3d/legacy/readers.py` 仍是当前重建产物的版本校验入口，保留其读取与拒绝旧产物的行为；它不是旧求解器或重建实现。文件名含 v3/v6/v9 的测试只要仍约束当前数据和工具合同，就继续执行。
 
 ## 15. 证据索引
 

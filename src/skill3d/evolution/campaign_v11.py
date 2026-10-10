@@ -14,14 +14,14 @@ import math
 import os
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, TypeVar
 
 from pydantic import BaseModel
 
-from skill3d.memory.consolidation import leakage_scan_text
+from skill3d.evolution.leakage import leakage_scan_text
 from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
 from skill3d.schemas import (
     SkillCandidateV11,
@@ -78,6 +78,14 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 
 class V11CampaignBlocked(RuntimeError):
     """The campaign cannot proceed without violating a v11 contract."""
+
+
+class V11RevisionFormatError(RuntimeError):
+    """A durably recorded model response consumed a revision attempt."""
+
+    def __init__(self, message: str, *, source_run_ref: str) -> None:
+        super().__init__(message)
+        self.source_run_ref = source_run_ref
 
 
 @dataclass(frozen=True)
@@ -302,6 +310,30 @@ class V11CampaignRunner:
 
     def _initialize(self) -> tuple[SkillSpecV11, dict]:
         self.root.mkdir(parents=True, exist_ok=True)
+        config = asdict(self.cfg)
+        config.pop("resume")
+        config.update(campaign_id=self.campaign_id,
+                      library_root=str(self.library_root), run_root=str(self.root.parent))
+        source_root = Path(__file__).resolve().parents[3]
+        sources = sorted((source_root / "src" / "skill3d").rglob("*.py"))
+        sources += sorted((source_root / "scripts").glob("*.py"))
+        sources += sorted((source_root / "scripts").glob("*.sh"))
+        sources += sorted((source_root / "configs").rglob("*.yaml"))
+        sources += [p for p in (source_root / "pyproject.toml",) if p.is_file()]
+        contract = _json_bytes({
+            "schema_version": "campaign-contract-v11/1.0",
+            "config": config,
+            "source_sha256": {
+                p.relative_to(source_root).as_posix(): _sha256(p.read_bytes())
+                for p in sources
+            },
+        })
+        contract_path = self.root / "contract.json"
+        if self.checkpoint_path.exists() and not contract_path.is_file():
+            raise V11CampaignBlocked("旧 campaign 缺少冻结 contract，拒绝复用")
+        if contract_path.exists() and contract_path.read_bytes() != contract:
+            raise V11CampaignBlocked("campaign contract 已改变；必须使用新 campaign_id")
+        _write_create_once(contract_path, contract)
         if self.checkpoint_path.exists():
             if not self.cfg.resume:
                 raise V11CampaignBlocked(
@@ -320,6 +352,11 @@ class V11CampaignRunner:
                 raise V11CampaignBlocked("checkpoint question_type 与配置不一致")
             if Path(cp.library_root).resolve() != self.library_root:
                 raise V11CampaignBlocked("checkpoint library_root 与配置不一致")
+            for key, ref in cp.receipts.items():
+                path = self._receipt_path(key)
+                if (ref.path != path.relative_to(self.root).as_posix()
+                        or not path.is_file() or _sha256(path.read_bytes()) != ref.sha256):
+                    raise V11CampaignBlocked(f"checkpoint 收据 hash 不一致: {key}")
             parent, snapshot = self._load_frozen_parent(cp.parent_snapshot_id)
             if (
                 f"{parent.skill_id}@{parent.version}" != cp.parent_skill_version
@@ -447,14 +484,23 @@ class V11CampaignRunner:
                 raise V11CampaignBlocked("修订收据与当前父版本/经验包不一致")
             return existing
         self._set_status("revising")
-        value = self.reviser(
-            campaign_id=self.campaign_id,
-            parent=parent.model_copy(deep=True),
-            experience=bundle.model_copy(deep=True),
-            attempt=int(attempt),
-            static_feedback=list(feedback),
-            idempotency_key=f"{self.campaign_id}:revise:{attempt}",
-        )
+        try:
+            value = self.reviser(
+                campaign_id=self.campaign_id,
+                parent=parent.model_copy(deep=True),
+                experience=bundle.model_copy(deep=True),
+                attempt=int(attempt),
+                static_feedback=list(feedback),
+                idempotency_key=f"{self.campaign_id}:revise:{attempt}",
+            )
+        except V11RevisionFormatError as exc:
+            # Deliberately invalid source: static validation records the failure,
+            # provides feedback, and consumes the same bounded attempt budget.
+            value = V11RevisionProposal(
+                full_skill_md=f"Invalid offline response: {exc}\n",
+                modification_reason=f"Response format failure: {exc}",
+                source_run_ref=exc.source_run_ref,
+            )
         proposal = _coerce(V11RevisionProposal, value)
         receipt = V11RevisionAttemptReceipt(
             campaign_id=self.campaign_id,
@@ -519,6 +565,10 @@ class V11CampaignRunner:
         )
         if not checks["same_lineage"]:
             problems.append("候选必须保持父 skill_id 和 question_type")
+        checks["stable_name"] = (
+            candidate_spec is not None and candidate_spec.name == parent.name)
+        if not checks["stable_name"]:
+            problems.append("候选必须保持父 Skill 的稳定 name")
         checks["next_minor_version"] = candidate_spec is not None and (
             candidate_spec.version == version
         )
@@ -1041,10 +1091,13 @@ class V11CampaignRunner:
         reason: str,
     ) -> V11RollbackReceipt:
         """Rollback only when the active pointer still names this campaign's candidate."""
+        _write_create_once(self.root / "rollback_intent.json", _json_bytes({
+            "publication": publication.model_dump(mode="json"), "reason": reason,
+        }))
         with publish_lock(self.store_dir):
             active = read_active_snapshot(self.store_dir)
             active_id = str(active.get("snapshot_id") or "")
-            if active_id != publication.snapshot_after:
+            if active_id not in {publication.snapshot_after, publication.snapshot_before}:
                 raise V11CampaignBlocked(
                     "发布后校验失败，但 active pointer 已离开本 campaign 候选；"
                     "拒绝覆盖其他发布")
@@ -1081,6 +1134,13 @@ class V11CampaignRunner:
         """Run or resume one campaign through reject, promote, or blocked."""
         parent, _snapshot = self._initialize()
         assert self.checkpoint is not None
+        rollback_intent = self.root / "rollback_intent.json"
+        if rollback_intent.is_file() and self.checkpoint.status != "blocked":
+            intent = json.loads(rollback_intent.read_bytes())
+            publication = V11PublicationReceipt.model_validate(intent["publication"])
+            self._rollback_failed_publication(publication, reason=intent["reason"])
+            self.checkpoint.published_snapshot_id = ""
+            self._block(intent["reason"])
         if self.checkpoint.status in {"promoted", "rejected"}:
             return self.checkpoint
         if self.checkpoint.status == "blocked":
@@ -1119,9 +1179,14 @@ class V11CampaignRunner:
             # failures can therefore resume without repeating completed stages.
             self._save_checkpoint()
             raise
-        post = self._verify_post_publish(candidate, publication)
-        if not post.verified:
-            reason = f"发布后新 learning 验证失败: {post.problems}"
+        reason = ""
+        try:
+            post = self._verify_post_publish(candidate, publication)
+            if not post.verified:
+                reason = f"发布后新 learning 验证失败: {post.problems}"
+        except Exception as exc:
+            reason = f"发布后新 learning 验证失败: {type(exc).__name__}: {exc}"
+        if reason:
             try:
                 rollback = self._rollback_failed_publication(
                     publication,

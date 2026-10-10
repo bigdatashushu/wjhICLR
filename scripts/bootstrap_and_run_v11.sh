@@ -108,9 +108,15 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
 fi
 PYTHON="$VENV_DIR/bin/python"
 PIP="$VENV_DIR/bin/pip"
-MARKER="$ENV_RECEIPT_DIR/installed_code_ref.txt"
+MARKER="$ENV_RECEIPT_DIR/installed_contract_sha256.txt"
+INSTALL_ID="$("$PYTHON" - "$CODE_REF" "$CONFIG_PATH" <<'PY'
+import hashlib, pathlib, sys
+print(hashlib.sha256(sys.argv[1].encode() + b"\n" +
+                     pathlib.Path(sys.argv[2]).read_bytes()).hexdigest())
+PY
+)"
 
-if [[ ! -f "$MARKER" || "$(cat "$MARKER")" != "$CODE_REF" ]]; then
+if [[ ! -f "$MARKER" || "$(cat "$MARKER")" != "$INSTALL_ID" ]]; then
   mkdir -p "$ENV_RECEIPT_DIR"
   "$PIP" install --upgrade pip setuptools wheel
   "$PIP" install "pyyaml>=6,<7"
@@ -157,7 +163,7 @@ if not torch.cuda.is_available():
 print("torch", torch.__version__, "cuda", torch.version.cuda)
 print("vllm", vllm.__version__)
 PY
-  printf '%s\n' "$CODE_REF" > "$MARKER"
+  printf '%s\n' "$INSTALL_ID" > "$MARKER"
   "$PIP" freeze | LC_ALL=C sort > "$ENV_RECEIPT_DIR/pip_freeze.txt"
   "$PYTHON" - "$ENV_RECEIPT_DIR/pip_freeze.txt" \
     > "$ENV_RECEIPT_DIR/pip_freeze.sha256" <<'PY'

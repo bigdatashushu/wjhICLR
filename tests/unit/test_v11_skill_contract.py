@@ -9,15 +9,9 @@ from pathlib import Path
 import pytest
 
 from skill3d.routing.skill_retriever import retrieve_ex
-from skill3d.evolution.campaign import (
-    CampaignBlocked,
-    CampaignConfig,
-    EvolutionCampaignRunner,
-)
 from skill3d.schemas import (
     SceneState,
     SkillCandidateV11,
-    SkillSpec,
     SkillSpecV11,
     parse_skill_markdown,
 )
@@ -265,14 +259,14 @@ def test_v11_retrieval_is_deterministic_question_type_lookup(tmp_path):
 
 def test_v11_retrieval_rejects_mixed_runtime_formats(tmp_path):
     source = _install_s03(tmp_path)
-    legacy = SkillSpec(
+    legacy = dict(
         skill_id="legacy",
         version="1.0.0",
         applicable_question_types=["object_rel_distance"],
         skill_family="relative_geometry",
     )
     scene = SceneState(artifact_ref="artifact", scene_route="fallback_2d_only")
-    with pytest.raises(ValueError, match="不能混用"):
+    with pytest.raises(ValueError, match="只接受 SkillSpecV11"):
         retrieve_ex(
             "question",
             scene,
@@ -362,19 +356,6 @@ def test_v11_active_pointer_contains_only_snapshot_identity(tmp_path):
     assert pointer == {"snapshot_id": snapshot["snapshot_id"]}
 
 
-def test_legacy_campaign_stops_before_using_v11_active_snapshot(tmp_path):
-    runner = EvolutionCampaignRunner(
-        CampaignConfig(
-            campaign_id="blocked-v11",
-            library_root=str(LIBRARY),
-            run_root=str(tmp_path),
-        ),
-        print_fn=lambda *_: None,
-    )
-    with pytest.raises(CampaignBlocked, match="不支持当前 SkillSpecV11"):
-        runner.run()
-
-
 def test_current_online_loader_rejects_legacy_snapshot_schema(tmp_path):
     store = tmp_path / "snapshots"
     store.mkdir()
@@ -386,3 +367,43 @@ def test_current_online_loader_rejects_legacy_snapshot_schema(tmp_path):
     )
     with pytest.raises(ValueError, match="只接受 runtime-skill-snapshot/2.0"):
         load_active_skills(store)
+
+
+def test_empty_and_populated_arms_record_the_same_lookup_contract(tmp_path):
+    from skill3d.online.config import load_config, retrieval_policy_from
+
+    skill = _install_s03(tmp_path).spec
+    scene = SceneState(artifact_ref="artifact", scene_route="fallback_2d_only")
+    policy = retrieval_policy_from(load_config())
+    _, empty = retrieve_ex("q", scene, [], question_type=skill.question_type, policy=policy)
+    _, populated = retrieve_ex(
+        "q", scene, [skill], question_type=skill.question_type, policy=policy)
+    assert empty.config_sha256 == populated.config_sha256 == policy.sha256()
+    assert empty.partition_policy == populated.partition_policy
+    assert empty.policy == populated.policy
+    assert empty.retrieved_skill_versions == []
+    assert populated.retrieved_skill_versions == ["S03@1.1.0"]
+
+
+@pytest.mark.parametrize("field", ["top_k", "rerank", "candidates", "rank_weights"])
+def test_retired_ranking_configuration_fails_before_running(field):
+    from skill3d.online.config import retrieval_policy_from
+
+    with pytest.raises(ValueError, match="不支持检索配置字段"):
+        retrieval_policy_from({"retrieval": {field: 1}})
+
+
+def test_legacy_payload_cannot_be_rendered_as_current_skill():
+    with pytest.raises(ValueError, match="只接受 SkillSpecV11"):
+        render_skill_entry({"skill_id": "old", "call_graph_template": "old body"})
+
+
+def test_rollback_rejects_old_schema_and_preserves_active_pointer(tmp_path):
+    _, parent = _activate_s03_baseline(tmp_path)
+    store = tmp_path / "snapshots"
+    (store / "snapshot_old.json").write_text(json.dumps({
+        "schema_version": "runtime-skill-snapshot/1.0", "snapshot_id": "old",
+    }))
+    with pytest.raises(ValueError, match="runtime-skill-snapshot/2.0"):
+        rollback(store, "old")
+    assert load_active_skills(store)[2] == parent["snapshot_id"]

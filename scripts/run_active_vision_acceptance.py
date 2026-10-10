@@ -186,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = OnlineRunConfig(
         mode="real", vllm_endpoints=[args.endpoint], vllm_model=args.model,
         reuse_artifact=str(REPO / args.artifact) if args.artifact else None,
-        seed=0, memory_dir="", trace_dir=str(REPO / "data/traces_real"),
+        seed=0, trace_dir=str(REPO / "data/traces_real"),
         max_images=int((cfg_yaml.get("vllm") or {}).get("n_frames", 32) or 32),
         max_pixels=int((cfg_yaml.get("vllm") or {}).get("max_pixels", 131072) or 131072),
         max_model_len=int((cfg_yaml.get("vllm") or {}).get("max_model_len", 32768) or 32768),

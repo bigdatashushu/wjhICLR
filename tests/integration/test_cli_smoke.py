@@ -3,7 +3,7 @@
 ```bash
 python -m skill3d.online.eval           --split inner_validation --source synthetic --mode mock_light
 python -m skill3d.reconstruction.run    --source jsonl --plan-only
-python -m skill3d.evolution.optimize_loop --spec-file <SkillSpec> --mode mock_light
+scripts/run_evolution_campaign_v11.py --help
 ```
 
 用子进程跑真命令行（验证入口、参数、退出码、落盘），不依赖 GPU / 真实数据集。
@@ -12,6 +12,7 @@ python -m skill3d.evolution.optimize_loop --spec-file <SkillSpec> --mode mock_li
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,12 +26,14 @@ from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
 
 
 def _run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [src, env.get("PYTHONPATH", "")]))
     return subprocess.run([sys.executable, "-m", *args], capture_output=True,
-                          text=True, cwd=str(cwd) if cwd else None, timeout=900)
+                          text=True, cwd=str(cwd) if cwd else None, timeout=900, env=env)
 
 
-@pytest.mark.parametrize("module", ["skill3d.online.eval", "skill3d.reconstruction.run",
-                                    "skill3d.evolution.optimize_loop"])
+@pytest.mark.parametrize("module", ["skill3d.online.eval", "skill3d.reconstruction.run"])
 def test_help_available(module):
     """三条 §13.5 入口均存在且可自述。"""
     r = _run(module, "--help")
@@ -45,7 +48,7 @@ def test_online_eval_writes_traces(tmp_path):
              "--mode", "mock_light", "--limit", "2", "--deterministic-replay",
              "--trace-dir", str(trace_dir), "--seed", "0",
              # 记忆与 RunManifest 也落在 tmp，避免污染仓库工作目录
-             "--memory-dir", str(tmp_path / "mem"),
+
              "--run-manifest", str(tmp_path / "run_manifest.json"),
              "--frame-size", "120x160")
     assert r.returncode == 0, r.stderr
@@ -95,7 +98,7 @@ def test_online_eval_writes_input_error_row_and_preserves_denominator(tmp_path):
         "--episodes-jsonl", str(episodes),
         "--mode", "mock_light",
         "--trace-dir", str(trace_dir),
-        "--memory-dir", str(tmp_path / "memory"),
+
         "--run-manifest", str(manifest_path),
     )
 
@@ -160,32 +163,3 @@ def test_reconstruction_blocks_final_test(tmp_path):
              "--method", "vggt", "--plan-only")
     assert r.returncode == 2
     assert "硬约束 9" in r.stderr
-
-
-def test_legacy_optimize_loop_is_disabled_under_current_protocol(tmp_path):
-    """The pre-v11 optimizer must fail before running an old SkillSpec online."""
-    spec = {
-        "skill_id": "sk-room-size", "version": "1.0.0",
-        "applicable_question_types": ["room_size_estimation"],
-        # v6 §5.8：米制 Skill 必须声明证据签名 + gate 版本（双重 fail-closed）
-        "required_evidence_signature": {"metric_scale": "available"},
-        "requires_metric_evidence": True,
-        "applicable_gate_version": "metric-evidence-gate-v6",
-        "skill_family": "metric", "source": "real",
-        "description": "房间面积：平面拟合的地面两轴乘积",
-        "call_graph_template": ("area = plane_fit_room_size()\n"
-                                "ReturnAnswer(str(round(area['room_area_m2'], 2)))"),
-        "validation_assertions": ["area['room_area_m2'] > 0"],
-    }
-    spec_file = tmp_path / "skill.json"
-    spec_file.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
-    store = tmp_path / "store"
-    r = _run("skill3d.evolution.optimize_loop", "--spec-file", str(spec_file),
-             "--root-candidate-id", "cand-cli", "--mode", "mock_light",
-             "--panel-source", "synthetic", "--l1-limit", "1", "--limit", "1",
-             "--seed", "0", "--skill-store", str(store),
-             "--trace-dir", str(tmp_path / "traces"))
-    assert r.returncode == 2, (r.stdout, r.stderr)
-    assert "当前 v11 在线协议下停用" in r.stderr
-    assert not (store / "active_snapshot.json").exists()
-    assert not (tmp_path / "traces").exists()

@@ -16,7 +16,7 @@ from skill3d.adapters import frame_set as fs
 from skill3d.gates.input_gate import annotate_frames, input_gate
 from skill3d.sandbox.ast_guard import ast_guard
 from skill3d.sandbox.kernel import RestrictedNamespaceKernel
-from skill3d.schemas import InputFrame, ObjectInstance, SceneState, SkillSpec, ToolSpec
+from skill3d.schemas import InputFrame, ObjectInstance, SceneState, ToolSpec
 from skill3d.schemas.episode import FrameSet
 from skill3d.schemas.evidence import (
     GATE_SUBCONDITIONS,
@@ -385,81 +385,5 @@ def test_guarded_early_return_passes_static_and_is_terminated_at_runtime():
 
 # ------------------------------------- M7 检索：证据签名 + 米制门双重 fail-closed ----
 
-def _evidence_scene(*, metric_scale: str = "available", gate_passed: bool = True,
-                    gate_version: str = GATE_VERSION) -> SceneState:
-    """v6 SceneState：EvidenceProfile（metric_scale 三值）+ 米制门（供 M7 检索测试用）。"""
-    return SceneState(
-        artifact_ref="test", scene_route="full_3d",
-        evidence_profile=EvidenceProfile(
-            geometry_3d="available", world_frame="available",
-            metric_scale=metric_scale, object_detection="available",
-            track_consensus="available", object_grounding="available"),
-        metric_evidence_gate_result=MetricEvidenceGateResult(
-            gate_passed=gate_passed, gate_version=gate_version,
-            sub_results={name: gate_passed for name in GATE_SUBCONDITIONS}),
-        objects=[], summary="s")
-
-
-def _abs_distance_skill() -> SkillSpec:
-    """米制 Skill：声明证据签名 + requires_metric_evidence + gate 版本（§13.6）。"""
-    return SkillSpec(
-        skill_id="sk", version="1.0.0",
-        applicable_question_types=["object_abs_distance"],
-        required_evidence_signature={"metric_scale": "available"},
-        requires_metric_evidence=True, applicable_gate_version=GATE_VERSION,
-        skill_family="metric", source="real",
-        description="d", call_graph_template="t",
-        supported_coordinate_frames=["world"], validation_assertions=[])
-
-
-def test_skill_hard_filter_metric_requires_gate_and_evidence_signature():
-    """M7 硬过滤（v6 §17.1/§13.6）：米制 Skill 要求证据签名达标 **且** 米制门通过且版本匹配。
-
-    v5 的 `metric_scale_required` + `scale_confidence ∈ {medium,high}` 全局粗粒度判据已废止：
-    现在由 EvidenceProfile 的 `metric_scale` 分项能力 + `MetricEvidenceGateResult` 双重表达。
-    """
-    from skill3d.routing.skill_retriever import hard_filter, metric_evidence_usable
-
-    skill = _abs_distance_skill()
-    assert metric_evidence_usable(_evidence_scene(metric_scale="available"))
-    # 融合失败/有限值不过 → metric_scale=unavailable，米制能力不可用
-    assert not metric_evidence_usable(
-        _evidence_scene(metric_scale="unavailable", gate_passed=False))
-    # 融合成功但自洽松 → degraded：签名要求 available 的米制 Skill 仍不得被检索
-    assert not metric_evidence_usable(_evidence_scene(metric_scale="degraded"))
-
-    ok = _evidence_scene()
-    assert hard_filter(skill, ok, question_type="object_abs_distance")
-    assert not hard_filter(  # gate 版本不匹配 → fail-closed（§13.6 双重校验）
-        skill, _evidence_scene(gate_version="metric-evidence-gate-v5"),
-        question_type="object_abs_distance")
-    assert not hard_filter(  # 题型不匹配 → 不检索（§17.1）
-        skill, ok, question_type="object_counting")
-
 
 # --------------------------------------------- 硬约束 18：paired A/B 同源断言 ----
-
-def test_paired_ab_asserts_same_artifact_and_frame_set_per_episode():
-    """逐 episode 断言 A/B 同 artifact ref 与同 frame_set_hash（硬约束 18/21）。"""
-    from skill3d.skills.paired_ab import (
-        PairedArtifactMismatchError,
-        PairedFrameSetMismatchError,
-        assert_paired_outcomes_share_artifact,
-    )
-
-    class _O:
-        def __init__(self, ref, h, qa="q1"):
-            self.artifact_ref, self.frame_set_hash, self.qa_id = ref, h, qa
-
-    a = [_O("art/x.json", "hash-a"), _O("art/y.json", "hash-b", "q2")]
-    b = [_O("art/x.json", "hash-a"), _O("art/y.json", "hash-b", "q2")]
-    assert_paired_outcomes_share_artifact(a, b)          # 同源 → 通过
-
-    with pytest.raises(PairedArtifactMismatchError):
-        assert_paired_outcomes_share_artifact(a, [_O("art/other.json", "hash-a"),
-                                                  _O("art/y.json", "hash-b", "q2")])
-    with pytest.raises(PairedFrameSetMismatchError):
-        assert_paired_outcomes_share_artifact(a, [_O("art/x.json", "hash-DIFFERENT"),
-                                                  _O("art/y.json", "hash-b", "q2")])
-    with pytest.raises(PairedArtifactMismatchError):
-        assert_paired_outcomes_share_artifact(a, b[:1])   # episode 数不一致

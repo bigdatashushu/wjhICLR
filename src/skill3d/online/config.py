@@ -1,10 +1,4 @@
-"""在线链配置读取（§13 配置样例）。
-
-§4 M21 首选 Hydra；本机环境未安装 hydra-core，故用 PyYAML 直读 `configs/*.yaml`
-（键名与 §13 样例一致，接口不变，后续接入 Hydra 时替换本模块实现即可）。
-
-仅读取，不写配置；阈值一律来自 yaml，代码内不硬编码实验阈值。
-"""
+"""Read the frozen v11 YAML runtime configuration."""
 
 from __future__ import annotations
 
@@ -18,7 +12,6 @@ DEFAULT_CONFIG = "configs/config.yaml"
 
 # 与 configs/config.yaml 的默认值保持一致（yaml 缺失键时的兜底）
 _FALLBACK: dict[str, Any] = {
-    "mode": "online",
     "seed": 0,
     "max_solver_rounds": 6,
     "max_retries_per_operation": 3,
@@ -30,9 +23,7 @@ _FALLBACK: dict[str, Any] = {
         "raw_video_fallbacks": [],
         "reconstructions": "data/reconstructions",
         "trace_store": "data/traces",
-        "memory_db": "data/memory_lancedb",
         "skill_library": "skill_library",
-        "skill_registry": "skill_library/snapshots",
         "active_snapshot": "skill_library/snapshots/active_snapshot.json",
     },
     "frame_sampling": {"n_frames": 32, "strategy": "uniform"},
@@ -41,14 +32,6 @@ _FALLBACK: dict[str, Any] = {
     # 缺省值不会被冒充成"已冻结配置"。
     "retrieval": {
         "config_version": "ret-v11-deterministic-1",
-        "top_k": 3,
-        "rerank": True,
-        "candidates": 50,
-        "rank_weights": {
-            "semantic": 1.0,
-            "keyword": 1.0,
-            "semantic_mix_keyword": 0.0,
-        },
         "method_context_max_chars": 8000,
     },
     "vllm": {
@@ -64,19 +47,12 @@ _FALLBACK: dict[str, Any] = {
         "temperature": 0.0,
     },
     "sandbox": {
-        "image": "skill3d-sandbox:latest",
-        "network": "none",
-        "read_only": True,
-        "cpus": 4,
-        "memory": "8g",
-        "pids_limit": 256,
         "cell_timeout_s": 120,
         "max_regenerate": 3,
     },
     # v9 §9.4 主动图像布局（缺键时的默认，与 configs/config.yaml 一致）
     "active_vision": {"layout": "derived_plus_originals_v1", "max_derived_images": 8},
     "split_config": "configs/vsi_bench_split.yaml",
-    "admission_thresholds": "configs/admission_thresholds.yaml",
     # v6 §20：v4/v5 的 `scale` 段（冻结 conformal 校准器 / 标定池 / 逐题型授权校准）
     # 随"放弃一切需要校准的路线"整体废止，键已删除；米制尺度改由
     # `reconstruction/metric_fusion.py`（零样本度量深度跨帧融合，§11）在推理期产出，
@@ -106,7 +82,7 @@ def load_config(path: Optional[str | Path] = None) -> dict:
 
 
 def load_yaml(path: str | Path) -> dict:
-    """读任意配置 yaml（split / admission_thresholds）。"""
+    """读任意配置 yaml（split）。"""
     p = Path(path)
     if not p.is_file():
         return {}
@@ -150,9 +126,7 @@ class PathSettings:
     raw_video_fallbacks: list[str] = field(default_factory=list)
     reconstructions: str = "data/reconstructions"
     trace_store: str = "data/traces"
-    memory_db: str = "data/memory_lancedb"
     skill_library: str = "skill_library"
-    skill_registry: str = "skill_library/snapshots"
     active_snapshot: str = "skill_library/snapshots/active_snapshot.json"
 
 
@@ -160,12 +134,6 @@ class PathSettings:
 class SandboxSettings:
     """§13.2 沙箱参数。"""
 
-    image: str = "skill3d-sandbox:latest"
-    network: str = "none"
-    read_only: bool = True
-    cpus: int = 4
-    memory: str = "8g"
-    pids_limit: int = 256
     cell_timeout_s: int = 120
     max_regenerate: int = 3
 
@@ -200,7 +168,7 @@ def active_vision_from(cfg: dict) -> ActiveVisionSettings:
 
 
 def retrieval_policy_from(cfg: dict):
-    """§13.5：读冻结的检索策略（top-k／排序权重／方法上下文上限）。
+    """读取 v11 固定查找合同与完整正文长度上限。
 
     唯一读取点是这里 —— 检索策略不得在运行期按题/按场景临时构造。
     """

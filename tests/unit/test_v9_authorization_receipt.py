@@ -281,8 +281,7 @@ def test_episode_trace_persists_authorization_receipts(tmp_path):
     items = load_synthetic_items("inner_validation",
                                  question_types=["object_counting"],
                                  frame_size=(120, 160))
-    cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"),
-                          memory_dir="")
+    cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"))
     out = run_episode(items[0].episode, items[0].pixels, cfg,
                       geometry=items[0].geometry)
     receipts = out.episode_trace.authorization_receipts

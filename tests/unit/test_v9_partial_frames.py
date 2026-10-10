@@ -102,13 +102,44 @@ def test_pairing_passes_for_identical_readable_sets():
 
 def test_runner_expects_readable_frame_count_not_planned():
     """M8 的帧数断言必须按**实际可读**帧数，否则部分解码会在提示词层炸掉。"""
-    import inspect
-
     from skill3d.online import runner
+    from skill3d.schemas import SceneState, VSIBenchEpisode
+    from skill3d.tools.scene_handle import SceneHandle
 
-    src = inspect.getsource(runner)
-    assert "len(episode.frame_set.readable_frame_ids)" in src
-    assert "len(episode.frame_set.frame_ids)" not in src
+    planned = fs.uniform_frame_ids(64, 32)
+    readable = [planned[i] for i in (0, 5, 31)]
+    fset = fs.build_frame_set(64, readable_frame_ids=readable)
+    episode = VSIBenchEpisode(
+        qa_id="partial", scene_name="partial-scene", dataset="scannet",
+        question_type="object_counting", question="How many chairs?",
+        options=None, ground_truth="private-label-sentinel", frames=[],
+        split="inner_validation", frame_set=fset,
+    )
+    pixels = [np.full((48, 64, 3), i * 80, dtype=np.uint8) for i in range(3)]
+    scene = SceneState(artifact_ref="a", scene_route="fallback_2d_only")
+    handle = SceneHandle(scene)
+    cfg = _cfg()
+    runner._configure_image_ledger(handle, cfg, episode)
+    runner._attach_episode_frames(handle, episode, pixels)
+
+    class Client:
+        messages = []
+
+        def chat(self, messages, **kwargs):
+            self.messages = messages
+            return "ReturnAnswer(3)\n"
+
+    client = Client()
+    result = runner._synthesize(
+        episode, scene, handle, [], cfg, client, pixels=pixels)
+    assert result.program is not None, result.note
+    assert result.n_images == len(readable)
+    images = [part for message in client.messages
+              for part in message["content"] if part["type"] == "image_url"]
+    assert len(images) == 3
+    assert fset.frame_ids == planned and fset.readable_frame_ids == readable
+    assert handle._ledger.rounds[0].observed is True
+    assert "private-label-sentinel" not in str(client.messages)
 
 
 def test_partial_frame_set_still_passes_the_prompt_alignment_check():

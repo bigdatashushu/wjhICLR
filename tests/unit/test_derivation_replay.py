@@ -172,3 +172,21 @@ def test_mixed_without_derivation_does_not_claim_replay():
 
     assert replay.passed
     assert not replay.performed
+
+
+@pytest.mark.parametrize(("value", "unit", "question_type", "code"), [
+    ("NaN", "m", "object_abs_distance", "answer_not_finite"),
+    ("Infinity", "cm", "object_size_estimation", "answer_not_finite"),
+    (-1, "m2", "room_size_estimation", "answer_negative"),
+    (2.5, "count", "object_counting", "answer_not_integer"),
+    ("Z", "option", "object_rel_distance", "option_out_of_range"),
+])
+def test_visual_and_mixed_answers_validate_domain_without_derivation(
+        value, unit, question_type, code):
+    for basis in ("visual_estimate", "mixed"):
+        payload = AnswerPayload(value=value, unit=unit, basis=basis)
+        replay = replay_derivation(
+            payload, [], question_type=question_type, options=["chair", "table"])
+        assert not replay.passed
+        assert not replay.performed
+        assert code in {issue.code for issue in replay.issues}

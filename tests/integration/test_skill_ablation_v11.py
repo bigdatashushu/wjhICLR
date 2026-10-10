@@ -150,6 +150,53 @@ def test_real_runner_seed_skill_geometry_and_recomputed_summary(panel, tmp_path)
     assert (artifact.parent / "stale_m5_cache.json").exists()
 
 
+def test_campaign_adapter_revalidates_cached_panel_and_summary(panel, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from skill3d.evolution import adapters_v11 as adapters
+    from skill3d.schemas import SkillCandidateV11
+
+    item, artifact, calls = panel
+    source = (ROOT / "skill_library/versions/S03/1.1.0/"
+              "rank-object-distances/SKILL.md").read_text()
+    parent = SkillSpecV11(skill_id="S03", version="1.1.0",
+                         question_type="object_rel_distance", skill_md=source)
+    spec = SkillSpecV11(skill_id="S03", version="1.2.0",
+                       question_type=parent.question_type,
+                       skill_md=source + "\n复核对象绑定后再提交。\n")
+    candidate = SkillCandidateV11(
+        candidate_id="candidate-test", parent_snapshot_id="parent-test",
+        parent_skill_version="S03@1.1.0", full_skill_spec=spec,
+        modification_reason="clarify", source_run_ref="test:revision")
+    cfg = OnlineRunConfig(mode="real", seed=137, max_retries_per_operation=0)
+    evaluator = adapters.V11PairedEvaluator(
+        items=[item], artifact_paths={item.episode.qa_id: artifact}, base_cfg=cfg,
+        output_root=tmp_path / "adapter", library_root=tmp_path / "library",
+        client_factory=lambda arm, qa: FakeClient(['ReturnAnswer("A")\n']))
+    monkeypatch.setattr(evaluator, "_parent_manifest_hash", lambda snapshot: "a" * 64)
+    kwargs = dict(
+        campaign_id="campaign", parent=parent, candidate=candidate,
+        experience=SimpleNamespace(parent_snapshot_id="parent-test", cases=[]),
+        question_type=parent.question_type, seed=137, model_id=cfg.vllm_model,
+        model_config_sha256=adapters.model_config_identity_v11(cfg)["sha256"],
+        quality_contract_sha256=ab.quality_contract()["sha256"],
+        solver_config_sha256=adapters.solver_config_identity_v11(cfg, seed=137)["sha256"])
+    first = evaluator(**kwargs)
+    assert first.status == "completed" and not first.formal_result_eligible
+    assert evaluator(**kwargs) == first
+    assert len(calls) == 1
+    kwargs["experience"].cases = [SimpleNamespace(scene_id=item.episode.scene_name)]
+    with pytest.raises(adapters.V11AdapterError, match="scene overlap"):
+        evaluator(**kwargs)
+    kwargs["experience"].cases = []
+    output = evaluator._output_dir("campaign")
+    summary_path = output / "summary.json"
+    summary = json.loads(summary_path.read_bytes())
+    summary["groups"]["all"]["arms"]["B01"]["Accuracy"] = 0.123
+    summary_path.write_text(json.dumps(summary))
+    with pytest.raises(adapters.V11AdapterError, match="recomputed"):
+        evaluator(**kwargs)
+
+
 def test_e11_fixed_parent_candidate_injection_is_auditable(panel, tmp_path):
     item, artifact, _ = panel
     source = (
@@ -503,3 +550,24 @@ def test_cli_help_and_quality_contract_inherit_pythonpath():
         assert p.returncode == 0, p.stderr
         if flag != "--help":
             assert json.loads(p.stdout) == ab.quality_contract()
+
+
+@pytest.mark.parametrize("change", [
+    {"scene_name": "another-scene"},
+    {"frame_set_hash": ""},
+    {"source_frame_indices": list(range(100, 108))},
+    {"timestamps": [float(i + 100) for i in range(8)]},
+])
+def test_normal_solver_rejects_wrong_explicit_artifact_before_requests(panel, change):
+    from skill3d.online.runner import run_episode
+
+    item, path, calls = panel
+    art = ReconstructionArtifact.model_validate_json(path.read_text())
+    path.write_text(art.model_copy(update=change).model_dump_json())
+    llm = FakeClient(["ReturnAnswer('A')"])
+    with pytest.raises(ValueError, match="artifact .*mismatch"):
+        run_episode(
+            item.episode, item.pixels,
+            OnlineRunConfig(mode="real", reuse_artifact=str(path)), llm=llm)
+    assert llm.calls == []
+    assert calls == []

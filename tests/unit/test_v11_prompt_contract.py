@@ -8,7 +8,6 @@ import pytest
 
 from skill3d.online.eval import build_parser, current_version_fields
 from skill3d.online.runner import OnlineRunConfig
-from skill3d.schemas import SkillSpec
 from skill3d.synthesis import prompt_builder
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION, PromptBuilder
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
@@ -41,7 +40,7 @@ def test_historical_prompt_selectors_are_absent():
 
 
 def test_online_config_rejects_legacy_skill_spec_before_execution():
-    legacy = SkillSpec(
+    legacy = dict(
         skill_id="legacy",
         version="1.0.0",
         applicable_question_types=["object_counting"],
@@ -49,6 +48,22 @@ def test_online_config_rejects_legacy_skill_spec_before_execution():
     )
     with pytest.raises(ValueError, match="只接受 SkillSpecV11"):
         OnlineRunConfig(skills=[legacy])
+
+
+def test_online_config_rejects_retired_direct_answer_baseline():
+    with pytest.raises(ValueError, match="只支持 C1_tools_program"):
+        OnlineRunConfig(baseline="C0_direct_vlm")
+
+
+@pytest.mark.parametrize("args", [
+    ["--baseline", "C0_direct_vlm"],
+    ["--skill-spec", "old.json"],
+    ["--inject-wrong-skill"],
+])
+def test_cli_rejects_retired_solver_and_manual_injection(args):
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(args)
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize(("question_type", "meaning"), [

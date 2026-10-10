@@ -30,17 +30,26 @@ def submission_scope(kernel, trace):
 
 
 def invalid_reference_issues(kernel) -> list[GeometryIssue]:
-    """明确引用已撤销结果必须拒绝，不能只把 basis 改为 mixed 后继续评分。"""
+    """显式引用必须存在、成功且未撤销，不因 mixed 声明而放宽。"""
     payload = kernel.answer_slot.payload
     if payload is None:
         return []
     referenced = set(payload.used_result_ids) | set(payload.derivation_inputs())
-    return [
-        GeometryIssue(
-            check="invalidated_reference", tool=r.tool, result_id=r.result_id,
-            reason="本次答案显式引用了已撤销的工具结果")
-        for r in kernel.tool_results if r.result_id in referenced and r.invalidated_by
-    ]
+    by_id = {r.result_id: r for r in kernel.tool_results}
+    issues = []
+    for rid in sorted(referenced):
+        result = by_id.get(rid)
+        if result is None:
+            check, reason = "missing_reference", "本次答案引用了不存在的工具结果"
+        elif result.invalidated_by:
+            check, reason = "invalidated_reference", "本次答案显式引用了已撤销的工具结果"
+        elif result.status != "ok" or result.error is not None:
+            check, reason = "failed_reference", "本次答案引用了失败的工具结果"
+        else:
+            continue
+        issues.append(GeometryIssue(
+            check=check, tool=result.tool if result else "", result_id=rid, reason=reason))
+    return issues
 
 
 def rejected_submission(kernel) -> dict:

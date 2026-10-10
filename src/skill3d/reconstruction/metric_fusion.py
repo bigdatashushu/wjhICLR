@@ -901,7 +901,13 @@ def make_moge2_model(device: str = "cuda",
         raise RuntimeError(
             f"device={dev!r} 但 CUDA 不可用 → 拒绝静默降到 CPU"
             "（会把 C5 的资源/延迟证据换成另一台硬件；要跑 CPU 请显式传 device='cpu'）")
-    ckpt = str(checkpoint or MOGE2_CHECKPOINT)
+    import os
+    from pathlib import Path
+
+    ckpt = str(checkpoint or os.environ.get("SKILL3D_MOGE2_CHECKPOINT") or MOGE2_CHECKPOINT)
+    if Path(ckpt).is_dir():
+        # The pinned MoGe API loads a checkpoint file, not an HF snapshot directory.
+        ckpt = str(Path(ckpt) / "model.pt")
     try:
         model = MoGeModel.from_pretrained(ckpt)
     except Exception as exc:  # noqa: BLE001

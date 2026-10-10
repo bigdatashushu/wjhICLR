@@ -13,7 +13,7 @@
 > `object_centroid(ids[0])` → IndexError → `violation_runtime`，内测方向题全栽在这里。
 > AST 层拦不住的写法（例如把 Tool 存进变量再调用）由运行层兜住。
 
-AST 检查不能替代容器隔离（L2/L3/L4 由 M10 docker 承担）。
+v11 将 AST 检查、受控 namespace 和 Tool 授权共同用于类沙箱执行。
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from typing import Optional, Set
 from skill3d.schemas import ASTCheckResult
 
 from skill3d.tools.registry import REGISTRY
+from skill3d.sandbox.safe_runtime import NUMERICAL_EXPORTS
 
 # 白名单 import 模块（§9.1）
 ALLOWED_MODULES = frozenset({"numpy", "scipy", "math", "statistics"})
@@ -32,7 +33,7 @@ ALLOWED_MODULES = frozenset({"numpy", "scipy", "math", "statistics"})
 # 保留名：禁止 program 重赋值（§4 M10 字段 5）
 RESERVED_NAMES = frozenset(
     {"show", "ReturnAnswer", "YieldObservations", "AnswerPayload", "tools", "scene",
-     "frames"})
+     "frames", "ctx"})
 
 # 控制接口与答案合同构造器（§10.1/§10.2）：不属 Tool 面，不受证据门过滤。
 # `AnswerPayload` 必须在这里 —— 否则 §10.2 的规范示例
@@ -54,6 +55,9 @@ SAFE_BUILTINS = frozenset(
         "print", "len", "range", "float", "int", "str", "bool", "abs",
         "min", "max", "sum", "sorted", "list", "dict", "tuple", "set",
         "enumerate", "zip", "round", "isinstance", "format", "repr",
+        "all", "any", "pow", "reversed", "next", "iter", "map", "filter", "slice",
+        "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
+        "RuntimeError", "ArithmeticError", "ZeroDivisionError", "AssertionError",
     }
 )
 
@@ -76,6 +80,9 @@ FORBIDDEN_ATTRS = frozenset(
         "system", "popen", "spawnl", "spawnv", "execv", "fork",
         "connect", "request", "urlopen", "urlretrieve", "geturl",
         "loadtxt_from_url", "socket",
+        "load", "loadtxt", "genfromtxt", "fromfile", "tofile", "memmap", "read",
+        "read_bytes", "read_text", "savetxt", "savez", "savez_compressed", "dumps",
+        "ctypes", "ctypeslib", "data", "format", "format_map", "mro",
     }
 )
 
@@ -164,17 +171,35 @@ class _WhiteListVisitor(ast.NodeVisitor):
     def visit_Import(self, node: ast.Import) -> None:
         for a in node.names:
             root = a.name.split(".")[0]
-            if root not in ALLOWED_MODULES:
+            if a.name not in NUMERICAL_EXPORTS:
                 self.violations.append(f"禁止 import 模块: {a.name}")
+            self._check_target(ast.Name(id=a.asname or root))
             self.imported_names.add((a.asname or root).split(".")[0])
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        root = (node.module or "").split(".")[0]
-        if root not in ALLOWED_MODULES:
+        module = node.module or ""
+        if node.level or module not in NUMERICAL_EXPORTS:
             self.violations.append(f"禁止 from-import 模块: {node.module}")
         for a in node.names:
+            if (a.name not in NUMERICAL_EXPORTS.get(module, ())
+                    and f"{module}.{a.name}" not in NUMERICAL_EXPORTS):
+                self.violations.append(f"禁止导入非计算接口: {module}.{a.name}")
+            self._check_target(ast.Name(id=a.asname or a.name))
             self.imported_names.add(a.asname or a.name)
+        self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if node.id.startswith("__") and node.id != "__episode_entry__":
+            self.violations.append(f"禁止访问内部名称: {node.id}")
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.violations.append("生成程序不得定义类")
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is None:
+            self.violations.append("禁止裸 except 吞掉控制终结或超时信号")
         self.generic_visit(node)
 
     # ---- 函数调用白名单 ----
@@ -227,15 +252,22 @@ class _WhiteListVisitor(ast.NodeVisitor):
                 f"禁止访问 scene 属性: {'.'.join(path)}；只允许 {sorted(SAFE_SCENE_ATTRS)}")
         elif node.attr.startswith("_"):
             self.violations.append(f"禁止访问下划线属性: {node.attr}")
+        elif node.attr in FORBIDDEN_ATTRS:
+            self.violations.append(f"禁止访问危险属性: {node.attr}")
         self.generic_visit(node)
 
     # ---- 保留名重赋值 ----
     def _check_target(self, target: ast.expr) -> None:
-        if isinstance(target, ast.Name) and target.id in RESERVED_NAMES:
+        if isinstance(target, ast.Name) and (
+                target.id in RESERVED_NAMES or target.id in self.allowed_tools):
             self.violations.append(f"禁止重赋值保留名: {target.id}")
         elif isinstance(target, ast.Attribute) and \
                 _scene_attribute(_attribute_path(target)) is not None:
             self.violations.append("禁止修改 scene/ctx.scene 只读题级状态")
+        elif isinstance(target, ast.Attribute) and (
+                _attribute_path(target)[:1]
+                and _attribute_path(target)[0] in RESERVED_NAMES):
+            self.violations.append("禁止修改框架接口或上下文")
         elif isinstance(target, (ast.Tuple, ast.List)):
             for elt in target.elts:
                 self._check_target(elt)

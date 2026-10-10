@@ -210,7 +210,7 @@ def test_v11_contract_survives_solver_rounds_and_reaches_trace(
     client = _RecordingClient([first_program, final_response])
     cfg = OnlineRunConfig(
         mode="real", reuse_artifact=artifact, skills=[spec], seed=7,
-        memory_dir="", trace_dir=str(tmp_path / "traces"),
+        trace_dir=str(tmp_path / "traces"),
         max_solver_rounds=round_limit, finalization_rounds=1,
     )
     out = run_episode(
@@ -265,7 +265,7 @@ def _run_m11_case(room_source_and_artifact, tmp_path, monkeypatch, programs, ver
     monkeypatch.setattr(runner, "geometry_verify", verifier)
     cfg = OnlineRunConfig(
         mode="real", reuse_artifact=artifact, skills=[spec], seed=7,
-        memory_dir="", trace_dir=str(tmp_path / "traces"),
+        trace_dir=str(tmp_path / "traces"),
         max_solver_rounds=max_rounds, max_retries_per_operation=retries,
         finalization_rounds=1)
     out = run_episode(item.episode, item.pixels, cfg, llm=client)

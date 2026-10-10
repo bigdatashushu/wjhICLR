@@ -1,7 +1,4 @@
-# 主配置（系统架构.md §2 / §13.5）
-# mode=online 走在线推理链（M1-M13，绝对无 GPT-6）
-# mode=offline_evolution 走离线演进链（M14-M21）
-mode: online  # online | offline_evolution
+# harness3d v11 运行配置；在线求解与离线修订由各自入口驱动。
 
 seed: 0
 
@@ -26,11 +23,8 @@ paths:
     - /nas/wangjh/Skill-3D/dataset/VSI_videos
   reconstructions: data/reconstructions
   trace_store: data/traces
-  memory_db: data/memory_lancedb
-  # v9: one authoritative repository-local Skill library. The registry path
-  # remains as a compatibility alias to the atomic snapshot store.
+  # 每题型唯一 active Skill。
   skill_library: skill_library
-  skill_registry: skill_library/snapshots
   active_snapshot: skill_library/snapshots/active_snapshot.json
 
 frame_sampling:
@@ -40,18 +34,9 @@ frame_sampling:
 # 只在独立诊断实验中开启。默认 1.0 权重不影响主流程（scene_route 不再被 M2 权重左右）。
 input_diagnostics: false
 
-# v11 检索策略：top-k／排序规则／方法上下文上限必须**写入配置并在演化
-# 开始前冻结**，且每次检索的记录里带配置版本（§13.6）。改这里等于改实验自变量，
-# 必须同时改 config_version 标签 —— 不得在运行期按题/按场景临时调整。
+# v11 固定按题型查找唯一方法；只配置完整正文的服务长度上限。
 retrieval:
   config_version: ret-v11-deterministic-1  # 人类标签；内容摘要由代码复算并落盘
-  top_k: 3                      # §13.5 起始配置（规范允许开发起点取 1；S0 每题型只有 1 条）
-  rerank: true                  # false = 关键词打分（§8.1 "w/o LanceDB reranker" 消融）
-  candidates: 50                # 语义排序的候选池大小
-  rank_weights:                 # 排序规则的完整参数集（未登记键会被拒绝，不静默忽略）
-    semantic: 1.0               # 语义主分权重（rerank=true）
-    keyword: 1.0                # 关键词主分权重（rerank=false）
-    semantic_mix_keyword: 0.0   # 语义路径混入关键词分的权重（0=纯语义）
   # §13.5"上下文放不下时先减少完整条目"的上限，同时是"超过服务限制的候选在静态
   # 检查中拒绝"的判据（单条正文超过它的候选永远无法完整交付）。
   # 依据：32 帧 @max_pixels=131072 ≈ 9.7k prompt tokens，max_model_len=32768，
@@ -81,12 +66,6 @@ vllm:
   temperature: 0.0                      # greedy，保证同 seed 字节级一致
 
 sandbox:
-  image: skill3d-sandbox:latest
-  network: none
-  read_only: true
-  cpus: 4
-  memory: 8g
-  pids_limit: 256
   cell_timeout_s: 120                   # TODO_CALIBRATE
   max_regenerate: 3                     # AST 失败有限重生成 TODO_CALIBRATE
 
@@ -103,4 +82,3 @@ detection:
 # [待实验]/[TODO_CALIBRATE]，PoC 通过前不登记任何默认值（不得给"兜底常量"）。
 
 split_config: configs/vsi_bench_split.yaml
-admission_thresholds: configs/admission_thresholds.yaml

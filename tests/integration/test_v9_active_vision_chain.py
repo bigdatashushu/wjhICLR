@@ -83,7 +83,7 @@ def fixture_episode():
 
 def _cfg(tmp_path, art_path: str, **over) -> OnlineRunConfig:
     base = dict(mode="real", vllm_endpoints=["http://fake"], deterministic_replay=True,
-                memory_dir="", trace_dir=str(tmp_path / "t"), max_images=32,
+                trace_dir=str(tmp_path / "t"), max_images=32,
                 reuse_artifact=art_path)
     base.update(over)
     return OnlineRunConfig(**base)

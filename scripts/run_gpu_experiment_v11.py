@@ -203,7 +203,7 @@ def _validate_weight_config(cfg: dict) -> None:
 def _snapshot_files(root: Path) -> list[dict]:
     files = []
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or "/.cache/" in path.as_posix():
+        if not path.is_file() or ".cache" in path.relative_to(root).parts:
             continue
         files.append({
             "path": path.relative_to(root).as_posix(),
@@ -222,14 +222,14 @@ def _existing_weight_path(entry: dict) -> tuple[Path | None, str]:
     path = Path(value).expanduser().resolve()
     if not path.is_dir():
         return None, ""
-    main_ref = path / "refs" / "main"
-    if main_ref.is_file():
-        revision = main_ref.read_text(encoding="utf-8").strip()
-        snapshot = path / "snapshots" / revision
-        if _COMMIT_RE.fullmatch(revision) and snapshot.is_dir():
-            return snapshot, revision
-    revision = path.name if _COMMIT_RE.fullmatch(path.name) else ""
-    return path, revision
+    revision = str(entry.get("revision") or "")
+    snapshot = path / "snapshots" / revision
+    if _COMMIT_RE.fullmatch(revision) and snapshot.is_dir():
+        return snapshot, revision
+    if path.parent.name == "snapshots" and path.name == revision:
+        return path, revision
+    # A mutable directory or refs/main is not proof of the requested revision.
+    return None, ""
 
 
 def _download_weights(
@@ -261,7 +261,7 @@ def _download_weights(
         existing, existing_revision = _existing_weight_path(entry)
         if existing is not None:
             destination = existing
-            source = "existing_verified_cache"
+            source = "existing_pinned_snapshot"
         else:
             destination = weight_root / name / revision
             destination.mkdir(parents=True, exist_ok=True)
@@ -322,6 +322,8 @@ def _command_env(
     detector = str(cfg["experiment"].get("detector_endpoint") or "")
     if detector:
         environment["SKILL3D_DETECTOR_ENDPOINT"] = detector
+    if "moge2" in weights:
+        environment["SKILL3D_MOGE2_CHECKPOINT"] = str(weights["moge2"] / "model.pt")
     return environment
 
 
@@ -456,22 +458,60 @@ def _pipeline(
     weights: dict[str, Path],
     *,
     dry_run: bool,
+    weight_manifest: dict | None = None,
 ) -> list[dict]:
     experiment = cfg["experiment"]
     runtime = cfg["runtime"]
     commands: list[dict] = []
     env = _command_env(root, cfg, weights)
+    from importlib.metadata import distributions
+    environment = {
+        "python": sys.version, "platform": platform.platform(),
+        "packages": sorted((dist.metadata["Name"], dist.version)
+                           for dist in distributions() if dist.metadata["Name"]),
+    }
+    _write_json(run_root / "environment.json", environment)
+    env["SKILL3D_ENVIRONMENT_SHA256"] = hashlib.sha256(_json_bytes(environment)).hexdigest()
+    qwen_identity = (weight_manifest or {}).get("models", {}).get("qwen")
+    if qwen_identity:
+        env["SKILL3D_MODEL_WEIGHTS_SHA256"] = hashlib.sha256(_json_bytes({
+            key: qwen_identity[key] for key in ("repo_id", "revision", "files")
+        })).hexdigest()
+    else:
+        env.pop("SKILL3D_MODEL_WEIGHTS_SHA256", None)
     geometry_env = dict(env)
     geometry_env["CUDA_VISIBLE_DEVICES"] = str(runtime["geometry_gpu"])
     endpoint = f"http://{runtime['host']}:{runtime['port']}"
     python = sys.executable
     video_root = str(Path(str(experiment["video_root"])).expanduser())
-    config_path = str(root / "configs" / "config.yaml")
+    runtime_config = _read_config(root / "configs" / "config.yaml")
+    runtime_config["seed"] = int(experiment["seed"])
+    runtime_config.setdefault("frame_sampling", {})["n_frames"] = int(runtime["n_images"])
+    runtime_config.setdefault("vllm", {}).update({
+        "n_frames": int(runtime["n_images"]),
+        "max_pixels": int(runtime["max_pixels"]),
+        "max_model_len": int(runtime["max_model_len"]),
+        "model": str(runtime["served_model_name"]),
+    })
+    library = run_root / "skill_library"
+    if not dry_run:
+        shutil.copytree(root / "skill_library", library)
+    runtime_config.setdefault("paths", {}).update({
+        "skill_library": str(library),
+        "active_snapshot": str(library / "snapshots" / "active_snapshot.json"),
+    })
+    config_file = run_root / "runtime_config.yaml"
+    config_file.write_text(yaml.safe_dump(
+        runtime_config, allow_unicode=True, sort_keys=True), encoding="utf-8")
+    config_path = str(config_file)
     recon_dir = run_root / "reconstructions"
     question_type = str(experiment["question_type"])
     datasets = str(experiment.get("datasets") or "")
     seed = int(experiment["seed"])
     sampling = int(experiment["reconstruction_sampling_per_task"])
+    if sampling < max(int(experiment["inner_limit"]),
+                      int(experiment["induction_limit"]) + int(experiment["post_publish_limit"])):
+        raise GPUExperimentError("reconstruction panel cannot cover learning/inner/post limits")
 
     reconstruction = [
         python,
@@ -495,6 +535,8 @@ def _pipeline(
         "1",
         "--n-frames",
         str(runtime["n_images"]),
+        "--seed",
+        str(seed),
         "--gpus",
         "0",
     ]
@@ -551,7 +593,6 @@ def _pipeline(
             str(runtime["served_model_name"]),
             "--trace-dir",
             str(parent_trace),
-            "--no-memory",
             "--run-manifest",
             str(parent_manifest),
         ]
@@ -606,6 +647,10 @@ def _pipeline(
             commands=commands,
             stage="b01_b11",
         )
+        if experiment.get("formal") and not dry_run:
+            summary = json.loads((ablation_dir / "summary.json").read_bytes())
+            if summary.get("formal_result_eligible") is not True:
+                raise GPUExperimentError("B01/B11 completed without formal eligibility")
 
         if experiment.get("run_evolution"):
             if not os.environ.get("DEEPSEEK_API_KEY") and not dry_run:
@@ -637,7 +682,7 @@ def _pipeline(
                 "--quality-confirmation",
                 confirmation,
                 "--library-root",
-                str(root / "skill_library"),
+                str(library),
                 "--run-root",
                 str(run_root / "evolution"),
                 "--vllm-endpoint",
@@ -695,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     run_root.mkdir(parents=True, exist_ok=args.dry_run)
+    pipeline = None
     try:
         cfg = _read_config(config_path)
         preflight = _preflight(
@@ -732,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
             cfg,
             weights,
             dry_run=args.dry_run,
+            weight_manifest=weight_manifest,
         )
         pipeline["commands"] = commands
         pipeline["status"] = "dry_run" if args.dry_run else "completed"
@@ -747,6 +794,9 @@ def main(argv: list[str] | None = None) -> int:
             "final_test_touched": False,
         }
         _write_json(run_root / "failure.json", failure)
+        if pipeline is not None:
+            pipeline.update(status="failed", error=failure["error"])
+            _write_json(run_root / "pipeline_manifest.json", pipeline)
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 

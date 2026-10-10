@@ -714,12 +714,11 @@ def test_ast_guard_accepts_toplevel_answer_then_tool_now_that_answer_terminates(
     assert ast_guard(src).ok, "静态层不再做顺序判定（由终结语义在运行层保证）"
 
 
-def test_runtime_guard_still_fires_when_terminate_signal_is_swallowed():
-    """即使生成程序吞掉终结信号，答后调 Tool 仍被拦成受控 `AnswerAlreadyGiven`。
+def test_runtime_guard_still_fires_after_answer_is_already_submitted():
+    """首次答案已终结后，捕获重复提交异常仍不能绕过工具包装的答后调用检查。
 
-    v7 §10.2 的第一道保证是 `ControlTerminate`；本用例覆盖第二道：
-    程序用 `except BaseException: pass` 强行吞掉信号后继续跑时，
-    运行层的工具包装必须继续拦截，而不是让它跑成 IndexError/假服务故障。
+    BaseException 已不向程序暴露；本用例从宿主再次执行一个 cell，
+    覆盖独立于终结信号的 AnswerAlreadyGiven 防线。
     """
     import numpy as np
 
@@ -745,11 +744,11 @@ def test_runtime_guard_still_fires_when_terminate_signal_is_swallowed():
     assert cell.error_code is None
     assert not (cell.contract_violations or [])
 
-    # 恶意/防御式写法：吞掉终结信号后继续调 Tool → 运行层兜住
+    # 捕获重复提交的普通异常后继续调 Tool → 运行层仍兜住
     cell2 = kernel.run_cell(
         "try:\n"
         "    ReturnAnswer(3)\n"
-        "except BaseException:\n"
+        "except Exception:\n"
         "    pass\n"
         "list_objects('chair')\n")
     assert cell2.error_code == "tool_contract"

@@ -95,65 +95,16 @@ from .retrieval import (
     SkillRetrievalRecord,
     short_method_summary,
 )
-# `SparseBAReceipt`（原 `.sparse_ba`）随 v6 §20 废止 `vggt_sparse_ba` 一并归档到
-# `skill3d/legacy/retired/sparse_ba.py`，不再由 Schemas 导出（Schema 与 legacy 隔离）。
-from .readiness import ExperimentReadiness
 from .tool import ToolCall, ToolResult, ToolSpec
 from .program import ASTCheckResult, EpisodeProgram, ProgramExecutionTrace
 from .skill import (
-    DeepSeekGovernanceDecision,
     RetrievedSkill,
     SkillCandidateV11,
-    SkillCandidateV5,
-    SkillGovernanceDecision,
-    SkillSpec,
     SkillSpecV11,
-    SkillState,
     normalize_skill_markdown,
     parse_skill_markdown,
 )
-from .experience import (
-    BEHAVIOR_SUMMARY_KEYS,
-    EXCLUSION_REASON_CODES,
-    EXPERIENCE_BUNDLE_SCHEMA_VERSION,
-    EXPERIENCE_EVENT_SCHEMA_VERSION,
-    EXPERIENCE_SPLITS,
-    FAILURE_SUMMARY_KEYS,
-    RETRIEVAL_STATES,
-    ExperienceBundle,
-    ExperienceEvent,
-)
-from .evolution import (
-    AdmissionDecision,
-    BudgetLimit,
-    BudgetUsage,
-    CANDIDATE_OPERATIONS,
-    DECISION_CONDITION_KEYS,
-    EVOLUTION_STATES,
-    STATIC_CHECK_KEYS,
-    CampaignDecision,
-    CandidateRevision,
-    EvolutionCampaign,
-    PairedPanelReceipt,
-    PostPublishUseReceipt,
-    PromotionReceipt,
-    RejectionReceipt,
-    SkillCandidate,
-    SkillEvaluationBinding,
-    StaticValidationReceipt,
-    SkillLibraryCandidate,
-    CounterexampleBundle,
-    CounterexampleCase,
-    EnvironmentSnapshot,
-    EvolutionSandboxSpec,
-    ExperimentBranch,
-    GPT6Patch,
-    GPUJob,
-    MetamorphicTransform,
-    OptimizationRun,
-    PairedOutcome,
-    RevisionExperiment,
-)
+from .evolution import GPUJob, SkillEvaluationBinding
 from .evolution_v11 import (
     V11_CAMPAIGN_SCHEMA_VERSION,
     V11_EVALUATION_SCHEMA_VERSION,
@@ -174,13 +125,11 @@ from .evolution_v11 import (
     V11RevisionProposal,
     V11StaticValidationReceipt,
 )
-from .memory import MemoryEntry, MemorySnapshot
 from .trace import (
     EpisodeInputTrace,
     EpisodeTrace,
     EvaluationResultTrace,
     EvaluationRun,
-    EvolutionGeneration,
     FailureTaxonomy,
     RunManifest,
     TraceRecord,

@@ -312,7 +312,7 @@ def quality_contract() -> dict:
 
 def _common_config(cfg: OnlineRunConfig) -> dict:
     private = {"skills", "active_snapshot_ref", "active_snapshot_manifest_sha256",
-               "trace_dir", "work_dir", "recon_dir", "reuse_artifact", "memory_dir",
+               "trace_dir", "work_dir", "recon_dir", "reuse_artifact",
                "evaluation_binding"}
     value = {f.name: getattr(cfg, f.name) for f in fields(cfg)
              if f.name not in private and f.name != "retrieval_policy"}
@@ -356,7 +356,10 @@ class _RecordingClient:
             for part in parts:
                 text = part.get("text", "")
                 is_solver = is_solver or "ReturnAnswer" in text
-                for spec in self.specs:
+                # A candidate may extend the complete parent text verbatim.
+                # Match the longest full body first so the parent prefix cannot
+                # be counted as delivery or left behind in the common prompt.
+                for spec in sorted(self.specs, key=lambda s: len(s.skill_md), reverse=True):
                     block = "\n## 参考方法\n" + spec.skill_md
                     if block in text:
                         key = f"{spec.skill_id}@{spec.version}"
@@ -699,7 +702,7 @@ def run_skill_ablation_v11(
                 f"missing artifact mappings: {sorted(runnable - set(artifact_paths))}")
         if any(it.episode.split == "final_test" for it in chosen.values()) and not base_cfg.allow_final_test:
             raise PairingError("final_test requires allow_final_test")
-        cfg = replace(copy.deepcopy(base_cfg), seed=int(seed), skills=[], memory_dir="",
+        cfg = replace(copy.deepcopy(base_cfg), seed=int(seed), skills=[],
                       active_snapshot_ref=snapshot_id,
                       active_snapshot_manifest_sha256="")
         common = _common_config(cfg)
@@ -892,7 +895,6 @@ def run_skill_ablation_v11(
                         arm_cfg,
                         trace_store=trace,
                         llm=llm,
-                        episodic=None,
                         input_error=item.input_error,
                     )
                     row = _arm_result(
@@ -973,8 +975,7 @@ def run_skill_ablation_v11(
                             out = runner.run_episode(
                                 item.episode.model_copy(deep=True),
                                 [np.load(p, allow_pickle=False) for p in sorted(local.glob("frame_*.npy"))],
-                                arm_cfg, trace_store=trace, llm=llm, episodic=None,
-                                prepared_binding=_load_binding(local))
+                                arm_cfg, trace_store=trace, llm=llm, prepared_binding=_load_binding(local))
                         llm.failures.extend(detection_errors)
                         row = _arm_result(
                             out, llm, identity, input_hash, config_hash,
@@ -1016,6 +1017,7 @@ def run_skill_ablation_v11(
         summary = summarize_pairs(pairs)
         summary.update({"experiment_id": experiment_id, "n_planned": len(expected),
                         "formal_result_eligible": confirmed and client_factory is None
+                        and bool(cfg.model_weights_sha256) and bool(cfg.environment_sha256)
                         and summary["status"] == "completed"
                         and summary["n_input_error_pairs"] < summary["n_pairs"]
                         and all(p["comparable"] for p in pairs)})

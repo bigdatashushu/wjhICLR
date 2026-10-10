@@ -107,7 +107,7 @@ def main(argv=None) -> int:
         expected = (json.loads(Path(args.expected_qa_ids).read_text()) if args.expected_qa_ids
                     else sampling.get("qa_ids"))
         cfg = OnlineRunConfig(
-            mode="real", seed=seed, memory_dir="", allow_final_test=args.allow_final_test,
+            mode="real", seed=seed, allow_final_test=args.allow_final_test,
             vllm_endpoints=args.vllm_endpoint or model.get("endpoints", []),
             vllm_model=args.vllm_model or model["model"],
             max_images=int(model.get("n_frames", 32)), max_pixels=int(model["max_pixels"]),

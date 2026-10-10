@@ -77,6 +77,7 @@ class FailureTaxonomy(Spec):
 class EpisodeInputTrace(Spec):
     """M13 structured episode input, including scorer-only reference answer."""
 
+    run_id: str = ""
     qa_id: str
     scene_id: str
     dataset: str
@@ -94,6 +95,7 @@ class EpisodeInputTrace(Spec):
 class EvaluationResultTrace(Spec):
     """M12 result joined with episode/program traces by ``qa_id``."""
 
+    run_id: str = ""
     qa_id: str
     question_type: str
     task: str
@@ -115,6 +117,8 @@ class EvaluationResultTrace(Spec):
 class TraceRecord(Spec):
     """逐 episode 全套落盘（§5.9 D10）——**不依赖重跑即可归因失败**。"""
 
+    run_id: str = ""
+    qa_id: str = ""
     episode_id: str
     active_snapshot_manifest_sha256: str = ""
     # ---- 版本字段（D10）----
@@ -203,6 +207,7 @@ class TraceRecord(Spec):
 
 
 class EpisodeTrace(Spec):
+    run_id: str = ""
     episode_id: str
     qa_id: str
     final_state: str
@@ -293,6 +298,8 @@ class EpisodeTrace(Spec):
 
 class EvaluationRun(Spec):
     run_id: str
+    status: Literal["completed", "incomplete"] = "completed"
+    n_unavailable: int = 0
     split: str
     n_episodes: int
     accuracy: Optional[float]
@@ -305,24 +312,13 @@ class EvaluationRun(Spec):
     n_seeds: int = 1
 
 
-class EvolutionGeneration(Spec):
-    generation: int
-    root_candidates: list[str]
-    promoted: list[str]
-    rejected: list[str]
-    quarantined: list[str]
-    paired_outcomes_ref: str
-
-
 class RunManifest(Spec):
     """M21 版本锁定清单（§19.2 复现 checklist）。"""
 
     code_commit: str
-    docker_digest: str
     checkpoint_sha256: str
     pip_freeze_hash: str
     config_hash: str
-    mlflow_run_id: str
     split_version: str = ""
     split_config_hash: str = ""
     seed: Optional[int] = None
@@ -344,7 +340,6 @@ class RunManifest(Spec):
     metric_model: str = "none"
     metric_fusion_version: str = ""
     distance_primitive_params: dict = {}
-    golden_version: str = ""
     # ---- 离线治理模型（§3.4/§19.2）----
     # `provider="deepseek"`、`model_id="deepseek-flash"` 已核验；
     # 认证值仅从 DEEPSEEK_API_KEY 注入，**绝不落盘**。
@@ -355,8 +350,6 @@ class RunManifest(Spec):
     prompt_version: str = ""
     latency: Optional[float] = None
     token_usage: dict = {}
-    # HC34：readiness manifest 引用（四级证据门的快照位置）
-    readiness_manifest_ref: str = ""
 
 
 __all__ = [
@@ -365,7 +358,6 @@ __all__ = [
     "EpisodeTrace",
     "EvaluationResultTrace",
     "EvaluationRun",
-    "EvolutionGeneration",
     "FailureCode",
     "FailureTaxonomy",
     "RunManifest",

@@ -48,9 +48,10 @@ def _parent() -> SkillSpecV11:
     )
 
 
-def _write_run(store: TraceStore, *, split="induction", mode="real") -> None:
+def _write_run(store: TraceStore, *, split="induction", mode="real",
+               run_id="learning-run-1") -> None:
     store.append("online_run", {
-        "run_id": "learning-run-1",
+        "run_id": run_id,
         "mode": mode,
         "split": split,
         "template_version": PROMPT_TEMPLATE_VERSION,
@@ -68,9 +69,10 @@ def _write_case(
     correct: bool,
     source_split: str = "induction",
     delivered_hash: str | None = None,
+    program_id: str = "",
 ) -> None:
     key = f"{parent.skill_id}@{parent.version}"
-    program_id = f"program-{qa_id}"
+    program_id = program_id or f"program-{qa_id}"
     model_answer = "B" if correct else "A"
     store.append("episode_input", EpisodeInputTrace(
         qa_id=qa_id,
@@ -315,3 +317,26 @@ def test_case_schema_requires_explicit_learning_identity(tmp_path, field):
 
     with pytest.raises(ValidationError):
         V11ExperienceCase.model_validate(payload)
+
+
+def test_selects_one_of_repeated_runs_and_joins_shared_program_by_qa(tmp_path):
+    parent = _parent()
+    root = TraceStore(tmp_path)
+    for run_id in ("first", "second"):
+        store = root.bind(run_id=run_id)
+        _write_run(store, run_id=run_id)
+        for qa_id in ("same-qa", "other-qa"):
+            _write_case(
+                store.bind(qa_id=qa_id), parent, qa_id=qa_id,
+                correct=run_id == "second", program_id="shared-source-hash")
+    with pytest.raises(V11ExperienceBuildError, match="source_run_ref"):
+        build_v11_experience_bundle_from_trace_store(
+            tmp_path, campaign_id="c", parent_snapshot_id="S0-v11-learning",
+            parent=parent)
+    bundle = build_v11_experience_bundle_from_trace_store(
+        tmp_path, campaign_id="c", parent_snapshot_id="S0-v11-learning",
+        parent=parent, source_run_ref="online_run:second")
+    assert len(bundle.cases) == 2
+    assert all(case.score == 1 for case in bundle.cases)
+    assert {case.tool_observations[0]["result_id"] for case in bundle.cases} == {
+        "result-same-qa", "result-other-qa"}

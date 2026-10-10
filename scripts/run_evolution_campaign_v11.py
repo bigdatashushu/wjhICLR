@@ -288,7 +288,6 @@ def main(argv: list[str] | None = None) -> int:
             baseline="C1_tools_program",
             seed=args.seed,
             skills=[],
-            memory_dir="",
             vllm_endpoints=endpoints,
             vllm_model=args.vllm_model or model["model"],
             max_images=int(model.get("n_frames", 32)),

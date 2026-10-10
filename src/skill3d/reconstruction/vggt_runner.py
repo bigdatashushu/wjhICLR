@@ -27,6 +27,7 @@ v6 三层（§3.1）：
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -57,7 +58,7 @@ def run_vggt(
     frames: Sequence[np.ndarray],
     scene_name: str,
     output_dir: str | Path,
-    checkpoint: Optional[str] = VGGT_CHECKPOINT,
+    checkpoint: Optional[str] = None,
     objects: Optional[Sequence[object]] = None,
     *,
     frame_set: Optional[object] = None,
@@ -80,7 +81,8 @@ def run_vggt(
     except Exception as e:  # noqa: BLE001
         raise ReconstructionFailed(f"vggt/torch 不可用: {e}") from e
 
-    if checkpoint is None:
+    checkpoint = checkpoint or os.environ.get("SKILL3D_VGGT_CHECKPOINT") or VGGT_CHECKPOINT
+    if not checkpoint:
         raise ReconstructionFailed("VGGT checkpoint 未配置")
 
     out = Path(output_dir)

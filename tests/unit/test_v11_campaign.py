@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -596,3 +597,70 @@ def test_v11_campaign_recovers_publication_without_republishing(
 
     assert result.status == "promoted"
     assert second.calls["post"] == 1
+
+
+def test_post_publish_exception_rolls_back_candidate(tmp_path):
+    _parent, snapshot = _activate_parent(tmp_path / "library")
+    campaign = _runner(tmp_path, _Callbacks())
+
+    def unavailable(**kwargs):
+        raise RuntimeError("post service unavailable")
+
+    campaign.post_publish_verifier = unavailable
+    with pytest.raises(V11CampaignBlocked, match="post service unavailable"):
+        campaign.run()
+    assert _pointer(tmp_path / "library")["snapshot_id"] == snapshot["snapshot_id"]
+    assert campaign.checkpoint.status == "blocked"
+    assert campaign._receipt_path("rollback").is_file()
+
+
+@pytest.mark.parametrize("change", [
+    {"seed": 999}, {"max_revision_attempts": 4},
+    {"model_config_sha256": "9" * 64},
+    {"solver_config_sha256": "9" * 64},
+])
+def test_resume_rejects_changed_contract_even_after_completion(tmp_path, change):
+    _activate_parent(tmp_path / "library")
+    campaign = _runner(tmp_path, _Callbacks(candidate_score=0.5))
+    assert campaign.run().status == "rejected"
+    resumed = _runner(tmp_path, _Callbacks())
+    resumed.cfg = replace(resumed.cfg, **change)
+    with pytest.raises(V11CampaignBlocked, match="contract"):
+        resumed.run()
+
+
+def test_revision_must_keep_stable_name(tmp_path):
+    parent, _ = _activate_parent(tmp_path / "library")
+    renamed = _candidate_md(parent).replace(
+        "name: rank-object-distances", "name: new-distance-method")
+    callbacks = _Callbacks(
+        candidate_score=0.5, revision_values=[renamed, _candidate_md(parent)])
+    campaign = _runner(tmp_path, callbacks)
+    assert campaign.run().revision_attempt == 2
+    first = json.loads(campaign._receipt_path("static_validation_01").read_bytes())
+    assert first["checks"]["stable_name"] is False
+
+
+def test_revision_format_error_consumes_one_attempt_and_keeps_response_ref(tmp_path):
+    from skill3d.evolution.campaign_v11 import V11RevisionFormatError
+
+    _activate_parent(tmp_path / "library")
+    callbacks = _Callbacks(candidate_score=0.5)
+    campaign = _runner(tmp_path, callbacks)
+    calls = []
+
+    def revise(**kwargs):
+        calls.append(kwargs["attempt"])
+        if kwargs["attempt"] == 1:
+            raise V11RevisionFormatError(
+                "invalid JSON", source_run_ref="revision:captured-response")
+        return callbacks.revise(**kwargs)
+
+    campaign.reviser = revise
+    checkpoint = campaign.run()
+    assert checkpoint.status == "rejected"
+    assert checkpoint.revision_attempt == 2
+    assert calls == [1, 2]
+    assert callbacks.calls["evaluate"] == 1
+    proposal = campaign._receipt_path("revision_attempt_01").read_text()
+    assert "revision:captured-response" in proposal

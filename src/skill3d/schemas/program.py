@@ -20,6 +20,8 @@ class ASTCheckResult(Spec):
 
 
 class ProgramExecutionTrace(Spec):
+    run_id: str = ""
+    qa_id: str = ""
     program_id: str
     calls: list[ToolCall]
     results: list[ToolResult]

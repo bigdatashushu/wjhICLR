@@ -225,9 +225,32 @@ def build_v11_experience_bundle_from_trace_store(
     access_started_at = utcnow_iso()
     root = Path(trace_dir)
     online_rows = _read_jsonl(root / "online_run.jsonl")
-    if len(online_rows) != 1:
-        raise V11ExperienceBuildError("online_run 必须恰有一行")
-    online = online_rows[0]
+    runs = _index(online_rows, key="run_id", topic="online_run")
+    requested_id = source_run_ref.removeprefix("online_run:") if (
+        source_run_ref.startswith("online_run:")) else ""
+    if requested_id:
+        if requested_id not in runs:
+            raise V11ExperienceBuildError(f"找不到指定 online_run: {requested_id}")
+        online = runs[requested_id]
+    elif len(runs) == 1:
+        online = next(iter(runs.values()))
+    else:
+        raise V11ExperienceBuildError("多个 online_run 必须用 source_run_ref 指定 run_id")
+    if online.get("status") == "incomplete" or online.get("n_unavailable", 0):
+        raise V11ExperienceBuildError("未完成的在线 run 不可用作修订经验")
+    selected_run_id = str(online["run_id"])
+
+    def read_topic(topic: str, *, required: bool = True) -> list[dict]:
+        rows = _read_jsonl(root / f"{topic}.jsonl", required=required)
+        bound = [row for row in rows if row.get("run_id")]
+        if bound:
+            if len(bound) != len(rows):
+                raise V11ExperienceBuildError(f"{topic} 混有缺少 run_id 的行")
+            return [row for row in bound if row["run_id"] == selected_run_id]
+        if len(runs) != 1 and rows:
+            raise V11ExperienceBuildError(f"{topic} 无法按 run_id 关联")
+        return rows  # Single legacy run, never silently assign it to another run.
+
     if str(online.get("split") or "") != "induction":
         raise V11ExperienceBuildError("v11 Skill 修订只接受 split=induction")
     if require_real and str(online.get("mode") or "") != "real":
@@ -252,30 +275,31 @@ def build_v11_experience_bundle_from_trace_store(
         raise V11ExperienceBuildError("缺少 source_run_ref/run_id")
 
     inputs = _index(
-        _read_jsonl(root / "episode_input.jsonl"),
+        read_topic("episode_input"),
         key="qa_id",
         topic="episode_input",
     )
     traces = _index(
-        _read_jsonl(root / "episode_trace.jsonl"),
+        read_topic("episode_trace"),
         key="qa_id",
         topic="episode_trace",
     )
     evaluations = _index(
-        _read_jsonl(root / "evaluation_result.jsonl"),
+        read_topic("evaluation_result"),
         key="qa_id",
         topic="evaluation_result",
     )
     programs = _index(
-        _read_jsonl(root / "episode_program.jsonl", required=False),
+        read_topic("episode_program", required=False),
         key="qa_id",
         topic="episode_program",
     )
-    program_traces = _index(
-        _read_jsonl(root / "program_trace.jsonl", required=False),
-        key="program_id",
-        topic="program_trace",
-    )
+    program_traces: dict[tuple[str, str], dict] = {}
+    for row in read_topic("program_trace", required=False):
+        key = (str(row.get("qa_id") or ""), str(row.get("program_id") or ""))
+        if not key[1] or key in program_traces:
+            raise V11ExperienceBuildError(f"program_trace 身份缺失或重复: {key}")
+        program_traces[key] = row
     if set(inputs) != set(traces) or set(inputs) != set(evaluations):
         raise V11ExperienceBuildError(
             "episode_input、episode_trace、evaluation_result 的 qa_id 集合不一致"
@@ -378,7 +402,8 @@ def build_v11_experience_bundle_from_trace_store(
             response_text = response_texts[-1]
             program_id = str(program_row.get("program_id") or "")
             if program_id:
-                raw_program_trace = program_traces.get(program_id)
+                raw_program_trace = program_traces.get(
+                    (qa_id, program_id), program_traces.get(("", program_id)))
                 if raw_program_trace is None:
                     raise V11ExperienceBuildError(
                         f"{qa_id}: 缺少 program_trace:{program_id}"

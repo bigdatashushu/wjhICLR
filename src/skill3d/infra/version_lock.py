@@ -1,4 +1,4 @@
-"""M21 版本锁定：pip freeze hash + docker digest + checkpoint sha256 + git HEAD → RunManifest。
+"""运行身份：pip freeze hash + checkpoint sha256 + git HEAD → RunManifest。
 
 subprocess 真实实现；单项失败记 "unknown"（不阻断）。
 """
@@ -28,11 +28,6 @@ def pip_freeze_hash() -> str:
     if out == "unknown":
         return "unknown"
     return hashlib.sha256(out.encode("utf-8")).hexdigest()
-
-
-def docker_digest(image: str) -> str:
-    """docker image inspect 取 digest；docker 不可用 → "unknown"。"""
-    return _run_cmd(["docker", "image", "inspect", "--format", "{{.Id}}", image])
 
 
 def checkpoint_sha256(path: str) -> str:
@@ -83,18 +78,15 @@ def inference_env_versions() -> dict:
     return out
 
 
-def build_run_manifest(docker_image: str, checkpoint_path: str,
+def build_run_manifest(checkpoint_path: str,
                        config_path: str, repo_dir: str,
-                       mlflow_run_id: str = "unknown",
                        *, split_version: str = "", seed: int | None = None,
                        split_config_path: str = "") -> RunManifest:
     manifest = RunManifest(
         code_commit=git_head(repo_dir),
-        docker_digest=docker_digest(docker_image),
         checkpoint_sha256=checkpoint_sha256(checkpoint_path),
         pip_freeze_hash=pip_freeze_hash(),
         config_hash=config_hash(config_path),
-        mlflow_run_id=mlflow_run_id,
     )
     # §16.4：split version / split 配置哈希 / seed / 推理环境版本一并落盘
     return manifest.model_copy(update={

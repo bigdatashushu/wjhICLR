@@ -205,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--video-root", default="")
     p.add_argument("--recon-dir", default="")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--seed", type=int, default=None)
     p.add_argument("--question-types", default="",
                    help="逗号分隔的题型子集（默认 8 题型；用于按任务分层重建/子集实验）")
     p.add_argument("--episodes-per-scene", type=int, default=1,
@@ -244,6 +245,7 @@ def _maybe_moge2(args):
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = load_config(args.config)
+    args.seed = int(cfg.get("seed", 0) if args.seed is None else args.seed)
     paths = paths_from(cfg)
     recon_dir = args.recon_dir or paths.reconstructions
     gpus = [int(g) for g in args.gpus.split(",") if g.strip()] or [0]
@@ -280,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
                     datasets=dsets or None,
                     max_per_scene=int(args.episodes_per_scene),
                     stratified_per_task=int(args.sampling_per_task),
+                    seed=args.seed, sampling_seed=args.seed,
                 )
         except EpisodeSourceError as exc:
             print(f"[错误] split={split} 数据源不可用: {exc}", file=sys.stderr)
@@ -333,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": "6.0",
         "quality_metric_version": "v6-m4-main-gate",
         "n_frames": args.n_frames,
+        "seed": args.seed,
         "dataset_scope": [d.strip() for d in args.datasets.split(",") if d.strip()] or "all",
         "sampling_per_task": int(args.sampling_per_task),
         "sampling_strategy": ("first_n_per_task_by_meta_order"

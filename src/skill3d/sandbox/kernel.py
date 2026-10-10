@@ -1,10 +1,10 @@
 """持久 kernel（§4 M10）：code-as-action，跨 cell 变量存活。
 
-MVP 为 in-process RestrictedNamespaceKernel（exec 于受控 namespace）；
-Docker 隔离由 docker_manager 负责（AST 检查不能替代容器隔离，§4 M9 字段 12）。
+使用 in-process RestrictedNamespaceKernel，在题级受控 namespace 中执行；
+结合 AST 白名单和 Tool 授权实现 v11 的程序执行与分支隔离。
 
 注入保留名：frames / scene / tools / show / ReturnAnswer。
-cell 超时与错误捕获；两级兜底（no-tool CoT → 正则抽取）留钩子。
+提供 cell 超时、错误捕获和可撤销的答案提交。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import inspect
 import io
 import json
 import signal
+import time
 import types
 import uuid
 from dataclasses import dataclass, field
@@ -29,6 +30,7 @@ from skill3d.tools.contract import (
     ToolContractError,
 )
 from skill3d.sandbox.ast_guard import normalize_program_source
+from skill3d.sandbox.safe_runtime import frozen_frames, safe_builtins
 from skill3d.tools.contract import authorize_tool_call
 from skill3d.tools.mock_switch import request_key
 from skill3d.tools.registry import ToolRegistry
@@ -153,8 +155,12 @@ def _normalize_answer_value(value: Any) -> str:
     return str(value)
 
 
+class _CellTimeout(BaseException):
+    """Generated `except Exception` must not suppress the host time limit."""
+
+
 class _Timeout:
-    """SIGALRM cell 超时（仅主线程可用；非主线程静默退化为无超时）。"""
+    """Protect the complete cell, including the host-invoked solve entry."""
 
     def __init__(self, seconds: int) -> None:
         self.seconds = seconds
@@ -162,21 +168,28 @@ class _Timeout:
 
     def __enter__(self):
         try:
+            self._previous_handler = signal.getsignal(signal.SIGALRM)
+            self._started = time.monotonic()
             signal.signal(signal.SIGALRM, self._raise)
-            signal.alarm(self.seconds)
+            self._previous_timer = signal.setitimer(signal.ITIMER_REAL, self.seconds)
             self._active = True
-        except (ValueError, AttributeError):
-            self._active = False  # 非主线程或无 SIGALRM 平台
+        except (ValueError, AttributeError) as exc:
+            raise RuntimeError("cell timeout requires a main-thread SIGALRM runtime") from exc
         return self
 
     def __exit__(self, *exc):
         if self._active:
-            signal.alarm(0)
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, self._previous_handler)
+            remaining, interval = self._previous_timer
+            if remaining:
+                remaining = max(0.000001, remaining - (time.monotonic() - self._started))
+            signal.setitimer(signal.ITIMER_REAL, remaining, interval)
         return False
 
     @staticmethod
     def _raise(signum, frame):
-        raise TimeoutError("cell 执行超时")
+        raise _CellTimeout("cell 执行超时")
 
 
 @dataclass
@@ -285,6 +298,31 @@ class QuestionContextView:
     available_artifacts: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class SolverContext:
+    scene: QuestionContextView
+    tools: object
+    frames: tuple
+
+
+class ToolNamespace:
+    """No writable attributes shared across solver rounds."""
+
+    __slots__ = ("_functions",)
+
+    def __init__(self, functions):
+        object.__setattr__(self, "_functions", functions)
+
+    def __getattr__(self, name):
+        try:
+            return object.__getattribute__(self, "_functions")[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def __setattr__(self, name, value):
+        raise TypeError("tool namespace is read-only")
+
+
 def _question_context_view(scene: SceneHandle) -> QuestionContextView:
     return QuestionContextView(
         frame=str(scene.frame),
@@ -344,24 +382,27 @@ class RestrictedNamespaceKernel:
         self.answer_untrusted: bool = False
 
         # tools 命名空间：tools.<name>(**args) → 经 REGISTRY.call_tool
-        tools_ns = types.SimpleNamespace()
-        for name in tool_registry.names():
-            tools_ns.__dict__[name] = self._make_tool_fn(name)
+        self._tool_functions = {
+            name: self._make_tool_fn(name) for name in tool_registry.names()
+        }
+        tools_ns = ToolNamespace(self._tool_functions)
 
         public_scene = _question_context_view(scene)
         self._ns: dict[str, Any] = {
-            "frames": frames or [],
+            "__builtins__": safe_builtins(),
+            "frames": frozen_frames(frames or []),
             "scene": public_scene,
             "tools": tools_ns,
             "show": self._show,
-            "ReturnAnswer": self.answer_slot,
+            "ReturnAnswer": lambda value: self.answer_slot(value),
             # v9 §10.1：完整答案载荷构造器（`ReturnAnswer(AnswerPayload(...))`）
-            "AnswerPayload": AnswerPayload,
-            "YieldObservations": self.yield_slot,
+            "AnswerPayload": lambda *args, **kwargs: AnswerPayload(*args, **kwargs),
+            "YieldObservations": lambda result_ids=None, reason="": self.yield_slot(
+                result_ids, reason),
         }
         # 同步注入 Tool 顶层名（program 可直接写 euclidean_distance(...)）
         for name in tool_registry.names():
-            self._ns[name] = tools_ns.__dict__[name]
+            self._ns[name] = self._tool_functions[name]
 
     def _invoke_entry(self) -> Optional[str]:
         """调用生成程序的入口 `def solve(ctx)`（v7 §10.2：**host 负责调用**）。
@@ -382,7 +423,7 @@ class RestrictedNamespaceKernel:
         entry = self._ns.get("solve")
         if not callable(entry):
             return None
-        ctx = types.SimpleNamespace(
+        ctx = SolverContext(
             scene=self._ns["scene"],
             tools=self._ns.get("tools"),
             frames=self._ns.get("frames", []),
@@ -489,6 +530,14 @@ class RestrictedNamespaceKernel:
                 # 执行期 fail-closed：产物缺失在调用实现前就抛（硬约束 23）
                 self._record_failed_call(name, call_args, exc)
                 raise
+            # 请求摘要标识输入；结果 ID 标识本 episode 中的一次发生。
+            result_id = _failed_result_id(result.request_digest, len(self.tool_results))
+            authorization = dict(result.authorization or {})
+            if authorization:
+                authorization["result_id"] = result_id
+            result = result.model_copy(update={
+                "result_id": result_id, "authorization": authorization,
+            })
             # 记录到 ProgramExecutionTrace（§5.4）：调用与结果成对入库
             self.tool_calls.append(
                 ToolCall(tool=name, args=call_args, call_id=self._call_id_factory())
@@ -559,11 +608,17 @@ class RestrictedNamespaceKernel:
         try:
             with contextlib.redirect_stdout(buf), _Timeout(self.cell_timeout_s):
                 exec(_compile_program(code), self._ns)
+                if self.answer_slot.given:
+                    terminated = "answer"
+                elif self.yield_slot.given:
+                    terminated = "yield"
+                else:
+                    terminated = self._invoke_entry()
         except AnswerTerminate:
             terminated = "answer"
         except YieldTerminate:
             terminated = "yield"
-        except TimeoutError:
+        except (_CellTimeout, TimeoutError):
             error, error_code = "cell 执行超时", "timeout"
         except SyntaxError:
             error, error_code = "语法错误", "violation_syntax"
@@ -576,24 +631,6 @@ class RestrictedNamespaceKernel:
             self.answer_untrusted = True
         except Exception as exc:
             error, error_code = f"{type(exc).__name__}: {exc}", "violation_runtime"
-        else:
-            # 未抛终结信号但槽已写入（生成程序吞掉了 BaseException）→ 仍按已终结处理，
-            # 保证"提交过的答案不会丢"，也保证不会重复提交第二次。
-            if self.answer_slot.given:
-                terminated = "answer"
-            elif self.yield_slot.given:
-                terminated = "yield"
-            else:
-                # v7 §10.2：host 负责调用 `def solve(ctx)` 入口（模型常只定义不调用）
-                try:
-                    terminated = self._invoke_entry()
-                except ToolContractError as exc:
-                    error = f"{type(exc).__name__}: {exc}"
-                    error_code = "tool_contract"
-                    self.answer_untrusted = True
-                except Exception as exc:      # noqa: BLE001
-                    error = f"{type(exc).__name__}: {exc}"
-                    error_code = "violation_runtime"
         new_vars = sorted(set(self._ns.keys()) - before)
         return CellResult(
             stdout_tail=buf.getvalue()[-4096:],
@@ -631,14 +668,13 @@ class RestrictedNamespaceKernel:
         runner 在 yield 路径上试图保留账本的写法被下一次 reset 立刻抹掉。
         逐轮视图由 `cell_calls` / `cell_results` 提供。
         """
-        tools_ns = self._ns["tools"]
         keep = ("frames", "scene", "tools", "show", "ReturnAnswer",
-                "YieldObservations", "AnswerPayload")
+                "YieldObservations", "AnswerPayload", "__builtins__")
         preserved = {k: self._ns[k] for k in keep if k in self._ns}
         self._ns.clear()
         self._ns.update(preserved)
         for name in self._registry.names():
-            self._ns[name] = tools_ns.__dict__[name]
+            self._ns[name] = self._tool_functions[name]
         self.answer_slot.answer = None
         self.answer_slot.given = False
         self.answer_slot.payload = None

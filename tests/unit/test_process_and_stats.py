@@ -9,21 +9,6 @@ import numpy as np
 import pytest
 
 from skill3d.evaluation.multi_seed_aggregator import (
-    MIN_SEEDS_FOR_MAIN_TABLE,
-    SeedAggregate,
-    aggregate_metric,
-    aggregate_runs,
-    bonferroni,
-    check_seed_count,
-    cliffs_delta,
-    cohens_d,
-    format_paper_table,
-    friedman_test,
-    nemenyi_posthoc,
-    spearman_correlation,
-    two_sample_test,
-)
-from skill3d.evaluation.multi_seed_aggregator import (
     format_main_table_row,
     macro_average_over_tasks,
 )
@@ -81,14 +66,6 @@ def _outcome(final_state="answer", correct=True, is_mca=True, mra=None,
                              steps=steps, wallclock_s=0.2),
         verify=(_Verify(passed=verify) if verify is not None else None),
     )
-
-
-@dataclass
-class _Run:
-    accuracy: float
-    mra: float
-    n_episodes: int = 10
-    per_task: dict = field(default_factory=dict)
 
 
 # ------------------------------------------------------------------ G-65 ----
@@ -197,115 +174,6 @@ def test_write_process_metrics_csv(tmp_path):
 
 
 # ------------------------------------------------------------------ G-66 ----
-
-def test_aggregate_metric_mean_std_ci():
-    agg = aggregate_metric("accuracy", [0.40, 0.45, 0.50])
-    assert agg.mean == pytest.approx(0.45)
-    assert agg.std == pytest.approx(0.05, abs=1e-6)
-    assert agg.n_seeds == 3
-    assert agg.ci95_lo < agg.mean < agg.ci95_hi
-    assert agg.as_mean_std() == "0.4500 ± 0.0500"
-    assert aggregate_metric("x", []).n_seeds == 0
-
-
-def test_seed_count_warning():
-    assert check_seed_count(3) is None
-    assert "不满足论文主表" in check_seed_count(2)
-    assert MIN_SEEDS_FOR_MAIN_TABLE == 3
-
-
-def test_aggregate_runs_including_per_task():
-    runs = [
-        _Run(0.4, 0.30, per_task={"object_counting": {"accuracy": 0.5, "mra": None}}),
-        _Run(0.5, 0.32, per_task={"object_counting": {"accuracy": 0.6, "mra": None}}),
-        _Run(0.6, 0.34, per_task={"object_counting": {"accuracy": 0.7, "mra": None}}),
-    ]
-    agg = aggregate_runs(runs)
-    assert agg["accuracy"].mean == pytest.approx(0.5)
-    assert agg["mra"].mean == pytest.approx(0.32)
-    assert agg["task:object_counting:accuracy"].mean == pytest.approx(0.6)
-    assert "task:object_counting:mra" not in agg
-    assert aggregate_runs([]) == {}
-
-
-def test_cohens_d_and_cliffs_delta():
-    a, b = [1.0, 1.1, 0.9], [0.0, 0.1, -0.1]
-    assert cohens_d(a, b) > 5            # 分离很大
-    assert cliffs_delta(a, b) == pytest.approx(1.0)
-    assert cliffs_delta(b, a) == pytest.approx(-1.0)
-    assert cohens_d([1.0], [0.0]) is None
-    assert cliffs_delta([], [1.0]) is None
-
-
-def test_two_sample_test_detects_clear_separation():
-    a = [0.60, 0.62, 0.58, 0.61]
-    b = [0.40, 0.42, 0.38, 0.41]
-    res = two_sample_test(a, b)
-    assert res["t_p"] is not None and res["t_p"] < 0.05
-    assert res["mannwhitney_p"] is not None and res["mannwhitney_p"] <= 0.08
-    assert res["cliffs_delta"] == pytest.approx(1.0)
-    assert res["n_a"] == 4 and res["n_b"] == 4
-
-
-def test_two_sample_test_identical_groups_not_significant():
-    """完全相同的两组 → 不显著（p 值随 scipy 版本在 None/1.0 间变化，只断言实质）。"""
-    a = [0.5, 0.5, 0.5, 0.5]
-    res = two_sample_test(a, a)
-    assert res["t_p"] is None or res["t_p"] > 0.05     # 不显著（零方差退化或 p=1.0）
-    assert res["cliffs_delta"] == pytest.approx(0.0)
-
-
-def test_two_sample_test_empty_is_safe():
-    res = two_sample_test([], [1.0])
-    assert res["t_p"] is None and res["n_a"] == 0
-
-
-def test_friedman_and_nemenyi_on_synthetic_blocks():
-    rng = np.random.default_rng(0)
-    base = rng.normal(0.4, 0.02, size=8)
-    groups = [base, base + 0.10, base + 0.02]      # 方法 2 明显最好
-    res = friedman_test(groups)
-    assert res["n_methods"] == 3 and res["n_blocks"] == 8
-    assert res["p"] is not None and res["p"] < 0.05
-    post = nemenyi_posthoc(groups)
-    assert len(post) == 3                           # C(3,2)
-    sig = [c for c in post if c["significant"]]
-    assert any({c["i"], c["j"]} == {0, 1} for c in sig)
-
-
-def test_friedman_requires_valid_shape():
-    assert friedman_test([[1.0]])["p"] is None
-    assert friedman_test([[1.0, 2.0], [1.0]])["p"] is None   # 长度不等
-
-
-def test_spearman_correlation():
-    x = [1.0, 2.0, 3.0, 4.0, 5.0]
-    y = [2.0, 4.0, 6.0, 8.0, 10.0]
-    res = spearman_correlation(x, y)
-    assert res["rho"] == pytest.approx(1.0)
-    assert res["n"] == 5
-    neg = spearman_correlation(x, y[::-1])
-    assert neg["rho"] == pytest.approx(-1.0)
-    assert spearman_correlation([1.0, 2.0], [1.0, 2.0])["rho"] is None   # n<3
-
-
-def test_bonferroni_correction():
-    assert bonferroni([0.001, 0.04, 0.5]) == [True, False, False]   # α/m = 0.05/3
-    assert bonferroni([]) == []
-    assert bonferroni([0.01]) == [True]
-
-
-def test_format_paper_table_warns_on_few_seeds():
-    agg = {"accuracy": aggregate_metric("accuracy", [0.4, 0.5]),
-           "mra": aggregate_metric("mra", [0.3, 0.32]),
-           "task:object_counting:accuracy": aggregate_metric("t", [0.5, 0.6])}
-    text = format_paper_table(agg)
-    assert "accuracy" in text and "object_counting" in text
-    assert "不满足论文主表" in text
-    ok = format_paper_table({"accuracy": aggregate_metric("accuracy",
-                                                        [0.4, 0.45, 0.5])})
-    assert "不满足论文主表" not in ok
-    assert SeedAggregate("m", [0.5]).as_mean_std() == "0.5000 ± 0.0000"
 
 
 # --------------------------------------------------- v3 可靠性指标（D-3/§4 M6）----

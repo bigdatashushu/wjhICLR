@@ -73,6 +73,8 @@ class GeometryIssue(BaseModel):
 class GeometryVerifyResult(BaseModel):
     model_config = ConfigDict(extra="forbid", protected_namespaces=())
 
+    run_id: str = ""
+    qa_id: str = ""
     passed: bool
     checks: dict[str, bool]
     violations: list[str]
@@ -94,8 +96,29 @@ def _iter_tool_values(trace: ProgramExecutionTrace, tool_name: str) -> Iterable[
 
 
 def _finite_number(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and bool(
-        np.isfinite(float(v)))
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return bool(np.isfinite(float(v)))
+    except OverflowError:
+        return False
+
+
+def _valid_json_result(value: str) -> bool:
+    """Successful public ToolResults must carry finite, decodable JSON."""
+    def finite(node: Any) -> bool:
+        if isinstance(node, float):
+            return bool(np.isfinite(node))
+        if isinstance(node, list):
+            return all(finite(item) for item in node)
+        if isinstance(node, dict):
+            return all(finite(item) for item in node.values())
+        return True
+
+    try:
+        return finite(json.loads(value))
+    except (ValueError, TypeError, RecursionError):
+        return False
 
 
 def _world_frame_available(handle: SceneHandle) -> bool:
@@ -125,8 +148,6 @@ def check_no_negative_distance(trace: ProgramExecutionTrace) -> bool:
                  "surface_distance_between_objects", "object_3d_extent",
                  "plane_fit_room_size", "object_distance_m"):
         for v in _iter_tool_values(trace, name):
-            if _finite_number(v) and float(v) < 0:
-                return False
             if isinstance(v, dict):
                 for key in ("distance_metric", "distance_normalized",
                             "surface_distance_metric", "surface_distance_normalized",
@@ -134,8 +155,12 @@ def check_no_negative_distance(trace: ProgramExecutionTrace) -> bool:
                             "extent_metric", "extent_normalized", "extent_longest_metric"):
                     val = v.get(key)
                     values = val if isinstance(val, list) else [val]
-                    if any(_finite_number(x) and float(x) < 0 for x in values):
+                    if any(x is not None and (
+                        not _finite_number(x) or float(x) < 0
+                    ) for x in values):
                         return False
+            elif not _finite_number(v) or float(v) < 0:
+                return False
     return True
 
 
@@ -189,7 +214,8 @@ def check_inside_bbox(
     for r in trace.results:
         if r.tool == "reproject" and "p3d" in r.args:
             p = np.asarray(r.args["p3d"], dtype=np.float64)
-            if p.shape != (3,) or np.any(p < lo) or np.any(p > hi):
+            if p.shape != (3,) or not np.all(np.isfinite(p)) \
+                    or np.any(p < lo) or np.any(p > hi):
                 return False
     return True
 
@@ -230,11 +256,12 @@ def geometry_verify(
     authorized = metric_evidence_authorized(handle)
     wf_ok = _world_frame_available(handle)
     checks = dict.fromkeys((
-        "no_negative_distance", "unit_consistent", "world_frame",
+        "valid_json", "no_negative_distance", "unit_consistent", "world_frame",
         "inside_bbox", "reprojection"), True)
     issues: list[GeometryIssue] = []
     reasons = {
-        "no_negative_distance": "距离、尺寸或面积结果含负值",
+        "valid_json": "成功工具结果不是有限合法 JSON",
+        "no_negative_distance": "距离、尺寸或面积结果含负值或非法数值",
         "unit_consistent": "本题无米制授权，但结果包含绝对单位数值",
         "world_frame": "世界系上方向或手性契约缺失",
         "inside_bbox": "重投影输入点不在场景包围盒内，或世界系契约缺失",
@@ -246,6 +273,7 @@ def geometry_verify(
             continue
         single = trace.model_copy(update={"results": [result]})
         row = {
+            "valid_json": _valid_json_result(result.value),
             "no_negative_distance": check_no_negative_distance(single),
             "unit_consistent": check_unit_consistent(single, handle),
             "world_frame": check_world_frame(single, handle),

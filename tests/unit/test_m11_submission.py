@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from skill3d.online.recovery import collect_validated, invalidate_results
-from skill3d.online.submission import submission_scope
+from skill3d.online.submission import invalid_reference_issues, submission_scope
 from skill3d.sandbox.kernel import AnswerTerminate, RestrictedNamespaceKernel
 from skill3d.schemas import AnswerPayload, ProgramExecutionTrace, ToolResult
 from skill3d.tools import REGISTRY
@@ -101,3 +101,54 @@ def test_local_invalidation_removes_only_the_named_result_from_recovery():
 
     assert invalidate_results(kernel, ["bad"], reason="M11:test") == ["bad"]
     assert [o.result_id for o in collect_validated(kernel)] == ["good"]
+
+
+def test_repeated_tool_requests_have_unique_replayable_occurrence_ids():
+    kernel = RestrictedNamespaceKernel(REGISTRY, _handle(_scene()))
+    result = kernel.run_cell(
+        "euclidean_distance([0,0,0], [1,0,0])\n"
+        "euclidean_distance([0,0,0], [1,0,0])")
+    assert result.error_code is None
+    a, b = kernel.tool_results
+    assert a.request_digest == b.request_digest
+    assert a.result_id != b.result_id
+    assert a.authorization["result_id"] == a.result_id
+    assert b.authorization["result_id"] == b.result_id
+    replay = RestrictedNamespaceKernel(REGISTRY, _handle(_scene()))
+    replay.run_cell(
+        "euclidean_distance([0,0,0], [1,0,0])\n"
+        "euclidean_distance([0,0,0], [1,0,0])")
+    assert [r.result_id for r in replay.tool_results] == [a.result_id, b.result_id]
+
+
+@pytest.mark.parametrize("kind", ["missing", "failed", "invalidated"])
+def test_mixed_submission_rejects_unusable_references(kind):
+    kernel = RestrictedNamespaceKernel(REGISTRY, _handle(_scene()))
+    if kind != "missing":
+        result = _result("reference", 1.0)
+        if kind == "failed":
+            result = result.model_copy(update={"status": "error", "error": "failure"})
+        else:
+            result = result.model_copy(update={"invalidated_by": ["M11"]})
+        kernel.tool_results.append(result)
+    with pytest.raises(AnswerTerminate):
+        kernel.answer_slot(AnswerPayload(
+            value=1, unit="m", basis="mixed", used_result_ids=["reference"]))
+    issues = invalid_reference_issues(kernel)
+    assert len(issues) == 1
+    assert issues[0].check == f"{kind}_reference"
+
+
+@pytest.mark.parametrize("raw", [
+    "{broken", "NaN", '{"distance_normalized": NaN}',
+    '{"distance_normalized": "unknown"}',
+])
+def test_m11_rejects_malformed_or_nonfinite_measurements(raw):
+    result = _result("bad", None, tool="robust_distance")
+    result.value = raw
+    trace = ProgramExecutionTrace(
+        program_id="p", calls=[], results=[result], stdout_tail="",
+        error_code=None, steps=1, wallclock_s=0.0)
+    verified = geometry_verify(trace, _VerifierHandle())
+    assert not verified.passed
+    assert {issue.result_id for issue in verified.issues} == {"bad"}

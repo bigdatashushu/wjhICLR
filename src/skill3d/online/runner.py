@@ -23,6 +23,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,10 +34,6 @@ import numpy as np
 from skill3d.evaluation.accuracy import extract_option_letter, mca_correct
 from skill3d.evaluation.mra import mra_single, parse_numeric_answer
 from skill3d.fsm.online_fsm import OnlineFSM, OnlineState
-from skill3d.memory.online_memory import (
-    EpisodicMemory,
-    MemoryWriteForbiddenError,
-)
 from skill3d.gates.input_gate import annotate_frames, input_gate
 from skill3d.reconstruction.vggt_runner import ReconstructionFailed, reconstruct
 from skill3d.reconstruction_gate.quality_metrics import (
@@ -138,24 +135,25 @@ class OnlineRunConfig:
     """在线链运行配置（阈值/路径一律来自 configs/*.yaml，见 online/config.py）。"""
 
     mode: str = "real"                      # real | mock_light
-    baseline: str = "C1_tools_program"      # C0_direct_vlm | C1_tools_program（§16.1）
+    baseline: str = "C1_tools_program"      # 固定的 v11 程序求解入口
     seed: int = 0
     deterministic_replay: bool = False      # 同 seed 字节级一致（时间/id 取确定性占位）
     active_snapshot_ref: str = "genesis"
     skills: list[RuntimeSkillSpec] = field(default_factory=list)
-    scene_quality: Optional[float] = None
     max_regen: int = 3                      # TODO_CALIBRATE（configs/config.yaml）
     # v9 §5.1：M2 质量诊断默认关闭；仅独立诊断实验开启（开启后 quality_weight 参与
     # 合成质量，会改变 scene_route —— 那是诊断实验的自变量，不是默认口径）
     input_diagnostics: bool = False
     cell_timeout_s: int = 30                # TODO_CALIBRATE
-    use_docker: bool = False                # MVP 用 in-process kernel（§4 M10 字段 12）
     trace_dir: str = "data/traces"
-    memory_dir: str = "data/memory_episodic"   # G-26：在线 episodic 记忆（JSONL）
     recon_dir: str = "data/reconstructions"
     work_dir: str = "data/reconstructions/mock_light"
     vllm_endpoints: list[str] = field(default_factory=list)
     vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+    model_weights_sha256: str = field(
+        default_factory=lambda: os.environ.get("SKILL3D_MODEL_WEIGHTS_SHA256", ""))
+    environment_sha256: str = field(
+        default_factory=lambda: os.environ.get("SKILL3D_ENVIRONMENT_SHA256", ""))
     recon_method: str = "vggt"              # v6 只允许 vggt（§5.2）
     # v6 D1/D2：零样本度量深度模型（首个 PoC = MoGe-2）。
     # 默认 None → 不跑融合，artifact 记 scale_fusion_status="not_run"、metric_scale=None。
@@ -191,6 +189,13 @@ class OnlineRunConfig:
     # 该模式只能用于候选效果评测（不得用于 learning 经验采集 / 发布后运行 / 最终成绩）。
     evaluation_binding: Optional[object] = None
     def __post_init__(self) -> None:
+        if self.mode not in {"real", "mock_light"}:
+            raise ValueError("mode 只支持 real 或 mock_light")
+        for value in (self.model_weights_sha256, self.environment_sha256):
+            if value and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value)):
+                raise ValueError("模型/环境身份必须是 SHA256")
+        if self.baseline != "C1_tools_program":
+            raise ValueError("当前在线入口只支持 C1_tools_program")
         legacy = [type(skill).__name__ for skill in self.skills
                   if not isinstance(skill, SkillSpecV11)]
         if legacy:
@@ -274,7 +279,6 @@ class EpisodeOutcome:
     # `room_size_estimation` medium 档的三态平面质量输入（TODO_CALIBRATE：阈值未标定）。
     # None = 证据缺失 → fail-closed 不授权（不得默认放行）。
     plane_quality_ok: Optional[bool] = None
-    direct_answer: Optional[str] = None     # C0 基线：答案不经沙箱，生成阶段即产出
     # 答案来源（v6 §5.3 四值）：tool_program / direct_vlm_routed / abstain / tool_contract
     answer_source: str = ""
     # v9 §10.1：规范 episode 终态（answered/input_error/run_error），由 final_state 显式映射
@@ -363,13 +367,12 @@ class FixedSkillInjectionError(RuntimeError):
 
 @dataclass
 class _SynthResult:
-    """M8 产出。direct_answer 仅 C0（无 program）时非空。"""
+    """M8 program generation result."""
     program: Optional[EpisodeProgram]
     # §19.3 六类 + `mock_stub`：vllm_ok | vllm_parse_error | vllm_service_error |
     # m8_parse_recovered | direct_answer_fallback | partial_tool_recovery | mock_stub
     source: str
     note: str
-    direct_answer: Optional[str] = None
     response_text: str = ""  # 模型原始回复；不得用解析后的 program_source 回填
     prompt: str = ""        # M8 文本 prompt（错误归因用；图像不入日志）
     # HC26：实际送进模型的多模态图像数（必须等于统一 FrameSet 帧数；0 表示纯文本，
@@ -712,7 +715,6 @@ def _hit_from_decision(skill: SkillSpecV11, decision) -> RetrievedSkill:
 
 def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: EpisodeOutcome,
                           *, trigger: str = "initial",
-                          scene_quality: Optional[float] = None,
                           llm=None) -> list[RuntimeSkillSpec]:
     """§13.5/§13.6：检索一次并把**完整记录**落进 outcome；返回可用 SkillSpec 列表。
 
@@ -731,7 +733,6 @@ def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: Episode
     retrieved, record = retrieve_ex(
         episode.question, scene, cfg.skills,  # type: ignore[arg-type]
         question_type=episode.question_type,
-        scene_quality=scene_quality,
         policy=cfg.retrieval_policy,
         trigger=trigger,
         retrieval_index=index,
@@ -1019,7 +1020,6 @@ def run_episode(
     geometry: Optional[synth.SyntheticGeometry] = None,
     trace_store: Optional[TraceStore] = None,
     llm=None,
-    episodic: Optional[EpisodicMemory] = None,
     prepared_binding: Optional[PreparedObjectBinding] = None,
     input_error: Optional[InputErrorRecord] = None,
 ) -> EpisodeOutcome:
@@ -1076,7 +1076,7 @@ def run_episode(
     states.append(fsm.state.value)
     if fsm.terminated:
         return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
-                     episodic=episodic)
+                     )
 
     cls: Optional[TaskClassification] = None
     scene: Optional[SceneState] = None
@@ -1087,7 +1087,6 @@ def run_episode(
     program: Optional[EpisodeProgram] = None
     program_trace: Optional[ProgramExecutionTrace] = None
     kernel: Optional[RestrictedNamespaceKernel] = None
-    direct_answer: Optional[str] = None
     art = None
 
     # ---------------- M2 INPUT_GATE（被动观测，硬约束 21）----------------
@@ -1121,7 +1120,6 @@ def run_episode(
             notes.append("M2 输入合法性 hard fail → input_error（§4 M2 字段 9；"
                          f"hard_fail_frames={verdict.hard_fail_frame_ids[:5]}）")
             return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
-                     episodic=episodic,
                              verdict=verdict)
 
     # ---------------- M3 RECONSTRUCT ----------------
@@ -1136,12 +1134,7 @@ def run_episode(
             art = load_artifact_v5(cfg.reuse_artifact)
             art_path = cfg.reuse_artifact
             notes.append(f"M3 复用既有 artifact（A/B 同源，硬约束 18）: {cfg.reuse_artifact}")
-            if episode.frame_set is not None and art.frame_set_hash \
-                    and art.frame_set_hash != episode.frame_set.frame_set_hash:
-                notes.append(
-                    f"[warn] 复用 artifact 的 frame_set_hash={art.frame_set_hash[:12]} 与 "
-                    f"episode={episode.frame_set.frame_set_hash[:12]} 不一致"
-                    "（硬约束 21：禁止双帧集）")
+            _validate_artifact_identity(art, episode, pixels)
             fsm.step("done")
         elif cfg.mode == "real":
             # 方案 X（§2.2 / §4 M4）：P1 已把 artifact（含实算 quality）落盘时，
@@ -1153,15 +1146,11 @@ def run_episode(
                     from skill3d.legacy.readers import load_artifact_v5
 
                     cand = load_artifact_v5(existing)   # v5 门：版本/legacy fail-closed
-                    want = (episode.frame_set.frame_set_hash
-                            if episode.frame_set is not None else "")
-                    if want and cand.frame_set_hash and cand.frame_set_hash != want:
-                        # 帧集身份不符 = 双帧集风险（硬约束 21）→ 不复用，重算并留痕
-                        notes.append(
-                            f"[warn] P1 artifact 的 frame_set_hash="
-                            f"{cand.frame_set_hash[:12]} 与本 episode="
-                            f"{want[:12]} 不符 → 不复用，改为重算（硬约束 21）")
-                        raise _ReuseMiss()
+                    try:
+                        _validate_artifact_identity(cand, episode, pixels)
+                    except ValueError as exc:
+                        notes.append(f"[warn] P1 artifact 身份不符 → 重算: {exc}")
+                        raise _ReuseMiss() from exc
                     art, art_path = cand, existing
                     notes.append(
                         f"M3 复用 P1 落盘 artifact（方案 X：quality_status="
@@ -1208,7 +1197,6 @@ def run_episode(
         states.append(fsm.state.value)
         if fsm.state is OnlineState.ANSWER:
             return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
-                     episodic=episodic,
                              verdict=verdict)
 
     # ---------------- M3.5 WORLD_FRAME + METRIC_FUSION（v6 D5/D1）----------------
@@ -1331,7 +1319,6 @@ def run_episode(
         states.append(fsm.state.value)
         if fsm.state is OnlineState.ANSWER:
             return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
-                     episodic=episodic,
                              verdict=verdict, scene=scene, handle=handle)
 
     # ---------------- M7 CLASSIFY_TASK + 逐题 scope 派生 + RETRIEVE_SKILL ----------------
@@ -1363,13 +1350,11 @@ def run_episode(
         states.append(fsm.state.value)
         if decision is not None and not decision.allowed:
             return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
-                             episodic=episodic, verdict=verdict, scene=scene, handle=handle)
+                             verdict=verdict, scene=scene, handle=handle)
 
     if fsm.state is OnlineState.RETRIEVE_SKILL:
-        quality = cfg.scene_quality if cfg.scene_quality is not None \
-            else (handle.quality_overall if handle is not None else None)
         selected_skills = _retrieve_for_episode(
-            episode, scene, cfg, outcome, trigger="initial", scene_quality=quality,
+            episode, scene, cfg, outcome, trigger="initial",
             llm=llm)
         outcome.retrieved_skill_versions = list(
             outcome.retrieval_records[-1].retrieved_skill_versions)
@@ -1382,35 +1367,7 @@ def run_episode(
         fsm.step("done")
         states.append(fsm.state.value)
 
-    if cfg.baseline == "C0_direct_vlm":
-        res = _synthesize(
-            episode, scene, handle, [], cfg, llm, geometry=geometry, pixels=pixels)
-        _record_first_synthesis(outcome, res, scene, cfg)
-        outcome.synthesis_source = res.source
-        outcome.n_images_to_synthesizer = int(res.n_images)
-        outcome.m8_prompt = str(res.prompt or "")
-        program = res.program
-        direct_answer = res.direct_answer
-        if program is None:
-            outcome.final_state = "unavailable"
-            notes.append(res.note)
-            return _finalize(
-                outcome, fsm, cfg, episode, states, receipts, trace_store,
-                episodic=episodic, verdict=verdict, scene=scene, handle=handle)
-        outcome.program = program
-        notes.append(f"M8 C0 直答来源={res.source}")
-        fsm.step("done")
-        states.append(fsm.state.value)
-        fsm.step("pass")
-        states.append(fsm.state.value)
-        program_trace = _empty_program_trace(program)
-        outcome.program_trace = program_trace
-        notes.append("M9-M11 C0 直答不生成或执行程序，跳过程序与几何验收")
-        fsm.step("ok")
-        states.append(fsm.state.value)
-        fsm.step("pass")
-        states.append(fsm.state.value)
-    elif fsm.state is OnlineState.SYNTHESIZE_PROGRAM:
+    if fsm.state is OnlineState.SYNTHESIZE_PROGRAM:
         scene, handle, selected_skills, kernel, program_trace = _solve_program(
             episode, scene, handle, selected_skills, cfg, llm, outcome, fsm,
             states, receipts, pixels=pixels, geometry=geometry)
@@ -1418,10 +1375,10 @@ def run_episode(
         if outcome.final_state == "unavailable":
             return _finalize(
                 outcome, fsm, cfg, episode, states, receipts, trace_store,
-                episodic=episodic, verdict=verdict, scene=scene, handle=handle)
+                verdict=verdict, scene=scene, handle=handle)
 
     # ---------------- M12 BENCHMARK_EVAL ----------------
-    answer: Optional[str] = kernel.answer_slot.answer if kernel is not None else direct_answer
+    answer: Optional[str] = kernel.answer_slot.answer if kernel is not None else None
     answer_source = _answer_source_v6(answer=answer, program=program, kernel=kernel,
                                       outcome=outcome)
     if fsm.state is OnlineState.BENCHMARK_EVAL:
@@ -1438,7 +1395,6 @@ def run_episode(
     # ---------------- ANSWER → M13 LOG_TRACE ----------------
     if fsm.state is OnlineState.ANSWER:
         outcome.answer = answer
-        outcome.direct_answer = direct_answer
         outcome.answer_source = answer_source
         # ---- v9 §10.1/§12：答案载荷 + 框架核验的工具归因 ----
         if answer is not None:
@@ -1453,7 +1409,6 @@ def run_episode(
         states.append(fsm.state.value)
 
     return _finalize(outcome, fsm, cfg, episode, states, receipts, trace_store,
-                     episodic=episodic,
                      verdict=verdict, scene=scene, handle=handle)
 
 
@@ -2123,7 +2078,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                 observation_image_ids: Optional[Sequence[str]] = None,
                 round_index: int = 1,
                 trigger: str = "initial") -> _SynthResult:
-    """M8：生成 program（或 C0 直答）。
+    """M8：生成 program。
 
     `scope_override` / `traceback_feedback` / `prior_program` 供 D-3 恢复层使用：
     裁剪 prompt（强制受限 route）或把"上一轮 program + 裁剪 traceback"作为
@@ -2134,27 +2089,6 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
     账本里记 `delivered`（请求发出）/`observed`（响应返回）；图像清单与 token 成本
     一并落盘。没进请求的图保持 unobserved（不静默丢图）。
     """
-    if cfg.baseline == "C0_direct_vlm":
-        # §16.1 C0：直接自然语言作答，不编排 Tool → 无 program，不执行沙箱
-        # （**必须**带统一 FrameSet 的图像：C0 是"直答 VLM"基线，不是纯文本基线）
-        answer, note = _direct_vlm_answer(episode, cfg, llm, pixels=pixels)
-        if answer is None:
-            return _SynthResult(None, "none", note)
-        program = EpisodeProgram(
-            program_id=f"c0-{episode.qa_id}",
-            program_source="",           # C0 无 program
-            skill_semver_used=[],
-            intended_answer_slot="direct_answer",
-        )
-        source = "vllm_ok" if cfg.mode == "real" else "mock_stub"
-        return _SynthResult(
-            program,
-            source,
-            note,
-            direct_answer=answer,
-            response_text=str(answer or ""),
-        )
-
     if cfg.mode == "mock_light":
         # 有合成几何用合成几何；否则（冻结真实 artifact / golden 重放）用 handle 对象名
         names = None
@@ -2298,36 +2232,6 @@ def _class_hint_of(handle, obj_id: str) -> str:
         return obj_id
 
 
-def _direct_vlm_answer(episode: VSIBenchEpisode, cfg: OnlineRunConfig, llm,
-                       pixels: Optional[Sequence[np.ndarray]] = None
-                       ) -> tuple[Optional[str], str]:
-    """C0 直答：把**同一套 32 帧** + 问题一起给 VLM，要求直接作答（不编排 Tool）。
-
-    历史缺陷（2026-09-20 实测修出）：real 模式此前只发纯文本 → 模型看不到视频，
-    C0 在全部 32 题上 predicted=None（Avg 0.00），把"直答基线"变成了"瞎答基线"。
-    C0 必须与 C1 共用同一 FrameSet（硬约束 21/26：同一帧集、多模态且不丢帧）。
-    """
-    if cfg.mode == "mock_light":
-        return synth.stub_direct_answer(episode), (
-            "M8/C0 mock_light 确定性 stub 直答（非模型输出，仅管道验证）")
-    client = llm if llm is not None else _make_vllm_client(cfg)
-    if client is None:
-        return None, "M8/C0 vLLM 未配置 → 记 unavailable（TODO_USER_INPUT: endpoint）"
-    q = episode.question
-    if episode.options:
-        q += ("\n选项: " + "; ".join(episode.options)
-              + "\n直接给出最终答案：选择题只回答选项字母（如 C），不要解释。")
-    else:
-        q += "\n直接给出最终答案（一个数字），不要解释。"
-    try:
-        expected = (len(episode.frame_set.readable_frame_ids)
-                    if getattr(episode, "frame_set", None) is not None else None)
-        messages = _prompt_messages(q, pixels, cfg, expected_frames=expected)
-        return client.chat(messages, max_tokens=256), "vllm"
-    except Exception as exc:  # noqa: BLE001
-        return None, f"M8/C0 调用失败: {type(exc).__name__}: {exc}"
-
-
 def _build_prompt(episode, scene, handle, skills, feedback, *,
                   scope_override: Optional[str] = None,
                   traceback_feedback: Optional[str] = None,
@@ -2402,19 +2306,11 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
 
 def _answer_source_v6(*, answer: Optional[str], program, kernel,
                       outcome: EpisodeOutcome) -> str:
-    """`answer_source` 的 v6 四值口径（§5.3/§6.3，D9）：
-
-    `tool_program`（沙箱内程序作答）/ `direct_vlm_routed`（直答，含 C0 基线与题型策略
-    回退）/ `abstain`（确实无从作答）/ `tool_contract`（契约失败终止：恢复层用尽）。
-
-    v5 的 `program` / `direct_vlm` 两名已废止（`evaluation.experiment_protocol`
-    只为历史 trace 回读保留别名映射）。
-    """
+    """Attribute accepted answers to the program; retain failure distinctions."""
     if answer is not None and str(answer) != "":
         from_program = (kernel is not None
                         and str(getattr(program, "program_source", "") or "") != "")
-        # 无 program 却能作答 = 直答（C0 基线 / M8 直答回退 / 题型策略）→ 直答来源
-        return "tool_program" if from_program else "direct_vlm_routed"
+        return "tool_program" if from_program else "abstain"
     if outcome.failure_code == "tool_contract" or int(outcome.tool_contract_hits) > 0:
         return "tool_contract"
     return "abstain"
@@ -2462,14 +2358,6 @@ def _make_vllm_client(cfg: OnlineRunConfig):
     from skill3d.synthesis.vllm_client import VLLMClient
 
     return VLLMClient(cfg.vllm_endpoints, cfg.vllm_model)
-
-
-def _empty_program_trace(program: EpisodeProgram) -> ProgramExecutionTrace:
-    """C0：无 program 的占位 trace（无可执行内容，非"执行成功"的伪装）。"""
-    return ProgramExecutionTrace(
-        program_id=program.program_id, calls=[], results=[], stdout_tail="",
-        error_code=None, steps=0, wallclock_s=0.0,
-    )
 
 
 def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, receipts,
@@ -2680,9 +2568,8 @@ def _evaluate(episode: VSIBenchEpisode, answer: Optional[str], cls: TaskClassifi
 def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
               episode: VSIBenchEpisode, states: list[str], receipts: ReceiptChain,
               trace_store: Optional[TraceStore], *, verdict=None,
-              scene=None, handle=None,
-              episodic: Optional[EpisodicMemory] = None) -> EpisodeOutcome:
-    """收尾：failure 归因、receipts 链校验、EpisodeTrace 落盘（M13）+ episodic 记忆（G-26）。"""
+              scene=None, handle=None) -> EpisodeOutcome:
+    """收尾：failure 归因、receipts 链校验、EpisodeTrace 落盘（M13）。"""
     outcome.states = list(states)
     # v9 §9.4：图像账本在这里**唯一**落一次（handle 只在此可见），保证每条 finalize
     # 路径都带上三态记录，不会因为某条 continue/break 分支漏掉。
@@ -2708,13 +2595,6 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
                                     "qa_id": episode.qa_id})
     outcome.receipts = receipts.receipts
     outcome.receipts_ok = verify_chain(outcome.receipts)
-
-    # C0 基线：答案不经沙箱，由生成阶段直接产出
-    if outcome.program is not None and outcome.program.program_source == "" \
-            and outcome.answer is None and outcome.direct_answer is not None:
-        outcome.answer = outcome.direct_answer
-        if outcome.final_state == "unanswerable":
-            outcome.final_state = "answer"
 
     if not outcome.task:
         cls = classify(episode)
@@ -2916,8 +2796,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             # §19.1「不依赖重跑即可归因失败」：`predicted=None` 有两种截然不同的原因——
             # (a) 模型 abstain（无答案），(b) 模型给了自由文本但抽不出选项字母。
             # 不落原始答案就分不开这两者（实测 2770 属 (b)，却只留下一只普通错题）。
-            answer_text=(outcome.answer if outcome.answer is not None
-                         else outcome.direct_answer),
+            answer_text=outcome.answer,
             answer_source=str(outcome.answer_source or ""),
             episode_status=str(outcome.episode_status or ""),
             label_access=False,
@@ -2928,40 +2807,41 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             abstained=bool(outcome.abstained),
             failure_code=outcome.failure_code,
         ))
-    if episodic is not None:
-        _write_episodic_memory(episodic, outcome, episode, trace_store)
     return outcome
 
 
-def _write_episodic_memory(episodic: EpisodicMemory, outcome: EpisodeOutcome,
-                           episode: VSIBenchEpisode,
-                           trace_store: Optional[TraceStore]) -> None:
-    """G-26：在线写 episodic 记忆（semantic 绝不在此写，硬约束 1/2）。
-
-    final_test 由 `record_episode` 静默跳过（硬约束 9）；写失败只记 note 不阻断在线链
-    （记忆是增强项，不能影响单题作答）。
-    """
-    try:
-        entry = episodic.record_episode(
-            qa_id=episode.qa_id, scene_name=episode.scene_name,
-            task=outcome.task or episode.question_type,
-            final_state=outcome.final_state, correct=outcome.correct,
-            split=episode.split, route=outcome.scene_route or "",
-            flags=outcome.answer_flags,
-        )
-    except MemoryWriteForbiddenError as exc:
-        outcome.notes.append(f"M14 episodic 记忆拒写（硬约束 9/19）: {exc}")
-        return
-    except Exception as exc:  # noqa: BLE001 - 磁盘/序列化异常不得阻断在线链
-        outcome.notes.append(f"M14 episodic 记忆写入失败（{type(exc).__name__}: {exc}）")
-        return
-    if entry is not None:
-        outcome.notes.append(f"M14 episodic 记忆已写 {entry.memory_id}（G-26）")
-        if trace_store is not None:
-            trace_store.append("memory_entry", entry.model_dump())
-
-
 # --------------------------------------------------------------- split 批量 ----
+
+
+def _validate_artifact_identity(art, episode, pixels) -> None:
+    """Reject a cached reconstruction from a different source or frame order."""
+    from skill3d.adapters.frame_set import frame_set_hash
+
+    fs = episode.frame_set
+    if fs is None or fs.frame_set_hash != frame_set_hash(fs.frame_ids):
+        raise ValueError(f"{episode.qa_id}: missing or invalid FrameSet identity")
+    for key, actual, expected in (
+        ("scene", art.scene_name, episode.scene_name),
+        ("frame_set_hash", art.frame_set_hash, fs.frame_set_hash),
+    ):
+        if actual != expected:
+            raise ValueError(f"{episode.qa_id}: artifact {key} mismatch")
+    for key, expected in (
+        ("dataset_id", episode.dataset), ("scene_name", episode.scene_name),
+        ("episode_id", episode.qa_id),
+    ):
+        if getattr(fs, key) and getattr(fs, key) != expected:
+            raise ValueError(f"{episode.qa_id}: FrameSet {key} mismatch")
+    slots = [fs.frame_ids.index(fid) for fid in fs.readable_frame_ids]
+    if slots != sorted(set(slots)) or len(pixels) != len(slots):
+        raise ValueError(f"{episode.qa_id}: readable frame order/count mismatch")
+    for key, expected in (
+        ("frame_ids", fs.readable_frame_ids),
+        ("source_frame_indices", [fs.source_frame_indices[i] for i in slots]),
+        ("timestamps", [fs.timestamps[i] for i in slots]),
+    ):
+        if list(getattr(art, key)) != list(expected):
+            raise ValueError(f"{episode.qa_id}: artifact {key} mismatch")
 
 def _run_id(cfg: OnlineRunConfig, split: str, n: int) -> str:
     if cfg.deterministic_replay:
@@ -2977,37 +2857,42 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
     """跑一批 episode 并聚合为 `EvaluationRun`（§5.7）。items 为 EpisodeItem 序列。"""
     from datetime import datetime, timezone
 
+    if len({it.episode.qa_id for it in items}) != len(items):
+        raise ValueError("run_split requires unique qa_id within one run")
+    if len({it.episode.split for it in items}) > 1:
+        raise ValueError("run_split cannot mix source splits")
+    run_id = _run_id(cfg, items[0].episode.split if items else "", len(items))
     store = trace_store
     if store is None and items:
         store = TraceStore(cfg.trace_dir)
-    # G-26：在线 episodic 记忆（在线写、离线读；semantic 不在线写）。
-    # 构造失败（路径不可写等）→ 记降级、不阻断在线链；EpisodicMemory 内部已自降级。
-    episodic = None
-    if cfg.memory_dir:
-        try:
-            episodic = EpisodicMemory(path=_episodic_path(cfg))
-        except Exception:  # noqa: BLE001 - 记忆是增强项，绝不阻断评测
-            episodic = None
+    if store is not None and items:
+        store.claim_run(run_id)
+        store = store.bind(run_id=run_id)
     outcomes = [run_episode(
         it.episode,
         it.pixels,
         cfg,
         geometry=it.geometry,
-        trace_store=store,
+        trace_store=store.bind(qa_id=it.episode.qa_id) if store is not None else None,
         llm=llm,
-        episodic=episodic,
         input_error=getattr(it, "input_error", None),
     ) for it in items]
 
     mca = [o for o in outcomes if o.is_mca]
     na = [o for o in outcomes if not o.is_mca]
+    def unavailable(outcome) -> bool:
+        return outcome.final_state == "unavailable" or any(
+            row.get("service_errors") for row in outcome.rounds)
+
+    n_unavailable = sum(unavailable(o) for o in outcomes)
     # 按 §4 M7 规范题型（8 类）聚合：rel_direction 三档变体合为一类（§16"8 任务分别准确率"）
     per_task: dict[str, dict] = {}
     for o in outcomes:
         slot = per_task.setdefault(o.task or o.question_type,
                                    {"n": 0, "correct": 0, "mra_values": [],
-                                    "n_mca": 0, "n_na": 0, "levels": {}})
+                                    "n_mca": 0, "n_na": 0, "n_unavailable": 0, "levels": {}})
         slot["n"] += 1
+        slot["n_unavailable"] += int(unavailable(o))
         slot["n_mca" if o.is_mca else "n_na"] += 1
         if o.correct:
             slot["correct"] += 1
@@ -3016,8 +2901,10 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
         # 档位明细（§8.3：object_rel_direction 的 easy/medium/hard 先等权聚合）
         lv = slot["levels"].setdefault(
             o.question_type or o.task,
-            {"n": 0, "correct": 0, "mra_values": [], "n_mca": 0, "n_na": 0})
+            {"n": 0, "correct": 0, "mra_values": [], "n_mca": 0, "n_na": 0,
+             "n_unavailable": 0})
         lv["n"] += 1
+        lv["n_unavailable"] += int(unavailable(o))
         lv["n_mca" if o.is_mca else "n_na"] += 1
         if o.correct:
             lv["correct"] += 1
@@ -3031,14 +2918,20 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
             lv["accuracy"] = (lv["correct"] / lv["n"]) if lv["n"] else None
             lvals = lv.pop("mra_values")
             lv["mra"] = (sum(lvals) / len(lvals)) if lvals else None
+        for row in [slot, *slot["levels"].values()]:
+            row["status"] = "incomplete" if row["n_unavailable"] else "completed"
+            if row["n_unavailable"]:
+                row["accuracy"] = row["mra"] = None
 
     na_scored = [o.mra_value for o in na if o.mra_value is not None]
     run = EvaluationRun(
-        run_id=_run_id(cfg, items[0].episode.split if items else "", len(outcomes)),
+        run_id=run_id,
+        status="incomplete" if n_unavailable or not outcomes else "completed",
+        n_unavailable=n_unavailable,
         split=items[0].episode.split if items else "",
         n_episodes=len(outcomes),
-        accuracy=(sum(1 for o in mca if o.correct) / len(mca)) if mca else None,
-        mra=(sum(na_scored) / len(na_scored)) if na_scored else None,
+        accuracy=(sum(1 for o in mca if o.correct) / len(mca)) if mca and not n_unavailable else None,
+        mra=(sum(na_scored) / len(na_scored)) if na_scored and not n_unavailable else None,
         per_task=per_task,
         active_snapshot_ref=cfg.active_snapshot_ref,
         code_commit=_git_head(),
@@ -3049,13 +2942,14 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
         store.append("evaluation_run", run)
         store.append("online_run", {
             "run_id": run.run_id, "mode": cfg.mode, "baseline": cfg.baseline,
+            "status": run.status,
             "template_version": PROMPT_TEMPLATE_VERSION,
             "execution_protocol_version": EXECUTION_PROTOCOL_VERSION,
             "tool_docs_version": TOOL_DOCS_VERSION,
             "seed": cfg.seed, "source": getattr(items[0], "source", "unknown"),
             "n_episodes": len(outcomes), "split": run.split,
             "label_access": False,
-            "n_unavailable": sum(1 for o in outcomes if o.final_state == "unavailable"),
+            "n_unavailable": n_unavailable,
             "n_unanswerable": sum(1 for o in outcomes if o.final_state == "unanswerable"),
             "n_input_error": sum(1 for o in outcomes if o.final_state == "input_error"),
             "deterministic_replay": cfg.deterministic_replay,
@@ -3063,11 +2957,6 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
                      if cfg.mode != "real" else "real 模式"),
         })
     return outcomes, run
-
-
-def _episodic_path(cfg: OnlineRunConfig) -> str:
-    """episodic 记忆落盘路径（按 seed/baseline 分文件，便于按 run 审计）。"""
-    return f"{cfg.memory_dir}/episodic_seed{cfg.seed}_{cfg.baseline}.jsonl"
 
 
 def _git_head() -> str:

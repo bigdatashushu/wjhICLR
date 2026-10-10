@@ -323,7 +323,10 @@ def _numeric_value(value: Any) -> Optional[float]:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
     elif isinstance(value, str):
         try:
             number = float(value.strip())
@@ -384,6 +387,27 @@ def replay_derivation(
             reason=f"题型 {question_type} 要求 unit={expected_unit}，实际为 {payload.unit}",
         ))
     derivation = payload.derivation
+    # Visual/mixed submissions still have an answer domain even without a
+    # declared calculation. Validate before the no-derivation early return.
+    if payload.unit in {"count", "m", "cm", "m2"}:
+        number = _numeric_value(payload.value)
+        if number is None:
+            issues.append(DerivationIssue(
+                code="answer_not_finite", reason="答案必须是有限数值"))
+        elif number < 0:
+            issues.append(DerivationIssue(
+                code="answer_negative", reason="距离、尺寸、面积与计数不能为负"))
+        elif payload.unit == "count" and not number.is_integer():
+            issues.append(DerivationIssue(
+                code="answer_not_integer", reason="计数答案必须是整数"))
+    elif payload.unit == "option" and options and (
+        derivation is None or derivation.get("op") != "sort"
+    ):
+        allowed = set(string.ascii_uppercase[:len(options)])
+        if str(payload.value).strip().upper() not in allowed:
+            issues.append(DerivationIssue(
+                code="option_out_of_range",
+                reason=f"答案必须是合法选项字母 {sorted(allowed)}"))
     if derivation is None:
         return DerivationReplayResult(
             passed=not issues,

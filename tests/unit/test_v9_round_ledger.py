@@ -99,9 +99,10 @@ def test_ledger_survives_namespace_reset_while_cell_view_is_per_round():
     kernel.run_cell('b = object_centroid("obj_0")\n')
     assert len(kernel.cell_results) == 1, "逐轮视图只应含本轮结果"
     assert len(kernel.tool_results) == 2, "账本应累计两轮结果"
-    # result_id 是**内容寻址**的（请求 + 场景状态摘要），因此同一场景里重复同一次
-    # 测量得到同一个 id —— 这是"两次测的是同一件事"的正确表达，不是碰撞。
-    assert kernel.cell_results[0].result_id == first[0]
+    # 相同请求保留同一个 request_digest；每次调用必须有独立 result_id，
+    # 以便跨轮重放与撤销准确定位调用实例。
+    assert kernel.cell_results[0].result_id != first[0]
+    assert kernel.tool_results[0].request_digest == kernel.tool_results[1].request_digest
 
     # 换一个请求则必须是不同的 id
     kernel.run_cell('c = object_3d_extent("obj_0")\n')
@@ -134,7 +135,7 @@ def _real_cfg(tmp_path, art_path: str, **over) -> OnlineRunConfig:
     而 real 模式要求真实重建产物 → 走 `reuse_artifact`（与恢复测试同一路径）。"""
     return OnlineRunConfig(mode="real", reuse_artifact=art_path,
                            vllm_endpoints=["http://fake"], deterministic_replay=True,
-                           trace_dir=str(tmp_path / "t"), memory_dir="", **over)
+                           trace_dir=str(tmp_path / "t"), **over)
 
 
 def _write_v6_artifact(tmp_path) -> str:
@@ -245,7 +246,7 @@ def test_recovery_rounds_consume_solver_budget(tmp_path):
     # v9 §5.1：诊断默认关闭 → 路由不再被 M2 权重拉低，也就不会触发契约恢复。
     # 本用例要验证"恢复轮计入轮预算"，故显式开启诊断（独立诊断实验口径）。
     cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"),
-                          memory_dir="", input_diagnostics=True)
+                          input_diagnostics=True)
     out = run_episode(items[0].episode, items[0].pixels, cfg, geometry=items[0].geometry)
     trace = out.episode_trace
     assert out.tool_contract_hits >= 1

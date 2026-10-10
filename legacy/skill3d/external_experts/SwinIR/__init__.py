@@ -1,3 +1,0 @@
-"""
-SwinIR external expert integration.
-"""

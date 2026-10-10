@@ -1,6 +1,6 @@
 """v11 Skill source, snapshot, and single-active-version publishing.
 
-The v11 path is intentionally separate from the v9/v10 inline ``SkillSpec``
+The current v11 path replaces the retired v9/v10 inline ``SkillSpec``
 snapshot format. A v11 snapshot stores framework identity plus a content
 addressed ``source_ref``; the referenced immutable ``SKILL.md`` remains the
 only method-content source.
@@ -307,11 +307,19 @@ def validate_v11_snapshot(
 
 def _write_create_once(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.read_bytes() != data:
-            raise V11LibraryError(f"不可变文件已存在且内容不同: {path}")
-        return
-    path.write_bytes(data)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_bytes() != data:
+                raise V11LibraryError(f"不可变文件已存在且内容不同: {path}")
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_pointer_atomic(store_dir: Path, snapshot_id: str) -> None:
@@ -419,6 +427,8 @@ def publish_v11_candidate(
         parent_spec = parent_specs.get(parent_key)
         if parent_spec is None:
             raise V11LibraryError(f"父版本不是当前 active Skill: {parent_key}")
+        if spec.name != parent_spec.name:
+            raise V11LibraryError("首期修订不得改变稳定 name")
         candidate_key = candidate.candidate_skill_version
         if candidate_key in entries:
             raise V11LibraryError(f"候选版本已存在: {candidate_key}")

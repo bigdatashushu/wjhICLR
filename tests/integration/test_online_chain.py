@@ -14,7 +14,6 @@
   且主榜按错计；
 - 硬约束 9：final_test 默认拒绝；
 - 硬约束 1：real 模式缺 vLLM → 记 unavailable（不伪造答案）；
-- C0 baseline 不经沙箱（无 program）。
 """
 
 from __future__ import annotations
@@ -44,8 +43,7 @@ def items():
 
 def test_all_question_types_run_end_to_end(items, tmp_path):
     """8 题型全部跑完在线链并产出答案（M1 端到端可运行）。"""
-    cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "traces"),
-                          memory_dir=str(tmp_path / "mem"))
+    cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "traces"))
     outcomes, run = run_split(items, cfg)
     assert run.n_episodes == len(ALL_QUESTION_TYPES) == 8
     for o in outcomes:
@@ -67,7 +65,7 @@ def test_all_question_types_run_end_to_end(items, tmp_path):
 def test_synthetic_scene_passes_real_m4_main_gate(items):
     """mock_light 的 scene_route 必须由**真算**的 M4 主门给出（不许绕过门）。"""
     for it in items:
-        cfg = OnlineRunConfig(mode="mock_light", memory_dir="")
+        cfg = OnlineRunConfig(mode="mock_light")
         out = run_episode(it.episode, it.pixels, cfg, geometry=it.geometry)
         assert out.main_gate_passed is True, it.episode.question_type
         assert out.scene_route == "full_3d", it.episode.question_type
@@ -84,7 +82,7 @@ def test_synthetic_scene_passes_real_m4_main_gate(items):
 def test_program_actually_calls_tools(items):
     """C1：program 经 M9 AST 后进沙箱，Tool 被真实调用且结果进 trace（§5.4）。"""
     it = next(i for i in items if i.episode.question_type == "room_size_estimation")
-    cfg = OnlineRunConfig(mode="mock_light", memory_dir="")
+    cfg = OnlineRunConfig(mode="mock_light")
     out = run_episode(it.episode, it.pixels, cfg, geometry=it.geometry)
     assert out.synthesis_source == "mock_stub"
     trace = out.program_trace
@@ -109,8 +107,7 @@ def test_same_seed_is_byte_identical(items, tmp_path):
     """
     def dump(tag: str) -> str:
         cfg = OnlineRunConfig(mode="mock_light", deterministic_replay=True, seed=7,
-                              trace_dir=str(tmp_path / tag),
-                              memory_dir=str(tmp_path / f"mem-{tag}"))
+                              trace_dir=str(tmp_path / tag))
         outcomes, run = run_split(items, cfg)
         assert all(o.program_trace is not None for o in outcomes), \
             "mock_light 8 题都应执行过 program（program_trace 不得为 None）"
@@ -139,8 +136,7 @@ def test_blur_default_does_not_change_the_main_flow(tmp_path):
                                  frame_size=FRAME_SIZE, degrade="blur_all",
                                  out_dir=str(tmp_path / "obj"))
     n_before = len(items[0].pixels)
-    cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"),
-                          memory_dir="")
+    cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"))
     out = run_episode(items[0].episode, items[0].pixels, cfg, geometry=items[0].geometry)
 
     # 帧集不变（M2 被动观测）
@@ -165,7 +161,7 @@ def test_diagnostic_experiment_blur_all_still_answers(tmp_path):
                                  frame_size=FRAME_SIZE, degrade="blur_all",
                                  out_dir=str(tmp_path / "obj"))
     cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"),
-                          memory_dir="", input_diagnostics=True)
+                          input_diagnostics=True)
     out = run_episode(items[0].episode, items[0].pixels, cfg, geometry=items[0].geometry)
 
     assert out.episode_trace.input_degradation_flags, "诊断开启后应有质量 flag"
@@ -189,7 +185,7 @@ def test_input_gate_blur_some_keeps_all_frames_and_answers(tmp_path):
                                  out_dir=str(tmp_path / "obj"))
     # v9 §5.1：诊断默认关闭 → 本用例属"独立诊断实验"，显式开启
     cfg = OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path / "t"),
-                          memory_dir="", input_diagnostics=True)
+                          input_diagnostics=True)
     out = run_episode(items[0].episode, items[0].pixels, cfg, geometry=items[0].geometry)
     assert len(items[0].pixels) == 32                   # 没删帧
     assert out.final_state == "answer"
@@ -204,19 +200,18 @@ def test_final_test_refused_by_default(items):
     it = load_synthetic_items("final_test", question_types=["room_size_estimation"],
                               frame_size=FRAME_SIZE)[0]
     out = run_episode(it.episode, it.pixels,
-                      OnlineRunConfig(mode="mock_light", memory_dir=""),
+                      OnlineRunConfig(mode="mock_light"),
                       geometry=it.geometry)
     assert out.final_state == "unanswerable"
     assert "final_test" in " ".join(out.notes)
 
     out2 = run_episode(it.episode, it.pixels,
-                       OnlineRunConfig(mode="mock_light", allow_final_test=True,
-                                       memory_dir=""),
+                       OnlineRunConfig(mode="mock_light", allow_final_test=True),
                        geometry=it.geometry)
     assert out2.final_state == "answer"
 
 
-def _test_double_artifact(path) -> str:
+def _test_double_artifact(path, episode) -> str:
     """测试替身：一个合法 **v6** ReconstructionArtifact（数组 ref 不存在 → 走 NaN 兜底）。
 
     v6 口径：`QualityMetrics` 不再有 G5/G11 字段、artifact 不再有 `scale_/scale_confidence`
@@ -228,9 +223,11 @@ def _test_double_artifact(path) -> str:
     nan = float("nan")
     art = ReconstructionArtifact(
         artifact_id="test-double", artifact_version="test-double",
-        scene_name="test-double-scene", recon_method="vggt",
-        frame_ids=list(range(32)), source_frame_indices=list(range(32)),
-        timestamps=[float(i) for i in range(32)], frame_set_hash="test-double-hash",
+        scene_name=episode.scene_name, recon_method="vggt",
+        frame_ids=episode.frame_set.frame_ids,
+        source_frame_indices=episode.frame_set.source_frame_indices,
+        timestamps=episode.frame_set.timestamps,
+        frame_set_hash=episode.frame_set.frame_set_hash,
         c2w_list="", intrinsics="", depth_maps="", point_map="", point_conf="",
         track_list=None,
         quality_status="computed",
@@ -258,8 +255,7 @@ def test_real_mode_without_vllm_is_unavailable_not_fake(items, tmp_path):
     """
     it = items[0]
     cfg = OnlineRunConfig(mode="real", vllm_endpoints=[],
-                          reuse_artifact=_test_double_artifact(tmp_path),
-                          memory_dir="")
+                          reuse_artifact=_test_double_artifact(tmp_path, it.episode))
     out = run_episode(it.episode, it.pixels, cfg, geometry=it.geometry)
     assert out.states == FULL_CHAIN[:-1] + ["LOG_TRACE"] or "SYNTHESIZE_PROGRAM" in out.states
     assert out.final_state == "unavailable"
@@ -274,23 +270,10 @@ def test_real_mode_without_vllm_is_unavailable_not_fake(items, tmp_path):
     assert out.scene_route == "fallback_2d_only"
 
 
-def test_c0_baseline_skips_sandbox(items):
-    """§16.1 C0：direct VLM 基线无 program → 不经沙箱执行。"""
-    it = next(i for i in items if i.episode.question_type == "object_counting")
-    cfg = OnlineRunConfig(mode="mock_light", baseline="C0_direct_vlm", memory_dir="")
-    out = run_episode(it.episode, it.pixels, cfg, geometry=it.geometry)
-    assert out.final_state == "answer"
-    assert out.program is not None and out.program.program_source == ""
-    assert out.program_trace.steps == 0 and out.program_trace.results == []
-    assert "SANDBOX_EXECUTE" in out.states
-    # C0 的答案由生成阶段直接产出 → direct_vlm_routed（§6.3；不属于工具/程序路径贡献）
-    assert out.answer_source == "direct_vlm_routed"
-
-
 def test_trace_store_records_all_topics(items, tmp_path):
     """M13：episode_trace / program_trace / geometry_check / evaluation_result 落盘。"""
     store = TraceStore(tmp_path / "traces")
-    cfg = OnlineRunConfig(mode="mock_light", memory_dir="")
+    cfg = OnlineRunConfig(mode="mock_light")
     it = next(i for i in items if i.episode.question_type == "room_size_estimation")
     run_episode(it.episode, it.pixels, cfg, geometry=it.geometry, trace_store=store)
     for topic in (
@@ -326,3 +309,38 @@ def test_trace_store_records_all_topics(items, tmp_path):
     assert trec["metric_evidence_gate_result"]["gate_passed"] is True
     assert trec["template_version"] and trec["tool_face_version"]
     assert trec["gate_version"] and trec["distance_primitive_params"]
+
+
+def test_run_split_binds_every_episode_topic_and_rejects_duplicate_run(items, tmp_path):
+    cfg = OnlineRunConfig(mode="mock_light", deterministic_replay=True,
+                          trace_dir=str(tmp_path))
+    _, run = run_split(items[:1], cfg)
+    for topic in ("episode_input", "episode_trace", "evaluation_result",
+                  "episode_program", "program_trace", "geometry_check", "trace_record"):
+        rows = [json.loads(line) for line in
+                (tmp_path / f"{topic}.jsonl").read_text().splitlines()]
+        assert all(row["run_id"] == run.run_id for row in rows)
+        assert all(row["qa_id"] == items[0].episode.qa_id for row in rows)
+    with pytest.raises(ValueError, match="already exists"):
+        run_split(items[:1], cfg)
+
+
+def test_service_failure_makes_whole_run_incomplete_for_both_metrics(
+        items, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import skill3d.online.runner as runner
+
+    def failed(episode, *args, **kwargs):
+        is_mca = bool(episode.options)
+        return SimpleNamespace(
+            task=episode.question_type, question_type=episode.question_type,
+            is_mca=is_mca, correct=None, mra_value=None, final_state="unavailable",
+            rounds=[])
+    monkeypatch.setattr(runner, "run_episode", failed)
+    _, run = run_split(
+        items, OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path)))
+    assert run.status == "incomplete"
+    assert run.n_unavailable == run.n_episodes == len(items)
+    assert run.accuracy is None and run.mra is None
+    assert all(row["status"] == "incomplete" and row["accuracy"] is None
+               and row["mra"] is None for row in run.per_task.values())

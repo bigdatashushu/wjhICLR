@@ -53,19 +53,13 @@ DELIVERY_REASON_CODES: frozenset[str] = frozenset({
 def render_skill_entry(skill: Any) -> str:
     """单条方法的**完整**正文（进 prompt 的唯一形态；不做任何截断）。
 
-    v11 Skill 直接返回规范化的完整 ``skill_md``；这个字符串同时用于模型请求与
-    ``content_sha256``。旧 SkillSpec 继续使用历史三段式，保证已有快照可重放。
+    直接返回完整 ``skill_md``；这个字符串同时用于模型请求与 ``content_sha256``。
     """
-    skill_md = getattr(skill, "skill_md", None)
-    if skill_md is not None:
-        return str(skill_md)
-    header = f"### {skill.skill_id}@{skill.version} (task_type={skill.task_type})"
-    return "\n".join([
-        header,
-        str(getattr(skill, "description", "") or ""),
-        "模板:",
-        str(getattr(skill, "call_graph_template", "") or ""),
-    ])
+    from skill3d.schemas.skill import SkillSpecV11
+
+    if not isinstance(skill, SkillSpecV11):
+        raise ValueError("当前交付只接受 SkillSpecV11")
+    return skill.skill_md
 
 
 def skill_content_sha256(skill: Any) -> str:
@@ -159,7 +153,6 @@ def plan_delivery(skills: Optional[Sequence[Any]], *,
     规则（按规范原文）：
 
     - 按**传入顺序**（= 检索排序）贪心取完整条目，累计长度含分隔符不得超上限；
-    - 旧 Skill 放不下时整条丢弃并记录 `context_cap_exceeded`，绝不截断正文；
     - v11 每题只有一条完整方法，单条放不下表示候选静态准入失效，直接报错；
     - 上限必须为正：`None` 用默认值，非正数 raise（"0 字符预算"与"无上限"是两回事，
       静默当成无上限会让上限形同虚设）。
@@ -173,21 +166,16 @@ def plan_delivery(skills: Optional[Sequence[Any]], *,
         text = render_skill_entry(skill)
         n = len(text)
         sep = 1 if plan.entries else 0        # 条目间的换行分隔符也算进预算
-        if getattr(skill, "skill_md", None) is not None and used + sep + n > limit:
+        if used + sep + n > limit:
             raise ValueError(
                 f"v11 Skill {skill_version_key(skill)} 完整正文 {n} 字符超过"
                 f"方法上下文上限 {limit}；必须压缩候选，不能运行时丢弃")
-        if used + sep + n <= limit:
-            used += sep + n
-            plan.entries.append(DeliveredSkill(
-                skill_version=skill_version_key(skill),
-                content_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                chars=n,
-                text=text))
-        else:
-            plan.dropped.append(DroppedSkill(
-                skill_version=skill_version_key(skill),
-                reason="context_cap_exceeded", chars=n))
+        used += sep + n
+        plan.entries.append(DeliveredSkill(
+            skill_version=skill_version_key(skill),
+            content_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            chars=n,
+            text=text))
     plan.used_chars = used
     return plan
 

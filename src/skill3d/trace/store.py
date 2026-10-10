@@ -46,6 +46,21 @@ class TraceStore:
     def append_episode(self, episode_trace: BaseModel) -> None:
         self.append("episode_trace", episode_trace)
 
+    def claim_run(self, run_id: str) -> None:
+        """Reserve a run identity before writing any episode, including failures."""
+        if not run_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in run_id):
+            raise ValueError("invalid trace run_id")
+        claims = self.root / ".runs"
+        claims.mkdir(exist_ok=True)
+        try:
+            with (claims / f"{run_id}.json").open("x", encoding="utf-8") as handle:
+                json.dump({"run_id": run_id}, handle)
+        except FileExistsError as exc:
+            raise ValueError(f"trace run_id already exists: {run_id}; use a new run") from exc
+
+    def bind(self, **identity: str):
+        return BoundTraceStore(self, identity)
+
     def build_parquet(self, topic: str, out_path: Union[str, Path, None] = None):
         """离线聚合 JSONL → Parquet；pyarrow 不可用时跳过并警告。"""
         try:
@@ -100,6 +115,29 @@ class TraceStore:
             (base or self.root).joinpath("parquet_manifest.json").write_text(
                 json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         return out
+
+
+class BoundTraceStore:
+    """Attach run/qa provenance without mutating the in-memory execution result."""
+
+    def __init__(self, store: TraceStore, identity: dict[str, str]) -> None:
+        self.store = store
+        self.root = store.root
+        self.identity = dict(identity)
+
+    def bind(self, **identity: str):
+        if any(key in self.identity and self.identity[key] != value
+               for key, value in identity.items()):
+            raise ValueError("trace identity cannot be rebound")
+        return BoundTraceStore(self.store, {**self.identity, **identity})
+
+    def append(self, topic: str, record: Union[BaseModel, dict]) -> None:
+        row = record.model_dump(mode="json") if isinstance(record, BaseModel) else dict(record)
+        for key, value in self.identity.items():
+            if row.get(key) not in (None, "", value):
+                raise ValueError(f"trace {key} conflicts with bound identity")
+            row[key] = value
+        self.store.append(topic, row)
 
 
 def main(argv: list[str] | None = None) -> int:

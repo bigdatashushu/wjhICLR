@@ -1,107 +1,46 @@
 # harness3D Skill Library
 
-This directory is the repository-local Skill library. The active snapshot is
-`S0-v11-contract-repair`; the v9 source/compiler artifacts remain available for
-historical checks and rollback.
+当前 active snapshot 为 `S0-v11-contract-repair`。每个规范题型只有一条 active 方法，
+运行对象仅接受 `SkillSpecV11`，快照 Schema 仅接受 `runtime-skill-snapshot/2.0`。
 
-## Source of truth
+## 方法源与运行合同
 
-Legacy v9 sources live in `skills/<skill-name>/SKILL.md`, with YAML front matter
-and the fixed Markdown sections required by source format `1.0`. Active v11 sources
-live in `versions/` as described below. A released source version is immutable;
-a method change creates a new semantic version and candidate record.
+完整方法位于 `versions/<skill_id>/<version>/<name>/SKILL.md`，每个已发布版本不可覆盖。
+框架在索引中维护 `skill_id`、版本、题型、`source_ref` 和 `content_sha256`。
+加载器核对 manifest、源文件路径、UTF-8/LF 和全文 hash 后，原样交付完整 `skill_md`。
+超出方法上下文上限时拒绝运行，不截断正文。方法内容不经 JSON SkillSpec 重编译。
 
-`imports/` contains the verified transport bundle and its receipt. The bundle keeps the original document-level export identity (`schema_version=8.0`); it is not the runtime schema.
+在线合同固定为 `program_synth_v11_2`、`solver-v11.2-m11-acceptance` 与 `tool-docs-v11.1`。
+B01 不交付 Skill；B11 交付当前题型的冻结 S0 方法。工具证据和权限由框架统一校验。
 
-## Derived files
+## 快照与发布
 
-Run from the repository root:
+- `snapshots/active_snapshot.json`：唯一在线指针。
+- `snapshots/snapshot_<id>.json`：不可变快照。
+- `manifests/`：每个快照的内容身份。
+- `versions/`：不可变完整方法源。
+- `candidates/`：v11 修订候选与 provenance，不能直接参与正常在线查找。
+- `imports/`、`validation/`：历史导入证据，不是运行入口。
 
-```bash
-EXP=/home/cvailab/anaconda3/envs/skill3d-exp/bin/python   # 冻结实验环境，必须用它
-PYTHONPATH=src $EXP scripts/build_skill_library.py --check
-```
-
-Do not run these commands with the base conda env: its numpy/scipy pair is incompatible, and the failure there is silent rather than loud (M4 sub-items fail closed and the scene route degrades to `fallback_2d_only`). The online entry point and the test suite therefore refuse to start when the dependency probes fail.
-
-The compiler parses and validates the sources, then maps the document-level S0 format into the current strict runtime `skill3d.schemas.SkillSpec` contract. Generated specs are written to `generated/<skill_id>/<version>.json`, with a digest index in `generated/index.json`. Do not hand-edit generated files.
-
-The compiler intentionally keeps `image_2d` as the only whole-Skill requirement. Geometry, scale, world-frame, binding and temporal requirements remain local method conditions and are enforced by the runtime ToolSpec/evidence authorization path. This preserves the v9 visual fallback when an optional capability is unavailable.
-
-## Snapshots and candidates
-
-`snapshots/active_snapshot.json` is the only online pointer. The online loader reads
-the pointed immutable snapshot: inline `spec_content` for v9, or verified
-`source_ref` content for v11. It never scans `generated/`, `candidates/`, or
-`candidates/future/`.
-
-- `snapshots/snapshot_<id>.json`: immutable promoted snapshot.
-- `candidates/`: immutable records for real, trace-backed revisions that may be validated.
-- `candidates/future/`: drafts and ideas; never active and never eligible for online retrieval.
-- `manifests/`: source, generated, compiler, snapshot and validation identities.
-- `validation/`: static import/compile receipts. They do not claim real model/tool execution.
-
-Promotion must use the existing atomic snapshot writer. A rejected candidate leaves the active pointer unchanged; a promoted candidate is loaded only by new episodes. The legacy S0 `S0-seed-20260925-v1` remains available for rollback. Activating the v11 format migration does not claim a benchmark score or Skill evolution gain.
-
-## v11 active snapshot
-
-The v11 path keeps each immutable complete source under
-`versions/<skill_id>/<version>/<name>/SKILL.md`. Runtime identity and the source
-digest live in a schema `runtime-skill-snapshot/2.0` entry; the loader verifies
-the manifest, source path, UTF-8/LF form, and full-source hash before returning
-`SkillSpecV11`. Delivery uses that exact `skill_md` string without recompiling
-or reconstructing sections.
-
-`S0-v11-format-migration` contains the eight v11 `1.1.0` methods, with exactly
-one active method for each canonical question type. The earlier
-`S0-v11-s03-format-migration` snapshot is retained as the S03 vertical migration
-preview. The repository active pointer references `S0-v11-contract-repair`,
-whose parent is the format-migration snapshot. S01/S08 are now 1.2.0 with
-explicit parent-version references; the other six sources remain 1.1.0.
-All previous snapshots and source bytes are preserved. This is a contract-repair
-baseline (generation 0), not an evidence-backed evolution gain.
-
-Build or verify the snapshot with:
+验证当前基线：
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py
-PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py --check
 PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py --profile contract-repair --check
 ```
 
-`--profile contract-repair --activate` selects the repaired snapshot through the atomic pointer writer
-after validation. Normal benchmark commands do not change the pointer.
+修订入口为 `scripts/run_evolution_campaign_v11.py`，通过
+`publish_v11_candidate` 写入完整候选与快照并原子切换指针。拒绝保持父版；
+发布后正常 learning 未能确认新正文交付时回滚。旧快照只供审计，旧编译器的 `skills/` 与 `generated/` 已删除，旧格式不能在当前
+运行时加载；复现实验需 checkout 对应 Git 提交。
 
-## v11 public prompt
+`S0-v11-contract-repair` 是格式与接口修复基线，不是经真实 learning 晋升的性能版本。
+S01/S08 为 1.2.0，其余六条为 1.1.0；既有源文件和快照身份保持不变。
 
-The online runtime has one contract: `program_synth_v11_2`,
-`solver-v11.2-m11-acceptance`, and `tool-docs-v11.1`. These identities are
-recorded in every run but are not selectable through YAML, CLI, or
-`OnlineRunConfig`. B01 and B11 therefore share the same public task definitions,
-unit rules, execution contract, and authorized Tool documentation. B11 appends
-the complete selected Skill source as a method block; B01 appends none.
+## 配对与标签隔离
 
-The control contract documents `AnswerPayload`, real result IDs, pending
-submissions, and M11 rejection/revision. S06 no longer promises a nonexistent
-angle field; visibility docs describe stored frame slots. S01 groups tracks
-before geometric merging; S08 uses horizontal projections and valid
-world-up/handedness metadata from `object_centroid`.
+`scripts/run_skill_ablation_v11.py` 在相同输入、模型、预算及固定质量门上独立执行
+B01/B11，输出逐题结果、交付 hash 和汇总。详见[配对协议](../docs/skill_ablation_v11.md)。
 
-Historical prompt and Tool-document behavior is available only by checking out
-the corresponding Git commit. Current tool behavior remains identified as
-`tool-face-v11.1`.
-
-## v11 paired Skill ablation
-
-`scripts/run_skill_ablation_v11.py` runs B01 (empty delivery) and B11 (the explicit
-`S0-v11-contract-repair` snapshot by default) with the same v11 public prompt and an always-on
-quality gate. It freezes inputs and M5 results, gives each arm private runtime
-and artifact copies, and writes qa_id-paired scores and delivery hashes.
-See [运行命令、隔离合同与输出说明](../docs/skill_ablation_v11.md).
-This entry does not change the active pointer or use v10 fixed injection.
-
-## Data and provenance rules
-
-Candidate records must retain the canonical question type, parent Skill version, source split, experience relation, trace references, patch/diff, expected scope, known risks and static-check receipt. Learning traces may inform a future candidate only when the Skill was actually retrieved and delivered; inner/outer/final evaluation material must not be copied into online prompts or candidate drafts.
-
-The runtime snapshot stores only public method content and audit digests. Ground-truth labels, private credentials, offline provider output and answer-model secrets do not belong here.
+离线修订只能读取 induction 的题目级标准答案和反馈，并记录 `label_access=true`。
+inner/outer/final 的逐题标签不得进入修订输入；在线求解始终不读取答案或 GT 三维标注。
+候选正文不得包含具体样本身份或答案。

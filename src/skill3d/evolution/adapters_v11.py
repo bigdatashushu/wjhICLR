@@ -13,14 +13,21 @@ from typing import Callable, Mapping, Sequence
 from skill3d.adapters.episode_source import EpisodeItem
 from skill3d.evaluation.skill_ablation_v11 import (
     ARMS,
+    _file_hash,
     _common_config,
     _hash,
+    input_identity,
+    input_error_identity,
+    pair_results,
     quality_contract,
     run_skill_pair_evaluation_v11,
+    summarize_pairs,
+    tree_identity,
 )
 from skill3d.evolution.experience_v11 import (
     build_v11_experience_bundle_from_trace_store,
 )
+from skill3d.evolution.campaign_v11 import V11RevisionFormatError, _write_create_once
 from skill3d.online import runner
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
@@ -37,12 +44,12 @@ from skill3d.skills.registry import (
     active_snapshot_provenance,
     load_active_skills,
 )
-from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
+from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION, _PROGRAM_SYNTH
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
 
-REVISION_PROMPT_VERSION = "skill-revision-v11.1"
+REVISION_PROMPT_VERSION = "skill-revision-v11.2"
 _SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -77,6 +84,8 @@ def model_config_identity_v11(cfg: OnlineRunConfig) -> dict:
     """Return the online model request configuration without raw endpoint URLs."""
     value = {
         "model_id": cfg.vllm_model,
+        "model_weights_sha256": cfg.model_weights_sha256,
+        "environment_sha256": cfg.environment_sha256,
         "endpoint_sha256": [
             hashlib.sha256(str(endpoint).encode("utf-8")).hexdigest()
             for endpoint in cfg.vllm_endpoints
@@ -96,7 +105,6 @@ def solver_config_identity_v11(cfg: OnlineRunConfig, *, seed: int) -> dict:
         copy.deepcopy(cfg),
         seed=int(seed),
         skills=[],
-        memory_dir="",
         active_snapshot_ref="identity-only",
         active_snapshot_manifest_sha256="",
         evaluation_binding=None,
@@ -126,7 +134,7 @@ def _parse_json_response(text: str) -> dict:
 
 
 class V11OfflineReviser:
-    """DeepSeek-backed complete-SKILL.md reviser with metadata-only call audit."""
+    """Complete-source reviser with durable response reuse and separate metadata."""
 
     def __init__(
         self,
@@ -143,6 +151,8 @@ class V11OfflineReviser:
         self._health_checked = False
 
     def _prompt(self, **kwargs) -> str:
+        from skill3d.tools import REGISTRY
+
         parent: SkillSpecV11 = kwargs["parent"]
         experience = kwargs["experience"]
         feedback = list(kwargs.get("static_feedback") or [])
@@ -162,6 +172,10 @@ class V11OfflineReviser:
             f"Parent identity: {parent.skill_id}@{parent.version} "
             f"({parent.question_type}, sha256={parent.content_sha256})\n"
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
+            f"Keep the stable frontmatter name exactly {parent.name!r}.\n"
+            "Current online execution contract:\n"
+            f"{_PROGRAM_SYNTH.split('## 当前题目与答案要求')[0]}\n"
+            f"Current Tool interfaces ({TOOL_DOCS_VERSION}):\n{REGISTRY.docs()}\n"
             "Induction experience JSON:\n"
             f"{json.dumps(evidence, ensure_ascii=False, sort_keys=True)}\n"
             "Static-validation feedback from earlier attempts:\n"
@@ -173,23 +187,9 @@ class V11OfflineReviser:
             payload, ensure_ascii=False, indent=2, sort_keys=True,
             allow_nan=False,
         ) + "\n"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with path.open("x", encoding="utf-8") as stream:
-                stream.write(data)
-        except FileExistsError:
-            if path.read_text(encoding="utf-8") != data:
-                raise V11AdapterError(
-                    f"revision call audit already exists with different content: {path}")
+        _write_create_once(path, data.encode("utf-8"))
 
     def __call__(self, **kwargs) -> V11RevisionProposal:
-        if self.require_health_check and not self._health_checked:
-            require_service = getattr(self.client, "require_service", None)
-            if require_service is None:
-                raise V11AdapterError(
-                    "offline client does not provide require_service()")
-            require_service()
-            self._health_checked = True
         prompt = self._prompt(**kwargs)
         messages = [
             {
@@ -200,43 +200,42 @@ class V11OfflineReviser:
             },
             {"role": "user", "content": prompt},
         ]
-        call = getattr(self.client, "chat_with_meta", None)
-        if call is None:
-            raise V11AdapterError(
-                "offline client does not provide chat_with_meta()")
-        meta = call(
-            messages,
-            max_tokens=self.max_tokens,
-            seed=int(kwargs.get("attempt", 0)),
-        )
-        if bool(getattr(meta, "truncated", False)):
-            raise V11AdapterError("offline revision response was truncated")
-        text = str(getattr(meta, "text", "") or "")
-        value = _parse_json_response(text)
-        full_skill_md = value.get("full_skill_md")
-        modification_reason = value.get("modification_reason")
-        if not isinstance(full_skill_md, str) or not full_skill_md.strip():
-            raise V11AdapterError("offline revision JSON lacks full_skill_md")
-        if not isinstance(modification_reason, str) or not modification_reason.strip():
-            raise V11AdapterError("offline revision JSON lacks modification_reason")
-
         prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        output_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        request_id = str(getattr(meta, "request_id", "") or "no-request-id")
         audit_path = (
             self.audit_root
             / _safe_component(str(kwargs["campaign_id"]))
             / f"revision_{int(kwargs['attempt']):02d}.json"
         )
-        manifest_fields = (
-            meta.manifest_fields()
-            if callable(getattr(meta, "manifest_fields", None))
-            else {
-                "request_id": request_id,
-                "text_sha256": output_sha,
-                "n_chars": len(text),
+        exchange_path = audit_path.with_suffix(".exchange.json")
+        request = {"messages": messages, "max_tokens": self.max_tokens,
+                   "seed": int(kwargs.get("attempt", 0)),
+                   "idempotency_key": str(kwargs["idempotency_key"])}
+        if exchange_path.is_file():
+            exchange = json.loads(exchange_path.read_bytes())
+            if exchange["request"] != request:
+                raise V11AdapterError("revision request changed during resume")
+        else:
+            if self.require_health_check and not self._health_checked:
+                require_service = getattr(self.client, "require_service", None)
+                if require_service is None:
+                    raise V11AdapterError("offline client lacks require_service()")
+                require_service()
+                self._health_checked = True
+            call = getattr(self.client, "chat_with_meta", None)
+            if call is None:
+                raise V11AdapterError("offline client lacks chat_with_meta()")
+            meta = call(messages, max_tokens=self.max_tokens, seed=request["seed"])
+            text = str(getattr(meta, "text", "") or "")
+            exchange = {
+                "request": request, "text": text,
+                "truncated": bool(getattr(meta, "truncated", False)),
+                "request_id": str(getattr(meta, "request_id", "") or "no-request-id"),
+                "call": meta.manifest_fields() if callable(
+                    getattr(meta, "manifest_fields", None)) else {},
             }
-        )
+            self._write_audit(exchange_path, exchange)
+        text, request_id = exchange["text"], exchange["request_id"]
+        output_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
         self._write_audit(audit_path, {
             "schema_version": "skill-revision-call-v11/1.0",
             "campaign_id": str(kwargs["campaign_id"]),
@@ -245,15 +244,29 @@ class V11OfflineReviser:
             "prompt_version": REVISION_PROMPT_VERSION,
             "prompt_sha256": prompt_sha,
             "response_sha256": output_sha,
-            "call": manifest_fields,
+            "exchange_sha256": hashlib.sha256(exchange_path.read_bytes()).hexdigest(),
+            "call": exchange["call"],
         })
+        source_ref = (
+            f"{audit_path}:request:{_safe_component(request_id)}:"
+            f"prompt:{prompt_sha}:response:{output_sha}"
+        )
+        try:
+            if exchange["truncated"]:
+                raise V11AdapterError("offline revision response was truncated")
+            value = _parse_json_response(text)
+            full_skill_md = value.get("full_skill_md")
+            modification_reason = value.get("modification_reason")
+            if not isinstance(full_skill_md, str) or not full_skill_md.strip():
+                raise V11AdapterError("offline revision JSON lacks full_skill_md")
+            if not isinstance(modification_reason, str) or not modification_reason.strip():
+                raise V11AdapterError("offline revision JSON lacks modification_reason")
+        except V11AdapterError as exc:
+            raise V11RevisionFormatError(str(exc), source_run_ref=source_ref) from exc
         return V11RevisionProposal(
             full_skill_md=full_skill_md,
             modification_reason=modification_reason,
-            source_run_ref=(
-                f"{audit_path}:request:{_safe_component(request_id)}:"
-                f"prompt:{prompt_sha}:response:{output_sha}"
-            ),
+            source_run_ref=source_ref,
         )
 
 
@@ -343,6 +356,19 @@ class V11PairedEvaluator:
             raise V11AdapterError("candidate and experience parent snapshots differ")
         if str(kwargs["question_type"]) != parent.question_type:
             raise V11AdapterError("evaluation question type differs from parent")
+        qa_ids = [item.episode.qa_id for item in self.items]
+        expected_ids = list(self.expected_qa_ids) if self.expected_qa_ids is not None else qa_ids
+        if (not qa_ids or len(set(qa_ids)) != len(qa_ids)
+                or len(set(expected_ids)) != len(expected_ids)
+                or set(qa_ids) != set(expected_ids)):
+            raise V11AdapterError("empty, duplicate, or mismatched E11 panel")
+        learning_scenes = {case.scene_id for case in kwargs["experience"].cases}
+        for item in self.items:
+            if (item.episode.split != "inner_validation"
+                    or item.episode.question_type != parent.question_type):
+                raise V11AdapterError("E11 requires the target inner_validation panel")
+            if not item.episode.scene_name or item.episode.scene_name in learning_scenes:
+                raise V11AdapterError("learning/inner scene overlap or missing scene identity")
 
         model_identity = model_config_identity_v11(self.base_cfg)
         solver_identity = solver_config_identity_v11(self.base_cfg, seed=seed)
@@ -401,6 +427,81 @@ class V11PairedEvaluator:
         ]
         if not rows or int(summary.get("n_pairs", -1)) != len(rows):
             raise V11AdapterError("E11 summary and pair rows have different denominators")
+        # Re-derive both the frozen inputs and every aggregate before trusting a
+        # previous directory (including one left by another candidate/config).
+        expected_inputs = {
+            item.episode.qa_id: input_error_identity(item) if item.input_error else
+            input_identity(item, self.artifact_paths[item.episode.qa_id])
+            for item in self.items
+        }
+        specs = {"B01": parent, "B11": candidate.full_skill_spec}
+        expected_arms = {
+            arm: {
+                "skill_version": f"{spec.skill_id}@{spec.version}",
+                "content_sha256": spec.content_sha256,
+                "snapshot_ref": candidate.parent_snapshot_id if arm == "B01"
+                else f"candidate:{candidate.candidate_id}",
+                "manifest_sha256": self._parent_manifest_hash(candidate.parent_snapshot_id)
+                if arm == "B01" else self._candidate_manifest_hash(candidate),
+            } for arm, spec in specs.items()
+        }
+        code_root = Path(runner.__file__).parents[1]
+        expected_fields = {
+            "qa_ids": expected_ids,
+            "question_types": [parent.question_type],
+            "seed": seed,
+            "evaluation_mode": "fixed_parent_candidate",
+            "config_sha256": solver_identity["sha256"],
+            "common_config": solver_identity["config"],
+            "inputs": expected_inputs,
+            "quality_contract": quality_identity,
+            "quality_confirmation": self.quality_confirmation,
+            "client_mode": "injected" if self.client_factory else "vllm",
+            "reconstruction_costs_s": dict(self.reconstruction_costs or {}),
+            "source_sha256": {str(p.relative_to(code_root)): _file_hash(p)
+                              for p in sorted(code_root.rglob("*.py"))},
+        }
+        for key, value in expected_fields.items():
+            if manifest.get(key) != value:
+                raise V11AdapterError(f"E11 frozen {key} changed or missing")
+        if (manifest.get("snapshot", {}).get("arms") != expected_arms
+                or manifest.get("skill_manifest", {}).get("arms") != expected_arms):
+            raise V11AdapterError("E11 parent/candidate identities changed")
+        recomputed_pairs = pair_results(
+            [pair["arms"]["B01"] for pair in rows],
+            [pair["arms"]["B11"] for pair in rows], expected_ids)
+        if recomputed_pairs != rows:
+            raise V11AdapterError("E11 pair rows do not replay")
+        recomputed = summarize_pairs(recomputed_pairs)
+        if any(summary.get(key) != value for key, value in recomputed.items()):
+            raise V11AdapterError("E11 summary does not match recomputed rows")
+        if manifest.get("status") != recomputed["status"]:
+            raise V11AdapterError("E11 manifest/row completion status differs")
+        for arm, spec in specs.items():
+            source = output / "skills" / spec.skill_id / spec.version / "SKILL.md"
+            if not source.is_file() or source.read_text() != spec.skill_md:
+                raise V11AdapterError("E11 frozen Skill source changed")
+        for pair in rows:
+            qa_id = pair["qa_id"]
+            prepared = manifest["prepared"][qa_id]
+            no_image = "input_error" in prepared
+            digest = expected_inputs[qa_id]["sha256"] if no_image else prepared["sha256"]
+            input_hash = digest if no_image else _hash({
+                "original": expected_inputs[qa_id]["sha256"], "prepared": digest})
+            key = hashlib.sha256(qa_id.encode()).hexdigest()
+            if not no_image and tree_identity(output / "frozen" / key)["sha256"] != digest:
+                raise V11AdapterError("E11 prepared geometry changed")
+            for arm in ARMS:
+                record = pair["arms"][arm]
+                if (record["input_sha256"] != input_hash
+                        or record["config_sha256"] != solver_identity["sha256"]
+                        or record["run_id"] != f"{manifest['experiment_id']}:{arm}:{qa_id}"):
+                    raise V11AdapterError("E11 arm input/run identity differs")
+                if not no_image:
+                    result_path = output / "arms" / arm / key / "result.json"
+                    if (record.get("initial_tree_sha256") != digest
+                            or json.loads(result_path.read_bytes()) != record):
+                        raise V11AdapterError("E11 independent arm evidence differs")
         solver_requests = [
             request
             for pair in rows
@@ -420,12 +521,23 @@ class V11PairedEvaluator:
         status = (
             "completed" if summary.get("status") == "completed" else "incomplete")
         formal = bool(
-            summary.get("formal_result_eligible")
+            self.quality_confirmation
+            and self.quality_confirmation.get("confirmed") is True
+            and self.quality_confirmation.get("sha256") == quality_identity["sha256"]
+            and self.quality_confirmation.get("evidence_ref")
+            and self.client_factory is None
+            and bool(self.base_cfg.model_weights_sha256)
+            and bool(self.base_cfg.environment_sha256)
+            and recomputed["status"] == "completed"
+            and recomputed["n_input_error_pairs"] < len(rows)
+            and all(pair["comparable"] for pair in rows)
             and request_seed_observed
             and manifest.get("config_sha256") == solver_identity["sha256"]
             and manifest.get("quality_contract", {}).get("sha256")
             == quality_identity["sha256"]
         )
+        if bool(summary.get("formal_result_eligible")) != formal:
+            raise V11AdapterError("E11 formal eligibility does not replay")
         return V11PairedEvaluationReceipt(
             campaign_id=campaign_id,
             evaluation_id=str(manifest["experiment_id"]),
@@ -532,6 +644,9 @@ class V11PostPublishVerifier:
         ).hexdigest()[:16]
         if not trace_dir.exists():
             store = TraceStore(trace_dir)
+            store.claim_run(run_id)
+            store = store.bind(run_id=run_id)
+            outcomes = []
             for item in self.items:
                 cfg = replace(
                     copy.deepcopy(self.base_cfg),
@@ -540,7 +655,6 @@ class V11PostPublishVerifier:
                     active_snapshot_ref=snapshot_id,
                     active_snapshot_manifest_sha256=manifest_hash,
                     trace_dir=str(trace_dir),
-                    memory_dir="",
                     reuse_artifact=str(
                         Path(self.artifact_paths[item.episode.qa_id]).resolve()),
                     evaluation_binding=None,
@@ -549,17 +663,22 @@ class V11PostPublishVerifier:
                     self.client_factory(item.episode.qa_id)
                     if self.client_factory is not None else None
                 )
-                runner.run_episode(
+                outcomes.append(runner.run_episode(
                     item.episode.model_copy(deep=True),
                     [pixels.copy() for pixels in item.pixels],
                     cfg,
-                    trace_store=store,
+                    trace_store=store.bind(qa_id=item.episode.qa_id),
                     llm=llm,
-                    episodic=None,
                     input_error=None,
-                )
+                ))
+            n_unavailable = sum(
+                out.final_state == "unavailable" or any(
+                    row.get("service_errors") for row in out.rounds)
+                for out in outcomes)
             store.append("online_run", {
                 "run_id": run_id,
+                "status": "incomplete" if n_unavailable else "completed",
+                "n_unavailable": n_unavailable,
                 "mode": "real",
                 "baseline": "C1_tools_program",
                 "template_version": PROMPT_TEMPLATE_VERSION,

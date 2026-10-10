@@ -64,9 +64,10 @@ def _write_v6_artifact(tmp_path, *, with_poses: bool) -> str:
     调用依赖与位姿的 Tool 会抛 `ArtifactUnavailableError(missing=['poses'])`
     —— 正是 §14.1 的"共享前提失效"（geometry_3d）。
     """
-    se = syn.make_synthetic_episode("room_size_estimation", scene_name="tc-scene",
-                                    qa_id="tc-0", frame_size=FRAME_SIZE)
-    g = se.geometry
+    item = load_synthetic_items(
+        "inner_validation", question_types=["room_size_estimation"],
+        frame_size=FRAME_SIZE, seed=0)[0]
+    g, fs = item.geometry, item.episode.frame_set
     d = tmp_path / "recon"
     d.mkdir(parents=True, exist_ok=True)
     np.save(d / "depth.npy", g.depth_maps)
@@ -75,17 +76,17 @@ def _write_v6_artifact(tmp_path, *, with_poses: bool) -> str:
     np.save(d / "conf.npy", g.depth_conf)
     if with_poses:
         np.save(d / "c2w.npy", g.c2w)
-    q = compute_quality(None, frames=se.frames, depth_maps=g.depth_maps,
+    q = compute_quality(None, frames=item.pixels, depth_maps=g.depth_maps,
                         c2w_list=g.c2w, intrinsics=g.intrinsics,
                         point_map=g.point_map, depth_conf=g.depth_conf)
     assert q.main_gate_passed, q.diagnostic_warnings
     fusion = syn._synthetic_metric_fusion(g)
     receipt = write_per_frame_receipt(fusion, d / "per_frame_scale.json")
     art = ReconstructionArtifact(
-        artifact_id="tc-artifact", artifact_version="v1", scene_name="tc-scene",
-        frame_ids=list(range(32)), source_frame_indices=list(range(32)),
-        timestamps=[i / 30.0 for i in range(32)],
-        frame_set_hash=se.episode.frame_set.frame_set_hash,
+        artifact_id="tc-artifact", artifact_version="v1",
+        scene_name=item.episode.scene_name,
+        frame_ids=fs.frame_ids, source_frame_indices=fs.source_frame_indices,
+        timestamps=fs.timestamps, frame_set_hash=fs.frame_set_hash,
         c2w_list=str(d / "c2w.npy") if with_poses else "",
         intrinsics=str(d / "k.npy"),
         depth_maps=str(d / "depth.npy"), point_map=str(d / "pm.npy"), point_conf="",
@@ -119,7 +120,7 @@ def episode_item():
 def _cfg(tmp_path, art_path: str, *, max_recovery: int) -> OnlineRunConfig:
     return OnlineRunConfig(mode="real", reuse_artifact=art_path,
                            vllm_endpoints=["http://fake"], deterministic_replay=True,
-                           trace_dir=str(tmp_path / "t"), memory_dir="",
+                           trace_dir=str(tmp_path / "t"),
                            max_retries_per_operation=max_recovery, max_images=32)
 
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "skill3d"
 version = "0.1.0"
-description = "Skill3D: 自演进 3D 空间感知 VLM 智能体（在线 Qwen3-VL-8B + 离线 GPT-6 治理）"
+description = "harness3d: Skill 指导的可校验 3D 代码推理（基于 Skill3D codebase）"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.13",
@@ -23,13 +23,7 @@ dependencies = [
     "pandas",
     "datasets",
     "jinja2",
-    "lancedb",
-    "structlog",
     "hydra-core",
-    "mlflow",
-    "hypothesis",
-    "docker",
-    "transitions",
     "openai>=1.12.0",
     "pyyaml>=6.0,<7",
 ]
@@ -47,7 +41,4 @@ where = ["src"]
 # 单一事实源是 src/skill3d（§2）；`pytest` 从仓库根可直接运行，无需先安装。
 testpaths = ["tests"]
 pythonpath = ["src"]
-# legacy/ 为原 Skill-3D 参考代码，不参与新系统测试收集。
-# tests/archive_v5/ 为已废止机制的 v5 回归测试与旧 golden（只读历史证据，v6 §20）：
-# 刻意不收集（它们 import 的模块已被移入 skill3d/legacy/retired/，本就不该再跑）。
-norecursedirs = ["legacy", "third_party", ".git", "build", "dist", "tests/archive_v5"]
+norecursedirs = ["third_party", ".git", "build", "dist"]

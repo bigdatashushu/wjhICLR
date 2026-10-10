@@ -28,7 +28,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .experiment_protocol import MOCK_SYNTHESIS_SOURCES, normalize_synthesis_source
+MOCK_SYNTHESIS_SOURCES = frozenset({"mock_stub", "deterministic_stub"})
 
 # TODO_CALIBRATE：几何验证 / 成功率的目标阈值（论文报告用）
 DEFAULT_TARGET_MCA = 0.5
@@ -179,7 +179,7 @@ def aggregate_process_metrics(
             m.wallclock_s_total += float(getattr(trace, "wallclock_s", 0.0) or 0.0)
         regen.append(_regen_rounds(o))
         # §19.3：按 6 类（+mock_stub）归一分桶；未知取值保守归到 vllm_ok 之外的空桶
-        src = normalize_synthesis_source(getattr(o, "synthesis_source", ""))
+        src = str(getattr(o, "synthesis_source", "") or "").strip()
         synth_counts[src or "(none)"] = synth_counts.get(src or "(none)", 0) + 1
         if src in MOCK_SYNTHESIS_SOURCES:
             from_mock += 1

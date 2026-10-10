@@ -8,7 +8,7 @@ python -m skill3d.online.eval --split test --active-snapshot data/active_snapsho
   `TODO_USER_INPUT`）| `jsonl`（本系统约定格式的预抽帧清单）；
 - 两种运行模式 `--mode`：`real`（真实 M1–M13）| `mock_light`（合成输入 + 确定性 stub
   program，仅管道验证，§9.2）；
-- 两档 baseline `--baseline`：`C0_direct_vlm`（无 Tool 直答）| `C1_tools_program`（§16.1）；
+- 在线入口固定 `C1_tools_program`；B01/B11 与父/候选比较由 v11 实验驱动器执行；
 - 硬约束 9：`final_test`（或 `--split test`）需显式 `--allow-final-test`，且仅应盲评一次；
 - 硬约束 1：本模块在线，禁止任何离线强模型调用（v6 §3.3/§20：离线治理模型为
   DeepSeek-V4.1-Flash，仅离线；RunManifest 只**登记**其冻结配置，不发起调用）。
@@ -87,22 +87,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=0, help="最多跑 N 条（0 = 不限）")
     p.add_argument("--mode", default="mock_light", choices=["real", "mock_light"])
     p.add_argument("--baseline", default="C1_tools_program",
-                   choices=["C0_direct_vlm", "C1_tools_program"])
+                   choices=["C1_tools_program"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--deterministic-replay", action="store_true",
                    help="重放确定性：时间/id/latency 取确定性占位，保证同 seed 字节级一致")
     p.add_argument("--active-snapshot", default="", help="active snapshot 文件或目录（§13.5）")
-    p.add_argument("--skill-spec", default="",
-                   help="C2 消融：直接注入手写 SkillSpecV11 JSON（静态人工 Skill，无归纳）")
-    p.add_argument("--inject-wrong-skill", action="store_true",
-                   help="C5 消融：注入已知错误 Skill，观察回退/退化（可证伪 §17.5 #5）")
     p.add_argument("--vllm-endpoint", action="append", default=[],
                    help="本地 vLLM endpoint（可重复，DP×8 时给 8 个）")
     p.add_argument("--vllm-model", default="", help="served model name")
     p.add_argument("--trace-dir", default="")
-    p.add_argument("--memory-dir", default="",
-                   help="episodic 记忆目录（G-26；空=用 config 的 paths.memory_db 同级）")
-    p.add_argument("--no-memory", action="store_true", help="关闭在线 episodic 记忆写入")
     p.add_argument("--recon-dir", default="")
     # v6 §11：零样本度量深度跨帧融合（首个 PoC = MoGe-2）。
     # 默认**关闭**（metric_scale=None + scale_fusion_status="not_run"）——§11 全部
@@ -113,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="覆盖 MoGe-2 权重（HF repo id 或本地目录）")
     p.add_argument("--recon-method", default="vggt", choices=["vggt"],
                    help="重建方法；v6 §5.2 受控枚举只有 vggt（BA 路线与 colmap/dust3r "
-                        "对照基线均已废止并入 legacy/retired）")
+                        "历史对照基线请在对应 Git 提交运行）")
     p.add_argument("--max-retries-per-operation", type=int, default=None,
                    help="每类失败在有界求解循环中的最大恢复次数")
     p.add_argument("--frame-size", default="", help="合成帧尺寸 HxW（默认 480x640，与 VSI-Bench 对齐）")
@@ -203,18 +196,6 @@ def main(argv: list[str] | None = None) -> int:
     for w in warnings:
         print(f"[warn] {w}", file=sys.stderr)
 
-    # ---- 消融注入（C2 静态人工 Skill / C5 已知错误 Skill，§16.1）----
-    try:
-        skills, extra_ref = _apply_skill_ablations(args, skills)
-    except Exception as exc:  # noqa: BLE001 - spec 非法 → 明确报错退出
-        print(f"[错误] Skill 消融注入失败: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return 2
-    if extra_ref:
-        snapshot_ref = f"{snapshot_ref}+{extra_ref}"
-    if args.skill_spec or args.inject_wrong_skill:
-        print(f"[消融] C2/C5 Skill 注入：共 {len(skills)} 条（"
-              f"{'含已知错误 Skill' if args.inject_wrong_skill else '静态人工 Skill'}）")
-
     # ---- 数据源 ----
     qtypes = [q.strip() for q in args.question_types.split(",") if q.strip()]
     limit = args.limit or None
@@ -300,12 +281,11 @@ def main(argv: list[str] | None = None) -> int:
         max_regen=int(sandbox.max_regenerate),
         cell_timeout_s=int(sandbox.cell_timeout_s),
         trace_dir=args.trace_dir or paths.trace_store,
-        memory_dir=("" if args.no_memory
-                    else (args.memory_dir or str(Path(paths.memory_db).parent
-                                                 / "memory_episodic"))),
         recon_dir=args.recon_dir or paths.reconstructions,
         vllm_endpoints=list(args.vllm_endpoint),
         vllm_model=args.vllm_model or vllm.model,
+        max_images=int(getattr(vllm, "n_frames", 32)),
+        max_tokens=int(cfg_yaml.get("vllm", {}).get("max_tokens", 4096)),
         recon_method=args.recon_method,
         metric_depth_model=_maybe_moge2(args),
         # v6 §20：BA（官方 VGGSfM / vggt_sparse_ba）与整套"需校准的尺度"路线已废止，
@@ -385,8 +365,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\ntrace 已写: {run_cfg.trace_dir}（episode_input / episode_trace / "
           f"program_trace / geometry_check / evaluation_result / evaluation_run / "
           f"online_run）")
-    if run_cfg.memory_dir:
-        print(f"episodic 记忆: {run_cfg.memory_dir}（G-26；semantic 不在线写，硬约束 1/2）")
     print(f"synthesis_source 分布: "
           f"{ {s: sum(1 for o in outcomes if o.synthesis_source == s) for s in set(o.synthesis_source for o in outcomes)} }")
 
@@ -421,8 +399,11 @@ def main(argv: list[str] | None = None) -> int:
     # 免得跑了半天才发现用的不是配置里那一份（标签 + 内容摘要一起打）。
     _rp = run_cfg.retrieval_policy
     print(f"[info] 检索策略 {_rp.version()}（sha256={_rp.sha256()[:12]}，"
-          f"来源={_rp.source}）：top_k={_rp.top_k} rerank={_rp.rerank} "
+          f"来源={_rp.source}）：按题型选择唯一 active 方法，"
           f"方法上下文上限={_rp.method_context_max_chars} 字符")
+    if run.status != "completed":
+        print(f"[error] run incomplete: {run.n_unavailable} service-unavailable episodes")
+        return 1
     return 0
 
 
@@ -583,7 +564,6 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
         split_cfg_path, split_version = "", ""
     try:
         m = build_run_manifest(
-            docker_image=str((cfg_yaml.get("sandbox") or {}).get("image", "")),
             checkpoint_path=str((cfg_yaml.get("vllm") or {}).get("model", "")),
             config_path=args.config, repo_dir=".",
             split_version=split_version, seed=args.seed,
@@ -591,24 +571,13 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
         out = args.run_manifest or "data/run_manifest.json"
         vllm_cfg = cfg_yaml.get("vllm") or {}
         fsh, n_fsh = _frame_set_summary(items or [])
-        from skill3d.evaluation.golden_v5 import golden_versions
         from skill3d.reconstruction_gate.quality_metrics import (
             QUALITY_METRIC_VERSION,
         )
 
         # §19.2 离线治理模型块（无离线客户端 → 只登记冻结配置，invoked=false）
         offline = offline_manifest_fields(offline_client)
-        # HC39 golden 三元组：**必须带 `golden_` 前缀**。`golden_versions()` 里的
-        # `schema_version` / `quality_metric_version` 是 **golden 夹具**的版本
-        # （v5 golden = 5.0 / v5-no-g8-g5-optional），与本 run 的 v6 口径不同名同义——
-        # 直接展开会把 "6.0 / v6-warp-overlap-no-g5" 覆盖成 golden 的版本号，
-        # 让 RunManifest 谎报本 run 的 schema 口径。
-        golden = golden_versions()
-        golden_fields = {
-            "golden_version": golden.get("golden_version", ""),
-            "golden_schema_version": golden.get("schema_version", ""),
-            "golden_quality_metric_version": golden.get("quality_metric_version", ""),
-        }
+
         # §5.3：抽样算法／seed／qa_id 清单／hash 与排除行必须落盘 ——
         # "每个预登记 qa_id 必须有结果行"，且总体分母不得因排除而消失。
         sampling_fields = {}
@@ -636,12 +605,11 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
                 outcomes, sampling_receipt, exclusions))
         return write_run_manifest(m, out, extra={
             **sampling_fields,
-            # ---- 版本三元组（HC39：schema/质量口径/golden 必须同时留档）----
+            # ---- 版本三元组（HC39：schema/质量口径必须同时留档）----
             # v9：本 run 的 episode trace 声明当前合同（§17.2），manifest 必须
             # 与之一致 —— 否则 manifest 说 6.0、trace 说 9.0，又是一处自相矛盾。
             "schema_version": EPISODE_TRACE_SCHEMA_VERSION,
             "quality_metric_version": QUALITY_METRIC_VERSION,
-            **golden_fields,
             # ---- §19.2 版本字段（模板 / tool-face / 证据画像 / gate / 距离原语）----
             **current_version_fields(),
             # ---- §19.2 离线治理模型块（扁平键 + 嵌套块双写，便于审计脚本直读）----
@@ -683,13 +651,8 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
             "retrieval_config_version": retriev.version(),
             "retrieval_config_sha256": retriev.sha256(),
             "retrieval_config_source": str(retriev.source),
-            "retrieval_top_k": int(retriev.top_k),
-            "retrieval_rerank": bool(retriev.rerank),
-            "retrieval_candidates": int(retriev.candidates),
-            "retrieval_rank_weights": {k: float(retriev.rank_weights[k])
-                                       for k in sorted(retriev.rank_weights)},
             "retrieval_method_context_max_chars": int(retriev.method_context_max_chars),
-            "retrieval_ranking_rule": str(retriev.ranking_rule),
+            "retrieval_policy": retriev.canonical(),
             # §13.6：实测交付事实（本 run 里"检索选中"与"已送达模型"各有多少条）
             "n_retrieval_records": sum(
                 len(getattr(o, "retrieval_records", []) or []) for o in (outcomes or [])),
@@ -704,44 +667,9 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
                 for v in (getattr(o, "declared_selected_skill_versions", []) or [])}),
             "n_episodes_with_delivered_skills": sum(
                 1 for o in (outcomes or [])
-                if getattr(o, "delivered_skill_versions", None)),
-            "readiness_manifest_ref": str(
-                (cfg_yaml.get("readiness") or {}).get("manifest_path", ""))})
+                if getattr(o, "delivered_skill_versions", None))})
     except Exception as exc:  # noqa: BLE001
         return f"(写失败: {type(exc).__name__}: {exc})"
-
-
-def _apply_skill_ablations(args, skills: list) -> tuple[list, str]:
-    """Apply optional C2/C5 ablations using only the current SkillSpecV11."""
-    out = list(skills)
-    ref = ""
-    if args.skill_spec:
-        spec = SkillSpecV11.model_validate_json(
-            Path(args.skill_spec).read_text(encoding="utf-8"))
-        out = [s for s in out if s.question_type != spec.question_type] + [spec]
-        ref = f"static:{spec.skill_id}@{spec.version}"
-    if args.inject_wrong_skill:
-        wrong = wrong_skill_spec()
-        out = [s for s in out if s.question_type != wrong.question_type] + [wrong]
-        ref = (ref + "+" if ref else "") + f"wrong:{wrong.skill_id}@{wrong.version}"
-    return out, ref
-
-
-def wrong_skill_spec() -> SkillSpecV11:
-    """C5's deliberately invalid counting method in the current Skill format."""
-    return SkillSpecV11(
-        skill_id="S01",
-        version="999.0.0",
-        question_type="object_counting",
-        skill_md=(
-            "---\n"
-            "name: known-wrong-counting\n"
-            "description: Deliberately invalid C5 method for contract testing.\n"
-            "---\n"
-            "# Invalid method\n"
-            "Call `definitely_not_a_registered_tool(1, 2)` and return `42`.\n"
-        ),
-    )
 
 
 def _fmt(v) -> str:

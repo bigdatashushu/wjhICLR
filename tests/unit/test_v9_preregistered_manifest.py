@@ -179,7 +179,7 @@ def test_input_error_is_a_zero_score_result_and_preserves_the_denominator(
     trace_dir = tmp_path / "traces"
     outcomes, run = run_split(
         items,
-        OnlineRunConfig(mode="real", trace_dir=str(trace_dir), memory_dir=""),
+        OnlineRunConfig(mode="real", trace_dir=str(trace_dir)),
         trace_store=TraceStore(trace_dir),
     )
 
