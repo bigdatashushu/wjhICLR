@@ -531,6 +531,7 @@ src/skill3d/
   governance/                    离线模型客户端
   evolution/                     v11 四阶段更新与真实执行适配
 docs/skill_ablation_v11.md       v11 B01/B11 详细合同
+docs/reports/                    v11 运行诊断报告（正确率与证据链分析）
 ```
 
 `src/skill3d/legacy/readers.py` 仍是当前重建产物的版本校验入口，保留其读取与拒绝旧产物的行为；它不是旧求解器或重建实现。文件名含 v3/v6/v9 的测试只要仍约束当前数据和工具合同，就继续执行。
