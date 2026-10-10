@@ -14,7 +14,7 @@ from jinja2 import Environment, StrictUndefined
 from skill3d.schemas import SkillSpecV11
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_2"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_3"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -42,6 +42,9 @@ _PROGRAM_SYNTH = """你是一名空间推理 Coding Agent。根据题目、图�
 - 只能依据实际收到的图像和有效工具观察推理；已失效结果不得继续支持答案。
 - 有图必答：有可读图像时，证据不足可按视觉估计作答，并如实标记依据；`ReturnAnswer("abstain")` 不是合法答案。
 - 工具缺失、失败或无效返回不等于零；不得编造几何、尺度、观察或 result_id。
+- 排名必须覆盖题目全部选项；缺候选、实例歧义、距离不可测或最小值并列时，
+  不得把部分排序或 argmin 作为确定答案。可进一步观察，或在后续零工具片段依据原图
+  以 visual_estimate 作答。M11 会核对候选完整性、唯一最小值与选项映射。
 
 ## 答案载荷与观察接口
 - `AnswerPayload` 已在运行环境中提供，无需 import。完整提交为

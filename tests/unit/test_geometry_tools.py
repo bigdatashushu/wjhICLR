@@ -648,3 +648,91 @@ def test_horizontal_degenerate_direction_is_domain_error():
     r = call_tool("relative_direction_of",
                   {"observer_id": "obj_0", "facing_at_id": "obj_1", "target_id": "obj_2"}, h)
     assert r.error_code == "domain_value" and r.value == "null"
+
+
+def _ranking_handle(*, missing=False, invalid_instance=False, shared_track=False, duplicate=False):
+    objs = [_obj("ref", "desk", (0, 0, 0), track="ref-track"),
+            _obj("a", "chair", (2, 0, 0), track="a-track", dup=duplicate)]
+    if not missing:
+        objs.append(_obj("b", "lamp", (4, 0, 0),
+                         track="a-track" if shared_track else "b-track"))
+    if invalid_instance:
+        objs.append(_obj("a2", "chair", (1, 0, 0)))
+    handle = _handle(_scene(objs=objs, question_type="object_rel_distance"), objs=objs)
+    for i, obj in enumerate(objs):
+        handle.set_object_points(obj.obj_id, np.zeros((1, 3)) if obj.obj_id == "a2"
+                                 else _cluster(obj.centroid_world, spread=.15, seed=i))
+    return handle
+
+
+def test_relative_rank_covers_options_and_preserves_diagnostics():
+    from skill3d.tools.geometry_tools import relative_distance_rank
+    from skill3d.tools.ranking_contract import ranking_problems
+    handle = _ranking_handle(duplicate=True)
+    rank = relative_distance_rank(handle, "desk", ["chair", "lamp"])
+    reordered = relative_distance_rank(handle, "desk", ["lamp", "chair"])
+    assert rank["closest_category"] == reordered["closest_category"] == "chair"
+    assert rank["margin_normalized"] > 0
+    assert "suspect_duplicate" in rank["degradation_flags"]
+    assert "suspect_duplicate" in rank["candidates"][0]["instances"][0]["degradation_flags"]
+    assert not ranking_problems(rank, ["A. office chair", "B. lamp"])
+    assert ranking_problems(rank, ["chair", "lamp", "table"])
+
+
+@pytest.mark.parametrize(("kwargs", "status", "missing", "invalid"), [
+    ({"missing": True}, "incomplete_candidates", ["lamp"], []),
+    ({"invalid_instance": True}, "uncertain_geometry", [], ["chair"]),
+    ({"shared_track": True}, "ambiguous_grounding", [], []),
+])
+def test_partial_or_ambiguous_ranking_cannot_produce_winner(kwargs, status, missing, invalid):
+    from skill3d.tools.geometry_tools import relative_distance_rank
+    from skill3d.tools.ranking_contract import ranking_problems
+    rank = relative_distance_rank(_ranking_handle(**kwargs), "desk", ["chair", "lamp"])
+    assert rank["status"] == status
+    assert rank["closest_category"] is None
+    assert rank["categories_without_detection"] == missing
+    assert rank["categories_with_invalid_geometry"] == invalid
+    assert ranking_problems(rank)
+    if invalid:
+        assert rank["per_candidate"]["chair"] is None
+        assert len(rank["candidates"][0]["instances"]) == 2
+        assert "degraded" in rank["degradation_flags"]
+
+
+def test_self_candidate_and_same_reference_track_cannot_win():
+    from skill3d.tools.geometry_tools import relative_distance_rank
+    handle = _ranking_handle()
+    assert relative_distance_rank(handle, "desk", ["desk", "chair"])["status"] == "ambiguous_grounding"
+    handle.get_object("a").track_id = "ref-track"
+    assert relative_distance_rank(handle, "desk", ["chair", "lamp"])["closest_category"] is None
+
+
+def test_exact_tie_rejects_both_candidate_orders(monkeypatch):
+    from skill3d.tools import geometry_tools as gt
+    from skill3d.tools.distance_primitives import DistanceResult
+    monkeypatch.setattr(gt, "robust_distance_between_pointsets",
+                        lambda *a, **k: DistanceResult(1.0, None, 300))
+    for categories in (["chair", "lamp"], ["lamp", "chair"]):
+        rank = gt.relative_distance_rank(_ranking_handle(), "desk", categories)
+        assert rank["status"] == "uncertain_geometry"
+        assert rank["closest_category"] is None
+        assert rank["margin_normalized"] == 0
+        assert set(rank["tied_categories"]) == {"chair", "lamp"}
+
+
+def test_rank_contract_rejects_forged_ok_and_inconsistent_distance():
+    import copy
+    from skill3d.tools.geometry_tools import relative_distance_rank
+    from skill3d.tools.ranking_contract import ranking_problems
+    partial = relative_distance_rank(_ranking_handle(missing=True), "desk", ["chair", "lamp"])
+    partial.update(status="ok", closest_category="chair")
+    assert ranking_problems(partial)
+    rank = relative_distance_rank(_ranking_handle(), "desk", ["chair", "lamp"])
+    for mutate in (
+        lambda r: r["candidates"][0]["instances"].clear(),
+        lambda r: r["per_candidate"].update(chair=-1),
+        lambda r: r.update(closest_category="lamp"),
+    ):
+        bad = copy.deepcopy(rank)
+        mutate(bad)
+        assert ranking_problems(bad)

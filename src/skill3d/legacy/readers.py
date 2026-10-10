@@ -180,11 +180,12 @@ def read_legacy_episode_trace(raw: Any, *,
     elif str(detected) != str(EPISODE_TRACE_SCHEMA_VERSION):
         warnings.append(
             f"schema_version={detected!r} ≠ {EPISODE_TRACE_SCHEMA_VERSION!r} → "
-            "该记录不含 v9 引入的字段；缺字段不等于当时事实不存在，不得混入当前统计")
-    v9_only = ("round_trigger", "finalization_used")
-    missing = [f for f in v9_only if f not in data]
+            "该记录不含当前 Schema 的全部字段；缺字段不等于当时事实不存在，"
+            "不得混入当前统计")
+    current_only = ("round_trigger", "finalization_used", "eval_visual_fallback")
+    missing = [f for f in current_only if f not in data]
     if missing:
-        warnings.append(f"缺少 v9 字段 {missing} → 当时未记录这些事实")
+        warnings.append(f"缺少当前字段 {missing} → 当时未记录这些事实")
     return LegacyEpisodeTrace(
         source_path=source_path,
         detected_schema_version=(str(detected) if detected is not None else None),

@@ -187,6 +187,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-solver-rounds", type=int)
     parser.add_argument("--max-retries-per-operation", type=int)
     parser.add_argument("--finalization-rounds", type=int)
+    parser.add_argument("--eval-visual-fallback", action=argparse.BooleanOptionalAction,
+                        default=None, help="extra visual answer in evaluation splits only")
     parser.add_argument("--deepseek-base-url", default=BASE_URL)
     parser.add_argument("--deepseek-model", default=MODEL_ID)
     parser.add_argument("--deepseek-timeout-s", type=float, default=300.0)
@@ -310,6 +312,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.finalization_rounds
                 if args.finalization_rounds is not None
                 else int(raw["finalization_rounds"])
+            ),
+            eval_visual_fallback=(
+                args.eval_visual_fallback if args.eval_visual_fallback is not None
+                else bool(raw["eval_visual_fallback"])
             ),
             image_layout=vision.layout,
             max_derived_images=int(vision.max_derived_images),

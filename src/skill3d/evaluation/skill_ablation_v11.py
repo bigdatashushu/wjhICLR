@@ -39,6 +39,8 @@ from skill3d.skills.v11_library import (
     validate_v11_snapshot,
 )
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
+from skill3d.synthesis.eval_visual_fallback import EVAL_VISUAL_PROMPT_VERSION
+from skill3d.synthesis.request_context import current_request_phase
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
@@ -301,11 +303,26 @@ def quality_contract() -> dict:
     from skill3d.reconstruction_gate import m4_main_gate, scene_state
 
     root = Path(m4_main_gate.__file__).parent
+    evidence_sources = (
+        "tools/category_match.py", "tools/scene_handle.py", "tools/geometry_tools.py",
+        "tools/distance_primitives.py", "tools/ranking_contract.py",
+        "segmentation/sam2_tracker.py", "segmentation/open_vocab_detector.py",
+        "verifier/geometry_oracle.py", "verifier/derivation.py",
+        "online/runner.py", "online/submission.py",
+        "synthesis/eval_visual_fallback.py", "synthesis/request_context.py",
+        "synthesis/vllm_client.py", "fsm/online_fsm.py",
+    )
     value = {
         "enabled": True, "metric_version": m4_main_gate.M4_GATE_VERSION,
         "default_thresholds": m4_main_gate.default_thresholds(),
         "overall_quality_threshold": scene_state.TH_OVERALL_QUALITY,
         "source_sha256": {p.name: _file_hash(p) for p in sorted(root.glob("*.py"))},
+        "evidence_source_sha256": {
+            path: _file_hash(root.parent / path) for path in evidence_sources},
+        "execution_protocol_version": EXECUTION_PROTOCOL_VERSION,
+        "tool_docs_version": TOOL_DOCS_VERSION,
+        "prompt_template_version": PROMPT_TEMPLATE_VERSION,
+        "eval_visual_prompt_version": EVAL_VISUAL_PROMPT_VERSION,
     }
     return {**value, "sha256": _hash(value)}
 
@@ -322,6 +339,7 @@ def _common_config(cfg: OnlineRunConfig) -> dict:
     value["execution_protocol_version"] = EXECUTION_PROTOCOL_VERSION
     value["tool_face_version"] = TOOL_FACE_VERSION
     value["tool_docs_version"] = TOOL_DOCS_VERSION
+    value["eval_visual_prompt_version"] = EVAL_VISUAL_PROMPT_VERSION
     return _clean(value)
 
 
@@ -349,13 +367,12 @@ class _RecordingClient:
     def chat(self, messages, max_tokens=4096, **kwargs):
         plain = copy.deepcopy(messages)
         delivered = {}
-        is_solver = False
+        phase = current_request_phase()
         for message in plain:
             content = message.get("content")
             parts = ([{"text": content}] if isinstance(content, str) else content or [])
             for part in parts:
                 text = part.get("text", "")
-                is_solver = is_solver or "ReturnAnswer" in text
                 # A candidate may extend the complete parent text verbatim.
                 # Match the longest full body first so the parent prefix cannot
                 # be counted as delivery or left behind in the common prompt.
@@ -369,7 +386,8 @@ class _RecordingClient:
                     part["text"] = text
             if isinstance(content, str):
                 message["content"] = parts[0]["text"]
-        row = {"request_index": len(self.requests), "solver": is_solver,
+        row = {"request_index": len(self.requests), "solver": phase == "program",
+               "phase": phase,
                "seed": kwargs.get("seed"), "max_tokens": max_tokens,
                "request_sha256": _hash(messages), "common_request_sha256": _hash(plain),
                "skill_content_sha256": delivered, "success": False}
@@ -416,14 +434,18 @@ def _arm_result(
     for record in out.retrieval_records:
         data = record.model_dump(mode="json") if hasattr(record, "model_dump") else record
         delivered.update(data.get("delivered_content_sha256") or {})
-    requests = [r for r in client.requests if r["solver"]]
-    successful = [r for r in requests if r["success"]]
+    program_requests = [r for r in client.requests if r["phase"] == "program"]
+    visual_requests = [r for r in client.requests if r["phase"] == "eval_visual_fallback"]
+    requests = program_requests + visual_requests
+    successful = [r for r in program_requests if r["success"]]
     service_errors = list(client.failures) + [
         e for r in out.rounds for e in r.get("service_errors", [])]
     incomplete = bool(service_errors) or out.final_state == "unavailable"
     errors = [r for r in out.rounds if r.get("error_code")]
     error_codes = {str(row.get("error_code") or "") for row in errors}
-    delivery_ok = (all(r["skill_content_sha256"] == expected for r in requests)
+    delivery_ok = (all(r["skill_content_sha256"] == expected for r in program_requests)
+                   and all(not r["skill_content_sha256"] for r in visual_requests)
+                   and len(visual_requests) <= 1
                    and (not successful or delivered == expected)
                    and set(out.delivered_skill_versions) == set(delivered))
     score = None if incomplete else (
@@ -458,6 +480,15 @@ def _arm_result(
         "agent_rounds": int(out.agent_rounds),
         "yield_count": int(out.yield_count),
         "model_request_count": len(requests),
+        "program_request_count": len(program_requests),
+        "eval_visual_request_count": len(visual_requests),
+        "eval_visual_accepted": bool(out.eval_visual_fallback.get("accepted")),
+        "eval_visual_request_sha256": (
+            visual_requests[0]["request_sha256"] if visual_requests else None),
+        "eval_visual_fallback": dict(out.eval_visual_fallback),
+        "original_score": out.eval_visual_fallback.get("original_result", {}).get("score", score),
+        "original_final_state": out.eval_visual_fallback.get("original_result", {}).get(
+            "final_state", out.final_state),
         "tool_call_count": sum(
             len(row.get("results") or []) for row in out.rounds
         ),
@@ -467,10 +498,14 @@ def _arm_result(
         "errors": errors, "static_check_errors": out.static_check_errors,
         "service_errors": service_errors,
         "failure_code": out.failure_code, "notes": list(out.notes),
+        "terminal_failure": dict(out.terminal_failure),
+        "detector_attempts": list(out.detector_attempts),
+        "answer_basis": out.answer_basis,
         "delivered_skill_versions": out.delivered_skill_versions,
         "delivered_content_sha256": delivered, "delivery_ok": delivery_ok,
         "requests": client.requests,
-        "first_common_request_sha256": requests[0]["common_request_sha256"] if requests else None,
+        "first_common_request_sha256": (
+            program_requests[0]["common_request_sha256"] if program_requests else None),
         "quality_status": out.quality_status, "main_gate_passed": out.main_gate_passed,
         "scene_route": out.scene_route, "question_tool_scope": out.question_tool_scope,
         "answer_source": out.answer_source, "image_ledger": out.image_ledger,
@@ -490,6 +525,10 @@ def _incomplete_row(identity, *, task, is_mca, input_hash, config_hash, errors):
         "tool_contract_error": False, "geometry_rejection": False,
         "untrusted_geometry_used": False, "agent_rounds": 0, "yield_count": 0,
         "model_request_count": 0, "tool_call_count": 0, "reconstruction_cost_s": None,
+        "program_request_count": 0, "eval_visual_request_count": 0,
+        "eval_visual_accepted": False, "eval_visual_request_sha256": None,
+        "eval_visual_fallback": {},
+        "original_score": None, "original_final_state": "unavailable",
         "input_error_reason": "", "episode_status": "run_error", "delivery_ok": True,
         "delivered_skill_versions": [], "delivered_content_sha256": {},
         "service_errors": errors, "requests": [],
@@ -511,6 +550,10 @@ def pair_results(b01: Sequence[dict], b11: Sequence[dict], expected_qa_ids) -> l
         prompts = [a.get("first_common_request_sha256"), b.get("first_common_request_sha256")]
         if all(prompts) and prompts[0] != prompts[1]:
             raise PairingError(f"{qa_id}: actual common first requests differ")
+        visual_prompts = [
+            a.get("eval_visual_request_sha256"), b.get("eval_visual_request_sha256")]
+        if all(visual_prompts) and visual_prompts[0] != visual_prompts[1]:
+            raise PairingError(f"{qa_id}: actual evaluation visual requests differ")
         if not a["delivery_ok"] or not b["delivery_ok"]:
             raise PairingError(f"{qa_id}: actual Skill delivery mismatch")
         completed = a["status"] == b["status"] == "completed"
@@ -520,6 +563,8 @@ def pair_results(b01: Sequence[dict], b11: Sequence[dict], expected_qa_ids) -> l
             "input_sha256": a["input_sha256"], "config_sha256": a["config_sha256"],
             "status": "completed" if completed else "incomplete",
             "comparable": completed and (all(prompts) or input_error_pair),
+            "eval_visual_common_request_sha256": (
+                visual_prompts[0] if all(visual_prompts) else None),
             "arms": {"B01": a, "B11": b},
             "delta": b["score"] - a["score"] if completed else None,
         })
@@ -563,6 +608,29 @@ def summarize_pairs(pairs: Sequence[dict]) -> dict:
                 "n_incomplete": len(records) - len(scored),
                 "Accuracy": mean("score", [r for r in scored if r["metric"] == "Accuracy"]),
                 "MRA": mean("score", [r for r in scored if r["metric"] == "MRA"]),
+                "original_Accuracy": mean(
+                    "original_score", [r for r in records if r["metric"] == "Accuracy"
+                                       and r.get("original_score") is not None]),
+                "original_MRA": mean(
+                    "original_score", [r for r in records if r["metric"] == "MRA"
+                                       and r.get("original_score") is not None]),
+                "eval_visual_requests": sum(r.get("eval_visual_request_count", 0)
+                                            for r in records),
+                "eval_visual_accepted": sum(bool(r.get("eval_visual_accepted"))
+                                            for r in records),
+                "eval_visual_acceptance_rate": mean(
+                    "eval_visual_accepted",
+                    [r for r in records if r.get("eval_visual_request_count")]),
+                "eval_visual_Accuracy": mean(
+                    "score", [r for r in scored if r.get("eval_visual_request_count")
+                              and r["metric"] == "Accuracy"]),
+                "eval_visual_MRA": mean(
+                    "score", [r for r in scored if r.get("eval_visual_request_count")
+                              and r["metric"] == "MRA"]),
+                "answer_basis_counts": {
+                    basis: sum(r.get("answer_basis", "") == basis for r in records)
+                    for basis in ("tool_derived", "visual_estimate", "mixed", "")
+                },
                 **{
                     output: mean(field, scored)
                     for output, field in rate_fields.items()
@@ -822,7 +890,7 @@ def run_skill_ablation_v11(
                      else runner._make_vllm_client(cfg))
             return _RecordingClient(inner, seed=cfg.seed, specs=specs, store=store)
 
-        prepared, prepare_errors = {}, {}
+        prepared, prepare_errors, preparation_detector_attempts = {}, {}, {}
         # Freeze *all* common inputs before starting either arm.
         for q in expected:
             item = chosen[q]
@@ -846,6 +914,7 @@ def run_skill_ablation_v11(
             with capture_detector_failures() as detection_errors:
                 binding = PreparedObjectBinding(*runner._bind_objects_best_effort(
                     art, local_pixels, None, item.episode.model_copy(deep=True), cfg, llm))
+            preparation_detector_attempts[q] = list(binding.stats.get("detector_attempts") or [])
             if llm.contract_errors:
                 raise PairingError("; ".join(llm.contract_errors))
             llm.failures.extend(detection_errors)
@@ -864,7 +933,7 @@ def run_skill_ablation_v11(
                            "gate_thresholds": art.quality.gate_thresholds if art.quality else None}
             confirmation = confirmation_by_qa[q]
             if confirmation and confirmation.get("artifact", {}).get("sha256"):
-                artifact_sha = _sha256_file(Path(artifact_paths[q]).resolve())
+                artifact_sha = _file_hash(Path(artifact_paths[q]).resolve())
                 if artifact_sha != confirmation["artifact"]["sha256"]:
                     raise PairingError(f"{q}: artifact hash differs from quality confirmation")
             if confirmation and confirmation.get("artifact", {}).get("frame_set_hash"):
@@ -875,6 +944,7 @@ def run_skill_ablation_v11(
             ):
                 raise PairingError(f"{q}: artifact quality thresholds differ from confirmed contract")
         manifest.update({"prepared": prepared, "preparation_errors": prepare_errors,
+                         "preparation_detector_attempts": preparation_detector_attempts,
                          "status": "running"})
         _write(root / "manifest.json", manifest)
         results = {arm: [] for arm in ARMS}

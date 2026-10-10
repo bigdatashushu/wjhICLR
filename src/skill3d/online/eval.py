@@ -109,6 +109,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "历史对照基线请在对应 Git 提交运行）")
     p.add_argument("--max-retries-per-operation", type=int, default=None,
                    help="每类失败在有界求解循环中的最大恢复次数")
+    p.add_argument("--eval-visual-fallback", action=argparse.BooleanOptionalAction,
+                   default=None, help="评测失败后追加一次独立的 32 原帧视觉回答")
     p.add_argument("--frame-size", default="", help="合成帧尺寸 HxW（默认 480x640，与 VSI-Bench 对齐）")
     p.add_argument("--degrade", default="", choices=["", "blur_all", "blur_some",
                                                      "overexposed_all", "few_frames"],
@@ -297,6 +299,8 @@ def main(argv: list[str] | None = None) -> int:
         input_diagnostics=bool(cfg_yaml.get("input_diagnostics", False)),
         max_solver_rounds=int(cfg_yaml.get("max_solver_rounds", 6)),
         finalization_rounds=int(cfg_yaml.get("finalization_rounds", 1)),
+        eval_visual_fallback=(args.eval_visual_fallback if args.eval_visual_fallback is not None
+                              else bool(cfg_yaml["eval_visual_fallback"])),
         max_pixels=int(getattr(vllm, "max_pixels", 131072) or 131072),
         max_model_len=int(getattr(vllm, "max_model_len", 32768) or 32768),
         allow_final_test=args.allow_final_test,

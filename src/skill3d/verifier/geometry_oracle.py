@@ -29,6 +29,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
 from skill3d.schemas import ProgramExecutionTrace
+from skill3d.tools.ranking_contract import ranking_problems
 from skill3d.tools.scene_handle import SceneHandle
 
 TH_REPROJ_PX = 2.0  # TODO_CALIBRATE 重投影误差阈值（像素）
@@ -251,13 +252,15 @@ def geometry_verify(
     handle: SceneHandle,
     answer: Optional[str] = None,
     threshold_px: float = TH_REPROJ_PX,
+    *,
+    options: Optional[list[str]] = None,
 ) -> GeometryVerifyResult:
     """§4 M11 伪代码的确定性实现（不调 VLM / 离线治理模型；硬约束 13）。"""
     authorized = metric_evidence_authorized(handle)
     wf_ok = _world_frame_available(handle)
     checks = dict.fromkeys((
         "valid_json", "no_negative_distance", "unit_consistent", "world_frame",
-        "inside_bbox", "reprojection"), True)
+        "inside_bbox", "reprojection", "complete_ranking"), True)
     issues: list[GeometryIssue] = []
     reasons = {
         "valid_json": "成功工具结果不是有限合法 JSON",
@@ -280,6 +283,10 @@ def geometry_verify(
             "inside_bbox": check_inside_bbox(single, handle),
             "reprojection": check_reprojection(single, handle, threshold_px),
         }
+        if result.tool == "relative_distance_rank" and row["valid_json"]:
+            problems = ranking_problems(json.loads(result.value), options)
+            row["complete_ranking"] = not problems
+            reasons["complete_ranking"] = "; ".join(problems)
         for check, passed in row.items():
             if passed:
                 continue

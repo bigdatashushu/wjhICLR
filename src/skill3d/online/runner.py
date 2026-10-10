@@ -50,7 +50,7 @@ from skill3d.routing.skill_retriever import (
     retrieval_decision,
     retrieve_ex,
 )
-from skill3d.routing.task_classifier import TaskClassification, classify
+from skill3d.routing.task_classifier import TaskClassification, canonical_task, classify
 from skill3d.sandbox.ast_guard import ast_guard, normalize_program_source
 from skill3d.sandbox.kernel import CellResult, RestrictedNamespaceKernel
 from skill3d.sandbox.receipt import ReceiptChain, SandboxReceipt, verify_chain
@@ -92,10 +92,18 @@ from skill3d.synthesis.prompt_builder import (
     PROMPT_TEMPLATE_VERSION,
     PromptBuilder,
 )
+from skill3d.synthesis.eval_visual_fallback import (
+    EVAL_VISUAL_SPLITS,
+    request_visual_answer,
+)
+from skill3d.synthesis.request_context import request_phase
 from skill3d.tools import REGISTRY
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.mock_switch import MockSwitch
 from skill3d.tools.scene_handle import SceneHandle
+from skill3d.segmentation.open_vocab_detector import (
+    capture_detector_attempts, current_detector_attempts,
+)
 from skill3d.online.recovery import (
     MAX_RECOVERY_ATTEMPTS,
     RecoveryPlan,
@@ -173,6 +181,8 @@ class OnlineRunConfig:
     max_solver_rounds: Optional[int] = None
     max_retries_per_operation: Optional[int] = None
     finalization_rounds: Optional[int] = None
+    # 仅评测失败后追加一次干净视觉请求，不占原 solver 轮数；induction 硬禁用。
+    eval_visual_fallback: bool = False
     # Content-addressed provenance for the active skill snapshot. The human
     # readable ref remains separate so pointer movement cannot hide lineage.
     active_snapshot_manifest_sha256: str = ""
@@ -315,6 +325,9 @@ class EpisodeOutcome:
     used_result_ids: list[str] = field(default_factory=list)
     invalidated_result_ids: list[str] = field(default_factory=list)
     failure_code: Optional[str] = None
+    terminal_failure: dict = field(default_factory=dict)
+    eval_visual_fallback: dict = field(default_factory=dict)
+    detector_attempts: list[dict] = field(default_factory=list)
     degenerate_regenerated: bool = False    # 退化输出触发过重生成（§15.3）
     # v6 §5.9 P8：分阶段判读信息（M5/M7/M8），供 TraceRecord 归因
     m5_notes: list[str] = field(default_factory=list)
@@ -495,9 +508,7 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
         answer_basis=str(outcome.answer_basis or ""),
         answer=(outcome.answer_payload.model_dump()
                 if outcome.answer_payload is not None else {}),
-        derivation_replay=(
-            dict(outcome.verify.derivation_replay)
-            if outcome.verify is not None else {}),
+        derivation_replay=_final_derivation_replay(outcome),
         attribution=(outcome.attribution.model_dump()
                      if outcome.attribution is not None else {}),
         authorization_receipts=[dict(r) for r in (outcome.authorization_receipts or [])],
@@ -510,6 +521,9 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
                        if outcome.m5_summary is not None else 0)),
         cache_hit=bool(outcome.cache_hit),
         failure_code=outcome.failure_code,
+        terminal_failure=dict(outcome.terminal_failure),
+        eval_visual_fallback=dict(outcome.eval_visual_fallback),
+        detector_attempts=list(outcome.detector_attempts),
         m5_notes=_joined(outcome.m5_notes),
         m7_notes=_joined(outcome.m7_notes),
         m8_notes=_joined(outcome.m8_notes),
@@ -853,7 +867,8 @@ def _episode_status_of(final_state: str) -> str:
     return "run_error"
 
 
-def _record_answer_attribution(outcome: EpisodeOutcome, episode, kernel, answer: str) -> None:
+def _record_answer_attribution(outcome: EpisodeOutcome, episode, kernel, answer: str,
+                               *, payload_override=None) -> None:
     """§10.1/§12：记录答案载荷与**框架核验后**的工具归因。
 
     - 载荷优先取 `ReturnAnswer` 收到的原始对象；没有（如 C0 直答路径）则按 §12
@@ -863,8 +878,11 @@ def _record_answer_attribution(outcome: EpisodeOutcome, episode, kernel, answer:
     - 历史短写经适配器转换的问题记录一并保留。
     """
     slot = getattr(kernel, "answer_slot", None) if kernel is not None else None
-    payload = getattr(slot, "payload", None)
-    adapter_problems: list[str] = list(getattr(slot, "adapter_problems", []) or [])
+    payload = (payload_override if payload_override is not None
+               else getattr(slot, "payload", None))
+    adapter_problems: list[str] = (
+        [] if payload_override is not None
+        else list(getattr(slot, "adapter_problems", []) or []))
     if payload is None:
         payload, extra = parse_answer_payload(
             answer, question_type=str(getattr(episode, "question_type", "") or ""))
@@ -906,7 +924,14 @@ def _budget_receipt(cfg: OnlineRunConfig) -> dict:
         "finalization_rounds": int(cfg.finalization_rounds or 0),
         "max_retries_per_operation": int(cfg.max_retries_per_operation or 0),
         "max_regen": int(cfg.max_regen),
+        "eval_visual_fallback_max_requests": int(cfg.eval_visual_fallback),
     }
+
+
+def _final_derivation_replay(outcome: EpisodeOutcome) -> dict:
+    if outcome.eval_visual_fallback.get("accepted"):
+        return dict(outcome.eval_visual_fallback["derivation_replay"])
+    return dict(outcome.verify.derivation_replay) if outcome.verify is not None else {}
 
 
 def _joined(notes: Optional[list[str]]) -> Optional[str]:
@@ -1012,6 +1037,7 @@ def _record_first_synthesis(outcome: EpisodeOutcome, res: _SynthResult,
 
 # --------------------------------------------------------------- episode 执行 ----
 
+@capture_detector_attempts()
 def run_episode(
     episode: VSIBenchEpisode,
     pixels: Sequence[np.ndarray],
@@ -1259,6 +1285,8 @@ def run_episode(
                 m5_notes, m5_materialized = binding.notes, binding.materialized
             notes.extend(m5_notes)
             outcome.m5_notes = list(m5_notes)
+            if prepared_binding is not None:
+                outcome.detector_attempts = list(m5_stats.get("detector_attempts") or [])
             scene, handle, art = _scene_from_artifact(
                 art, pixels, m5_stats, m5_objects, episode, artifact_path=art_path,
                 objects_materialized=m5_materialized,
@@ -1379,6 +1407,65 @@ def run_episode(
 
     # ---------------- M12 BENCHMARK_EVAL ----------------
     answer: Optional[str] = kernel.answer_slot.answer if kernel is not None else None
+    visual_payload = None
+    if (cfg.eval_visual_fallback and cfg.mode == "real"
+            and episode.split in EVAL_VISUAL_SPLITS
+            and outcome.final_state == "run_error" and outcome.agent_rounds > 0
+            and answer is None):
+        original = {
+            "final_state": outcome.final_state, "answer": None,
+            "score": (None if any(r.get("service_errors") for r in outcome.rounds) else 0.0),
+            "failure_code": outcome.failure_code,
+            "terminal_failure": dict(outcome.terminal_failure),
+            "answer_untrusted": outcome.answer_untrusted,
+            "answer_flags": list(outcome.answer_flags) + list(fsm.answer_flags),
+            "agent_rounds": outcome.agent_rounds,
+            "geometry_verify": (outcome.verify.model_dump(mode="json")
+                                if outcome.verify is not None else None),
+        }
+        visual_payload, audit = request_visual_answer(
+            question=episode.question, options=list(episode.options or []),
+            question_type=str(outcome.task or canonical_task(episode.question_type)),
+            ledger=getattr(handle, "_ledger", None),
+            client=llm if llm is not None else _make_vllm_client(cfg),
+            round_index=outcome.agent_rounds + 1, max_images=cfg.max_images,
+            max_tokens=cfg.max_tokens, seed=int(cfg.seed))
+        outcome.eval_visual_fallback = {**audit, "original_result": original}
+        receipts.append("eval_visual_fallback", outcome.eval_visual_fallback)
+        if visual_payload is not None:
+            answer = str(visual_payload.value)
+            outcome.final_state = "answer"
+            outcome.failure_code = None
+            outcome.terminal_failure = {}
+            outcome.answer_untrusted = False
+            outcome.abstained = False
+            outcome.used_result_ids = []
+            outcome.answer_flags = [
+                flag for flag in outcome.answer_flags
+                if flag not in ("unanswerable", "abstain")
+            ]
+            fsm.answer_flags = [
+                flag for flag in fsm.answer_flags
+                if flag not in ("unanswerable", "abstain")
+            ]
+            # 原 M11 检查留在 original_result 与 rounds；视觉答案只做答案合同验收。
+            outcome.verify = None
+            outcome.answer_flags.append("eval_visual_fallback")
+            fsm.step("eval_visual_answer")
+            states.append(fsm.state.value)
+        elif audit.get("service_error"):
+            outcome.final_state = "unavailable"
+            outcome.failure_code = "service_unavailable"
+            outcome.terminal_failure = {
+                "code": "service_unavailable",
+                "stage": "EVAL_VISUAL_FALLBACK",
+                "termination_reason": "visual_request_failed",
+                "round": outcome.agent_rounds + 1,
+            }
+        notes.append(
+            f"评测增量视觉补答 requests={audit['request_count']} "
+            f"accepted={audit['accepted']} "
+            f"detail={audit.get('error') or audit.get('skipped_reason') or 'ok'}")
     answer_source = _answer_source_v6(answer=answer, program=program, kernel=kernel,
                                       outcome=outcome)
     if fsm.state is OnlineState.BENCHMARK_EVAL:
@@ -1398,7 +1485,8 @@ def run_episode(
         outcome.answer_source = answer_source
         # ---- v9 §10.1/§12：答案载荷 + 框架核验的工具归因 ----
         if answer is not None:
-            _record_answer_attribution(outcome, episode, kernel, answer)
+            _record_answer_attribution(
+                outcome, episode, kernel, answer, payload_override=visual_payload)
         if kernel is not None:
             outcome.authorization_receipts = [
                 dict(r) for r in (getattr(kernel, "authorization_receipts", []) or [])]
@@ -1426,6 +1514,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
     retry_counts: dict[str, int] = {}
     force_next = False
     unresolved_ids: set[str] = set()
+    termination_reason = "solver_round_budget_exhausted"
 
     def step(event):
         fsm.step(event)
@@ -1512,6 +1601,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             failure_key = "synthesis"
             if res.source in ("none", "vllm_service_error"):
                 outcome.final_state = "unavailable"
+                termination_reason = "synthesis_unavailable"
                 break
         else:
             prior_source = program.program_source
@@ -1549,12 +1639,16 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 if cell.answer_untrusted:
                     outcome.answer_flags.append("tool_contract_observed")
                 error = cell.error_code
+                if error == "tool_contract" and cell.contract_violations:
+                    cause = cell.contract_violations[-1]
+                    if cause.get("error_code"):
+                        record["cause_code"] = str(cause["error_code"])
                 if finalizing and cell.answer_untrusted:
                     error = "tool_contract"
                 if error is None and str(cell.answer or "").strip():
                     step("ok")
                     scope = submission_scope(kernel, trace)
-                    verify = geometry_verify(scope, handle, cell.answer)
+                    verify = geometry_verify(scope, handle, cell.answer, options=episode.options)
                     reference_issues = invalid_reference_issues(kernel)
                     if reference_issues:
                         verify = verify.model_copy(update={
@@ -1599,6 +1693,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     outcome.notes.append(
                         f"M11 round={index} passed={verify.passed} violations={verify.violations}")
                     if verify.passed:
+                        outcome.failure_code = None
+                        outcome.terminal_failure = {}
                         record["submission_accepted"] = True
                         outcome.used_result_ids = accepted_result_ids(kernel, scope)
                         step("pass")
@@ -1669,6 +1765,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         if kernel is not None:
             kernel.reset_user_namespace()
         if finalizing:
+            termination_reason = "finalization_failed"
             outcome.notes.append(f"M11 终结轮未通过验收（round={index}），不再请求模型")
             break
         if feedback and kernel is not None:
@@ -1682,6 +1779,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                            else int(cfg.max_retries_per_operation))
             exhausted = retry_counts[failure_key] > retry_limit
             if exhausted and int(cfg.finalization_rounds) <= 0:
+                termination_reason = "operation_retry_budget_exhausted"
                 outcome.notes.append(
                     f"{failure_key} 重试预算耗尽，且未保留 finalization 轮")
                 break
@@ -1696,7 +1794,16 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         kernel.reset_user_namespace()
     if outcome.final_state != "unavailable":
         outcome.final_state = "run_error"
-        outcome.failure_code = "unknown"
+    last = outcome.rounds[-1] if outcome.rounds else {}
+    outcome.failure_code = str(last.get("cause_code") or last.get("error_code") or "no_answer")
+    stage = ("M8" if not last.get("program_source") and not last.get("executed")
+             else "M9" if outcome.failure_code == "ast_violation"
+             else "M11" if outcome.failure_code == "geometry_rejected" else "M10")
+    outcome.terminal_failure = {
+        "code": outcome.failure_code, "stage": stage,
+        "termination_reason": termination_reason, "round": outcome.agent_rounds,
+    }
+    last["terminal_failure"] = dict(outcome.terminal_failure)
     outcome.notes.append(
         f"当前求解协议结束，无通过验收的答案；已用 "
         f"{outcome.agent_rounds}/{cfg.max_solver_rounds} 轮")
@@ -1786,7 +1893,8 @@ def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
     )
     handle = SceneHandle(scene, objects=objects or [], c2w_list=c2w, intrinsics=intr,
                          quality_overall=_overall_of(art),
-                         objects_materialized=objects_materialized)
+                         objects_materialized=objects_materialized,
+                         grounding_coverage=stats.get("grounding"))
     # 世界系点图注入句柄（平面拟合 / 连通性图的唯一数据入口）
     handle.set_point_map(point_map)
     # v9 §9.4：把**本 episode 实际可读的帧**装进句柄的图像账本 ——
@@ -1819,12 +1927,15 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
     # §7.1 `object_grounding`：M5 逐题补漏的**实际结果**（不是"没查"）
     g = (stats or {}).get("grounding") or grounding or {}
     if g.get("attempted"):
-        if g.get("miss") or int(g.get("n_boxes", 0)) <= 0:
+        if g.get("miss") or g.get("status") in ("missing", "fault"):
             hit, miss = False, True
-        elif int(g.get("n_new", 0)) > 0 or g.get("all_present"):
+        elif g.get("status") in ("partial", "ambiguous"):
+            hit, miss = None, False
+        elif g.get("all_present"):
             hit, miss = True, False
         else:
-            hit, miss = True, False
+            # 框数/新增数不能证明全部需求已覆盖；旧统计缺覆盖记录时保守降级。
+            hit, miss = None, False
     else:
         hit, miss = None, False      # 未做校验 → 上层按 degraded（不是 available）
     return M5EvidenceSummary(
@@ -1907,7 +2018,8 @@ def _retarget_handle(handle: Optional[SceneHandle], scene: SceneState) -> Option
                              c2w_list=handle._c2w, intrinsics=handle._k,     # noqa: SLF001
                              quality_overall=handle.quality_overall,
                              objects_materialized=handle.objects_materialized,
-                             metric_scale=handle.metric_scale)
+                             metric_scale=handle.metric_scale,
+                             grounding_coverage=handle.grounding_coverage)
     new_handle.set_point_map(handle.get_point_map())
     # v9 §9.4：逐题 scope 重派生**不得丢**帧集与已产出的图像（同一 episode 的账本）
     new_handle._set_image_ledger(handle._ledger)  # noqa: SLF001
@@ -1917,6 +2029,7 @@ def _retarget_handle(handle: Optional[SceneHandle], scene: SceneState) -> Option
     return new_handle
 
 
+@capture_detector_attempts()
 def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
                               llm=None, point_conf=None) -> tuple[list, dict, list[str], bool]:
     """M5 对象绑定：SAM2 未配置等失败 → 记降级、不阻断（§4 M5 字段 9）。
@@ -1944,6 +2057,8 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
     try:
         objects, stats, notes = bind_objects_for_scene(
             pixels, None, episode.question, depth_maps=depth, c2w_list=c2w,
+            question_type=canonical_task(episode.question_type),
+            options=episode.options,
             intrinsics=intr, out_dir=_m5_out_dir(art), scene_name=art.scene_name,
             # v6：BA 已废止 → 深度网格恒为纯缩放（mask_to_grid 走 resize_mask_nearest），
             # 不再需要 grid_transform 仿射映射（§20 废止表）
@@ -1956,9 +2071,14 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
             seed=int(cfg.seed),
         )
     except Exception as exc:  # noqa: BLE001 - checkpoint/依赖/传播失败
-        return [], {"binding_error": f"{type(exc).__name__}: {exc}"}, [
+        return [], {"binding_error": f"{type(exc).__name__}: {exc}",
+                    "detector_attempts": current_detector_attempts()}, [
                         f"M5 对象绑定不可用（{type(exc).__name__}: {exc}）→ "
                         "相关 Tool 查询回退全场景（TODO_USER_INPUT: SAM2 checkpoint，§7.1 G-19）"], False
+    stats["detector_attempts"] = current_detector_attempts()
+    if any(a.get("status") == "error" and not a.get("will_retry")
+           for a in stats["detector_attempts"]):
+        stats["detector_fault"] = True
     return objects, stats, notes, True
 
 
@@ -2159,7 +2279,8 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             messages.append({"role": "user", "content": traceback_feedback})
     try:
         # 请求级 seed：钉住 vLLM 采样随机性（§7 复现纪律）
-        text = client.chat(messages, max_tokens=cfg.max_tokens, seed=int(cfg.seed))
+        with request_phase("program"):
+            text = client.chat(messages, max_tokens=cfg.max_tokens, seed=int(cfg.seed))
     except Exception as exc:  # noqa: BLE001 - 网络/服务不可用
         from skill3d.synthesis.vllm_client import ServiceUnavailable
 
@@ -2275,9 +2396,13 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
     gate = getattr(scene, "metric_evidence_gate_result", None) if scene is not None else None
     plan = plan_delivery(
         skills, max_chars=(policy.method_context_max_chars if policy is not None else None))
+    scene_summary = scene.summary if scene is not None else ""
+    if handle is not None and handle.grounding_coverage:
+        scene_summary += "\nM5 初始对象覆盖（后续新增对象以工具清单为准）: " + json.dumps(
+            handle.grounding_coverage, ensure_ascii=False, sort_keys=True)
     text = PromptBuilder().render(
         question=episode.question,
-        scene_summary=(scene.summary if scene is not None else ""),
+        scene_summary=scene_summary,
         scene_frame="world",
         # 静态裁剪：scope + EvidenceProfile + 句柄实际装载产物 三条件，
         # 使 prompt 列出的 Tool 在执行期一定不会因缺产物/证据不足抛错
@@ -2308,6 +2433,8 @@ def _answer_source_v6(*, answer: Optional[str], program, kernel,
                       outcome: EpisodeOutcome) -> str:
     """Attribute accepted answers to the program; retain failure distinctions."""
     if answer is not None and str(answer) != "":
+        if outcome.eval_visual_fallback.get("accepted"):
+            return "direct_vlm_routed"
         from_program = (kernel is not None
                         and str(getattr(program, "program_source", "") or "") != "")
         return "tool_program" if from_program else "abstain"
@@ -2571,6 +2698,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
               scene=None, handle=None) -> EpisodeOutcome:
     """收尾：failure 归因、receipts 链校验、EpisodeTrace 落盘（M13）。"""
     outcome.states = list(states)
+    outcome.detector_attempts.extend(current_detector_attempts())
     # v9 §9.4：图像账本在这里**唯一**落一次（handle 只在此可见），保证每条 finalize
     # 路径都带上三态记录，不会因为某条 continue/break 分支漏掉。
     if handle is not None:
@@ -2695,6 +2823,9 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         used_result_ids=sorted(set(outcome.used_result_ids or [])),
         invalidated_result_ids=sorted(set(outcome.invalidated_result_ids or [])),
         failure_code=outcome.failure_code,
+        terminal_failure=dict(outcome.terminal_failure),
+        eval_visual_fallback=dict(outcome.eval_visual_fallback),
+        detector_attempts=list(outcome.detector_attempts),
         synthesis_source=str(outcome.synthesis_source or ""),
         round_trigger=str(outcome.round_trigger or "initial"),
         finalization_used=bool(outcome.finalization_used),
@@ -2702,9 +2833,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         answer_basis=str(outcome.answer_basis or ""),
         answer=(outcome.answer_payload.model_dump()
                 if outcome.answer_payload is not None else {}),
-        derivation_replay=(
-            dict(outcome.verify.derivation_replay)
-            if outcome.verify is not None else {}),
+        derivation_replay=_final_derivation_replay(outcome),
         attribution=(outcome.attribution.model_dump()
                      if outcome.attribution is not None else {}),
         authorization_receipts=[dict(r) for r in (outcome.authorization_receipts or [])],
@@ -2801,11 +2930,10 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             episode_status=str(outcome.episode_status or ""),
             label_access=False,
             input_error_reason=str(outcome.input_error_reason or ""),
-            derivation_replay=(
-                dict(outcome.verify.derivation_replay)
-                if outcome.verify is not None else {}),
+            derivation_replay=_final_derivation_replay(outcome),
             abstained=bool(outcome.abstained),
             failure_code=outcome.failure_code,
+            eval_visual_fallback=dict(outcome.eval_visual_fallback),
         ))
     return outcome
 

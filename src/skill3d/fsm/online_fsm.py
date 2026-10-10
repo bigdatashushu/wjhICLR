@@ -74,6 +74,10 @@ class OnlineFSM:
         if event == "solver_failed" and s not in TERMINAL:
             self.state = OnlineState.ANSWER
             return self.state
+        # driver 仅在评测失败后的独立视觉答案通过合同验收时发出此事件。
+        if event == "eval_visual_answer" and s is OnlineState.ANSWER:
+            self.state = OnlineState.BENCHMARK_EVAL
+            return self.state
         if event == "resynthesize" and s in (
                 OnlineState.STATIC_CHECK, OnlineState.SANDBOX_EXECUTE):
             self.state = OnlineState.SYNTHESIZE_PROGRAM

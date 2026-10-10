@@ -76,6 +76,8 @@ def main(argv=None) -> int:
     parser.add_argument("--max-solver-rounds", type=int)
     parser.add_argument("--max-retries-per-operation", type=int)
     parser.add_argument("--finalization-rounds", type=int)
+    parser.add_argument("--eval-visual-fallback", action=argparse.BooleanOptionalAction,
+                        default=None, help="one extra clean visual answer after evaluation failure")
     parser.add_argument("--allow-final-test", action="store_true")
     parser.add_argument("--quality-confirmation", help="confirmed current quality contract with evidence_ref")
     parser.add_argument("--print-quality-contract", action="store_true")
@@ -143,6 +145,8 @@ def main(argv=None) -> int:
             max_retries_per_operation=(args.max_retries_per_operation
                                        if args.max_retries_per_operation is not None else raw["max_retries_per_operation"]),
             finalization_rounds=args.finalization_rounds if args.finalization_rounds is not None else raw["finalization_rounds"],
+            eval_visual_fallback=(args.eval_visual_fallback if args.eval_visual_fallback is not None
+                                  else bool(raw["eval_visual_fallback"])),
             image_layout=vision.layout, max_derived_images=vision.max_derived_images,
             retrieval_policy=retrieval_policy_from(raw),
         )

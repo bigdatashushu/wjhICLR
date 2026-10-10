@@ -49,12 +49,11 @@ RoundTriggerValue = Literal["initial", "observation", "error_recovery", "finaliz
 
 # EpisodeTrace 的 Schema 身份（v9 §17.2：旧结果保留原身份，新结果用当前合同）。
 #
-# 6.0 语料（`data/v5_*`、`data/v6_*`、`data/v7_*`）继续声明 "6.0"，由
-# `skill3d.legacy.readers.read_legacy_episode_trace` 只读解释；**不得**把 6.0 的
-# JSON 直接 `model_validate` 成当前对象 —— 新增字段会被默认值静默填满，看起来
-# 像"当时那个事实不存在"，而真相是"当时没记这个事实"。
-EPISODE_TRACE_SCHEMA_VERSION = "9.0"
-LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS: tuple[str, ...] = ("6.0",)
+# 6.0 与 9.0 语料由 `skill3d.legacy.readers.read_legacy_episode_trace` 只读解释；
+# **不得**直接 `model_validate` 成当前对象。9.1 新增评测视觉补答及原失败快照，
+# 旧记录缺该字段表示“当时未记录”，不能被默认空对象解释成“当时未触发”。
+EPISODE_TRACE_SCHEMA_VERSION = "9.1"
+LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS: tuple[str, ...] = ("6.0", "9.0")
 
 # 失败码（§5.9 / §19.1；不依赖重跑即可归因失败）
 FailureCode = Literal[
@@ -112,6 +111,7 @@ class EvaluationResultTrace(Spec):
     derivation_replay: dict = {}
     abstained: bool = False
     failure_code: Optional[str] = None
+    eval_visual_fallback: dict = {}
 
 
 class TraceRecord(Spec):
@@ -176,6 +176,10 @@ class TraceRecord(Spec):
     n_objects: int = 0
     cache_hit: bool = False
     failure_code: Optional[str] = None
+    terminal_failure: dict = {}
+    # 评测独立补答及原流程失败快照；不计入程序轮/Skill 交付。
+    eval_visual_fallback: dict = {}
+    detector_attempts: list[dict] = []
     m5_notes: Optional[str] = None
     m7_notes: Optional[str] = None
     m8_notes: Optional[str] = None
@@ -257,6 +261,9 @@ class EpisodeTrace(Spec):
     used_result_ids: list[str] = []
     invalidated_result_ids: list[str] = []
     failure_code: Optional[str] = None
+    terminal_failure: dict = {}
+    eval_visual_fallback: dict = {}
+    detector_attempts: list[dict] = []
     # synthesis_source 六类（§19.3）
     synthesis_source: str = ""
     # v9 §12.2：这一轮为何被生成 / 是否进入收口阶段（与 synthesis_source 分开）

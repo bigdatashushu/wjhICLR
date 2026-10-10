@@ -20,10 +20,9 @@
 - 归一：小写、`_-/` → 空格、压空格、去首尾；
 - 单复数：简单词尾剥离（`s` / `es`）后比较（不做词干递归）；
 - 同义词：`SYNONYMS` 表把常见室内同义词折叠到同一规范名；
-- 命中判据：**规范串的单词集合有交集**（而非子串包含），
-  这样 `blue chair` 能命中 `chair`，`chair` 也能命中 `blue chair`，
-  但 `chair` **不会**误命中 `chair mat` 之外的无关联（`chair mat` 仍会命中，
-  这是允许的：题面点名的修饰词不影响类别）。
+- 命中判据：移除登记的外观前缀后，规范类别必须相等；
+  不以子串或任意共享单词判定类别。`bookshelf`、`book`、`shelf` 各自独立。
+  外观修饰只用于类别检索，具体实例仍由 SceneHandle 做唯一性检查。
 """
 
 from __future__ import annotations
@@ -51,6 +50,8 @@ SYNONYMS: dict[str, str] = {
     "screen": "monitor",
     "display": "monitor",
     "computer mouse": "mouse",
+    "desk chair": "chair",
+    "office chair": "chair",
     "mouse": "mouse",
     "keyboard": "keyboard",
     "fridge": "refrigerator",
@@ -170,6 +171,12 @@ SYNONYMS: dict[str, str] = {
 
 _WS = re.compile(r"[\s_\-/,]+")
 _TOKEN = re.compile(r"[a-z0-9]+")
+CATEGORY_MATCH_VERSION = "category-match-v11.2"
+_APPEARANCE_PREFIXES = frozenset({
+    "the", "a", "an", "black", "white", "blue", "red", "green", "yellow",
+    "orange", "brown", "gray", "grey", "pink", "purple", "beige",
+    "small", "large", "big", "wooden", "metal", "plastic",
+})
 
 
 def normalize(name: str) -> str:
@@ -213,31 +220,30 @@ def _depluralize(s: str) -> str:
 
 
 def tokens(name: str) -> set[str]:
-    """规范名的单词集合（用于交集判据）。"""
+    """规范名的单词集合（供调用方分析，不作为类别命中判据）。"""
     return set(_TOKEN.findall(canonical(name)))
+
+
+def option_category(value: str) -> str:
+    """对象选项去掉可选字母前缀；只读取题面选项，不读取答案标签。"""
+    return re.sub(r"^\s*(?:\([A-Za-z]\)|[A-Za-z][.)])\s*", "", str(value)).strip()
 
 
 def matches(query: str, category_name: str) -> bool:
     """`query`（题面用词）是否指向 `category_name`（清单里的类别）。
 
-    判据（按优先级）：
-
-    1. 规范化后**完全相等** → 命中；
-    2. 规范化后一方是另一方的**子串**（处理 `chair` vs `blue chair`、
-       `desk` vs `desk counter`）→ 命中；
-    3. 规范化的**单词集合有交集** → 命中（处理词序/修饰词差异）。
-
+    只去掉明确的外观前缀，再做完整类别与同义词匹配；不猜复合名词的含义。
     空查询/空类别名 → False（不把"没写类别"当成"匹配一切"）。
     """
-    q = canonical(query)
-    c = canonical(category_name)
-    if not q or not c:
-        return False
-    if q == c:
-        return True
-    if q in c or c in q:
-        return True
-    return bool(tokens(q) & tokens(c))
+    def category(value: str) -> str:
+        words = normalize(value).split()
+        while len(words) > 1 and words[0] in _APPEARANCE_PREFIXES:
+            words.pop(0)
+        return canonical(" ".join(words))
+
+    q, c = category(query), category(category_name)
+    return bool(q and c and q == c)
 
 
-__all__ = ["SYNONYMS", "canonical", "matches", "normalize", "tokens"]
+__all__ = ["CATEGORY_MATCH_VERSION", "SYNONYMS", "canonical", "matches",
+           "normalize", "option_category", "tokens"]

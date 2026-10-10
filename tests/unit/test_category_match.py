@@ -62,6 +62,12 @@ def test_true_matches(query, category):
     ("chair", "table"),
     ("microwave", "monitor"),
     ("pan", "pot"),         # 同义词表里没有的语义相近词不算等价
+    ("bookshelf", "book"),
+    ("bookshelf", "shelf"),
+    ("desk", "desk chair"),
+    ("chair", "chair mat"),
+    ("coffee table", "coffee maker"),
+    ("computer mouse", "computer tower"),
 ])
 def test_false_matches(query, category):
     assert not matches(query, category), f"{query!r} 不应命中 {category!r}"
@@ -122,3 +128,18 @@ def test_scene_handle_uses_normalized_matching():
     assert h.resolve_object_id("obj_2") == "obj_2"
     with pytest.raises(KeyError):
         h.resolve_object_id("microwave")
+
+    # 存在性不依赖唯一绑定；多个实例不得按 obj_id 顺序选择参考物。
+    from skill3d.tools.contract import DomainValueError
+
+    duplicate = objs[0].model_copy(update={"obj_id": "obj_9"})
+    ambiguous = SceneHandle(scene, objects=[*objs, duplicate], objects_materialized=True)
+    assert ambiguous.exists("telephone")
+    with pytest.raises(DomainValueError, match="ambiguous_object"):
+        ambiguous.resolve_object_id("telephone")
+    with pytest.raises(DomainValueError, match="ambiguous_object"):
+        ambiguous.resolve_object_id("phone")
+    assert ambiguous.resolve_object_id("obj_9") == "obj_9"
+    assert not ambiguous.exists("")
+    with pytest.raises(KeyError):
+        ambiguous.resolve_object_id("")

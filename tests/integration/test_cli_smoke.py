@@ -50,7 +50,7 @@ def test_online_eval_writes_traces(tmp_path):
              # 记忆与 RunManifest 也落在 tmp，避免污染仓库工作目录
 
              "--run-manifest", str(tmp_path / "run_manifest.json"),
-             "--frame-size", "120x160")
+             "--frame-size", "120x160", cwd=tmp_path)
     assert r.returncode == 0, r.stderr
     assert "EvaluationRun" in r.stdout
     for topic in ("episode_trace", "evaluation_run", "online_run", "trace_record"):
@@ -163,3 +163,17 @@ def test_reconstruction_blocks_final_test(tmp_path):
              "--method", "vggt", "--plan-only")
     assert r.returncode == 2
     assert "硬约束 9" in r.stderr
+
+
+def test_root_gpu_launcher_has_valid_shell_and_documents_gpu_plan():
+    root = Path(__file__).resolve().parents[2]
+    launcher = root / "start_harness3d.sh"
+    syntax = subprocess.run(
+        ["bash", "-n", str(launcher)], capture_output=True, text=True, timeout=30)
+    assert syntax.returncode == 0, syntax.stderr
+    help_result = subprocess.run(
+        [str(launcher), "--help"], capture_output=True, text=True,
+        cwd=root, timeout=30)
+    assert help_result.returncode == 0, help_result.stderr
+    assert all(label in help_result.stdout for label in (
+        "GPU 2", "GPU 3", "GPU 4", "--smoke", "--dry-run"))

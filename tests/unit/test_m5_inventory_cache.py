@@ -128,7 +128,7 @@ def test_detector_healthy_but_no_detection_is_not_blamed(monkeypatch):
     assert not any("降级" in n for n in notes)
 
 
-def test_detector_retry_recovers(monkeypatch):
+def test_inventory_does_not_repeat_detector_requests_for_empty_results(monkeypatch):
     from skill3d.segmentation import open_vocab_detector as ovd
 
     calls = {"n": 0}
@@ -139,6 +139,7 @@ def test_detector_retry_recovers(monkeypatch):
 
     def fake_detect(frame, prompt, **kw):
         calls["n"] += 1
+        ovd.detect.last_error = ""
         return [] if calls["n"] <= 3 else [_D()]
 
     monkeypatch.setattr(ovd, "available", lambda: True)
@@ -146,8 +147,24 @@ def test_detector_retry_recovers(monkeypatch):
     monkeypatch.setattr(ovd, "detect", fake_detect)
     notes: list[str] = []
     out = _detector_boxes(_frames(3), [0, 1, 2], "chair", notes)
-    assert out and out[0][1] == "chair"
-    assert any("重试后恢复" in n for n in notes)
+    assert not out and calls["n"] == 3
+    assert any("服务正常" in n for n in notes)
+
+
+def test_inventory_preserves_earlier_frame_failure_after_healthy_response(monkeypatch):
+    from skill3d.segmentation import open_vocab_detector as ovd
+    calls = []
+    def fake_detect(frame, prompt, **kw):
+        ovd.detect.last_error = "" if calls else "ConnectionError: refused"
+        calls.append(1)
+        return []
+    monkeypatch.setattr(ovd, "available", lambda: True)
+    monkeypatch.setattr(ovd, "detect", fake_detect)
+    notes, stats = [], {}
+    _detector_boxes(_frames(2), [0, 1], "chair", notes, stats=stats)
+    assert len(calls) == 2
+    assert stats["detector_fault"] is True
+    assert any("frame=0" in n and "检测器侧降级" in n for n in notes)
 
 
 # ----------------------------------------------------- 端到端：清单复用 ----

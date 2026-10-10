@@ -30,6 +30,7 @@ v6 证据字段（本模块的落点）：
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -39,13 +40,15 @@ import numpy as np
 
 from skill3d.coords import vlm_box_to_pixels
 from skill3d.schemas.reconstruction import ObjectRecord
+from skill3d.tools.category_match import CATEGORY_MATCH_VERSION, matches, option_category
+from .open_vocab_detector import capture_detector_failures, current_detector_failures
 
 # 场景清单缓存版本（改 M5 清单构造逻辑时递增 → 旧缓存自动失效，不会混用口径）
 # v2：`ObjectInstance` 增 `visible_frames`（逐帧可见性题型）→ 旧缓存缺该字段，必须失效
 # v3：v6 §5.6 字段改名（obj_id/category_name/det_conf）+ 新增 track_id /
 #     duplicate_suspect / pointconf_world / grounding_status → 旧缓存是 v5 口径
 #     （无 track，计数无法做 track 共识），必须失效重算。
-_INVENTORY_VERSION = "m5-inventory-5"
+_INVENTORY_VERSION = "m5-inventory-6"
 
 # `track_id` 命名空间（v6 §5.6）：不同 pass 的传播序号会重名（都从 0 起），
 # 前缀把它隔开 —— 否则 `count_objects` 的 track 去重会把两条不同对象算成一条。
@@ -804,6 +807,7 @@ def _inventory_key(scene_name: str, frame_set_hash: str, depth_maps, n_frames: i
 
     payload = json.dumps({
         "v": _INVENTORY_VERSION,
+        "category_match_version": CATEGORY_MATCH_VERSION,
         "scene": str(scene_name),
         "fsh": str(frame_set_hash or ""),
         "n_frames": int(n_frames),
@@ -950,7 +954,8 @@ def _box_area_fraction(item, frame_hw) -> float:
 
 
 def _detector_boxes(frames: Sequence[np.ndarray], probe: Sequence[int],
-                    text_prompt: str, notes: list[str]) -> list[tuple[int, str, list[float], float]]:
+                    text_prompt: str, notes: list[str], *,
+                    stats: Optional[dict] = None) -> list[tuple[int, str, list[float], float]]:
     """检测器探测（**失败要出声**）：返回 `(frame_idx, label, box, conf)` 列表。
 
     置信度随框一起返回：基础清单要按它截断（`_cap_detections`），
@@ -960,44 +965,43 @@ def _detector_boxes(frames: Sequence[np.ndarray], probe: Sequence[int],
     历史缺陷（2026-09-21 实测）：`ovd.detect` 在服务不可用/超时时**静默返回 `[]`**，
     调用方只在"新增了框"时才记 note → 检测器整段不可用时对象清单悄悄退化成
     "只有 VLM 框"（outer_holdout 实测：同一 scene 一题只剩 2 个对象，程序路径直接不可答），
-    而日志里看不出任何异常。这里改成：整轮零检测 → 重试一次；仍为零则按
-    `ovd.detect.last_error` 如实区分"服务故障降级"与"本轮确实没检出"。
+    而日志里看不出任何异常。传输重试统一在 `ovd.detect` 内执行；逐帧保留最终
+    错误，不让后续健康帧覆盖，也不额外重试业务错误或健康空检测。
     """
     from skill3d.segmentation import open_vocab_detector as ovd
 
     if not ovd.available() or not text_prompt:
         return []
     out: list[tuple[int, str, list[float], float]] = []
-    for attempt in (1, 2):
-        out = []
-        for fi in probe:
-            for d in ovd.detect(frames[fi], text_prompt):
-                x0, y0, x1, y1 = d.bbox_xyxy
-                out.append((int(fi), d.label or "object", [x0, y0, x1, y1],
-                            # 缺 confidence 的检测器实现（含测试替身）按并列处理，
-                            # 不因此丢框 —— 置信度只用于截断排序，不是硬前提
-                            float(getattr(d, "confidence", 1.0))))
-        if out:
-            if attempt > 1:
-                notes.append("M5 检测器首次整轮零检测 → 重试后恢复")
-            return out
-    err = str(getattr(ovd.detect, "last_error", "") or "")
-    if err:
+    errors = []
+    for fi in probe:
+        for d in ovd.detect(frames[fi], text_prompt):
+            x0, y0, x1, y1 = d.bbox_xyxy
+            out.append((int(fi), d.label or "object", [x0, y0, x1, y1],
+                        float(getattr(d, "confidence", 1.0))))
+        err = str(getattr(ovd.detect, "last_error", "") or "")
+        if err:
+            errors.append(f"frame={fi}: {err}")
+    if errors:
+        if stats is not None:
+            stats["detector_fault"] = True
         notes.append(
-            f"M5 检测器（{ovd.detector_endpoint()}）连续 2 轮探测均返回 0 个框"
-            f"（last_error={err}）→ **检测器侧降级**，对象清单仅来自 VLM 框；"
-            "对象类 Tool 的可用性随之下降（不得据此判定场景中不存在某物体）")
-    else:
-        notes.append(f"M5 检测器（{ovd.detector_endpoint()}）连续 2 轮探测均无检出"
+            f"M5 检测器返回 {len(out)} 个框；**检测器侧降级**：{'; '.join(errors)}；"
+            "不得据此判定场景中不存在某物体")
+    elif not out:
+        notes.append("M5 检测器本轮探测无检出"
                      "（服务正常，本轮确实没检出）")
     return out
 
 
+@capture_detector_failures()
 def bind_objects_for_scene(
     frames: Sequence[np.ndarray],
     handle,
     question: str = "",
     *,
+    question_type: str = "",
+    options: Optional[Sequence[str]] = None,
     depth_maps: Optional[np.ndarray] = None,
     c2w_list: Optional[np.ndarray] = None,
     intrinsics: Optional[np.ndarray] = None,
@@ -1087,7 +1091,7 @@ def bind_objects_for_scene(
                 notes.append(f"M5 VLM 通用清单：{len(inv_hints)} 个框"
                              f"（{sorted(set(inv_hints))[:8]}）")
         text_prompt = ovd_prompt_full_vocabulary()
-        det = _detector_boxes(frames, probe, text_prompt, notes)
+        det = _detector_boxes(frames, probe, text_prompt, notes, stats=stats)
         # v7 成本控制：基础清单按检测置信度**截断**。
         # 为什么安全：M5 的成本几乎线性于 SAM2 传播条数（实测单条 2–25 s），
         # 而未截断时一个场景可达 80+ 条 → 单场景 25 min，24 个场景不可接受。
@@ -1146,7 +1150,7 @@ def bind_objects_for_scene(
         if ratio is not None:
             notes.append(f"M5 track 稳定占比={ratio:.3f}"
                          f"（每条 track 可见帧数/帧集帧数的均值 → §7.1 track_consensus）")
-        if use_inventory_cache:
+        if use_inventory_cache and not stats.get("detector_fault"):
             _save_inventory(out_dir, scene_name, key, objects,
                             {k: v for k, v in stats.items() if k != "dynamic_masks"},
                             stats.get("dynamic_masks"))
@@ -1169,12 +1173,12 @@ def bind_objects_for_scene(
                      f"dynamic_masks={'有' if 'dynamic_masks' in stats else '无'}）")
 
     # ---- ③ 逐题补漏：问题里的目标物若不在清单中，补绑一次 ----
-    if vlm_client is not None and n_frames and question:
+    if n_frames and (question or options):
         sup_objs, sup_stats, sup_note = _bind_question_supplement(
             frames, probe, question, objects, depth_maps, c2w_list, intrinsics,
             grid_transform=grid_transform, out_dir=out_dir, scene_name=scene_name,
             predictor=predictor, vlm_client=vlm_client, handle=handle, seed=seed,
-            point_conf=point_conf)
+            point_conf=point_conf, question_type=question_type, options=options)
         if sup_note:
             notes.append(sup_note)
         if sup_stats.get("grounding"):
@@ -1189,6 +1193,8 @@ def bind_objects_for_scene(
     if stats.get("track_ious"):
         notes.append(f"G9 跟踪 IoU 均值={float(np.mean(stats['track_ious'])):.3f}"
                      "（去重后对象集）")
+    stats["detector_errors"] = current_detector_failures()
+    stats["detector_fault"] = bool(stats.get("detector_fault") or stats["detector_errors"])
     return objects, stats, notes
 
 
@@ -1321,10 +1327,36 @@ def ovd_boxes_for_nouns(frames: Sequence[np.ndarray], probe: Sequence[int],
     return hints, boxes, prompt_list
 
 
+def _grounding_coverage(names, objects, *, candidate_names=(), question_type=""):
+    """逐个核对需求；部分命中不冒充整题成功，多个候选实例允许取最近者。"""
+    requirements = []
+    for name in names:
+        role = ("candidate" if any(matches(name, c) for c in candidate_names)
+                else "reference" if question_type == "object_rel_distance" else "target")
+        ids = sorted(o.obj_id for o in objects if matches(name, o.category_name))
+        status = ("missing" if not ids else "ambiguous"
+                  if role == "reference" and len(ids) > 1 else "present")
+        requirements.append({"name": name, "role": role, "object_ids": ids, "status": status})
+    missing = [r["name"] for r in requirements if r["status"] == "missing"]
+    ambiguous = [r["name"] for r in requirements if r["status"] == "ambiguous"]
+    present = any(r["object_ids"] for r in requirements)
+    reference_unresolved = (question_type == "object_rel_distance"
+                            and not any(r["role"] == "reference" for r in requirements))
+    complete = bool(requirements) and not missing and not ambiguous and not reference_unresolved
+    status = ("not_checked" if not requirements else "complete" if complete else
+              "ambiguous" if ambiguous and not missing else "partial" if present else "missing")
+    return {
+        "attempted": bool(requirements), "status": status, "requirements": requirements,
+        "required_names": list(names), "missing_names": missing, "ambiguous_names": ambiguous,
+        "reference_unresolved": reference_unresolved,
+        "all_present": complete, "miss": bool(requirements) and not present,
+    }
+
+
 def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w_list,
                               intrinsics, *, grid_transform, out_dir, scene_name,
                               predictor, vlm_client, handle, seed: Optional[int] = None,
-                              point_conf=None
+                              point_conf=None, question_type="", options=None
                               ) -> tuple[list[ObjectRecord], dict, str]:
     """逐题补漏：只把"清单里还没有"的问题目标物绑进来（不重算已有对象）。
 
@@ -1345,25 +1377,26 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
     if not named:
         # VLM 不可用 → 退回确定性词表抽取（够用作检测器提示）
         named = object_prompts_from_question(question)
+    # 相对距离选项本身就是候选类别，必须独立于 VLM 的题干名词抽取纳入需求。
+    candidate_names = ([option_category(o) for o in (options or [])]
+                       if question_type == "object_rel_distance" else [])
+    required = list(dict.fromkeys(str(n).strip() for n in [*named, *candidate_names]
+                                 if str(n).strip()))
+
+    def coverage(objects, n_boxes=0, n_new=0):
+        return {**_grounding_coverage(required, objects, candidate_names=candidate_names,
+                                     question_type=question_type),
+                "n_boxes": n_boxes, "n_new": n_new}
     # v7 成本控制（关键）：题面点名的物体**已经全在清单里** → 直接跳过检测。
     # 依据：一次检测服务调用实测 42–59 s，而绝大多数题目的物体在场景基础清单里
     # 已经有了（v6 的补漏是"先检测再判重"，等于每次都白付一次最贵的调用）。
     # 语义不变：只有"确实缺物体"时才去检测，`all_present=True` 的申报口径与原来一致。
-    if named and existing:
-        from skill3d.tools.category_match import matches
-
-        def _present(n: str) -> bool:
-            return any(matches(n, str(getattr(o, "category_name", "") or ""))
-                       for o in existing)
-        if all(_present(n) for n in named):
-            return [], {"grounding": {"attempted": True, "n_boxes": 0, "n_new": 0,
-                                      "all_present": True, "skipped_detection": True}}, (
-                f"M5 逐题补漏：题面物体 {named} 均已在场景清单中（跳过检测调用）")
-        # 只对**确实缺的**名词做检测：检测耗时随类目数增长，而已经绑好的物体
-        # 不需要再检一遍（语义不变，检出后仍会按质心判重，不会重复绑定）。
-        missing_names = [n for n in named if not _present(n)]
-        if missing_names:
-            named = missing_names
+    initial = coverage(existing)
+    if required and not initial["missing_names"]:
+        return [], {"grounding": {**initial, "skipped_detection": True}}, (
+            f"M5 逐题补漏：题面物体 {required} 均已在场景清单中（跳过检测调用）；"
+            f"歧义目标={initial['ambiguous_names']}")
+    named = initial["missing_names"]
     if named:
         # ①-a 确定性检测器（首选）：GroundingDINO 的定位是可靠的，
         #     且直接吃"问题名词"，正是补漏需要的输入。
@@ -1398,14 +1431,21 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
         # v6 证据：题面点名了物体但检测/VLM 一个框都没给出 → **明确未命中**。
         # 必须报给 EvidenceProfile 的 `object_grounding=unavailable`，
         # 不能让"没找到"静默退化成"没查"（§7.1 三值判定 + fail-closed）。
-        return [], {"grounding": {"attempted": True, "n_boxes": 0,
-                                  "n_new": 0, "all_present": False,
-                                  "miss": True}}, (
+        return [], {"grounding": coverage(existing)}, (
             "M5 逐题补漏：题面点名物未检出（grounding_recall_miss）")
     masks = track_objects(frames, boxes, predictor, prompts=prompt_list,
                           handle=handle, question=question)
+    # 传播局部编号从 obj_0 开始；必须先隔离落盘路径，再重映射 scene 内的对象 ID，
+    # 否则补检的 obj_0 会覆盖基础清单仍在引用的点云、置信度和掩码。
+    supplement_dir = None
+    if out_dir is not None:
+        request_key = hashlib.sha256(json.dumps(
+            {"question": question, "options": list(options or []), "seed": seed,
+             "existing_ids": sorted(o.obj_id for o in existing)},
+            sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
+        supplement_dir = Path(out_dir) / "question_grounding" / request_key
     cand = bind_masks_to_world(masks, depth_maps, c2w_list, intrinsics,
-                               class_hints=hints or None, out_dir=out_dir,
+                               class_hints=hints or None, out_dir=supplement_dir,
                                scene_name=scene_name, grid_transform=grid_transform,
                                point_conf=point_conf,
                                track_prefix=TRACK_PREFIX_QUESTION,
@@ -1430,7 +1470,7 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
             if np.linalg.norm(co - np.asarray(b.centroid_world, dtype=np.float64)) >= tol:
                 continue
             ho, hb = _hint(o), _hint(b)
-            if ho and hb and ho != hb:
+            if ho and hb and not matches(ho, hb):
                 continue
             dup = True
             break
@@ -1439,20 +1479,19 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
             kept_masks.append(_merge_mask_groups(masks, [g])[0])
 
     if not kept:
-        # v6 证据：题面点名物**已在清单中确认存在**（框都能对上已有对象）→ 命中
-        return [], {"grounding": {"attempted": True, "n_boxes": len(boxes),
-                                  "n_new": 0, "all_present": True}}, (
-            f"M5 逐题补漏：{len(boxes)} 个问题目标框均已在场景清单中"
-            f"（复用，不重算）")
+        return [], {"grounding": coverage(existing, len(boxes))}, (
+            f"M5 逐题补漏：{len(boxes)} 个框没有新增绑定；按实际对象清单复核覆盖情况")
     out: list[ObjectRecord] = []
+    next_id = 0
     for i, o in enumerate(kept):
-        new_id = f"obj_{len(base_ids) + i}"
+        while f"obj_{next_id}" in base_ids:
+            next_id += 1
+        new_id = f"obj_{next_id}"
+        base_ids.add(new_id)
         # obj_id 换成 scene 内唯一的稳定 id；track_id / grounding_status /
         # duplicate_suspect 原样保留（track 由本次传播产生，`qtrk*` 命名空间）
         out.append(o.model_copy(update={"obj_id": new_id}))
-    stats: dict = {"grounding": {"attempted": True, "n_boxes": len(boxes),
-                                 "n_new": len(out), "all_present": False,
-                                 "miss": False}}
+    stats: dict = {"grounding": coverage([*existing, *out], len(boxes), len(out))}
     from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
 
     ious = track_ious_from_masks(kept_masks)

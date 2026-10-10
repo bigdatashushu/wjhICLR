@@ -69,7 +69,7 @@ def _payload(value, unit, op, input_ids, parameters):
     ),
     (
         _payload("B", "option", "argmin", ["r1"], {}),
-        [_result("r1", {"A": 2.0, "B": 1.0}, tool="relative_distance_rank")],
+        [_result("r1", {"A": 2.0, "B": 1.0}, tool="distance_values")],
         "object_rel_distance",
         "B",
     ),
@@ -158,7 +158,7 @@ def test_unknown_source_unit_cannot_be_claimed_as_metric():
     assert "unit_unverified" in {issue.code for issue in replay.issues}
 
 
-def test_mixed_without_derivation_does_not_claim_replay():
+def test_mixed_cannot_reference_incomplete_rank_without_derivation():
     payload = AnswerPayload(
         value="A", unit="option", basis="mixed", used_result_ids=["r1"])
 
@@ -170,8 +170,26 @@ def test_mixed_without_derivation_does_not_claim_replay():
         options=["chair", "table"],
     )
 
-    assert replay.passed
+    assert not replay.passed
+    assert "incomplete_ranking" in {issue.code for issue in replay.issues}
     assert not replay.performed
+
+
+def test_argmin_rejects_ties_independently_of_insertion_order():
+    for values in ({"A": 1, "B": 1}, {"B": 1, "A": 1}):
+        replay = replay_derivation(
+            _payload("A", "option", "argmin", ["r1"], {}),
+            [_result("r1", values, tool="distance_values")],
+            question_type="object_rel_distance", options=["chair", "lamp"])
+        assert "ambiguous_minimum" in {issue.code for issue in replay.issues}
+
+
+def test_visual_submission_can_discard_historical_incomplete_rank():
+    replay = replay_derivation(
+        AnswerPayload(value="A", unit="option", basis="visual_estimate"),
+        [_result("r1", {"status": "incomplete_candidates"}, tool="relative_distance_rank")],
+        question_type="object_rel_distance", options=["chair", "lamp"])
+    assert replay.passed
 
 
 @pytest.mark.parametrize(("value", "unit", "question_type", "code"), [

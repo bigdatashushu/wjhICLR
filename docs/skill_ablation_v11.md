@@ -5,7 +5,7 @@
 `object_rel_distance`（S03），`--question-types` 接受逗号分隔的规范题型。
 
 两臂均通过真实 `run_episode` 生成、执行程序，默认共同使用
-`program_synth_v11_2`、`solver-v11.2-m11-acceptance` 和 `tool-docs-v11.1`，
+`program_synth_v11_3`、`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.2`，
 质量门始终开启。`ReturnAnswer` 先暂存提交；M11 通过后才进入评分，拒绝时在同一
 求解预算内撤销受影响结果并把结构化失败反馈给同一模型。声明了 `derivation` 时，
 M11 只使用登记操作确定性重放并核对答案；计算声明错误不会撤销本身有效的工具结果。
@@ -15,6 +15,26 @@ B11 默认校验并加载 `S0-v11-contract-repair` 的 snapshot、manifest 和�
 也不使用 v10 的 `evaluation_binding`。
 
 ## GPU 环境运行
+
+仓库根目录的一键入口按当前服务器空闲卡规划为 GPU 2 跑 Qwen/vLLM、GPU 3 跑
+VGGT/SAM2、GPU 4 预留 GroundingDINO 或故障切换。提交并推送当前修改后，先做小样本
+端到端检查：
+
+```bash
+./start_harness3d.sh --smoke
+```
+
+质量确认与当前合同一致后，直接运行正式配置：
+
+```bash
+./start_harness3d.sh
+```
+
+脚本默认使用 `/home/cvailab/experiments/harness3d-v11`，可通过
+`HARNESS3D_WORK_DIR` 或 `--work-dir` 覆盖；控制台同时写入
+`<work-dir>/launcher_logs/`。正式模式拒绝脏工作树、未推送的固定提交、过期质量确认、
+缺失视频、显存不足和不可达的检测服务。检测器部署在其它机器时设置
+`HARNESS3D_DETECTOR_ENDPOINT`；仅诊断时可显式传 `--skip-detector-check`。
 
 先准备与输入清单一致的 P1 重建产物、模型服务及 M5 所需的检测/SAM2。
 入口只复用既有重建，不在缺失或帧集不匹配时偷偷重建。示例在仓库根目录运行：
@@ -74,13 +94,37 @@ PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
 模型名需与服务实际的 served model name 一致。配对宜使用单个 endpoint；
 请求 seed 会进入准备阶段和两臂的模型请求，但不承诺不同 GPU 批处理调度下逐位复现。
 `--max-solver-rounds`、`--max-retries-per-operation`、`--finalization-rounds`
-可覆盖 YAML；其余图像、token、沙箱和检索预算从 YAML 加载。两臂配置由同一份配置复制，
+和 `--[no-]eval-visual-fallback` 可覆盖 YAML；其余图像、token、沙箱和检索预算从
+YAML 加载。两臂配置由同一份配置复制，
 公共模板、执行协议、工具文档和 Skill 快照固定为当前合同，不提供 YAML 或 CLI
 版本选择。
 
 修订基线仅更新 S01/S08 为 1.2.0，其他六条仍为 1.1.0，修订记录不构成演化收益。
 历史快照和历史提示词不再由当前入口加载；复现实验时 checkout 对应 Git 提交。
 模板版本、执行协议版本、工具文档版本与工具实现版本仍分别进入运行记录。
+
+2026-10-10 候选完整性修复形成新工程基线，冻结 Skill 正文和快照不变。M5 按角色记录
+对象覆盖并把全部选项纳入补检；排名保留逐实例测量、缺失与几何不可测状态，M11 按实际
+选项拒绝部分排序、身份冲突和并列最小值。补检点云、掩码与置信度写入独立请求目录，
+避免局部 obj_0 编号覆盖基础清单仍引用的几何文件。两臂共用这些规则，有可读图时仍允许在后续
+零工具轮做纯视觉估计。`answer_basis_counts` 仅作诊断，不删除视觉答案或失败题的分母。
+`terminal_failure` 记录末次错误、阶段和预算结束原因；`detector_attempts` 与 manifest
+中的 `preparation_detector_attempts` 记录检测尝试，只有最终未恢复故障使配对 incomplete。
+检测器默认最多三次尝试，共享 180 秒调度预算，单次 timeout 保持 120 秒并受剩余预算限制；仅重试
+超时、连接错误、429 和 5xx，业务错误与健康空检测不作传输重试。
+
+评测增量视觉终结默认开启，但不替换原求解循环：只有 `inner_validation`、
+`outer_holdout` 或已显式授权的 `final_test` 在原 solver 用完有限重试和原终结轮后仍为
+`run_error`，才预算外增加一次请求。请求是全新的单条 user message，只含冻结 FrameSet
+的 32 张原帧、query、选项和题型对应的字母／数值输出模板；不含 Skill、场景摘要、
+工具结果、程序、反馈、裁剪图或标准答案。SDK 隐式重试在该阶段关闭，输出非法或请求失败
+都不再重试。`induction`、输入错误、原 solver 服务不可用及已通过验收的答案均不触发；
+因此也不会根据评分正确性决定是否补答。成功答案登记为 `visual_estimate` 和
+`direct_vlm_routed`，原失败快照、程序轮次及工具审计保留在 `eval_visual_fallback`。
+新增字段使用 `EpisodeTrace.schema_version=9.1`；旧 `9.0` trace 只能经 legacy reader
+只读审计，不能把缺失字段默认解释为“当时未触发补答”。
+旧质量确认与旧运行结果不能证明本工程版本有效；需重新确认当前合同并另建 GPU 运行，
+结果变化不得与 Skill 演化收益混报。
 
 预抽帧数据可使用：
 
@@ -161,7 +205,8 @@ M5 的耗时和请求只计在共享准备阶段，求解成本从两臂 trace �
   请求参数与图像观察记录。
 - `paired_results.jsonl`：按 `qa_id` 严格连接的逐题结果，两臂答案与逐题差值。
 - `summary.json`：总体和各题型的 Accuracy、MRA、合法答案率、程序错误率、
-  最终运行错误率、输入错误率及 B11−B01；指标范围为 0–1。
+  最终运行错误率、输入错误率、视觉补答请求／采纳数、补答前后指标及 B11−B01；
+  比率和得分范围为 0–1。
 
 Accuracy 和 MRA 使用现有 runner 的官方评分器。程序/格式失败或无答案计零，
 不从评分分母删除。程序错误率表示出现过执行错误、AST 拒绝或生成解析失败的题占比，
@@ -193,6 +238,9 @@ CLI 退出码：0 = 完成（与分数正负无关），1 = 有未完成题，
 PYTHONPATH=src .venv/bin/python -m pytest -q \
   tests/integration/test_skill_ablation_v11.py \
   tests/integration/test_v11_skill_delivery.py \
+  tests/integration/test_eval_visual_boundaries.py \
+  tests/integration/test_eval_visual_fallback.py \
+  tests/unit/test_eval_visual_request.py \
   tests/unit/test_m11_submission.py \
   tests/unit/test_v11_prompt_contract.py \
   tests/unit/test_v11_tool_contract_repair.py

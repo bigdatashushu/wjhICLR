@@ -54,6 +54,8 @@ from .distance_primitives import (
     room_size_from_planes,
 )
 from .registry import REGISTRY
+from .category_match import matches
+from .ranking_contract import RANKING_CONTRACT_VERSION, UNCERTAIN_DISTANCE_FLAGS
 from .scene_handle import SceneHandle
 
 # 实例整合的双向点云重合阈值（v7 §9.1）。
@@ -177,7 +179,7 @@ def _degraded_property(distance_result, *, metric_ok: bool) -> list[str]:
                      "`objs[0]['obj_id']`；**列表元素是 dict，不是字符串**"
                      "（写 `for o in objs: 'chair' in o` 会报错）。"
                      "**obj_id 里不含类别名**，按类别筛选必须传 category_filter"
-                     "（子串匹配）。计数请改用 count_objects（它以 track 共识为准）"),
+                     "（规范类别与同义词匹配）。计数请改用 count_objects（它以 track 共识为准）"),
         args_schema_ref="category_filter:str=''",
         returns_schema_ref="list[dict]",
         cost_estimate_ms=1.0,
@@ -212,7 +214,7 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
 @REGISTRY.register(
     ToolSpec(
         name="count_objects",
-        description=("按类别统计实例数（category_name 子串匹配，如 'chair'）。"
+        description=("按规范类别与同义词统计实例数（如 'chair'）。"
                      "**以实例共识为准**：先按 track 去重，再按点云几何重合把"
                      "「同一物体被重复检出」的记录合并（v7 §9.1 三值之二）。"
                      "返回一个 dict："
@@ -619,8 +621,10 @@ def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str
                      "不需要米制尺度（比较中尺度约掉）。"
                      "参数：reference 是对象 id 或类别名；candidates 是**类别名列表**"
                      "（如 ['telephone','keyboard']）。"
-                     "返回 {ranking:[{category, distance_normalized, obj_id}...], "
-                     "closest_category, per_candidate:{类别: 最近距离}}（按距离升序）"),
+                     "必须传入题目全部选项类别。返回 status、candidates 实例明细、"
+                     "ranking、closest_category、per_candidate、margin_normalized。"
+                     "仅完整、无身份冲突且最小值唯一时 status=ok 并提供 closest_category；"
+                     "缺失、不可测或并列时不得从部分排序强行选择。"),
         args_schema_ref="reference:str, candidate_categories:list[str]",
         returns_schema_ref="dict",
         cost_estimate_ms=60.0,
@@ -638,52 +642,109 @@ def relative_distance_rank(handle: SceneHandle, reference: str,
     X 是参照对象，a/b/c/d 是候选类别。官方口径是「X 到各候选的最近距离」，
     **不是**相机到候选的距离 —— v6 曾把后者写成官方口径，导致该类题系统性答错。
     """
-    ref = handle.get_object(_get_object(handle, reference,
-                                        "relative_distance_rank").obj_id)
-    ref_pts = handle.object_points(ref.obj_id)
-    if not isinstance(candidate_categories, (list, tuple)) or not candidate_categories:
+    if (not isinstance(candidate_categories, (list, tuple))
+            or len(candidate_categories) < 2
+            or not all(isinstance(c, str) and c.strip() for c in candidate_categories)):
         raise DomainValueError("relative_distance_rank",
-                               "candidate_categories 必须是非空列表（类别名列表）",
+                               "candidate_categories 必须包含至少两个非空类别名",
                                args={"candidate_categories": candidate_categories})
+    categories = [c.strip() for c in candidate_categories]
+    if any(matches(a, b) for i, a in enumerate(categories) for b in categories[i + 1:]):
+        raise DomainValueError("relative_distance_rank", "候选类别重复或同义，无法唯一排名")
+    ref = _get_object(handle, reference, "relative_distance_rank")
+    ref_pts = handle.object_points(ref.obj_id)
     ranking: list[dict] = []
-    per_candidate: dict[str, object] = {}
+    per_candidate: dict[str, Optional[float]] = dict.fromkeys(categories)
+    candidates: list[dict] = []
     missing: list[str] = []
-    for cat in candidate_categories:
-        oids = handle.list_objects_by_name(str(cat))
+    invalid: list[str] = []
+    flags: set[str] = set()
+    identities: dict[tuple[str, str], str] = {("object", ref.obj_id): "reference"}
+    if ref.track_id:
+        identities[("track", ref.track_id)] = "reference"
+    ambiguous = False
+    for cat in categories:
+        oids = handle.list_objects_by_name(cat)
+        detail = {"category": cat, "n_instances": len(oids), "instances": [],
+                  "status": "missing" if not oids else "ok"}
+        candidates.append(detail)
         if not oids:
-            missing.append(str(cat))
+            missing.append(cat)
+            flags.add("category_missing:" + cat)
             continue
-        # 类别有多个实例 → 取离参照对象最近的实例（官方口径）
-        best = None
         for oid in oids:
+            obj = handle.get_object(oid)
+            keys = [("object", oid)] + ([("track", obj.track_id)] if obj.track_id else [])
+            collision = any(k in identities and identities[k] != cat for k in keys)
+            for key in keys:
+                identities[key] = cat
+            instance = {"obj_id": oid, "track_id": obj.track_id,
+                        "grounding_status": obj.grounding_status,
+                        "duplicate_suspect": bool(obj.duplicate_suspect),
+                        "distance_normalized": None, "n_valid_points": 0,
+                        "degradation_flags": [], "status": "ok"}
+            detail["instances"].append(instance)
+            if collision:
+                ambiguous = True
+                detail["status"] = instance["status"] = "ambiguous_grounding"
+                instance["degradation_flags"] = ["identity_collision"]
+                flags.add("identity_collision")
+                continue
             res = robust_distance_between_pointsets(
                 ref_pts, handle.object_points(oid),
-                metric_scale=_metric_scale_if_authorized(handle),
+                metric_scale=None,
                 params=DistancePrimitiveParams(),
-                duplicate_suspect=bool(handle.get_object(oid).duplicate_suspect))
+                duplicate_suspect=bool(ref.duplicate_suspect or obj.duplicate_suspect))
             d = res.distance_normalized
-            if d is None or not np.isfinite(float(d)):
-                continue
-            if best is None or float(d) < float(best[0]):
-                best = (float(d), oid, len(oids))
-        if best is None:
-            missing.append(str(cat))
+            primitive_flags = list(res.degradation_flags or [])
+            instance.update(
+                distance_normalized=float(d) if d is not None and np.isfinite(d) else None,
+                n_valid_points=int(res.n_valid_points),
+                n_nn_samples=int(getattr(res, "n_nn_samples", 0) or 0),
+                degradation_flags=primitive_flags, audit=res.audit)
+            flags.update(primitive_flags)
+            if (d is None or not np.isfinite(d) or d < 0 or res.n_valid_points <= 0
+                    or UNCERTAIN_DISTANCE_FLAGS.intersection(primitive_flags)):
+                instance["status"] = "uncertain_geometry"
+                if detail["status"] == "ok":
+                    detail["status"] = "uncertain_geometry"
+                if cat not in invalid:
+                    invalid.append(cat)
+        # 未测实例仍可能更近，不能把其余实例的最小值当成全类最小值。
+        if detail["status"] != "ok":
             continue
-        per_candidate[str(cat)] = best[0]
-        ranking.append({"category": str(cat), "obj_id": best[1],
-                        "distance_normalized": best[0],
-                        "n_instances_in_category": int(best[2])})
-    ranking.sort(key=lambda r: r["distance_normalized"])
+        best = min(detail["instances"], key=lambda i: (i["distance_normalized"], i["obj_id"]))
+        per_candidate[cat] = best["distance_normalized"]
+        ranking.append({"category": cat, "obj_id": best["obj_id"],
+                        "distance_normalized": best["distance_normalized"],
+                        "n_instances_in_category": len(oids)})
+    ranking.sort(key=lambda r: (r["distance_normalized"], r["category"]))
+    tied = ([r["category"] for r in ranking
+             if r["distance_normalized"] == ranking[0]["distance_normalized"]]
+            if len(ranking) >= 2 else [])
+    tied = tied if len(tied) > 1 else []
+    status = ("ambiguous_grounding" if ambiguous else
+              "incomplete_candidates" if missing else
+              "uncertain_geometry" if invalid or tied else "ok")
+    if tied:
+        flags.add("tied_minimum")
+    margin = (ranking[1]["distance_normalized"] - ranking[0]["distance_normalized"]
+              if len(ranking) == len(categories) else None)
     return {
-        "reference": {"obj_id": ref.obj_id, "category_name": ref.category_name},
+        "contract_version": RANKING_CONTRACT_VERSION,
+        "status": status, "requested_categories": categories, "candidates": candidates,
+        "reference": {"obj_id": ref.obj_id, "category_name": ref.category_name,
+                      "track_id": ref.track_id, "duplicate_suspect": bool(ref.duplicate_suspect)},
         "ranking": ranking,
-        "closest_category": ranking[0]["category"] if ranking else None,
+        "closest_category": ranking[0]["category"] if status == "ok" else None,
         "per_candidate": per_candidate,
         "categories_without_detection": missing,
+        "categories_with_invalid_geometry": invalid,
+        "tied_categories": tied, "margin_normalized": margin,
+        "uncertainty_policy": "exact_ties_only; near_tie_threshold_not_calibrated",
         "definition": "reference_object_to_nearest_candidate_instance_v7",
         "quantile_q": DistancePrimitiveParams().quantile_q,
-        "degradation_flags": ([] if not missing else ["category_missing:" +
-                                                     ",".join(missing)]),
+        "degradation_flags": sorted(flags),
     }
 
 

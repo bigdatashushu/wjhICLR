@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from skill3d.verifier.geometry_oracle import GeometryIssue
 
-EXECUTION_PROTOCOL_VERSION = "solver-v11.2-m11-acceptance"
+EXECUTION_PROTOCOL_VERSION = "solver-v11.4-eval-visual-fallback"
 
 
 def submission_scope(kernel, trace):

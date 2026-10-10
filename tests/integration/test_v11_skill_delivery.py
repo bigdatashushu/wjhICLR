@@ -231,11 +231,11 @@ def test_v11_contract_survives_solver_rounds_and_reaches_trace(
     else:
         assert any(r.get("trigger") == expected_trigger for r in out.rounds), out.rounds
     assert out.first_synthesis["template_version"] == PROMPT_TEMPLATE_VERSION
-    assert out.first_synthesis["tool_docs_version"] == "tool-docs-v11.1"
+    assert out.first_synthesis["tool_docs_version"] == "tool-docs-v11.2"
     rows = (tmp_path / "traces/trace_record.jsonl").read_text().splitlines()
     assert len(rows) == 1
     assert json.loads(rows[0])["template_version"] == PROMPT_TEMPLATE_VERSION
-    assert json.loads(rows[0])["tool_docs_version"] == "tool-docs-v11.1"
+    assert json.loads(rows[0])["tool_docs_version"] == "tool-docs-v11.2"
     program_row = json.loads(
         (tmp_path / "traces/episode_program.jsonl").read_text().splitlines()[0]
     )
@@ -275,7 +275,7 @@ def _run_m11_case(room_source_and_artifact, tmp_path, monkeypatch, programs, ver
 def test_m11_rejects_first_answer_revokes_local_result_and_scores_correction(
         room_source_and_artifact, tmp_path, monkeypatch):
     calls = 0
-    def verifier(trace, handle, answer):
+    def verifier(trace, handle, answer, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -295,6 +295,7 @@ def test_m11_rejects_first_answer_revokes_local_result_and_scores_correction(
 
     assert len(client.calls) == 2
     assert out.final_state == "answer" and out.answer == "2"
+    assert out.failure_code is None and out.terminal_failure == {}
     # 被拒绝的首答恰好等于 GT；若旧路径仍采纳它会是 1.0。
     assert out.mra_value == pytest.approx(0.0)
     first = out.rounds[0]
@@ -311,7 +312,7 @@ def test_m11_rejects_first_answer_revokes_local_result_and_scores_correction(
 def test_m11_confirmed_shared_premise_cascades_and_visual_close_is_clean(
         room_source_and_artifact, tmp_path, monkeypatch):
     calls = 0
-    def verifier(trace, handle, answer):
+    def verifier(trace, handle, answer, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -343,7 +344,7 @@ def test_m11_confirmed_shared_premise_cascades_and_visual_close_is_clean(
 def test_m11_checks_valid_cross_round_results_after_yield(
         room_source_and_artifact, tmp_path, monkeypatch):
     seen = []
-    def verifier(trace, handle, answer):
+    def verifier(trace, handle, answer, **kwargs):
         seen.extend(r.result_id for r in trace.results)
         return _verify_result(passed=True)
 
@@ -362,7 +363,7 @@ def test_m11_checks_valid_cross_round_results_after_yield(
 
 def test_m11_replays_derivation_without_invalidating_a_valid_tool_result(
         room_source_and_artifact, tmp_path, monkeypatch):
-    def verifier(trace, handle, answer):
+    def verifier(trace, handle, answer, **kwargs):
         return _verify_result(passed=True)
 
     out, client = _run_m11_case(
@@ -397,7 +398,7 @@ def test_m11_replays_derivation_without_invalidating_a_valid_tool_result(
 
 def test_m11_accepts_a_matching_replayed_derivation(
         room_source_and_artifact, tmp_path, monkeypatch):
-    def verifier(trace, handle, answer):
+    def verifier(trace, handle, answer, **kwargs):
         return _verify_result(passed=True)
 
     program = (
@@ -426,7 +427,7 @@ def test_m11_accepts_a_matching_replayed_derivation(
 
 def test_m11_budget_exhaustion_clears_rejected_answer_and_keeps_denominator(
         room_source_and_artifact, tmp_path, monkeypatch):
-    def verifier(trace, handle, answer):
+    def verifier(trace, handle, answer, **kwargs):
         return _verify_result(
             passed=False,
             issue=GeometryIssue(
@@ -443,3 +444,26 @@ def test_m11_budget_exhaustion_clears_rejected_answer_and_keeps_denominator(
     assert out.mra_value == 0.0
     assert all(r["submission_accepted"] is False for r in out.rounds)
     assert out.rounds[-1]["trigger"] == "finalize"
+    assert out.failure_code == "geometry_rejected"
+    assert out.terminal_failure == {
+        "code": "geometry_rejected", "stage": "M11",
+        "termination_reason": "finalization_failed", "round": 2}
+    assert out.episode_trace.terminal_failure == out.terminal_failure
+
+
+@pytest.mark.parametrize(("program", "code", "stage"), [
+    ("import os\nReturnAnswer(1)", "ast_violation", "M9"),
+    ("euclidean_distance([0, 0], [0, 0, 1])", "domain_value", "M10"),
+    ("x = 1", "no_answer", "M10"),
+])
+def test_solver_budget_retains_terminal_error_and_stage(
+        room_source_and_artifact, tmp_path, monkeypatch, program, code, stage):
+    out, _ = _run_m11_case(
+        room_source_and_artifact, tmp_path, monkeypatch, [program],
+        lambda *args, **kwargs: _verify_result(passed=True), max_rounds=1)
+    assert out.failure_code == code
+    assert out.terminal_failure["stage"] == stage
+    assert out.terminal_failure["termination_reason"] == "solver_round_budget_exhausted"
+    if code == "domain_value":
+        assert out.rounds[-1]["error_code"] == "tool_contract"
+        assert out.rounds[-1]["cause_code"] == "domain_value"

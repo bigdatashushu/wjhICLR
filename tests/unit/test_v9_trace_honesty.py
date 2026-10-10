@@ -216,6 +216,17 @@ def test_legacy_trace_is_rejected_by_runtime_guard():
         assert_runtime_eligible(carrier)
 
 
+def test_pre_visual_9_0_trace_is_read_only_legacy():
+    legacy = _current_trace_payload() | {"schema_version": "9.0"}
+    legacy.pop("eval_visual_fallback", None)
+    with pytest.raises(LegacyEpisodeTraceError) as exc:
+        read_episode_trace(legacy, source_path="data/pre_visual/episode_trace.jsonl")
+    assert "read_legacy_episode_trace" in str(exc.value)
+    carrier = read_legacy_episode_trace(legacy, source_path="legacy-9.0.jsonl")
+    assert carrier.detected_schema_version == "9.0"
+    assert any("eval_visual_fallback" in warning for warning in carrier.warnings)
+
+
 def test_unknown_schema_version_fails_closed():
     with pytest.raises(LegacyEpisodeTraceError):
         read_episode_trace(_current_trace_payload() | {"schema_version": "7.3"},

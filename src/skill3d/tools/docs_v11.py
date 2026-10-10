@@ -1,13 +1,14 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.1"
+TOOL_DOCS_VERSION = "tool-docs-v11.2"
 
 
 DESCRIPTIONS = {
     "list_objects": (
         "返回对象记录 list[dict]，字段 obj_id、category_name、visible_frames、track_id、"
         "det_conf、grounding_status、duplicate_suspect。空过滤串返回全部；类别过滤使用"
-        "大小写/分隔符/单复数/同义词归一化后的相等、子串或词交集匹配。obj_id 不编码类别。"),
+        "大小写/分隔符/单复数/同义词归一化后的完整类别匹配，可移除登记的外观前缀。"
+        "不作子串或词交集匹配。obj_id 不编码类别；需要唯一对象的接口遇到多实例类别会抛歧义错误。"),
     "count_objects": (
         "按与 list_objects 相同的类别规则统计实例。相同非空 track_id 先分组，"
         "无 track 的记录各自一组；组内点云合并后按双向近邻重合率合并重复组；"
@@ -46,13 +47,20 @@ DESCRIPTIONS = {
         "point_contamination_suspect、quantile_q、voxel_size、degradation_flags。"
         "点不足时距离可为 None。"),
     "relative_distance_rank": (
-        "reference 为参照对象 id 或可解析类别名；candidate_categories 为非空类别名列表。"
+        "reference 为参照对象 id 或唯一可解析类别名；candidate_categories 包含题目全部"
+        "选项的类别名，至少两类，不得重复或为同义类别。"
         "每类取与参照对象的表面距离代理最小的实例，代理为点集双向最近邻距离低分位。"
         "返回 dict：reference（obj_id/category_name）、ranking（按距离升序的记录列表，"
         "每项 category、obj_id、distance_normalized、n_instances_in_category）、"
-        "closest_category（无有效项时 None）、per_candidate（类别到归一化距离）、"
-        "categories_without_detection（含没有有限距离的类别）、definition、quantile_q、"
-        "degradation_flags。无需米制尺度。"),
+        "status（ok/incomplete_candidates/uncertain_geometry/ambiguous_grounding）、"
+        "closest_category（仅 status=ok 有值）、per_candidate（不可判定类别为 None）、"
+        "candidates（逐类别 status/n_instances/instances；实例含 obj_id、track_id、"
+        "distance_normalized、n_valid_points、degradation_flags、audit）、"
+        "requested_categories、categories_without_detection、categories_with_invalid_geometry、"
+        "tied_categories、margin_normalized、contract_version、definition、quantile_q、"
+        "degradation_flags。缺实例测量、同一对象/track 跨角色复用或最小距离并列均不可判定，"
+        "不得对不完整 per_candidate 另取最小值。接近但不相等的距离仅记录差值，阈值未标定。"
+        "无需米制尺度。"),
     "object_distance_m": (
         "两个不同对象点集的双向最近邻距离低分位，作为表面最近距离代理。"
         "返回 dict：distance_m（米）、同值别名 distance_metric、distance_normalized、"

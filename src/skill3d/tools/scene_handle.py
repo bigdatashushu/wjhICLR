@@ -23,13 +23,14 @@ import numpy as np
 
 from skill3d.schemas import ObjectRecord, SceneState
 
-from .category_match import matches
+from .category_match import matches, normalize
 from .image_ledger import ImageLedger
 from .contract import (
     ARTIFACT_INTRINSICS,
     ARTIFACT_OBJECTS,
     ARTIFACT_POSES,
     ARTIFACT_SCALE,
+    DomainValueError,
     route_aware_available,
 )
 
@@ -52,8 +53,10 @@ class SceneHandle:
         quality_overall: Optional[float] = None,
         objects_materialized: Optional[bool] = None,
         metric_scale: Optional[float] = None,
+        grounding_coverage: Optional[dict] = None,
     ) -> None:
         self._state = scene_state
+        self.grounding_coverage = dict(grounding_coverage or {})
         # 世界系 → 米 的换算系数。优先用显式传入值（mock_light 的合成几何），
         # 否则读运行时 artifact。
         self._metric_scale = metric_scale
@@ -289,7 +292,7 @@ class SceneHandle:
         """按类别名过滤对象 id（空 = 全部）。
 
         匹配走 `tools.category_match.matches`（归一化分隔符 + 同义词 + 单复数 +
-        词集合交集），**不是**朴素子串比较。真实实测依据：清单里是 `phone` /
+        登记的外观前缀），不按子串或任意共享单词匹配。清单里是 `phone` /
         `trash_can`，题面写 `telephone` / `trash can`，朴素子串匹配两者都返回空 →
         整类题型 abstain。详见 category_match 模块头。
 
@@ -314,18 +317,24 @@ class SceneHandle:
         """按 obj_id、类别名（归一化匹配）或唯一候选解析对象。
 
         解析顺序：obj_id 精确 → 类别名精确 → 类别名归一化/同义词匹配。
-        归一化匹配命中**多个**时取第一个（obj_id 升序，确定性）——
-        题面只点名一个物体、清单里同类多个时，这是唯一的确定性选择。
+        同一优先级存在多个实例时返回受控歧义错误，要求调用方检查可见帧并传 obj_id。
         """
         if name_or_id in self._objects:
             return name_or_id
-        key = str(name_or_id or "").strip().lower()
-        hit = self._by_name.get(key)
-        if hit is not None:
-            return hit
-        cands = self.list_objects_by_name(name_or_id)
-        if cands:
+        key = normalize(name_or_id)
+        if not key:
+            raise KeyError("对象名称不能为空")
+        exact = [oid for oid in self.list_objects()
+                 if normalize(self._objects[oid].category_name) == key]
+        cands = exact or self.list_objects_by_name(name_or_id)
+        if len(cands) == 1:
             return cands[0]
+        if cands:
+            raise DomainValueError(
+                "resolve_object_id",
+                f"ambiguous_object: {name_or_id!r} 对应多个实例 {cands}；"
+                "请用 list_objects 查看可见帧，确认后传入明确 obj_id",
+                args={"name": name_or_id, "candidate_object_ids": cands})
         raise KeyError(f"对象不存在: {name_or_id}")
 
     def get_object(self, name_or_id: str) -> ObjectRecord:
@@ -435,11 +444,10 @@ class SceneHandle:
         return np.asarray(self._c2w[frame_idx][:3, 3], dtype=np.float64)
 
     def exists(self, name_or_id: str) -> bool:
-        try:
-            self.resolve_object_id(name_or_id)
+        if name_or_id in self._objects:
             return True
-        except KeyError:
-            return False
+        return bool(str(name_or_id or "").strip()
+                    and self.list_objects_by_name(name_or_id))
 
     # ---- 相机参数 ----
     def get_c2w(self, frame_idx: int) -> np.ndarray:

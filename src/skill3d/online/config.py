@@ -16,6 +16,7 @@ _FALLBACK: dict[str, Any] = {
     "max_solver_rounds": 6,
     "max_retries_per_operation": 3,
     "finalization_rounds": 1,
+    "eval_visual_fallback": True,
     "paths": {
         "data_root": "data",
         "vsi_bench_meta": "data/vsi_bench_meta",

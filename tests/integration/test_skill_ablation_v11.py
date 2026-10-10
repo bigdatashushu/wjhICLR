@@ -344,6 +344,9 @@ def test_service_failure_is_incomplete_and_never_fabricates_score(panel, tmp_pat
     for arm in ab.ARMS if failed_arm == "prepare" else [failed_arm]:
         assert pairs[0]["arms"][arm]["score"] is None
         assert pairs[0]["arms"][arm]["service_errors"]
+        if failed_arm != "prepare":
+            assert pairs[0]["arms"][arm]["failure_code"] == "vllm_service_error"
+            assert pairs[0]["arms"][arm]["terminal_failure"]["stage"] == "M8"
     assert pairs[0]["delta"] is None
     assert result["groups"]["all"]["B11_minus_B01"]["Accuracy"] is None
 
@@ -445,6 +448,45 @@ def test_detection_service_fault_after_yield_stays_incomplete(panel, tmp_path, m
     assert pairs[0]["arms"]["B01"]["service_errors"]
 
 
+@pytest.mark.parametrize("recover", [True, False])
+def test_detector_transport_attempts_reach_pair_and_online_trace(panel, tmp_path, monkeypatch, recover):
+    from unittest.mock import Mock
+    import requests
+    from skill3d.segmentation import open_vocab_detector as ovd
+    response = Mock(status_code=200)
+    response.json.return_value = {"success": True, "detections": []}
+    post = Mock(side_effect=([requests.Timeout("timeout"), response] if recover
+                            else requests.Timeout("timeout")))
+    monkeypatch.setenv("SKILL3D_DETECTOR_ENDPOINT", "http://detector")
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(ovd.time, "sleep", lambda _: None)
+    program = ('r = detect_objects([0], ["chair"])\n'
+               'return YieldObservations([r], "inspect result")\n')
+    summary, pairs, _, root = run(panel, tmp_path, programs={
+        "B01": [program, 'ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate"))\n']})
+    row = pairs[0]["arms"]["B01"]
+    assert len(row["detector_attempts"]) == (2 if recover else 3)
+    assert summary["status"] == ("completed" if recover else "incomplete")
+    assert (row["score"] is not None) == recover
+    if recover:
+        assert row["detector_attempts"][-1]["recovered"]
+        assert not row["service_errors"]
+        assert row["answer_basis"] == "visual_estimate"
+        assert summary["groups"]["all"]["arms"]["B01"]["answer_basis_counts"]["visual_estimate"] == 1
+    traces = [json.loads(line) for path in root.rglob("trace_record.jsonl")
+              for line in path.read_text().splitlines()]
+    assert any(t.get("detector_attempts") == row["detector_attempts"] for t in traces)
+
+
+def test_synthesis_service_error_keeps_specific_terminal_reason(panel, tmp_path):
+    _, pairs, _, _ = run(panel, tmp_path, programs={"B01": [ConnectionError("unavailable")]})
+    row = pairs[0]["arms"]["B01"]
+    assert row["failure_code"] == "vllm_service_error"
+    assert row["terminal_failure"]["stage"] == "M8"
+    assert row["terminal_failure"]["termination_reason"] == "synthesis_unavailable"
+    assert row["score"] is None
+
+
 def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypatch):
     import importlib.util
     # CLI sets a detector endpoint from YAML. Keep it disabled and restore the
@@ -469,10 +511,10 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_2"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_3"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.2-m11-acceptance")
-    assert manifest["common_config"]["tool_docs_version"] == "tool-docs-v11.1"
+        "solver-v11.4-eval-visual-fallback")
+    assert manifest["common_config"]["tool_docs_version"] == "tool-docs-v11.2"
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-contract-repair"
 
 
@@ -512,11 +554,73 @@ def test_invalid_inputs_fail_before_model_and_write_receipt(panel, tmp_path, dam
 def test_quality_confirmation_does_not_change_thresholds(panel, tmp_path):
     contract = ab.quality_contract()
     result, _, _, root = run(panel, tmp_path, quality_confirmation={
-        "confirmed": True, "sha256": contract["sha256"], "evidence_ref": "synthetic-test-only"})
+        "confirmed": True, "sha256": contract["sha256"], "evidence_ref": "synthetic-test-only",
+        "artifact": {"sha256": ab._file_hash(panel[1])}})
     manifest = json.loads((root / "manifest.json").read_text())
     assert manifest["quality_contract"] == contract
     assert manifest["quality_confirmation_status"] == "confirmed"
     assert result["formal_result_eligible"] is False
+
+
+def test_old_quality_confirmation_cannot_reuse_pre_ranking_contract(panel, tmp_path):
+    contract = ab.quality_contract()
+    legacy = {k: v for k, v in contract.items() if k not in (
+        "sha256", "evidence_source_sha256", "execution_protocol_version",
+        "tool_docs_version", "prompt_template_version")}
+    assert "tools/ranking_contract.py" in contract["evidence_source_sha256"]
+    with pytest.raises(ab.PairingError, match="quality confirmation"):
+        run(panel, tmp_path, quality_confirmation={
+            "confirmed": True, "sha256": ab._hash(legacy), "evidence_ref": "old-engineering"})
+
+
+def test_partial_rank_rejected_then_visual_answer_keeps_pair_denominator(panel, tmp_path):
+    item = panel[0]
+    ref = item.geometry.objects[1].obj_id
+    candidates = list(item.episode.options)
+    item.episode.options.append("unmeasured candidate")
+    program = f"rank = relative_distance_rank({ref!r}, {candidates!r})\nReturnAnswer('A')\n"
+    visual = "ReturnAnswer(AnswerPayload(value='A', unit='option', basis='visual_estimate'))\n"
+    result, pairs, _, _ = run(panel, tmp_path, programs={
+        "B01": [program, visual], "B11": [program, visual]})
+    assert result["status"] == "completed"
+    for arm in ab.ARMS:
+        row = pairs[0]["arms"][arm]
+        assert row["geometry_rejection"] and row["answer"] == "A"
+        assert row["answer_basis"] == "visual_estimate"
+        assert row["failure_code"] is None and row["terminal_failure"] == {}
+        assert row["errors"][0]["downgraded_capabilities"] == {}
+        assert result["groups"]["all"]["arms"][arm]["n_scored"] == 1
+        assert result["groups"]["all"]["arms"][arm]["answer_basis_counts"]["visual_estimate"] == 1
+
+
+def test_recovered_detector_attempts_reach_manifest_and_both_arm_traces(
+        panel, tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    import requests
+    from skill3d.segmentation import open_vocab_detector as ovd
+    original = sam2_tracker.bind_objects_for_scene
+    def bind(frames, *args, **kwargs):
+        ovd.detect(frames[0], "chair", endpoint="http://injected")
+        return original(frames, *args, **kwargs)
+    response = Mock(status_code=200)
+    response.json.return_value = {"success": True, "detections": []}
+    monkeypatch.setattr(requests, "post", Mock(side_effect=[
+        requests.ConnectionError("transient"), response]))
+    monkeypatch.setattr(ovd.time, "sleep", lambda _: None)
+    monkeypatch.setattr(sam2_tracker, "bind_objects_for_scene", bind)
+    result, pairs, _, root = run(panel, tmp_path)
+    assert result["status"] == "completed"
+    manifest = json.loads((root / "manifest.json").read_text())
+    attempts = manifest["preparation_detector_attempts"][panel[0].episode.qa_id]
+    assert len(attempts) == 2 and attempts[1]["recovered"]
+    assert not manifest["preparation_errors"]
+    for arm in ab.ARMS:
+        row = pairs[0]["arms"][arm]
+        assert row["detector_attempts"] == attempts
+        assert not row["service_errors"] and row["score"] is not None
+        trace_path = next((root / "arms" / arm).glob("*/trace/trace_record.jsonl"))
+        trace = json.loads(trace_path.read_text().splitlines()[0])
+        assert trace["detector_attempts"] == attempts
 
 
 def test_malformed_program_counts_as_failure_not_service_outage(panel, tmp_path):

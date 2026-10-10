@@ -18,6 +18,8 @@ import urllib.error
 import urllib.request
 from typing import Optional, Sequence
 
+from skill3d.synthesis.request_context import current_request_phase
+
 def _normalize_base_url(endpoint: str) -> str:
     """把 endpoint 归一化为 OpenAI 兼容 base_url（保留末尾 /v1，去掉多余斜杠）。"""
     ep = str(endpoint).strip().rstrip("/")
@@ -129,6 +131,10 @@ class VLLMClient:
         与"模型答得不对"严格区分开。
         """
         client = self._clients[next(self._rr)]
+        # 评测增量请求最多发一次；避免 OpenAI SDK 隐式重试突破该上限。
+        if current_request_phase() == "eval_visual_fallback":
+            client = client.with_options(max_retries=0)
+        self.last_usage = {}
         kwargs: dict = {"model": self.model, "messages": messages,
                         "temperature": 0.0, "max_tokens": max_tokens}
         if seed is not None:

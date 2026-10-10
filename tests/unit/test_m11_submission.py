@@ -13,6 +13,9 @@ from skill3d.tools import REGISTRY
 from skill3d.verifier.geometry_oracle import geometry_verify
 
 from test_geometry_tools import _handle, _scene
+from test_geometry_tools import _ranking_handle
+from skill3d.tools.geometry_tools import relative_distance_rank
+from skill3d.verifier.derivation import replay_derivation
 
 
 class _MetricState:
@@ -152,3 +155,46 @@ def test_m11_rejects_malformed_or_nonfinite_measurements(raw):
     verified = geometry_verify(trace, _VerifierHandle())
     assert not verified.passed
     assert {issue.result_id for issue in verified.issues} == {"bad"}
+
+
+@pytest.mark.parametrize("mutation", ["missing", "omitted_option", "tie"])
+def test_rank_acceptance_rejects_incomplete_result_without_revoking_shared_geometry(mutation):
+    handle = _ranking_handle(missing=mutation == "missing")
+    rank = relative_distance_rank(handle, "desk", ["chair", "lamp"])
+    if mutation == "tie":
+        rank["ranking"][1]["distance_normalized"] = rank["ranking"][0]["distance_normalized"]
+    options = ["chair", "lamp", "table"] if mutation == "omitted_option" else ["chair", "lamp"]
+    result = _result("rank", rank, tool="relative_distance_rank")
+    trace = ProgramExecutionTrace(
+        program_id="p", calls=[], results=[result], stdout_tail="",
+        error_code=None, steps=1, wallclock_s=0.0)
+    verified = geometry_verify(trace, handle, options=options)
+    assert not verified.passed and "complete_ranking" in verified.violations
+    assert all(i.confirmed_shared_premise is None for i in verified.issues)
+    kernel = RestrictedNamespaceKernel(REGISTRY, handle)
+    kernel.tool_results.append(result)
+    with pytest.raises(AnswerTerminate):
+        kernel.answer_slot(AnswerPayload(value="A", unit="option", basis="visual_estimate"))
+    # A pure visual answer cannot hide a rank produced in the same cell.
+    assert not geometry_verify(submission_scope(kernel, trace), handle, options=options).passed
+    # A subsequent zero-tool answer may explicitly discard historical geometry.
+    next_trace = trace.model_copy(update={"results": []})
+    assert geometry_verify(submission_scope(kernel, next_trace), handle, options=options).passed
+
+
+def test_rank_derivation_checks_actual_option_coverage_and_mapping():
+    handle = _ranking_handle()
+    rank = relative_distance_rank(handle, "desk", ["chair", "lamp"])
+    result = _result("rank", rank, tool="relative_distance_rank")
+    def replay(value, mapping, options):
+        return replay_derivation(
+            AnswerPayload(
+                value=value, unit="option", basis="tool_derived", used_result_ids=["rank"],
+                derivation={"op": "option_map", "input_result_ids": ["rank"],
+                            "parameters": {"field": "closest_category", "mapping": mapping}}),
+            [result], question_type="object_rel_distance", options=options)
+    assert replay("A", {"chair": "A", "lamp": "B"}, ["chair", "lamp"]).passed
+    assert replay("B", {"chair": "B", "lamp": "A"}, ["lamp", "chair"]).passed
+    assert not replay("A", {"chair": "A"}, ["chair", "lamp", "table"]).passed
+    wrong = replay("B", {"chair": "B", "lamp": "A"}, ["chair", "lamp"])
+    assert "ranking_option_mismatch" in {i.code for i in wrong.issues}

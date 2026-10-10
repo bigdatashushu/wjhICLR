@@ -7,6 +7,8 @@ seed: 0
 max_solver_rounds: 6
 max_retries_per_operation: 3
 finalization_rounds: 1
+# 只在评测原流程失败后，预算外追加一次 32 原帧直答；induction 不启用。
+eval_visual_fallback: true
 
 paths:
   data_root: data

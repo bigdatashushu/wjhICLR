@@ -14,6 +14,8 @@ from skill3d.schemas import (
     AnswerPayload,
     ToolResult,
 )
+from skill3d.tools.category_match import matches, option_category
+from skill3d.tools.ranking_contract import ranking_problems
 
 
 class DerivationIssue(BaseModel):
@@ -291,6 +293,8 @@ def _execute(
             reverse=descending if op == "sort" else False,
         )
         if op == "argmin":
+            if len(order) > 1 and values[order[0]] == values[order[1]]:
+                raise DerivationReplayError("ambiguous_minimum", "argmin 的最小值并列")
             return labels[order[0]], "option"
         return [labels[index] for index in order], "option"
 
@@ -387,6 +391,32 @@ def replay_derivation(
             reason=f"题型 {question_type} 要求 unit={expected_unit}，实际为 {payload.unit}",
         ))
     derivation = payload.derivation
+    referenced = set(payload.used_result_ids) | set(payload.derivation_inputs())
+    ranks = []
+    for result in results:
+        if result.result_id not in referenced or result.tool != "relative_distance_rank":
+            continue
+        try:
+            value = _decode_result(result)
+            problems = ranking_problems(value, options)
+            if problems:
+                issues.append(DerivationIssue(
+                    code="incomplete_ranking", reason="; ".join(problems),
+                    result_id=result.result_id))
+            else:
+                ranks.append(value)
+        except DerivationReplayError as exc:
+            issues.append(DerivationIssue(
+                code=exc.code, reason=str(exc), result_id=exc.result_id))
+    # A model-provided mapping/labels array must not swap the measured winner.
+    if options and payload.basis == "tool_derived" and question_type == "object_rel_distance":
+        for rank in ranks:
+            winner = next(i for i, option in enumerate(options)
+                          if matches(option_category(option), rank["closest_category"]))
+            if str(payload.value).strip().upper() != string.ascii_uppercase[winner]:
+                issues.append(DerivationIssue(
+                    code="ranking_option_mismatch",
+                    reason="答案选项与完整排名的最近类别不一致"))
     # Visual/mixed submissions still have an answer domain even without a
     # declared calculation. Validate before the no-derivation early return.
     if payload.unit in {"count", "m", "cm", "m2"}:
@@ -440,6 +470,7 @@ def replay_derivation(
     computed_unit = ""
     blocking_codes = {
         "payload_contract", "duplicate_result_id", "duplicate_input_result_id",
+        "incomplete_ranking",
     }
     if not any(issue.code in blocking_codes for issue in issues):
         try:

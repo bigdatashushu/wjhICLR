@@ -27,15 +27,12 @@
    意义**（`q=0.01` 在 100 点以下退化成极小值，毫无稳健性），给数字等于邀请下游
    把它当精确值用；置 None 能把"测不出"和"测出来很差"区分开（fail-closed）。
 
-两类距离口径**严格分开**（§12.3）
+两类几何原语与题型口径（v7 §2.2 修正）
 --------------------------------
-- **abs_distance（相机→对象）**：`robust_distance_to_reference(points=对象 mask 内
-  3D 点, reference_xyz=相机中心)`；米制值 = 归一化距离 × `metric_scale`
-  （无米制尺度 → `distance_metric=None`，**绝不用 1.0 冒充**）。
-- **rel_distance（官方 VSI-Bench 口径）**：参考 = 观察点（相机/agent），对题面每个
-  候选对象**分别**算一次 `robust_distance_to_reference` 再比较排序；尺度 `s` 在比较
-  中约掉，不需要 `metric_scale`。**它不是对象↔对象距离** —— 对象↔对象表面距离是
-  另一个原语 `robust_distance_between_pointsets`（§9.7），不得用于官方 rel_distance 作答。
+- 点到对象：`robust_distance_to_reference`，可用于相机或对象质心到点集的辅助测量。
+- 对象到对象：`robust_distance_between_pointsets`，由 `object_distance_m` 与
+  `relative_distance_rank` 使用。相对距离题比较题面参照对象到各候选类别最近实例的
+  距离，不以相机替代参照对象；尺度在比较中约掉。绝对距离的米制值需要授权尺度。
 
 降级条件（§12.4）与"值可否输出"的对应表
 --------------------------------------
@@ -646,7 +643,7 @@ def _result(
 
 
 # ---------------------------------------------------------------------------
-# §12.1 距离原语之一：点集 → 参考点（abs_distance / rel_distance 共用内核）
+# §12.1 距离原语之一：点集 → 参考点（相机/质心辅助测量）
 # ---------------------------------------------------------------------------
 
 def robust_distance_to_reference(
@@ -665,13 +662,9 @@ def robust_distance_to_reference(
 ) -> DistanceResult:
     """§12.1：`quantile({||p − R||}, q)`——稳健低分位距离。
 
-    口径（§12.3，调用方按用途选，本函数不区分）：
-
-    - **abs_distance（相机→对象）**：`points` = 对象 mask 内 3D 点，`reference_xyz` = 相机
-      中心；`metric_scale` 给出时 `distance_metric = distance_normalized × metric_scale`。
-    - **rel_distance（官方口径）**：`reference_xyz` = 观察点，对每个候选对象**分别**调用
-      本函数，再比较排序；尺度在比较中约掉 → 不传 `metric_scale`。
-      **不要**用 `robust_distance_between_pointsets` 回答 rel_distance（§12.3 明令）。
+    `points` 是对象 mask 内 3D 点，`reference_xyz` 为调用方提供的相机中心或参考点。
+    `metric_scale` 给出时 `distance_metric = distance_normalized × metric_scale`。
+    VSI-Bench 题面对象间的相对/绝对距离由点集间原语提供，不以相机距离替代。
 
     参数
     ----
@@ -734,7 +727,7 @@ def robust_distance_to_reference(
 
 
 # ---------------------------------------------------------------------------
-# §9.7 距离原语之二：点集 ↔ 点集（双向 NN，低分位；**不参与 rel_distance 官方口径**）
+# §9.7 距离原语之二：点集 ↔ 点集（双向 NN，低分位）
 # ---------------------------------------------------------------------------
 
 def robust_distance_between_pointsets(
@@ -759,9 +752,8 @@ def robust_distance_between_pointsets(
     `quantile(D_AB ∪ D_BA, q)`；复杂度 `O((n_A+n_B)·log·max)`，
     **不做全笛卡尔积**（`n_A × n_B` 矩阵在本模块里根本不会出现）。
 
-    **定位**（§9.7/§12.3）：对象↔对象表面距离是独立原语，**不得**用于
-    `object_rel_distance` 题型的官方口径作答（官方口径是"观察点→各参考对象分别比较"，
-    见 `robust_distance_to_reference`）。
+    **定位**（v7 §2.2）：对象↔对象表面距离代理；相对距离工具比较题面参照对象
+    与各候选实例，候选完整性和排名唯一性由 Tool 层校验。
 
     污染判据（§12.4-3）用**双向 NN 集合自身**：极近距离占比（基准 = 两侧集合内采样
     间距的中位数）超门 ⇒ `point_contamination_suspect`，此时不输出精确值
@@ -824,7 +816,7 @@ def robust_distance_between_pointsets(
         contamination_ratio=ratio, duplicate_suspect=duplicate_suspect,
         suppressed=(raw if suspect else None),
         extra_audit={
-            "surface_distance_note": "双向 NN 低分位（§9.7）；不得用于 rel_distance 官方口径",
+            "surface_distance_note": "双向 NN 低分位（§9.7）；对象间表面最近距离代理",
             "contamination_note": note,
             "reference_spacing": None if spacing is None else float(spacing),
             "n_used_a": prep_a["n_used"], "n_used_b": prep_b["n_used"],

@@ -6,7 +6,15 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
 
-> **当前结论（2026-10-09）**：仓库代码与 v11 启动器已核查，v11 dry-run 已完成，正式 run `v11-s03-seed137` 已按真实入口执行，但在模型许可证门处退出。没有启动 vLLM，没有执行重建、induction、B01/B11 或演化，没有可报告的样本数、分数或 Skill 晋升结果。
+2026-10-10 的工程基线使用 `program_synth_v11_3`、
+`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.2`。类别匹配、对象覆盖、
+完整排名验收及检测器重试由两臂共用；评测时原 solver 失败后可预算外追加一次
+`eval-visual-v1` 请求，只携带冻结的 32 张原帧、问题、选项和答案格式。该路径不在
+`induction` 使用，正常提交但答错也不会触发。冻结 Skill 不变，质量确认哈希包含相关
+源码和合同版本，旧确认会被拒绝。真实准确率需另行运行 GPU 配对验证，详见
+[配对运行合同](docs/skill_ablation_v11.md)。
+
+> **历史核查结论（2026-10-09）**：仓库代码与 v11 启动器已核查，v11 dry-run 已完成，正式 run `v11-s03-seed137` 已按真实入口执行，但在模型许可证门处退出。没有启动 vLLM，没有执行重建、induction、B01/B11 或演化，没有可报告的样本数、分数或 Skill 晋升结果。
 
 ## 1. 当前基线与证据口径
 

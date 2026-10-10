@@ -739,3 +739,89 @@ def test_question_supplement_skips_targets_already_in_inventory(tmp_path):
     assert stats["grounding"]["attempted"] is True
     assert stats["grounding"]["all_present"] is True
     assert "均已在场景清单中" in note
+
+    # 生产者→消费者回归：没有新增框的完整命中仍然可用。
+    from skill3d.online.runner import _m5_evidence_summary
+    from skill3d.reconstruction_gate.evidence_profile import grounding_capability
+
+    summary = _m5_evidence_summary(stats, base + first, None, m5_materialized=True)
+    assert summary.grounding_pointed_hit is True
+    assert not summary.grounding_miss
+    assert grounding_capability(summary) == "available"
+
+
+def test_supplement_checks_options_and_partial_detector_coverage(tmp_path, monkeypatch):
+    from skill3d.segmentation import sam2_tracker as tracker
+    from skill3d.online.runner import _m5_evidence_summary
+    from skill3d.reconstruction_gate.evidence_profile import grounding_capability
+
+    base = [_inst("obj_0", "heater", [0., 0., 0.])]
+    client = _FakeVLM(["heater"])
+    requested = []
+
+    def detect(frames, probe, nouns):
+        requested.extend(nouns)
+        return ["chair"], [[1., 1., 20., 20.]], [(0, 0, [1., 1., 20., 20.])]
+
+    monkeypatch.setattr(tracker, "ovd_boxes_for_nouns", detect)
+    monkeypatch.setattr(tracker, "track_objects", lambda *a, **k: [{0: np.ones((2, 2))}])
+    monkeypatch.setattr(tracker, "bind_masks_to_world", lambda *a, **k: [
+        _inst("obj_0", "chair", [10., 0., 0.])])
+    monkeypatch.setattr(tracker, "_dedupe_by_world_centroid",
+                        lambda objects, *a, **k: (objects, 0, [[0]]))
+    new, stats, _ = tracker._bind_question_supplement(
+        [np.zeros((2, 2, 3), dtype=np.uint8)], [0], "Which is closest to the heater?",
+        base, np.ones((1, 2, 2)), np.eye(4)[None], np.eye(3)[None],
+        grid_transform=None, out_dir=tmp_path, scene_name="coverage",
+        predictor=None, vlm_client=client, handle=None,
+        question_type="object_rel_distance", options=["A. chair", "B. sofa"])
+    assert requested == ["chair", "sofa"]
+    assert stats["grounding"]["missing_names"] == ["sofa"]
+    assert stats["grounding"]["status"] == "partial"
+    assert not stats["grounding"]["all_present"]
+    summary = _m5_evidence_summary(stats, base + new, None, m5_materialized=True)
+    assert grounding_capability(summary) == "degraded"
+
+
+def test_grounding_reference_ambiguity_allows_multiple_candidate_instances():
+    from skill3d.segmentation.sam2_tracker import _grounding_coverage
+
+    objects = [_inst(f"obj_{i}", category, [float(i), 0., 0.])
+               for i, category in enumerate(["heater", "heater", "chair", "chair"])]
+    coverage = _grounding_coverage(
+        ["heater", "chair"], objects, candidate_names=["chair"],
+        question_type="object_rel_distance")
+    assert coverage["status"] == "ambiguous"
+    assert coverage["ambiguous_names"] == ["heater"]
+    assert coverage["requirements"][1]["status"] == "present"
+
+
+def test_candidates_alone_cannot_claim_reference_grounding_complete():
+    from skill3d.segmentation.sam2_tracker import _grounding_coverage
+    objects = [_inst("a", "chair", [0., 0., 0.]), _inst("b", "lamp", [1., 0., 0.])]
+    coverage = _grounding_coverage(
+        ["chair", "lamp"], objects, candidate_names=["chair", "lamp"],
+        question_type="object_rel_distance")
+    assert coverage["status"] == "partial"
+    assert coverage["reference_unresolved"] and not coverage["all_present"]
+
+
+def test_question_supplement_never_overwrites_base_geometry_files(tmp_path):
+    from pathlib import Path
+    base = _inst("obj_0", "chair", [10., 10., 10.])
+    refs = {}
+    for field, suffix, data in (
+        ("pointcloud_world", "points", np.full((200, 3), 10.)),
+        ("pointconf_world", "pointconf", np.full(200, 2.)),
+        ("mask_per_frame", "mask", np.zeros((3, H, W), dtype=np.uint8)),
+    ):
+        path = tmp_path / f"sup_obj_0_{suffix}.npy"
+        np.save(path, data)
+        setattr(base, field, str(path))
+        refs[path] = path.read_bytes()
+    new, _, _ = _supplement_case(tmp_path, [base], point_conf=np.full((3, H, W), 4.))
+    assert len(new) == 1 and new[0].obj_id == "obj_1"
+    assert all(path.read_bytes() == content for path, content in refs.items())
+    for field in ("pointcloud_world", "pointconf_world", "mask_per_frame"):
+        path = Path(getattr(new[0], field))
+        assert path.is_file() and path not in refs
