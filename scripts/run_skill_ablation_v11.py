@@ -24,6 +24,32 @@ from skill3d.reconstruction.run import resolve_artifact_path
 from skill3d.routing.task_classifier import canonical_task
 
 
+def _load_quality_confirmations(path: Path, items):
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if "scenes" not in value:
+        return value, None
+    scene_paths = {
+        str(row["scene_name"]): Path(str(row["path"]))
+        for row in value["scenes"]
+    }
+    confirmations = {}
+    missing = []
+    for item in items:
+        scene = str(item.episode.scene_name)
+        confirmation_path = scene_paths.get(scene)
+        if confirmation_path is not None and not confirmation_path.is_absolute():
+            confirmation_path = path.parent / confirmation_path
+        if confirmation_path is None or not confirmation_path.is_file():
+            missing.append(scene)
+            continue
+        confirmations[item.episode.qa_id] = json.loads(
+            confirmation_path.read_text(encoding="utf-8"))
+    if missing:
+        raise PairingError(
+            f"missing scene quality confirmations: {sorted(set(missing))}")
+    return None, confirmations
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="v11 B01(no Skill) / B11(frozen S0), quality always on")
     parser.add_argument("--config", default="configs/config.yaml")
@@ -131,8 +157,10 @@ def main(argv=None) -> int:
                     recon, it.episode.scene_name, "vggt",
                     frame_set=it.episode.frame_set)[0])
                 for it in items if it.input_error is None}
-        confirmation = (json.loads(Path(args.quality_confirmation).read_text())
-                        if args.quality_confirmation else None)
+        confirmation, confirmations = (None, None)
+        if args.quality_confirmation:
+            confirmation, confirmations = _load_quality_confirmations(
+                Path(args.quality_confirmation), items)
         reconstruction_costs = (
             json.loads(Path(args.reconstruction_costs_json).read_text())
             if args.reconstruction_costs_json
@@ -142,6 +170,7 @@ def main(argv=None) -> int:
             items, artifact_paths=artifacts, output_dir=root, base_cfg=cfg, seed=seed,
             question_types=tasks, expected_qa_ids=expected, library_root=args.library_root,
             quality_confirmation=confirmation,
+            quality_confirmations=confirmations,
             reconstruction_costs=reconstruction_costs)
         (root / "source_receipt.json").write_text(
             json.dumps({"sampling": sampling, "exclusions": exclusions}, ensure_ascii=False, indent=2))

@@ -444,11 +444,29 @@ def _quality_confirmation_ok(path: Path) -> bool:
     except Exception:
         return False
     contract = quality_contract()
-    return bool(
-        value.get("confirmed") is True
-        and value.get("sha256") == contract["sha256"]
-        and value.get("evidence_ref")
-    )
+    if "scenes" not in value:
+        return bool(
+            value.get("confirmed") is True
+            and value.get("sha256") == contract["sha256"]
+            and value.get("evidence_ref")
+        )
+    for row in value["scenes"]:
+        scene_path = Path(str(row.get("path") or "")).expanduser()
+        if not scene_path.is_absolute():
+            scene_path = path.parent / scene_path
+        if not scene_path.is_file():
+            return False
+        try:
+            scene = json.loads(scene_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if scene.get("confirmed") not in (True, False):
+            return False
+        if scene.get("sha256", scene.get("quality_contract_sha256")) != contract["sha256"]:
+            return False
+        if not scene.get("evidence_ref"):
+            return False
+    return bool(value["scenes"])
 
 
 def _pipeline(

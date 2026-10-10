@@ -1,0 +1,7 @@
+{
+  "confirmed": false,
+  "sha256": "d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678",
+  "evidence_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/quality_gate_receipt.json",
+  "status": "not_confirmed",
+  "reason": "one_or_more_real_reconstruction_artifacts_failed_current_main_quality_gate"
+}

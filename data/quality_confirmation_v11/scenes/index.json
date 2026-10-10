@@ -1,0 +1,61 @@
+{
+  "schema_version": "skill3d-scene-quality-confirmation-index-v11/1.0",
+  "status": "completed_with_scene_level_decisions",
+  "code_commit": "6e59bb9e35a46b8427de98962bdfc86ae808bf90",
+  "quality_contract_sha256": "d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678",
+  "batch_receipt": "../quality_gate_receipt.json",
+  "scenes_total": 7,
+  "scenes_confirmed": 6,
+  "scenes_not_confirmed": 1,
+  "scenes": [
+    {
+      "scene_name": "5eb31827b7",
+      "split": "induction",
+      "confirmed": false,
+      "path": "5eb31827b7/quality_confirmation.json",
+      "artifact_sha256": "48db02d641a0e8154325aa757039ad0d07d6862b83cdc6545eb6f9d2742cb0f4"
+    },
+    {
+      "scene_name": "bde1e479ad",
+      "split": "induction",
+      "confirmed": true,
+      "path": "bde1e479ad/quality_confirmation.json",
+      "artifact_sha256": "8d850ca6b0a6bba24bf3908bfa19d17419e183fed92f508ea2ff6372784d9d61"
+    },
+    {
+      "scene_name": "fb5a96b1a2",
+      "split": "induction",
+      "confirmed": true,
+      "path": "fb5a96b1a2/quality_confirmation.json",
+      "artifact_sha256": "ea3752a0dbb77bb7f5ef9815bec99c83ef2fbc649f6c229e31c7ec9f9457f2bd"
+    },
+    {
+      "scene_name": "1ada7a0617",
+      "split": "inner_validation",
+      "confirmed": true,
+      "path": "1ada7a0617/quality_confirmation.json",
+      "artifact_sha256": "20a5bee85f2381129f5a1981a9ea023348f22c2cfa7b50d2c7e6c7a0bab18e8e"
+    },
+    {
+      "scene_name": "3e8bba0176",
+      "split": "inner_validation",
+      "confirmed": true,
+      "path": "3e8bba0176/quality_confirmation.json",
+      "artifact_sha256": "dc755d14b6a2e71d372ec2af1373e01bc340a0a8bc4be150abdc43b3613a67bd"
+    },
+    {
+      "scene_name": "7b6477cb95",
+      "split": "inner_validation",
+      "confirmed": true,
+      "path": "7b6477cb95/quality_confirmation.json",
+      "artifact_sha256": "c6234efb296457756fe536512d4104f379d62be980efa726cc19c562b6b339d3"
+    },
+    {
+      "scene_name": "cc5237fd77",
+      "split": "inner_validation",
+      "confirmed": true,
+      "path": "cc5237fd77/quality_confirmation.json",
+      "artifact_sha256": "56604604cb3d076b8a9a46b90f512dd81b547e1039454e55c0335dd95dabdba2"
+    }
+  ]
+}

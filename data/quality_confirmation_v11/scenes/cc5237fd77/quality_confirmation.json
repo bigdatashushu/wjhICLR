@@ -1,0 +1,33 @@
+{
+  "schema_version": "skill3d-scene-quality-confirmation-v11/1.0",
+  "confirmed": true,
+  "status": "confirmed",
+  "scene_name": "cc5237fd77",
+  "split": "inner_validation",
+  "code_commit": "6e59bb9e35a46b8427de98962bdfc86ae808bf90",
+  "quality_contract_sha256": "d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678",
+  "quality_metric_version": "v6-warp-overlap-no-g5",
+  "artifact": {
+    "path": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/cc5237fd77__da56b1075d27818a.json",
+    "sha256": "56604604cb3d076b8a9a46b90f512dd81b547e1039454e55c0335dd95dabdba2",
+    "artifact_id": "vggt-cc5237fd77",
+    "artifact_version": "8f7e8429cb0b212a",
+    "frame_set_hash": "a1d8389f20b2f656ccaa10c99381709a72d70f2a1deef931a2f3be3f40e758a1"
+  },
+  "quality": {
+    "quality_status": "computed",
+    "main_gate_passed": true,
+    "warp_inlier_ratio": 0.6920722213019712,
+    "cloud_overlap_ratio": 0.6921,
+    "overall_quality": 0.953125,
+    "gate_thresholds": {
+      "warp_inlier_ratio": 0.5,
+      "cloud_overlap_ratio": 0.3
+    },
+    "diagnostic_warnings": [
+      "相邻帧旋转跳变中位数 51.3° 超阈（诊断告警，不计入主门；§10.2）"
+    ]
+  },
+  "evidence_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/quality_gate_receipt.json",
+  "batch_receipt_sha256": "fcedd6888755cd61ef65b004e17f7f9c021b92b258d132d3c525fb7c3923dec7"
+}

@@ -1,0 +1,69 @@
+# Reproducible GPU bootstrap and v11 experiment defaults.
+# CODE_REF must still be supplied to bootstrap_and_run_v11.sh because this file
+# cannot predict the future commit that will contain itself.
+code:
+  repository: https://github.com/bigdatashushu/wjhICLR.git
+
+environment:
+  python: "3.11"
+  min_free_disk_gib: 80
+  min_gpu_count: 2
+  min_gpu_memory_gib: 20
+  vllm_version: "0.19.1"
+  sam2_code_revision: 2b90b9f5ceec907a1c18123530e92e794ad901a4
+  moge_code_revision: 74fbce054ebed49800de42d0ad0e83495065719a
+
+weights:
+  qwen:
+    repo_id: Qwen/Qwen3-VL-8B-Instruct-FP8
+    revision: 9cdc6310a8cb770ce18efaf4e9935334512aee45
+    existing_path: ${QWEN_EXISTING_PATH:-}
+  vggt:
+    repo_id: facebook/VGGT-1B
+    revision: 860abec7937da0a4c03c41d3c269c366e82abdf9
+    existing_path: ${VGGT_EXISTING_PATH:-}
+  sam2:
+    repo_id: facebook/sam2.1-hiera-large
+    revision: 227a114a2f535cd147f82442e7d2038cdd2e5d68
+    existing_path: ${SAM2_EXISTING_PATH:-}
+    checkpoint_file: sam2.1_hiera_large.pt
+    config: ${SAM2_CONFIG:-configs/sam2.1/sam2.1_hiera_l.yaml}
+  moge2:
+    enabled: false
+    repo_id: Ruicheng/moge-2-vitl
+    revision: 39c4d5e957afe587e04eec59dc2bcc3be5ecd968
+    existing_path: ""
+
+runtime:
+  qwen_gpu: 2
+  geometry_gpu: 3
+  host: 127.0.0.1
+  port: 18110
+  served_model_name: qwen3vl-v11
+  max_model_len: 32768
+  gpu_memory_utilization: 0.90
+  max_pixels: 131072
+  n_images: 32
+  startup_timeout_s: 900
+
+experiment:
+  # Formal mode never manufactures these prerequisites. The launcher fails if
+  # license acknowledgement, real videos, or quality confirmation is absent.
+  formal: true
+  accept_model_licenses: true
+  accept_vsi_bench_license: true
+  # Fill these machine-local paths in an untracked copy before formal runs.
+  video_root: /nas/wangjh/Skill-3D/dataset/VSI-Bench
+  quality_confirmation: data/quality_confirmation_v11/scenes/index.json
+  detector_endpoint: ""
+  question_type: object_rel_distance
+  datasets: scannet,scannetpp
+  seed: 137
+  induction_limit: 12
+  inner_limit: 8
+  post_publish_limit: 4
+  reconstruction_sampling_per_task: 24
+  run_evolution: false
+  campaign_id: v11-s03-gpu
+  # Deliberately no final_test option. This launcher only touches induction and
+  # inner_validation; independent final evaluation remains a separate action.

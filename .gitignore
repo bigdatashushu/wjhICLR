@@ -104,3 +104,12 @@ configs/*.local.env
 !/data/v10_campaign/**
 # 运行日志（控制台记录，便于对账；结论仍以 JSON 收据为准）
 !/data/v10_campaign*.log
+
+# v11 reproducibility metadata: JSON/YAML receipts only; raw videos, weights,
+# logs and reconstruction arrays remain external.
+!/data/quality_confirmation_v11/
+!/data/quality_confirmation_v11/**
+!/data/quality_confirmation_v11/**/*.json
+!/data/quality_confirmation_v11/README.md
+!/configs/v11/
+!/configs/v11/*.yaml

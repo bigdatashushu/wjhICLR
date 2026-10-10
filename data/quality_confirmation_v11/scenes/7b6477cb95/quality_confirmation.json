@@ -1,0 +1,34 @@
+{
+  "schema_version": "skill3d-scene-quality-confirmation-v11/1.0",
+  "confirmed": true,
+  "status": "confirmed",
+  "scene_name": "7b6477cb95",
+  "split": "inner_validation",
+  "code_commit": "6e59bb9e35a46b8427de98962bdfc86ae808bf90",
+  "quality_contract_sha256": "d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678",
+  "quality_metric_version": "v6-warp-overlap-no-g5",
+  "artifact": {
+    "path": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/7b6477cb95__657a42880e2e26dc.json",
+    "sha256": "c6234efb296457756fe536512d4104f379d62be980efa726cc19c562b6b339d3",
+    "artifact_id": "vggt-7b6477cb95",
+    "artifact_version": "055322a7917cae45",
+    "frame_set_hash": "3be93ac237159ea0650551bae61a82ab40256f1461a1e4c36e5f30bbaaed7ba8"
+  },
+  "quality": {
+    "quality_status": "computed",
+    "main_gate_passed": true,
+    "warp_inlier_ratio": 0.6797531488877243,
+    "cloud_overlap_ratio": 0.741055,
+    "overall_quality": 0.9739583333333334,
+    "gate_thresholds": {
+      "warp_inlier_ratio": 0.5,
+      "cloud_overlap_ratio": 0.3
+    },
+    "diagnostic_warnings": [
+      "warp 配对覆盖率低：91/160 对被跳过（可比像素 < 64）→ warp 内点率只代表剩余配对（多为互视图重叠的那些），不能当作全序列证据（§10.5 诚实边界）",
+      "相邻帧旋转跳变中位数 59.0° 超阈（诊断告警，不计入主门；§10.2）"
+    ]
+  },
+  "evidence_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/quality_gate_receipt.json",
+  "batch_receipt_sha256": "fcedd6888755cd61ef65b004e17f7f9c021b92b258d132d3c525fb7c3923dec7"
+}

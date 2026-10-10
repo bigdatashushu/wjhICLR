@@ -618,6 +618,7 @@ def run_skill_ablation_v11(
     library_root: str | Path = DEFAULT_LIBRARY,
     client_factory: Callable[[str, str], object] | None = None,
     quality_confirmation: dict | None = None,
+    quality_confirmations: Mapping[str, dict] | None = None,
     reconstruction_costs: Mapping[str, float] | None = None,
     _fixed_skill_arms: Mapping[str, SkillSpecV11] | None = None,
     _fixed_arm_snapshot_refs: Mapping[str, str] | None = None,
@@ -753,11 +754,27 @@ def run_skill_ablation_v11(
                 raise PairingError(
                     f"missing frozen Skills: {sorted(wanted - set(by_task))}")
         quality = quality_contract()
-        confirmed = bool(quality_confirmation and quality_confirmation.get("confirmed") is True
-                         and quality_confirmation.get("sha256") == quality["sha256"]
-                         and quality_confirmation.get("evidence_ref"))
-        if quality_confirmation and not confirmed:
-            raise PairingError("quality confirmation must match current contract and include evidence_ref")
+        if quality_confirmations is not None:
+            unknown = set(quality_confirmations) - set(expected)
+            if unknown:
+                raise PairingError(
+                    f"quality confirmations contain unexpected qa_ids: {sorted(unknown)}")
+        confirmation_by_qa = {
+            q: (quality_confirmations.get(q) if quality_confirmations is not None
+                else quality_confirmation)
+            for q in expected
+        }
+        for q, confirmation in confirmation_by_qa.items():
+            if confirmation is None:
+                continue
+            if not (
+                confirmation.get("confirmed") in (True, False)
+                and confirmation.get("sha256", confirmation.get("quality_contract_sha256"))
+                == quality["sha256"]
+                and confirmation.get("evidence_ref")
+            ):
+                raise PairingError(
+                    f"{q}: quality confirmation must match current contract and include evidence_ref")
         identities = {
             q: (input_error_identity(it) if it.input_error is not None
                 else input_identity(it, artifact_paths[q]))
@@ -780,8 +797,14 @@ def run_skill_ablation_v11(
                 "fixed_parent_candidate" if fixed_pair else "skill_ablation"),
             "common_config": common, "config_sha256": config_hash,
             "inputs": identities, "snapshot": snapshot, "skill_manifest": skill_manifest,
-            "quality_contract": quality, "quality_confirmation": quality_confirmation,
-            "quality_confirmation_status": "confirmed" if confirmed else "unconfirmed",
+            "quality_contract": quality,
+            "quality_confirmation": quality_confirmation,
+            "quality_confirmations": confirmation_by_qa if quality_confirmations is not None else None,
+            "quality_confirmation_status": (
+                "confirmed" if all(
+                    c is not None and c.get("confirmed") is True
+                    for c in confirmation_by_qa.values()
+                ) else "unconfirmed"),
             "reconstruction_costs_s": dict(sorted(costs.items())),
             "client_mode": "injected" if client_factory else "vllm",
             "source_sha256": {str(p.relative_to(code_root)): _file_hash(p)
@@ -839,7 +862,17 @@ def run_skill_ablation_v11(
             (frozen / "artifact.json").write_text(art.model_dump_json(), encoding="utf-8")
             prepared[q] = {"directory": str(frozen), **tree_identity(frozen),
                            "gate_thresholds": art.quality.gate_thresholds if art.quality else None}
-            if confirmed and prepared[q]["gate_thresholds"] != quality["default_thresholds"]:
+            confirmation = confirmation_by_qa[q]
+            if confirmation and confirmation.get("artifact", {}).get("sha256"):
+                artifact_sha = _sha256_file(Path(artifact_paths[q]).resolve())
+                if artifact_sha != confirmation["artifact"]["sha256"]:
+                    raise PairingError(f"{q}: artifact hash differs from quality confirmation")
+            if confirmation and confirmation.get("artifact", {}).get("frame_set_hash"):
+                if confirmation["artifact"]["frame_set_hash"] != identities[q]["frame_set_hash"]:
+                    raise PairingError(f"{q}: frame_set_hash differs from quality confirmation")
+            if confirmation and confirmation.get("confirmed") is True and (
+                prepared[q]["gate_thresholds"] != quality["default_thresholds"]
+            ):
                 raise PairingError(f"{q}: artifact quality thresholds differ from confirmed contract")
         manifest.update({"prepared": prepared, "preparation_errors": prepare_errors,
                          "status": "running"})
@@ -1016,8 +1049,11 @@ def run_skill_ablation_v11(
                 raise PairingError(f"{q}: original input changed later in the experiment")
         summary = summarize_pairs(pairs)
         summary.update({"experiment_id": experiment_id, "n_planned": len(expected),
-                        "formal_result_eligible": confirmed and client_factory is None
-                        and bool(cfg.model_weights_sha256) and bool(cfg.environment_sha256)
+                        "formal_result_eligible": (
+                        all(c is not None and c.get("confirmed") is True
+                            for c in confirmation_by_qa.values())
+                        and client_factory is None
+                        and bool(cfg.model_weights_sha256) and bool(cfg.environment_sha256))
                         and summary["status"] == "completed"
                         and summary["n_input_error_pairs"] < summary["n_pairs"]
                         and all(p["comparable"] for p in pairs)})

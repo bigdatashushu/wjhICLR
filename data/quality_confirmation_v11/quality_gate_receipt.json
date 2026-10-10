@@ -1,0 +1,269 @@
+{
+  "schema_version": "skill3d-quality-verification-v11/1.0",
+  "status": "completed_but_not_confirmed",
+  "confirmed": false,
+  "reason": "one_or_more_real_reconstruction_artifacts_failed_current_main_quality_gate",
+  "code_commit": "6e59bb9e35a46b8427de98962bdfc86ae808bf90",
+  "git_status_porcelain": "",
+  "quality_contract": {
+    "enabled": true,
+    "metric_version": "v6-warp-overlap-no-g5",
+    "default_thresholds": {
+      "warp_inlier_ratio": 0.5,
+      "cloud_overlap_ratio": 0.3
+    },
+    "overall_quality_threshold": 0.5,
+    "source_sha256": {
+      "__init__.py": "2a529abe7b03e5623274f50d8971cba384d4e8233d492b31cfaa3e6b303b5acd",
+      "confidence_map.py": "c067f425bb62cfead58481c240f6699559fac3e2eed1ac0214b27eeb92251b33",
+      "evidence_profile.py": "5cf4e1d4cee61c49a56a9495cdfbea9f79db0405a10ddfaa73e1efacc1f2258e",
+      "m4_main_gate.py": "0d3cd32689aac0cb9ff76f5fb8485e7c2d0526201a33622fb75647bcf02d3817",
+      "quality_metrics.py": "9d4e8ebf9a3e227da5ce1c080dab71302c64240565146390aa5bed00b7984753",
+      "scene_state.py": "d97af5b404d743bcd265c25e5d1594598fc3f35c516dd9240ae14ccd191fb3ef",
+      "world_frame.py": "dede005ca3c78d9b2ac94bdfe04bf6c0e5ef860e86db6740dac14f7d5814299b"
+    },
+    "sha256": "d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678"
+  },
+  "quality_contract_sha256": "d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678",
+  "configuration": {
+    "path": "/home/cvailab/experiments/wjhICLR-v11-config.yaml",
+    "sha256": "8530aea8cff5401e84949c4d632b07068e09b816a7b72b4fb4eca6e855b39403"
+  },
+  "dataset": {
+    "video_root": "/nas/wangjh/Skill-3D/dataset/VSI-Bench",
+    "question_types": [
+      "object_rel_distance"
+    ],
+    "splits": [
+      "induction",
+      "inner_validation"
+    ],
+    "datasets": [
+      "scannet",
+      "scannetpp"
+    ],
+    "seed": 137,
+    "n_frames": 32
+  },
+  "reconstruction": {
+    "manifest_path": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/manifest.json",
+    "manifest_sha256": "a797519ba3fdfdf9c1717c781029e2ea18051d4cd692c1e4b31a4980938f2d01",
+    "log_path": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstruction.log",
+    "method": "vggt",
+    "moge2_enabled": false,
+    "cuda_visible_devices": "7",
+    "jobs_total": 7,
+    "jobs_passed_main_gate": 6,
+    "jobs_failed_main_gate": 1,
+    "jobs": [
+      {
+        "scene_name": "5eb31827b7",
+        "split": "induction",
+        "artifact_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/5eb31827b7__eedde39585c20225.json",
+        "artifact_sha256": "48db02d641a0e8154325aa757039ad0d07d6862b83cdc6545eb6f9d2742cb0f4",
+        "artifact_id": "vggt-5eb31827b7",
+        "artifact_version": "7577f674fa2e0ab6",
+        "frame_set_hash": "f78c4097af06d5726b5d27b73a66442461965020f873043cf2dfe5bc8a65ada4",
+        "quality_status": "computed",
+        "main_gate_passed": false,
+        "warp_inlier_ratio": 0.40737766624843164,
+        "cloud_overlap_ratio": 0.44566,
+        "overall_quality": 0.0,
+        "gate_thresholds": {
+          "warp_inlier_ratio": 0.5,
+          "cloud_overlap_ratio": 0.3
+        },
+        "diagnostic_warnings": [
+          "warp_inlier_ratio=0.4074 < 阈值 0.5000 → 子项未过",
+          "warp 配对覆盖率低：84/160 对被跳过（可比像素 < 64）→ warp 内点率只代表剩余配对（多为互视图重叠的那些），不能当作全序列证据（§10.5 诚实边界）",
+          "相邻帧旋转跳变中位数 68.5° 超阈（诊断告警，不计入主门；§10.2）"
+        ]
+      },
+      {
+        "scene_name": "bde1e479ad",
+        "split": "induction",
+        "artifact_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/bde1e479ad__7de3697a05fb2aa1.json",
+        "artifact_sha256": "8d850ca6b0a6bba24bf3908bfa19d17419e183fed92f508ea2ff6372784d9d61",
+        "artifact_id": "vggt-bde1e479ad",
+        "artifact_version": "7a71f7237ded14cf",
+        "frame_set_hash": "a118b50721152f6b96f2991c2e252ff66482c725435851337c073239599004a9",
+        "quality_status": "computed",
+        "main_gate_passed": true,
+        "warp_inlier_ratio": 0.5109412429682664,
+        "cloud_overlap_ratio": 0.813545,
+        "overall_quality": 1.0,
+        "gate_thresholds": {
+          "warp_inlier_ratio": 0.5,
+          "cloud_overlap_ratio": 0.3
+        },
+        "diagnostic_warnings": [
+          "相邻帧旋转跳变中位数 82.3° 超阈（诊断告警，不计入主门；§10.2）"
+        ]
+      },
+      {
+        "scene_name": "fb5a96b1a2",
+        "split": "induction",
+        "artifact_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/fb5a96b1a2__69fd49c7da95b970.json",
+        "artifact_sha256": "ea3752a0dbb77bb7f5ef9815bec99c83ef2fbc649f6c229e31c7ec9f9457f2bd",
+        "artifact_id": "vggt-fb5a96b1a2",
+        "artifact_version": "a3d6daf971cca99e",
+        "frame_set_hash": "b534ea19ccb0f2e69c8caff80ecbd4a5a449883d1d449d2008223bd033498c07",
+        "quality_status": "computed",
+        "main_gate_passed": true,
+        "warp_inlier_ratio": 0.667684922539821,
+        "cloud_overlap_ratio": 0.82534,
+        "overall_quality": 0.9739583333333334,
+        "gate_thresholds": {
+          "warp_inlier_ratio": 0.5,
+          "cloud_overlap_ratio": 0.3
+        },
+        "diagnostic_warnings": [
+          "warp 配对覆盖率低：81/160 对被跳过（可比像素 < 64）→ warp 内点率只代表剩余配对（多为互视图重叠的那些），不能当作全序列证据（§10.5 诚实边界）",
+          "相邻帧旋转跳变中位数 63.0° 超阈（诊断告警，不计入主门；§10.2）"
+        ]
+      },
+      {
+        "scene_name": "1ada7a0617",
+        "split": "inner_validation",
+        "artifact_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/1ada7a0617__33ad332ccc7cf800.json",
+        "artifact_sha256": "20a5bee85f2381129f5a1981a9ea023348f22c2cfa7b50d2c7e6c7a0bab18e8e",
+        "artifact_id": "vggt-1ada7a0617",
+        "artifact_version": "affb32b02bbde0ab",
+        "frame_set_hash": "7a1cd3a4e9b5a9ee8f76174607d4ca10023048df1cce11ceabcf9546c9c5ddf1",
+        "quality_status": "computed",
+        "main_gate_passed": true,
+        "warp_inlier_ratio": 0.8402893711741792,
+        "cloud_overlap_ratio": 0.755515,
+        "overall_quality": 0.9739583333333334,
+        "gate_thresholds": {
+          "warp_inlier_ratio": 0.5,
+          "cloud_overlap_ratio": 0.3
+        },
+        "diagnostic_warnings": [
+          "warp 配对覆盖率低：104/160 对被跳过（可比像素 < 64）→ warp 内点率只代表剩余配对（多为互视图重叠的那些），不能当作全序列证据（§10.5 诚实边界）",
+          "相邻帧旋转跳变中位数 75.7° 超阈（诊断告警，不计入主门；§10.2）"
+        ]
+      },
+      {
+        "scene_name": "3e8bba0176",
+        "split": "inner_validation",
+        "artifact_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/3e8bba0176__103b127479916bfd.json",
+        "artifact_sha256": "dc755d14b6a2e71d372ec2af1373e01bc340a0a8bc4be150abdc43b3613a67bd",
+        "artifact_id": "vggt-3e8bba0176",
+        "artifact_version": "4b4654b34cff002e",
+        "frame_set_hash": "d6d0f6ad801b8cd17b9955ae6f427d6b88abab7b8e47b35817086781956341ba",
+        "quality_status": "computed",
+        "main_gate_passed": true,
+        "warp_inlier_ratio": 0.7094419429662983,
+        "cloud_overlap_ratio": 0.758905,
+        "overall_quality": 0.9739583333333334,
+        "gate_thresholds": {
+          "warp_inlier_ratio": 0.5,
+          "cloud_overlap_ratio": 0.3
+        },
+        "diagnostic_warnings": [
+          "warp 配对覆盖率低：103/160 对被跳过（可比像素 < 64）→ warp 内点率只代表剩余配对（多为互视图重叠的那些），不能当作全序列证据（§10.5 诚实边界）",
+          "相邻帧旋转跳变中位数 59.8° 超阈（诊断告警，不计入主门；§10.2）"
+        ]
+      },
+      {
+        "scene_name": "7b6477cb95",
+        "split": "inner_validation",
+        "artifact_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/7b6477cb95__657a42880e2e26dc.json",
+        "artifact_sha256": "c6234efb296457756fe536512d4104f379d62be980efa726cc19c562b6b339d3",
+        "artifact_id": "vggt-7b6477cb95",
+        "artifact_version": "055322a7917cae45",
+        "frame_set_hash": "3be93ac237159ea0650551bae61a82ab40256f1461a1e4c36e5f30bbaaed7ba8",
+        "quality_status": "computed",
+        "main_gate_passed": true,
+        "warp_inlier_ratio": 0.6797531488877243,
+        "cloud_overlap_ratio": 0.741055,
+        "overall_quality": 0.9739583333333334,
+        "gate_thresholds": {
+          "warp_inlier_ratio": 0.5,
+          "cloud_overlap_ratio": 0.3
+        },
+        "diagnostic_warnings": [
+          "warp 配对覆盖率低：91/160 对被跳过（可比像素 < 64）→ warp 内点率只代表剩余配对（多为互视图重叠的那些），不能当作全序列证据（§10.5 诚实边界）",
+          "相邻帧旋转跳变中位数 59.0° 超阈（诊断告警，不计入主门；§10.2）"
+        ]
+      },
+      {
+        "scene_name": "cc5237fd77",
+        "split": "inner_validation",
+        "artifact_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/cc5237fd77__da56b1075d27818a.json",
+        "artifact_sha256": "56604604cb3d076b8a9a46b90f512dd81b547e1039454e55c0335dd95dabdba2",
+        "artifact_id": "vggt-cc5237fd77",
+        "artifact_version": "8f7e8429cb0b212a",
+        "frame_set_hash": "a1d8389f20b2f656ccaa10c99381709a72d70f2a1deef931a2f3be3f40e758a1",
+        "quality_status": "computed",
+        "main_gate_passed": true,
+        "warp_inlier_ratio": 0.6920722213019712,
+        "cloud_overlap_ratio": 0.6921,
+        "overall_quality": 0.953125,
+        "gate_thresholds": {
+          "warp_inlier_ratio": 0.5,
+          "cloud_overlap_ratio": 0.3
+        },
+        "diagnostic_warnings": [
+          "相邻帧旋转跳变中位数 51.3° 超阈（诊断告警，不计入主门；§10.2）"
+        ]
+      }
+    ]
+  },
+  "quality_decision": {
+    "all_jobs_quality_status_computed": true,
+    "all_jobs_main_gate_passed": false,
+    "passed_main_gate_count": 6,
+    "failed_main_gate_count": 1,
+    "failed_jobs": [
+      {
+        "scene_name": "5eb31827b7",
+        "split": "induction",
+        "artifact_ref": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/5eb31827b7__eedde39585c20225.json",
+        "warp_inlier_ratio": 0.40737766624843164,
+        "threshold": 0.5,
+        "cloud_overlap_ratio": 0.44566
+      }
+    ]
+  },
+  "models": {
+    "qwen_index": {
+      "path": "/home/cvailab/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct-FP8/snapshots/9cdc6310a8cb770ce18efaf4e9935334512aee45/model.safetensors.index.json",
+      "sha256": "751e4b7c17b148d5cc8fb1296b281fe98a711c0182d88b8516f459186990f49d",
+      "size": 94475
+    },
+    "vggt_config": {
+      "path": "/home/cvailab/.cache/huggingface/geothinker/VGGT-1B/config.json",
+      "sha256": "a73e929a168b900546a84fe88cd70dfaaf2f8e39cf77355b12984eaa686f3855",
+      "size": 62
+    },
+    "sam2_checkpoint": {
+      "path": "/home/cvailab/.cache/huggingface/hub/models--facebook--sam2.1-hiera-large/snapshots/227a114a2f535cd147f82442e7d2038cdd2e5d68/sam2.1_hiera_large.pt",
+      "sha256": "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318",
+      "size": 898083611
+    },
+    "sam2_config": {
+      "path": "/home/cvailab/.cache/huggingface/hub/models--facebook--sam2.1-hiera-large/snapshots/227a114a2f535cd147f82442e7d2038cdd2e5d68/sam2.1_hiera_l.yaml",
+      "sha256": "545e4325aa5c19a1615d43c946b07276ed4c57214eacf1437e38fa3d9374f636",
+      "size": 3798
+    }
+  },
+  "environment": {
+    "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
+    "platform": "Linux-5.4.0-216-generic-x86_64-with-glibc2.31",
+    "packages": {
+      "torch": "2.10.0",
+      "vllm": "0.19.1",
+      "sam2": "1.1.0",
+      "huggingface-hub": "0.34.4",
+      "transformers": "4.57.1"
+    }
+  },
+  "evidence_paths": {
+    "receipt": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/quality_gate_receipt.json",
+    "reconstruction_manifest": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstructions/vggt/manifest.json",
+    "reconstruction_log": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/reconstruction.log",
+    "artifact_hashes": "/home/cvailab/experiments/wjhICLR-v11-quality-confirmation-20261010/artifact_json_sha256.txt"
+  }
+}
