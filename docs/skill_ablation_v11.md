@@ -36,6 +36,37 @@ VGGT/SAM2、GPU 4 预留 GroundingDINO 或故障切换。提交并推送当前�
 缺失视频、显存不足和不可达的检测服务。检测器部署在其它机器时设置
 `HARNESS3D_DETECTOR_ENDPOINT`；仅诊断时可显式传 `--skip-detector-check`。
 
+### GroundingDINO 离线启动
+
+独立检测器使用 `start_groundingdino.sh`，默认解释器为
+`/home/cvailab/anaconda3/envs/skill3d/bin/python`，GPU 4、端口 20024。
+启动器先查找固定 BERT revision
+`86b5e0934494bd15c9632b12f734a8a67f723594`，兼容 `HF_HOME/hub`、
+`HF_HOME/transformers`、`HF_HUB_CACHE` 和 `TRANSFORMERS_CACHE`。也可明确指定
+`SKILL3D_BERT_PATH` 或 `--bert-path`，其值应为包含 config、tokenizer 和权重的
+完整本地快照目录。显式路径错误时直接失败，不切换模型。
+
+```bash
+# 使用已有 BERT 快照验证实际加载；不启动服务，不下载权重。
+bash start_groundingdino.sh --check-only
+
+# 保持该终端运行；外部服务源码与 checkpoint 默认来自 /nas/wangjh/Skill-3D。
+bash start_groundingdino.sh --gpu 4 --port 20024 \
+  --log-dir /home/cvailab/experiments/harness3d-v11/groundingdino
+
+# 另一个终端中将实验连接到该独立服务。
+HARNESS3D_DETECTOR_ENDPOINT=http://127.0.0.1:20024 ./start_harness3d.sh --smoke
+```
+
+在其它机器通过 `SKILL3D_DETECTOR_PYTHON`、`SKILL3D_DETECTOR_ROOT`、
+`--checkpoint-path` 和 `--bert-path` 配置实际路径。启动前会用
+`local_files_only=True` 真正加载 tokenizer 和 BERT，再将这两个已验证实例交给
+GroundingDINO。`HF_HUB_OFFLINE=1`、`TRANSFORMERS_OFFLINE=1` 在导入之前设置，
+不依赖联网查询或可变的 `refs/main`。缺缓存、损坏权重或错误文本模型会明确退出；
+`<log-dir>/groundingdino_startup.json` 记录文件 hash、状态、错误及完整启动堆栈。
+正常 `starting_service` 记录只表示进入外部服务启动阶段，就绪需检查 `/health`
+并执行真实 `/infer`。该入口不修改外部仓库或已有服务。
+
 先准备与输入清单一致的 P1 重建产物、模型服务及 M5 所需的检测/SAM2。
 入口只复用既有重建，不在缺失或帧集不匹配时偷偷重建。示例在仓库根目录运行：
 

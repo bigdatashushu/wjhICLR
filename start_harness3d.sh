@@ -278,7 +278,7 @@ with socket.create_connection((host, port), timeout=3):
 PY
     then
       if [[ "$REQUIRE_DETECTOR" == "1" ]]; then
-        die "detector is not listening at $DETECTOR_ENDPOINT; start it on reserved GPU $RESERVE_GPU or pass --skip-detector-check"
+        die "detector is not listening at $DETECTOR_ENDPOINT; use bash start_groundingdino.sh --gpu $RESERVE_GPU --port <endpoint-port> for verified offline BERT loading, or pass --skip-detector-check"
       fi
       printf 'warning: detector unavailable at %s; M5 may be incomplete\n' \
         "$DETECTOR_ENDPOINT" >&2
