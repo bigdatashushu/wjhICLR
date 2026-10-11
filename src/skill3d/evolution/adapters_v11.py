@@ -527,6 +527,7 @@ class V11PairedEvaluator:
             and self.quality_confirmation.get("sha256") == quality_identity["sha256"]
             and self.quality_confirmation.get("evidence_ref")
             and self.client_factory is None
+            and manifest.get("run_mode") != "development"
             and bool(self.base_cfg.model_weights_sha256)
             and bool(self.base_cfg.environment_sha256)
             and recomputed["status"] == "completed"

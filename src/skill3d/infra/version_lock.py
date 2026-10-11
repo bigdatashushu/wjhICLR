@@ -43,6 +43,10 @@ def checkpoint_sha256(path: str) -> str:
 
 
 def git_head(repo_dir: str) -> str:
+    from skill3d.infra.experiment_startup import current_code_identity
+    identity = current_code_identity(Path(repo_dir).resolve())
+    if identity:
+        return identity["base_commit"]
     return _run_cmd(["git", "rev-parse", "HEAD"], cwd=repo_dir)
 
 
@@ -106,6 +110,11 @@ def write_run_manifest(manifest: RunManifest, out_path: str | Path,
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     data = manifest.model_dump()
+    from skill3d.infra.experiment_startup import current_code_identity
+    identity = current_code_identity()
+    if identity:
+        data.update(run_mode=identity["run_mode"], code_identity=identity,
+                    formal_result_eligible=False)
     if extra:
         data.update(extra)
     out.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -11,6 +11,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import shutil
 import uuid
 from dataclasses import fields, replace
@@ -44,6 +45,7 @@ from skill3d.synthesis.request_context import current_request_phase
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
+from skill3d.infra.experiment_startup import MODE_ENV, current_code_identity
 
 SNAPSHOT_ID = "S0-v11-english"
 DEFAULT_LIBRARY = Path(__file__).resolve().parents[3] / "skill_library"
@@ -703,6 +705,8 @@ def run_skill_ablation_v11(
     experiment_id = f"v11-{uuid.uuid4().hex}"
     manifest = {"schema_version": "skill-ablation-v11/1.0",
                 "experiment_id": experiment_id, "status": "preparing", "seed": int(seed),
+                "run_mode": os.environ.get(MODE_ENV, "formal"),
+                "code_identity": current_code_identity(),
                 "requested_qa_ids": list(expected_qa_ids) if expected_qa_ids is not None
                 else [it.episode.qa_id for it in items]}
     _write(root / "manifest.json", manifest)
@@ -875,6 +879,8 @@ def run_skill_ablation_v11(
                 ) else "unconfirmed"),
             "reconstruction_costs_s": dict(sorted(costs.items())),
             "client_mode": "injected" if client_factory else "vllm",
+            "run_mode": os.environ.get(MODE_ENV, "formal"),
+            "code_identity": current_code_identity(),
             "source_sha256": {str(p.relative_to(code_root)): _file_hash(p)
                               for p in sorted(code_root.rglob("*.py"))},
         })
@@ -1123,10 +1129,12 @@ def run_skill_ablation_v11(
                         all(c is not None and c.get("confirmed") is True
                             for c in confirmation_by_qa.values())
                         and client_factory is None
+                        and os.environ.get(MODE_ENV) != "development"
                         and bool(cfg.model_weights_sha256) and bool(cfg.environment_sha256))
                         and summary["status"] == "completed"
                         and summary["n_input_error_pairs"] < summary["n_pairs"]
                         and all(p["comparable"] for p in pairs)})
+        summary["run_mode"] = manifest["run_mode"]
         manifest["status"] = summary["status"]
         _write(root / "manifest.json", manifest)
         _write(root / "summary.json", summary)

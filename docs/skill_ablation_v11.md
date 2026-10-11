@@ -17,8 +17,8 @@ B11 默认校验并加载 `S0-v11-contract-repair` 的 snapshot、manifest 和�
 ## GPU 环境运行
 
 仓库根目录的一键入口按当前服务器空闲卡规划为 GPU 2 跑 Qwen/vLLM、GPU 3 跑
-VGGT/SAM2、GPU 4 预留 GroundingDINO 或故障切换。提交并推送当前修改后，先做小样本
-端到端检查：
+VGGT/SAM2、GPU 4 预留 GroundingDINO 或故障切换。开发和冒烟可直接使用尚未提交的
+当前源码，先做小样本端到端检查：
 
 ```bash
 ./start_harness3d.sh --smoke
@@ -35,6 +35,50 @@ VGGT/SAM2、GPU 4 预留 GroundingDINO 或故障切换。提交并推送当前�
 `<work-dir>/launcher_logs/`。正式模式拒绝脏工作树、未推送的固定提交、过期质量确认、
 缺失视频、显存不足和不可达的检测服务。检测器部署在其它机器时设置
 `HARNESS3D_DETECTOR_ENDPOINT`；仅诊断时可显式传 `--skip-detector-check`。
+
+### 开发迭代与源码身份
+
+三个入口 `start_harness3d.sh`、`bootstrap_and_run_v11.sh`、
+`run_gpu_experiment_v11.py` 共用同一模式规则：
+
+| 参数/配置 | 源码来源 | 工作区要求 | 样本与预算 |
+|---|---|---|---|
+| `--smoke` | 当前源码独立快照 | 允许未提交增删改 | 固定 induction 2、inner 2，其余求解预算不变 |
+| `--dev` | 当前源码独立快照 | 允许未提交增删改 | 保留配置样本数、模型和求解预算 |
+| `--dry-run` | 当前源码独立快照 | 允许未提交增删改 | 只生成配置、身份和命令，不创建环境或执行 GPU |
+| 无开发参数且 `experiment.formal: true` | 固定 Git 提交 | 必须干净 | 使用正式配置，保留质量与资格检查 |
+| `experiment.formal: false` | 当前源码独立快照 | 允许未提交增删改 | 按非正式开发配置执行 |
+
+```bash
+./start_harness3d.sh --smoke
+./start_harness3d.sh --dev
+./start_harness3d.sh --dry-run
+
+# 直接使用底层入口时规则相同。
+PYTHON_BIN=python3.11 bash scripts/bootstrap_and_run_v11.sh \
+  --dev --work-dir /data/skill3d-dev --run-id iteration-01
+PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
+  --dev --config configs/gpu_experiment_v11.yaml \
+  --work-dir /data/skill3d-dev --run-id iteration-02
+```
+
+开发源码位于 `<work-dir>/source_snapshots/<run-id>/source/`，包含 Git 跟踪文件的
+当前内容、未被忽略的新源码及删除结果。Git、环境、缓存、权重、日志和运行数据不会
+复制为源码。已有离线 `data/vsi_bench_meta/test.jsonl` 单独复制并记录为输入身份。
+`code_identity.json` 保存基础 commit、工作区状态、逐文件 SHA256、源码集合 hash、
+新增和删除清单；`working_tree.diff` 保存已跟踪源码相对 HEAD 的实际差异，新增文件
+完整正文保存在快照中。已有 run ID 不可覆盖；启动后修改原工作目录不影响该 run。
+快照文件只读，启动时核对缺失、篡改和新增文件。
+
+开发配置清除旧质量确认，仍执行相同的几何质量门；pipeline、配对 summary 和在线
+manifest 标记 `run_mode: development`，开发结果不能取得正式资格。`dry-run` 只要求
+Python 3.11+ 和 PyYAML，不拉取 Git、安装 GPU 依赖、下载模型或启动服务。
+
+bootstrap 的 `<work-dir>/venv` 按依赖合同复用：代码、提示词、seed、样本量、端口或
+资源门限变化不触发重装；项目依赖声明、根目录 requirements/constraints/lock 文件、
+Python 主次版本、vLLM/SAM2 或已启用 MoGe 的版本变化会使安装标识失效。依赖通过包
+声明安装，运行始终以本次 source 路径作为 PYTHONPATH，不保留旧快照的 editable
+安装指针。每次真实启动都执行运行依赖和 CUDA 预检；安装标识不是环境可用性的证明。
 
 ### GroundingDINO 离线启动
 

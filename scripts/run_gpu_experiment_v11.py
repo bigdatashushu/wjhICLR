@@ -20,6 +20,12 @@ from urllib.request import urlopen
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from skill3d.infra.experiment_startup import (
+    MODE_ENV, RECEIPT_ENV, RUN_ID_RE, configure_run, freeze_working_tree,
+    verify_source_receipt,
+)
+
 _COMMIT_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
 
 
@@ -171,10 +177,12 @@ def _preflight(
     ):
         raise GPUExperimentError(
             f"selected GPUs need at least {required_memory / 1024:.1f} GiB")
-    commit = _git(root, "rev-parse", "HEAD")
+    receipt = (verify_source_receipt(Path(os.environ[RECEIPT_ENV]), root)
+               if os.environ.get(RECEIPT_ENV) else None)
+    commit = receipt["base_commit"] if receipt else _git(root, "rev-parse", "HEAD")
     if not _COMMIT_RE.fullmatch(commit):
         raise GPUExperimentError("current code is not at a full Git commit")
-    dirty = _git(root, "status", "--porcelain")
+    dirty = receipt["git_dirty"] if receipt else bool(_git(root, "status", "--porcelain"))
     if experiment.get("formal") and dirty and not dry_run:
         raise GPUExperimentError(
             "formal run requires a clean detached/pinned code checkout")
@@ -183,6 +191,8 @@ def _preflight(
         "python": sys.version,
         "code_commit": commit,
         "git_dirty": bool(dirty),
+        "source_sha256": receipt["source_sha256"] if receipt else "",
+        "run_mode": experiment.get("run_mode", "formal" if experiment.get("formal") else "development"),
         "free_disk_gib": round(free_gib, 2),
         "gpus": gpus,
     }
@@ -383,7 +393,9 @@ def _start_vllm(
 ) -> subprocess.Popen | None:
     runtime = cfg["runtime"]
     command = [
-        shutil.which("vllm") or "vllm",
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.cli.main",
         "serve",
         str(weights["qwen"]),
         "--served-model-name",
@@ -482,6 +494,8 @@ def _pipeline(
     runtime = cfg["runtime"]
     commands: list[dict] = []
     env = _command_env(root, cfg, weights)
+    env[MODE_ENV] = experiment.get(
+        "run_mode", "formal" if experiment.get("formal") else "development")
     from importlib.metadata import distributions
     environment = {
         "python": sys.version, "platform": platform.platform(),
@@ -503,6 +517,7 @@ def _pipeline(
     python = sys.executable
     video_root = str(Path(str(experiment["video_root"])).expanduser())
     runtime_config = _read_config(root / "configs" / "config.yaml")
+    runtime_config["split_config"] = str(root / runtime_config["split_config"])
     runtime_config["seed"] = int(experiment["seed"])
     runtime_config.setdefault("frame_sampling", {})["n_frames"] = int(runtime["n_images"])
     runtime_config.setdefault("vllm", {}).update({
@@ -649,6 +664,8 @@ def _pipeline(
             endpoint,
             "--vllm-model",
             str(runtime["served_model_name"]),
+            "--library-root",
+            str(library),
             "--output-dir",
             str(ablation_dir),
         ]
@@ -740,6 +757,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--download-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dev", action="store_true")
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--code-receipt", help=argparse.SUPPRESS)
     return parser
 
 
@@ -752,15 +772,56 @@ def main(argv: list[str] | None = None) -> int:
     work_dir = Path(args.work_dir).expanduser().resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     run_id = args.run_id or time.strftime("v11-%Y%m%dT%H%M%SZ", time.gmtime())
+    if not RUN_ID_RE.fullmatch(run_id):
+        print("GPUExperimentError: invalid run ID", file=sys.stderr)
+        return 2
     run_root = work_dir / "runs" / run_id
-    if run_root.exists() and not args.dry_run:
+    if run_root.exists():
         print(f"GPUExperimentError: run directory already exists: {run_root}",
               file=sys.stderr)
         return 2
-    run_root.mkdir(parents=True, exist_ok=args.dry_run)
     pipeline = None
     try:
-        cfg = _read_config(config_path)
+        cfg = configure_run(_read_config(config_path), dev=args.dev,
+                            smoke=args.smoke, dry_run=args.dry_run)
+        _validate_weight_config(cfg)
+        if cfg["experiment"]["run_mode"] == "development" and not args.code_receipt:
+            video = cfg["experiment"].get("video_root")
+            if video and not Path(video).expanduser().is_absolute():
+                cfg["experiment"]["video_root"] = str(root / video)
+            for model in cfg["weights"].values():
+                existing = model.get("existing_path")
+                if existing and not Path(existing).expanduser().is_absolute():
+                    model["existing_path"] = str(root / existing)
+            receipt = freeze_working_tree(root, work_dir / "source_snapshots" / run_id)
+            source_root = Path(receipt["source_root"])
+            frozen_config = source_root.parent / "runtime_input.yaml"
+            frozen_config.write_text(yaml.safe_dump(cfg, allow_unicode=True))
+            # Re-execute the frozen runner before importing any runtime code.
+            env = os.environ.copy()
+            env.update({RECEIPT_ENV: str(source_root.parent / "code_identity.json"),
+                        MODE_ENV: "development", "PYTHONDONTWRITEBYTECODE": "1",
+                        "PYTHONPATH": os.pathsep.join([str(source_root / "src"),
+                                                       str(source_root / "third_party/vggt")])})
+            command = [sys.executable, str(source_root / "scripts/run_gpu_experiment_v11.py"),
+                       "--config", str(frozen_config), "--work-dir", str(work_dir),
+                       "--run-id", run_id, "--code-receipt", env[RECEIPT_ENV]]
+            if args.dry_run:
+                command.append("--dry-run")
+            if args.download_only:
+                command.append("--download-only")
+            return subprocess.call(command, cwd=source_root, env=env)
+        if args.code_receipt:
+            if cfg["experiment"]["run_mode"] != "development":
+                raise GPUExperimentError("A working-source receipt cannot be used for a formal run")
+            os.environ[RECEIPT_ENV] = args.code_receipt
+            verify_source_receipt(Path(args.code_receipt), root)
+        else:
+            os.environ.pop(RECEIPT_ENV, None)
+        os.environ[MODE_ENV] = cfg["experiment"]["run_mode"]
+        run_root.mkdir(parents=True)
+        effective_config = run_root / "experiment_config.yaml"
+        effective_config.write_text(yaml.safe_dump(cfg, allow_unicode=True))
         preflight = _preflight(
             root, work_dir, cfg, dry_run=args.dry_run)
         if cfg["experiment"].get("formal") and not args.dry_run:
@@ -777,11 +838,16 @@ def main(argv: list[str] | None = None) -> int:
         pipeline = {
             "schema_version": "skill3d-gpu-pipeline-v11/1.0",
             "run_id": run_id,
-            "config_path": str(config_path),
-            "config_sha256": _sha256_file(config_path),
+            "config_path": str(effective_config),
+            "config_sha256": _sha256_file(effective_config),
             "preflight": preflight,
             "weight_manifest_sha256": weight_manifest.get("manifest_sha256", ""),
             "formal_requested": bool(cfg["experiment"].get("formal")),
+            "run_mode": cfg["experiment"]["run_mode"],
+            "formal_result_eligible": False,
+            "code_identity": (json.loads(Path(args.code_receipt).read_text())
+                              if args.code_receipt else {"base_commit": preflight["code_commit"],
+                                                        "git_dirty": preflight["git_dirty"]}),
             "final_test_touched": False,
             "status": "downloaded",
             "commands": [],
@@ -800,6 +866,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         pipeline["commands"] = commands
         pipeline["status"] = "dry_run" if args.dry_run else "completed"
+        if cfg["experiment"].get("formal") and not args.dry_run:
+            pipeline["formal_result_eligible"] = True
         _write_json(run_root / "pipeline_manifest.json", pipeline)
         print(json.dumps(pipeline, ensure_ascii=False, indent=2))
         return 0

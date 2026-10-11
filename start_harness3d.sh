@@ -26,6 +26,7 @@ DRY_RUN=0
 DOWNLOAD_ONLY=0
 SKIP_DETECTOR_CHECK=0
 SMOKE=0
+DEV=0
 
 usage() {
   cat <<'EOF'
@@ -42,6 +43,7 @@ Options:
   --work-dir PATH        weights, environment and run output root
   --run-id NAME          unique run identity
   --smoke                non-formal 2+2 sample end-to-end GPU check
+  --dev                  run current working source with configured sample budgets
   --dry-run              build receipts and print the pipeline without execution
   --download-only        prepare pinned weights without running the experiment
   --skip-detector-check  continue when the detector endpoint is not listening
@@ -89,6 +91,10 @@ while [[ $# -gt 0 ]]; do
       SMOKE=1
       shift
       ;;
+    --dev)
+      DEV=1
+      shift
+      ;;
     --download-only)
       DOWNLOAD_ONLY=1
       shift
@@ -107,7 +113,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -d "$ROOT/.git" ]] || die "repository metadata not found at $ROOT"
+[[ -e "$ROOT/.git" ]] || die "repository metadata not found at $ROOT"
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Python executable not found: $PYTHON_BIN"
 [[ -f "$CONFIG_SOURCE" ]] || die "GPU config not found: $CONFIG_SOURCE"
@@ -124,22 +130,31 @@ if [[ -z "$CODE_REF" ]]; then
   CODE_REF="$(git rev-parse HEAD)"
 fi
 [[ "$CODE_REF" =~ ^[0-9a-f]{40}$ ]] || die "CODE_REF must be a 40-character lowercase commit"
-if [[ -n "$(git status --porcelain)" ]]; then
+MODE_ARGS=()
+[[ "$DEV" -eq 1 ]] && MODE_ARGS+=(--dev)
+[[ "$SMOKE" -eq 1 ]] && MODE_ARGS+=(--smoke)
+[[ "$DRY_RUN" -eq 1 ]] && MODE_ARGS+=(--dry-run)
+MODE="$("$PYTHON_BIN" "$ROOT/scripts/prepare_gpu_run_v11.py" \
+  --action mode --config "$CONFIG_SOURCE" ${MODE_ARGS[@]+"${MODE_ARGS[@]}"})"
+if [[ "$MODE" == "formal" && -n "$(git status --porcelain)" ]]; then
   die "working tree is dirty; commit and push all changes before a pinned GPU run"
 fi
 
 if [[ -z "$REPO_URL" ]]; then
   REPO_URL="$(git remote get-url origin 2>/dev/null || true)"
 fi
-[[ -n "$REPO_URL" ]] || die "REPO_URL is empty and origin is not configured"
+[[ "$MODE" == "development" || -n "$REPO_URL" ]] \
+  || die "REPO_URL is empty and origin is not configured"
 
 WORK_DIR="$(mkdir -p "$WORK_DIR" && cd "$WORK_DIR" && pwd)"
 CONFIG_SOURCE="$(cd "$(dirname "$CONFIG_SOURCE")" && pwd)/$(basename "$CONFIG_SOURCE")"
-GENERATED_DIR="$WORK_DIR/launcher_configs"
+GENERATED_DIR="$WORK_DIR/launcher_inputs"
 LOG_DIR="$WORK_DIR/launcher_logs"
 mkdir -p "$GENERATED_DIR" "$LOG_DIR"
 GENERATED_CONFIG="$GENERATED_DIR/${RUN_ID}.yaml"
 LOG_PATH="$LOG_DIR/${RUN_ID}.log"
+[[ ! -e "$GENERATED_CONFIG" && ! -e "$WORK_DIR/runs/$RUN_ID" ]] \
+  || die "run ID already exists: $RUN_ID"
 
 use_existing_dir() {
   local variable="$1"
@@ -159,14 +174,17 @@ use_existing_dir SAM2_EXISTING_PATH \
 export SAM2_CONFIG="${SAM2_CONFIG:-configs/sam2.1/sam2.1_hiera_l.yaml}"
 
 "$PYTHON_BIN" - "$CONFIG_SOURCE" "$GENERATED_CONFIG" \
-  "$QWEN_GPU" "$GEOMETRY_GPU" "$DETECTOR_ENDPOINT" "$SMOKE" <<'PY'
+  "$QWEN_GPU" "$GEOMETRY_GPU" "$DETECTOR_ENDPOINT" "$SMOKE" "$DEV" "$DRY_RUN" "$ROOT" <<'PY'
 import os
 import pathlib
 import re
 import sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[9]) / "src"))
+import yaml
+from skill3d.infra.experiment_startup import configure_run
 
 source, target = map(pathlib.Path, sys.argv[1:3])
-qwen_gpu, geometry_gpu, detector, smoke = sys.argv[3:7]
+qwen_gpu, geometry_gpu, detector, smoke, dev, dry_run = sys.argv[3:9]
 text = source.read_text(encoding="utf-8")
 
 pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
@@ -175,33 +193,14 @@ text = pattern.sub(
     text,
 )
 
-def replace_scalar(name: str, value: str) -> None:
-    global text
-    updated, count = re.subn(
-        rf"(?m)^(\s*{re.escape(name)}:)\s*.*$",
-        lambda match: f"{match.group(1)} {value}",
-        text,
-        count=1,
-    )
-    if count != 1:
-        raise SystemExit(f"missing or duplicate YAML key: {name}")
-    text = updated
-
-replace_scalar("qwen_gpu", qwen_gpu)
-replace_scalar("geometry_gpu", geometry_gpu)
-replace_scalar("detector_endpoint", detector)
-if smoke == "1":
-    replace_scalar("formal", "false")
-    replace_scalar("quality_confirmation", '""')
-    replace_scalar("induction_limit", "2")
-    replace_scalar("inner_limit", "2")
-    replace_scalar("post_publish_limit", "1")
-    replace_scalar("reconstruction_sampling_per_task", "4")
-    replace_scalar("run_evolution", "false")
-target.write_text(text, encoding="utf-8")
+cfg = configure_run(yaml.safe_load(text), dev=dev == "1",
+                    smoke=smoke == "1", dry_run=dry_run == "1")
+cfg["runtime"].update(qwen_gpu=int(qwen_gpu), geometry_gpu=int(geometry_gpu))
+cfg["experiment"]["detector_endpoint"] = detector
+target.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
 PY
 
-if [[ "$SMOKE" -eq 0 && "$DRY_RUN" -eq 0 && "$DOWNLOAD_ONLY" -eq 0 ]]; then
+if [[ "$MODE" == "formal" && "$DRY_RUN" -eq 0 && "$DOWNLOAD_ONLY" -eq 0 ]]; then
   "$PYTHON_BIN" - "$GENERATED_CONFIG" "$ROOT" "$CODE_REF" <<'PY'
 import json
 import pathlib
@@ -292,7 +291,7 @@ printf '  code_ref:      %s\n' "$CODE_REF"
 printf '  config:        %s\n' "$GENERATED_CONFIG"
 printf '  work_dir:      %s\n' "$WORK_DIR"
 printf '  run_id:        %s\n' "$RUN_ID"
-printf '  mode:          %s\n' "$([[ "$SMOKE" -eq 1 ]] && echo smoke || echo formal)"
+printf '  mode:          %s\n' "$MODE"
 printf '  qwen_gpu:      %s\n' "$QWEN_GPU"
 printf '  geometry_gpu:  %s\n' "$GEOMETRY_GPU"
 printf '  reserve_gpu:   %s\n' "$RESERVE_GPU"
@@ -302,6 +301,8 @@ printf '  log:           %s\n' "$LOG_PATH"
 ARGS=(--work-dir "$WORK_DIR" --config "$GENERATED_CONFIG" --run-id "$RUN_ID")
 [[ "$DRY_RUN" -eq 1 ]] && ARGS+=(--dry-run)
 [[ "$DOWNLOAD_ONLY" -eq 1 ]] && ARGS+=(--download-only)
+[[ "$DEV" -eq 1 ]] && ARGS+=(--dev)
+[[ "$SMOKE" -eq 1 ]] && ARGS+=(--smoke)
 
 export CODE_REF REPO_URL PYTHON_BIN
 exec bash "$ROOT/scripts/bootstrap_and_run_v11.sh" "${ARGS[@]}"

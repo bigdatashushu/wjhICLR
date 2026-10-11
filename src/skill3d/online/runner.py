@@ -3048,6 +3048,10 @@ def _git_head() -> str:
     """M21：code_commit（无 git 仓库时 "unknown"，不阻断）。"""
     import subprocess
 
+    from skill3d.infra.experiment_startup import current_code_identity
+    identity = current_code_identity(Path.cwd())
+    if identity:
+        return identity["base_commit"]
     try:
         out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
                              text=True, timeout=10, check=True)

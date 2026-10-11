@@ -562,6 +562,24 @@ def test_quality_confirmation_does_not_change_thresholds(panel, tmp_path):
     assert result["formal_result_eligible"] is False
 
 
+def test_development_run_cannot_gain_formal_eligibility(panel, tmp_path, monkeypatch):
+    monkeypatch.setenv("SKILL3D_RUN_MODE", "development")
+    monkeypatch.setenv("SKILL3D_MODEL_WEIGHTS_SHA256", "a" * 64)
+    monkeypatch.setenv("SKILL3D_ENVIRONMENT_SHA256", "b" * 64)
+    monkeypatch.setattr(ab.runner, "_make_vllm_client", lambda _cfg: FakeClient([
+        'ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
+        'used_result_ids=[], derivation=None))\n']))
+    item, artifact, _ = panel
+    result = ab.run_skill_ablation_v11(
+        [item], artifact_paths={item.episode.qa_id: artifact},
+        output_dir=tmp_path / "development",
+        base_cfg=OnlineRunConfig(mode="real", seed=137), seed=137,
+        quality_confirmation={"confirmed": True, "sha256": ab.quality_contract()["sha256"],
+                              "evidence_ref": "test-only"})
+    assert result["status"] == "completed" and result["run_mode"] == "development"
+    assert result["formal_result_eligible"] is False
+
+
 def test_old_quality_confirmation_cannot_reuse_pre_ranking_contract(panel, tmp_path):
     contract = ab.quality_contract()
     legacy = {k: v for k, v in contract.items() if k not in (
