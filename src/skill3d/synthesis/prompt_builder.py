@@ -12,9 +12,10 @@ from typing import Optional, Sequence
 from jinja2 import Environment, StrictUndefined
 
 from skill3d.schemas import SkillSpecV11
+from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_3"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_4"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -30,18 +31,22 @@ _TASK_DEFINITIONS = {
 }
 
 _PROGRAM_SYNTH = """你是一名空间推理 Coding Agent。根据题目、图像和当前可用工具，
-生成并执行一段 Python program，最终通过 `return ReturnAnswer(答案)` 提交。
+生成并执行一段 Python program，最终通过 `return ReturnAnswer(AnswerPayload(...))` 提交。
 
 ## 公共执行规则
 - 只输出一个 ```python 代码块，代码块之外不要写解释。
 - 可以顶层直接写代码，也可以定义 `def solve(ctx): ...`，host 会自动调用该入口。
 - 只允许 import numpy / scipy / math / statistics；禁止其他 import，以及 eval/exec/__import__/open/文件写/网络。
 - 禁止对 show / ReturnAnswer / YieldObservations / AnswerPayload / tools / scene / frames 赋值。
-- `return ReturnAnswer(答案)` 提交暂存答案并立即结束当前程序片段；框架通过几何与有效证据验收后才结束本题。验收失败时撤销提交，反馈检查项、受影响结果及仍有效的观察，由同一模型在剩余预算内修正。
+- `return ReturnAnswer(AnswerPayload(...))` 提交暂存答案并立即结束当前程序片段；框架通过几何与有效证据验收后才结束本题。验收失败时撤销提交，反馈检查项、受影响结果及仍有效的观察，由同一模型在剩余预算内修正。
 - `return YieldObservations([result_id, ...], "理由")` 结束本段程序，将点名结果的实际返回值送入下一轮请求；求解轮数和重试次数由框架预算控制。
 - 只能依据实际收到的图像和有效工具观察推理；已失效结果不得继续支持答案。
 - 有图必答：有可读图像时，证据不足可按视觉估计作答，并如实标记依据；`ReturnAnswer("abstain")` 不是合法答案。
 - 工具缺失、失败或无效返回不等于零；不得编造几何、尺度、观察或 result_id。
+- ToolResult.status=ok 仅表示调用成功；还须检查 payload 的状态、缺失项、歧义和降级标记。
+  摘要中明示省略的字段不等于空值，未检出不证明对象不存在。
+- 恢复时旧变量已清空，但有效结果可按回灌的真实 ID 和数值复用，无需重复计算。
+  参数和证据前提未改变时，不要重复已确定无效的调用；修改注释不构成修复。
 - 排名必须覆盖题目全部选项；缺候选、实例歧义、距离不可测或最小值并列时，
   不得把部分排序或 argmin 作为确定答案。可进一步观察，或在后续零工具片段依据原图
   以 visual_estimate 作答。M11 会核对候选完整性、唯一最小值与选项映射。
@@ -63,6 +68,10 @@ _PROGRAM_SYNTH = """你是一名空间推理 Coding Agent。根据题目、图�
   参数只能是这些结构化字段，不能放代码或表达式。无法用一个登记操作完整证明答案时，
   使用 mixed，不得声明 tool_derived。
 - 兼容 `ReturnAnswer(value)`，此时依据保守登记为 mixed。
+  新程序统一使用完整 AnswerPayload。短写会检查历史有效成功结果，即使本段没有调用工具；
+  注释声称“视觉估计”不会改变该规则。只有真正完全依据原图的零工具片段，才可用
+  visual_estimate、空 used_result_ids 和 derivation=None 放弃历史工具依据。
+  当前片段产生的工具结果始终接受验收；不得仅修改 basis 来绕过失败检查。
   ReturnAnswer 只接受一个参数，不能直接传 basis、unit 等关键字。
 - 工具返回 dict 时，框架附加 `result_id` 字符串；可用
   `return YieldObservations([result["result_id"]], "理由")` 请求回传。
@@ -72,6 +81,8 @@ _PROGRAM_SYNTH = """你是一名空间推理 Coding Agent。根据题目、图�
 ## 当前题目与答案要求
 {{ question }}
 本题题型: {{ question_type or "未分类" }}
+{% if answer_unit %}本题提交单位: {{ answer_unit }}
+{% endif %}
 {% if task_definition %}题义: {{ task_definition }}
 {% endif %}{% if options %}选项:
 {% for opt in options %}{{ opt }}
@@ -154,6 +165,7 @@ class PromptBuilder:
             tool_docs=tool_docs,
             route_header=route_header or "（未声明 scope：仅使用不依赖重建产物的 Tool）",
             question_type=question_type,
+            answer_unit=CANONICAL_UNIT_BY_QUESTION_TYPE.get(question_type, ""),
             task_definition=_TASK_DEFINITIONS.get(question_type, ""),
             options=list(options) if options else None,
             skill_entries=[e.text for e in (plan.entries if plan is not None else [])],
@@ -161,6 +173,38 @@ class PromptBuilder:
 
     def render_messages(self, **kwargs) -> list[dict]:
         return [{"role": "user", "content": self.render(**kwargs)}]
+
+
+def round_action_instructions(question_type: str, *, finalizing: bool = False) -> str:
+    """反馈末尾的公共执行合同；不包含选项答案或 Skill 方法。"""
+    unit = CANONICAL_UNIT_BY_QUESTION_TYPE.get(question_type)
+    unit_expr = repr(unit) if unit else "unit"
+    lines = ["本轮行动要求：只输出一个 ```python 代码块，修复必须落实到可执行语句，"
+             "不能只改注释或重复上一轮程序。"]
+    if finalizing:
+        lines.append("这是预算内最后一次作答请求。只允许零工具程序，不得 YieldObservations。")
+    else:
+        lines.append(
+            "只调用当前文档列出的工具。参数与证据前提未变时，不要重复已确定无效的调用；"
+            "需要新观察可 `return YieldObservations([实际结果ID], '理由')`，"
+            "不得把旧变量当作仍然存在。")
+    lines.append(
+        "先根据题面和有效依据在代码中定义 answer（本题选项字母或有限数值），"
+        "不得把下面的变量名当作答案。"
+        + ("" if unit else "按题面定义合法的 unit。"))
+    lines.append(
+        "真正完全依据原图时，用零工具片段提交："
+        f"return ReturnAnswer(AnswerPayload(value=answer, unit={unit_expr}, "
+        "basis='visual_estimate', used_result_ids=[], derivation=None))")
+    lines.append(
+        "若结合视觉与有效工具结果，先将实际使用的结果 ID 放入 used_ids，再提交："
+        f"return ReturnAnswer(AnswerPayload(value=answer, unit={unit_expr}, "
+        "basis='mixed', used_result_ids=used_ids, derivation=None))。"
+        "纯工具推导须按公共合同声明 tool_derived 及可重放 derivation。")
+    lines.append(
+        "已撤销结果和被拒绝的答案不能作为依据；不要用短写或只改 basis 规避验收。"
+        "有图必答，不提交 abstain；ReturnAnswer 之后不得再调用工具。")
+    return "\n".join(lines)
 
 
 def build_image_messages(text: str, frames, *, max_images: int = 32,

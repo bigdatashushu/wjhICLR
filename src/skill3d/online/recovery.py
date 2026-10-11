@@ -27,6 +27,7 @@ EvidenceProfile 状态统一适用；级联撤销会**回写** EvidenceProfile�
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -59,6 +60,122 @@ _DEPENDENTS: dict[str, tuple[str, ...]] = {
     EVIDENCE_METRIC_SCALE: (EVIDENCE_METRIC_SCALE,),
 }
 
+# 状态和可判定性先于测量，测量先于审计；不是题型解法。
+_COMMON_FIELDS = (
+    "status", "error", "service_healthy", "degradation_flags", "evidence_degraded",
+    "duplicate_suspect", "grounding_status", "unit", "units",
+    "obj_id", "category", "category_name", "track_id",
+)
+_SUMMARY_FIELDS = {
+    "relative_distance_rank": (
+        "status", "closest_category", "categories_without_detection",
+        "categories_with_invalid_geometry", "tied_categories", "degradation_flags",
+        "requested_categories", "reference", "ranking", "per_candidate",
+        "margin_normalized", "candidates",
+    ),
+    "detect_objects": (
+        "status", "service_healthy", "error", "n_detections", "n_new_objects",
+        "new_object_ids", "categories", "frame_ids", "detections",
+    ),
+    "count_objects": ("count", "duplicate_suspect", "evidence_degraded",
+                      "n_records", "n_distinct_tracks", "n_geometric_merges"),
+    "object_centroid": ("centroid_normalized", "centroid_metric",
+                        "category_name", "track_id", "world_up_used", "handedness_used"),
+    "object_3d_extent": ("degradation_flags", "extent_longest_metric", "extent_metric",
+                         "extent_normalized", "n_valid_points"),
+    "plane_fit_room_size": ("degradation_flags", "room_area_m2", "fit_quality",
+                            "plane_inlier_ratio", "room_diagonal_normalized"),
+    "object_distance_m": ("degradation_flags", "distance_m", "distance_normalized", "a", "b"),
+    "relative_direction_of": ("direction", "difficulty", "world_up_used", "handedness_used"),
+    "inspect_frames": ("n_images", "frame_ids", "images", "note"),
+}
+_AUDIT_FIELDS = frozenset({"audit", "detector_endpoint_hash", "content_sha256"})
+
+
+def _json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _payload_of(result):
+    payload = getattr(result, "payload", None)
+    if payload is not None:
+        return payload
+    raw = getattr(result, "value", None)
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        return raw
+
+
+def summarize_payload(payload: object, *, tool: str = "", max_chars: int = 1200) -> str:
+    """按完整字段/列表项压缩，所有省略明示；不截断 JSON 或把省略误作空值。"""
+    omitted: list[str] = []
+
+    def ordered(value, path=""):
+        if isinstance(value, dict):
+            keys = list(dict.fromkeys(
+                (*(_SUMMARY_FIELDS.get(tool, ()) if not path else ()),
+                 *_COMMON_FIELDS, *value)))
+            out = {}
+            for key in keys:
+                if key not in value:
+                    continue
+                child = f"{path}.{key}" if path else key
+                if key in _AUDIT_FIELDS:
+                    omitted.append(child)
+                else:
+                    out[key] = ordered(value[key], child)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [ordered(item, f"{path}[{i}]") for i, item in enumerate(value)]
+        return value
+
+    def fit(value, budget, path="payload"):
+        if len(_json(value)) <= budget:
+            return value
+        if isinstance(value, dict):
+            out = {}
+            for key, item in value.items():
+                # 标量不截断；容器可以保留其完整前缀，但必须报告省略。
+                room = budget - len(_json(out)) - len(_json(key)) - 4
+                child = f"{path}.{key}"
+                if room < 4:
+                    omitted.append(child)
+                    continue
+                if isinstance(item, (dict, list)):
+                    reduced = fit(item, room, child)
+                    if reduced is None and item is not None:
+                        continue
+                    out[key] = reduced
+                elif len(_json(item)) <= room:
+                    out[key] = item
+                else:
+                    omitted.append(child)
+            if out:
+                return out
+        elif isinstance(value, list):
+            out = []
+            for index, item in enumerate(value):
+                if len(_json(out + [item])) > budget:
+                    omitted.append(f"{path}[{index}:]（{len(value) - index} 项）")
+                    break
+                out.append(item)
+            if out:
+                return out
+        omitted.append(path)
+        return None
+
+    clean = ordered(payload)
+    reduced = fit(clean, max_chars)
+    text = _json(reduced) if reduced is not None or payload is None else "（内容超出摘要预算）"
+    if omitted:
+        shown = list(dict.fromkeys(omitted))
+        text += "\n  摘要省略：" + "、".join(shown[:8])
+        if len(shown) > 8:
+            text += f" 等共 {len(shown)} 处"
+        text += "；省略不表示空值，不能据此假定候选或记录完整。"
+    return text
+
 
 @dataclass
 class ValidatedObservation:
@@ -68,12 +185,51 @@ class ValidatedObservation:
     source_tool: str
     payload: object
     evidence_version: str = ""
+    args: dict = field(default_factory=dict)
+    degraded_evidence: list[str] = field(default_factory=list)
 
-    def summary(self, max_chars: int = 400) -> str:
-        text = str(self.payload)
-        if len(text) > max_chars:
-            text = text[:max_chars] + "…"
-        return f"- {self.source_tool}() → {text}   [result_id={self.result_id}]"
+    def summary(self, max_chars: int = 1200) -> str:
+        text = summarize_payload(self.payload, tool=self.source_tool, max_chars=max_chars)
+        flags = (f" degraded_evidence={_json(self.degraded_evidence)}"
+                 if self.degraded_evidence else "")
+        return (f"- {self.source_tool}({_json(self.args)}) [result_id={self.result_id}]"
+                f" ToolResult.status=ok evidence_version={self.evidence_version!r}{flags}"
+                f"\n  payload={text}")
+
+
+def observation_feedback(observations: list[ValidatedObservation]) -> str:
+    """仅合并同版本、同参数、同完整内容的观察；账本与真实 ID 不变。"""
+    groups: dict[str, list[ValidatedObservation]] = {}
+    for obs in observations:
+        key = json.dumps(
+            [obs.source_tool, obs.evidence_version, obs.args, obs.payload,
+             obs.degraded_evidence], ensure_ascii=False, sort_keys=True, default=str)
+        groups.setdefault(key, []).append(obs)
+    lines = ["仍然可信的既有观测（未撤销的成功调用；不等于业务结论可判定）："]
+    if not groups:
+        lines.append("当前没有任何可信的既有观测；可继续获取观察或依据原图判断。")
+    for group in groups.values():
+        lines.append(group[0].summary())
+        aliases = list(dict.fromkeys(o.result_id for o in group[1:]
+                                    if o.result_id != group[0].result_id))
+        if aliases:
+            lines.append(f"  相同观察另有 result_ids={_json(aliases)}；内容仅显示一次。")
+    lines.append("payload.status、缺失项、歧义与降级标记仍须检查；"
+                 "未检出不证明不存在，None/不可测不等于零。")
+    return "\n".join(lines)
+
+
+def failed_call_feedback(results) -> str:
+    """只展示本轮真实失败调用，不从生成代码猜测参数。"""
+    lines = []
+    for result in results:
+        if result.status == "ok" and result.error is None:
+            continue
+        lines.append(
+            f"失败调用：{result.source_tool or result.tool}({_json(result.args)})"
+            f" [result_id={result.result_id}] error_code={result.error_code}"
+            f"；原因={result.error}")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -129,15 +285,17 @@ def collect_validated(kernel, *, evidence_version: str = "") -> list[ValidatedOb
     for r in getattr(kernel, "tool_results", []) or []:
         if str(getattr(r, "status", "ok")) != "ok":
             continue                                  # 失败结果不进 validated
+        if getattr(r, "error", None) is not None:
+            continue
         if getattr(r, "invalidated_by", None):
             continue                                  # 已被级联撤销
         out.append(ValidatedObservation(
             result_id=str(getattr(r, "result_id", "") or getattr(r, "request_digest", "")),
             source_tool=str(getattr(r, "source_tool", "") or getattr(r, "tool", "")),
-            payload=getattr(r, "payload", None) if getattr(r, "payload", None) is not None
-            else getattr(r, "value", None),
-            evidence_version=str(evidence_version or
-                                 getattr(r, "evidence_version", "") or "")))
+            payload=_payload_of(r),
+            evidence_version=str(getattr(r, "evidence_version", "") or evidence_version),
+            args=dict(getattr(r, "args", None) or {}),
+            degraded_evidence=list(getattr(r, "degraded_evidence", None) or [])))
     return out
 
 
@@ -219,10 +377,10 @@ def downgrade_profile(profile: Optional[EvidenceProfile],
 
 
 def build_feedback(plan: RecoveryPlan, *, question_type: str,
-                   scope: str, require_answer: bool = False) -> str:
+                   scope: str, require_answer: bool = False,
+                   include_observations: bool = True) -> str:
     """恢复用的回灌文本（§14.1 第 5 条）：失败信息 + validated observations 摘要。"""
     lines = [
-        "上一轮 program 执行失败，请改写后重新输出**一个** ```python 代码块。",
         f"失败 Tool：{plan.failed_tool}（{plan.failure_kind}）",
     ]
     if plan.premise:
@@ -234,20 +392,17 @@ def build_feedback(plan: RecoveryPlan, *, question_type: str,
         lines.append("**不要**再使用上面被撤销的数值。")
     else:
         lines.append("根因：该 Tool 的局部错误（域值/参数），共享证据仍然有效。")
-    if plan.validated:
-        lines.append("\n仍然可信的既有观测（可直接复用，不必重算）：")
-        lines.extend(o.summary() for o in plan.validated)
-    else:
-        lines.append("\n当前没有任何可信的既有观测，请从 Tool 重新开始。")
+    if include_observations:
+        lines.append(observation_feedback(plan.validated))
     ending = (
         "请使用仍有效的观察或原图给出最佳答案；视觉估计如实标记为 visual_estimate，"
         "不要提交 abstain。" if require_answer else
         "若确实拿不到答案，直接 `ReturnAnswer(\"abstain\")`（主榜按错计，优于编造）。")
-    lines.append(
-        f"\n当前 question_tool_scope={scope}，本题题型={question_type}。"
-        "只允许调用 prompt 里列出的 Tool；" + ending)
-    lines.append("注意：`ReturnAnswer` 之后**不得**再调用任何 Tool（会抛 "
-                 "AnswerAlreadyGiven）。")
+    lines.append(f"当前 question_tool_scope={scope}，本题题型={question_type}。")
+    if include_observations:
+        lines.append("只允许调用 prompt 里列出的 Tool；" + ending)
+        lines.append("注意：`ReturnAnswer` 之后**不得**再调用任何 Tool（会抛 "
+                     "AnswerAlreadyGiven）。")
     return "\n".join(lines)
 
 
@@ -272,7 +427,10 @@ __all__ = [
     "cascade_invalidate",
     "collect_validated",
     "downgrade_profile",
+    "failed_call_feedback",
     "invalidate_results",
+    "observation_feedback",
     "premise_of_failure",
     "recovery_exhausted",
+    "summarize_payload",
 ]

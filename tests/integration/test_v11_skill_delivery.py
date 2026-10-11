@@ -196,6 +196,7 @@ def room_source_and_artifact(tmp_path_factory):
 
 
 @pytest.mark.parametrize(("first_program", "round_limit", "expected_trigger"), [
+    ("", 4, "error_recovery"),
     ("import os\nReturnAnswer(1)\n", 4, "ast_feedback"),
     ("euclidean_distance([0.0, 0.0], 1.0)\nReturnAnswer(1)\n", 4, "error_recovery"),
     ('img = inspect_frames([0])\nreturn YieldObservations([img], "查看图像")\n',
@@ -230,6 +231,13 @@ def test_v11_contract_survives_solver_rounds_and_reaches_trace(
         assert out.finalization_used
     else:
         assert any(r.get("trigger") == expected_trigger for r in out.rounds), out.rounds
+    feedback = out.rounds[1]["feedback"]
+    assert feedback.count("仍然可信的既有观测") == 1
+    assert feedback.count("本轮行动要求") == 1
+    assert feedback.index("剩余模型请求上限") < feedback.index("本轮行动要求")
+    assert feedback.endswith("ReturnAnswer 之后不得再调用工具。")
+    if expected_trigger == "finalize":
+        assert "unit='m2', basis='visual_estimate', used_result_ids=[], derivation=None" in feedback
     assert out.first_synthesis["template_version"] == PROMPT_TEMPLATE_VERSION
     assert out.first_synthesis["tool_docs_version"] == "tool-docs-v11.2"
     rows = (tmp_path / "traces/trace_record.jsonl").read_text().splitlines()
@@ -307,6 +315,9 @@ def test_m11_rejects_first_answer_revokes_local_result_and_scores_correction(
     assert "M11 拒绝上一轮提交" in second_text
     assert second_text.count("synthetic local violation") == 1
     assert first["invalidated_result_ids"][0] not in first["recovery_observation_ids"]
+    feedback = out.rounds[1]["feedback"]
+    assert feedback.count("仍然可信的既有观测") == 1
+    assert feedback.index("定位事实") < feedback.index("已撤销结果") < feedback.index("本轮行动要求")
 
 
 def test_m11_confirmed_shared_premise_cascades_and_visual_close_is_clean(

@@ -91,6 +91,7 @@ from skill3d.synthesis.program_assembler import (
 from skill3d.synthesis.prompt_builder import (
     PROMPT_TEMPLATE_VERSION,
     PromptBuilder,
+    round_action_instructions,
 )
 from skill3d.synthesis.eval_visual_fallback import (
     EVAL_VISUAL_SPLITS,
@@ -111,7 +112,9 @@ from skill3d.online.recovery import (
     cascade_invalidate,
     collect_validated,
     downgrade_profile,
+    failed_call_feedback,
     invalidate_results,
+    observation_feedback,
     premise_of_failure,
 )
 from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION, TraceRecord
@@ -1552,11 +1555,9 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             trigger = "finalize"
             outcome.finalization_used = True
             outcome.answer_flags.append("finalization")
-            feedback = (feedback or "") + (
-                "\n这是预算内最后一次作答请求。只允许零工具程序，不得 YieldObservations。"
-                "请依据仍有效的观察或本次原图给出最佳答案；完全依据原图时提交 "
-                "AnswerPayload(value=答案, unit=题型单位, basis='visual_estimate')。"
-                "已撤销的结果与被拒绝的答案不能作为依据。")
+        if feedback is not None or finalizing:
+            feedback = (feedback or "") + "\n" + round_action_instructions(
+                str(outcome.task or episode.question_type or ""), finalizing=finalizing)
         outcome.agent_rounds = index
         outcome.round_trigger = trigger
         # _synthesize 对 v11 不在内部追加退化重试，所有请求都经过这里计数。
@@ -1597,7 +1598,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         observation_images = []
         if program is None:
             record["error_code"] = res.source
-            feedback = f"上一轮程序生成失败：{res.note}。请重新输出一个合法 Python 代码块。"
+            feedback = f"上一轮程序生成失败：{res.note}。"
             failure_key = "synthesis"
             if res.source in ("none", "vllm_service_error"):
                 outcome.final_state = "unavailable"
@@ -1725,7 +1726,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         # 归因不足：不猜共享根因，也不把尚未通过验收的结果回灌成可信观察。
                         unresolved_ids.update(r.result_id for r in scope.results)
                     feedback = (
-                        "M11 拒绝上一轮提交，答案槽和程序变量已清空；请修正后重新提交。\n"
+                        "M11 拒绝上一轮提交，答案槽和程序变量已清空。\n"
                         f"检查失败：{verify.violations}\n"
                         f"定位事实：{[i.model_dump() for i in verify.issues]}\n"
                         f"已撤销结果：{sorted(set(ids))}；证据能力变化：{changes}。\n"
@@ -1735,11 +1736,15 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     step("reject")
                 elif error is None and cell.terminated == "yield" and not finalizing:
                     outcome.yield_count += 1
-                    feedback = _yield_feedback(cell, kernel, scene, cfg)
+                    feedback = _yield_feedback(
+                        cell, kernel, scene, cfg, include_observations=False)
                     observation_images = _yield_image_ids(cell, kernel, handle)
                     trigger = "observation"
                 else:
                     feedback = f"程序执行失败：{error or 'no_answer'}；{cell.error or '没有提交答案'}"
+                    details = failed_call_feedback(trace.results)
+                    if details:
+                        feedback += "\n" + details
                     failure_key = str(error or "no_answer")
                     record["error_code"] = failure_key
                     if kernel.answer_slot.given:
@@ -1760,7 +1765,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                             invalidated_result_ids=ids, downgraded_capabilities=changes)
                         feedback += "\n" + build_feedback(
                             plan, question_type=outcome.task, scope=outcome.question_tool_scope,
-                            require_answer=True)
+                            require_answer=True, include_observations=False)
 
         if kernel is not None:
             kernel.reset_user_namespace()
@@ -1768,10 +1773,9 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             termination_reason = "finalization_failed"
             outcome.notes.append(f"M11 终结轮未通过验收（round={index}），不再请求模型")
             break
-        if feedback and kernel is not None:
+        if feedback:
             valid = observations()
-            feedback += "\n仍然有效的既有观察（仅这些结果可复用）：\n" + (
-                "\n".join(o.summary(max_chars=1200) for o in valid) or "无；请依据原图重新判断。")
+            feedback += "\n" + observation_feedback(valid)
             record["recovery_observation_ids"] = [o.result_id for o in valid]
         if failure_key:
             retry_counts[failure_key] = retry_counts.get(failure_key, 0) + 1
@@ -2538,80 +2542,30 @@ def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, rec
 
 
 def _yield_feedback(cell: CellResult, kernel, scene,
-                    cfg: OnlineRunConfig) -> str:
-    """构造 yield 后的观察反馈（v7 §11.1/§11.3）。
-
-    硬要求：反馈必须包含**实际 payload 内容**，不能只给"成功标记"，也不能只给模型
-    读不到的服务器路径。这里把 `YieldObservations` 点名的结果按 `result_id` 取回，
-    逐条给出 `工具名 + 参数 + 实际返回值`（失败结果给出错误码与原因），
-    并附上"这一轮还剩多少预算"，让同一 agent 用这些信息写下一段程序。
-    """
+                    cfg: OnlineRunConfig, *, include_observations: bool = True) -> str:
+    """主动观察与失败恢复共用摘要；在线循环统一追加观察、实际预算和行动要求。"""
     wanted = list(getattr(cell, "yielded_result_ids", []) or [])
-    # 点名结果按 result_id 从 **episode 账本**取回：id 在 episode 内唯一，早期轮次的
-    # 结果也应能被点名（此前账本每轮被清空，只能解析出本轮结果）。
-    by_id: dict[str, Any] = {}
-    for r in (getattr(kernel, "tool_results", []) or []) if kernel is not None else []:
-        rid = str(getattr(r, "result_id", "") or "")
-        if rid:
-            by_id[rid] = r
-
-    lines = ["## 本轮观察（YieldObservations 回灌）"]
+    results = list(getattr(kernel, "tool_results", []) or [])
+    by_id = {r.result_id: r for r in results}
+    lines = ["YieldObservations 已结束上一段程序，变量已清空。"]
     if getattr(cell, "yielded_reason", ""):
         lines.append(f"让出理由：{cell.yielded_reason}")
-
-    picked = [by_id[i] for i in wanted if i in by_id]
-    if wanted and not picked:
-        lines.append("（指定的 result_id 在本 episode 结果中不存在："
-                     f"{wanted}；下面是本轮全部成功结果）")
-        picked = [r for r in (getattr(kernel, "cell_results", []) or [])
-                  if str(getattr(r, "status", "ok")) == "ok"]
-    if not picked:
-        # 未点名或没有可回灌结果 → 给出本轮全部成功结果，保证下一轮不空手
-        picked = [r for r in (getattr(kernel, "tool_results", []) or [])
-                  if str(getattr(r, "status", "ok")) == "ok"]
-    if not picked:
-        lines.append("（本轮没有任何成功的工具结果；请改用其他方法或直接视觉判断）")
-
-    for r in picked:
-        name = str(getattr(r, "source_tool", "") or getattr(r, "tool", "") or "?")
-        rid = str(getattr(r, "result_id", "") or "")
-        args = getattr(r, "args", None) or {}
-        payload = getattr(r, "payload", None)
-        if payload is None:
-            raw = getattr(r, "value", None)
-            try:
-                payload = json.loads(raw) if isinstance(raw, str) else raw
-            except Exception:  # noqa: BLE001 - 非 JSON 就原样展示
-                payload = raw
-        body = json.dumps(payload, ensure_ascii=False, default=str)
-        if len(body) > 1200:
-            body = body[:1200] + "…(截断)"
-        lines.append(f"- {name}({json.dumps(args, ensure_ascii=False, default=str)})"
-                     f" [result_id={rid}] → {body}")
-        flags = list(getattr(r, "degradation_flags", None) or [])
-        if getattr(r, "invalidated_by", None):
-            lines.append(f"  ⚠ 该结果已被级联撤销（invalidated_by="
-                         f"{getattr(r, 'invalidated_by')}），**不得**再用于答案")
-        if flags:
-            lines.append(f"  降级标记：{flags}")
-    for r in (getattr(kernel, "tool_results", []) or []):
-        if str(getattr(r, "status", "ok")) != "ok":
-            name = str(getattr(r, "source_tool", "") or getattr(r, "tool", "") or "?")
-            lines.append(f"- {name} 调用失败：error_code="
-                         f"{getattr(r, 'error_code', None)}"
-                         f"（{str(getattr(r, 'error', '') or '')[:200]}）；"
-                         "失败的工具不会再给出数值，请换方法或直接用图片判断")
-
-    call_used = len(getattr(kernel, "tool_results", []) or [])
-    rounds_left = max(0, int(cfg.max_solver_rounds) - int(cfg.finalization_rounds))
-    lines.append(
-        f"预算：本轮已观察工具调用 {call_used}（无独立工具总预算）；"
-        f"后续最多还能让出/重试 {rounds_left} 轮。")
-    lines.append(
-        "请基于以上**实际返回值**继续写下一段 program：需要再让出就调用 "
-        "`return YieldObservations([...], '理由')`；已经有把握就 "
-        "`return ReturnAnswer(...)` 提交。有图必答：证据不足只改变求解方式，"
-        "不改变必须作答这一条。")
+    missing = [rid for rid in wanted if rid not in by_id]
+    if missing:
+        lines.append(f"点名的 result_id 不存在：{missing}；不得引用。")
+    for result in results:
+        if result.invalidated_by and (not wanted or result.result_id in wanted):
+            lines.append(
+                f"result_id={result.result_id} 已被级联撤销：{result.invalidated_by}；不得引用。")
+    failed = failed_call_feedback(
+        [r for r in results if r.result_id in wanted]
+        if wanted else (getattr(kernel, "cell_results", []) or []))
+    if failed:
+        lines.append(failed)
+    if include_observations:
+        valid = collect_validated(kernel)
+        selected = [obs for obs in valid if obs.result_id in wanted] if wanted else valid
+        lines.append(observation_feedback(selected or valid))
     return "\n".join(lines)
 
 

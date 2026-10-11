@@ -158,6 +158,13 @@ def test_local_failure_keeps_validated_observations(tmp_path, episode_item):
     text = _blob(client.calls[1])
     assert "局部错误" in text
     assert "仍然可信的既有观测" in text and "result_id=" in text
+    feedback = out.rounds[1]["feedback"]
+    assert feedback.count("仍然可信的既有观测") == 1
+    for rid in out.rounds[0]["recovery_observation_ids"]:
+        assert feedback.count(f"[result_id={rid}]") == 1
+    assert '失败调用：euclidean_distance({"point_a": [0.0, 0.0], "point_b": 1.0})' in feedback
+    assert feedback.index("失败调用") < feedback.index("仍然可信的既有观测")
+    assert feedback.index("剩余模型请求上限") < feedback.index("本轮行动要求")
     # 局部失败**不得**出现"已级联撤销"这类断言
     assert "级联撤销" not in text
     # 恢复后答案关联到本次用的 result（§14.1：trace 记 used_result_ids）
