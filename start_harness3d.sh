@@ -244,11 +244,11 @@ if [[ "$DRY_RUN" -eq 0 && "$DOWNLOAD_ONLY" -eq 0 ]]; then
     -v qwen="$QWEN_GPU" -v geometry="$GEOMETRY_GPU" -v reserve="$RESERVE_GPU" \
     -v minimum="$MIN_FREE_GPU_MIB" '
       {
-        index=$1; free=$4
-        gsub(/^[ \t]+|[ \t]+$/, "", index)
-        gsub(/^[ \t]+|[ \t]+$/, "", free)
-        seen[index]=1
-        free_mib[index]=free+0
+        gpu_idx=$1; free_text=$4
+        gsub(/^[ \t]+|[ \t]+$/, "", gpu_idx)
+        gsub(/^[ \t]+|[ \t]+$/, "", free_text)
+        seen[gpu_idx]=1
+        free_mib[gpu_idx]=free_text+0
       }
       END {
         if (!seen[qwen] || !seen[geometry] || !seen[reserve]) {
