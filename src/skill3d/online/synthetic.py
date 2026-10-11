@@ -972,17 +972,17 @@ def build_scene_state(
         metric_scale_override=None)
 
     summary = (
-        f"scene={geometry.scene_name} (mock_light 合成) scene_route={route} "
+        f"scene={geometry.scene_name} (mock_light synthetic) scene_route={route} "
         f"question_tool_scope={scope} "
         f"main_gate_passed={bool(q.main_gate_passed)} "
         f"warp_inlier={float(q.warp_inlier_ratio):.3f} "
         f"cloud_overlap={float(q.cloud_overlap_ratio):.3f} "
         f"overall_quality={effective_quality:.3f} "
-        f"(诊断综合={q.overall_quality:.3f} × M2 权重={float(input_quality_weight):.2f}) "
-        f"input_flags={sorted(set(input_degradation_flags or [])) or '无'} "
+        f"(diagnostic aggregate={q.overall_quality:.3f} * M2 weight={float(input_quality_weight):.2f}) "
+        f"input_flags={sorted(set(input_degradation_flags or [])) or 'none'} "
         f"world_frame={geometry.world_frame_status} "
         f"metric_gate_passed={gate.gate_passed} "
-        f"metric_tasks={sorted(allowed)}（合成 GT 尺度，仅管道验证，不得当结果）"
+        f"metric_tasks={sorted(allowed)} (synthetic GT scale; pipeline validation only, not experimental results) "
         f"coverage={coverage:.3f} objects={len(geometry.objects)}"
     )
     scene = SceneState(

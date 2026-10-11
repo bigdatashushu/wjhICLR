@@ -91,8 +91,8 @@ class _AnswerSlot:
         if self.given:
             raise AnswerAlreadyGiven(
                 "ReturnAnswer",
-                f"本片段已提交答案（{self.answer!r}）；控制接口一经调用即结束本片段，"
-                "不得再次提交（§10.2）",
+                f"This cell already submitted an answer ({self.answer!r}); a control call ends the cell. "
+                "Do not submit again (§10.2).",
                 route="", args={"value": value})
         payload, problems = parse_answer_payload(
             value, question_type=self._question_type)
@@ -189,7 +189,7 @@ class _Timeout:
 
     @staticmethod
     def _raise(signum, frame):
-        raise _CellTimeout("cell 执行超时")
+        raise _CellTimeout("Cell execution timed out")
 
 
 @dataclass
@@ -453,7 +453,7 @@ class RestrictedNamespaceKernel:
             if k in ("show", "ReturnAnswer", "YieldObservations", "AnswerPayload",
                  "tools", "scene",
                      "frames"):
-                raise ValueError(f"禁止覆盖保留名: {k}")
+                raise ValueError(f"Overwriting reserved names is forbidden: {k}")
             self._ns[k] = v
 
     def _record_failed_call(self, name: str, call_args: dict, exc: ToolContractError,
@@ -503,7 +503,7 @@ class RestrictedNamespaceKernel:
             # 或用了显式 return 之外的路径越过控制流；仍然硬拦，不让程序继续跑。
             if not self._tools_enabled:
                 exc = ToolContractError(
-                    name, f"Tool {name} 在 finalization 阶段不可调用",
+                    name, f"Tool {name} cannot be called during finalization",
                     route=self._scene.scene_route, args=kwargs if kwargs else {"args": list(args)})
                 self._record_failed_call(name, dict(kwargs), exc)
                 raise exc
@@ -511,9 +511,9 @@ class RestrictedNamespaceKernel:
                 what = ("ReturnAnswer" if self.answer_slot.given else "YieldObservations")
                 exc = AnswerAlreadyGiven(
                     name,
-                    f"Tool {name} 在 {what} 之后被调用"
-                    f"（已给出的答案={self.answer_slot.answer!r}）；"
-                    "控制接口一经调用即结束本片段，之后不得再调用工具（§10.2）",
+                    f"Tool {name} was called after {what}"
+                    f" (submitted answer={self.answer_slot.answer!r}); "
+                    "a control call ends the cell. Do not call tools afterward (§10.2).",
                     route=self._scene.scene_route,
                     args=kwargs if kwargs else {"args": list(args)})
                 self._record_failed_call(name, dict(kwargs), exc)
@@ -548,30 +548,30 @@ class RestrictedNamespaceKernel:
             if result.error_code == "tool_contract":
                 # D-3/硬约束 23：产物缺失等契约违规 → 确定性异常，绝不静默返回假值
                 self._record_failed_call(name, call_args, ArtifactUnavailableError(
-                    name, result.missing_artifacts or ["(未标注)"],
+                    name, result.missing_artifacts or ["(unspecified)"],
                     route=self._scene.scene_route,
                     available=result.available_artifacts,
                     args=call_args), result=result)
                 raise ArtifactUnavailableError(
-                    name, result.missing_artifacts or ["(未标注)"],
+                    name, result.missing_artifacts or ["(unspecified)"],
                     route=self._scene.scene_route,
                     available=result.available_artifacts,
                     args=call_args)
             if result.error_code == "confidence_gate":
                 exc = ConfidenceGateError(
-                    name, result.error or "局部质量门未过",
+                    name, result.error or "Local quality gate failed",
                     route=self._scene.scene_route,
                     available=result.available_artifacts, args=call_args)
                 self._record_failed_call(name, call_args, exc, result=result)
                 raise exc
             if result.error_code == "domain_value":
                 exc = DomainValueError(
-                    name, result.error or "域值错误", route=self._scene.scene_route,
+                    name, result.error or "Domain value error", route=self._scene.scene_route,
                     available=result.available_artifacts, args=call_args)
                 self._record_failed_call(name, call_args, exc, result=result)
                 raise exc
             if result.error is not None:
-                raise RuntimeError(f"Tool {name} 执行失败: {result.error}")
+                raise RuntimeError(f"Tool {name} execution failed: {result.error}")
             import json
 
             payload = json.loads(result.value)
@@ -619,9 +619,9 @@ class RestrictedNamespaceKernel:
         except YieldTerminate:
             terminated = "yield"
         except (_CellTimeout, TimeoutError):
-            error, error_code = "cell 执行超时", "timeout"
+            error, error_code = "Cell execution timed out", "timeout"
         except SyntaxError:
-            error, error_code = "语法错误", "violation_syntax"
+            error, error_code = "Syntax error", "violation_syntax"
         except ToolContractError as exc:
             # 契约违规一律记 tool_contract 桶（§5 FailureTaxonomy 已有该桶）；
             # 具体子类（含 ConfidenceGateError / AnswerAlreadyGiven / 基类

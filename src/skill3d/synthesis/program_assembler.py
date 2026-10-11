@@ -106,19 +106,19 @@ def degenerate_reason(text: str) -> Optional[str]:
     """
     raw = str(text or "")
     if len(raw) > TH_DEGENERATE_CHARS:
-        return f"输出长度 {len(raw)} 字符 > {TH_DEGENERATE_CHARS}（疑似退化重复）"
+        return f"Output length {len(raw)} characters > {TH_DEGENERATE_CHARS} (suspected degenerate repetition)"
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     if len(lines) > TH_DEGENERATE_LINES:
-        return f"输出行数 {len(lines)} > {TH_DEGENERATE_LINES}（疑似退化重复）"
+        return f"Output line count {len(lines)} > {TH_DEGENERATE_LINES} (suspected degenerate repetition)"
     if len(lines) >= 8:
         uniq = len(set(lines))
         if uniq / len(lines) < TH_MIN_DISTINCT_RATIO:
-            return (f"去重后行占比 {uniq / len(lines):.3f} < "
-                    f"{TH_MIN_DISTINCT_RATIO}（几乎全是重复行）")
+            return (f"Distinct line ratio {uniq / len(lines):.3f} < "
+                    f"{TH_MIN_DISTINCT_RATIO} (almost all lines repeat)")
         repeat_ratio = 1.0 - uniq / len(lines)
         if repeat_ratio >= TH_REPEAT_RATIO:
-            return (f"重复行占比 {repeat_ratio:.3f} ≥ {TH_REPEAT_RATIO}"
-                    "（模型自辩循环）")
+            return (f"Repeated line ratio {repeat_ratio:.3f} >= {TH_REPEAT_RATIO}"
+                    " (repetitive model self-debate)")
     return None
 
 
@@ -127,7 +127,7 @@ def extract_program_source_ex(text: str) -> tuple[str, bool]:
     （True → 上层把 `synthesis_source` 记为 `m8_parse_recovered`，§15.2）。"""
     raw = str(text or "")
     if not raw.strip():
-        raise SynthesisError("模型输出为空，无法提取 program")
+        raise SynthesisError("Model output is empty; cannot extract a program")
 
     m = _PY_BLOCK.search(raw)
     if m is None:
@@ -135,13 +135,13 @@ def extract_program_source_ex(text: str) -> tuple[str, bool]:
     if m is not None:
         source = m.group(1)
         if not source.strip():
-            raise SynthesisError("代码块为空，无法提取 program")
+            raise SynthesisError("Code block is empty; cannot extract a program")
         if _parses(source):
             return source, False            # 干净路径：没有回退
         recovered = _recover_truncated(source)
         if recovered is None:
             exc = _syntax_error(source)
-            raise SynthesisError(f"program 语法错误: {exc}") from exc
+            raise SynthesisError(f"Program syntax error: {exc}") from exc
         return recovered, True
 
     remainder = _open_fence_remainder(raw)
@@ -151,13 +151,13 @@ def extract_program_source_ex(text: str) -> tuple[str, bool]:
             return recovered, True
         exc = _syntax_error(remainder)
         raise SynthesisError(
-            f"program 代码块未闭合且无可解析前缀（疑似 max_tokens 截断/输出退化）: {exc}"
+            f"Program code fence is unclosed with no parseable prefix (suspected max_tokens truncation/output degeneration): {exc}"
         ) from exc
 
     stripped = raw.strip()
     if not _parses(stripped):
         exc = _syntax_error(stripped)
-        raise SynthesisError(f"program 语法错误: {exc}") from exc
+        raise SynthesisError(f"Program syntax error: {exc}") from exc
     # §11.3（规范原文）："无围栏但完整程序**不计**解析恢复。"
     # 这里既没有截断，也没有丢弃内容，更没有补造答案 —— 只是没写围栏，属正常产出，
     # 因此返回 False（干净路径）。此前返回 True 会把这类 episode 记成
@@ -173,7 +173,7 @@ def extract_program_source(text: str) -> str:
     """
     raw = str(text or "")
     if not raw.strip():
-        raise SynthesisError("模型输出为空，无法提取 program")
+        raise SynthesisError("Model output is empty; cannot extract a program")
 
     m = _PY_BLOCK.search(raw)
     if m is None:
@@ -181,13 +181,13 @@ def extract_program_source(text: str) -> str:
     if m is not None:
         source = m.group(1)
         if not source.strip():
-            raise SynthesisError("代码块为空，无法提取 program")
+            raise SynthesisError("Code block is empty; cannot extract a program")
         if not _parses(source):
             # 闭合块内仍有语法错误 → 试着丢掉截断残行（同未闭合路径的保守回退）
             recovered = _recover_truncated(source)
             if recovered is None:
                 exc = _syntax_error(source)
-                raise SynthesisError(f"program 语法错误: {exc}") from exc
+                raise SynthesisError(f"Program syntax error: {exc}") from exc
             return recovered
         return source
 
@@ -198,14 +198,14 @@ def extract_program_source(text: str) -> str:
             return recovered
         exc = _syntax_error(remainder)
         raise SynthesisError(
-            f"program 代码块未闭合且无可解析前缀（疑似 max_tokens 截断/输出退化）: {exc}"
+            f"Program code fence is unclosed with no parseable prefix (suspected max_tokens truncation/output degeneration): {exc}"
         ) from exc
 
     # 无围栏：整段文本自洽时才接受（保持原有回退）
     stripped = raw.strip()
     if not _parses(stripped):
         exc = _syntax_error(stripped)
-        raise SynthesisError(f"program 语法错误: {exc}") from exc
+        raise SynthesisError(f"Program syntax error: {exc}") from exc
     return stripped
 
 
@@ -214,7 +214,7 @@ def _syntax_error(source: str) -> SyntaxError:
         ast.parse(source)
     except SyntaxError as exc:  # pragma: no cover - 调用点保证必然抛错
         return exc
-    raise AssertionError("_syntax_error 只在源码无法解析时调用")  # pragma: no cover
+    raise AssertionError("_syntax_error must only be called for unparseable source")  # pragma: no cover
 
 
 def assemble_program(

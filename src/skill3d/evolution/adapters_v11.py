@@ -49,7 +49,7 @@ from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
 
-REVISION_PROMPT_VERSION = "skill-revision-v11.2"
+REVISION_PROMPT_VERSION = "skill-revision-v11.3-en"
 _SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -162,7 +162,8 @@ class V11OfflineReviser:
             f"Protocol: {REVISION_PROMPT_VERSION}.\n"
             "Return exactly one JSON object with string fields full_skill_md and "
             "modification_reason. full_skill_md must be the complete canonical "
-            "SKILL.md, including YAML frontmatter and the full Markdown body.\n"
+            "SKILL.md, including YAML frontmatter and the full Markdown body. "
+            "Write all natural-language content and code comments in English.\n"
             "Keep the method generic. Never copy case_id, qa_id, scene_id, a "
             "question, an option list, or a reference answer into the method. "
             "Do not invent tools or alter framework/model/evaluation settings. "
@@ -174,7 +175,7 @@ class V11OfflineReviser:
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
             f"Keep the stable frontmatter name exactly {parent.name!r}.\n"
             "Current online execution contract:\n"
-            f"{_PROGRAM_SYNTH.split('## 当前题目与答案要求')[0]}\n"
+            f"{_PROGRAM_SYNTH.split('## Current question and answer requirements')[0]}\n"
             f"Current Tool interfaces ({TOOL_DOCS_VERSION}):\n{REGISTRY.docs()}\n"
             "Induction experience JSON:\n"
             f"{json.dumps(evidence, ensure_ascii=False, sort_keys=True)}\n"

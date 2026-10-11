@@ -40,11 +40,11 @@ def invalid_reference_issues(kernel) -> list[GeometryIssue]:
     for rid in sorted(referenced):
         result = by_id.get(rid)
         if result is None:
-            check, reason = "missing_reference", "本次答案引用了不存在的工具结果"
+            check, reason = "missing_reference", "This answer references a nonexistent tool result"
         elif result.invalidated_by:
-            check, reason = "invalidated_reference", "本次答案显式引用了已撤销的工具结果"
+            check, reason = "invalidated_reference", "This answer explicitly references an invalidated tool result"
         elif result.status != "ok" or result.error is not None:
-            check, reason = "failed_reference", "本次答案引用了失败的工具结果"
+            check, reason = "failed_reference", "This answer references a failed tool result"
         else:
             continue
         issues.append(GeometryIssue(

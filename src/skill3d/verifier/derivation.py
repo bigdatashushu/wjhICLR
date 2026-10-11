@@ -87,13 +87,13 @@ def _decode_result(result: ToolResult) -> Any:
     if result.status != "ok" or result.error is not None:
         raise DerivationReplayError(
             "result_not_successful",
-            f"结果 {result.result_id} 状态不是 ok",
+            f"Result {result.result_id} does not have status ok",
             result_id=result.result_id,
         )
     if result.invalidated_by:
         raise DerivationReplayError(
             "result_invalidated",
-            f"结果 {result.result_id} 已失效",
+            f"Result {result.result_id} has been invalidated",
             result_id=result.result_id,
         )
     try:
@@ -101,13 +101,13 @@ def _decode_result(result: ToolResult) -> Any:
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise DerivationReplayError(
             "result_not_json",
-            f"结果 {result.result_id} 不是可重放 JSON: {exc}",
+            f"Result {result.result_id} is not replayable JSON: {exc}",
             result_id=result.result_id,
         ) from exc
     if not _finite_json(value):
         raise DerivationReplayError(
             "result_not_finite_json",
-            f"结果 {result.result_id} 含非有限或不支持的值",
+            f"Result {result.result_id} contains non-finite or unsupported values",
             result_id=result.result_id,
         )
     return value
@@ -119,12 +119,12 @@ def _field_tokens(raw: Any) -> list[str | int]:
     if isinstance(raw, str):
         parts = raw.split(".")
         if any(not part for part in parts):
-            raise DerivationReplayError("invalid_parameters", "field 路径含空片段")
+            raise DerivationReplayError("invalid_parameters", "field path contains an empty segment")
         return [int(part) if part.isdigit() else part for part in parts]
     if isinstance(raw, list) and all(isinstance(part, (str, int)) for part in raw):
         return list(raw)
     raise DerivationReplayError(
-        "invalid_parameters", "field 必须是点分隔字符串或字符串/整数列表")
+        "invalid_parameters", "field must be a dot-separated string or a list of strings/integers")
 
 
 def _lookup(value: Any, raw_field: Any) -> Any:
@@ -133,28 +133,28 @@ def _lookup(value: Any, raw_field: Any) -> Any:
         if isinstance(current, Mapping) and isinstance(token, str):
             if token not in current:
                 raise DerivationReplayError(
-                    "field_missing", f"结果中不存在字段 {token!r}")
+                    "field_missing", f"Result has no field {token!r}")
             current = current[token]
             continue
         if isinstance(current, list) and isinstance(token, int):
             if token < 0 or token >= len(current):
                 raise DerivationReplayError(
-                    "field_missing", f"列表索引 {token} 越界")
+                    "field_missing", f"List index {token} is out of range")
             current = current[token]
             continue
         raise DerivationReplayError(
             "field_type_mismatch",
-            f"无法从 {type(current).__name__} 读取路径片段 {token!r}")
+            f"Cannot read path segment {token!r} from {type(current).__name__}")
     return current
 
 
 def _number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise DerivationReplayError(
-            "type_mismatch", f"{label} 必须是有限数值，实际为 {type(value).__name__}")
+            "type_mismatch", f"{label} must be a finite number; got {type(value).__name__}")
     number = float(value)
     if not math.isfinite(number):
-        raise DerivationReplayError("non_finite", f"{label} 不是有限数值")
+        raise DerivationReplayError("non_finite", f"{label} is not a finite number")
     return number
 
 
@@ -181,11 +181,11 @@ def _validate_parameters(op: str, raw: Any) -> dict:
         params = dict(raw)
     else:
         raise DerivationReplayError(
-            "invalid_parameters", "derivation.parameters 必须是对象")
+            "invalid_parameters", "derivation.parameters must be an object")
     extra = set(params) - _ALLOWED_PARAMETERS[op]
     if extra:
         raise DerivationReplayError(
-            "invalid_parameters", f"{op} 含未登记参数 {sorted(extra)}")
+            "invalid_parameters", f"{op} contains unregistered parameters {sorted(extra)}")
     return params
 
 
@@ -195,13 +195,13 @@ def _labels(params: dict, size: int) -> Optional[list[Any]]:
         return None
     if not isinstance(raw, list) or len(raw) != size:
         raise DerivationReplayError(
-            "invalid_parameters", f"labels 必须是长度为 {size} 的列表")
+            "invalid_parameters", f"labels must be a list of length {size}")
     if not all(isinstance(value, (str, int, float)) and not isinstance(value, bool)
                for value in raw):
         raise DerivationReplayError(
-            "invalid_parameters", "labels 只能包含字符串或有限数值")
+            "invalid_parameters", "labels must contain only strings or finite numbers")
     if not all(_finite_json(value) for value in raw):
-        raise DerivationReplayError("invalid_parameters", "labels 含非有限数值")
+        raise DerivationReplayError("invalid_parameters", "labels contains non-finite numbers")
     return list(raw)
 
 
@@ -211,7 +211,7 @@ def _sortable(values: Sequence[Any], label: str) -> None:
              for value in values}
     if "other" in kinds or len(kinds) != 1:
         raise DerivationReplayError(
-            "type_mismatch", f"{label} 必须全部为数值或全部为字符串")
+            "type_mismatch", f"{label} must contain either all numbers or all strings")
     if "number" in kinds:
         for index, value in enumerate(values):
             _number(value, f"{label}[{index}]")
@@ -226,37 +226,37 @@ def _execute(
     field = params.get("field")
     if op == "field":
         if len(decoded) != 1:
-            raise DerivationReplayError("invalid_arity", "field 必须且只能引用一个结果")
+            raise DerivationReplayError("invalid_arity", "field must reference exactly one result")
         return _lookup(decoded[0], field), _unit_for_field(tools[0], field)
 
     if op == "convert":
         if len(decoded) != 1:
-            raise DerivationReplayError("invalid_arity", "convert 必须且只能引用一个结果")
+            raise DerivationReplayError("invalid_arity", "convert must reference exactly one result")
         source_unit = str(params.get("from_unit") or "")
         target_unit = str(params.get("to_unit") or "")
         factor = _CONVERSION_FACTORS.get((source_unit, target_unit))
         if factor is None:
             raise DerivationReplayError(
                 "invalid_parameters",
-                f"不支持的单位换算 {source_unit!r} -> {target_unit!r}")
+                f"Unsupported unit conversion {source_unit!r} -> {target_unit!r}")
         inferred = _unit_for_field(tools[0], field)
         if not inferred:
             raise DerivationReplayError(
-                "unit_unverified", "无法从工具返回字段确定 convert 的源单位")
+                "unit_unverified", "Cannot determine the source unit for convert from tool result fields")
         if inferred != source_unit:
             raise DerivationReplayError(
                 "unit_mismatch",
-                f"字段单位为 {inferred}，但 derivation 声明 from_unit={source_unit}")
-        value = _number(_lookup(decoded[0], field), "convert 输入")
+                f"Field unit is {inferred}, but derivation declares from_unit={source_unit}")
+        value = _number(_lookup(decoded[0], field), "convert input")
         return value * factor, target_unit
 
     if op == "count":
         if len(decoded) != 1:
-            raise DerivationReplayError("invalid_arity", "count 必须且只能引用一个结果")
+            raise DerivationReplayError("invalid_arity", "count must reference exactly one result")
         value = _lookup(decoded[0], field)
         if not isinstance(value, (list, dict)):
             raise DerivationReplayError(
-                "type_mismatch", "count 只能统计 JSON list 或 object 的元素数")
+                "type_mismatch", "count can only count elements in a JSON list or object")
         return len(value), "count"
 
     if op in {"sort", "argmin"}:
@@ -264,7 +264,7 @@ def _execute(
         descending = params.get("descending", False)
         if not isinstance(descending, bool):
             raise DerivationReplayError(
-                "invalid_parameters", "sort.descending 必须是布尔值")
+                "invalid_parameters", "sort.descending must be a boolean")
         if len(decoded) == 1:
             source = _lookup(decoded[0], field)
             if isinstance(source, dict):
@@ -277,16 +277,16 @@ def _execute(
                 values = [_lookup(item, key) for item in source]
             else:
                 raise DerivationReplayError(
-                    "type_mismatch", f"{op} 的单个输入必须解析为 list 或 object")
+                    "type_mismatch", f"A single input to {op} must decode to a list or object")
         else:
             labels = _labels(params, len(decoded))
             if labels is None:
                 raise DerivationReplayError(
-                    "invalid_parameters", f"{op} 引用多个结果时必须提供 labels")
+                    "invalid_parameters", f"{op} requires labels when referencing multiple results")
             values = [_lookup(value, field) for value in decoded]
         if not values:
-            raise DerivationReplayError("empty_input", f"{op} 不能处理空集合")
-        _sortable(values, f"{op} 输入")
+            raise DerivationReplayError("empty_input", f"{op} cannot process an empty collection")
+        _sortable(values, f"{op} input")
         order = sorted(
             range(len(values)),
             key=lambda index: values[index],
@@ -294,33 +294,33 @@ def _execute(
         )
         if op == "argmin":
             if len(order) > 1 and values[order[0]] == values[order[1]]:
-                raise DerivationReplayError("ambiguous_minimum", "argmin 的最小值并列")
+                raise DerivationReplayError("ambiguous_minimum", "argmin has tied minimum values")
             return labels[order[0]], "option"
         return [labels[index] for index in order], "option"
 
     if op == "option_map":
         if len(decoded) != 1:
             raise DerivationReplayError(
-                "invalid_arity", "option_map 必须且只能引用一个结果")
+                "invalid_arity", "option_map must reference exactly one result")
         mapping = params.get("mapping")
         if not isinstance(mapping, dict) or not mapping:
             raise DerivationReplayError(
-                "invalid_parameters", "option_map.mapping 必须是非空对象")
+                "invalid_parameters", "option_map.mapping must be a nonempty object")
         source = _lookup(decoded[0], field)
         if isinstance(source, bool) or not isinstance(source, (str, int, float)):
             raise DerivationReplayError(
-                "type_mismatch", "option_map 输入必须是字符串或数值")
+                "type_mismatch", "option_map input must be a string or number")
         key = str(int(source)) if isinstance(source, float) and source.is_integer() else str(source)
         if key not in mapping:
             raise DerivationReplayError(
-                "mapping_missing", f"option_map.mapping 不包含键 {key!r}")
+                "mapping_missing", f"option_map.mapping has no key {key!r}")
         value = mapping[key]
         if isinstance(value, bool) or not isinstance(value, (str, int, float)):
             raise DerivationReplayError(
-                "type_mismatch", "option_map 输出必须是字符串或数值")
+                "type_mismatch", "option_map output must be a string or number")
         return value, "option"
 
-    raise DerivationReplayError("unsupported_op", f"不支持的 derivation 操作 {op!r}")
+    raise DerivationReplayError("unsupported_op", f"Unsupported derivation operation {op!r}")
 
 
 def _numeric_value(value: Any) -> Optional[float]:
@@ -377,7 +377,7 @@ def replay_derivation(
             performed=False,
             issues=[DerivationIssue(
                 code="answer_payload_missing",
-                reason="ReturnAnswer 未保留可验证的 AnswerPayload",
+                reason="ReturnAnswer did not preserve a verifiable AnswerPayload",
             )],
         )
     issues = [
@@ -388,7 +388,7 @@ def replay_derivation(
     if expected_unit and payload.unit != expected_unit:
         issues.append(DerivationIssue(
             code="canonical_unit_mismatch",
-            reason=f"题型 {question_type} 要求 unit={expected_unit}，实际为 {payload.unit}",
+            reason=f"Question type {question_type} requires unit={expected_unit}; got {payload.unit}",
         ))
     derivation = payload.derivation
     referenced = set(payload.used_result_ids) | set(payload.derivation_inputs())
@@ -416,20 +416,20 @@ def replay_derivation(
             if str(payload.value).strip().upper() != string.ascii_uppercase[winner]:
                 issues.append(DerivationIssue(
                     code="ranking_option_mismatch",
-                    reason="答案选项与完整排名的最近类别不一致"))
+                    reason="The answer option does not match the closest category in the complete ranking"))
     # Visual/mixed submissions still have an answer domain even without a
     # declared calculation. Validate before the no-derivation early return.
     if payload.unit in {"count", "m", "cm", "m2"}:
         number = _numeric_value(payload.value)
         if number is None:
             issues.append(DerivationIssue(
-                code="answer_not_finite", reason="答案必须是有限数值"))
+                code="answer_not_finite", reason="The answer must be a finite number"))
         elif number < 0:
             issues.append(DerivationIssue(
-                code="answer_negative", reason="距离、尺寸、面积与计数不能为负"))
+                code="answer_negative", reason="Distance, size, area, and count must be nonnegative"))
         elif payload.unit == "count" and not number.is_integer():
             issues.append(DerivationIssue(
-                code="answer_not_integer", reason="计数答案必须是整数"))
+                code="answer_not_integer", reason="A count answer must be an integer"))
     elif payload.unit == "option" and options and (
         derivation is None or derivation.get("op") != "sort"
     ):
@@ -437,7 +437,7 @@ def replay_derivation(
         if str(payload.value).strip().upper() not in allowed:
             issues.append(DerivationIssue(
                 code="option_out_of_range",
-                reason=f"答案必须是合法选项字母 {sorted(allowed)}"))
+                reason=f"The answer must be a valid option letter in {sorted(allowed)}"))
     if derivation is None:
         return DerivationReplayResult(
             passed=not issues,
@@ -458,12 +458,12 @@ def replay_derivation(
     if duplicate_ids:
         issues.append(DerivationIssue(
             code="duplicate_result_id",
-            reason=f"工具台账存在重复 result_id: {sorted(duplicate_ids)}",
+            reason=f"The tool ledger contains duplicate result_id values: {sorted(duplicate_ids)}",
         ))
     if len(input_ids) != len(set(input_ids)):
         issues.append(DerivationIssue(
             code="duplicate_input_result_id",
-            reason="derivation.input_result_ids 不得重复",
+            reason="derivation.input_result_ids must not contain duplicates",
         ))
 
     computed: Any = None
@@ -482,7 +482,7 @@ def replay_derivation(
                 if result is None:
                     raise DerivationReplayError(
                         "result_missing",
-                        f"derivation 引用的结果 {result_id!r} 不存在",
+                        f"Result {result_id!r} referenced by derivation does not exist",
                         result_id=result_id,
                     )
                 decoded.append(_decode_result(result))
@@ -490,21 +490,21 @@ def replay_derivation(
             computed, computed_unit = _execute(op, decoded, tools, params)
             if not _finite_json(computed):
                 raise DerivationReplayError(
-                    "computed_value_invalid", "derivation 重放结果不可序列化或包含非有限值")
+                    "computed_value_invalid", "derivation replay produced a non-serializable or non-finite value")
             if not computed_unit:
                 issues.append(DerivationIssue(
                     code="unit_unverified",
-                    reason="无法从登记操作和工具字段确定重放结果单位",
+                    reason="Cannot determine the replay result unit from registered operations and tool fields",
                 ))
             elif computed_unit != payload.unit:
                 issues.append(DerivationIssue(
                     code="derived_unit_mismatch",
-                    reason=f"derivation 产出 unit={computed_unit}，答案声明 unit={payload.unit}",
+                    reason=f"derivation produced unit={computed_unit}, but the answer declares unit={payload.unit}",
                 ))
             if not _equal_value(payload.value, computed, payload.unit):
                 issues.append(DerivationIssue(
                     code="value_mismatch",
-                    reason=f"derivation 重算值 {computed!r} 与答案 {payload.value!r} 不一致",
+                    reason=f"derivation recomputed value {computed!r} does not match answer {payload.value!r}",
                 ))
             if payload.unit == "option" and options and not isinstance(computed, (list, dict)):
                 answer = str(computed).strip().upper()
@@ -512,7 +512,7 @@ def replay_derivation(
                 if answer not in allowed:
                     issues.append(DerivationIssue(
                         code="option_out_of_range",
-                        reason=f"derivation 产出选项 {answer!r}，合法范围为 {sorted(allowed)}",
+                        reason=f"derivation produced option {answer!r}; valid options are {sorted(allowed)}",
                     ))
         except DerivationReplayError as exc:
             issues.append(DerivationIssue(

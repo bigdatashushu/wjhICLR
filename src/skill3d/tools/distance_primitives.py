@@ -180,16 +180,16 @@ class DistancePrimitiveParams:
     def __post_init__(self) -> None:
         q = float(self.quantile_q)
         if not np.isfinite(q) or q < 0.0 or q > 1.0:
-            raise ValueError(f"quantile_q 必须落在 [0,1]（收到 {self.quantile_q!r}）")
+            raise ValueError(f"quantile_q must be in [0,1]; got {self.quantile_q!r}")
         v = float(self.voxel_size)
         if not np.isfinite(v):
             raise ValueError(
-                f"voxel_size 必须有限（收到 {self.voxel_size!r}）；"
-                "关闭降采样请显式传 0（<=0 视为关闭）")
+                f"voxel_size must be finite; got {self.voxel_size!r}. "
+                "Pass 0 explicitly to disable downsampling (<=0 disables it)")
         if int(self.n_min) < 1:
-            raise ValueError(f"n_min 必须 >= 1（收到 {self.n_min!r}）")
+            raise ValueError(f"n_min must be >= 1; got {self.n_min!r}")
         if not isinstance(self.conf_warp_version, str) or not self.conf_warp_version:
-            raise ValueError("conf_warp_version 必须是非空字符串（进 trace）")
+            raise ValueError("conf_warp_version must be a nonempty string (recorded in the trace)")
 
     def snapshot(self) -> dict:
         """阈值/口径快照（§12.5：进 `ToolResult` 与 trace）。"""
@@ -286,7 +286,7 @@ def _params(params: Optional[Any]) -> DistancePrimitiveParams:
             n_min=params.get("n_min", N_MIN_DEFAULT),
         )
     raise TypeError(
-        f"params 必须是 DistancePrimitiveParams / dict / None，收到 {type(params).__name__}")
+        f"params must be DistancePrimitiveParams / dict / None; got {type(params).__name__}")
 
 
 def _as_points(points: Any, name: str = "points") -> np.ndarray:
@@ -294,7 +294,7 @@ def _as_points(points: Any, name: str = "points") -> np.ndarray:
     a = np.asarray(points, dtype=np.float64)
     if a.ndim < 2 or a.shape[-1] != 3:
         raise ValueError(
-            f"{name} 必须是 (N,3) 或 (H,W,3) 的点集（末维=3），实际 shape={a.shape}")
+            f"{name} must be a point set of shape (N,3) or (H,W,3) with last dimension 3; got shape={a.shape}")
     return np.ascontiguousarray(a.reshape(-1, 3), dtype=np.float64)
 
 
@@ -302,9 +302,9 @@ def _as_vector3(v: Any, name: str) -> np.ndarray:
     """3 维向量入参校验（非 3 维或非有限 → 抛错，不静默兜底）。"""
     a = np.asarray(v, dtype=np.float64).reshape(-1)
     if a.shape != (3,):
-        raise ValueError(f"{name} 必须是 3 维向量（收到 shape={np.asarray(v).shape}）")
+        raise ValueError(f"{name} must be a 3D vector; got shape={np.asarray(v).shape}")
     if not np.all(np.isfinite(a)):
-        raise ValueError(f"{name} 含 NaN/Inf（收到 {v!r}）：参考点非法 → 拒算，不猜")
+        raise ValueError(f"{name} contains NaN/Inf ({v!r}): invalid reference point; refusing to compute or guess")
     return a
 
 
@@ -393,23 +393,23 @@ def _conf_weights(
     c = np.asarray(conf, dtype=np.float64).reshape(-1)
     if c.size != n_expected:
         raise ValueError(
-            f"point_conf 长度 {c.size} 与点数 {n_expected} 不一致（必须逐点对齐）")
+            f"point_conf length {c.size} does not match point count {n_expected} (must align point by point)")
     if monotonic is None:
         return None, None, "ignored_unverified", [
-            "conf_warp_monotonic=None（未自检）→ 完全不用 point_conf（§12.2-2/§10.3）"]
+            "conf_warp_monotonic=None (not checked); point_conf is not used at all (§12.2-2/§10.3)"]
     notes: list[str] = []
     finite = np.isfinite(c)
     if not np.all(finite):
         med = float(np.median(c[finite])) if np.any(finite) else 1.0
         notes.append(
-            f"point_conf 含 {int((~finite).sum())} 个非有限值 → 用有限值中位数 {med:.6g} 顶替"
-            "（软权重的中性填充，不丢弃点）")
+            f"point_conf has {int((~finite).sum())} non-finite values; replaced with the finite median {med:.6g}"
+            " (neutral imputation for soft weights; no points discarded)")
         c = np.where(finite, c, med)
     w = np.clip(c, 0.0, None)
     mean_w = float(np.mean(w)) if w.size else 0.0
     if not np.isfinite(mean_w) or mean_w <= 0.0:
         return None, None, "unusable", notes + [
-            "point_conf 全为 0/非正 → 无法形成权重，退回无权重口径"]
+            "All point_conf values are zero/nonpositive; cannot form weights, falling back to unweighted computation"]
     w = w / mean_w
     usage = "weighted"
     if monotonic is False:
@@ -417,8 +417,8 @@ def _conf_weights(
         w = w / float(np.mean(w))
         usage = "downweighted"
         notes.append(
-            f"conf_warp 单调自检未过 → conf 只降权（w**{CONF_DOWNWEIGHT_POWER}），不丢弃点"
-            "（§10.3/§12.2-2）")
+            f"conf_warp monotonicity check failed; only downweight confidence (w**{CONF_DOWNWEIGHT_POWER}), without discarding points"
+            " (§10.3/§12.2-2)")
     w = np.clip(w, float(CONF_WEIGHT_FLOOR), None)
     w = w / float(np.mean(w))
     keep: Optional[np.ndarray] = None
@@ -427,10 +427,10 @@ def _conf_weights(
             keep = (c >= float(CONF_OPTIONAL_MASK_C))
             usage = "masked_optional"
             notes.append(
-                f"启用 C>={CONF_OPTIONAL_MASK_C:g} **可选掩码**（§10.3：可选，不是硬阈值）"
-                f"，滤掉 {int((~keep).sum())} 点")
+                f"Enabled the optional C>={CONF_OPTIONAL_MASK_C:g} mask (§10.3: optional, not a hard threshold)"
+                f"; filtered {int((~keep).sum())} points")
         else:
-            notes.append("conf-warp 自检未过 → 拒绝启用 C>2 可选掩码（§10.3）")
+            notes.append("conf-warp check failed; refusing to enable the optional C>2 mask (§10.3)")
     return w, keep, usage, notes
 
 
@@ -512,13 +512,13 @@ def preprocess_points(
             "points": empty, "weights": None, "n_raw": 0, "n_finite": 0, "n_used": 0,
             "voxel_size": float(p.voxel_size), "degraded": True,
             "degradation_flags": ["degraded"], "conf_usage": "disabled",
-            "robust_scale": float("nan"), "notes": ["点集为空"], "audit": {},
+            "robust_scale": float("nan"), "notes": ["Point set is empty"], "audit": {},
         }
 
     finite = np.isfinite(pts_raw).all(axis=1)
     n_drop_nonfinite = int(n_raw - np.count_nonzero(finite))
     if n_drop_nonfinite:
-        notes.append(f"排除 NaN/Inf 坐标 {n_drop_nonfinite}/{n_raw} 个（§12.2-3）")
+        notes.append(f"Excluded {n_drop_nonfinite}/{n_raw} points with NaN/Inf coordinates (§12.2-3)")
     pts = pts_raw[finite]
 
     weights, keep_mask, conf_usage, conf_notes = _conf_weights(
@@ -541,7 +541,7 @@ def preprocess_points(
     degraded = n_used < int(p.n_min)
     if degraded:
         notes.append(
-            f"有效点 {n_used} < N_min={int(p.n_min)} → degraded（§12.2-4：不输出伪精确值）")
+            f"Valid points {n_used} < N_min={int(p.n_min)}; degraded (§12.2-4: do not output falsely precise values)")
     voxel_rel = (float(p.voxel_size) / scale) if (np.isfinite(scale) and scale > 0) else float("nan")
     audit = {
         "n_raw": n_raw, "n_finite": n_finite, "n_used": n_used,
@@ -592,15 +592,15 @@ def _contamination(
     d = np.asarray(nn_distances, dtype=np.float64).reshape(-1)
     d = d[np.isfinite(d)]
     if d.size == 0:
-        return None, False, "无有效 NN 距离"
+        return None, False, "No valid nearest-neighbor distances"
     if reference_spacing is None or not np.isfinite(reference_spacing) or reference_spacing <= 0:
-        return None, False, "表面采样间距不可用 → 污染判据判不了（不假装干净）"
+        return None, False, "Surface sampling spacing unavailable; contamination cannot be assessed (do not assume clean data)"
     thr = float(tau) * float(reference_spacing)
     ratio = float(np.mean(d <= thr))
     suspect = ratio > float(fraction)
     return ratio, suspect, (
-        f"极近距离(< {tau:g}×{reference_spacing:.6g} = {thr:.6g}) 占比 {ratio:.3f}"
-        f"（门 {fraction:g}）")
+        f"Very-close distance fraction (< {tau:g}*{reference_spacing:.6g} = {thr:.6g}): {ratio:.3f}"
+        f" (gate {fraction:g})")
 
 
 def _result(
@@ -816,7 +816,7 @@ def robust_distance_between_pointsets(
         contamination_ratio=ratio, duplicate_suspect=duplicate_suspect,
         suppressed=(raw if suspect else None),
         extra_audit={
-            "surface_distance_note": "双向 NN 低分位（§9.7）；对象间表面最近距离代理",
+            "surface_distance_note": "Low quantile of bidirectional nearest-neighbor distances (§9.7); proxy for nearest object surface distance",
             "contamination_note": note,
             "reference_spacing": None if spacing is None else float(spacing),
             "n_used_a": prep_a["n_used"], "n_used_b": prep_b["n_used"],
@@ -875,7 +875,7 @@ def object_extent(
                              conf_optional_mask=conf_optional_mask)
     q = float(p.quantile_q if extent_tail_q is None else extent_tail_q)
     if not np.isfinite(q) or q < 0.0 or q > 0.5:
-        raise ValueError(f"extent_tail_q 必须落在 [0, 0.5]（收到 {extent_tail_q!r}）")
+        raise ValueError(f"extent_tail_q must be in [0, 0.5]; got {extent_tail_q!r}")
     mscale, mflags = _metric_scale_check(metric_scale)
     flags: list[Optional[str]] = list(prep["degradation_flags"]) + list(mflags)
     sv = (scale_version or SCALE_VERSION_DEFAULT) if mscale is not None else None
@@ -912,7 +912,7 @@ def object_extent(
         "area_metric": area_metric,
         "audit": {**prep["audit"],
                   "bbox_low": [float(x) for x in lo], "bbox_high": [float(x) for x in hi],
-                  "note": "世界轴对齐稳健 extent；面积按平方换算（§9.4）"},
+                  "note": "Robust world-axis-aligned extent; area uses squared scale conversion (§9.4)"},
     })
     return base
 
@@ -928,7 +928,7 @@ def _fit_plane(points: np.ndarray) -> tuple[np.ndarray, float]:
     n = np.asarray(vt[-1], dtype=np.float64)
     norm = float(np.linalg.norm(n))
     if norm <= 0 or not np.isfinite(norm):
-        raise ValueError("平面拟合退化：点集无法张成 2 维（法向未定义）")
+        raise ValueError("Degenerate plane fit: points do not span two dimensions (normal undefined)")
     n = n / norm
     return n, float(np.dot(n, c))
 
@@ -1078,7 +1078,7 @@ def planarity_and_ground(
         up = _as_vector3(up_hint, "up_hint")
         n = float(np.linalg.norm(up))
         if n <= MIN_SPACING_EPS:
-            raise ValueError("up_hint 是零向量：上方向未定义 → 拒算（fail-closed）")
+            raise ValueError("up_hint is a zero vector: up direction undefined; refusing computation (fail closed)")
         up = up / n
         out["up_source"] = "provided"
     else:
@@ -1222,8 +1222,8 @@ def planarity_and_ground(
         "room_surface_inlier_ratio": float(n_covered / pts.shape[0]),
         "wall_plane_offsets": {"u1": [c1_lo, c1_hi], "u2": [c2_lo, c2_hi]},
         "horizontal_anisotropy": None if not np.isfinite(aniso_h) else float(aniso_h),
-        "note": ("地面/墙平面为确定性 TLS 拟合（无 RANSAC 随机）；"
-                 "plane_inlier_ratio 是**地面**平面内点率，墙内点率见 wall_inlier_ratio"),
+        "note": ("Ground/wall planes use deterministic TLS fitting (no RANSAC randomness); "
+                 "plane_inlier_ratio is the ground plane inlier ratio; see wall_inlier_ratio for the wall"),
     }
     return out
 
@@ -1294,8 +1294,8 @@ def room_size_from_planes(
     out["room_area_m2"] = (area * mscale * mscale) if mscale is not None else None
     out["audit"] = {**out["audit"],
                     "wall_extents_normalized": [d1, d2],
-                    "area_metric_note": "面积按 metric_scale 的**平方**换算（§9.5）",
-                    "diagonal_note": "地面矩形对角线（非三维体对角线）"}
+                    "area_metric_note": "Area is converted using metric_scale squared (§9.5)",
+                    "diagonal_note": "Diagonal of the floor rectangle, not the 3D body diagonal"}
     return out
 
 
@@ -1509,9 +1509,9 @@ def consolidate_instances(
     if n == 0:
         return {"clusters": [], "n_clusters": 0, "n_input": 0, "merge_edges": []}
     if not np.isfinite(eps) or eps <= 0:
-        raise ValueError(f"eps 必须是正的有限值（收到 {eps!r}）")
+        raise ValueError(f"eps must be positive and finite; got {eps!r}")
     if not (0.0 < float(min_overlap) <= 1.0):
-        raise ValueError(f"min_overlap 必须落在 (0,1]（收到 {min_overlap!r}）")
+        raise ValueError(f"min_overlap must be in (0,1]; got {min_overlap!r}")
 
     parent = list(range(n))
 

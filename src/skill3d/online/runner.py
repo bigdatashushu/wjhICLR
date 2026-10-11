@@ -1598,7 +1598,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         observation_images = []
         if program is None:
             record["error_code"] = res.source
-            feedback = f"上一轮程序生成失败：{res.note}。"
+            feedback = f"The previous program generation failed: {res.note}."
             failure_key = "synthesis"
             if res.source in ("none", "vllm_service_error"):
                 outcome.final_state = "unavailable"
@@ -1609,10 +1609,10 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             step("done")  # SYNTHESIZE_PROGRAM → STATIC_CHECK
             check = ast_guard(program.program_source, allowed_tools=set(REGISTRY.names()))
             if not check.ok or (finalizing and not _is_zero_tool_answer_program(program)):
-                problems = list(check.violations) or ["终结程序必须零工具并提交答案"]
+                problems = list(check.violations) or ["The final program must call no tools and submit an answer"]
                 outcome.static_check_errors.extend(problems)
                 record["error_code"] = "ast_violation"
-                feedback = "上一次生成被 AST 拒绝：" + "; ".join(problems)
+                feedback = "The previous program was rejected by the AST check: " + "; ".join(problems)
                 failure_key = "ast"
             else:
                 step("pass")
@@ -1726,11 +1726,12 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         # 归因不足：不猜共享根因，也不把尚未通过验收的结果回灌成可信观察。
                         unresolved_ids.update(r.result_id for r in scope.results)
                     feedback = (
-                        "M11 拒绝上一轮提交，答案槽和程序变量已清空。\n"
-                        f"检查失败：{verify.violations}\n"
-                        f"定位事实：{[i.model_dump() for i in verify.issues]}\n"
-                        f"已撤销结果：{sorted(set(ids))}；证据能力变化：{changes}。\n"
-                        "无明确共享根因的失败只作局部处理；未定位结果不当作可信观察。")
+                        "M11 rejected the previous submission; the answer slot and program variables have been cleared.\n"
+                        f"Failed checks: {verify.violations}\n"
+                        f"Located facts: {[i.model_dump() for i in verify.issues]}\n"
+                        f"Invalidated results: {sorted(set(ids))}; evidence capability changes: {changes}.\n"
+                        "Failures without an established shared cause are handled locally; "
+                        "unresolved results are not treated as valid observations.")
                     failure_key = "geometry_verify"
                     record["error_code"] = "geometry_rejected"
                     step("reject")
@@ -1741,7 +1742,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     observation_images = _yield_image_ids(cell, kernel, handle)
                     trigger = "observation"
                 else:
-                    feedback = f"程序执行失败：{error or 'no_answer'}；{cell.error or '没有提交答案'}"
+                    feedback = f"Program execution failed: {error or 'no_answer'}; {cell.error or 'No answer was submitted'}"
                     details = failed_call_feedback(trace.results)
                     if details:
                         feedback += "\n" + details
@@ -1790,7 +1791,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             force_next = exhausted
             trigger = "error_recovery"
         if feedback:
-            feedback += f"\n剩余模型请求上限：{int(cfg.max_solver_rounds) - index}（含终结轮）。"
+            feedback += f"\nRemaining model request limit: {int(cfg.max_solver_rounds) - index} (including finalization)."
         if fsm.state is not OnlineState.SYNTHESIZE_PROGRAM:
             step("resynthesize")
 
@@ -2173,22 +2174,22 @@ def _image_manifest_text(ledger, plan) -> str:
     """
     if not plan.image_ids:
         return ""
-    lines = ["", "## 本轮图像清单（按顺序，与本次请求里的图片一一对应）"]
+    lines = ["", "## Images for this round (in order, matching the images in this request)"]
     idx = 0
     for i in plan.derived_image_ids:
         idx += 1
         rec = ledger.get(i)
         lines.append(
-            f"{idx}. [裁剪图] image_id={rec.image_id} 源帧={rec.source_frame_id} "
-            f"裁剪框(x0,y0,x1,y1)={rec.box_xyxy} 源尺寸={rec.source_hw} "
-            f"送达尺寸={rec.sent_hw} scale={rec.scale}")
+            f"{idx}. [Crop] image_id={rec.image_id} source_frame={rec.source_frame_id} "
+            f"crop_box(x0,y0,x1,y1)={rec.box_xyxy} source_size={rec.source_hw} "
+            f"delivered_size={rec.sent_hw} scale={rec.scale}")
     for i in plan.original_image_ids:
         idx += 1
-        lines.append(f"{idx}. [原帧] frame_id={i.split('-', 1)[1]}")
+        lines.append(f"{idx}. [Original frame] frame_id={i.split('-', 1)[1]}")
     if plan.omitted_originals:
         lines.append(
-            f"（此外还有 {len(plan.omitted_originals)} 张原帧本轮未再重复发送："
-            "它们已在更早的请求里给过你，本轮为派生图让出名额）")
+            f"({len(plan.omitted_originals)} additional original frames are not resent this round. "
+            "They were provided in earlier requests; derived images use those slots this round.)")
     return "\n".join(lines) + "\n"
 
 
@@ -2313,7 +2314,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
     reason = degenerate_reason(text)
     if reason is not None:
         return _SynthResult(
-            None, "vllm_parse_error", f"M8 退化输出：{reason}（交由有界求解循环重试）",
+            None, "vllm_parse_error", f"M8 degenerate output: {reason} (retry through the bounded solver loop)",
             prompt=prompt, n_images=n_images, delivery=delivery,
             image_round=_round_dict(ledger, round_index), response_text=text)
 
@@ -2328,7 +2329,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         return _SynthResult(
             None,
             "vllm_parse_error",
-            f"M8 program 解析失败: {exc}",
+            f"M8 program parsing failed: {exc}",
             prompt=prompt,
             n_images=n_images,
             delivery=delivery,
@@ -2402,7 +2403,7 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
         skills, max_chars=(policy.method_context_max_chars if policy is not None else None))
     scene_summary = scene.summary if scene is not None else ""
     if handle is not None and handle.grounding_coverage:
-        scene_summary += "\nM5 初始对象覆盖（后续新增对象以工具清单为准）: " + json.dumps(
+        scene_summary += "\nM5 initial object coverage (consult the tool inventory for subsequently added objects): " + json.dumps(
             handle.grounding_coverage, ensure_ascii=False, sort_keys=True)
     text = PromptBuilder().render(
         question=episode.question,
@@ -2427,7 +2428,7 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
         skill_plan=plan,
     )
     if feedback:
-        text += f"\n上一次生成被 AST 拒绝，原因：{feedback}\n请修正后重新输出。"
+        text += f"\nThe previous program was rejected by the AST check: {feedback}\nCorrect it and output the program again."
     if traceback_feedback:
         text += f"\n{traceback_feedback}"
     return text, plan
@@ -2547,16 +2548,16 @@ def _yield_feedback(cell: CellResult, kernel, scene,
     wanted = list(getattr(cell, "yielded_result_ids", []) or [])
     results = list(getattr(kernel, "tool_results", []) or [])
     by_id = {r.result_id: r for r in results}
-    lines = ["YieldObservations 已结束上一段程序，变量已清空。"]
+    lines = ["YieldObservations ended the previous program segment; variables have been cleared."]
     if getattr(cell, "yielded_reason", ""):
-        lines.append(f"让出理由：{cell.yielded_reason}")
+        lines.append(f"Yield reason: {cell.yielded_reason}")
     missing = [rid for rid in wanted if rid not in by_id]
     if missing:
-        lines.append(f"点名的 result_id 不存在：{missing}；不得引用。")
+        lines.append(f"Requested result IDs do not exist: {missing}; do not reference them.")
     for result in results:
         if result.invalidated_by and (not wanted or result.result_id in wanted):
             lines.append(
-                f"result_id={result.result_id} 已被级联撤销：{result.invalidated_by}；不得引用。")
+                f"result_id={result.result_id} was cascade-invalidated: {result.invalidated_by}; do not reference it.")
     failed = failed_call_feedback(
         [r for r in results if r.result_id in wanted]
         if wanted else (getattr(kernel, "cell_results", []) or []))
@@ -2569,11 +2570,13 @@ def _yield_feedback(cell: CellResult, kernel, scene,
     return "\n".join(lines)
 
 
-_FORCED_ANSWER_FEEDBACK = (    "工具路径已经用尽（上一轮仍未能通过工具得到可用的量）。\n"
-    "**本题必须作答**：图片是完整可读的，请把缺失的测量值改成你自己的视觉估计。\n"
-    "请写一个**零工具** program：不要调用任何 Tool，直接依据你在这些图片里"
-    "看到的空间布局和常识给出最佳答案，并用 `return ReturnAnswer(...)` 提交。\n"
-    "只输出一个 ```python 代码块，不要解释。"
+_FORCED_ANSWER_FEEDBACK = (
+    "The tool path is exhausted; the previous round did not obtain a usable measurement.\n"
+    "You must answer this question. The images are readable; use your own visual estimate "
+    "for unavailable measurements.\n"
+    "Write a zero-tool program using the spatial layout visible in the images and common knowledge, "
+    "then submit the best answer with `return ReturnAnswer(AnswerPayload(...))`.\n"
+    "Output exactly one ```python code block, with no explanation."
 )
 
 

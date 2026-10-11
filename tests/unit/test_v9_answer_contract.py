@@ -95,7 +95,7 @@ def test_legacy_short_form_is_explicitly_adapted_and_not_claimed_as_tool_derived
 def test_legacy_short_form_with_unknown_type_does_not_guess_unit():
     payload, problems = parse_answer_payload("7", question_type="mystery_task")
     assert payload.basis == "mixed"
-    assert any("无 §4 单位合同" in p for p in problems)
+    assert any("has no §4 unit contract" in p for p in problems)
 
 
 # ------------------------------------------------------- §12 归因核验 ----
@@ -113,19 +113,19 @@ def test_derivation_op_must_be_registered():
     assert _payload().problems() == []
     bad = _payload(derivation={"op": "exec_python", "input_result_ids": ["r1"],
                                "parameters": {}})
-    assert any("不在登记操作" in p for p in bad.problems())
+    assert any("not among registered operations" in p for p in bad.problems())
 
 
 def test_derivation_cannot_reference_undeclared_results():
     bad = _payload(derivation={"op": "field", "input_result_ids": ["r9"],
                                "parameters": {}})
-    assert any("未在 used_result_ids 声明" in p for p in bad.problems())
+    assert any("not declared in used_result_ids" in p for p in bad.problems())
 
 
 def test_derivation_rejects_unregistered_keys():
     bad = _payload(derivation={"op": "field", "input_result_ids": ["r1"],
                                "parameters": {}, "code": "os.system('rm -rf /')"})
-    assert any("未登记键" in p for p in bad.problems())
+    assert any("unregistered keys" in p for p in bad.problems())
 
 
 def test_registered_ops_cover_the_documented_repertoire():
@@ -136,13 +136,13 @@ def test_registered_ops_cover_the_documented_repertoire():
 
 def test_visual_estimate_cannot_declare_tool_results():
     bad = _payload(basis="visual_estimate")
-    assert any("visual_estimate 却声明了工具结果" in p for p in bad.problems())
+    assert any("visual_estimate must not declare tool results" in p for p in bad.problems())
 
 
 def test_tool_derived_requires_derivation_and_declaration():
-    assert any("缺少可重放 derivation" in p
+    assert any("requires a replayable derivation" in p
                for p in _payload(derivation=None).problems())
-    assert any("未声明任何 used_result_ids" in p
+    assert any("requires declared used_result_ids" in p
                for p in _payload(used_result_ids=[], derivation=None).problems())
 
 
@@ -173,8 +173,8 @@ def test_unverifiable_tool_derived_downgrades_to_mixed_without_rejecting():
     assert verdict.declared_basis == "tool_derived"
     assert verdict.verified_basis == "mixed" and verdict.downgraded is True
     assert verdict.ledger.verified_used_result_ids == []
-    assert any("不在本 episode 工具台账中" in p for p in verdict.problems)
-    assert "保守记 mixed" in verdict.note
+    assert any("not in this episode's tool ledger" in p for p in verdict.problems)
+    assert "conservatively recorded as mixed" in verdict.note
 
 
 def test_invalidated_evidence_is_dropped_and_downgrades():
@@ -185,7 +185,7 @@ def test_invalidated_evidence_is_dropped_and_downgrades():
         invalidated_result_ids=["r1"])
     assert verdict.ledger.verified_used_result_ids == []
     assert verdict.verified_basis == "mixed"
-    assert any("已被级联撤销" in p for p in verdict.problems)
+    assert any("invalidated by a cascade" in p for p in verdict.problems)
 
 
 def test_failed_declared_result_is_not_verified():
@@ -194,7 +194,7 @@ def test_failed_declared_result_is_not_verified():
         observed_result_ids=["r1"], succeeded_result_ids=[],
         invalidated_result_ids=[])
     assert verdict.ledger.verified_used_result_ids == []
-    assert any("状态非 ok" in p for p in verdict.problems)
+    assert any("does not have status ok" in p for p in verdict.problems)
 
 
 def test_mixed_is_accepted_as_declared():

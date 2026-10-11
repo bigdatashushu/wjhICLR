@@ -278,12 +278,12 @@ def _scene_summary(art, *, scene_route: str, scope: str,
         return (f"scene={getattr(art, 'scene_name', '')} "
                 f"scene_route={scene_route} question_tool_scope={scope} "
                 f"quality_status={getattr(art, 'quality_status', 'not_computed')} "
-                "（质量未计算 → 无几何证据）")
+                "(quality not computed; no geometric evidence)")
 
-    ev = ("；".join(f"{c}={profile.state(c)}" for c in
+    ev = ("; ".join(f"{c}={profile.state(c)}" for c in
                     ("geometry_3d", "world_frame", "metric_scale",
                      "object_detection", "track_consensus", "object_grounding"))
-          if profile is not None else "无证据画像")
+          if profile is not None else "no evidence profile")
     wf = getattr(art, "world_frame_status", "unavailable")
     return (
         f"scene={art.scene_name} method={art.recon_method} "

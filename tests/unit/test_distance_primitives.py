@@ -254,7 +254,7 @@ def test_between_pointsets_uses_bidirectional_nn_not_cartesian():
         a, b, params=dp.DistancePrimitiveParams(voxel_size=0.0))
     assert res.n_nn_samples == 1200
     assert res.n_valid_points == 1200
-    assert res.audit["surface_distance_note"].startswith("双向 NN")
+    assert "bidirectional nearest-neighbor" in res.audit["surface_distance_note"]
 
 
 # ---------------------------------------------------------------------------

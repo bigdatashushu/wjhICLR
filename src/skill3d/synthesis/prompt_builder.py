@@ -15,96 +15,93 @@ from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_4"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_5_en"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
 _TASK_DEFINITIONS = {
-    "object_counting": "统计题面指定类别与范围内的对象数量，答案为非负整数。",
-    "object_abs_distance": "估计题面点名的两个对象之间的最近距离，单位按题目要求。",
-    "object_rel_distance": "选择距离题面参照对象最近的候选类别；参照对象不是相机。",
-    "object_size_estimation": "估计目标对象长、宽、高中的最大物理维度，单位按题目要求。",
-    "room_size_estimation": "估计题面指定空间的地面面积，答案单位为平方米。",
-    "object_rel_direction": "判断站在题面指定位置、面向指定对象时目标的方向，答案词表由选项决定。",
-    "obj_appearance_order": "判断题面指定类别在给定视频中的首次出现顺序。",
-    "route_planning": "判断沿题面给定路线行进时的转向，答案为当前选项中的完整动作序列。",
+    "object_counting": "Count objects of the specified category within the stated scope; return a non-negative integer.",
+    "object_abs_distance": "Estimate the nearest distance between the two named objects, in the requested unit.",
+    "object_rel_distance": "Select the candidate category nearest to the reference object; the reference is not the camera.",
+    "object_size_estimation": "Estimate the largest physical dimension among the target object's length, width, and height, in the requested unit.",
+    "room_size_estimation": "Estimate the floor area of the specified space in square meters.",
+    "object_rel_direction": "Determine the target's direction when standing at the specified location and facing the specified object; use the vocabulary of the options.",
+    "obj_appearance_order": "Determine the order in which the specified categories first appear in the video.",
+    "route_planning": "Determine the turns along the specified route; return the complete action sequence represented by one of the current options.",
 }
 
-_PROGRAM_SYNTH = """你是一名空间推理 Coding Agent。根据题目、图像和当前可用工具，
-生成并执行一段 Python program，最终通过 `return ReturnAnswer(AnswerPayload(...))` 提交。
+_PROGRAM_SYNTH = """You are a spatial reasoning coding agent. Use the question, images, and
+currently available tools to generate a Python program for execution, then submit
+with `return ReturnAnswer(AnswerPayload(...))`.
 
-## 公共执行规则
-- 只输出一个 ```python 代码块，代码块之外不要写解释。
-- 可以顶层直接写代码，也可以定义 `def solve(ctx): ...`，host 会自动调用该入口。
-- 只允许 import numpy / scipy / math / statistics；禁止其他 import，以及 eval/exec/__import__/open/文件写/网络。
-- 禁止对 show / ReturnAnswer / YieldObservations / AnswerPayload / tools / scene / frames 赋值。
-- `return ReturnAnswer(AnswerPayload(...))` 提交暂存答案并立即结束当前程序片段；框架通过几何与有效证据验收后才结束本题。验收失败时撤销提交，反馈检查项、受影响结果及仍有效的观察，由同一模型在剩余预算内修正。
-- `return YieldObservations([result_id, ...], "理由")` 结束本段程序，将点名结果的实际返回值送入下一轮请求；求解轮数和重试次数由框架预算控制。
-- 只能依据实际收到的图像和有效工具观察推理；已失效结果不得继续支持答案。
-- 有图必答：有可读图像时，证据不足可按视觉估计作答，并如实标记依据；`ReturnAnswer("abstain")` 不是合法答案。
-- 工具缺失、失败或无效返回不等于零；不得编造几何、尺度、观察或 result_id。
-- ToolResult.status=ok 仅表示调用成功；还须检查 payload 的状态、缺失项、歧义和降级标记。
-  摘要中明示省略的字段不等于空值，未检出不证明对象不存在。
-- 恢复时旧变量已清空，但有效结果可按回灌的真实 ID 和数值复用，无需重复计算。
-  参数和证据前提未改变时，不要重复已确定无效的调用；修改注释不构成修复。
-- 排名必须覆盖题目全部选项；缺候选、实例歧义、距离不可测或最小值并列时，
-  不得把部分排序或 argmin 作为确定答案。可进一步观察，或在后续零工具片段依据原图
-  以 visual_estimate 作答。M11 会核对候选完整性、唯一最小值与选项映射。
+## Shared execution rules
+- Output exactly one ```python code block, with no explanation outside it. Write comments and observation reasons in English.
+- Write top-level code or define `def solve(ctx): ...`; the host automatically calls this entry point.
+- Only numpy / scipy / math / statistics may be imported. Other imports, eval/exec/__import__/open, file writes, and network access are prohibited.
+- Do not assign to show / ReturnAnswer / YieldObservations / AnswerPayload / tools / scene / frames.
+- `return ReturnAnswer(AnswerPayload(...))` submits a provisional answer and immediately ends the current program segment. The episode ends only after geometry and valid-evidence checks pass. A rejected submission is revoked; the same model receives failed checks, affected results, and still-valid observations to correct it within the remaining budget.
+- `return YieldObservations([result_id, ...], "reason")` ends this segment and sends the named results' actual values into the next request. The framework controls the round and retry budgets.
+- Reason only from images actually received and valid tool observations. Invalidated results must not support the answer.
+- Answer whenever readable images are available. Insufficient evidence permits a visual estimate with an honest basis declaration; `ReturnAnswer("abstain")` is not a valid answer.
+- Missing tools, failed calls, and invalid results do not mean zero. Do not invent geometry, scale, observations, or result_id values.
+- ToolResult.status=ok only means the call succeeded. Also check payload status, missing items, ambiguity, and degradation flags.
+  Explicitly omitted summary fields are not empty values; no detection does not prove absence.
+- Old variables are cleared during recovery. Reuse valid results using their actual IDs and values in the feedback without recomputing them.
+  Do not repeat a deterministically invalid call while its arguments and evidence premises remain unchanged. Editing comments is not a repair.
+- A ranking must cover all question options. Missing candidates, ambiguous instances, unmeasurable distances, or tied minima make a partial ranking or argmin insufficient for a definitive answer.
+  Obtain further observations or use the original images in a later zero-tool segment with basis=visual_estimate. M11 checks candidate coverage, a unique minimum, and the option mapping.
 
-## 答案载荷与观察接口
-- `AnswerPayload` 已在运行环境中提供，无需 import。完整提交为
-  `return ReturnAnswer(AnswerPayload(value=答案, unit=单位, basis=依据, used_result_ids=[], derivation=None))`。
-  unit 取 option/count/m/cm/m2；basis 取 visual_estimate/tool_derived/mixed。
-  纯视觉估计使用 visual_estimate，used_result_ids 为空且 derivation 为 None；
-  结合视觉与工具使用 mixed，并列出实际使用的结果 ID。
-- tool_derived 还需声明非空 used_result_ids 和 derivation：
-  `{"op": 操作名, "input_result_ids": [实际结果ID], "parameters": {变换参数}}`。
-  op 仅支持 field/convert/count/sort/argmin/option_map，框架会按真实 ToolResult
-  确定性重放并核对答案。参数格式：
-  field=`{"field":"a.b.0"}`；convert=`{"field":"distance_m","from_unit":"m","to_unit":"cm"}`；
-  count=`{"field":"items"}`；argmin 可对一个字典或多个结果取最小值，多个结果需给
-  `labels`；sort 与 argmin 类似，可给 `descending`；option_map=
-  `{"field":"direction","mapping":{"left":"A","right":"B"}}`。
-  参数只能是这些结构化字段，不能放代码或表达式。无法用一个登记操作完整证明答案时，
-  使用 mixed，不得声明 tool_derived。
-- 兼容 `ReturnAnswer(value)`，此时依据保守登记为 mixed。
-  新程序统一使用完整 AnswerPayload。短写会检查历史有效成功结果，即使本段没有调用工具；
-  注释声称“视觉估计”不会改变该规则。只有真正完全依据原图的零工具片段，才可用
-  visual_estimate、空 used_result_ids 和 derivation=None 放弃历史工具依据。
-  当前片段产生的工具结果始终接受验收；不得仅修改 basis 来绕过失败检查。
-  ReturnAnswer 只接受一个参数，不能直接传 basis、unit 等关键字。
-- 工具返回 dict 时，框架附加 `result_id` 字符串；可用
-  `return YieldObservations([result["result_id"]], "理由")` 请求回传。
-  list/数值/bool 返回值不附加 ID；`return YieldObservations([], "理由")`
-  回传本 episode 仍有效的成功工具结果及其 ID；已失效结果不会作为观察回传。
+## Answer payload and observation interfaces
+- `AnswerPayload` is already available; no import is needed. A complete submission is
+  `return ReturnAnswer(AnswerPayload(value=answer, unit=unit, basis=basis, used_result_ids=[], derivation=None))`.
+  unit must be option/count/m/cm/m2; basis must be visual_estimate/tool_derived/mixed.
+  For a purely visual estimate, use visual_estimate with empty used_result_ids and derivation=None.
+  For combined visual and tool evidence, use mixed and list the actual result IDs used.
+- tool_derived additionally requires nonempty used_result_ids and a derivation:
+  `{"op": operation_name, "input_result_ids": [actual_result_id], "parameters": transformation_parameters}`.
+  Supported operations are field/convert/count/sort/argmin/option_map. The framework deterministically replays the operation against actual ToolResults and checks the answer. Parameter formats:
+  field=`{"field":"a.b.0"}`; convert=`{"field":"distance_m","from_unit":"m","to_unit":"cm"}`;
+  count=`{"field":"items"}`; argmin accepts one dictionary or multiple results, with `labels` required for multiple results.
+  sort is similar to argmin and also accepts `descending`; option_map=
+  `{"field":"direction","mapping":{"left":"A","right":"B"}}`.
+  Parameters may contain only these structured fields, never code or expressions. If a single registered operation cannot fully establish the answer, use mixed, not tool_derived.
+- `ReturnAnswer(value)` remains compatible and is conservatively recorded as mixed.
+  Use the complete AnswerPayload in new programs. Short-form answers cause historical valid successful results to be checked even if the current segment calls no tools.
+  A comment claiming a "visual estimate" does not change this rule. Only a zero-tool segment genuinely based entirely on original images may discard historical tool evidence using visual_estimate, empty used_result_ids, and derivation=None.
+  Results produced in the current segment are always checked. Do not merely change basis to bypass a failed check.
+  ReturnAnswer accepts exactly one argument; do not pass basis or unit directly as keyword arguments.
+- For a dict result, the framework attaches a `result_id` string. Request feedback with
+  `return YieldObservations([result["result_id"]], "reason")`.
+  Lists, numbers, and booleans do not carry an attached ID. `return YieldObservations([], "reason")`
+  returns this episode's still-valid successful results and their IDs. Invalidated results are not returned as usable observations.
 
-## 当前题目与答案要求
+## Current question and answer requirements
 {{ question }}
-本题题型: {{ question_type or "未分类" }}
-{% if answer_unit %}本题提交单位: {{ answer_unit }}
+Question type: {{ question_type or "unclassified" }}
+{% if answer_unit %}Submission unit: {{ answer_unit }}
 {% endif %}
-{% if task_definition %}题义: {{ task_definition }}
-{% endif %}{% if options %}选项:
+{% if task_definition %}Task meaning: {{ task_definition }}
+{% endif %}{% if options %}Options:
 {% for opt in options %}{{ opt }}
-{% endfor %}MCA 题：提交与选项文本对应的选项字母（如 "A"）。
-{% else %}NA 题：答案值（短写 value 或 AnswerPayload.value）必须为一个有限数值，不得为列表或字典。
+{% endfor %}MCA: submit the letter corresponding to the selected option text (for example, "A").
+{% else %}NA: the answer value (short-form value or AnswerPayload.value) must be one finite number, never a list or dictionary.
 {% endif %}
-题面中的对象角色、空间范围、参照系和要求单位必须保持一致。
-工具的单位、坐标与计算定义以当前接口文档和有效返回为准；近似结果应按其实际定义解释。
-米转厘米乘以 100，面积转换按长度比例的平方进行；已为目标单位的值不再换算。
-缺少有效尺度时不得将归一化几何量冒充米制测量；视觉估计不得冒充工具测量。
+Preserve the object roles, spatial scope, reference frame, and units specified in the question.
+Use the current interface documentation and valid returns for tool units, coordinates, and computation definitions. Interpret approximations according to their actual definitions.
+Multiply by 100 to convert meters to centimeters; area conversions use the square of the length ratio. Do not reconvert a value already in the target unit.
+Without valid scale, do not present normalized geometry as metric measurements. Do not present visual estimates as tool measurements.
 
-## 当前证据状态
+## Current evidence state
 {{ route_header }}
-场景摘要: {{ scene_summary }}
-坐标与尺度的可用性以当前证据状态和工具合同为准。
+Scene summary: {{ scene_summary }}
+Coordinate and scale availability follows the current evidence state and tool contracts.
 
-## 获准工具及接口文档
+## Authorized tools and interface documentation
 {{ tool_docs }}
-只允许调用当前文档列出的工具；签名、返回字段与可用性以该文档为准。
-方法指导不会新增工具权限；具体对象绑定与调用前置条件仍由框架检查。
+Call only tools listed in the current documentation; it defines their signatures, return fields, and availability.
+Method guidance does not grant additional tool permissions. The framework still checks specific object bindings and call preconditions.
 {% if skill_entries %}
-## 参考方法
+## Reference method
 {% for e in skill_entries %}{{ e }}{% endfor %}{% endif %}"""
 
 
@@ -163,7 +160,7 @@ class PromptBuilder:
             scene_summary=scene_summary,
             scene_frame=scene_frame,
             tool_docs=tool_docs,
-            route_header=route_header or "（未声明 scope：仅使用不依赖重建产物的 Tool）",
+            route_header=route_header or "(Scope unspecified: use only tools independent of reconstruction artifacts.)",
             question_type=question_type,
             answer_unit=CANONICAL_UNIT_BY_QUESTION_TYPE.get(question_type, ""),
             task_definition=_TASK_DEFINITIONS.get(question_type, ""),
@@ -179,31 +176,34 @@ def round_action_instructions(question_type: str, *, finalizing: bool = False) -
     """反馈末尾的公共执行合同；不包含选项答案或 Skill 方法。"""
     unit = CANONICAL_UNIT_BY_QUESTION_TYPE.get(question_type)
     unit_expr = repr(unit) if unit else "unit"
-    lines = ["本轮行动要求：只输出一个 ```python 代码块，修复必须落实到可执行语句，"
-             "不能只改注释或重复上一轮程序。"]
+    lines = ["Required action this round: output exactly one ```python code block. "
+             "Repair executable statements; do not merely edit comments or repeat the previous program."]
     if finalizing:
-        lines.append("这是预算内最后一次作答请求。只允许零工具程序，不得 YieldObservations。")
+        lines.append("This is the final answer request within the budget. "
+                     "Only a zero-tool program is allowed; do not call YieldObservations.")
     else:
         lines.append(
-            "只调用当前文档列出的工具。参数与证据前提未变时，不要重复已确定无效的调用；"
-            "需要新观察可 `return YieldObservations([实际结果ID], '理由')`，"
-            "不得把旧变量当作仍然存在。")
+            "Call only currently documented tools. Do not repeat a deterministically invalid call "
+            "with unchanged arguments and evidence premises. Request new observations with "
+            "`return YieldObservations([actual_result_id], 'reason')`; old variables no longer exist.")
     lines.append(
-        "先根据题面和有效依据在代码中定义 answer（本题选项字母或有限数值），"
-        "不得把下面的变量名当作答案。"
-        + ("" if unit else "按题面定义合法的 unit。"))
+        "First define answer in code from the question and valid evidence "
+        "(an option letter or a finite number for this question). "
+        "Do not submit the variable names below as literal answers."
+        + ("" if unit else " Define a valid unit according to the question."))
     lines.append(
-        "真正完全依据原图时，用零工具片段提交："
+        "For an answer genuinely based entirely on original images, submit in a zero-tool segment: "
         f"return ReturnAnswer(AnswerPayload(value=answer, unit={unit_expr}, "
         "basis='visual_estimate', used_result_ids=[], derivation=None))")
     lines.append(
-        "若结合视觉与有效工具结果，先将实际使用的结果 ID 放入 used_ids，再提交："
+        "For combined visual and valid tool evidence, put the actual result IDs used in used_ids, then submit: "
         f"return ReturnAnswer(AnswerPayload(value=answer, unit={unit_expr}, "
-        "basis='mixed', used_result_ids=used_ids, derivation=None))。"
-        "纯工具推导须按公共合同声明 tool_derived 及可重放 derivation。")
+        "basis='mixed', used_result_ids=used_ids, derivation=None)). "
+        "Pure tool derivations require tool_derived and a replayable derivation under the shared contract.")
     lines.append(
-        "已撤销结果和被拒绝的答案不能作为依据；不要用短写或只改 basis 规避验收。"
-        "有图必答，不提交 abstain；ReturnAnswer 之后不得再调用工具。")
+        "Invalidated results and rejected answers cannot serve as evidence. "
+        "Do not bypass validation with short-form answers or by merely changing basis. "
+        "Answer when images are available; do not submit abstain. Do not call tools after ReturnAnswer.")
     return "\n".join(lines)
 
 

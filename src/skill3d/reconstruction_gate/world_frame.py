@@ -421,11 +421,11 @@ def _as_vec3(value: Any, name: str) -> np.ndarray:
     try:
         arr = np.asarray(value, dtype=np.float64)
     except (TypeError, ValueError):
-        raise ValueError(f"{name} 不是数值 3 向量（收到 {value!r}）") from None
+        raise ValueError(f"{name} is not a numeric 3D vector; got {value!r}") from None
     if arr.shape != (3,):
-        raise ValueError(f"{name} 必须是 3 向量（收到 {value!r}）")
+        raise ValueError(f"{name} must be a 3D vector; got {value!r}")
     if not bool(np.all(np.isfinite(arr))):
-        raise ValueError(f"{name} 含 NaN/Inf（收到 {value!r}）")
+        raise ValueError(f"{name} contains NaN/Inf; got {value!r}")
     return arr
 
 
@@ -438,13 +438,13 @@ def _validated_world_up(world_up: Any) -> np.ndarray:
     """
     if world_up is None:
         raise ValueError(
-            "world_up 缺失（None）→ 方向判定 fail-closed（§9.8：不退回无符号启发式）；"
-            "请先由 M3 落盘世界系契约（estimate_world_frame）")
+            "world_up is missing (None); direction determination fails closed (§9.8: no fallback to unsigned heuristics). "
+            "M3 must first persist the world frame contract (estimate_world_frame)")
     arr = _as_vec3(world_up, "world_up")
     n = float(np.linalg.norm(arr))
     if not np.isfinite(n) or abs(n - 1.0) > TH_UNIT_TOL:
         raise ValueError(
-            f"world_up 必须是**单位**向量（模长={n}，收到 {world_up!r}）→ fail-closed，不做静默归一化")
+            f"world_up must be a unit vector (norm={n}, got {world_up!r}); fail closed without silent normalization")
     return arr / n
 
 
@@ -452,8 +452,8 @@ def _validated_handedness(handedness: Any) -> str:
     """校验 `handedness` ∈ {"right", "left"}；缺失/未知 → 抛 `ValueError`。"""
     if handedness not in ("right", "left"):
         raise ValueError(
-            f"handedness 必须是 'right'/'left'（收到 {handedness!r}）→ 方向判定 fail-closed"
-            "（叉积符号依赖坐标系手性，缺它就只能猜）")
+            f"handedness must be 'right'/'left' (got {handedness!r}); direction determination fails closed"
+            " (the cross-product sign depends on handedness and must not be guessed)")
     return str(handedness)
 
 
@@ -499,8 +499,8 @@ def direction_of(observer_xyz: Any, facing_xyz: Any, target_xyz: Any, world_up: 
     diff = str(difficulty or "").strip().lower()
     if diff not in ("easy", "medium", "hard"):
         raise ValueError(
-            f"difficulty 必须是 'easy'/'medium'/'hard'（收到 {difficulty!r}）"
-            "→ 方向选项集合未定义，fail-closed（不同难度的选项集合不同，猜不得）")
+            f"difficulty must be 'easy'/'medium'/'hard' (got {difficulty!r}); "
+            "the direction option set is undefined, so fail closed (each difficulty has different options; do not guess)")
     obs = _as_vec3(observer_xyz, "observer_xyz")
     fac = _as_vec3(facing_xyz, "facing_xyz")
     tgt = _as_vec3(target_xyz, "target_xyz")
@@ -513,11 +513,11 @@ def direction_of(observer_xyz: Any, facing_xyz: Any, target_xyz: Any, world_up: 
     d_norm = float(np.linalg.norm(d_h))
     if not np.isfinite(f_norm) or f_norm <= TH_HORIZ_EPS:
         raise ValueError(
-            "facing 向量在水平面上退化为零（facing_at 与 observer 只差竖直方向）"
-            "→ 方位未定义，fail-closed")
+            "The facing vector degenerates to zero in the horizontal plane (facing_at and observer differ only vertically); "
+            "direction is undefined, so fail closed")
     if not np.isfinite(d_norm) or d_norm <= TH_HORIZ_EPS:
         raise ValueError(
-            "target 与 observer 重合或只差竖直方向 → 水平方位未定义，fail-closed")
+            "target and observer coincide or differ only vertically; horizontal direction is undefined, so fail closed")
     f_hat = f_h / f_norm
     d_hat = d_h / d_norm
 

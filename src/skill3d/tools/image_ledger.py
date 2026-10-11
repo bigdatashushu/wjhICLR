@@ -104,8 +104,8 @@ class ImageLedger:
 
     def frame_pixels(self, frame_id: int) -> np.ndarray:
         if int(frame_id) not in self.frames:
-            raise KeyError(f"帧 {frame_id} 不在本 episode 的冻结 FrameSet 中"
-                           f"（可读帧={self.frame_ids[:8]}…）")
+            raise KeyError(f"Frame {frame_id} is not in this episode's frozen FrameSet"
+                           f" (readable frames={self.frame_ids[:8]}...)")
         return self.frames[int(frame_id)]
 
     # ---- 产出（§9.4 produced）----
@@ -120,7 +120,7 @@ class ImageLedger:
         """登记一张**真实产出**的图像（像素必须存在）。"""
         arr = np.asarray(pixels)
         if arr.size == 0:
-            raise ValueError("produce() 收到空像素：空图不得进入观察链")
+            raise ValueError("produce() received empty pixels: empty images must not enter the observation chain")
         self._seq += 1
         digest = _digest(arr)
         image_id = f"img-{kind}-{self._seq:03d}-{digest[:8]}"
@@ -150,13 +150,13 @@ class ImageLedger:
     # ---- 查询 ----
     def get(self, image_id: str) -> ProducedImage:
         if image_id not in self._entries:
-            raise KeyError(f"未知 image_id: {image_id}")
+            raise KeyError(f"Unknown image_id: {image_id}")
         return self._entries[image_id].record
 
     def pixels_of(self, image_id: str) -> np.ndarray:
         entry = self._entries.get(image_id)
         if entry is None or entry.pixels is None:
-            raise KeyError(f"未知 image_id（或像素已释放）: {image_id}")
+            raise KeyError(f"Unknown image_id (or pixels have been released): {image_id}")
         return entry.pixels
 
     def all_images(self) -> list[ProducedImage]:
@@ -224,7 +224,7 @@ class ImageLedger:
             rec = self._entries[i].record
             if not rec.delivered_rounds:
                 rec.unobserved_reason = (
-                    "本轮图像名额已满（layout=derived_plus_originals_v1），保持 unobserved")
+                    "This round's image limit is full (layout=derived_plus_originals_v1); remains unobserved")
         n_pixels = 0
         tokens = 0
         for i in chosen:
@@ -322,7 +322,7 @@ class ImageLedger:
             for i in rnd.image_ids:
                 rec = self._entries[i].record
                 if rec.delivered_rounds and not rec.observed_rounds:
-                    rec.unobserved_reason = f"请求失败：{note}"[:200]
+                    rec.unobserved_reason = f"Request failed: {note}"[:200]
 
     def mark_round_sent(self, round_index: int, *, prompt_tokens: Optional[int] = None
                         ) -> None:

@@ -156,17 +156,17 @@ def test_local_failure_keeps_validated_observations(tmp_path, episode_item):
     # 回灌内容：失败信息 + validated observations 摘要（含 result_id）都在 prompt 里
     assert len(client.calls) == 2
     text = _blob(client.calls[1])
-    assert "局部错误" in text
-    assert "仍然可信的既有观测" in text and "result_id=" in text
+    assert "local tool error" in text
+    assert "Still-valid observations" in text and "result_id=" in text
     feedback = out.rounds[1]["feedback"]
-    assert feedback.count("仍然可信的既有观测") == 1
+    assert feedback.count("Still-valid observations") == 1
     for rid in out.rounds[0]["recovery_observation_ids"]:
         assert feedback.count(f"[result_id={rid}]") == 1
-    assert '失败调用：euclidean_distance({"point_a": [0.0, 0.0], "point_b": 1.0})' in feedback
-    assert feedback.index("失败调用") < feedback.index("仍然可信的既有观测")
-    assert feedback.index("剩余模型请求上限") < feedback.index("本轮行动要求")
+    assert 'Failed call: euclidean_distance({"point_a": [0.0, 0.0], "point_b": 1.0})' in feedback
+    assert feedback.index("Failed call") < feedback.index("Still-valid observations")
+    assert feedback.index("Remaining model request limit") < feedback.index("Required action this round")
     # 局部失败**不得**出现"已级联撤销"这类断言
-    assert "级联撤销" not in text
+    assert "were cascade-invalidated" not in text
     # 恢复后答案关联到本次用的 result（§14.1：trace 记 used_result_ids）
     assert out.used_result_ids
 
@@ -208,8 +208,8 @@ def test_shared_premise_failure_cascades_and_downgrades(tmp_path, episode_item):
     assert "plane_fit_room_size" not in docs
     # 回灌文本明确写着"不要再用被撤销的数值"，且此时已无任何可信既有观测
     text = _blob(client.calls[1])
-    assert "级联撤销" in text and "被撤销的数值" in text
-    assert "当前没有任何可信的既有观测" in text
+    assert "cascade-invalidated" in text and "invalidated values" in text
+    assert "No valid prior observations are available" in text
     # 恢复后仍能作答（用未被污染的工具），但答案绝不复用被撤销的房间面积
     assert out.final_state == "answer" and out.answer_source == "tool_program"
     assert out.answer not in ("17.11",)                   # 被撤销的旧数值不得复用

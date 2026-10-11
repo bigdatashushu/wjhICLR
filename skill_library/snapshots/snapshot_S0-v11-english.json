@@ -1,0 +1,126 @@
+{
+  "active_by_question_type": {
+    "obj_appearance_order": "S07@1.2.0",
+    "object_abs_distance": "S02@1.2.0",
+    "object_counting": "S01@1.3.0",
+    "object_rel_direction": "S06@1.2.0",
+    "object_rel_distance": "S03@1.2.0",
+    "object_size_estimation": "S04@1.2.0",
+    "room_size_estimation": "S05@1.2.0",
+    "route_planning": "S08@1.3.0"
+  },
+  "entries": {
+    "S01@1.3.0": {
+      "candidate_type": "skill",
+      "content_sha256": "7228655c090a477da1a5ced11e554d90110f59b9721ac3dc3a4b8d8f9021bd84",
+      "created_by": "english_translation",
+      "format": "skill-md/v11",
+      "parent_version": "S01@1.2.0",
+      "question_type": "object_counting",
+      "skill_id": "S01",
+      "source_ref": "versions/S01/1.3.0/count-scene-objects/SKILL.md",
+      "state": "active",
+      "version": "1.3.0"
+    },
+    "S02@1.2.0": {
+      "candidate_type": "skill",
+      "content_sha256": "4387ba0d6a61d5c1425620c782a164e7acb7ef2cb6c924e191a37da61132fa15",
+      "created_by": "english_translation",
+      "format": "skill-md/v11",
+      "parent_version": "S02@1.1.0",
+      "question_type": "object_abs_distance",
+      "skill_id": "S02",
+      "source_ref": "versions/S02/1.2.0/estimate-object-distance/SKILL.md",
+      "state": "active",
+      "version": "1.2.0"
+    },
+    "S03@1.2.0": {
+      "candidate_type": "skill",
+      "content_sha256": "efa2a89dc3952c08da484db39752d0c428213636626f2ac3a96d3c4d2c5503af",
+      "created_by": "english_translation",
+      "format": "skill-md/v11",
+      "parent_version": "S03@1.1.0",
+      "question_type": "object_rel_distance",
+      "skill_id": "S03",
+      "source_ref": "versions/S03/1.2.0/rank-object-distances/SKILL.md",
+      "state": "active",
+      "version": "1.2.0"
+    },
+    "S04@1.2.0": {
+      "candidate_type": "skill",
+      "content_sha256": "11f8410f85f8fa41a416627952ffebdca96bd3934a56a0603e46a0eb6fdccf52",
+      "created_by": "english_translation",
+      "format": "skill-md/v11",
+      "parent_version": "S04@1.1.0",
+      "question_type": "object_size_estimation",
+      "skill_id": "S04",
+      "source_ref": "versions/S04/1.2.0/estimate-object-size/SKILL.md",
+      "state": "active",
+      "version": "1.2.0"
+    },
+    "S05@1.2.0": {
+      "candidate_type": "skill",
+      "content_sha256": "277709d1e250737a7eec479eb50ef6dffacd287bf0cf3dc4e8e6fd96381796cc",
+      "created_by": "english_translation",
+      "format": "skill-md/v11",
+      "parent_version": "S05@1.1.0",
+      "question_type": "room_size_estimation",
+      "skill_id": "S05",
+      "source_ref": "versions/S05/1.2.0/estimate-room-area/SKILL.md",
+      "state": "active",
+      "version": "1.2.0"
+    },
+    "S06@1.2.0": {
+      "candidate_type": "skill",
+      "content_sha256": "72c165c7f7d71ae5ce614b566d6c96f67fb98bfff23dcdeb427cb84b0f664e1e",
+      "created_by": "english_translation",
+      "format": "skill-md/v11",
+      "parent_version": "S06@1.1.0",
+      "question_type": "object_rel_direction",
+      "skill_id": "S06",
+      "source_ref": "versions/S06/1.2.0/judge-relative-direction/SKILL.md",
+      "state": "active",
+      "version": "1.2.0"
+    },
+    "S07@1.2.0": {
+      "candidate_type": "skill",
+      "content_sha256": "c420b77efd2b22c87d4d9381a3d22145fb66bfd59438d2f8350c88cc7a174c65",
+      "created_by": "english_translation",
+      "format": "skill-md/v11",
+      "parent_version": "S07@1.1.0",
+      "question_type": "obj_appearance_order",
+      "skill_id": "S07",
+      "source_ref": "versions/S07/1.2.0/order-first-appearances/SKILL.md",
+      "state": "active",
+      "version": "1.2.0"
+    },
+    "S08@1.3.0": {
+      "candidate_type": "skill",
+      "content_sha256": "4f3e67b2af39dfe748869efd937c9f88907ae320e267e8b97fa0000b5e31a77a",
+      "created_by": "english_translation",
+      "format": "skill-md/v11",
+      "parent_version": "S08@1.2.0",
+      "question_type": "route_planning",
+      "skill_id": "S08",
+      "source_ref": "versions/S08/1.3.0/infer-route-turns/SKILL.md",
+      "state": "active",
+      "version": "1.3.0"
+    }
+  },
+  "generation": 0,
+  "manifest_hash": "4c74c29f5d965f18a124d018b14c08bb4e4211c505875293d7f88195e4fd49e5",
+  "manifest_ref": "manifests/manifest_S0-v11-english.json",
+  "parent_snapshot_id": "S0-v11-contract-repair",
+  "schema_version": "runtime-skill-snapshot/2.0",
+  "skill_versions": [
+    "S01@1.3.0",
+    "S02@1.2.0",
+    "S03@1.2.0",
+    "S04@1.2.0",
+    "S05@1.2.0",
+    "S06@1.2.0",
+    "S07@1.2.0",
+    "S08@1.3.0"
+  ],
+  "snapshot_id": "S0-v11-english"
+}

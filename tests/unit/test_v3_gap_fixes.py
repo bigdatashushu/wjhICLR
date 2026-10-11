@@ -357,7 +357,7 @@ def test_prompt_header_reports_actually_loaded_artifacts(tmp_path):
     item = load_synthetic_items("inner_validation", question_types=["object_counting"],
                                 frame_size=(32, 32), seed=0)[0]
     text = _build_prompt(item.episode, scene, handle, [], None)
-    line = next(l for l in text.splitlines() if "可用重建产物=" in l)
+    line = next(l for l in text.splitlines() if "available reconstruction artifacts=" in l)
     assert "frames" in line
     for absent in ("objects", "poses", "intrinsics", "scale"):
         assert absent not in line, f"未装载的产物 {absent} 不应出现在 prompt 头部: {line}"

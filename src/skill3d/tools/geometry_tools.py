@@ -77,11 +77,11 @@ def _as_point(p: list[float], name: str) -> np.ndarray:
     arr = np.asarray(p, dtype=np.float64)
     if arr.shape != (3,):
         raise DomainValueError(
-            "argument_check", f"{name} 必须为 3 维点, 实际 shape={arr.shape}",
+            "argument_check", f"{name} must be a 3D point; got shape={arr.shape}",
             args={"name": name})
     if not np.all(np.isfinite(arr)):
         raise DomainValueError(
-            "argument_check", f"{name} 含 NaN/Inf: {p!r}", args={"name": name})
+            "argument_check", f"{name} contains NaN/Inf: {p!r}", args={"name": name})
     return arr
 
 
@@ -97,9 +97,9 @@ def _require_metric(value, tool: str, what: str):
     if value is None or not np.isfinite(float(value)):
         raise DomainValueError(
             tool,
-            f"{what} 无法给出有限数值（{value!r}）：通常是该对象的有效 3D 点不足或"
-            "点云被判定为降级。请不要把它当作 0 —— 改用其他可用工具，"
-            "或直接依据图片给出视觉估计并在答案里标明是估计。")
+            f"{what} cannot provide a finite value ({value!r}): usually the object has too few valid 3D points "
+            "or its point cloud is degraded. Do not treat this as 0. Use other available tools, "
+            "or estimate directly from the images and declare the answer as an estimate.")
     return float(value)
 
 
@@ -112,8 +112,8 @@ def _metric_scale_or_fail(handle: SceneHandle, tool: str) -> float:
     v = handle.metric_scale
     if v is None or not np.isfinite(float(v)) or float(v) <= 0:
         raise DomainValueError(
-            tool, f"缺少可用的 metric_scale（世界单位→米 的换算系数）：{v!r}；"
-                  "尺度融合未成功时米制 Tool 不得以世界单位冒充米制")
+            tool, f"No usable metric_scale (world units to meters conversion factor): {v!r}; "
+                  "metric tools must not present world units as metric units when scale fusion has not succeeded")
     return float(v)
 
 
@@ -123,7 +123,7 @@ def _get_object(handle: SceneHandle, object_id: str, tool: str):
         return handle.get_object(object_id)
     except KeyError as exc:
         raise DomainValueError(
-            tool, f"对象不存在: {object_id}（objects 产物可用且已列出全部实例）",
+            tool, f"Object does not exist: {object_id} (the objects artifact is available and all instances have been listed)",
             args={"object_id": object_id}) from exc
 
 
@@ -337,11 +337,11 @@ def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
     c = np.asarray(obj.centroid_world, dtype=np.float64)
     if c.shape != (3,):
         raise DomainValueError("object_centroid",
-                               f"对象 {obj_id} centroid 维度异常: {obj.centroid_world}",
+                               f"Object {obj_id} has an invalid centroid shape: {obj.centroid_world}",
                                args={"obj_id": obj_id})
     if not np.all(np.isfinite(c)):
         raise DomainValueError("object_centroid",
-                               f"对象 {obj_id} centroid 含 NaN/Inf: {obj.centroid_world}",
+                               f"Object {obj_id} centroid contains NaN/Inf: {obj.centroid_world}",
                                args={"obj_id": obj_id})
     scale = _metric_scale_if_authorized(handle)
     metric = (None if scale is None
@@ -399,9 +399,9 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
         if ext_m is None:
             raise DomainValueError(
                 "object_3d_extent",
-                f"对象 {obj_id}（{obj.category_name}）的有效 3D 点不足"
-                f"（n_valid={res.get('n_valid_points')}），无法给出米制尺寸。"
-                "请不要把缺失值当作 0 —— 改用其他工具或依据图片给出视觉估计。",
+                f"Object {obj_id} ({obj.category_name}) has too few valid 3D points "
+                f"(n_valid={res.get('n_valid_points')}) to provide metric dimensions. "
+                "Do not treat missing values as 0. Use other tools or estimate from the images.",
                 args={"obj_id": obj_id})
         return {
             "extent_normalized": res["extent_normalized"],
@@ -415,7 +415,7 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
                                                                      dtype=np.float64)
         if np.any(ext < 0):
             raise DomainValueError("object_3d_extent",
-                                   f"对象 {obj_id} bbox 上下界反序（负边长）",
+                                   f"Object {obj_id} bbox bounds are reversed (negative extent)",
                                    args={"obj_id": obj_id})
         s = _metric_scale_or_fail(handle, "object_3d_extent")
         return {
@@ -425,7 +425,7 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
             "degradation_flags": ["bbox_fallback_no_pointcloud"],
         }
     raise DomainValueError("object_3d_extent",
-                           f"对象 {obj_id} 既无点云也无 bbox，无法测量尺寸",
+                           f"Object {obj_id} has neither a point cloud nor a bbox; cannot measure size",
                            args={"obj_id": obj_id})
 
 
@@ -453,12 +453,12 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
     pm = handle.get_point_map()
     if pm is None or pm.size == 0:
         raise DomainValueError("plane_fit_room_size",
-                               "未注入世界系点图，无法拟合平面（重建产物缺失）")
+                               "No world point map was provided; cannot fit planes (missing reconstruction artifact)")
     res = room_size_from_planes(np.asarray(pm, dtype=np.float64).reshape(-1, 3),
                                metric_scale=_metric_scale_or_fail(
                                    handle, "plane_fit_room_size"))
     area = _require_metric(res.get("room_area_m2"), "plane_fit_room_size",
-                           "房间面积（平方米）")
+                           "Room area (square meters)")
     return {
         "room_diagonal_normalized": res.get("room_diagonal_normalized"),
         "room_area_m2": area,
@@ -583,7 +583,7 @@ def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str
     b = _get_object(handle, obj_b, "surface_distance_between_objects")
     if a.obj_id == b.obj_id:
         raise DomainValueError("surface_distance_between_objects",
-                               f"obj_a 与 obj_b 是同一对象: {obj_a}",
+                               f"obj_a and obj_b refer to the same object: {obj_a}",
                                args={"obj_a": obj_a, "obj_b": obj_b})
     res = robust_distance_between_pointsets(
         handle.object_points(a.obj_id), handle.object_points(b.obj_id),
@@ -646,11 +646,11 @@ def relative_distance_rank(handle: SceneHandle, reference: str,
             or len(candidate_categories) < 2
             or not all(isinstance(c, str) and c.strip() for c in candidate_categories)):
         raise DomainValueError("relative_distance_rank",
-                               "candidate_categories 必须包含至少两个非空类别名",
+                               "candidate_categories must contain at least two nonempty category names",
                                args={"candidate_categories": candidate_categories})
     categories = [c.strip() for c in candidate_categories]
     if any(matches(a, b) for i, a in enumerate(categories) for b in categories[i + 1:]):
-        raise DomainValueError("relative_distance_rank", "候选类别重复或同义，无法唯一排名")
+        raise DomainValueError("relative_distance_rank", "Candidate categories are duplicates or synonyms; cannot rank uniquely")
     ref = _get_object(handle, reference, "relative_distance_rank")
     ref_pts = handle.object_points(ref.obj_id)
     ranking: list[dict] = []
@@ -771,7 +771,7 @@ def object_distance_m(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
     b = _get_object(handle, obj_b, "object_distance_m")
     if a.obj_id == b.obj_id:
         raise DomainValueError("object_distance_m",
-                               f"obj_a 与 obj_b 是同一对象: {obj_a}",
+                               f"obj_a and obj_b refer to the same object: {obj_a}",
                                args={"obj_a": obj_a, "obj_b": obj_b})
     scale = _metric_scale_or_fail(handle, "object_distance_m")
     res = robust_distance_between_pointsets(
@@ -779,7 +779,7 @@ def object_distance_m(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
         metric_scale=scale, params=DistancePrimitiveParams(),
         duplicate_suspect=bool(a.duplicate_suspect or b.duplicate_suspect))
     d_m = _require_metric(res.distance_metric, "object_distance_m",
-                          f"{a.category_name} 与 {b.category_name} 的最近距离（米）")
+                          f"Nearest distance between {a.category_name} and {b.category_name} (meters)")
     return {
         "distance_m": d_m,
         "distance_normalized": res.distance_normalized,
@@ -961,7 +961,7 @@ def reproject(handle: SceneHandle, p3d: list[float], frame_idx: int) -> list[flo
     z = p_cam[2]
     if z <= 0:
         raise DomainValueError("reproject",
-                               f"点在相机后方或成像平面上 (z={z})，无法重投影",
+                               f"Point is behind the camera or on the image plane (z={z}); cannot reproject",
                                args={"p3d": p3d, "frame_idx": frame_idx})
     uv = K @ p_cam[:3]
     return [float(uv[0] / z), float(uv[1] / z)]
@@ -985,7 +985,7 @@ def euclidean_distance(handle: SceneHandle, point_a: list[float],
     b = _as_point(point_b, "point_b")
     d = float(np.linalg.norm(a - b))
     if not np.isfinite(d) or d < 0:
-        raise DomainValueError("euclidean_distance", f"距离非有限或为负: {d}",
+        raise DomainValueError("euclidean_distance", f"Distance is non-finite or negative: {d}",
                                args={"point_a": point_a, "point_b": point_b})
     return d
 

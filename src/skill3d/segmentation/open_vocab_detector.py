@@ -119,7 +119,7 @@ def detect(frame: np.ndarray, prompt: str, *,
     ep = (endpoint or detector_endpoint()).rstrip("/")
     detect.last_error = ""
     if not ep or not prompt.strip() or frame is None:
-        return _failed("endpoint 未配置 / prompt 为空 / frame 为 None")
+        return _failed("endpoint is not configured / prompt is empty / frame is None")
     import cv2
     import requests
 
@@ -131,7 +131,7 @@ def detect(frame: np.ndarray, prompt: str, *,
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                           [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not ok:
-        return _failed("JPEG 编码失败")
+        return _failed("JPEG encoding failed")
     if timeout_s <= 0 or total_timeout_s <= 0 or not 1 <= max_attempts <= 5:
         return _failed("invalid detector retry budget")
     body = {"image": base64.b64encode(buf.tobytes()).decode("ascii"),

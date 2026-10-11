@@ -502,7 +502,7 @@ def build_v11_experience_bundle_from_trace_store(
             str(root / "episode_program.jsonl"),
             str(root / "program_trace.jsonl"),
         ],
-        notes=["只读取题目级答案与评分；未授权读取 GT 三维标注"],
+        notes=["Only question-level answers and scores were read; access to GT 3D annotations was not authorized"],
     )
     return V11ExperienceBundle(
         campaign_id=campaign_id,

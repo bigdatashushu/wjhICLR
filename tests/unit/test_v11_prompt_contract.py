@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 
 import pytest
 
@@ -21,7 +22,7 @@ def test_current_protocol_identity_is_fixed_and_not_cli_selectable():
     }
     assert PromptBuilder().template_version == PROMPT_TEMPLATE_VERSION
     versions = current_version_fields()
-    assert versions["template_version"] == "program_synth_v11_4"
+    assert versions["template_version"] == "program_synth_v11_5_en"
     assert versions["execution_protocol_version"] == "solver-v11.4-eval-visual-fallback"
     assert versions["tool_docs_version"] == TOOL_DOCS_VERSION
 
@@ -67,18 +68,18 @@ def test_cli_rejects_retired_solver_and_manual_injection(args):
 
 
 @pytest.mark.parametrize(("question_type", "meaning"), [
-    ("object_counting", "非负整数"),
-    ("object_abs_distance", "两个对象之间的最近距离"),
-    ("object_rel_distance", "参照对象不是相机"),
-    ("object_size_estimation", "最大物理维度"),
-    ("room_size_estimation", "地面面积"),
-    ("object_rel_direction", "面向指定对象"),
-    ("obj_appearance_order", "首次出现顺序"),
-    ("route_planning", "完整动作序列"),
+    ("object_counting", "non-negative integer"),
+    ("object_abs_distance", "nearest distance between the two named objects"),
+    ("object_rel_distance", "the reference is not the camera"),
+    ("object_size_estimation", "largest physical dimension"),
+    ("room_size_estimation", "floor area"),
+    ("object_rel_direction", "facing the specified object"),
+    ("obj_appearance_order", "first appear in the video"),
+    ("route_planning", "complete action sequence"),
 ])
 def test_public_task_semantics_do_not_include_solving_recipes(question_type, meaning):
     text = PromptBuilder().render(
-        question="题面要求",
+        question="Question requirements",
         scene_summary="",
         scene_frame="world",
         tool_docs="",
@@ -86,22 +87,37 @@ def test_public_task_semantics_do_not_include_solving_recipes(question_type, mea
     )
     assert meaning in text
     assert "ReturnAnswer" in text and "YieldObservations" in text
-    assert "米转厘米乘以 100" in text
-    assert "已失效结果不得继续支持答案" in text
-    assert "## 参考方法" not in text
-    assert "坐标系: world" not in text
+    assert "Multiply by 100 to convert meters to centimeters" in text
+    assert "Invalidated results must not support the answer" in text
+    assert "## Reference method" not in text
+    assert "Coordinate frame: world" not in text
+    assert not re.search(r"[\u4e00-\u9fff]", text)
     for stale in (
-        "对象质心距离",
-        "优先 `count_objects`",
+        "object centroid distance",
+        "prefer `count_objects`",
         "relative_direction_of(",
-        "先把所有候选都算出来",
-        "## 题目口径",
+        "first compute all candidates",
+        "## Task-specific recipe",
     ):
         assert stale not in text
 
 
 def test_return_answer_is_a_pending_submission():
     text = PromptBuilder().render(
-        question="题面", scene_summary="", scene_frame="world", tool_docs="")
-    assert "提交暂存答案" in text
-    assert "验收失败时撤销提交" in text
+        question="Question", scene_summary="", scene_frame="world", tool_docs="")
+    assert "submits a provisional answer" in text
+    assert "A rejected submission is revoked" in text
+
+
+def test_question_and_option_data_remain_verbatim():
+    question = "这把椅子距离桌子多远？"
+    options = ["A. 左侧", "B. 右侧"]
+    text = PromptBuilder().render(
+        question=question, options=options, scene_summary="", scene_frame="world",
+        tool_docs="", question_type="object_rel_direction")
+    assert question in text
+    assert all(option in text for option in options)
+    instructions = text.replace(question, "")
+    for option in options:
+        instructions = instructions.replace(option, "")
+    assert not re.search(r"[\u4e00-\u9fff]", instructions)

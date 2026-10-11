@@ -35,7 +35,7 @@ def test_reject_eval_exec():
 def test_reject_unregistered_function():
     r = ast_guard("result = my_custom_hack(1, 2)\nReturnAnswer(result)")
     assert not r.ok
-    assert any("REGISTRY 外" in v for v in r.violations)
+    assert any("outside REGISTRY" in v for v in r.violations)
 
 
 def test_reject_file_write_methods():

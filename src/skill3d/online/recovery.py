@@ -157,7 +157,7 @@ def summarize_payload(payload: object, *, tool: str = "", max_chars: int = 1200)
             out = []
             for index, item in enumerate(value):
                 if len(_json(out + [item])) > budget:
-                    omitted.append(f"{path}[{index}:]（{len(value) - index} 项）")
+                    omitted.append(f"{path}[{index}:] ({len(value) - index} items)")
                     break
                 out.append(item)
             if out:
@@ -167,13 +167,13 @@ def summarize_payload(payload: object, *, tool: str = "", max_chars: int = 1200)
 
     clean = ordered(payload)
     reduced = fit(clean, max_chars)
-    text = _json(reduced) if reduced is not None or payload is None else "（内容超出摘要预算）"
+    text = _json(reduced) if reduced is not None or payload is None else "(content exceeds summary budget)"
     if omitted:
         shown = list(dict.fromkeys(omitted))
-        text += "\n  摘要省略：" + "、".join(shown[:8])
+        text += "\n  Summary omissions: " + ", ".join(shown[:8])
         if len(shown) > 8:
-            text += f" 等共 {len(shown)} 处"
-        text += "；省略不表示空值，不能据此假定候选或记录完整。"
+            text += f" ({len(shown)} omissions in total)"
+        text += "; omission does not mean an empty value or complete candidate/record coverage."
     return text
 
 
@@ -205,17 +205,17 @@ def observation_feedback(observations: list[ValidatedObservation]) -> str:
             [obs.source_tool, obs.evidence_version, obs.args, obs.payload,
              obs.degraded_evidence], ensure_ascii=False, sort_keys=True, default=str)
         groups.setdefault(key, []).append(obs)
-    lines = ["仍然可信的既有观测（未撤销的成功调用；不等于业务结论可判定）："]
+    lines = ["Still-valid observations (successful, non-invalidated calls; task conclusions may remain indeterminate):"]
     if not groups:
-        lines.append("当前没有任何可信的既有观测；可继续获取观察或依据原图判断。")
+        lines.append("No valid prior observations are available; obtain further observations or reason from original images.")
     for group in groups.values():
         lines.append(group[0].summary())
         aliases = list(dict.fromkeys(o.result_id for o in group[1:]
                                     if o.result_id != group[0].result_id))
         if aliases:
-            lines.append(f"  相同观察另有 result_ids={_json(aliases)}；内容仅显示一次。")
-    lines.append("payload.status、缺失项、歧义与降级标记仍须检查；"
-                 "未检出不证明不存在，None/不可测不等于零。")
+            lines.append(f"  Identical observations also have result_ids={_json(aliases)}; content is shown once.")
+    lines.append("Check payload.status, missing items, ambiguity, and degradation flags. "
+                 "No detection does not prove absence; None/unmeasurable does not mean zero.")
     return "\n".join(lines)
 
 
@@ -226,9 +226,9 @@ def failed_call_feedback(results) -> str:
         if result.status == "ok" and result.error is None:
             continue
         lines.append(
-            f"失败调用：{result.source_tool or result.tool}({_json(result.args)})"
+            f"Failed call: {result.source_tool or result.tool}({_json(result.args)})"
             f" [result_id={result.result_id}] error_code={result.error_code}"
-            f"；原因={result.error}")
+            f"; reason={result.error}")
     return "\n".join(lines)
 
 
@@ -381,28 +381,28 @@ def build_feedback(plan: RecoveryPlan, *, question_type: str,
                    include_observations: bool = True) -> str:
     """恢复用的回灌文本（§14.1 第 5 条）：失败信息 + validated observations 摘要。"""
     lines = [
-        f"失败 Tool：{plan.failed_tool}（{plan.failure_kind}）",
+        f"Failed tool: {plan.failed_tool} ({plan.failure_kind})",
     ]
     if plan.premise:
         lines.append(
-            f"根因：共享前提 `{plan.premise}` 失效 → 已级联撤销依赖它的既有结果"
-            f"（撤销 {len(plan.invalidated_result_ids)} 条："
-            f"{plan.invalidated_result_ids[:6]}）；相应证据能力已降级 "
+            f"Cause: shared premise `{plan.premise}` is invalid. Dependent results were "
+            f"cascade-invalidated ({len(plan.invalidated_result_ids)} results: "
+            f"{plan.invalidated_result_ids[:6]}); corresponding evidence capabilities were downgraded: "
             f"{plan.downgraded_capabilities}")
-        lines.append("**不要**再使用上面被撤销的数值。")
+        lines.append("Do not reuse the invalidated values above.")
     else:
-        lines.append("根因：该 Tool 的局部错误（域值/参数），共享证据仍然有效。")
+        lines.append("Cause: a local tool error (domain value/arguments); shared evidence remains valid.")
     if include_observations:
         lines.append(observation_feedback(plan.validated))
     ending = (
-        "请使用仍有效的观察或原图给出最佳答案；视觉估计如实标记为 visual_estimate，"
-        "不要提交 abstain。" if require_answer else
-        "若确实拿不到答案，直接 `ReturnAnswer(\"abstain\")`（主榜按错计，优于编造）。")
-    lines.append(f"当前 question_tool_scope={scope}，本题题型={question_type}。")
+        "Give the best answer using still-valid observations or original images. "
+        "Honestly label a visual estimate as visual_estimate; do not submit abstain." if require_answer else
+        "If no answer can be obtained, use `ReturnAnswer(\"abstain\")` "
+        "(scored as incorrect on the main benchmark; preferable to fabrication).")
+    lines.append(f"Current question_tool_scope={scope}; question type={question_type}.")
     if include_observations:
-        lines.append("只允许调用 prompt 里列出的 Tool；" + ending)
-        lines.append("注意：`ReturnAnswer` 之后**不得**再调用任何 Tool（会抛 "
-                     "AnswerAlreadyGiven）。")
+        lines.append("Call only tools listed in the prompt. " + ending)
+        lines.append("Do not call any tool after `ReturnAnswer` (raises AnswerAlreadyGiven).")
     return "\n".join(lines)
 
 

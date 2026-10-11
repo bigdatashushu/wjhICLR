@@ -258,7 +258,7 @@ def test_failed_request_leaves_images_unobserved_with_reason():
     ledger.mark_round_failed(1, "ServiceUnavailable: refused")
     rec = ledger.get(iid)
     assert rec.delivered_rounds == [1] and rec.observed_rounds == []
-    assert "请求失败" in rec.unobserved_reason
+    assert "Request failed" in rec.unobserved_reason
     assert ledger.rounds[0].delivered is True and ledger.rounds[0].observed is False
 
 

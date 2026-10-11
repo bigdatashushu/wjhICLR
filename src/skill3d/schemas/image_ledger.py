@@ -88,7 +88,7 @@ class ProducedImage(Spec):
     def _needs_content_hash(cls, v: str) -> str:
         if not str(v or "").strip():
             raise ValueError(
-                "图像必须有内容哈希（§9.4：仅路径、ID 或成功标记不能算看过图）")
+                "Images must have a content hash (§9.4: a path, ID, or success flag alone does not prove an image was observed)")
         return v
 
     @field_validator("observed_rounds")
@@ -97,27 +97,27 @@ class ProducedImage(Spec):
         delivered = set(info.data.get("delivered_rounds") or [])
         if not set(v) <= delivered:
             raise ValueError(
-                f"observed_rounds={sorted(v)} 不在 delivered_rounds={sorted(delivered)} 内"
-                "（§9.4：进了请求才可能被观察到）")
+                f"observed_rounds={sorted(v)} is not a subset of delivered_rounds={sorted(delivered)}"
+                " (§9.4: an image can only be observed after entering a request)")
         return v
 
     @field_validator("kind")
     @classmethod
     def _known_kind(cls, v: str) -> str:
         if v not in ("frame", "crop", "contact_sheet"):
-            raise ValueError(f"未知图像种类 {v!r}")
+            raise ValueError(f"Unknown image kind {v!r}")
         return v
 
     def model_post_init(self, __context) -> None:  # noqa: D105 - pydantic v2 hook
         if self.kind in ("crop", "contact_sheet"):
             if self.source_frame_id is None or not self.box_xyxy:
                 raise ValueError(
-                    f"派生图（{self.kind}）必须记录源帧与像素范围（§9.4）")
+                    f"Derived images ({self.kind}) must record the source frame and pixel bounds (§9.4)")
         for hw in (self.source_hw, self.sent_hw):
             if hw and (len(hw) != 2 or min(int(x) for x in hw) <= 0):
-                raise ValueError(f"尺寸 {hw!r} 非法（应为正的 [H, W]）")
+                raise ValueError(f"Invalid dimensions {hw!r}; expected positive [H, W]")
         if self.box_xyxy and len(self.box_xyxy) != 4:
-            raise ValueError(f"box_xyxy 必须是 [x0, y0, x1, y1]，收到 {self.box_xyxy!r}")
+            raise ValueError(f"box_xyxy must be [x0, y0, x1, y1]; got {self.box_xyxy!r}")
 
     def observed(self) -> bool:
         """是否已被模型实际看到（收到响应才算）。"""
@@ -147,15 +147,15 @@ class ImageRound(Spec):
     @classmethod
     def _known_layout(cls, v: str) -> str:
         if v not in IMAGE_LAYOUTS:
-            raise ValueError(f"未知图像布局 {v!r}；已声明布局={list(IMAGE_LAYOUTS)}")
+            raise ValueError(f"Unknown image layout {v!r}; declared layouts={list(IMAGE_LAYOUTS)}")
         return v
 
     def model_post_init(self, __context) -> None:  # noqa: D105
         if self.observed and not self.delivered:
-            raise ValueError("observed=True 但 delivered=False（§9.4：没进请求就不算看到）")
+            raise ValueError("observed=True but delivered=False (§9.4: images outside a request cannot count as observed)")
         if self.n_images and self.n_images != len(self.image_ids):
             raise ValueError(
-                f"n_images={self.n_images} 与 image_ids={len(self.image_ids)} 不一致")
+                f"n_images={self.n_images} does not match image_ids={len(self.image_ids)}")
 
 
 __all__ = [

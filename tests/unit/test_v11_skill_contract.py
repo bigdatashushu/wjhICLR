@@ -334,7 +334,7 @@ def test_v11_static_limit_rejects_complete_source(tmp_path):
 
 def test_v11_runtime_never_silently_drops_an_oversized_active_skill(tmp_path):
     source = _install_s03(tmp_path)
-    with pytest.raises(ValueError, match="必须压缩候选"):
+    with pytest.raises(ValueError, match="shorten the candidate"):
         plan_delivery([source.spec], max_chars=100)
 
 
@@ -394,7 +394,7 @@ def test_retired_ranking_configuration_fails_before_running(field):
 
 
 def test_legacy_payload_cannot_be_rendered_as_current_skill():
-    with pytest.raises(ValueError, match="只接受 SkillSpecV11"):
+    with pytest.raises(ValueError, match="accepts only SkillSpecV11"):
         render_skill_entry({"skill_id": "old", "call_graph_template": "old body"})
 
 

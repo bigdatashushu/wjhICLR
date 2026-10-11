@@ -48,7 +48,7 @@ MAX_DERIVED_SIDE = 640
 def _clamp_box(box: Sequence[float], h: int, w: int) -> tuple[int, int, int, int]:
     """裁剪框裁到帧内并取整（越界框不得静默变成空图）。"""
     if len(box) != 4:
-        raise ValueError(f"box 必须是 [x0, y0, x1, y1]，收到 {list(box)!r}")
+        raise ValueError(f"box must be [x0, y0, x1, y1]; got {list(box)!r}")
     x0, y0, x1, y1 = (float(v) for v in box)
     xa, xb = sorted((x0, x1))
     ya, yb = sorted((y0, y1))
@@ -58,7 +58,7 @@ def _clamp_box(box: Sequence[float], h: int, w: int) -> tuple[int, int, int, int
     yb = int(max(0, min(round(yb), h - 1)))
     if xb - xa < MIN_CROP_SIDE or yb - ya < MIN_CROP_SIDE:
         raise ValueError(
-            f"裁剪框太小或越界：{[xa, ya, xb, yb]}（要求每边 ≥ {MIN_CROP_SIDE} 像素）")
+            f"Crop box is too small or out of bounds: {[xa, ya, xb, yb]} (each side must be >= {MIN_CROP_SIDE} pixels)")
     return xa, ya, xb, yb
 
 
@@ -117,17 +117,17 @@ def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
 
     ids = [int(x) for x in (frame_ids or [])]
     if not ids:
-        raise DomainValueError("inspect_frames", "需要至少一个 frame_id（帧槽位序号）",
+        raise DomainValueError("inspect_frames", "At least one frame_id (frame slot index) is required",
                                args={"frame_ids": list(frame_ids or [])})
     if boxes is not None and len(boxes) not in (0, len(ids)):
         raise DomainValueError(
             "inspect_frames",
-            f"boxes 数量（{len(boxes)}）必须与 frame_ids（{len(ids)}）一致，"
-            "或整体不传（返回整帧）",
+            f"The number of boxes ({len(boxes)}) must match frame_ids ({len(ids)}); "
+            "omit boxes entirely to return full frames",
             args={"frame_ids": ids, "n_boxes": len(boxes)})
     if len(ids) > MAX_BOXES_PER_CALL * 4:
         raise DomainValueError(
-            "inspect_frames", f"单次最多查看 {MAX_BOXES_PER_CALL * 4} 帧，收到 {len(ids)}",
+            "inspect_frames", f"At most {MAX_BOXES_PER_CALL * 4} frames per call; got {len(ids)}",
             args={"frame_ids": ids})
 
     ledger = handle._ledger  # noqa: SLF001 - 框架侧访问（模型撞下划线禁令）
@@ -139,8 +139,8 @@ def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
             # 越界帧号 = 参数错误（交给恢复层回灌），不是"没有图片"
             raise DomainValueError(
                 "inspect_frames",
-                f"帧槽位 {fid} 不在本 episode 的冻结帧集里"
-                f"（可用槽位 0..{len(ledger.frame_ids) - 1}）",
+                f"Frame slot {fid} is not in this episode's frozen frame set"
+                f" (available slots: 0..{len(ledger.frame_ids) - 1})",
                 args={"frame_ids": ids}) from None
         src_h, src_w = int(frame.shape[0]), int(frame.shape[1])
         box = boxes[k] if (boxes and len(boxes) == len(ids)) else None
@@ -156,12 +156,12 @@ def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
                 x0, y0, x1, y1 = _clamp_box(box, src_h, src_w)
             except ValueError as exc:
                 raise DomainValueError(
-                    "inspect_frames", f"frame={fid} 的裁剪框非法：{exc}",
+                    "inspect_frames", f"Invalid crop box for frame={fid}: {exc}",
                     args={"frame_id": fid, "box": list(box)}) from None
             sub = np.asarray(frame)[y0:y1, x0:x1]
             if sub.size == 0:
                 raise DomainValueError(
-                    "inspect_frames", f"裁剪结果为空：frame={fid} box={[x0, y0, x1, y1]}",
+                    "inspect_frames", f"Crop result is empty: frame={fid} box={[x0, y0, x1, y1]}",
                     args={"frame_id": fid, "box": [x0, y0, x1, y1]})
             crop, scale = _resize_for_model(sub)
             rec = ledger.produce(
@@ -184,9 +184,9 @@ def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
         "images": out_images,
         "n_images": len(out_images),
         "frame_ids": ids,
-        "note": ("这些图已产出（produced）。把它们连同其它结果交给 "
-                 "`return YieldObservations([...], '理由')` 让出，下一轮模型请求会"
-                 "**真的带上这些图**（受服务图像上限约束，未交付的图会保持 unobserved）"),
+        "note": ("These images have been produced. Yield them along with other results using "
+                 "`return YieldObservations([...], 'reason')`. The next model request will "
+                 "include their actual pixels, subject to the service image limit; undelivered images remain unobserved."),
     }
 
 
@@ -234,11 +234,11 @@ def detect_objects(handle: SceneHandle, frame_ids: Sequence[int],
     cats = [str(c).strip() for c in (categories or []) if str(c).strip()]
     if not ids:
         raise DomainValueError("detect_objects",
-                               "需要至少一个 frame_id（帧槽位序号）",
+                               "At least one frame_id (frame slot index) is required",
                                args={"frame_ids": list(frame_ids or [])})
     if not cats:
         raise DomainValueError("detect_objects",
-                               "需要至少一个类别名（categories）",
+                               "At least one category name (categories) is required",
                                args={"categories": list(categories or [])})
 
     ledger = handle._ledger  # noqa: SLF001 - 框架侧访问
@@ -252,8 +252,8 @@ def detect_objects(handle: SceneHandle, frame_ids: Sequence[int],
         except KeyError:
             raise DomainValueError(
                 "detect_objects",
-                f"帧槽位 {fid} 不在本 episode 的冻结帧集里"
-                f"（可用槽位 0..{len(ledger.frame_ids) - 1}）",
+                f"Frame slot {fid} is not in this episode's frozen frame set"
+                f" (available slots: 0..{len(ledger.frame_ids) - 1})",
                 args={"frame_ids": ids}) from None
         dets = ovd.detect(np.asarray(frame), prompt)
         if not dets and getattr(ovd.detect, "last_error", ""):
@@ -304,8 +304,8 @@ def detect_objects(handle: SceneHandle, frame_ids: Sequence[int],
         "error": "; ".join(errors)[:400],
         "detector_endpoint_hash": hashlib.sha256(
             str(ovd.detector_endpoint()).encode()).hexdigest()[:12],
-        "note": ("detections 为实际检出；status='fault' 表示检测服务不可用（不是空检出）；"
-                 "新检出已并入本 episode 对象记录（框架侧完成，agent 不直接改状态）"),
+        "note": ("detections contains actual detections; status='fault' means the detection service is unavailable, not an empty detection. "
+                 "New detections have been merged into this episode's object records by the framework; the agent does not modify state directly."),
     }
 
 

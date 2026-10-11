@@ -68,7 +68,7 @@ def test_centroid_direction_metadata_requires_evidence_and_real_values(evidence,
 
 @pytest.fixture
 def turn_angle():
-    text = (LIBRARY / "versions/S08/1.2.0/infer-route-turns/SKILL.md").read_text()
+    text = (LIBRARY / "versions/S08/1.3.0/infer-route-turns/SKILL.md").read_text()
     code = re.search(r"```python\n(.*?)```", text, re.S).group(1)
     check = ast_guard(code + "\nReturnAnswer(1)\n", allowed_tools=set())
     assert check.ok, check.violations
@@ -118,14 +118,14 @@ def test_control_examples_run_in_real_kernel():
     assert kernel.answer_slot.payload.basis == "visual_estimate"
     assert kernel.answer_slot.answer == "2"
 
-    request = 'return YieldObservations([result["result_id"]], "理由")'
+    request = 'return YieldObservations([result["result_id"]], "reason")'
     kernel = RestrictedNamespaceKernel(REGISTRY, handle)
     cell = kernel.run_cell('result = count_objects("chair")\n' + request)
     assert cell.error is None
     assert cell.yielded_result_ids == [kernel.tool_results[-1].result_id]
     assert '"count": 1' in _yield_feedback(cell, kernel, scene, OnlineRunConfig())
 
-    request_all = 'return YieldObservations([], "理由")'
+    request_all = 'return YieldObservations([], "reason")'
     kernel = RestrictedNamespaceKernel(REGISTRY, handle)
     cell = kernel.run_cell('records = list_objects("chair")\n'
                            'distance = euclidean_distance([0,0,0], [3,4,0])\n'
@@ -136,7 +136,7 @@ def test_control_examples_run_in_real_kernel():
     kernel.tool_results[0].invalidated_by = "test-revocation"
     feedback = _yield_feedback(cell, kernel, scene, OnlineRunConfig())
     assert all(result.result_id in feedback for result in kernel.tool_results)
-    assert "已被级联撤销" in feedback
+    assert "was cascade-invalidated" in feedback
 
 
 def test_neutral_docs_cover_current_tools_without_old_recipes():
@@ -147,7 +147,8 @@ def test_neutral_docs_cover_current_tools_without_old_recipes():
         assert stale not in text
     assert "candidate_categories" in text
     assert "centroid_normalized" in text and "world_up_used" in text
-    assert "不保证已排序或去重" in text
+    assert "Sorting and deduplication are not guaranteed" in text.replace("\n", " ")
+    assert not re.search(r"[\u4e00-\u9fff]", text)
     text = PromptBuilder().render(
         question="test", scene_summary="", scene_frame="world", tool_docs=text,
         scope="full_3d", question_type="object_rel_distance")

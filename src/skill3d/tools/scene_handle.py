@@ -323,7 +323,7 @@ class SceneHandle:
             return name_or_id
         key = normalize(name_or_id)
         if not key:
-            raise KeyError("对象名称不能为空")
+            raise KeyError("Object name must not be empty")
         exact = [oid for oid in self.list_objects()
                  if normalize(self._objects[oid].category_name) == key]
         cands = exact or self.list_objects_by_name(name_or_id)
@@ -332,10 +332,10 @@ class SceneHandle:
         if cands:
             raise DomainValueError(
                 "resolve_object_id",
-                f"ambiguous_object: {name_or_id!r} 对应多个实例 {cands}；"
-                "请用 list_objects 查看可见帧，确认后传入明确 obj_id",
+                f"ambiguous_object: {name_or_id!r} matches multiple instances {cands}; "
+                "use list_objects to inspect visible frames, confirm the instance, then pass an explicit obj_id",
                 args={"name": name_or_id, "candidate_object_ids": cands})
-        raise KeyError(f"对象不存在: {name_or_id}")
+        raise KeyError(f"Object does not exist: {name_or_id}")
 
     def get_object(self, name_or_id: str) -> ObjectRecord:
         return self._objects[self.resolve_object_id(name_or_id)]
@@ -413,10 +413,10 @@ class SceneHandle:
         """
         up = self.world_up
         if up is None:
-            raise KeyError("世界系约定缺失（world_up=None）→ 无法在正确平面上建连通图")
+            raise KeyError("World frame contract missing (world_up=None); cannot build connectivity on the correct plane")
         pm = self.get_point_map()
         if pm is None or pm.size == 0:
-            raise KeyError("未注入世界系点图，无法构建连通性图")
+            raise KeyError("No world point map was provided; cannot build the connectivity graph")
         from skill3d.tools.connectivity import build_connectivity_graph
 
         return build_connectivity_graph(
@@ -440,7 +440,7 @@ class SceneHandle:
     def camera_center(self, frame_idx: int = 0) -> np.ndarray:
         """相机中心（世界系）。主相机 = 首帧（世界系原点，c2w[0]=I）。"""
         if self._c2w is None:
-            raise KeyError("SceneHandle 未注入 c2w_list（重建产物缺失）")
+            raise KeyError("SceneHandle has no c2w_list (missing reconstruction artifact)")
         return np.asarray(self._c2w[frame_idx][:3, 3], dtype=np.float64)
 
     def exists(self, name_or_id: str) -> bool:
@@ -452,12 +452,12 @@ class SceneHandle:
     # ---- 相机参数 ----
     def get_c2w(self, frame_idx: int) -> np.ndarray:
         if self._c2w is None:
-            raise KeyError("SceneHandle 未注入 c2w_list（重建产物缺失）")
+            raise KeyError("SceneHandle has no c2w_list (missing reconstruction artifact)")
         return self._c2w[frame_idx]
 
     def get_intrinsics(self, frame_idx: int) -> np.ndarray:
         if self._k is None:
-            raise KeyError("SceneHandle 未注入 intrinsics（重建产物缺失）")
+            raise KeyError("SceneHandle has no intrinsics (missing reconstruction artifact)")
         return self._k[frame_idx] if self._k.ndim == 3 else self._k
 
     def get_point_map(self) -> Optional[np.ndarray]:
@@ -472,11 +472,11 @@ class SceneHandle:
     def scene_bbox(self) -> tuple[np.ndarray, np.ndarray]:
         """由所有对象 bbox（[min_x,min_y,min_z,max_x,max_y,max_z]）求并集。"""
         if not self._objects:
-            raise ValueError("场景中无对象，无法求包围盒")
+            raise ValueError("The scene has no objects; cannot compute a bounding box")
         mins, maxs = [], []
         for o in self._objects.values():
             if len(o.bbox) != 6:
-                raise ValueError(f"对象 {o.obj_id} bbox 维度异常: {o.bbox}")
+                raise ValueError(f"Object {o.obj_id} has an invalid bbox shape: {o.bbox}")
             mins.append(np.asarray(o.bbox[:3], dtype=np.float64))
             maxs.append(np.asarray(o.bbox[3:], dtype=np.float64))
         return np.minimum.reduce(mins), np.maximum.reduce(maxs)

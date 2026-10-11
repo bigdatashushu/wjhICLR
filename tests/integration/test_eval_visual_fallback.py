@@ -78,8 +78,8 @@ def test_failure_gets_exactly_one_clean_visual_answer(source, tmp_path, split):
     assert len(content) == 33
     assert content[1:] == client.calls[0][0][0]["content"][1:]
     text = content[0]["text"]
-    for forbidden in ("ReturnAnswer", "AnswerPayload", "参考方法", "场景", "M11", "12.5",
-                      "euclidean_distance", "上一轮"):
+    for forbidden in ("ReturnAnswer", "AnswerPayload", "Reference method", "Scene summary", "M11", "12.5",
+                      "euclidean_distance", "previous round"):
         assert forbidden not in text
     assert source[0].episode.question in text
     assert all(params["seed"] == 7 for _, _, params in client.calls)
@@ -111,7 +111,7 @@ def test_crop_from_failed_solver_never_enters_visual_request(source, tmp_path):
     assert out.final_state == "answer"
     # Original solver's finalization still receives the yielded crop.
     assert len(client.calls[1][0]) == 3
-    assert "裁剪图" in client.calls[1][0][0]["content"][0]["text"]
+    assert "crop_box" in client.calls[1][0][0]["content"][0]["text"]
     assert client.calls[-1][0][0]["content"][1:] == client.calls[0][0][0]["content"][1:]
     assert out.eval_visual_fallback["image_round"]["derived_image_ids"] == []
 

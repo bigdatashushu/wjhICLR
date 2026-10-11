@@ -39,7 +39,7 @@ def _ground_basis(up: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     e1 = np.cross(u, seed)
     n1 = float(np.linalg.norm(e1))
     if n1 < 1e-12:  # pragma: no cover - u 与所有坐标轴都平行时不可能
-        raise ValueError("无法由 world_up 构造地面基（退化向量）")
+        raise ValueError("Cannot construct a ground basis from world_up (degenerate vector)")
     e1 = e1 / n1
     e2 = np.cross(u, e1)
     return e1, e2 / float(np.linalg.norm(e2))
@@ -67,7 +67,7 @@ def build_connectivity_graph(
     finite = np.all(np.isfinite(pts), axis=1)
     pts = pts[finite]
     if pts.shape[0] < 3:
-        raise ValueError("点云有效点不足，无法构建连通性图")
+        raise ValueError("Too few valid points to build the connectivity graph")
 
     e1, e2 = _ground_basis(up)
     # 场景尺度：用点云在三个主轴上的跨度中位数（对离群点稳健）
@@ -75,7 +75,7 @@ def build_connectivity_graph(
     if not np.isfinite(span) or span <= 0:
         span = float(np.max(np.ptp(pts, axis=0)))
     if not np.isfinite(span) or span <= 0:
-        raise ValueError("点云跨度为 0，无法估计场景尺度")
+        raise ValueError("Point cloud span is zero; cannot estimate scene scale")
 
     xy = np.stack([pts @ e1, pts @ e2], axis=1)
     h = pts @ np.asarray(up, dtype=np.float64) / float(
@@ -166,13 +166,13 @@ def build_connectivity_graph(
                 edges.append({"a": node_ids[i], "b": node_ids[j], "cost": d})
 
     notes = [
-        f"连通性图 v{CONNECTIVITY_VERSION}：{n} 节点 / {len(edges)} 可达边；"
-        f"自由连通域 {int(n_comp)} 个；栅格 {nx}×{ny}，cell={cell:.4g}（场景尺度 {span:.4g}）；"
-        f"障碍膨胀 r={r_cells} 格；阈值全 TODO_CALIBRATE",
+        f"Connectivity graph v{CONNECTIVITY_VERSION}: {n} nodes / {len(edges)} reachable edges; "
+        f"{int(n_comp)} free-space components; grid {nx}x{ny}, cell={cell:.4g} (scene scale {span:.4g}); "
+        f"obstacle dilation r={r_cells} cells; all thresholds TODO_CALIBRATE",
     ]
     if n_comp > 1:
-        notes.append(f"[warn] 自由空间被切成 {int(n_comp)} 个连通域 —— "
-                     "可能真有隔断，也可能是阈值过严（TODO_CALIBRATE）")
+        notes.append(f"[warn] Free space is split into {int(n_comp)} connected components; "
+                     "this may reflect real partitions or overly strict thresholds (TODO_CALIBRATE)")
 
     return {
         "nodes": node_ids,

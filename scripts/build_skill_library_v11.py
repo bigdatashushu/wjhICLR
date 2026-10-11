@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build or check the complete eight-task v11 format-migration snapshot."""
+"""Build or check complete eight-task v11 snapshots, defaulting to English."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from skill3d.skills.v11_library import (
 
 DEFAULT_SNAPSHOT_ID = "S0-v11-format-migration"
 REPAIR_SNAPSHOT_ID = "S0-v11-contract-repair"
+ENGLISH_SNAPSHOT_ID = "S0-v11-english"
 SKILL_SOURCES = (
     ("S01", "object_counting", "count-scene-objects"),
     ("S02", "object_abs_distance", "estimate-object-distance"),
@@ -37,17 +38,25 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library-root", default="skill_library")
     parser.add_argument("--snapshot-id")
-    parser.add_argument("--profile", choices=["format-migration", "contract-repair"],
-                        default="format-migration")
+    parser.add_argument("--profile", choices=["format-migration", "contract-repair", "english"],
+                        default="english")
     parser.add_argument("--activate", action="store_true")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 
     root = Path(args.library_root)
     repair = args.profile == "contract-repair"
-    snapshot_id = args.snapshot_id or (REPAIR_SNAPSHOT_ID if repair else DEFAULT_SNAPSHOT_ID)
-    versions = {sid: "1.2.0" if repair and sid in ("S01", "S08") else "1.1.0"
-                for sid, _, _ in SKILL_SOURCES}
+    english = args.profile == "english"
+    snapshot_id = args.snapshot_id or (
+        ENGLISH_SNAPSHOT_ID if english else REPAIR_SNAPSHOT_ID if repair else DEFAULT_SNAPSHOT_ID)
+    parent_versions = (
+        {sid: f"{sid}@{'1.2.0' if sid in ('S01', 'S08') else '1.1.0'}"
+         for sid, _, _ in SKILL_SOURCES} if english else
+        {"S01": "S01@1.1.0", "S08": "S08@1.1.0"} if repair else None)
+    versions = {
+        sid: ("1.3.0" if sid in ("S01", "S08") else "1.2.0") if english
+        else "1.2.0" if repair and sid in ("S01", "S08") else "1.1.0"
+        for sid, _, _ in SKILL_SOURCES}
     sources = [
         load_skill_source_v11(
             root,
@@ -61,10 +70,11 @@ def main() -> int:
     snapshot, manifest = build_v11_snapshot(
         sources,
         snapshot_id=snapshot_id,
-        parent_snapshot_id=DEFAULT_SNAPSHOT_ID if repair else "S0-seed-20260925-v1",
+        parent_snapshot_id=(REPAIR_SNAPSHOT_ID if english else
+                            DEFAULT_SNAPSHOT_ID if repair else "S0-seed-20260925-v1"),
         generation=0,
-        created_by="contract_repair" if repair else "format_migration",
-        parent_versions={"S01": "S01@1.1.0", "S08": "S08@1.1.0"} if repair else None,
+        created_by="english_translation" if english else "contract_repair" if repair else "format_migration",
+        parent_versions=parent_versions,
     )
     snapshot_path = root / "snapshots" / f"snapshot_{snapshot_id}.json"
     manifest_path = root / snapshot["manifest_ref"]

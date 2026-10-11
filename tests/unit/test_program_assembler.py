@@ -117,19 +117,19 @@ def test_prompt_states_control_interfaces_terminate_and_ban_abstain():
         available_artifacts=["frames", "objects"])
     # 两个控制接口都必须出现，ReturnAnswer 是待验收提交。
     assert "YieldObservations" in text
-    assert "提交暂存答案" in text
+    assert "submits a provisional answer" in text
     # v7 D1：不得拒答 —— prompt 里不能再出现"abstain 是合法答案"这类指引
-    assert "不是合法答案" in text
-    assert "有图必答" in text
+    assert "is not a valid answer" in text
+    assert "Answer whenever readable images are available" in text
     # 公共合同只保留题义，不写具体工具调用策略。
-    assert "参照对象" in text
+    assert "reference" in text
     # v7 §10.2：两种入口写法都必须被明确支持（模型常只 `def solve` 不调用，
     # host 会代调用 —— prompt 必须写清这一点，否则模型会以为要自己调用）
     assert "def solve(ctx)" in text
-    assert "host 会自动调用" in text
+    assert "host automatically calls" in text
     # 头部与摘要同源（§5.3）：scope 由调用方传入并透传
     assert f"question_tool_scope={SCOPE_FULL_3D}" in text
-    assert PROMPT_TEMPLATE_VERSION == "program_synth_v11_4"
+    assert PROMPT_TEMPLATE_VERSION == "program_synth_v11_5_en"
 
 
 def test_prompt_header_carries_scope_evidence_and_metric_gate():
@@ -161,7 +161,7 @@ def test_prompt_header_carries_scope_evidence_and_metric_gate():
         available_artifacts=["frames", "objects"], evidence_profile=profile,
         gate_passed=False, gate_missing=["scale_self_consistency_ok"])
     assert "question_tool_scope=full_3d" in text
-    assert "米制证据门未通过" in text
+    assert "metric evidence gate did not pass" in text
     assert "scale_self_consistency_ok" in text          # 缺失子条件必须点名（§13.3）
     assert "metric_scale:unavailable" in text           # 证据画像逐项写清
     assert "abstain" in text                            # 拿不到就 abstain，不许编造

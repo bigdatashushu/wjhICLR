@@ -114,7 +114,7 @@ def test_service_limit_check_rejects_oversized_single_candidate():
     cap = len(render_skill_entry(small)) + 10
     assert check_service_limit(small, max_chars=cap) == []
     problems = check_service_limit(big, max_chars=cap)
-    assert problems and "服务限制" in problems[0]
+    assert problems and "service limit" in problems[0]
 
 
 # --------------------------------------------------------- §13.5 策略冻结 ----

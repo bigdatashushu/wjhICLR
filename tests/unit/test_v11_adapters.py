@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from skill3d.evaluation.skill_ablation_v11 import quality_contract
 from skill3d.evolution import adapters_v11 as adapters
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.schemas import SkillCandidateV11, SkillSpecV11
+from skill3d.skills.delivery import check_service_limit
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (
@@ -20,7 +22,7 @@ SOURCE = (
     / "skill_library"
     / "versions"
     / "S03"
-    / "1.1.0"
+    / "1.2.0"
     / "rank-object-distances"
     / "SKILL.md"
 ).read_text(encoding="utf-8")
@@ -29,7 +31,7 @@ SOURCE = (
 def _parent() -> SkillSpecV11:
     return SkillSpecV11(
         skill_id="S03",
-        version="1.1.0",
+        version="1.2.0",
         question_type="object_rel_distance",
         skill_md=SOURCE,
     )
@@ -38,18 +40,18 @@ def _parent() -> SkillSpecV11:
 def _candidate() -> SkillCandidateV11:
     spec = SkillSpecV11(
         skill_id="S03",
-        version="1.2.0",
+        version="1.3.0",
         question_type="object_rel_distance",
         skill_md=SOURCE.replace(
-            "重点核查会改变前两名的错误绑定",
-            "优先核查会改变前两名的错误绑定",
+            "Focus on incorrect bindings",
+            "Prioritize checking incorrect bindings",
             1,
         ),
     )
     return SkillCandidateV11(
         candidate_id="cand-s03-test",
         parent_snapshot_id="snapshot-parent",
-        parent_skill_version="S03@1.1.0",
+        parent_skill_version="S03@1.2.0",
         full_skill_spec=spec,
         modification_reason="improve ambiguity handling",
         source_run_ref="offline:test",
@@ -102,6 +104,8 @@ class _Experience:
 
 def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_path):
     candidate_md = _candidate().full_skill_spec.skill_md
+    feedback = check_service_limit(_parent(), max_chars=1)
+    assert feedback
     client = _OfflineClient(json.dumps({
         "full_skill_md": candidate_md,
         "modification_reason": "Use a stronger ambiguity check.",
@@ -117,7 +121,7 @@ def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_pa
         parent=_parent(),
         experience=_Experience(),
         attempt=1,
-        static_feedback=[],
+        static_feedback=feedback,
         idempotency_key="campaign-test:revise:1",
     )
 
@@ -131,9 +135,11 @@ def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_pa
     assert "reference_answer" not in audit
     assert str(audit_path) in proposal.source_run_ref
     assert "Current Tool interfaces" in client.calls[0][0][1]["content"]
+    assert not re.search(r"[\u4e00-\u9fff]", json.dumps(client.calls[0][0], ensure_ascii=False))
+    assert all(problem in client.calls[0][0][1]["content"] for problem in feedback)
     repeated = reviser(
         campaign_id="campaign-test", parent=_parent(), experience=_Experience(),
-        attempt=1, static_feedback=[], idempotency_key="campaign-test:revise:1")
+        attempt=1, static_feedback=feedback, idempotency_key="campaign-test:revise:1")
     assert repeated == proposal
     assert len(client.calls) == 1
 
@@ -288,7 +294,7 @@ def test_post_publish_verifier_uses_normal_active_loading(
         idempotency_key="campaign-test:post-publish",
     )
 
-    assert observation.delivered_skill_version == "S03@1.2.0"
+    assert observation.delivered_skill_version == "S03@1.3.0"
     assert observation.learning_event_refs
     assert len(seen) == 1
     assert seen[0].evaluation_binding is None

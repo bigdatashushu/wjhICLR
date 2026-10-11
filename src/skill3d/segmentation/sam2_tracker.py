@@ -48,7 +48,7 @@ from .open_vocab_detector import capture_detector_failures, current_detector_fai
 # v3：v6 §5.6 字段改名（obj_id/category_name/det_conf）+ 新增 track_id /
 #     duplicate_suspect / pointconf_world / grounding_status → 旧缓存是 v5 口径
 #     （无 track，计数无法做 track 共识），必须失效重算。
-_INVENTORY_VERSION = "m5-inventory-6"
+_INVENTORY_VERSION = "m5-inventory-7-en"
 
 # `track_id` 命名空间（v6 §5.6）：不同 pass 的传播序号会重名（都从 0 起），
 # 前缀把它隔开 —— 否则 `count_objects` 的 track 去重会把两条不同对象算成一条。
@@ -56,8 +56,8 @@ TRACK_PREFIX_BASE_LIST = "trk"      # 场景基础清单（scene 级，可缓存
 TRACK_PREFIX_QUESTION = "qtrk"      # 逐题补漏（题级，不复用基础清单的 track）
 # VLM **通用清单**问题（与具体题目无关 → 清单可跨 episode 复用/缓存）
 _GENERIC_INVENTORY_QUESTION = (
-    "请列出这张室内照片里最主要的物体（家具、门窗、家电、常见物品），"
-    "不要只挑与某道题相关的物体。")
+    "List the main objects in this indoor photo (furniture, doors, windows, appliances, and common items). "
+    "Do not restrict the list to objects relevant to a particular question.")
 
 # G-19 档位（本机实测，2026-09-18）：可用权重为 SAM2.1 Hiera-Large 与 Hiera-Base+，
 # **Tiny 未下载**。实测加载峰值显存：Large 0.98 GiB / Base+ 0.44 GiB（权重部分）。
@@ -272,11 +272,12 @@ def box_prompts_from_vlm(frames: Sequence[np.ndarray], question: str, client,
         return [], []
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
     prompt = (
-        f"这是一张室内照片。问题：{question}\n"
-        f"请找出不超过 {max_objects} 个与问题相关的物体，给出名称与包围盒。\n"
-        '严格只输出 JSON 数组：[{"name": "table", "bbox": [x0, y0, x1, y1]}]\n'
-        "**坐标必须用 0-1000 归一化整数**（左上为 (0,0)，右下为 (1000,1000)），"
-        "x0<x1, y0<y1。若图里确实没有相关物体，输出 []。不要解释。"
+        f"This is an indoor photograph. Question: {question}\n"
+        f"Identify at most {max_objects} relevant objects and provide their names and bounding boxes.\n"
+        'Output only a JSON array: [{"name": "table", "bbox": [x0, y0, x1, y1]}]\n'
+        "Coordinates must be normalized integers from 0 to 1000, with top-left (0,0) "
+        "and bottom-right (1000,1000), x0<x1, y0<y1. If no relevant objects are visible, "
+        "output []. Do not explain."
     )
     messages = [{"role": "user", "content": [
         {"type": "text", "text": prompt},
@@ -1258,11 +1259,11 @@ def question_object_names_from_vlm(question: str, client, *,
     if client is None or not str(question).strip():
         return []
     prompt = (
-        f"题目：{question}\n"
-        f"请列出题目里**提到或指向的物体**（用于在室内照片中定位它们），"
-        f"不超过 {max_names} 个，用常见的英文物体名，单数形式（如 telephone、cup、"
-        'trash can）。严格只输出 JSON 数组，例如 ["telephone", "cup", "trash can"]。'
-        "不要解释。"
+        f"Question: {question}\n"
+        "List objects mentioned or referred to in the question, for locating them in indoor images. "
+        f"Include at most {max_names} names, using common English singular object names "
+        '(such as telephone, cup, trash can). Output only a JSON array, '
+        'for example ["telephone", "cup", "trash can"]. Do not explain.'
     )
     try:
         text = client.chat([{"role": "user", "content": prompt}],
@@ -1407,10 +1408,10 @@ def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w
             prompt_list.extend(ovd_prompt)
         # ①-b VLM 框（次选）：仅在检测器没给出任何框时尝试（定位不稳，见模块头）
         if not boxes:
-            ask = ("请在这张室内照片中定位以下物体（能看到几个就报几个，看不到的不要报）："
-                   + "、".join(named)
-                   + '。严格只输出 JSON 数组：[{"name": "物体名", "bbox": [x0,y0,x1,y1]}]，'
-                     "坐标用 0-1000 归一化整数；若一个都看不到，输出 []。不要解释。")
+            ask = ("Locate the following objects in this indoor photo. Report all visible instances and omit objects you cannot see: "
+                   + ", ".join(named)
+                   + '. Output only a JSON array: [{"name": "object name", "bbox": [x0,y0,x1,y1]}], '
+                     "using integer coordinates normalized to 0-1000. If none are visible, output []. Do not explain.")
             for fi in probe:
                 f_hints, f_boxes = box_prompts_from_vlm(frames, ask, vlm_client,
                                                         frame_idx=fi, max_objects=8, seed=seed)

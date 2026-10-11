@@ -260,20 +260,20 @@ def check_metric_task_contract(
     if not qt:
         raise ConfidenceGateError(
             tool,
-            f"Tool {tool} 依赖米制尺度，但当前 episode 尚未分类出题型"
-            "（未知题型不授权米制 Tool）",
+            f"Tool {tool} requires metric scale, but this episode has no classified question type"
+            " (metric tools are not authorized for unknown question types)",
             args=args)
     if qt not in allowed:
         raise ConfidenceGateError(
             tool,
-            f"Tool {tool} 依赖米制尺度，但题型 {qt} 不在本次尺度评估授权的集合内"
-            f"（allowed_metric_tasks={sorted(allowed)}）",
+            f"Tool {tool} requires metric scale, but question type {qt} is not authorized by this scale assessment"
+            f" (allowed_metric_tasks={sorted(allowed)})",
             args=args)
     if qt not in set(supported_metric_tasks):
         raise ConfidenceGateError(
             tool,
-            f"Tool {tool} 不支持题型 {qt}（supported_metric_tasks="
-            f"{sorted(supported_metric_tasks)}）",
+            f"Tool {tool} does not support question type {qt} (supported_metric_tasks="
+            f"{sorted(supported_metric_tasks)})",
             args=args)
 
 
@@ -312,27 +312,27 @@ def check_evidence_contract(
         missing: list[str] = []
         for cap in (getattr(spec, "requires_evidence", None) or []):
             if cap not in CAPABILITIES:
-                missing.append(f"{cap}(未知能力)")
+                missing.append(f"{cap}(unknown capability)")
                 continue
             if profile is None:
-                missing.append(f"{cap}(无证据画像)")
+                missing.append(f"{cap}(no evidence profile)")
                 continue
             state = profile.state(cap)
             tolerates = set(getattr(spec, "tolerates_degraded", None) or [])
             if state == "unavailable":
                 missing.append(f"{cap}(unavailable)")
             elif state == "degraded" and cap not in tolerates:
-                missing.append(f"{cap}(degraded 且不容忍)")
+                missing.append(f"{cap}(degraded and not tolerated)")
         raise ArtifactUnavailableError(
-            tool, missing or ["(证据不足)"], route=route,
+            tool, missing or ["(insufficient evidence)"], route=route,
             available=[], args=args)
     # 米制 Tool 的专项二次校验（§13.2：执行层也校验 gate_passed）
     required = list(getattr(spec, "requires_evidence", None) or [])
     if EVIDENCE_METRIC_SCALE in required and gate_passed is not None and not gate_passed:
         raise ConfidenceGateError(
             tool,
-            f"Tool {tool} 依赖米制尺度，但 MetricEvidenceGate 未通过"
-            "（§13.2 执行期二次校验）",
+            f"Tool {tool} requires metric scale, but MetricEvidenceGate did not pass"
+            " (§13.2 runtime recheck)",
             args=args)
 
 
@@ -373,9 +373,9 @@ class ArtifactUnavailableError(ToolContractError):
     def __init__(self, tool: str, missing: Sequence[str], route: str = "",
                  available: Optional[Iterable[str]] = None,
                  args: Optional[dict] = None) -> None:
-        msg = (f"Tool {tool} 所需产物/证据缺失: {sorted(missing)}；"
-               f"route={route or 'unknown'}，可用产物={sorted(available or [])}"
-               "（硬约束 23：fail-closed，不静默返回 False/0）")
+        msg = (f"Tool {tool} is missing required artifacts/evidence: {sorted(missing)}; "
+               f"route={route or 'unknown'}, available artifacts={sorted(available or [])}"
+               " (hard constraint 23: fail closed; never silently return False/0)")
         super().__init__(tool, msg, args=args, route=route, missing=sorted(missing),
                          available=available)
 
@@ -461,20 +461,20 @@ def authorize_tool_call(
         reasons.append("tool_contract")
         for cap in (getattr(spec, "requires_evidence", None) or []):
             if cap not in CAPABILITIES:
-                missing.append(f"{cap}(未知能力)")
+                missing.append(f"{cap}(unknown capability)")
             elif profile is None:
-                missing.append(f"{cap}(无证据画像)")
+                missing.append(f"{cap}(no evidence profile)")
             elif profile.state(cap) == "unavailable":
                 missing.append(f"{cap}(unavailable)")
             elif profile.state(cap) == "degraded" and cap not in set(
                     getattr(spec, "tolerates_degraded", None) or []):
-                missing.append(f"{cap}(degraded 且不容忍)")
+                missing.append(f"{cap}(degraded and not tolerated)")
 
     need = set(getattr(spec, "requires_artifacts", None) or [])
     absent = sorted(need - set(available_artifacts))
     if absent:
         reasons.append("tool_contract")
-        missing.extend(f"{a}(产物缺失)" for a in absent)
+        missing.extend(f"{a}(artifact missing)" for a in absent)
 
     if metric_required and supported_metric_tasks and allowed_metric_tasks:
         allowed = set(allowed_metric_tasks)

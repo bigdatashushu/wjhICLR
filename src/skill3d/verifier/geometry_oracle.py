@@ -263,12 +263,12 @@ def geometry_verify(
         "inside_bbox", "reprojection", "complete_ranking"), True)
     issues: list[GeometryIssue] = []
     reasons = {
-        "valid_json": "成功工具结果不是有限合法 JSON",
-        "no_negative_distance": "距离、尺寸或面积结果含负值或非法数值",
-        "unit_consistent": "本题无米制授权，但结果包含绝对单位数值",
-        "world_frame": "世界系上方向或手性契约缺失",
-        "inside_bbox": "重投影输入点不在场景包围盒内，或世界系契约缺失",
-        "reprojection": "重投影结果无法通过同一位姿/内参复算",
+        "valid_json": "A successful tool result is not valid finite JSON",
+        "no_negative_distance": "Distance, size, or area results contain negative or invalid numbers",
+        "unit_consistent": "This question has no metric authorization, but the results contain absolute-unit values",
+        "world_frame": "The world up direction or handedness contract is missing",
+        "inside_bbox": "The reprojection input point is outside the scene bounding box, or the world frame contract is missing",
+        "reprojection": "The reprojection result cannot be reproduced using the same pose/intrinsics",
     }
     # 逐结果检查：既能精确撤销，也避免单个错误被多条正确重投影的均值掩盖。
     for result in trace.results:
@@ -301,9 +301,9 @@ def geometry_verify(
     violations = [k for k, v in checks.items() if not v]
     notes = [
         f"metric_evidence_authorized={authorized}"
-        f"（gate_passed={bool(getattr(handle, 'metric_gate_passed', False))} ∧ "
-        f"metric_task_authorized({getattr(handle, 'question_type', '')!r})；"
-        "v5 scale_known 已废止，§20）",
+        f" (gate_passed={bool(getattr(handle, 'metric_gate_passed', False))} and "
+        f"metric_task_authorized({getattr(handle, 'question_type', '')!r}); "
+        "v5 scale_known has been retired, §20)",
         f"world_frame_available={wf_ok}"
         f"（world_up={'set' if handle.world_up is not None else 'missing'}，"
         f"handedness={handle.handedness}）",

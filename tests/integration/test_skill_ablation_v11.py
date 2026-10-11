@@ -132,8 +132,8 @@ def test_real_runner_seed_skill_geometry_and_recomputed_summary(panel, tmp_path)
     assert pair["comparable"] is True
     off, on = (pair["arms"][arm] for arm in ab.ARMS)
     assert off["delivered_content_sha256"] == {}
-    assert on["delivered_skill_versions"] == ["S03@1.1.0"]
-    body = (root / "skills/S03/1.1.0/SKILL.md").read_text()
+    assert on["delivered_skill_versions"] == ["S03@1.2.0"]
+    body = (root / "skills/S03/1.2.0/SKILL.md").read_text()
     assert body in clients[("B11", item.episode.qa_id)].calls[0][0][0]["content"][0]["text"]
     assert off["initial_tree_sha256"] == on["initial_tree_sha256"]
     assert off["first_common_request_sha256"] == on["first_common_request_sha256"]
@@ -511,11 +511,11 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_4"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_5_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
         "solver-v11.4-eval-visual-fallback")
-    assert manifest["common_config"]["tool_docs_version"] == "tool-docs-v11.2"
-    assert manifest["snapshot"]["snapshot_id"] == "S0-v11-contract-repair"
+    assert manifest["common_config"]["tool_docs_version"] == "tool-docs-v11.3-en"
+    assert manifest["snapshot"]["snapshot_id"] == "S0-v11-english"
 
 
 @pytest.mark.parametrize("damage", ["missing_qa", "duplicate_qa", "frame_hash", "source",

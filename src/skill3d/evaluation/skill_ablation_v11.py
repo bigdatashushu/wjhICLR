@@ -45,7 +45,7 @@ from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
 
-SNAPSHOT_ID = "S0-v11-contract-repair"
+SNAPSHOT_ID = "S0-v11-english"
 DEFAULT_LIBRARY = Path(__file__).resolve().parents[3] / "skill_library"
 ARMS = ("B01", "B11")
 ARTIFACT_REFS = (
@@ -377,7 +377,7 @@ class _RecordingClient:
                 # Match the longest full body first so the parent prefix cannot
                 # be counted as delivery or left behind in the common prompt.
                 for spec in sorted(self.specs, key=lambda s: len(s.skill_md), reverse=True):
-                    block = "\n## 参考方法\n" + spec.skill_md
+                    block = "\n## Reference method\n" + spec.skill_md
                     if block in text:
                         key = f"{spec.skill_id}@{spec.version}"
                         delivered[key] = spec.content_sha256

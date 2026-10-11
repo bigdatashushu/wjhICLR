@@ -58,7 +58,7 @@ def render_skill_entry(skill: Any) -> str:
     from skill3d.schemas.skill import SkillSpecV11
 
     if not isinstance(skill, SkillSpecV11):
-        raise ValueError("当前交付只接受 SkillSpecV11")
+        raise ValueError("Current delivery accepts only SkillSpecV11")
     return skill.skill_md
 
 
@@ -159,7 +159,7 @@ def plan_delivery(skills: Optional[Sequence[Any]], *,
     """
     limit = int(DEFAULT_METHOD_CONTEXT_MAX_CHARS if max_chars is None else max_chars)
     if limit <= 0:
-        raise ValueError(f"method_context_max_chars 必须为正整数，收到 {limit!r}")
+        raise ValueError(f"method_context_max_chars must be a positive integer; got {limit!r}")
     plan = SkillDeliveryPlan(max_chars=limit)
     used = 0
     for skill in (skills or []):
@@ -168,8 +168,8 @@ def plan_delivery(skills: Optional[Sequence[Any]], *,
         sep = 1 if plan.entries else 0        # 条目间的换行分隔符也算进预算
         if used + sep + n > limit:
             raise ValueError(
-                f"v11 Skill {skill_version_key(skill)} 完整正文 {n} 字符超过"
-                f"方法上下文上限 {limit}；必须压缩候选，不能运行时丢弃")
+                f"v11 Skill {skill_version_key(skill)} has a complete body of {n} characters, exceeding "
+                f"the method context limit {limit}; shorten the candidate instead of dropping it at runtime")
         used += sep + n
         plan.entries.append(DeliveredSkill(
             skill_version=skill_version_key(skill),
@@ -193,8 +193,8 @@ def check_service_limit(skill: Any, *, max_chars: int) -> list[str]:
     """
     n = skill_body_length(skill)
     if int(max_chars) > 0 and n > int(max_chars):
-        return [f"方法正文 {n} 字符 > 服务限制 {int(max_chars)} 字符"
-                f"（§13.5：超过服务限制的候选在静态检查中拒绝或修订）"]
+        return [f"Method body {n} characters > service limit {int(max_chars)} characters"
+                f" (§13.5: reject or revise candidates exceeding service limits during static validation)"]
     return []
 
 

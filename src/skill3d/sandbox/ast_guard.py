@@ -172,7 +172,7 @@ class _WhiteListVisitor(ast.NodeVisitor):
         for a in node.names:
             root = a.name.split(".")[0]
             if a.name not in NUMERICAL_EXPORTS:
-                self.violations.append(f"禁止 import 模块: {a.name}")
+                self.violations.append(f"Module import is forbidden: {a.name}")
             self._check_target(ast.Name(id=a.asname or root))
             self.imported_names.add((a.asname or root).split(".")[0])
         self.generic_visit(node)
@@ -180,26 +180,26 @@ class _WhiteListVisitor(ast.NodeVisitor):
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         module = node.module or ""
         if node.level or module not in NUMERICAL_EXPORTS:
-            self.violations.append(f"禁止 from-import 模块: {node.module}")
+            self.violations.append(f"Module from-import is forbidden: {node.module}")
         for a in node.names:
             if (a.name not in NUMERICAL_EXPORTS.get(module, ())
                     and f"{module}.{a.name}" not in NUMERICAL_EXPORTS):
-                self.violations.append(f"禁止导入非计算接口: {module}.{a.name}")
+                self.violations.append(f"Importing non-numerical interfaces is forbidden: {module}.{a.name}")
             self._check_target(ast.Name(id=a.asname or a.name))
             self.imported_names.add(a.asname or a.name)
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
         if node.id.startswith("__") and node.id != "__episode_entry__":
-            self.violations.append(f"禁止访问内部名称: {node.id}")
+            self.violations.append(f"Access to internal names is forbidden: {node.id}")
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self.violations.append("生成程序不得定义类")
+        self.violations.append("Generated programs must not define classes")
         self.generic_visit(node)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         if node.type is None:
-            self.violations.append("禁止裸 except 吞掉控制终结或超时信号")
+            self.violations.append("Bare except must not swallow control termination or timeout signals")
         self.generic_visit(node)
 
     # ---- 函数调用白名单 ----
@@ -208,7 +208,7 @@ class _WhiteListVisitor(ast.NodeVisitor):
         if isinstance(func, ast.Name):
             name = func.id
             if name in FORBIDDEN_CALLS:
-                self.violations.append(f"禁止调用危险函数: {name}")
+                self.violations.append(f"Calling unsafe functions is forbidden: {name}")
             elif name in self.allowed_tools:
                 self.tool_calls.append(name)
             elif name in CONTROL_INTERFACE_NAMES:
@@ -223,23 +223,23 @@ class _WhiteListVisitor(ast.NodeVisitor):
             elif name in SAFE_BUILTINS or name in self.local_defs or name in self.imported_names:
                 pass
             else:
-                self.violations.append(f"REGISTRY 外未定义函数调用: {name}")
+                self.violations.append(f"Undefined function call outside REGISTRY: {name}")
         elif isinstance(func, ast.Attribute):
             path = _attribute_path(func)
             scene_attr = _scene_attribute(path)
             tool_name = _tool_attribute(path)
             if scene_attr is not None:
                 self.violations.append(
-                    "禁止调用 scene/ctx.scene 接口；几何、尺度和对象数据只能经 REGISTRY Tool")
+                    "Calling scene/ctx.scene interfaces is forbidden; access geometry, scale, and object data only through REGISTRY tools")
             elif func.attr.startswith("_"):
-                self.violations.append(f"禁止访问下划线属性: {func.attr}")
+                self.violations.append(f"Access to underscore attributes is forbidden: {func.attr}")
             elif func.attr in FORBIDDEN_ATTRS:
-                self.violations.append(f"禁止调用危险方法: .{func.attr}")
+                self.violations.append(f"Calling unsafe methods is forbidden: .{func.attr}")
             elif tool_name is not None:
                 if tool_name in self.allowed_tools:
                     self.tool_calls.append(tool_name)
                 else:
-                    self.violations.append(f"tools 命名空间内未知 Tool: {tool_name}")
+                    self.violations.append(f"Unknown tool in the tools namespace: {tool_name}")
         self.generic_visit(node)
 
     # ---- 属性访问（非调用）----
@@ -249,25 +249,25 @@ class _WhiteListVisitor(ast.NodeVisitor):
         if scene_attr is not None and scene_attr and (
                 len(scene_attr) != 1 or scene_attr[0] not in SAFE_SCENE_ATTRS):
             self.violations.append(
-                f"禁止访问 scene 属性: {'.'.join(path)}；只允许 {sorted(SAFE_SCENE_ATTRS)}")
+                f"Access to scene attribute is forbidden: {'.'.join(path)}; only {sorted(SAFE_SCENE_ATTRS)} are allowed")
         elif node.attr.startswith("_"):
-            self.violations.append(f"禁止访问下划线属性: {node.attr}")
+            self.violations.append(f"Access to underscore attributes is forbidden: {node.attr}")
         elif node.attr in FORBIDDEN_ATTRS:
-            self.violations.append(f"禁止访问危险属性: {node.attr}")
+            self.violations.append(f"Access to unsafe attributes is forbidden: {node.attr}")
         self.generic_visit(node)
 
     # ---- 保留名重赋值 ----
     def _check_target(self, target: ast.expr) -> None:
         if isinstance(target, ast.Name) and (
                 target.id in RESERVED_NAMES or target.id in self.allowed_tools):
-            self.violations.append(f"禁止重赋值保留名: {target.id}")
+            self.violations.append(f"Reassigning reserved names is forbidden: {target.id}")
         elif isinstance(target, ast.Attribute) and \
                 _scene_attribute(_attribute_path(target)) is not None:
-            self.violations.append("禁止修改 scene/ctx.scene 只读题级状态")
+            self.violations.append("Modifying read-only question state in scene/ctx.scene is forbidden")
         elif isinstance(target, ast.Attribute) and (
                 _attribute_path(target)[:1]
                 and _attribute_path(target)[0] in RESERVED_NAMES):
-            self.violations.append("禁止修改框架接口或上下文")
+            self.violations.append("Modifying framework interfaces or context is forbidden")
         elif isinstance(target, (ast.Tuple, ast.List)):
             for elt in target.elts:
                 self._check_target(elt)
@@ -287,7 +287,7 @@ class _WhiteListVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         if node.name in RESERVED_NAMES:
-            self.violations.append(f"禁止定义与保留名同名的函数: {node.name}")
+            self.violations.append(f"Defining a function with a reserved name is forbidden: {node.name}")
         self.local_defs.add(node.name)
         self._visit_block(node)
 
@@ -358,7 +358,7 @@ def ast_guard(
     try:
         tree = ast.parse(program)
     except SyntaxError as exc:
-        return ASTCheckResult(ok=False, violations=[f"语法错误: {exc}"], allowed_tool_calls=[])
+        return ASTCheckResult(ok=False, violations=[f"Syntax error: {exc}"], allowed_tool_calls=[])
 
     # 先收集全部 local def，再正式检查（允许先定义后调用之外的任意顺序）
     collector = _WhiteListVisitor(tools)
@@ -367,7 +367,7 @@ def ast_guard(
             collector.local_defs.add(node.name)
     collector.visit(tree)
 
-    violations = collector.violations + [f"正则二次扫描命中: {p}" for p in regex_hits]
+    violations = collector.violations + [f"Secondary regex scan matched: {p}" for p in regex_hits]
     return ASTCheckResult(
         ok=not violations,
         violations=violations,

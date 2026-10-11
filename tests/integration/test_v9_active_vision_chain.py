@@ -111,9 +111,9 @@ def test_crop_reaches_the_next_request_with_an_explicit_layout(fixture_episode, 
     second = client.calls[1]
     assert _n_images(second) <= cfg.max_images
     text = _prompt_text(second)
-    assert "本轮图像清单" in text
+    assert "Images for this round" in text
     assert crop["image_id"] in text                      # 明确映射：图 ↔ 源帧/框
-    assert "裁剪图" in text
+    assert "[Crop]" in text
     rnd = next(r for r in ledger["rounds"] if r["round_index"] == 2)
     assert rnd["layout"] == "derived_plus_originals_v1"
     assert crop["image_id"] in rnd["derived_image_ids"]

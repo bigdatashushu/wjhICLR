@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ from skill3d.skills.delivery import (
 )
 from skill3d.skills.v11_library import load_skill_source_v11, validate_v11_snapshot
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
+from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.trace.store import TraceStore
 from skill3d.verifier.geometry_oracle import GeometryIssue, GeometryVerifyResult
 
@@ -30,7 +32,7 @@ from test_tool_contract_recovery import (  # noqa: E402 - 同目录测试夹具
 
 ROOT = Path(__file__).resolve().parents[2]
 LIBRARY = ROOT / "skill_library"
-S03_REF = "versions/S03/1.1.0/rank-object-distances/SKILL.md"
+S03_REF = "versions/S03/1.2.0/rank-object-distances/SKILL.md"
 FRAME_SIZE = (120, 160)
 
 
@@ -67,21 +69,21 @@ def test_v11_complete_source_is_the_only_planned_model_text():
         LIBRARY,
         source_ref=S03_REF,
         skill_id="S03",
-        version="1.1.0",
+        version="1.2.0",
         question_type="object_rel_distance",
     )
     plan = plan_delivery([source.spec], max_chars=8000)
     plan.mark_delivered()
 
-    assert plan.delivered_skill_versions == ["S03@1.1.0"]
+    assert plan.delivered_skill_versions == ["S03@1.2.0"]
     assert plan.delivered_content_sha256 == {
-        "S03@1.1.0": skill_content_sha256(source.spec)}
+        "S03@1.2.0": skill_content_sha256(source.spec)}
     assert render_skill_entry(source.spec) == source.spec.skill_md
     assert len(plan.entries) == 1
     assert plan.entries[0].text == source.spec.skill_md
     assert plan.entries[0].chars == len(source.spec.skill_md)
     assert "categories_without_detection" in plan.entries[0].text
-    assert "### S03@1.1.0 (task_type=" not in plan.entries[0].text
+    assert "### S03@1.2.0 (task_type=" not in plan.entries[0].text
 
 
 def test_v11_complete_source_reaches_runner_model_request_once():
@@ -95,7 +97,7 @@ def test_v11_complete_source_reaches_runner_model_request_once():
         LIBRARY,
         source_ref=S03_REF,
         skill_id="S03",
-        version="1.1.0",
+        version="1.2.0",
         question_type="object_rel_distance",
     )
     client = _FakeClient(['ReturnAnswer("A")\n'])
@@ -119,19 +121,19 @@ def test_v11_complete_source_reaches_runner_model_request_once():
     assert result.program is not None, result.note
     sent = _prompt_text(client.calls[0])
     assert sent.count(source.spec.skill_md) == 1
-    assert "### S03@1.1.0 (task_type=" not in sent
-    assert result.delivery.delivered_skill_versions == ["S03@1.1.0"]
+    assert "### S03@1.2.0 (task_type=" not in sent
+    assert result.delivery.delivered_skill_versions == ["S03@1.2.0"]
     assert result.delivery.delivered_content_sha256 == {
-        "S03@1.1.0": hashlib.sha256(
+        "S03@1.2.0": hashlib.sha256(
             source.spec.skill_md.encode("utf-8")
         ).hexdigest()
     }
-    assert result.program.skill_semver_used == ["S03@1.1.0"]
+    assert result.program.skill_semver_used == ["S03@1.2.0"]
 
 
 def _v11_specs():
     snapshot = json.loads(
-        (LIBRARY / "snapshots/snapshot_S0-v11-contract-repair.json").read_text())
+        (LIBRARY / "snapshots/snapshot_S0-v11-english.json").read_text())
     return validate_v11_snapshot(snapshot, library_root=LIBRARY)
 
 
@@ -160,11 +162,12 @@ def test_skill_on_off_requests_only_differ_by_complete_method(spec, evidence_ava
             cfg=cfg, llm=client, pixels=list(item.pixels))
         assert result.program is not None, result.note
         assert client.request_params == [{"max_tokens": cfg.max_tokens, "seed": 7}]
-        assert f"本题题型: {spec.question_type}" in _prompt_text(client.calls[0])
+        assert f"Question type: {spec.question_type}" in _prompt_text(client.calls[0])
+        assert not re.search(r"[\u4e00-\u9fff]", _prompt_text(client.calls[0]))
         sent.append(client.calls[0])
         results.append(result)
     off_text, on_text = (_prompt_text(messages) for messages in sent)
-    assert on_text == off_text + "\n## 参考方法\n" + spec.skill_md
+    assert on_text == off_text + "\n## Reference method\n" + spec.skill_md
     assert on_text.count(spec.skill_md) == 1
     # Images, roles and all other message parts must also be the same.
     assert sent[0][0]["role"] == sent[1][0]["role"]
@@ -199,9 +202,9 @@ def room_source_and_artifact(tmp_path_factory):
     ("", 4, "error_recovery"),
     ("import os\nReturnAnswer(1)\n", 4, "ast_feedback"),
     ("euclidean_distance([0.0, 0.0], 1.0)\nReturnAnswer(1)\n", 4, "error_recovery"),
-    ('img = inspect_frames([0])\nreturn YieldObservations([img], "查看图像")\n',
+    ('img = inspect_frames([0])\nreturn YieldObservations([img], "inspect images")\n',
      4, "observation"),
-    ('img = inspect_frames([0])\nreturn YieldObservations([img], "查看图像")\n',
+    ('img = inspect_frames([0])\nreturn YieldObservations([img], "inspect images")\n',
      2, "finalize"),
 ])
 def test_v11_contract_survives_solver_rounds_and_reaches_trace(
@@ -221,29 +224,30 @@ def test_v11_contract_survives_solver_rounds_and_reaches_trace(
     for messages in client.calls:
         # Prior programs and feedback can follow this first text part.
         text = messages[0]["content"][0]["text"]
-        assert "## 公共执行规则" in text
+        assert "## Shared execution rules" in text
         assert "## 题目口径" not in text
         assert text.count(spec.skill_md) == 1
+        assert not re.search(r"[\u4e00-\u9fff]", _prompt_text(messages))
     assert all(p["seed"] == 7 for p in client.request_params)
     if expected_trigger == "ast_feedback":
-        assert "上一次生成被 AST 拒绝" in _prompt_text(client.calls[1])
+        assert "The previous program was rejected by the AST check" in _prompt_text(client.calls[1])
     elif expected_trigger == "finalize":
         assert out.finalization_used
     else:
         assert any(r.get("trigger") == expected_trigger for r in out.rounds), out.rounds
     feedback = out.rounds[1]["feedback"]
-    assert feedback.count("仍然可信的既有观测") == 1
-    assert feedback.count("本轮行动要求") == 1
-    assert feedback.index("剩余模型请求上限") < feedback.index("本轮行动要求")
-    assert feedback.endswith("ReturnAnswer 之后不得再调用工具。")
+    assert feedback.count("Still-valid observations") == 1
+    assert feedback.count("Required action this round") == 1
+    assert feedback.index("Remaining model request limit") < feedback.index("Required action this round")
+    assert feedback.endswith("Do not call tools after ReturnAnswer.")
     if expected_trigger == "finalize":
         assert "unit='m2', basis='visual_estimate', used_result_ids=[], derivation=None" in feedback
     assert out.first_synthesis["template_version"] == PROMPT_TEMPLATE_VERSION
-    assert out.first_synthesis["tool_docs_version"] == "tool-docs-v11.2"
+    assert out.first_synthesis["tool_docs_version"] == TOOL_DOCS_VERSION
     rows = (tmp_path / "traces/trace_record.jsonl").read_text().splitlines()
     assert len(rows) == 1
     assert json.loads(rows[0])["template_version"] == PROMPT_TEMPLATE_VERSION
-    assert json.loads(rows[0])["tool_docs_version"] == "tool-docs-v11.2"
+    assert json.loads(rows[0])["tool_docs_version"] == TOOL_DOCS_VERSION
     program_row = json.loads(
         (tmp_path / "traces/episode_program.jsonl").read_text().splitlines()[0]
     )
@@ -277,6 +281,8 @@ def _run_m11_case(room_source_and_artifact, tmp_path, monkeypatch, programs, ver
         max_solver_rounds=max_rounds, max_retries_per_operation=retries,
         finalization_rounds=1)
     out = run_episode(item.episode, item.pixels, cfg, llm=client)
+    for messages in client.calls:
+        assert not re.search(r"[\u4e00-\u9fff]", _prompt_text(messages))
     return out, client
 
 
@@ -312,12 +318,12 @@ def test_m11_rejects_first_answer_revokes_local_result_and_scores_correction(
     assert first["invalidated_result_ids"]
     assert first["invalidated_result_ids"] == out.invalidated_result_ids
     second_text = _prompt_text(client.calls[1])
-    assert "M11 拒绝上一轮提交" in second_text
+    assert "M11 rejected the previous submission" in second_text
     assert second_text.count("synthetic local violation") == 1
     assert first["invalidated_result_ids"][0] not in first["recovery_observation_ids"]
     feedback = out.rounds[1]["feedback"]
-    assert feedback.count("仍然可信的既有观测") == 1
-    assert feedback.index("定位事实") < feedback.index("已撤销结果") < feedback.index("本轮行动要求")
+    assert feedback.count("Still-valid observations") == 1
+    assert feedback.index("Located facts") < feedback.index("Invalidated results") < feedback.index("Required action this round")
 
 
 def test_m11_confirmed_shared_premise_cascades_and_visual_close_is_clean(
@@ -404,7 +410,7 @@ def test_m11_replays_derivation_without_invalidating_a_valid_tool_result(
     assert {issue["code"] for issue in replay["issues"]} == {"value_mismatch"}
     assert first["invalidated_result_ids"] == []
     assert first["recovery_observation_ids"], "正确 ToolResult 应保留给修正轮"
-    assert "derivation 重算值" in _prompt_text(client.calls[1])
+    assert "derivation recomputed value" in _prompt_text(client.calls[1])
 
 
 def test_m11_accepts_a_matching_replayed_derivation(

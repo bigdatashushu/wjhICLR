@@ -138,7 +138,7 @@ class ToolRegistry:
 
     def get(self, name: str) -> _RegisteredTool:
         if name not in self._tools:
-            raise ToolNotFoundError(f"未注册 Tool: {name}")
+            raise ToolNotFoundError(f"Unregistered tool: {name}")
         return self._tools[name]
 
     def __contains__(self, name: str) -> bool:
@@ -210,10 +210,10 @@ class ToolRegistry:
             t = self._tools[name]
             sig = inspect.signature(t.fn)
             params = [str(p) for p in list(sig.parameters.values())[1:]]
-            needs = ", ".join(t.spec.requires_artifacts) or "无"
-            ev = ", ".join(t.spec.requires_evidence or []) or "无"
+            needs = ", ".join(t.spec.requires_artifacts) or "none"
+            ev = ", ".join(t.spec.requires_evidence or []) or "none"
             lines.append(f"- {name}({', '.join(params)}): {DESCRIPTIONS[name]}"
-                         f" [requires_artifacts: {needs}；requires_evidence: {ev}]")
+                         f" [requires_artifacts: {needs}; requires_evidence: {ev}]")
         return "\n".join(lines)
 
     def docs_header(self, scope: str, available: Iterable[str],
@@ -237,22 +237,22 @@ class ToolRegistry:
         修正：只对**米制题型**报米制门状态；非米制题明确写"本题不需要米制尺度"，
         不让模型把"gate 对本题不适用"误读成"证据不足"。
         """
-        avail = ", ".join(sorted(available)) or "（无）"
+        avail = ", ".join(sorted(available)) or "(none)"
         metric_q = str(question_type or "") in set(METRIC_TASK_TYPES)
         if not metric_q:
-            metric_line = f"本题题型={question_type or '未分类'}；米制证据门不适用。"
+            metric_line = f"Question type={question_type or 'unclassified'}; metric evidence gate is not applicable."
         elif gate_passed:
-            metric_line = f"本题题型={question_type}；米制证据门已通过。"
+            metric_line = f"Question type={question_type}; metric evidence gate passed."
         else:
-            metric_line = (f"本题题型={question_type}；米制证据门未通过；"
-                           f"缺失子条件={sorted(gate_missing or [])}。")
-        evidence = ("证据画像=" + ", ".join(
-            f"{c}:{evidence_profile.state(c)}" for c in CAPABILITIES) + "。\n"
+            metric_line = (f"Question type={question_type}; metric evidence gate did not pass; "
+                           f"missing subconditions={sorted(gate_missing or [])}.")
+        evidence = ("Evidence profile=" + ", ".join(
+            f"{c}:{evidence_profile.state(c)}" for c in CAPABILITIES) + ".\n"
             if evidence_profile is not None else "")
-        return (f"当前 question_tool_scope={scope}；可用重建产物={avail}。\n"
-                f"{evidence}{metric_line}\n工具文档版本={TOOL_DOCS_VERSION}。"
-                "以下工具已按 scope、证据与实际产物筛选；"
-                "对象绑定、参数及具体数值有效性在调用时检查。")
+        return (f"Current question_tool_scope={scope}; available reconstruction artifacts={avail}.\n"
+                f"{evidence}{metric_line}\nTool documentation version={TOOL_DOCS_VERSION}. "
+                "The tools below are filtered by scope, evidence, and loaded artifacts. "
+                "Object bindings, arguments, and actual numerical validity are checked at call time.")
 
     # ---- 参数校验 ----
     @staticmethod
@@ -266,9 +266,9 @@ class ToolRegistry:
         missing = required - set(args)
         unknown = set(args) - allowed
         if missing:
-            raise ToolArgValidationError(f"Tool {spec_name} 缺参数: {sorted(missing)}")
+            raise ToolArgValidationError(f"Tool {spec_name} missing arguments: {sorted(missing)}")
         if unknown:
-            raise ToolArgValidationError(f"Tool {spec_name} 未知参数: {sorted(unknown)}")
+            raise ToolArgValidationError(f"Tool {spec_name} unknown arguments: {sorted(unknown)}")
 
     # ---- 统一调用（§4 M6 伪代码）----
     def call_tool(
@@ -323,8 +323,8 @@ class ToolRegistry:
             missing = sorted(set(entry.spec.requires_artifacts) - set(available))
             raise ToolContractError(
                 name,
-                f"Tool {name} 不在当前 question_tool_scope={scope} 的允许集合内"
-                "（§5.3：逐题只收窄；米制 Tool 需 metric_enabled）",
+                f"Tool {name} is not allowed in the current question_tool_scope={scope}"
+                " (§5.3: question-level scope can only narrow access; metric tools require metric_enabled)",
                 args=args, route=scene.scene_route,
                 missing=missing, available=available)
 

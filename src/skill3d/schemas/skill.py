@@ -21,9 +21,9 @@ def normalize_skill_markdown(text: str) -> str:
     untouched because the same string is delivered to the model and hashed.
     """
     if not isinstance(text, str):
-        raise TypeError("skill_md 必须是字符串")
+        raise TypeError("skill_md must be a string")
     if "\x00" in text:
-        raise ValueError("skill_md 不允许包含 NUL 字节")
+        raise ValueError("skill_md must not contain NUL bytes")
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     return normalized.rstrip("\n") + "\n"
 
@@ -32,37 +32,37 @@ def parse_skill_markdown(text: str) -> tuple[dict, str]:
     """Parse v11 frontmatter and return ``(metadata, body)`` without rewriting."""
     lines = text.splitlines(keepends=True)
     if not lines or lines[0].rstrip("\n") != "---":
-        raise ValueError("SKILL.md 必须以 YAML frontmatter 开始")
+        raise ValueError("SKILL.md must start with YAML frontmatter")
     end = next(
         (index for index, line in enumerate(lines[1:], start=1)
          if line.rstrip("\n") == "---"),
         None,
     )
     if end is None:
-        raise ValueError("SKILL.md frontmatter 缺少结束标记")
+        raise ValueError("SKILL.md frontmatter is missing its closing delimiter")
     try:
         front = yaml.safe_load("".join(lines[1:end])) or {}
     except yaml.YAMLError as exc:
-        raise ValueError(f"SKILL.md frontmatter 解析失败: {exc}") from exc
+        raise ValueError(f"SKILL.md frontmatter parsing failed: {exc}") from exc
     if not isinstance(front, dict):
-        raise ValueError("SKILL.md frontmatter 必须是 mapping")
+        raise ValueError("SKILL.md frontmatter must be a mapping")
     name = front.get("name")
     description = front.get("description")
     if not isinstance(name, str) or not _V11_NAME_RE.fullmatch(name) or len(name) > 64:
         raise ValueError(
-            "SKILL.md name 必须是不超过 64 字符的小写字母/数字/单连字符名称")
+            "SKILL.md name must use lowercase letters/digits separated by single hyphens and be at most 64 characters")
     if not isinstance(description, str) or not description.strip() \
             or len(description) > 1024:
-        raise ValueError("SKILL.md description 必须是 1-1024 字符的非空字符串")
+        raise ValueError("SKILL.md description must be a nonempty string of 1-1024 characters")
     metadata = front.get("metadata")
     if metadata is not None:
         if not isinstance(metadata, dict) or any(
                 not isinstance(key, str) or not isinstance(value, str)
                 for key, value in metadata.items()):
-            raise ValueError("SKILL.md metadata 的键和值必须都是字符串")
+            raise ValueError("SKILL.md metadata keys and values must all be strings")
     body = "".join(lines[end + 1:])
     if not body.strip():
-        raise ValueError("SKILL.md 正文不能为空")
+        raise ValueError("SKILL.md body must not be empty")
     return front, body
 
 
@@ -79,7 +79,7 @@ class SkillSpecV11(Spec):
     def _safe_skill_id(cls, value: str) -> str:
         value = str(value or "").strip()
         if not _V11_ID_RE.fullmatch(value) or "@" in value:
-            raise ValueError(f"skill_id 不是安全标识符: {value!r}")
+            raise ValueError(f"skill_id is not a safe identifier: {value!r}")
         return value
 
     @field_validator("question_type")
@@ -87,7 +87,7 @@ class SkillSpecV11(Spec):
     def _valid_question_type(cls, value: str) -> str:
         value = str(value or "").strip()
         if not _QUESTION_TYPE_RE.fullmatch(value):
-            raise ValueError(f"question_type 非法: {value!r}")
+            raise ValueError(f"Invalid question_type: {value!r}")
         return value
 
     @field_validator("version")
@@ -95,7 +95,7 @@ class SkillSpecV11(Spec):
     def _valid_version(cls, value: str) -> str:
         value = str(value or "").strip()
         if not _SEMVER_RE.fullmatch(value):
-            raise ValueError(f"非法语义版本: {value!r}")
+            raise ValueError(f"Invalid semantic version: {value!r}")
         return value
 
     @field_validator("skill_md")
@@ -103,7 +103,7 @@ class SkillSpecV11(Spec):
     def _canonical_complete_source(cls, value: str) -> str:
         normalized = normalize_skill_markdown(value)
         if value != normalized:
-            raise ValueError("skill_md 必须使用 LF 且文件末尾恰好一个换行")
+            raise ValueError("skill_md must use LF and end with exactly one newline")
         parse_skill_markdown(value)
         return value
 
@@ -152,24 +152,24 @@ class SkillCandidateV11(Spec):
     def _safe_candidate_id(cls, value: str) -> str:
         value = str(value or "").strip()
         if not _V11_ID_RE.fullmatch(value):
-            raise ValueError(f"candidate_id 不是安全标识符: {value!r}")
+            raise ValueError(f"candidate_id is not a safe identifier: {value!r}")
         return value
 
     def model_post_init(self, __context) -> None:  # noqa: D105
         parent_id, separator, parent_version = self.parent_skill_version.partition("@")
         if not separator or not _SEMVER_RE.fullmatch(parent_version):
             raise ValueError(
-                f"parent_skill_version 必须是 skill_id@version: "
+                f"parent_skill_version must be skill_id@version: "
                 f"{self.parent_skill_version!r}")
         if parent_id != self.full_skill_spec.skill_id:
             raise ValueError(
-                f"候选不得跨谱系: parent={parent_id}, "
+                f"A candidate must stay in its parent lineage: parent={parent_id}, "
                 f"candidate={self.full_skill_spec.skill_id}")
         old = tuple(int(part) for part in parent_version.split("."))
         new = tuple(int(part) for part in self.full_skill_spec.version.split("."))
         if new <= old:
             raise ValueError(
-                f"候选版本 {self.full_skill_spec.version} 必须高于父版本 {parent_version}")
+                f"Candidate version {self.full_skill_spec.version} must exceed parent version {parent_version}")
 
     @property
     def candidate_skill_version(self) -> str:

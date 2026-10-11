@@ -86,30 +86,30 @@ class AnswerPayload(Spec):
         if self.derivation is not None:
             op = self.derivation_op()
             if op not in DERIVATION_OPS:
-                out.append(f"derivation.op={op!r} 不在登记操作 {sorted(DERIVATION_OPS)} 中")
+                out.append(f"derivation.op={op!r} is not among registered operations {sorted(DERIVATION_OPS)}")
             missing_keys = {
                 "op", "input_result_ids", "parameters",
             } - set(self.derivation)
             if missing_keys:
-                out.append(f"derivation 缺少字段 {sorted(missing_keys)}")
+                out.append(f"derivation is missing fields {sorted(missing_keys)}")
             extra = set(self.derivation) - {"op", "input_result_ids", "parameters"}
             if extra:
-                out.append(f"derivation 含未登记键 {sorted(extra)}")
+                out.append(f"derivation contains unregistered keys {sorted(extra)}")
             raw_inputs = self.derivation.get("input_result_ids")
             if not isinstance(raw_inputs, list) or not raw_inputs or not all(
                     isinstance(value, str) and value for value in raw_inputs):
-                out.append("derivation.input_result_ids 必须是非空字符串列表")
+                out.append("derivation.input_result_ids must be a list of nonempty strings")
             if not isinstance(self.derivation.get("parameters"), dict):
-                out.append("derivation.parameters 必须是对象")
+                out.append("derivation.parameters must be an object")
             missing = sorted(set(self.derivation_inputs()) - set(self.used_result_ids))
             if missing:
-                out.append(f"derivation 引用了未在 used_result_ids 声明的结果 {missing}")
+                out.append(f"derivation references results not declared in used_result_ids: {missing}")
         if self.basis == "tool_derived" and self.derivation is None:
-            out.append("basis=tool_derived 但缺少可重放 derivation")
+            out.append("basis=tool_derived requires a replayable derivation")
         if self.basis == "tool_derived" and not self.used_result_ids:
-            out.append("basis=tool_derived 但未声明任何 used_result_ids")
+            out.append("basis=tool_derived requires declared used_result_ids")
         if self.basis == "visual_estimate" and (self.used_result_ids or self.derivation):
-            out.append("basis=visual_estimate 却声明了工具结果/变换")
+            out.append("basis=visual_estimate must not declare tool results or a derivation")
         return out
 
 
@@ -155,13 +155,13 @@ def verify_attribution(payload: AnswerPayload, *, observed_result_ids: list[str]
     verified: list[str] = []
     for rid in declared:
         if rid in invalidated:
-            problems.append(f"声明的 {rid} 已被级联撤销：不得作为有效依据（§14.1）")
+            problems.append(f"Declared result {rid} was invalidated by a cascade and cannot be used as evidence (§14.1)")
             continue
         if rid not in observed:
-            problems.append(f"声明的 {rid} 不在本 episode 工具台账中")
+            problems.append(f"Declared result {rid} is not in this episode's tool ledger")
             continue
         if rid not in succeeded:
-            problems.append(f"声明的 {rid} 状态非 ok")
+            problems.append(f"Declared result {rid} does not have status ok")
             continue
         verified.append(rid)
 
@@ -170,9 +170,9 @@ def verify_attribution(payload: AnswerPayload, *, observed_result_ids: list[str]
     if payload.basis == "tool_derived" and (problems or len(verified) != len(declared)
                                             or not declared):
         verified_basis = "mixed"
-        note = "tool_derived 无法被台账充分证实 → 保守记 mixed（§12）"
+        note = "The ledger cannot fully verify tool_derived; conservatively recorded as mixed (§12)"
     elif payload.basis == "mixed":
-        note = "mixed：工具事实与视觉/语义判断结合，或无法证明完全由工具推导"
+        note = "mixed: tool facts combined with visual/semantic judgment, or a purely tool-derived answer cannot be verified"
 
     ignored = [rid for rid in observed if rid not in set(declared)]
     ledger = AttributionLedger(
@@ -201,15 +201,15 @@ def parse_answer_payload(raw: Any, *, question_type: str = "") -> tuple[AnswerPa
     if isinstance(raw, AnswerPayload):
         return raw, []
     unit = CANONICAL_UNIT_BY_QUESTION_TYPE.get(str(question_type or ""), "")
-    problems = [f"历史短写 ReturnAnswer(value)：经 {ADAPTER_VERSION_LEGACY_SHORT_FORM} "
-                "适配，basis 保守记 mixed"]
+    problems = [f"Legacy shorthand ReturnAnswer(value): adapted via {ADAPTER_VERSION_LEGACY_SHORT_FORM}; "
+                "basis conservatively recorded as mixed"]
     if isinstance(raw, bool):
         # §4 的答案类型只有数值与选项标签，没有布尔。Pydantic 的 `str|int|float`
         # 会把 True 变成 1，因此显式留问题记录，不静默改变语义。
-        problems.append("答案入参是 bool；§4 无布尔答案类型，按整数记并留此记录")
+        problems.append("The answer argument is bool; §4 has no boolean answer type. Recorded as an integer with this audit note")
     if not unit:
         # 未知题型：不猜单位，记为空选项题的最保守取值并保留问题
-        problems.append(f"题型 {question_type!r} 无 §4 单位合同 → unit 无法登记")
+        problems.append(f"Question type {question_type!r} has no §4 unit contract; unit cannot be registered")
         unit = "option"
     return (AnswerPayload(value=raw, unit=unit,  # type: ignore[arg-type]
                           basis="mixed", used_result_ids=[], derivation=None),

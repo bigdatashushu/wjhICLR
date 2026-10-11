@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -442,6 +443,7 @@ def test_v11_campaign_retries_static_failure_with_feedback(tmp_path):
     assert first.passed is False
     assert first.checks["tools_known"] is False
     assert "invented_tool" in " ".join(first.problems)
+    assert not re.search(r"[\u4e00-\u9fff]", " ".join(first.problems))
     assert second.passed is True
     assert _pointer(tmp_path / "library")["snapshot_id"] == original["snapshot_id"]
 

@@ -42,7 +42,7 @@ def test_rank_summary_keeps_incomplete_status_after_large_nested_audit():
     ):
         assert fact in text
     assert len(text) < 1600
-    assert "摘要省略" in text and "audit" in text
+    assert "Summary omissions" in text and "audit" in text
     assert "x" * 100 not in text
     assert payload["candidates"][0]["instances"][0]["audit"]["details"] == "x" * 6000
 
@@ -58,7 +58,7 @@ def test_trimming_is_explicit_and_preserves_parseable_values(payload):
     body, omission = text.split("\n", 1)
     parsed = json.loads(body)
     assert parsed
-    assert "摘要省略" in omission
+    assert "Summary omissions" in omission
     if isinstance(payload, dict):
         assert parsed["status"] == payload["status"]
     if "detections" in payload:
@@ -76,7 +76,7 @@ def test_only_identical_observations_share_a_summary_and_all_ids_remain_real():
     ]
     text = observation_feedback([a, b, *changed])
     assert text.count("payload=") == 4
-    assert '相同观察另有 result_ids=["r2"]' in text
+    assert 'Identical observations also have result_ids=["r2"]' in text
     for obs in [a, *changed]:
         assert f"[result_id={obs.result_id}]" in text
 
@@ -108,8 +108,8 @@ def test_failed_call_reports_actual_runtime_arguments():
 @pytest.mark.parametrize("question_type,unit", CANONICAL_UNIT_BY_QUESTION_TYPE.items())
 def test_finalization_example_runs_with_explicit_visual_payload(question_type, unit):
     text = round_action_instructions(question_type, finalizing=True)
-    line = next(line for line in text.splitlines() if line.startswith("真正完全依据原图时"))
-    code = line.split("：", 1)[1]
+    line = next(line for line in text.splitlines() if line.startswith("For an answer genuinely based entirely on original images"))
+    code = line.split(": ", 1)[1]
     value = "B" if unit == "option" else 2
     code = f"answer = {value!r}\n" + code
     assert ast_guard(code, allowed_tools=set()).ok

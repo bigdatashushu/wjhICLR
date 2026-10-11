@@ -625,19 +625,19 @@ def test_docs_header_does_not_scare_non_metric_tasks():
                                  gate_passed=False, evidence_profile=p,
                                  gate_missing=["question_type_is_metric",
                                                "scale_fusion_success"])
-        assert "米制证据门未通过" not in h, task
-        assert "米制证据门不适用" in h, task
+        assert "metric evidence gate did not pass" not in h, task
+        assert "metric evidence gate is not applicable" in h, task
 
     # 米制题仍然必须明确写清门未通过
     h = REGISTRY.docs_header("full_3d", ["depth", "objects"],
                              question_type="object_abs_distance", gate_passed=False,
                              evidence_profile=p, gate_missing=["scale_fusion_success"])
-    assert "米制证据门未通过" in h and "scale_fusion_success" in h
+    assert "metric evidence gate did not pass" in h and "scale_fusion_success" in h
     # 门通过时也不得再喊"未通过"
     h2 = REGISTRY.docs_header("full_3d", ["depth", "objects"],
                               question_type="object_abs_distance", gate_passed=True,
                               evidence_profile=p)
-    assert "未通过" not in h2 and "已通过" in h2
+    assert "did not pass" not in h2 and "gate passed" in h2
 
 
 def test_tool_descriptions_expose_return_shape():
