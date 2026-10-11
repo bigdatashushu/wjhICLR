@@ -10,7 +10,9 @@ DESCRIPTIONS = {
         "Category filtering matches complete categories after case, separator, number, and synonym "
         "normalization, optionally removing registered appearance prefixes. It does not use substring "
         "or word-intersection matching. obj_id does not encode category. Interfaces requiring a unique "
-        "object raise an ambiguity error for categories with multiple instances."),
+        "object raise an ambiguity error for categories with multiple instances. Records may include "
+        "2D-only candidates without measurable 3D geometry. An empty result does not prove scene-wide "
+        "absence. Do not align these records with detections by list order."),
     "count_objects": (
         "Count instances using the same category rules as list_objects. Group records sharing a "
         "nonempty track_id; each untracked record forms its own group. Merge each group's point clouds, "
@@ -117,5 +119,9 @@ DESCRIPTIONS = {
         "categories, error, detector_endpoint_hash, note. fault means service failure; empty means a "
         "healthy detection run with no detections. Partial frame failures may produce status=ok with "
         "a nonempty error. The framework adds new candidates to this question's inventory; they have "
-        "only 2D boxes/visible frames, without 3D centroids, point clouds, or track identities."),
+        "only 2D boxes/visible frames, without 3D centroids, point clouds, or track identities. "
+        "Detection dictionaries have no obj_id. new_object_ids contains only newly added IDs; "
+        "it can be empty on repeated detection while earlier objects remain registered. Verify "
+        "real identities with list_objects; do not infer a one-to-one mapping from list order. "
+        "A partial result or empty list does not establish complete frame/category coverage."),
 }

@@ -37,6 +37,8 @@ from skill3d.online.config import (
     active_vision_from,
     load_config,
     load_yaml,
+    config_receipt,
+    resolve_runtime,
     retrieval_policy_from,
     sandbox_from,
 )
@@ -90,6 +92,8 @@ def _load_items(
             split,
             limit=decode_limit if decode_limit is not None else limit or None,
             include_input_errors=True,
+            split_cfg=load_yaml(raw["split_config"]),
+            n_frames=raw["frame_sampling"]["n_frames"],
         )
     else:
         split_cfg = load_yaml(raw["split_config"])
@@ -100,6 +104,7 @@ def _load_items(
                 "raw_videos", "data/raw_videos"),
             video_fallback_roots=paths.get("raw_video_fallbacks"),
             cache_dir=paths.get("vsi_bench_meta"),
+            local_meta_path=paths["vsi_bench_meta"],
             question_types=[args.question_type],
             datasets=(
                 [value for value in args.datasets.split(",") if value]
@@ -182,7 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--library-root", default="")
     parser.add_argument("--run-root", default="data/evolution/runs_v11")
     parser.add_argument("--max-revision-attempts", type=int, default=3)
-    parser.add_argument("--vllm-endpoint", action="append", default=[])
+    parser.add_argument("--vllm-endpoint", action="append", default=None)
     parser.add_argument("--vllm-model")
     parser.add_argument("--max-solver-rounds", type=int)
     parser.add_argument("--max-retries-per-operation", type=int)
@@ -205,18 +210,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if not Path(args.config).is_file():
-            raise V11CampaignCliError(f"config not found: {args.config}")
-        raw = load_config(args.config)
+        raw = resolve_runtime(load_config(args.config), seed=args.seed,
+                              endpoints=args.vllm_endpoint, model=args.vllm_model)
         args.question_type = canonical_task(args.question_type)
         if args.inner_limit <= 0 or args.post_limit <= 0:
             raise V11CampaignCliError("inner-limit and post-limit must be positive")
-        args.seed = int(raw["seed"] if args.seed is None else args.seed)
+        args.seed = raw["seed"]
         paths = raw.get("paths", {})
         model = raw.get("vllm", {})
         sandbox = sandbox_from(raw)
         vision = active_vision_from(raw)
-        endpoints = args.vllm_endpoint or list(model.get("endpoints") or [])
+        endpoints = model["endpoints"]
         if not endpoints:
             raise V11CampaignCliError(
                 "no vLLM endpoint; pass at least one --vllm-endpoint")
@@ -291,11 +295,12 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             skills=[],
             vllm_endpoints=endpoints,
-            vllm_model=args.vllm_model or model["model"],
+            vllm_model=model["model"],
             max_images=int(model.get("n_frames", 32)),
             max_pixels=int(model["max_pixels"]),
             max_model_len=int(model["max_model_len"]),
             max_tokens=int(model.get("max_tokens", 4096)),
+            temperature=model["temperature"],
             cell_timeout_s=int(sandbox.cell_timeout_s),
             max_regen=int(sandbox.max_regenerate),
             max_solver_rounds=(
@@ -381,6 +386,9 @@ def main(argv: list[str] | None = None) -> int:
             evaluator=evaluator,
             post_publish_verifier=verifier,
         ).run()
+        receipt_path = Path(args.run_root) / args.campaign_id / "runtime_configuration.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps(config_receipt(raw), ensure_ascii=False, indent=2))
         print(json.dumps(
             checkpoint.model_dump(mode="json"),
             ensure_ascii=False,

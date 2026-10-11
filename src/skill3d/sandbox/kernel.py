@@ -14,8 +14,10 @@ import hashlib
 import inspect
 import io
 import json
+import linecache
 import signal
 import time
+import traceback
 import types
 import uuid
 from dataclasses import dataclass, field
@@ -208,16 +210,27 @@ class CellResult:
     # v7 §11.1：YieldObservations 指定的结果与理由（terminated == "yield" 时有意义）
     yielded_result_ids: list[str] = field(default_factory=list)
     yielded_reason: str = ""
+    # M3: complete local evidence; model feedback keeps its concise summary.
+    stdout: str = ""
+    traceback_text: str = ""
+    error_type: str = ""
+    error_message: str = ""
+    error_line: Optional[int] = None
+    error_source_line: str = ""
+    program_sha256: str = ""
+    source_filename: str = ""
 
 
-def _compile_program(code: str):
+def _compile_program(code: str, filename: str = "<episode_program>"):
     """编译生成程序；对**顶层 `return`** 做函数包装（v7 §10.2）。
 
     与 `ast_guard.normalize_program_source` 共用同一套口径：推荐写法是
     `def solve(ctx): ...`，但模型经常直接写顶层 `return ReturnAnswer(...)` ——
     那在 Python 里是 SyntaxError，会让本来正确的程序整题作废。
     """
-    return compile(normalize_program_source(code), "<episode_program>", "exec")
+    normalized = normalize_program_source(code)
+    linecache.cache[filename] = (len(normalized), None, normalized.splitlines(True), filename)
+    return compile(normalized, filename, "exec")
 
 
 def _denial_receipt(kernel: Any, name: str, call_args: dict,
@@ -605,9 +618,30 @@ class RestrictedNamespaceKernel:
         error: Optional[str] = None
         error_code: Optional[str] = None
         terminated: Optional[str] = None
+        diagnostics = {}
+        program_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        filename = f"<episode_program:{program_sha256}>"
+
+        def capture(exc):
+            frames = traceback.extract_tb(exc.__traceback__)
+            own = [frame for frame in frames if frame.filename == filename]
+            line = getattr(exc, "lineno", None) if isinstance(exc, SyntaxError) else (
+                own[-1].lineno if own else None)
+            normalized = normalize_program_source(code)
+            # The top-level-return adapter adds one wrapper line to executable code.
+            original_line = line - 1 if line and normalized != code else line
+            lines = code.splitlines()
+            diagnostics.update(
+                traceback_text="".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+                error_type=type(exc).__name__, error_message=str(exc),
+                error_line=original_line,
+                error_source_line=(lines[original_line - 1]
+                                   if original_line and 0 < original_line <= len(lines) else ""),
+            )
+
         try:
             with contextlib.redirect_stdout(buf), _Timeout(self.cell_timeout_s):
-                exec(_compile_program(code), self._ns)
+                exec(_compile_program(code, filename), self._ns)
                 if self.answer_slot.given:
                     terminated = "answer"
                 elif self.yield_slot.given:
@@ -618,10 +652,12 @@ class RestrictedNamespaceKernel:
             terminated = "answer"
         except YieldTerminate:
             terminated = "yield"
-        except (_CellTimeout, TimeoutError):
+        except (_CellTimeout, TimeoutError) as exc:
             error, error_code = "Cell execution timed out", "timeout"
-        except SyntaxError:
+            capture(exc)
+        except SyntaxError as exc:
             error, error_code = "Syntax error", "violation_syntax"
+            capture(exc)
         except ToolContractError as exc:
             # 契约违规一律记 tool_contract 桶（§5 FailureTaxonomy 已有该桶）；
             # 具体子类（含 ConfidenceGateError / AnswerAlreadyGiven / 基类
@@ -629,8 +665,10 @@ class RestrictedNamespaceKernel:
             error = f"{type(exc).__name__}: {exc}"
             error_code = "tool_contract"
             self.answer_untrusted = True
+            capture(exc)
         except Exception as exc:
             error, error_code = f"{type(exc).__name__}: {exc}", "violation_runtime"
+            capture(exc)
         new_vars = sorted(set(self._ns.keys()) - before)
         return CellResult(
             stdout_tail=buf.getvalue()[-4096:],
@@ -643,6 +681,8 @@ class RestrictedNamespaceKernel:
             terminated=terminated,
             yielded_result_ids=list(self.yield_slot.result_ids),
             yielded_reason=self.yield_slot.reason,
+            stdout=buf.getvalue(), program_sha256=program_sha256,
+            source_filename=filename, **diagnostics,
         )
 
     # ---- 状态重置（回灌重执行前必须重注入，§4 M6 字段 9）----

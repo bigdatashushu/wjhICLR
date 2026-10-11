@@ -43,11 +43,13 @@ class FrameSet(Spec):
     decode_status: str = "ok"
     readable_frame_ids: list[int] = []
     preprocessing_version: str = ""
+    # M3/M5: optional content identity, independent of the frozen frame-index hash.
+    pixel_sha256: list[str] = []
 
     @model_validator(mode="after")
     def _consistency(self) -> "FrameSet":
         """§5.2：数组字段长度匹配，帧索引唯一且有序；可读帧必须是规划帧的子集。"""
-        if not self.readable_frame_ids:
+        if "readable_frame_ids" not in self.model_fields_set:
             # 未显式给出 = 全部规划帧都可读（当前实现的真实语义）
             object.__setattr__(self, "readable_frame_ids", list(self.frame_ids))
         if len(self.source_frame_indices) != len(self.frame_ids):
@@ -56,6 +58,8 @@ class FrameSet(Spec):
             raise ValueError("FrameSet: timestamps 与 frame_ids 长度不匹配")
         if self.frame_refs and len(self.frame_refs) != len(self.frame_ids):
             raise ValueError("FrameSet: frame_refs 与 frame_ids 长度不匹配")
+        if self.pixel_sha256 and len(self.pixel_sha256) != len(self.readable_frame_ids):
+            raise ValueError("FrameSet: pixel hashes must align with readable frames")
         if len(set(self.frame_ids)) != len(self.frame_ids):
             raise ValueError("FrameSet: frame_ids 必须唯一")
         if sorted(self.frame_ids) != list(self.frame_ids):
@@ -63,6 +67,9 @@ class FrameSet(Spec):
         extra = set(self.readable_frame_ids) - set(self.frame_ids)
         if extra:
             raise ValueError(f"FrameSet: readable_frame_ids 不在 frame_ids 内: {sorted(extra)}")
+        if (len(set(self.readable_frame_ids)) != len(self.readable_frame_ids)
+                or sorted(self.readable_frame_ids) != self.readable_frame_ids):
+            raise ValueError("FrameSet: readable_frame_ids must be unique and ordered")
         return self
 
     def cache_identity(self) -> str:
@@ -78,6 +85,10 @@ class FrameSet(Spec):
         return hashlib.sha256(_json.dumps({
             "dataset_id": self.dataset_id, "video_id": self.video_id,
             "scene_name": self.scene_name, "frame_set_hash": self.frame_set_hash,
+            "source_frame_indices": self.source_frame_indices,
+            "timestamps": self.timestamps, "readable_frame_ids": self.readable_frame_ids,
+            "preprocessing_version": self.preprocessing_version,
+            "pixel_sha256": self.pixel_sha256,
         }, sort_keys=True).encode("utf-8")).hexdigest()
 
 

@@ -34,6 +34,7 @@ def working_repo(tmp_path):
         "scripts/prepare_gpu_run_v11.py", "scripts/run_gpu_experiment_v11.py",
         "src/skill3d/__init__.py", "src/skill3d/infra/__init__.py",
         "src/skill3d/infra/experiment_startup.py", "pyproject.toml",
+        "src/skill3d/online/__init__.py", "src/skill3d/online/config.py",
         "configs/config.yaml", "configs/gpu_experiment_v11.yaml",
         "configs/v11/gpu_experiment_v11.local.yaml", "configs/vsi_bench_split.yaml",
     ]

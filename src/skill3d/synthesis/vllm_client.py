@@ -18,7 +18,9 @@ import urllib.error
 import urllib.request
 from typing import Optional, Sequence
 
+from skill3d.synthesis.program_assembler import streaming_degenerate_reason
 from skill3d.synthesis.request_context import current_request_phase
+
 
 def _normalize_base_url(endpoint: str) -> str:
     """把 endpoint 归一化为 OpenAI 兼容 base_url（保留末尾 /v1，去掉多余斜杠）。"""
@@ -78,6 +80,9 @@ class VLLMClient:
         timeout_s: float = 120.0,
         *,
         check_on_init: bool = False,
+        temperature: float = 0.0,
+        max_output_tokens: int = 4096,
+        program_streaming: bool = True,
     ) -> None:
         from openai import OpenAI
 
@@ -85,6 +90,11 @@ class VLLMClient:
             raise ValueError("endpoints 不能为空")
         # v9 §9.4：最近一次请求的**真实** token 用量（含图像 token）；runner 逐轮落盘
         self.last_usage: dict = {}
+        self.last_generation: dict = {}
+        # A service known not to support streaming retains post-generation checks.
+        self.program_streaming = program_streaming
+        self.temperature = temperature
+        self.max_output_tokens = max_output_tokens
         self._clients = [
             OpenAI(base_url=_normalize_base_url(ep), api_key="EMPTY", timeout=timeout_s)
             for ep in endpoints
@@ -135,30 +145,79 @@ class VLLMClient:
         if current_request_phase() == "eval_visual_fallback":
             client = client.with_options(max_retries=0)
         self.last_usage = {}
+        self.last_generation = {"mode": "nonstream", "stop_reason": "",
+                                "usage_status": "unknown", "server_abort_verified": False}
         kwargs: dict = {"model": self.model, "messages": messages,
-                        "temperature": 0.0, "max_tokens": max_tokens}
+                        "temperature": self.temperature,
+                        # M1: specialized M5 budgets remain bounded by runtime max_tokens.
+                        "max_tokens": min(max_tokens, self.max_output_tokens)}
         if seed is not None:
             kwargs["seed"] = int(seed)
+        streaming = (current_request_phase() == "program"
+                     and getattr(self, "program_streaming", True))
+        if streaming:
+            kwargs.update(stream=True, stream_options={"include_usage": True})
         try:
             resp = client.chat.completions.create(**kwargs)
+            if streaming and not hasattr(resp, "choices"):
+                return self._read_program_stream(resp)
         except Exception as exc:  # noqa: BLE001 - 归族为服务不可用
             name = type(exc).__name__
             if any(k in name for k in ("Connection", "Timeout", "APIStatus",
                                       "InternalServer", "NotFound")):
                 raise ServiceUnavailable(f"{name}: {exc}") from exc
             raise
+        if streaming:
+            self.last_generation["mode"] = "nonstream_response"
+            self.last_generation["streaming_note"] = "Service returned a complete response"
         content = resp.choices[0].message.content
         # v9 §9.4："实际传入图像、缩放和 token 成本完整记录" —— 服务返回的 usage 是
         # **真实** token 数（含图像 token），逐请求留在客户端上供 runner 落盘。
-        try:
-            usage = getattr(resp, "usage", None)
-            self.last_usage = (usage.model_dump() if usage is not None
-                               and hasattr(usage, "model_dump") else dict(usage or {}))
-        except Exception:  # noqa: BLE001 - usage 缺失不得影响作答
-            self.last_usage = {}
+        self._record_usage(getattr(resp, "usage", None))
         if content is None:
             raise RuntimeError("vLLM 返回空 content")
         return content
+
+
+    def _record_usage(self, usage) -> None:
+        if usage is None:
+            return
+        try:
+            self.last_usage = usage.model_dump() if hasattr(usage, "model_dump") else dict(usage)
+            self.last_generation["usage_status"] = "measured" if self.last_usage else "unknown"
+        except (TypeError, ValueError):
+            self.last_usage = {}
+
+    def _read_program_stream(self, stream) -> str:
+        """M4: close this response on proven repetition; never append a request."""
+        self.last_generation["mode"] = "stream"
+        parts = []
+        text = ""
+        try:
+            for chunk in stream:
+                self._record_usage(getattr(chunk, "usage", None))
+                for choice in chunk.choices:
+                    content = getattr(choice.delta, "content", None)
+                    if content:
+                        parts.append(content)
+                        text = "".join(parts)
+                        reason = streaming_degenerate_reason(text)
+                        if reason:
+                            self.last_generation.update(
+                                stop_reason="degenerate_repetition", reason=reason,
+                                received_chars=len(text))
+                            return text
+                    if choice.finish_reason:
+                        self.last_generation["stop_reason"] = choice.finish_reason
+            self.last_generation["received_chars"] = len(text)
+            if not text:
+                raise RuntimeError("vLLM 返回空 content")
+            return text
+        finally:
+            # Closing sends a disconnect. Service-side abortion is verified separately
+            # in GPU acceptance, never inferred from the client's close() alone.
+            stream.close()
+            self.last_generation["stream_closed"] = True
 
 
 def probe_service(endpoint: str, model: str = "") -> dict:

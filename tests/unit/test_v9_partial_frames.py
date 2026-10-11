@@ -158,3 +158,29 @@ def _cfg():
     from skill3d.online.runner import OnlineRunConfig
 
     return OnlineRunConfig(mode="real", max_images=32)
+
+
+def test_original_and_crop_sources_use_physical_numbers():
+    from skill3d.online.runner import _attach_episode_frames
+    from skill3d.schemas import SceneState, VSIBenchEpisode
+    from skill3d.tools.scene_handle import SceneHandle
+    from skill3d.reconstruction.vggt_runner import _frame_identity
+
+    fset = fs.build_frame_set(
+        4, n_frames=4, source_frame_indices=[0, 116, 233, 3604],
+        readable_frame_ids=[0, 2, 3])
+    episode = VSIBenchEpisode(
+        qa_id="partial", scene_name="scene", dataset="scannet",
+        question_type="object_counting", question="q", ground_truth="1",
+        frames=[], options=None, split="induction", frame_set=fset)
+    pixels = [np.full((8, 8, 3), value, dtype=np.uint8) for value in (0, 100, 200)]
+    handle = SceneHandle(SceneState(artifact_ref="fixture", scene_route="fallback_2d_only"))
+    _attach_episode_frames(handle, episode, pixels)
+    assert handle._ledger.source_frame_indices == {0: 0, 1: 233, 2: 3604}
+    crop = handle._ledger.produce(
+        pixels[1][:4, :4], kind="crop", produced_by="inspect_frames", source_frame_id=1,
+        box_xyxy=[0, 0, 4, 4], source_hw=[8, 8])
+    assert crop.source_frame_index == 233
+    ids, sources, stamps, digest = _frame_identity(fset, len(pixels))
+    assert ids == [0, 2, 3] and sources == [0, 233, 3604]
+    assert stamps == [0.0, 2.0, 3.0] and digest == fset.frame_set_hash

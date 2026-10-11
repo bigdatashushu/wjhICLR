@@ -17,7 +17,8 @@ from skill3d.evaluation.skill_ablation_v11 import (
     run_skill_ablation_v11,
 )
 from skill3d.online.config import (
-    active_vision_from, load_config, load_yaml, retrieval_policy_from, sandbox_from,
+    active_vision_from, config_receipt, load_config, load_yaml, resolve_runtime,
+    retrieval_policy_from, sandbox_from,
 )
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.reconstruction.run import resolve_artifact_path
@@ -71,7 +72,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--expected-qa-ids", help="JSON list of preregistered qa_id values")
     parser.add_argument("--library-root", default=str(DEFAULT_LIBRARY))
-    parser.add_argument("--vllm-endpoint", action="append", default=[])
+    parser.add_argument("--vllm-endpoint", action="append", default=None)
     parser.add_argument("--vllm-model")
     parser.add_argument("--max-solver-rounds", type=int)
     parser.add_argument("--max-retries-per-operation", type=int)
@@ -93,10 +94,11 @@ def main(argv=None) -> int:
         parser.error("--output-dir must not already exist")
     sampling, exclusions = {}, []
     try:
-        if not Path(args.config).is_file():
-            raise PairingError(f"config not found: {args.config}")
-        raw = load_config(args.config)
-        seed = int(args.seed if args.seed is not None else raw["seed"])
+        raw = resolve_runtime(load_config(args.config), seed=args.seed,
+                              endpoints=args.vllm_endpoint, model=args.vllm_model,
+                              formal=bool(args.quality_confirmation)
+                              and os.environ.get("SKILL3D_RUN_MODE") != "development")
+        seed = raw["seed"]
         paths = raw.get("paths", {})
         model = raw.get("vllm", {})
         vision, sandbox = active_vision_from(raw), sandbox_from(raw)
@@ -117,6 +119,8 @@ def main(argv=None) -> int:
                 args.split,
                 exclusions=exclusions,
                 include_input_errors=True,
+                split_cfg=load_yaml(raw["split_config"]),
+                n_frames=raw["frame_sampling"]["n_frames"],
             )
             items = [it for it in items if canonical_task(it.episode.question_type) in tasks]
             if args.limit:
@@ -127,6 +131,7 @@ def main(argv=None) -> int:
                 video_root=args.video_root or paths.get("raw_videos", "data/raw_videos"),
                 video_fallback_roots=paths.get("raw_video_fallbacks"),
                 cache_dir=paths.get("vsi_bench_meta"),
+                local_meta_path=paths["vsi_bench_meta"],
                 question_types=tasks, datasets=args.datasets.split(",") if args.datasets else None,
                 n_frames=int(raw.get("frame_sampling", {}).get("n_frames", 32)),
                 seed=seed, sampling_seed=seed, stratified_per_task=args.sampling_per_task,
@@ -136,10 +141,11 @@ def main(argv=None) -> int:
                     else sampling.get("qa_ids"))
         cfg = OnlineRunConfig(
             mode="real", seed=seed, allow_final_test=args.allow_final_test,
-            vllm_endpoints=args.vllm_endpoint or model.get("endpoints", []),
-            vllm_model=args.vllm_model or model["model"],
+            vllm_endpoints=model["endpoints"],
+            vllm_model=model["model"],
             max_images=int(model.get("n_frames", 32)), max_pixels=int(model["max_pixels"]),
             max_model_len=int(model["max_model_len"]), max_tokens=int(model.get("max_tokens", 4096)),
+            temperature=model["temperature"],
             cell_timeout_s=sandbox.cell_timeout_s, max_regen=sandbox.max_regenerate,
             max_solver_rounds=args.max_solver_rounds if args.max_solver_rounds is not None else raw["max_solver_rounds"],
             max_retries_per_operation=(args.max_retries_per_operation
@@ -177,7 +183,8 @@ def main(argv=None) -> int:
             quality_confirmations=confirmations,
             reconstruction_costs=reconstruction_costs)
         (root / "source_receipt.json").write_text(
-            json.dumps({"sampling": sampling, "exclusions": exclusions}, ensure_ascii=False, indent=2))
+            json.dumps({"sampling": sampling, "exclusions": exclusions,
+                        "configuration": config_receipt(raw)}, ensure_ascii=False, indent=2))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["status"] == "completed" else 1
     except Exception as exc:

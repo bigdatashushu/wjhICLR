@@ -31,7 +31,9 @@ from skill3d.adapters.episode_source import (
     load_jsonl_items,
     load_vsi_bench_items,
 )
-from skill3d.online.config import DEFAULT_CONFIG, load_config, load_yaml, paths_from
+from skill3d.online.config import (
+    DEFAULT_CONFIG, config_receipt, load_config, load_yaml, paths_from, resolve_runtime,
+)
 from skill3d.reconstruction.vggt_runner import ReconstructionFailed, reconstruct
 from skill3d.scheduling.gpu_scheduler import GPUScheduler
 from skill3d.schemas import ReconstructionArtifact
@@ -220,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--datasets", default="",
                    help="逗号分隔的来源数据集（scannet,scannetpp,arkitscenes；默认全部）。"
                         "限定范围会写进 manifest，不得当全量口径")
-    p.add_argument("--n-frames", type=int, default=32, help="均匀采样帧数（默认 32）")
+    p.add_argument("--n-frames", type=int, default=None, help="均匀采样帧数（缺省使用配置）")
     p.add_argument("--gpus", default="", help="逗号分隔 GPU 编号（默认 0；M20 DP 用）")
     p.add_argument("--force", action="store_true", help="忽略已有 artifact 重跑")
     p.add_argument("--plan-only", action="store_true", help="只打印作业表，不执行重建")
@@ -244,8 +246,9 @@ def _maybe_moge2(args):
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    cfg = load_config(args.config)
-    args.seed = int(cfg.get("seed", 0) if args.seed is None else args.seed)
+    cfg = resolve_runtime(load_config(args.config), seed=args.seed, n_frames=args.n_frames)
+    args.seed = cfg["seed"]
+    args.n_frames = cfg["frame_sampling"]["n_frames"]
     paths = paths_from(cfg)
     recon_dir = args.recon_dir or paths.reconstructions
     gpus = [int(g) for g in args.gpus.split(",") if g.strip()] or [0]
@@ -260,6 +263,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     items: list[EpisodeItem] = []
+    # Validate every requested split before any one of them starts decoding.
+    from skill3d.adapters.split_builder import validate_split_mapping
+
+    split_cfg = load_yaml(cfg["split_config"])
+    for split in splits:
+        validate_split_mapping(split_cfg, split)
     for split in splits:
         try:
             if args.source == "jsonl":
@@ -267,9 +276,9 @@ def main(argv: list[str] | None = None) -> int:
                     print("[错误] --source jsonl 需要 --episodes-jsonl PATH", file=sys.stderr)
                     return 2
                 part = load_jsonl_items(args.episodes_jsonl, split=split,
+                                        split_cfg=split_cfg, n_frames=args.n_frames,
                                         limit=args.limit or None)
             else:
-                split_cfg = load_yaml(cfg.get("split_config", "configs/vsi_bench_split.yaml"))
                 qtypes = [t.strip() for t in args.question_types.split(",") if t.strip()]
                 dsets = [d.strip() for d in args.datasets.split(",") if d.strip()]
                 part = load_vsi_bench_items(
@@ -277,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                     video_root=args.video_root or paths.raw_videos,
                     video_fallback_roots=paths.raw_video_fallbacks,
                     cache_dir=paths.vsi_bench_meta, limit=args.limit or None,
+                    local_meta_path=paths.vsi_bench_meta,
                     n_frames=args.n_frames,
                     question_types=qtypes or None,
                     datasets=dsets or None,
@@ -337,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
         "quality_metric_version": "v6-m4-main-gate",
         "n_frames": args.n_frames,
         "seed": args.seed,
+        "configuration": config_receipt(cfg),
         "dataset_scope": [d.strip() for d in args.datasets.split(",") if d.strip()] or "all",
         "sampling_per_task": int(args.sampling_per_task),
         "sampling_strategy": ("first_n_per_task_by_meta_order"

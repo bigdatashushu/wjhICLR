@@ -54,6 +54,36 @@ class ReconstructionFailed(RuntimeError):
     """重建失败（v6 无降级链：VGGT 是唯一正式主线）。"""
 
 
+def _frame_identity(frame_set, n_frames: int) -> tuple[list, list, list, str]:
+    """M3: identity rows follow the actual readable array order."""
+    from skill3d.adapters.frame_set import frame_set_hash
+
+    if frame_set is None:
+        ids = list(range(n_frames))
+        return ids, ids.copy(), [float(i) for i in ids], frame_set_hash(ids)
+    planned = list(frame_set.frame_ids)
+    ids = list(frame_set.readable_frame_ids)
+    positions = [planned.index(fid) for fid in ids]
+    if len(ids) != n_frames or positions != sorted(positions):
+        raise ReconstructionFailed("Readable FrameSet does not align with reconstruction pixels")
+    return (ids, [int(frame_set.source_frame_indices[i]) for i in positions],
+            [float(frame_set.timestamps[i]) for i in positions], frame_set.frame_set_hash)
+
+
+def _write_frozen_frames(frames, frame_dir: Path) -> list[str]:
+    """M5: write current pixels even when a prior run left PNG files here."""
+    import cv2
+
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for i, frame in enumerate(frames):
+        path = frame_dir / f"{i:04d}.png"
+        if not cv2.imwrite(str(path), cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR)):
+            raise ReconstructionFailed(f"Cannot write frozen input frame: {path}")
+        paths.append(str(path))
+    return paths
+
+
 def run_vggt(
     frames: Sequence[np.ndarray],
     scene_name: str,
@@ -74,6 +104,13 @@ def run_vggt(
     为 `None` 时**不做**融合，artifact 写 `scale_fusion_status="not_run"` ——
     这是当前默认状态（§11 全部为 `[待实验]`，PoC 通过前 metric_scale 必须为 None）。
     """
+    frame_ids, source_frame_indices, timestamps, fsh = _frame_identity(frame_set, len(frames))
+    from skill3d.adapters.frame_set import build_frame_set, with_pixel_identity
+
+    cache_frames = frame_set if frame_set is not None else build_frame_set(
+        len(frames), n_frames=len(frames), scene_name=scene_name)
+    cache_frames = with_pixel_identity(cache_frames, frames)
+    storage_name = f"{scene_name}__{cache_frames.cache_identity()[:16]}"
     try:
         import torch  # lazy import：未安装库
         from vggt.models.vggt import VGGT
@@ -93,16 +130,8 @@ def run_vggt(
     model = VGGT.from_pretrained(checkpoint).to(device).eval()
 
     # 官方 API 收**文件路径**：把 32 帧写到 work 目录再喂进去（帧已由 M1 抽好）
-    frame_dir = out / f"{scene_name}_frames"
-    frame_dir.mkdir(parents=True, exist_ok=True)
-    import cv2
-
-    frame_paths: list[str] = []
-    for i, fr in enumerate(frames):
-        p = frame_dir / f"{i:04d}.png"
-        if not p.is_file():
-            cv2.imwrite(str(p), cv2.cvtColor(np.asarray(fr), cv2.COLOR_RGB2BGR))
-        frame_paths.append(str(p))
+    frame_dir = out / f"{storage_name}_frames"
+    frame_paths = _write_frozen_frames(frames, frame_dir)
 
     images = load_and_preprocess_images(frame_paths)
     images = images.to(device)
@@ -124,11 +153,11 @@ def run_vggt(
     fusion = _run_metric_fusion(
         metric_depth_model, metric_model_name,
         frames=frames, preds=preds, intrinsics=preds["intrinsic"],
-        out_dir=out, scene_name=scene_name)
+        out_dir=out, scene_name=storage_name)
 
     # ---- 落盘并组装 artifact（字段为数组文件 ref，见 §5.2）----
     def _save(name: str, arr) -> str:
-        p = out / f"{scene_name}_{name}.npy"
+        p = out / f"{storage_name}_{name}.npy"
         arr = arr.detach().cpu().numpy() if hasattr(arr, "detach") else np.asarray(arr)
         np.save(p, arr)
         return str(p)
@@ -140,21 +169,6 @@ def run_vggt(
     pconf_ref = _save("point_conf", preds["point_conf"])
     dconf_ref = _save("depth_conf", preds["depth_conf"]) if preds.get("depth_conf") is not None else ""
     track_ref = _save("tracks", preds["track_list"]) if preds.get("track_list") is not None else None
-
-    frame_ids = list(range(len(frames)))
-    source_frame_indices = list(range(len(frames)))
-    timestamps = [float(i) for i in range(len(frames))]
-    fsh = ""
-    if frame_set is not None:
-        frame_ids = [int(i) for i in getattr(frame_set, "frame_ids", frame_ids)]
-        source_frame_indices = [int(i) for i in getattr(
-            frame_set, "source_frame_indices", frame_ids)]
-        timestamps = [float(t) for t in getattr(frame_set, "timestamps", timestamps)]
-        fsh = str(getattr(frame_set, "frame_set_hash", "") or "")
-    if not fsh:  # 无 FrameSet 传入时按规范槽位算哈希（jsonl/合成来源）
-        from skill3d.adapters.frame_set import frame_set_hash as _fsh
-
-        fsh = _fsh(frame_ids)
 
     artifact = ReconstructionArtifact(
         artifact_id=f"vggt-{scene_name}",

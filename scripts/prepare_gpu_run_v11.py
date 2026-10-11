@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
-import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -16,17 +15,11 @@ from skill3d.infra.experiment_startup import (
     COMMIT_RE, RUN_ID_RE, StartupError, configure_run, environment_contract,
     freeze_working_tree, git, run_mode, write_json,
 )
+from skill3d.online.config import load_yaml
 
 
 def read_config(path: Path) -> dict:
-    text = path.read_text(encoding="utf-8")
-    text = re.sub(
-        r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}",
-        lambda match: os.environ.get(match.group(1), match.group(2) or ""), text)
-    cfg = yaml.safe_load(text)
-    if not isinstance(cfg, dict):
-        raise StartupError("GPU configuration must be a YAML mapping")
-    return cfg
+    return load_yaml(path)
 
 
 def prepare(args) -> dict:

@@ -94,7 +94,7 @@ def model_config_identity_v11(cfg: OnlineRunConfig) -> dict:
         "max_images": int(cfg.max_images),
         "max_pixels": int(cfg.max_pixels),
         "max_model_len": int(cfg.max_model_len),
-        "temperature": 0.0,
+        "temperature": cfg.temperature,
     }
     return {**value, "sha256": _sha256(value)}
 

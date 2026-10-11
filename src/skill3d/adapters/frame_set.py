@@ -71,6 +71,22 @@ def frame_set_hash(frame_ids: Sequence[int]) -> str:
     ).hexdigest()
 
 
+def with_pixel_identity(frame_set: FrameSet, pixels: Sequence[np.ndarray]) -> FrameSet:
+    """M3/M5: content hashes follow readable rows without changing frame_set_hash."""
+    if len(pixels) != len(frame_set.readable_frame_ids):
+        raise FrameSetError("Readable frames and pixel rows do not align")
+    hashes = []
+    for frame in pixels:
+        value = np.ascontiguousarray(frame)
+        digest = hashlib.sha256()
+        digest.update(str((value.shape, value.dtype.str)).encode())
+        digest.update(value.tobytes())
+        hashes.append(digest.hexdigest())
+    if frame_set.pixel_sha256 and frame_set.pixel_sha256 != hashes:
+        raise FrameSetError("Frozen FrameSet pixels changed")
+    return frame_set.model_copy(update={"pixel_sha256": hashes})
+
+
 def build_frame_set(
     total_frames: int,
     *,
@@ -103,7 +119,8 @@ def build_frame_set(
         stamps = [float(i) for i in ids]
     return FrameSet(
         frame_ids=ids,
-        source_frame_indices=[int(i) for i in (source_frame_indices or ids)],
+        source_frame_indices=[int(i) for i in (
+            ids if source_frame_indices is None else source_frame_indices)],
         timestamps=stamps,
         frame_set_hash=frame_set_hash(ids),
         episode_id=episode_id,

@@ -32,6 +32,9 @@ class SandboxReceipt(BaseModel):
     error_code: Optional[str] = None  # timeout/oom/disk_full/violation_*
     timestamp: float
     receipt_hash: str
+    # M3: retain cell diagnostics as the hashed payload, while reading old
+    # receipts (which stored only payload_digest) with the same hash formula.
+    payload: Optional[dict] = None
 
 
 def _digest_payload(payload: Any) -> str:
@@ -98,6 +101,7 @@ class ReceiptChain:
             error_code=error_code,
             timestamp=ts,
             receipt_hash=h,
+            payload=dict(payload) if event == "cell_run" and isinstance(payload, dict) else None,
         )
         self._receipts.append(r)
         return r
@@ -108,6 +112,8 @@ def verify_chain(receipts: list[SandboxReceipt]) -> bool:
     prev = GENESIS_HASH
     for r in receipts:
         if r.prev_hash != prev:
+            return False
+        if r.payload is not None and _digest_payload(r.payload) != r.payload_digest:
             return False
         expected = _compute_hash(
             r.episode_id, r.prev_hash, r.event, r.payload_digest,

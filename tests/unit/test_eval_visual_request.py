@@ -86,6 +86,7 @@ def test_single_visual_request_disables_sdk_retries_and_restores_phase():
     one_shot.chat.completions.create.return_value = response
     client = VLLMClient.__new__(VLLMClient)
     client._clients, client._rr, client.model = [sdk], itertools.cycle([0]), "fixture"
+    client.temperature, client.max_output_tokens = 0.0, 4096
     messages = [{"role": "user", "content": "query"}]
     with request_phase("program"):
         assert client.chat(messages, seed=7) == "3"

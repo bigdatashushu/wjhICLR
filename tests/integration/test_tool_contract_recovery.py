@@ -299,3 +299,34 @@ def test_validated_observation_is_not_replayed_after_invalidation(tmp_path,
     # 撤销列表里的 result_id 必须出现在"已撤销"提示中，而不得作为可信观测回灌
     for rid in out.invalidated_result_ids:
         assert f"[result_id={rid}]" not in text
+
+
+def test_same_failed_ast_skips_tools_and_keeps_original_request_budget(tmp_path, episode_item):
+    bad = "euclidean_distance([0, 0, 0], [1, 0, 0])\nx = {}['obj_id']\n"
+    client = _FakeClient([bad, "# changed comment\n" + bad,
+                          '"""different docs"""\n' + bad, 'ReturnAnswer("3.0")\n'])
+    cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=3)
+    cfg.max_solver_rounds = 4
+    out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
+    # First execution adds a new observation, so one necessary replay is allowed.
+    # Its identical receipt does not count as new evidence for round three.
+    assert len(client.calls) == 4 and out.agent_rounds == 4
+    assert out.rounds[0]["executed"] and out.rounds[1]["executed"]
+    assert out.rounds[2]["executed"] is False
+    assert out.rounds[2]["repeated_failure"]["prior_round"] == 2
+    assert sum(len(r.get("results", [])) for r in out.rounds) == 2
+    assert out.final_state == "answer" and out.answer == "3.0"
+
+
+def test_changed_observation_does_not_trip_failed_ast_guard(tmp_path, episode_item):
+    bad = "euclidean_distance([0, 0, 0], [1, 0, 0])\nx = {}['obj_id']\n"
+    observe = ("value = euclidean_distance([0, 0, 0], [2, 0, 0])\n"
+               "YieldObservations([], 'New measurement is available')\n")
+    client = _FakeClient([bad, observe, "# comment\n" + bad, bad, 'ReturnAnswer("3.0")\n'])
+    cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=3)
+    cfg.max_solver_rounds = 5
+    out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
+    assert len(client.calls) == 5 and out.yield_count == 1
+    assert all(out.rounds[index]["executed"] for index in (0, 1, 2, 4))
+    assert not out.rounds[2].get("repeated_failure")
+    assert out.rounds[3]["repeated_failure"]["execution_skipped"]

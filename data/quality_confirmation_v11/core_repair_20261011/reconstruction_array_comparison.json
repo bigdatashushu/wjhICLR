@@ -1,0 +1,66 @@
+{
+  "27dd4da69e": {
+    "depth_maps": {
+      "after_sha256": "c3135346fb0c39907db815937214494d9c08b130889a0207c6cd183f3e654a89",
+      "before_sha256": "c3135346fb0c39907db815937214494d9c08b130889a0207c6cd183f3e654a89",
+      "equal": true
+    },
+    "c2w_list": {
+      "after_sha256": "e7e08451b228f16fc766afc8f7606e91a3e715a58e106a1c76761455c7c81198",
+      "before_sha256": "e7e08451b228f16fc766afc8f7606e91a3e715a58e106a1c76761455c7c81198",
+      "equal": true
+    },
+    "intrinsics": {
+      "after_sha256": "51878960941ebb6007d23378a695aecb30721731e18333ca8019b742ea8f22fd",
+      "before_sha256": "51878960941ebb6007d23378a695aecb30721731e18333ca8019b742ea8f22fd",
+      "equal": true
+    },
+    "point_map": {
+      "after_sha256": "f950e3fabab9789c10735abb9ec10c5caf05550ee5b286a01b5c11c202e5e200",
+      "before_sha256": "f950e3fabab9789c10735abb9ec10c5caf05550ee5b286a01b5c11c202e5e200",
+      "equal": true
+    },
+    "depth_conf": {
+      "after_sha256": "fe9155a2e4a7a08fa33603ce3476e140ad401189df81d081eee5569da290cd70",
+      "before_sha256": "fe9155a2e4a7a08fa33603ce3476e140ad401189df81d081eee5569da290cd70",
+      "equal": true
+    },
+    "point_conf": {
+      "after_sha256": "c14633bdc041b1f35323488a71c3e93a420a0f0750086f21327d4a8aba8ee585",
+      "before_sha256": "c14633bdc041b1f35323488a71c3e93a420a0f0750086f21327d4a8aba8ee585",
+      "equal": true
+    }
+  },
+  "scene0568_02": {
+    "depth_maps": {
+      "after_sha256": "3a403fb92bea91a6ba83370cbca5ed100d9256d13cf60b091061601f56d7c5e9",
+      "before_sha256": "3a403fb92bea91a6ba83370cbca5ed100d9256d13cf60b091061601f56d7c5e9",
+      "equal": true
+    },
+    "c2w_list": {
+      "after_sha256": "3d8088b64eed9ac80f8b65327be3f548dc14970ce138446c17ff6fd7caf1308f",
+      "before_sha256": "3d8088b64eed9ac80f8b65327be3f548dc14970ce138446c17ff6fd7caf1308f",
+      "equal": true
+    },
+    "intrinsics": {
+      "after_sha256": "b519ac47fb086d3fa1d0dce1e17ce4958f164d443347f036dae482d926ffd23c",
+      "before_sha256": "b519ac47fb086d3fa1d0dce1e17ce4958f164d443347f036dae482d926ffd23c",
+      "equal": true
+    },
+    "point_map": {
+      "after_sha256": "4ed7f95a9a982b4883e169b324ed48ae35cf846ff719659fbeb466d06dd486cd",
+      "before_sha256": "4ed7f95a9a982b4883e169b324ed48ae35cf846ff719659fbeb466d06dd486cd",
+      "equal": true
+    },
+    "depth_conf": {
+      "after_sha256": "98611a89e1e02f63798e12cd764585468bcc5d18997e8ab079cf14d71389b1aa",
+      "before_sha256": "98611a89e1e02f63798e12cd764585468bcc5d18997e8ab079cf14d71389b1aa",
+      "equal": true
+    },
+    "point_conf": {
+      "after_sha256": "e8aedb67e37108da13fcc8616fc0195605e3d1411fce3fe5f6cac25fb19b65f3",
+      "before_sha256": "e8aedb67e37108da13fcc8616fc0195605e3d1411fce3fe5f6cac25fb19b65f3",
+      "equal": true
+    }
+  }
+}

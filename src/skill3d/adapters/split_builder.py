@@ -531,10 +531,40 @@ def _checks(cfg: DataSplitConfig, report: SplitReport) -> list[tuple[str, bool, 
 
 def load_split_config(path: str | Path) -> DataSplitConfig:
     """从 YAML 读回 `DataSplitConfig`（忽略证据表等附加键）。"""
-    import yaml
+    from skill3d.online.config import load_yaml
 
-    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
-    if not isinstance(data, dict):
-        raise SplitBuildError(f"split 配置格式错误（应为 mapping）: {path}")
+    data = load_yaml(path)
+    validate_split_mapping(data)
     known = set(DataSplitConfig.model_fields)
     return DataSplitConfig(**{k: v for k, v in data.items() if k in known})
+
+
+def validate_split_mapping(data: dict, selected: Optional[str] = None) -> set[str]:
+    """M1: an absent/empty selected list is never permission to load every scene."""
+    if not isinstance(data, dict) or not data:
+        raise SplitBuildError("split configuration must be a non-empty mapping")
+    if selected is not None and selected not in SPLIT_KEYS:
+        raise SplitBuildError(f"Unknown split: {selected}")
+    if selected is not None and SPLIT_KEYS[selected] not in data:
+        raise SplitBuildError(f"Missing selected split list: {selected}")
+    owners: dict[str, str] = {}
+    for split, key in SPLIT_KEYS.items():
+        if key not in data:
+            continue
+        values = data[key]
+        if not isinstance(values, list) or any(not isinstance(v, str) or not v for v in values):
+            raise SplitBuildError(f"{key} must be a list of non-empty scene names")
+        if len(set(values)) != len(values):
+            raise SplitBuildError(f"Duplicate scene in {key}")
+        for scene in values:
+            if scene in owners:
+                raise SplitBuildError(f"split 相交: {scene} belongs to {owners[scene]} and {split}")
+            owners[scene] = split
+    if not owners:
+        raise SplitBuildError("No runnable scenes in split configuration")
+    if selected is None:
+        return set(owners)
+    allowed = set(data[SPLIT_KEYS[selected]])
+    if not allowed:
+        raise SplitBuildError(f"No runnable samples: split={selected} is explicitly empty")
+    return allowed

@@ -150,6 +150,7 @@ def load_vsi_bench_items(
     video_root: str | Path = "data/raw_videos",
     video_fallback_roots: Optional[Sequence[str | Path]] = None,
     cache_dir: Optional[str] = None,
+    local_meta_path: Optional[str | Path] = None,
     limit: Optional[int] = None,
     n_frames: int = _synth.N_FRAMES,
     seed: int = 0,
@@ -185,25 +186,19 @@ def load_vsi_bench_items(
     1993 条会把同一视频解码几十遍、常驻 ~58 GB 内存）。
     """
     from skill3d.adapters import vsibench_loader as vl
+    from skill3d.adapters.split_builder import SplitBuildError, validate_split_mapping
 
     try:
-        rows = vl.load_meta(cache_dir=cache_dir)
+        # Validate before metadata or decoding, including the explicitly empty case.
+        allowed_scenes = validate_split_mapping(split_cfg, split)
+    except SplitBuildError as exc:
+        raise EpisodeSourceError(str(exc)) from exc
+    try:
+        rows = vl.load_meta(cache_dir=cache_dir, local_path=local_meta_path)
     except ImportError as exc:
         raise EpisodeSourceError(
             "未安装 datasets（pip install datasets）；VSI-Bench meta 加载不可用"
         ) from exc
-
-    split_key = {
-        "induction": "induction_scene_ids",
-        "inner_validation": "inner_validation_scene_ids",
-        "outer_holdout": "outer_holdout_scene_ids",
-        "final_test": "final_test_scene_ids",
-    }.get(split)
-    allowed_scenes: Optional[set[str]] = None
-    if split_cfg and split_key:
-        allowed = split_cfg.get(split_key) or []
-        if allowed:
-            allowed_scenes = set(allowed)
 
     wanted: Optional[set[str]] = None
     if question_types:
@@ -521,13 +516,20 @@ def _episode_from_row(row: dict, split: str, pixels: Sequence[np.ndarray],
         ids = list(range(len(pixels)))
         frame_set = {
             "frame_ids": ids,
-            "source_frame_indices": list(row.get("source_frame_indices") or ids),
+            "source_frame_indices": list(row["source_frame_indices"]
+                                         if "source_frame_indices" in row else ids),
             "timestamps": [float(i) for i in ids],
             "frame_set_hash": _fsh(ids),
             "n_frames": len(pixels),
             "n_total_frames": int(row.get("n_total_frames") or len(pixels)),
             "fps": float(row.get("fps") or 0.0),
         }
+    from skill3d.adapters.frame_set import with_pixel_identity
+    from skill3d.schemas.episode import FrameSet
+
+    if isinstance(frame_set, dict):
+        frame_set = FrameSet.model_validate(frame_set)
+    frame_set = with_pixel_identity(frame_set, pixels)
     return VSIBenchEpisode(
         qa_id=_row_id(row),
         scene_name=str(row["scene_name"]),
@@ -555,29 +557,78 @@ def load_jsonl_items(
     limit: Optional[int] = None,
     exclusions: Optional[list] = None,
     include_input_errors: bool = False,
+    split_cfg: Optional[dict] = None,
+    n_frames: Optional[int] = None,
 ) -> list[EpisodeItem]:
     """读本系统约定格式的预抽帧清单（见模块 docstring）。"""
     import cv2
 
-    p = Path(path)
+    from skill3d.online.config import resolve_path
+
+    p = resolve_path(path)
     if not p.is_file():
         raise EpisodeSourceError(f"episodes jsonl 不存在: {p}")
-    items: list[EpisodeItem] = []
-    matched = 0
+    from skill3d.adapters.split_builder import SPLIT_KEYS, SplitBuildError, validate_split_mapping
+
+    if split is not None and split not in SPLIT_KEYS:
+        raise EpisodeSourceError(f"Unknown split: {split}")
+    if split_cfg is not None:
+        try:
+            validate_split_mapping(split_cfg, split)
+        except SplitBuildError as exc:
+            raise EpisodeSourceError(str(exc)) from exc
+    # Preflight the complete manifest, so a small limit cannot hide contamination.
+    records = []
+    scene_owners = {}
     for lineno, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
         if not line:
             continue
         rec = json.loads(line)
+        if not isinstance(rec, dict):
+            raise EpisodeSourceError(f"{p}:{lineno} episode must be a mapping")
         missing = [k for k in _JSONL_REQUIRED if k not in rec]
         if missing:
             raise EpisodeSourceError(f"{p}:{lineno} 缺字段 {missing}")
+        if rec["split"] not in SPLIT_KEYS:
+            raise EpisodeSourceError(f"{p}:{lineno} unknown split: {rec['split']}")
+        owner = scene_owners.setdefault(rec["scene_name"], rec["split"])
+        if owner != rec["split"]:
+            raise EpisodeSourceError(f"{p}:{lineno} scene appears in multiple splits")
+        if split_cfg is not None:
+            allowed = split_cfg.get(SPLIT_KEYS[rec["split"]], [])
+            if rec["scene_name"] not in allowed:
+                raise EpisodeSourceError(f"{p}:{lineno} scene is outside its declared split")
+        if not isinstance(rec["frame_paths"], list) or not rec["frame_paths"]:
+            raise EpisodeSourceError(f"{p}:{lineno} frame_paths must be a non-empty list")
+        if any(not isinstance(fp, str) or not fp for fp in rec["frame_paths"]):
+            raise EpisodeSourceError(f"{p}:{lineno} frame_paths must contain non-empty strings")
+        # M1/M3: identity arrays must fail before any decoder or model call.
+        for field in ("source_frame_indices", "timestamps"):
+            if field not in rec:
+                continue
+            values = rec[field]
+            if not isinstance(values, list) or len(values) != len(rec["frame_paths"]):
+                raise EpisodeSourceError(f"{p}:{lineno} {field} must align with frame_paths")
+            if field == "source_frame_indices":
+                valid = all(type(value) is int and value >= 0 for value in values)
+            else:
+                valid = all(type(value) in (int, float) and np.isfinite(value) for value in values)
+            if not valid:
+                raise EpisodeSourceError(f"{p}:{lineno} invalid {field} values")
+        if n_frames is not None and len(rec["frame_paths"]) > n_frames:
+            raise EpisodeSourceError(f"{p}:{lineno} pre-extracted frames exceed configured input count")
+        records.append(rec)
+    items: list[EpisodeItem] = []
+    matched = 0
+    for rec in records:
         if split is not None and rec["split"] != split:
             continue
         if limit is not None and matched >= limit:
             break
         matched += 1
-        frame_paths = list(rec["frame_paths"])
+        frame_paths = [str(Path(fp) if Path(fp).is_absolute() else p.parent / fp)
+                       for fp in rec["frame_paths"]]
         pixels = []
         readable: list[int] = []
         attempts: list[dict] = []
@@ -612,22 +663,28 @@ def load_jsonl_items(
                     input_error=failure,
                 ))
             continue
-        frame_set = None
-        if len(readable) != len(frame_paths):
-            from .frame_set import build_frame_set
+        from .frame_set import build_frame_set
 
-            frame_set = build_frame_set(
-                len(frame_paths),
-                n_frames=len(frame_paths),
-                source_frame_indices=list(rec.get("source_frame_indices")
-                                          or range(len(frame_paths))),
-                episode_id=str(rec["qa_id"]),
-                dataset_id=str(rec.get("dataset", "unknown")),
-                video_id=str(p.resolve()),
-                scene_name=str(rec["scene_name"]),
-                frame_refs=[str(value) for value in frame_paths],
-                readable_frame_ids=readable,
-            )
+        # M3: complete and partial JSONL inputs have the same identity contract.
+        frame_set = build_frame_set(
+            len(frame_paths),
+            n_frames=len(frame_paths),
+            source_frame_indices=(rec["source_frame_indices"]
+                                  if "source_frame_indices" in rec
+                                  else list(range(len(frame_paths)))),
+            episode_id=str(rec["qa_id"]),
+            dataset_id=str(rec.get("dataset", "unknown")),
+            video_id=str(rec.get("video_id") or p.resolve()),
+            scene_name=str(rec["scene_name"]),
+            frame_refs=frame_paths,
+            readable_frame_ids=readable,
+            fps=float(rec.get("fps", 0.0)),
+        )
+        if "timestamps" in rec:
+            from skill3d.schemas.episode import FrameSet
+
+            frame_set = FrameSet.model_validate({
+                **frame_set.model_dump(), "timestamps": rec["timestamps"]})
         episode = _episode_from_row(
             row,
             rec["split"],

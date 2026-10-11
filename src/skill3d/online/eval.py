@@ -35,6 +35,8 @@ from skill3d.online.config import (
     DEFAULT_CONFIG,
     load_config,
     load_yaml,
+    config_receipt,
+    resolve_runtime,
     active_vision_from,
     paths_from,
     retrieval_policy_from,
@@ -88,13 +90,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mode", default="mock_light", choices=["real", "mock_light"])
     p.add_argument("--baseline", default="C1_tools_program",
                    choices=["C1_tools_program"])
-    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=None)
     p.add_argument("--deterministic-replay", action="store_true",
                    help="重放确定性：时间/id/latency 取确定性占位，保证同 seed 字节级一致")
     p.add_argument("--active-snapshot", default="", help="active snapshot 文件或目录（§13.5）")
-    p.add_argument("--vllm-endpoint", action="append", default=[],
+    p.add_argument("--vllm-endpoint", action="append", default=None,
                    help="本地 vLLM endpoint（可重复，DP×8 时给 8 个）")
-    p.add_argument("--vllm-model", default="", help="served model name")
+    p.add_argument("--vllm-model", default=None, help="served model name")
     p.add_argument("--trace-dir", default="")
     p.add_argument("--recon-dir", default="")
     # v6 §11：零样本度量深度跨帧融合（首个 PoC = MoGe-2）。
@@ -150,17 +152,17 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeEnvironmentError as exc:
         print(f"[错误] {exc}", file=sys.stderr)
         return 2
+    # M1: resolve once before sampling; explicit CLI seed=0 remains meaningful.
+    cfg_yaml = resolve_runtime(load_config(args.config), seed=args.seed,
+                              endpoints=args.vllm_endpoint, model=args.vllm_model)
+    args.seed = cfg_yaml["seed"]
     # M5 检测器兜底地址：config 里配了就用它（除非环境变量已显式指定）。
     # 纪律：检测器是确定性 Tool（非 LLM），只产出 SAM2 的 box prompt，不参与出答案。
-    try:
-        _det = (load_config(args.config).get("detection") or {}).get("endpoint")
-        if _det and not os.environ.get("SKILL3D_DETECTOR_ENDPOINT"):
-            os.environ["SKILL3D_DETECTOR_ENDPOINT"] = str(_det)
-    except Exception:  # noqa: BLE001 - 配置缺失不阻断
-        pass
+    _det = cfg_yaml.get("detection", {}).get("endpoint")
+    if _det and "SKILL3D_DETECTOR_ENDPOINT" not in os.environ:
+        os.environ["SKILL3D_DETECTOR_ENDPOINT"] = str(_det)
     # v6 §5.2：`recon_method` 受控枚举只有 `vggt`；旧 BA / colmap / dust3r 路线
     # 已整体废止（§20），CLI 不再提供开关，也不再 import 已归档模块。
-    cfg_yaml = load_config(args.config)
     paths = paths_from(cfg_yaml)
     vllm = vllm_from(cfg_yaml)
     sandbox = sandbox_from(cfg_yaml)
@@ -211,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
                 frame_size = (int(h), int(w))
             items = load_synthetic_items(
                 split, question_types=qtypes or None, limit=limit, seed=args.seed,
+                n_frames=cfg_yaml["frame_sampling"]["n_frames"],
                 frame_size=frame_size, degrade=args.degrade or None,
                 out_dir=str(Path(paths.reconstructions) / "mock_light"),
             )
@@ -224,6 +227,8 @@ def main(argv: list[str] | None = None) -> int:
                 limit=limit,
                 exclusions=exclusions,
                 include_input_errors=True,
+                split_cfg=load_yaml(cfg_yaml["split_config"]),
+                n_frames=cfg_yaml["frame_sampling"]["n_frames"],
             )
         else:
             split_cfg = load_yaml(cfg_yaml.get("split_config", "configs/vsi_bench_split.yaml"))
@@ -237,6 +242,8 @@ def main(argv: list[str] | None = None) -> int:
                                       if args.video_fallback_root is not None
                                       else paths.raw_video_fallbacks),
                 cache_dir=paths.vsi_bench_meta, limit=limit, seed=args.seed,
+                local_meta_path=paths.vsi_bench_meta,
+                n_frames=cfg_yaml["frame_sampling"]["n_frames"],
                 # v5 修复：vsi_bench 源此前**静默忽略** --question-types（分层子集实验
                 # 会误跑成全量）→ 现在如实传递过滤条件。
                 question_types=qtypes or None,
@@ -284,10 +291,11 @@ def main(argv: list[str] | None = None) -> int:
         cell_timeout_s=int(sandbox.cell_timeout_s),
         trace_dir=args.trace_dir or paths.trace_store,
         recon_dir=args.recon_dir or paths.reconstructions,
-        vllm_endpoints=list(args.vllm_endpoint),
-        vllm_model=args.vllm_model or vllm.model,
+        vllm_endpoints=list(vllm.endpoints),
+        vllm_model=vllm.model,
         max_images=int(getattr(vllm, "n_frames", 32)),
-        max_tokens=int(cfg_yaml.get("vllm", {}).get("max_tokens", 4096)),
+        max_tokens=vllm.max_tokens,
+        temperature=vllm.temperature,
         recon_method=args.recon_method,
         metric_depth_model=_maybe_moge2(args),
         # v6 §20：BA（官方 VGGSfM / vggt_sparse_ba）与整套"需校准的尺度"路线已废止，
@@ -647,6 +655,8 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
             "max_pixels": vllm_cfg.get("max_pixels"),
             "max_model_len": vllm_cfg.get("max_model_len"),
             "vllm_endpoints": list(run_cfg.vllm_endpoints),
+            "max_tokens": run_cfg.max_tokens,
+            "runtime_configuration": config_receipt(cfg_yaml),
             # §7 / D-6 / A-8 / D-2：帧集身份（v6 不再记录 BA 开关与校准尺度来源）
             "frame_set_hash": fsh,
             "n_distinct_frame_sets": n_fsh,

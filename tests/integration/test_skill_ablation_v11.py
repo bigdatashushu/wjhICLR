@@ -26,10 +26,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
-def panel(tmp_path, monkeypatch):
+def panel(tmp_path, monkeypatch, request):
     item = load_synthetic_items(
         "inner_validation", question_types=["object_rel_distance"],
-        frame_size=(120, 160), n_frames=8)[0]
+        frame_size=(120, 160), n_frames=getattr(request, "param", 8))[0]
     g, fs = item.geometry, item.episode.frame_set
     names = [o.category_name for o in g.objects]
     item.episode.question = (
@@ -560,6 +560,66 @@ def test_quality_confirmation_does_not_change_thresholds(panel, tmp_path):
     assert manifest["quality_contract"] == contract
     assert manifest["quality_confirmation_status"] == "confirmed"
     assert result["formal_result_eligible"] is False
+
+
+def test_nested_frame_identity_confirmation_is_checked_before_m5(panel, tmp_path):
+    item, artifact, _ = panel
+    result, _, _, _ = run(panel, tmp_path, quality_confirmation={
+        "confirmed": True, "sha256": ab.quality_contract()["sha256"],
+        "evidence_ref": "test-only",
+        "scene_name": item.episode.scene_name,
+        "artifact": {"sha256": ab._file_hash(artifact),
+                     "frame_set_hash": item.episode.frame_set.frame_set_hash}})
+    assert result["status"] == "completed"
+
+
+@pytest.mark.parametrize("damage", ["frame", "artifact", "scene"])
+def test_confirmation_identity_mismatch_spends_no_model_request(panel, tmp_path, damage):
+    item, artifact, bindings = panel
+    confirmation = {
+        "confirmed": True, "sha256": ab.quality_contract()["sha256"],
+        "evidence_ref": "test-only", "scene_name": item.episode.scene_name,
+        "artifact": {"sha256": ab._file_hash(artifact),
+                     "frame_set_hash": item.episode.frame_set.frame_set_hash}}
+    if damage == "scene":
+        confirmation["scene_name"] = "wrong-scene"
+    else:
+        confirmation["artifact"]["frame_set_hash" if damage == "frame" else "sha256"] = "f" * 64
+    with pytest.raises(ab.PairingError):
+        run(panel, tmp_path, quality_confirmation=confirmation)
+    assert bindings == []
+
+
+@pytest.mark.parametrize("panel", [32], indirect=True)
+def test_confirmed_contract_with_low_geometry_is_formal_eligible(panel, tmp_path, monkeypatch):
+    item, artifact, _ = panel
+    # Deliberate synthetic inconsistency; recompute the real AND decision.
+    art = ReconstructionArtifact.model_validate_json(artifact.read_text())
+    points = np.load(art.point_map)
+    points[len(points) // 2:] += 100
+    np.save(art.point_map, points)
+    art.quality = compute_quality(
+        None, frames=item.pixels, depth_maps=np.load(art.depth_maps),
+        c2w_list=np.load(art.c2w_list), intrinsics=np.load(art.intrinsics),
+        point_map=points, depth_conf=np.load(art.depth_conf))
+    artifact.write_text(art.model_dump_json())
+    assert art.quality.main_gate_passed is False
+    monkeypatch.setenv("SKILL3D_RUN_MODE", "formal")
+    monkeypatch.setattr(ab.runner, "_make_vllm_client", lambda cfg: FakeClient([
+        'ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
+        'used_result_ids=[], derivation=None))\n']))
+    result = ab.run_skill_ablation_v11(
+        [item], artifact_paths={item.episode.qa_id: artifact},
+        output_dir=tmp_path / "formal-low-quality",
+        base_cfg=OnlineRunConfig(mode="real", seed=137,
+                                 model_weights_sha256="a" * 64, environment_sha256="b" * 64),
+        seed=137, quality_confirmation={
+            "confirmed": True, "sha256": ab.quality_contract()["sha256"],
+            "evidence_ref": "test-only", "main_gate_passed": False,
+            "artifact": {"sha256": ab._file_hash(artifact),
+                         "frame_set_hash": item.episode.frame_set.frame_set_hash}})
+    assert result["status"] == "completed"
+    assert result["formal_result_eligible"] is True
 
 
 def test_development_run_cannot_gain_formal_eligibility(panel, tmp_path, monkeypatch):

@@ -102,6 +102,46 @@ def test_cache_identity_is_stable_for_the_same_source():
     assert build() == build()
 
 
+@pytest.mark.parametrize("update", [
+    {"source_frame_indices": [100, 200]},
+    {"readable_frame_ids": [0], "decode_status": "partial"},
+    {"preprocessing_version": "different"},
+    {"timestamps": [1.0, 2.0]},
+])
+def test_cache_identity_separates_physical_frames_readability_and_preprocessing(update):
+    base = fs.build_frame_set(2, n_frames=2, video_id="same-video", scene_name="same")
+    changed = base.model_copy(update=update)
+    assert changed.frame_set_hash == base.frame_set_hash
+    assert changed.cache_identity() != base.cache_identity()
+
+
+def test_cache_identity_separates_pixels_and_rejects_changes_to_frozen_pixels():
+    import numpy as np
+
+    base = fs.build_frame_set(2, n_frames=2)
+    pixels = [np.zeros((4, 4, 3), np.uint8) for _ in range(2)]
+    first = fs.with_pixel_identity(base, pixels)
+    pixels[1][0, 0, 0] = 1
+    second = fs.with_pixel_identity(base, pixels)
+    assert first.cache_identity() != second.cache_identity()
+    assert first.frame_set_hash == second.frame_set_hash
+    with pytest.raises(fs.FrameSetError, match="pixels changed"):
+        fs.with_pixel_identity(first, pixels)
+
+
+def test_vggt_png_input_does_not_reuse_stale_pixels(tmp_path):
+    import cv2
+    import numpy as np
+    from skill3d.reconstruction.vggt_runner import _write_frozen_frames
+
+    stale = np.zeros((4, 4, 3), np.uint8)
+    cv2.imwrite(str(tmp_path / "0000.png"), stale)
+    current = np.full((4, 4, 3), 71, np.uint8)
+    paths = _write_frozen_frames([current], tmp_path)
+    decoded = cv2.cvtColor(cv2.imread(paths[0]), cv2.COLOR_BGR2RGB)
+    np.testing.assert_array_equal(decoded, current)
+
+
 def test_frame_set_hash_definition_is_unchanged():
     """`frame_set_hash` 仍是"帧索引内容哈希"——缓存身份是**另一个**键，不改写它。"""
     fset = fs.build_frame_set(64, n_frames=32, fps=30.0)

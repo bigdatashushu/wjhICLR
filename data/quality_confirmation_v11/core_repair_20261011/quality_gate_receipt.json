@@ -1,0 +1,44 @@
+{
+  "code_identity": {
+    "base_commit": "f3025ab89bd1dc510797de6d0132bd09675c13a2",
+    "source_root": "/home/cvailab/experiments/harness3d-v11/campaigns/core-repair-20261011/snapshot/source",
+    "source_sha256": "21100aea37a594c84fa1e31c948c9d7bd15620ca283c6adb2d869795f608f7ff",
+    "git_dirty": true,
+    "diff_sha256": "89e294e3bbf1a7de15742b9f96a1821f849f523e4f25232a8a06a7dc42b128c5",
+    "run_mode": "development"
+  },
+  "confirmation_scope": "Frozen rule/version/input identity and authorization correctness",
+  "confirmed": true,
+  "development_results_formal_eligible": false,
+  "evidence": {
+    "evidence/analysis.json": "59b220ed622cc48202c16289fde3b7c54c5168c4ed376c9682064252c15fb47d",
+    "evidence/effective_config.json": "3998f1401c1f8cdac93984386632e39b8906daa3df511bf894f86e83488adb24",
+    "evidence/runtime_environment.json": "3085f4a1cc85cefbc00e766ec0ea9368f009935cbe85b678d46e5de5abc80bdb",
+    "evidence/solve_adapter_failure.json": "d88b178b36229263c26cb675469f218f51bb2bd04cbf711b5b42590d456cb0c1",
+    "evidence/stream_abort_verification.json": "e4d373119fb851534c6e78c074991743dc8b08ba7ab25f2a65d04302bc3b6cd9",
+    "evidence/weights_reverified.json": "98c14a5bb59d68a8067150a0494a2e417121812014d85169599e4c36f39f2aa3"
+  },
+  "limits": [
+    "No natural fallback or runtime exception occurred in these six solver outcomes; local regressions cover them.",
+    "No repeated failed executable AST occurred in this GPU panel; local solver regression covers it.",
+    "Two production and one development aborted requests have unknown per-request usage.",
+    "Fixed 2+2 validation does not replace the 512-run experiment.",
+    "Rule confirmation does not claim TODO default thresholds are statistically calibrated."
+  ],
+  "quality_contract_sha256": "072fd4de48d6ae608487d3fbafa67419152862cba1f20d64250ce4a069bac363",
+  "scene_pass_rate_required": false,
+  "thresholds_calibrated": false,
+  "thresholds_changed": false,
+  "verified": {
+    "crop_frame_source_identity": true,
+    "fixed_threshold_AND": true,
+    "geometry_tools_withheld": true,
+    "image_tools_available": true,
+    "independent_scores_and_denominator": true,
+    "original_frame_source_identity": true,
+    "pairing_and_skill_delivery": true,
+    "single_request_stream_abort": true
+  },
+  "verified_utc": "2026-10-11T15:41:19.006949+00:00",
+  "evidence_ref": "/home/cvailab/experiments/harness3d-v11/campaigns/core-repair-20261011/confirmation/quality_gate_receipt.json"
+}

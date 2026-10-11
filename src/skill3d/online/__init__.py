@@ -9,11 +9,14 @@
 `tests/unit/test_no_gpt6_online.py` 静态守卫）。
 """
 
-from .runner import (
-    EpisodeOutcome,
-    OnlineRunConfig,
-    run_episode,
-    run_split,
-)
-
 __all__ = ["EpisodeOutcome", "OnlineRunConfig", "run_episode", "run_split"]
+
+
+def __getattr__(name):
+    # M1: bootstrap reads config before installing solver/model dependencies.
+    # Keep the existing package API while loading the solver only when requested.
+    if name in __all__:
+        from . import runner
+
+        return getattr(runner, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

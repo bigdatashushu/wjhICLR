@@ -25,6 +25,9 @@ from skill3d.infra.experiment_startup import (
     MODE_ENV, RECEIPT_ENV, RUN_ID_RE, configure_run, freeze_working_tree,
     verify_source_receipt,
 )
+from skill3d.online.config import (
+    VLLMSettings, config_receipt, load_config, load_yaml, resolve_runtime,
+)
 
 _COMMIT_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
 
@@ -34,9 +37,17 @@ class GPUExperimentError(RuntimeError):
 
 
 def _read_config(path: Path) -> dict:
-    value = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(value, dict):
-        raise GPUExperimentError("GPU experiment config must be a YAML mapping")
+    value = load_yaml(path)
+    runtime = value["runtime"]
+    # Validate the same request fields used by every Python entry point.
+    runtime.setdefault("max_tokens", 4096)
+    VLLMSettings(model=runtime["served_model_name"],
+                 n_frames=runtime["n_images"], max_pixels=runtime["max_pixels"],
+                 max_model_len=runtime["max_model_len"], max_tokens=runtime["max_tokens"],
+                 gpu_memory_utilization=runtime["gpu_memory_utilization"],
+                 endpoints=[f"http://{runtime['host']}:{runtime['port']}"])
+    if type(value["experiment"]["seed"]) is not int or value["experiment"]["seed"] < 0:
+        raise GPUExperimentError("experiment.seed must be a non-negative integer")
     return value
 
 
@@ -472,11 +483,15 @@ def _quality_confirmation_ok(path: Path) -> bool:
             scene = json.loads(scene_path.read_text(encoding="utf-8"))
         except Exception:
             return False
-        if scene.get("confirmed") not in (True, False):
+        # M2: this flag confirms the rules/identity, never scene main_gate_passed.
+        # A genuine low-quality scene may (and should) still have confirmed=True.
+        if scene.get("confirmed") is not True:
             return False
         if scene.get("sha256", scene.get("quality_contract_sha256")) != contract["sha256"]:
             return False
         if not scene.get("evidence_ref"):
+            return False
+        if scene.get("scene_name") != row.get("scene_name"):
             return False
     return bool(value["scenes"])
 
@@ -516,8 +531,7 @@ def _pipeline(
     endpoint = f"http://{runtime['host']}:{runtime['port']}"
     python = sys.executable
     video_root = str(Path(str(experiment["video_root"])).expanduser())
-    runtime_config = _read_config(root / "configs" / "config.yaml")
-    runtime_config["split_config"] = str(root / runtime_config["split_config"])
+    runtime_config = load_config(root / "configs" / "config.yaml")
     runtime_config["seed"] = int(experiment["seed"])
     runtime_config.setdefault("frame_sampling", {})["n_frames"] = int(runtime["n_images"])
     runtime_config.setdefault("vllm", {}).update({
@@ -525,7 +539,14 @@ def _pipeline(
         "max_pixels": int(runtime["max_pixels"]),
         "max_model_len": int(runtime["max_model_len"]),
         "model": str(runtime["served_model_name"]),
+        "endpoints": [endpoint],
+        "max_tokens": runtime.get("max_tokens", 4096),
     })
+    resolve_runtime(runtime_config, formal=bool(experiment.get("formal")) and not dry_run)
+    for key in ("n_frames", "max_pixels", "max_model_len", "model", "endpoints", "max_tokens"):
+        runtime_config.sources[f"vllm.{key}"] = "gpu.runtime"
+    runtime_config.sources["seed"] = "gpu.experiment"
+    runtime_config.sources["frame_sampling.n_frames"] = "gpu.runtime"
     library = run_root / "skill_library"
     if not dry_run:
         shutil.copytree(root / "skill_library", library)
@@ -533,9 +554,12 @@ def _pipeline(
         "skill_library": str(library),
         "active_snapshot": str(library / "snapshots" / "active_snapshot.json"),
     })
+    for key in ("skill_library", "active_snapshot"):
+        runtime_config.sources[f"paths.{key}"] = "gpu.run_directory"
     config_file = run_root / "runtime_config.yaml"
     config_file.write_text(yaml.safe_dump(
-        runtime_config, allow_unicode=True, sort_keys=True), encoding="utf-8")
+        dict(runtime_config), allow_unicode=True, sort_keys=True), encoding="utf-8")
+    _write_json(run_root / "runtime_configuration.json", config_receipt(runtime_config))
     config_path = str(config_file)
     recon_dir = run_root / "reconstructions"
     question_type = str(experiment["question_type"])

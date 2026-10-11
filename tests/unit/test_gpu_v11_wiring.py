@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location(
@@ -77,7 +78,7 @@ def test_vggt_uses_launcher_checkpoint(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "vggt.utils.load_fn",
                         SimpleNamespace(load_and_preprocess_images=None))
     with pytest.raises(RuntimeError, match="stop before inference"):
-        run_vggt([], "scene", tmp_path)
+        run_vggt([np.zeros((4, 4, 3), np.uint8)], "scene", tmp_path)
     assert received == [str(tmp_path / "pinned-vggt")]
 
 

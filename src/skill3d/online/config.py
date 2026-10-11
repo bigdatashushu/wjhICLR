@@ -2,13 +2,65 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, fields
+import math
+import os
 from pathlib import Path
+import re
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import yaml
 
 DEFAULT_CONFIG = "configs/config.yaml"
+SOURCE_ROOT = Path(__file__).resolve().parents[3]
+_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
+
+
+class RuntimeConfig(dict):
+    """Effective values with audit metadata kept outside the YAML fields."""
+
+    def __init__(self, values: dict, *, path: Path, sources: dict):
+        super().__init__(values)
+        self.path = str(path)
+        self.sources = sources
+
+
+def resolve_path(path: str | Path) -> Path:
+    """M1: repository resources have one root, independent of the caller's cwd."""
+    value = Path(path).expanduser()
+    return value.resolve() if value.is_absolute() else (SOURCE_ROOT / value).resolve()
+
+
+def expand_values(value: Any, _chain: tuple[str, ...] = ()) -> Any:
+    """Expand parsed string values; environment text can never become YAML syntax."""
+    if isinstance(value, dict):
+        return {key: expand_values(item, _chain) for key, item in value.items()}
+    if isinstance(value, list):
+        return [expand_values(item, _chain) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def replace(match):
+        name, default = match.groups()
+        if name in _chain:
+            raise ValueError(f"Cyclic configuration variable: {' -> '.join((*_chain, name))}")
+        if name in os.environ:
+            replacement = os.environ[name]
+            # Match the existing shell ${VAR:-default} convention for empty values.
+            if replacement == "" and default is not None:
+                replacement = default
+        elif default is not None:
+            replacement = default
+        else:
+            raise ValueError(f"Missing configuration variable: {name}")
+        return expand_values(replacement, (*_chain, name))
+
+    result = _PLACEHOLDER.sub(replace, value)
+    if "${" in result:
+        raise ValueError("Unresolved or malformed configuration placeholder")
+    return result
 
 # 与 configs/config.yaml 的默认值保持一致（yaml 缺失键时的兜底）
 _FALLBACK: dict[str, Any] = {
@@ -46,6 +98,8 @@ _FALLBACK: dict[str, Any] = {
         "dp_world_size": 8,
         "base_port": 8100,
         "temperature": 0.0,
+        "max_tokens": 4096,
+        "endpoints": [],
     },
     "sandbox": {
         "cell_timeout_s": 120,
@@ -72,25 +126,64 @@ def _deep_merge(base: dict, over: dict) -> dict:
 
 
 def load_config(path: Optional[str | Path] = None) -> dict:
-    """读主配置并与默认值合并；文件不存在时回退默认值（不报错，便于 CLI 先跑）。"""
-    cfg_path = Path(path) if path is not None else Path(DEFAULT_CONFIG)
-    if not cfg_path.is_file():
-        return dict(_FALLBACK)
-    loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(loaded, dict):
-        raise ValueError(f"配置格式错误（应为 mapping）: {cfg_path}")
-    return _deep_merge(_FALLBACK, loaded)
+    """Read and validate before sampling; missing explicit inputs never fall back."""
+    cfg_path = resolve_path(path if path is not None else DEFAULT_CONFIG)
+    loaded = load_yaml(cfg_path)
+    allowed = set(_FALLBACK) | {"input_diagnostics", "detection"}
+    unknown = set(loaded) - allowed
+    if unknown:
+        raise ValueError(f"Unknown runtime configuration fields: {sorted(unknown)}")
+    cfg = RuntimeConfig(_deep_merge(deepcopy(_FALLBACK), loaded),
+                        path=cfg_path, sources={})
+    for section in ("paths", "frame_sampling", "vllm", "sandbox", "active_vision", "retrieval"):
+        if not isinstance(cfg[section], dict):
+            raise ValueError(f"{section} must be a mapping")
+    for key, value in cfg.items():
+        if isinstance(value, dict):
+            for name in value:
+                cfg.sources[f"{key}.{name}"] = (
+                    "yaml" if name in loaded.get(key, {}) else "default")
+        else:
+            cfg.sources[key] = "yaml" if key in loaded else "default"
+    _integer(cfg["seed"], "seed", minimum=0)
+    for key in ("max_solver_rounds", "max_retries_per_operation", "finalization_rounds"):
+        _integer(cfg[key], key, minimum=0 if key == "finalization_rounds" else 1)
+    if not isinstance(cfg["eval_visual_fallback"], bool):
+        raise ValueError("eval_visual_fallback must be boolean")
+    cfg["paths"] = asdict(paths_from(cfg))
+    if not isinstance(cfg["split_config"], str) or not cfg["split_config"]:
+        raise ValueError("split_config must be a non-empty path")
+    cfg["split_config"] = str(resolve_path(cfg["split_config"]))
+    cfg["vllm"] = asdict(vllm_from(cfg))
+    sandbox_from(cfg)
+    active_vision_from(cfg)
+    resolve_runtime(cfg)
+    return cfg
 
 
 def load_yaml(path: str | Path) -> dict:
-    """读任意配置 yaml（split）。"""
-    p = Path(path)
+    """Shared strict parsed-value reader for runtime, split and GPU configurations."""
+    p = resolve_path(path)
     if not p.is_file():
-        return {}
-    data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        raise FileNotFoundError(f"Configuration file not found: {p}")
+    data = yaml.safe_load(p.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError(f"配置格式错误（应为 mapping）: {p}")
-    return data
+    return expand_values(data)
+
+
+def _integer(value: Any, name: str, *, minimum: int = 1) -> None:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}")
+
+
+def _settings(kind, data: Any, section: str):
+    if not isinstance(data, dict):
+        raise ValueError(f"{section} must be a mapping")
+    unknown = set(data) - {item.name for item in fields(kind)}
+    if unknown:
+        raise ValueError(f"Unknown {section} fields: {sorted(unknown)}")
+    return kind(**data)
 
 
 @dataclass
@@ -105,10 +198,44 @@ class VLLMSettings:
     dp_world_size: int = 8
     base_port: int = 8100
     temperature: float = 0.0
+    max_tokens: int = 4096
     # 32 帧输入与单帧像素上限（§1.2 / §4 M1；实测 32 帧 @131072 → ~9703 prompt tokens）
     n_frames: int = 32
     max_pixels: int = 131072
     endpoints: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        for name in ("max_model_len", "max_tokens", "n_frames", "max_pixels",
+                     "tensor_parallel_size", "dp_world_size", "base_port"):
+            _integer(getattr(self, name), f"vllm.{name}")
+        if self.base_port > 65535:
+            raise ValueError("vllm.base_port must be <= 65535")
+        if self.max_tokens >= self.max_model_len:
+            raise ValueError("vllm.max_tokens must leave a positive input context budget")
+        for name, low, high in (("temperature", 0, 2), ("gpu_memory_utilization", 0, 1)):
+            value = getattr(self, name)
+            if (type(value) not in (int, float) or not math.isfinite(value)
+                    or not low <= value <= high
+                    or (name == "gpu_memory_utilization" and value == 0)):
+                raise ValueError(f"vllm.{name} is outside its valid range")
+        if not isinstance(self.model, str) or not self.model:
+            raise ValueError("vllm.model must be non-empty")
+        if not isinstance(self.quantization, str) or not self.quantization:
+            raise ValueError("vllm.quantization must be non-empty")
+        if not isinstance(self.endpoints, list):
+            raise ValueError("vllm.endpoints must be a list of URLs")
+        for endpoint in self.endpoints:
+            if not isinstance(endpoint, str):
+                raise ValueError("vllm.endpoints must contain URLs")
+            parsed = urlsplit(endpoint)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise ValueError(f"Invalid vLLM endpoint: {endpoint}")
+            if parsed.username or parsed.password:
+                raise ValueError("vLLM endpoint credentials must not be embedded in URLs")
+            try:
+                parsed.port
+            except ValueError as exc:
+                raise ValueError("Invalid vLLM endpoint port") from exc
 
     @property
     def configured(self) -> bool:
@@ -140,17 +267,75 @@ class SandboxSettings:
 
 
 def paths_from(cfg: dict) -> PathSettings:
-    return PathSettings(**(cfg.get("paths") or {}))
+    settings = _settings(PathSettings, cfg.get("paths", {}), "paths")
+    for item in fields(settings):
+        value = getattr(settings, item.name)
+        if item.name == "raw_video_fallbacks":
+            if not isinstance(value, list) or any(not isinstance(v, str) or not v for v in value):
+                raise ValueError("paths.raw_video_fallbacks must be a list of paths")
+            setattr(settings, item.name, [str(resolve_path(v)) for v in value])
+        else:
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"paths.{item.name} must be a non-empty path")
+            setattr(settings, item.name, str(resolve_path(value)))
+    return settings
 
 
 def vllm_from(cfg: dict) -> VLLMSettings:
-    data = dict(cfg.get("vllm") or {})
-    data.pop("endpoints", None)
-    return VLLMSettings(**data)
+    return _settings(VLLMSettings, cfg.get("vllm", {}), "vllm")
+
+
+def resolve_runtime(cfg: dict, *, seed=None, n_frames=None, endpoints=None,
+                    model=None, formal: bool = False) -> dict:
+    """M1 precedence: explicit CLI overrides YAML/default; preserve 0 and []."""
+    sources = getattr(cfg, "sources", {})
+    if seed is not None:
+        cfg["seed"] = seed
+        sources["seed"] = "cli"
+    _integer(cfg["seed"], "seed", minimum=0)
+    sampling = cfg["frame_sampling"]
+    if set(sampling) - {"n_frames", "strategy"}:
+        raise ValueError("Unknown frame_sampling fields")
+    if n_frames is not None:
+        sampling["n_frames"] = n_frames
+        sources["frame_sampling.n_frames"] = "cli"
+    _integer(sampling["n_frames"], "frame_sampling.n_frames")
+    if sampling.get("strategy", "uniform") != "uniform":
+        raise ValueError("frame_sampling.strategy must be uniform")
+    if endpoints is not None:
+        cfg["vllm"]["endpoints"] = endpoints
+        sources["vllm.endpoints"] = "cli"
+    if model is not None:
+        cfg["vllm"]["model"] = model
+        sources["vllm.model"] = "cli"
+    settings = vllm_from(cfg)
+    if sampling["n_frames"] > settings.n_frames:
+        raise ValueError("Input frame count exceeds the configured model image capacity")
+    if formal and (sampling["n_frames"] != 32 or settings.n_frames < 32):
+        raise ValueError("Formal experiments require the frozen 32-frame input contract")
+    return cfg
+
+
+def config_receipt(cfg: dict) -> dict:
+    """Retain provenance without serializing secret-bearing extension fields."""
+    def public(value):
+        if isinstance(value, dict):
+            return {key: ("<redacted>" if any(word in str(key).lower()
+                        for word in ("api_key", "password", "secret", "authorization"))
+                          else public(item)) for key, item in value.items()}
+        if isinstance(value, list):
+            return [public(item) for item in value]
+        return value
+
+    return {"path": getattr(cfg, "path", ""), "effective": public(dict(cfg)),
+            "sources": dict(getattr(cfg, "sources", {}))}
 
 
 def sandbox_from(cfg: dict) -> SandboxSettings:
-    return SandboxSettings(**(cfg.get("sandbox") or {}))
+    settings = _settings(SandboxSettings, cfg.get("sandbox", {}), "sandbox")
+    _integer(settings.cell_timeout_s, "sandbox.cell_timeout_s")
+    _integer(settings.max_regenerate, "sandbox.max_regenerate", minimum=0)
+    return settings
 
 
 @dataclass
@@ -162,10 +347,11 @@ class ActiveVisionSettings:
 
 
 def active_vision_from(cfg: dict) -> ActiveVisionSettings:
-    data = dict((cfg or {}).get("active_vision") or {})
-    return ActiveVisionSettings(
-        layout=str(data.get("layout", "derived_plus_originals_v1")),
-        max_derived_images=int(data.get("max_derived_images", 8)))
+    settings = _settings(ActiveVisionSettings, cfg.get("active_vision", {}), "active_vision")
+    _integer(settings.max_derived_images, "active_vision.max_derived_images", minimum=0)
+    if settings.layout != "derived_plus_originals_v1":
+        raise ValueError("Unsupported active_vision.layout")
+    return settings
 
 
 def retrieval_policy_from(cfg: dict):

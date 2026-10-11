@@ -60,7 +60,14 @@ def load_meta(cache_dir: Optional[str] = None,
 
     HF 仅提供 QA meta，原始视频需另行获取（TODO_USER_INPUT 视频访问方式）。
     """
-    path = Path(local_path) if local_path is not None else Path(LOCAL_META_JSONL)
+    from skill3d.online.config import resolve_path
+
+    path = resolve_path(local_path if local_path is not None else LOCAL_META_JSONL)
+    if path.is_dir():
+        path = path / "test.jsonl"
+    if local_path is not None and not path.is_file():
+        # An explicit source typo must not silently download a different panel.
+        raise FileNotFoundError(f"Configured VSI metadata not found: {path}")
     if path.is_file():
         from skill3d.adapters.split_builder import load_local_meta
 

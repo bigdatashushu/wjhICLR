@@ -25,6 +25,15 @@ from skill3d.online import synthetic as syn
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
 
 
+def _fixture_config(tmp_path, split, scene):
+    """Synthetic CLI fixtures declare their scene membership just like real panels."""
+    split_path = tmp_path / "split.yaml"
+    split_path.write_text(f"{split}_scene_ids: [{scene}]\n")
+    config = tmp_path / "config.yaml"
+    config.write_text(f"split_config: {split_path}\n")
+    return config
+
+
 def _run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
     src = str(Path(__file__).resolve().parents[2] / "src")
     env = dict(os.environ)
@@ -96,6 +105,7 @@ def test_online_eval_writes_input_error_row_and_preserves_denominator(tmp_path):
         "--split", "inner_validation",
         "--source", "jsonl",
         "--episodes-jsonl", str(episodes),
+        "--config", str(_fixture_config(tmp_path, "inner_validation", "missing-scene")),
         "--mode", "mock_light",
         "--trace-dir", str(trace_dir),
 
@@ -151,6 +161,7 @@ def test_reconstruction_plan_only(tmp_path):
     }) for k, qt in enumerate(["room_size_estimation", "object_size_estimation"])) + "\n", encoding="utf-8")
 
     r = _run("skill3d.reconstruction.run", "--source", "jsonl", "--episodes-jsonl", str(jl),
+             "--config", str(_fixture_config(tmp_path, "induction", "cli-scene-1")),
              "--split", "induction", "--method", "vggt", "--plan-only",
              "--recon-dir", str(tmp_path / "recon"))
     assert r.returncode == 0, r.stderr

@@ -175,6 +175,9 @@ def input_identity(item: EpisodeItem, artifact_path: str | Path) -> dict:
         raise PairingError(f"{ep.qa_id}: actual pixel count mismatch")
     if any(p.ndim != 3 or p.shape[2] != 3 or p.size == 0 for p in item.pixels):
         raise PairingError(f"{ep.qa_id}: invalid RGB pixels")
+    from skill3d.adapters.frame_set import with_pixel_identity
+
+    with_pixel_identity(fs, item.pixels)
     for key, actual, expected in (
         ("dataset", fs.dataset_id, ep.dataset),
         ("scene", fs.scene_name, ep.scene_name),
@@ -313,6 +316,11 @@ def quality_contract() -> dict:
         "online/runner.py", "online/submission.py",
         "synthesis/eval_visual_fallback.py", "synthesis/request_context.py",
         "synthesis/vllm_client.py", "fsm/online_fsm.py",
+        "online/config.py", "online/recovery.py",
+        "synthesis/program_assembler.py", "synthesis/prompt_builder.py", "tools/docs_v11.py",
+        "adapters/frame_set.py", "adapters/episode_source.py",
+        "reconstruction/vggt_runner.py",
+        "sandbox/kernel.py", "sandbox/receipt.py",
     )
     value = {
         "enabled": True, "metric_version": m4_main_gate.M4_GATE_VERSION,
@@ -336,7 +344,7 @@ def _common_config(cfg: OnlineRunConfig) -> dict:
     value = {f.name: getattr(cfg, f.name) for f in fields(cfg)
              if f.name not in private and f.name != "retrieval_policy"}
     value["retrieval_policy"] = cfg.retrieval_policy.to_dict()
-    value["temperature"] = 0.0
+    value["temperature"] = cfg.temperature
     value["prompt_template_version"] = PROMPT_TEMPLATE_VERSION
     value["execution_protocol_version"] = EXECUTION_PROTOCOL_VERSION
     value["tool_face_version"] = TOOL_FACE_VERSION
@@ -365,6 +373,10 @@ class _RecordingClient:
     @property
     def last_usage(self):
         return getattr(self.client, "last_usage", {})
+
+    @property
+    def last_generation(self):
+        return getattr(self.client, "last_generation", {})
 
     def chat(self, messages, max_tokens=4096, **kwargs):
         plain = copy.deepcopy(messages)
@@ -401,6 +413,7 @@ class _RecordingClient:
                 raise RuntimeError("model endpoint not configured")
             answer = self.client.chat(messages, max_tokens=max_tokens, **kwargs)
             row["success"] = True
+            row["response_text"] = answer
             return answer
         except Exception as exc:
             row["error"] = f"{type(exc).__name__}: {exc}"
@@ -409,6 +422,9 @@ class _RecordingClient:
                 self.contract_errors.append(row["error"])
             raise
         finally:
+            row["usage"] = dict(self.last_usage or {})
+            row["usage_status"] = "measured" if row["usage"] else "unknown"
+            row["generation"] = dict(self.last_generation or {})
             self.store.append("model_requests", row)
 
 
@@ -836,6 +852,17 @@ def run_skill_ablation_v11(
                 else quality_confirmation)
             for q in expected
         }
+        formal_requested = (
+            client_factory is None and os.environ.get(MODE_ENV) != "development"
+            and any(c is not None and c.get("confirmed") is True
+                    for c in confirmation_by_qa.values()))
+        if formal_requested and (
+                cfg.max_images < 32
+                or any(it.episode.frame_set is None
+                       or (len(it.episode.frame_set.frame_ids) != 32
+                           and it.episode.frame_set.n_total_frames >= 32)
+                       for it in chosen.values() if it.input_error is None)):
+            raise PairingError("Formal experiments require the frozen 32-frame input contract")
         for q, confirmation in confirmation_by_qa.items():
             if confirmation is None:
                 continue
@@ -852,6 +879,33 @@ def run_skill_ablation_v11(
                 else input_identity(it, artifact_paths[q]))
             for q, it in chosen.items()
         }
+        # M2: confirm the already validated nested identity before M5/client creation.
+        # Contract confirmation is independent of the per-scene geometry decision.
+        for q, confirmation in confirmation_by_qa.items():
+            if confirmation is None or chosen[q].input_error is not None:
+                continue
+            identity = identities[q]
+            episode = identity["episode"]
+            if (confirmation.get("scene_name") is not None
+                    and confirmation["scene_name"] != episode["scene_name"]):
+                raise PairingError(f"{q}: scene differs from quality confirmation")
+            expected_artifact = confirmation.get("artifact", {})
+            if not isinstance(expected_artifact, dict):
+                raise PairingError(f"{q}: quality confirmation artifact must be a mapping")
+            for key, actual in (
+                ("sha256", identity["artifact_json_sha256"]),
+                ("frame_set_hash", episode["frame_set"]["frame_set_hash"]),
+                ("artifact_id", identity["artifact_id"]),
+                ("artifact_version", identity["artifact_version"]),
+            ):
+                if key in expected_artifact and expected_artifact[key] != actual:
+                    raise PairingError(f"{q}: {key} differs from quality confirmation")
+            original = ReconstructionArtifact.model_validate_json(
+                Path(artifact_paths[q]).read_bytes())
+            if confirmation.get("confirmed") is True and (
+                    original.quality is None
+                    or original.quality.gate_thresholds != quality["default_thresholds"]):
+                raise PairingError(f"{q}: artifact quality thresholds differ from confirmed contract")
         # One alleged artifact identity cannot refer to different data across questions.
         seen = {}
         for q, identity in identities.items():
@@ -938,13 +992,6 @@ def run_skill_ablation_v11(
             prepared[q] = {"directory": str(frozen), **tree_identity(frozen),
                            "gate_thresholds": art.quality.gate_thresholds if art.quality else None}
             confirmation = confirmation_by_qa[q]
-            if confirmation and confirmation.get("artifact", {}).get("sha256"):
-                artifact_sha = _file_hash(Path(artifact_paths[q]).resolve())
-                if artifact_sha != confirmation["artifact"]["sha256"]:
-                    raise PairingError(f"{q}: artifact hash differs from quality confirmation")
-            if confirmation and confirmation.get("artifact", {}).get("frame_set_hash"):
-                if confirmation["artifact"]["frame_set_hash"] != identities[q]["frame_set_hash"]:
-                    raise PairingError(f"{q}: frame_set_hash differs from quality confirmation")
             if confirmation and confirmation.get("confirmed") is True and (
                 prepared[q]["gate_thresholds"] != quality["default_thresholds"]
             ):

@@ -27,6 +27,7 @@ EvidenceProfile 状态统一适用；级联撤销会**回写** EvidenceProfile�
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Optional
@@ -232,6 +233,82 @@ def failed_call_feedback(results) -> str:
     return "\n".join(lines)
 
 
+def evidence_state_fingerprint(scene, handle, kernel, *, excluded_ids=()) -> str:
+    """M4: hash facts and authorization, excluding receipt/round bookkeeping."""
+    excluded = set(excluded_ids)
+    observations = set()
+    for obs in collect_validated(kernel):
+        if obs.result_id not in excluded:
+            observations.add(json.dumps(
+                [obs.source_tool, obs.evidence_version, obs.args,
+                 obs.payload, obs.degraded_evidence],
+                sort_keys=True, ensure_ascii=False, default=str))
+    ledger = getattr(handle, "_ledger", None)
+    images = [
+        [image.image_id, image.content_sha256, image.observed()]
+        for image in (ledger.all_images() if ledger is not None else [])
+    ]
+    value = {
+        "observations": sorted(observations),
+        "scene": scene.model_dump(mode="json") if scene is not None else None,
+        "handle": handle.state_digest() if handle is not None else None,
+        "objects": [obj.model_dump(mode="json") for obj in handle.object_records()]
+        if handle is not None else [],
+        "images": images,
+    }
+    return hashlib.sha256(json.dumps(
+        value, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+
+
+def deterministic_cell_failure(cell, results) -> bool:
+    """Transient service/network failures must retain the original retry path."""
+    transient = ("timeout", "connection", "service", "network", "unavailable", "fault", "offline")
+    for result in results:
+        payload = _payload_of(result)
+        if isinstance(payload, dict) and (
+                payload.get("service_healthy") is False or payload.get("status") == "fault"):
+            return False
+        if isinstance(payload, dict) and any(
+                word in str(payload.get("error", "")).lower() for word in transient):
+            return False
+        error = str(getattr(result, "error", "") or "").lower()
+        if any(word in error for word in transient):
+            return False
+    if cell.error_code == "timeout":
+        return False
+    return cell.error_type in {
+        "KeyError", "AttributeError", "TypeError", "IndexError",
+        "ToolContractError", "DomainValueError", "ArtifactUnavailableError",
+        "ConfidenceGateError",
+    }
+
+
+def field_repair_instructions(cell, results) -> str:
+    """Derive a specific field repair from the real error and real ToolResult."""
+    if cell.error_type != "KeyError" or cell.error_message.strip("'\"") != "obj_id":
+        return ""
+    lines = []
+    for result in results:
+        if (result.source_tool or result.tool) != "detect_objects":
+            continue
+        payload = _payload_of(result)
+        if result.status != "ok" or not isinstance(payload, dict):
+            continue
+        detections = payload.get("detections")
+        if not isinstance(detections, list) or not detections:
+            continue
+        if all(isinstance(item, dict) and "obj_id" not in item for item in detections):
+            lines.append(
+                f"Required field repair: detect_objects result_id={result.result_id} "
+                "detections have no obj_id. "
+                f"This result reports new_object_ids={_json(payload.get('new_object_ids'))}. "
+                "Use the real new_object_ids and list_objects records to verify object identity. "
+                "An empty new_object_ids list does not mean previously registered objects disappeared. "
+                "Do not infer a detection-to-object mapping from list order. "
+                "New 2D candidates have no 3D geometry.")
+    return "\n".join(lines)
+
+
 @dataclass
 class RecoveryPlan:
     """一次恢复动作的完整描述（进 trace，可审计）。"""
@@ -426,8 +503,11 @@ __all__ = [
     "build_feedback",
     "cascade_invalidate",
     "collect_validated",
+    "deterministic_cell_failure",
     "downgrade_profile",
+    "evidence_state_fingerprint",
     "failed_call_feedback",
+    "field_repair_instructions",
     "invalidate_results",
     "observation_feedback",
     "premise_of_failure",

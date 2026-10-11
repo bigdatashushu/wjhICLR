@@ -34,3 +34,12 @@ class ProgramExecutionTrace(Spec):
     wallclock_s: float
     # D-3：一旦 `ReturnAnswer` 依赖的某次 Tool 抛 ToolContractError，最终答案不得采纳
     answer_untrusted: bool = False
+    # M3 additive diagnostics; old traces remain readable with empty defaults.
+    stdout: str = ""
+    traceback_text: str = ""
+    error_type: str = ""
+    error_message: str = ""
+    error_line: Optional[int] = None
+    error_source_line: str = ""
+    program_sha256: str = ""
+    source_filename: str = ""

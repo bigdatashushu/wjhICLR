@@ -54,6 +54,40 @@ class SynthesisError(RuntimeError):
     """program 无法解析；上层据此触发有限次重生成。"""
 
 
+def executable_ast_fingerprint(source: str) -> str:
+    """M4: retain executable identity while ignoring comments and docstrings."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if (body and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)):
+                node.body = body[1:]
+    return hashlib.sha256(ast.dump(tree, include_attributes=False).encode()).hexdigest()
+
+
+def streaming_degenerate_reason(text: str) -> Optional[str]:
+    """Stop only a continuous, completed repetition; length alone is insufficient."""
+    completed = str(text).split("\n")[:-1]
+    lines = [line.strip() for line in completed if line.strip()]
+    # Short repeated syntax such as pass/brackets is common in valid programs.
+    for period in range(1, 5):
+        repeats = max(4, (8 + period - 1) // period)
+        width = period * repeats
+        if len(lines) < width:
+            continue
+        block = lines[-period:]
+        if any(len(line) < 24 for line in block):
+            continue
+        if not all(line.startswith("#") for line in block) and _parses("\n".join(block)):
+            # Repeated executable statements can be intentional; do not truncate them.
+            continue
+        if lines[-width:] == block * repeats:
+            return f"Continuous repetition of {period} completed lines ({repeats} cycles)"
+    return None
+
+
 def _parses(source: str) -> bool:
     try:
         ast.parse(source)

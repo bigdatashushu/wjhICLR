@@ -87,6 +87,7 @@ from skill3d.synthesis.program_assembler import (
     assemble_program,
     assemble_program_ex,
     degenerate_reason,
+    executable_ast_fingerprint,
 )
 from skill3d.synthesis.prompt_builder import (
     PROMPT_TEMPLATE_VERSION,
@@ -111,8 +112,11 @@ from skill3d.online.recovery import (
     build_feedback,
     cascade_invalidate,
     collect_validated,
+    deterministic_cell_failure,
     downgrade_profile,
+    evidence_state_fingerprint,
     failed_call_feedback,
+    field_repair_instructions,
     invalidate_results,
     observation_feedback,
     premise_of_failure,
@@ -173,6 +177,7 @@ class OnlineRunConfig:
     metric_model_name: str = "none"          # moge2 | metric3d_v2 | none
     reuse_artifact: Optional[str] = None    # 复用既有 artifact JSON（硬约束 18：A/B 同源）
     max_tokens: int = 4096
+    temperature: float = 0.0
     max_images: int = 32                    # M8 送进模型的最大帧数（与 §4 M1 对齐）
     max_pixels: int = 131072                # 实测起点：32 帧 ≈ 9.7k prompt tokens（A-4）
     max_model_len: int = 32768
@@ -399,6 +404,7 @@ class _SynthResult:
     delivery: Optional[SkillDeliveryPlan] = None
     # v9 §9.4：本轮图像清单（布局、实际装入的图像、被省略的图与 token 成本）
     image_round: dict = field(default_factory=dict)
+    generation: dict = field(default_factory=dict)
 
 
 class _Counter:
@@ -610,6 +616,11 @@ def _round_record(
                                 for r in results if str(getattr(r, "result_id", "") or "")],
         "tool_calls": len(results),
         "error_code": str(getattr(program_trace, "error_code", "") or ""),
+        "execution_diagnostics": ({
+            key: getattr(program_trace, key) for key in (
+                "traceback_text", "error_type", "error_message", "error_line",
+                "error_source_line", "source_filename", "program_sha256", "stdout")
+        } if program_trace is not None else {}),
         "service_errors": [
             {"tool": r.tool, "error": (r.payload or {}).get("error", "service fault")}
             for r in results
@@ -1515,6 +1526,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
     observation_images: list[str] = []
     trigger = "initial"
     retry_counts: dict[str, int] = {}
+    failed_programs: dict[tuple[str, str], dict] = {}
     force_next = False
     unresolved_ids: set[str] = set()
     termination_reason = "solver_round_budget_exhausted"
@@ -1589,11 +1601,14 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                                program=res.program, program_trace=None,
                                response_text=res.response_text)
         record.update(execution_protocol_version=EXECUTION_PROTOCOL_VERSION,
-                      feedback=feedback or "", executed=False)
+                      feedback=feedback or "", executed=False,
+                      generation=dict(res.generation))
         outcome.rounds.append(record)
         outcome.round_trace_refs = [f"round:{r['index']}" for r in outcome.rounds]
         program = res.program
         failure_key = ""
+        field_repair = ""
+        deterministic_failure = False
         feedback = None
         observation_images = []
         if program is None:
@@ -1606,6 +1621,13 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 break
         else:
             prior_source = program.program_source
+            ast_fingerprint = executable_ast_fingerprint(prior_source)
+            evidence_fingerprint = evidence_state_fingerprint(
+                scene, handle, kernel, excluded_ids=unresolved_ids)
+            failure_identity = (ast_fingerprint, evidence_fingerprint)
+            previous_failure = failed_programs.get(failure_identity)
+            record.update(ast_fingerprint=ast_fingerprint,
+                          evidence_fingerprint=evidence_fingerprint)
             step("done")  # SYNTHESIZE_PROGRAM → STATIC_CHECK
             check = ast_guard(program.program_source, allowed_tools=set(REGISTRY.names()))
             if not check.ok or (finalizing and not _is_zero_tool_answer_program(program)):
@@ -1614,6 +1636,27 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 record["error_code"] = "ast_violation"
                 feedback = "The previous program was rejected by the AST check: " + "; ".join(problems)
                 failure_key = "ast"
+            elif previous_failure is not None and not finalizing:
+                # M4: same deterministic failure with unchanged prerequisites.
+                # This generated response still consumes its existing solver round.
+                failure_key = previous_failure["error_code"]
+                record.update(error_code=failure_key, repeated_failure={
+                    "reason": "same_failed_ast_and_unchanged_evidence",
+                    "prior_round": previous_failure["round"],
+                    "ast_fingerprint": ast_fingerprint,
+                    "evidence_fingerprint": evidence_fingerprint,
+                    "execution_skipped": True,
+                })
+                receipts.append("repeated_program_skipped", {
+                    "round": index, **record["repeated_failure"]})
+                feedback = (
+                    "The same executable program already failed with unchanged evidence; "
+                    "this round did not rerun it or its tools. "
+                    f"Previous failure: {previous_failure['error']}. "
+                    "Change the executable logic using valid observations, or submit an "
+                    "honest visual_estimate from the original images. Comments and formatting "
+                    "changes do not repair the failure.")
+                field_repair = previous_failure["field_repair"]
             else:
                 step("pass")
                 if kernel is not None:
@@ -1636,7 +1679,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 record["executed"] = True
                 record["results"] = [r.model_dump(mode="json") for r in trace.results]
                 receipts.append("cell_run", {"program_id": program.program_id,
-                                             "error_code": cell.error_code})
+                                             "error_code": cell.error_code,
+                                             "execution_diagnostics": record["execution_diagnostics"]})
                 if cell.answer_untrusted:
                     outcome.answer_flags.append("tool_contract_observed")
                 error = cell.error_code
@@ -1742,7 +1786,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     observation_images = _yield_image_ids(cell, kernel, handle)
                     trigger = "observation"
                 else:
+                    deterministic_failure = deterministic_cell_failure(cell, trace.results)
+                    field_repair = field_repair_instructions(cell, trace.results)
                     feedback = f"Program execution failed: {error or 'no_answer'}; {cell.error or 'No answer was submitted'}"
+                    if cell.error_line:
+                        feedback += f"\nSource line {cell.error_line}: {cell.error_source_line}"
                     details = failed_call_feedback(trace.results)
                     if details:
                         feedback += "\n" + details
@@ -1767,6 +1815,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         feedback += "\n" + build_feedback(
                             plan, question_type=outcome.task, scope=outcome.question_tool_scope,
                             require_answer=True, include_observations=False)
+                    if deterministic_failure:
+                        failed_programs[failure_identity] = {
+                            "round": index, "error_code": failure_key,
+                            "error": cell.error, "field_repair": field_repair,
+                        }
 
         if kernel is not None:
             kernel.reset_user_namespace()
@@ -1792,6 +1845,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             trigger = "error_recovery"
         if feedback:
             feedback += f"\nRemaining model request limit: {int(cfg.max_solver_rounds) - index} (including finalization)."
+            if field_repair:
+                feedback += "\n" + field_repair
         if fsm.state is not OnlineState.SYNTHESIZE_PROGRAM:
             step("resynthesize")
 
@@ -2006,10 +2061,12 @@ def _attach_episode_frames(handle: SceneHandle, episode, pixels: Sequence[np.nda
     all_ids = list(getattr(fs, "frame_ids", None) or [])
     # 可读槽位 → 物理源帧号（readable_frame_ids 是 frame_ids 的子集，顺序一致）
     pos = {int(f): k for k, f in enumerate(all_ids)}
-    phys = [k for k in (pos.get(int(f)) for f in ids)]
-    phys = [p for p in phys if p is not None]
+    sources = list(fs.source_frame_indices)
+    if len(sources) != len(all_ids) or any(int(f) not in pos for f in ids):
+        raise ValueError("Readable pixels cannot be mapped to their frozen source frames")
+    phys = [sources[pos[int(f)]] for f in ids]
     handle._set_frames(list(range(len(pixels))), list(pixels),  # noqa: SLF001
-                       source_frame_indices=phys if len(phys) == len(pixels) else None)
+                       source_frame_indices=phys)
 
 
 def _retarget_handle(handle: Optional[SceneHandle], scene: SceneState) -> Optional[SceneHandle]:
@@ -2311,12 +2368,18 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                                    prompt_tokens=usage.get("prompt_tokens"))
 
     # 退化输出由同一个有界求解循环计为一次失败，不在请求函数内暗加重试。
-    reason = degenerate_reason(text)
+    generation = dict(getattr(client, "last_generation", None) or {})
+    generation["usage"] = dict(getattr(client, "last_usage", None) or {})
+    generation.setdefault("usage_status", "measured" if generation["usage"] else "unknown")
+    reason = (generation.get("reason")
+              if generation.get("stop_reason") == "degenerate_repetition"
+              else degenerate_reason(text))
     if reason is not None:
         return _SynthResult(
             None, "vllm_parse_error", f"M8 degenerate output: {reason} (retry through the bounded solver loop)",
             prompt=prompt, n_images=n_images, delivery=delivery,
-            image_round=_round_dict(ledger, round_index), response_text=text)
+            image_round=_round_dict(ledger, round_index), response_text=text,
+            generation=generation)
 
     try:
         # `skill_semver_used` 承载的是"这一轮**实际交付**给模型的方法集"（v8 以来的
@@ -2335,6 +2398,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             delivery=delivery,
             image_round=_round_dict(ledger, round_index),
             response_text=text,
+            generation=generation,
         )
     # §15.2：解析回退单列 m8_parse_recovered，与"真解析不出来"区分开
     source = "m8_parse_recovered" if recovered else "vllm_ok"
@@ -2347,6 +2411,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         delivery=delivery,
         image_round=_round_dict(ledger, round_index),
         response_text=text,
+        generation=generation,
     )
 
 
@@ -2489,7 +2554,8 @@ def _make_vllm_client(cfg: OnlineRunConfig):
         return None
     from skill3d.synthesis.vllm_client import VLLMClient
 
-    return VLLMClient(cfg.vllm_endpoints, cfg.vllm_model)
+    return VLLMClient(cfg.vllm_endpoints, cfg.vllm_model,
+                      temperature=cfg.temperature, max_output_tokens=cfg.max_tokens)
 
 
 def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, receipts,
@@ -2531,6 +2597,10 @@ def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, rec
         calls=list(kernel.cell_calls),
         results=results,
         stdout_tail=cell.stdout_tail,
+        stdout=cell.stdout, traceback_text=cell.traceback_text,
+        error_type=cell.error_type, error_message=cell.error_message,
+        error_line=cell.error_line, error_source_line=cell.error_source_line,
+        program_sha256=cell.program_sha256, source_filename=cell.source_filename,
         error_code=cell.error_code,  # type: ignore[arg-type]
         steps=len(results) + 1,
         wallclock_s=0.0,

@@ -175,25 +175,16 @@ export SAM2_CONFIG="${SAM2_CONFIG:-configs/sam2.1/sam2.1_hiera_l.yaml}"
 
 "$PYTHON_BIN" - "$CONFIG_SOURCE" "$GENERATED_CONFIG" \
   "$QWEN_GPU" "$GEOMETRY_GPU" "$DETECTOR_ENDPOINT" "$SMOKE" "$DEV" "$DRY_RUN" "$ROOT" <<'PY'
-import os
 import pathlib
-import re
 import sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[9]) / "src"))
 import yaml
 from skill3d.infra.experiment_startup import configure_run
+from skill3d.online.config import load_yaml
 
 source, target = map(pathlib.Path, sys.argv[1:3])
 qwen_gpu, geometry_gpu, detector, smoke, dev, dry_run = sys.argv[3:9]
-text = source.read_text(encoding="utf-8")
-
-pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
-text = pattern.sub(
-    lambda match: os.environ.get(match.group(1), match.group(2) or ""),
-    text,
-)
-
-cfg = configure_run(yaml.safe_load(text), dev=dev == "1",
+cfg = configure_run(load_yaml(source), dev=dev == "1",
                     smoke=smoke == "1", dry_run=dry_run == "1")
 cfg["runtime"].update(qwen_gpu=int(qwen_gpu), geometry_gpu=int(geometry_gpu))
 cfg["experiment"]["detector_endpoint"] = detector
@@ -204,15 +195,12 @@ if [[ "$MODE" == "formal" && "$DRY_RUN" -eq 0 && "$DOWNLOAD_ONLY" -eq 0 ]]; then
   "$PYTHON_BIN" - "$GENERATED_CONFIG" "$ROOT" "$CODE_REF" <<'PY'
 import json
 import pathlib
-import re
 import sys
+sys.path.insert(0, str(pathlib.Path(sys.argv[2]) / "src"))
+from skill3d.online.config import load_yaml
 
 config, root, expected_commit = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
-text = config.read_text(encoding="utf-8")
-match = re.search(r"(?m)^\s*quality_confirmation:\s*(.*?)\s*$", text)
-if match is None:
-    raise SystemExit("formal config has no quality_confirmation key")
-value = match.group(1).strip().strip("'\"")
+value = load_yaml(config)["experiment"].get("quality_confirmation")
 if not value:
     raise SystemExit("formal run requires quality_confirmation")
 path = pathlib.Path(value).expanduser()
