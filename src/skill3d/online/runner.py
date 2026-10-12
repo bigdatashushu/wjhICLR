@@ -31,7 +31,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from skill3d.evaluation.accuracy import extract_option_letter, mca_correct
+from skill3d.evaluation.accuracy import extract_option_letter
 from skill3d.evaluation.mra import mra_single, parse_numeric_answer
 from skill3d.fsm.online_fsm import OnlineFSM, OnlineState
 from skill3d.gates.input_gate import annotate_frames, input_gate
@@ -117,11 +117,13 @@ from skill3d.online.recovery import (
     evidence_state_fingerprint,
     failed_call_feedback,
     field_repair_instructions,
+    invalidate_objects,
     invalidate_results,
     observation_feedback,
     premise_of_failure,
 )
 from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION, TraceRecord
+from skill3d.schemas.tool import FailureCause
 from skill3d.trace.store import TraceStore
 from skill3d.verifier.derivation import replay_derivation
 from skill3d.verifier.geometry_oracle import (
@@ -137,6 +139,7 @@ from .submission import (
     invalid_reference_issues,
     rejected_submission,
     submission_scope,
+    used_evidence_flags,
 )
 
 # 确定性重放模式下的固定时间基准（§4 M8/M17 字节级一致；真实实验不启用）
@@ -275,6 +278,11 @@ class EpisodeOutcome:
     is_mca: bool
     correct: Optional[bool]
     mra_value: Optional[float]
+    answer_parse_status: str = "no_answer"
+    submission_status: str = "not_submitted"
+    scoring_status: str = "reference_unavailable"
+    score: Optional[float] = None
+    legal_answer: bool = False
     task: str = ""                          # §4 M7 规范题型（8 类之一，聚合用）
     states: list[str] = field(default_factory=list)
     answer_flags: list[str] = field(default_factory=list)
@@ -332,6 +340,7 @@ class EpisodeOutcome:
     # 与 synthesis_source 分开：来源讲"程序文本从哪来"，触发讲"这一轮为什么生成"。
     round_trigger: str = "initial"
     used_result_ids: list[str] = field(default_factory=list)
+    used_evidence_flags: list[dict] = field(default_factory=list)
     invalidated_result_ids: list[str] = field(default_factory=list)
     failure_code: Optional[str] = None
     terminal_failure: dict = field(default_factory=dict)
@@ -506,8 +515,13 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
         scene_route=str(outcome.scene_route or ""),
         question_tool_scope=str(outcome.question_tool_scope or ""),
         answer_source=str(outcome.answer_source or ""),
+        answer_parse_status=outcome.answer_parse_status,
+        submission_status=outcome.submission_status,
+        scoring_status=outcome.scoring_status,
+        score=outcome.score, legal_answer=outcome.legal_answer,
         input_error_reason=str(outcome.input_error_reason or ""),
         used_result_ids=sorted(set(outcome.used_result_ids or [])),
+        used_evidence_flags=list(outcome.used_evidence_flags),
         recovery_count=int(outcome.recovery_count),
         partial_tool_recovery=bool(outcome.partial_tool_recovery),
         invalidated_result_ids=sorted(set(outcome.invalidated_result_ids or [])),
@@ -1432,7 +1446,13 @@ def run_episode(
             and answer is None):
         original = {
             "final_state": outcome.final_state, "answer": None,
-            "score": (None if any(r.get("service_errors") for r in outcome.rounds) else 0.0),
+            **_evaluation_values(
+                episode, None, cls or classify(episode),
+                incomplete=any(r.get("service_errors") for r in outcome.rounds),
+                force_wrong=True),
+            "submission_status": ("rejected" if any(
+                r.get("submission_accepted") is False for r in outcome.rounds)
+                else "not_submitted"),
             "failure_code": outcome.failure_code,
             "terminal_failure": dict(outcome.terminal_failure),
             "answer_untrusted": outcome.answer_untrusted,
@@ -1467,7 +1487,17 @@ def run_episode(
                 if flag not in ("unanswerable", "abstain")
             ]
             # 原 M11 检查留在 original_result 与 rounds；视觉答案只做答案合同验收。
-            outcome.verify = None
+            outcome.verify = GeometryVerifyResult(
+                passed=True, checks={"answer_contract": True}, violations=[],
+                check_status={**{check: "not_applicable" for check in (
+                    "valid_json", "no_negative_distance", "unit_consistent", "world_frame",
+                    "binding_integrity", "inside_bbox", "reprojection", "complete_ranking")},
+                              "derivation_replay": "not_performed", "answer_contract": "pass"},
+                check_details={
+                    "answer_contract": {"execution_count": 1, "source": "eval_visual_fallback"},
+                    "derivation_replay": {"execution_count": 0, "reason": "no_declared_derivation"},
+                }, derivation_replay=dict(audit.get("derivation_replay") or {}))
+            outcome.used_evidence_flags = []
             outcome.answer_flags.append("eval_visual_fallback")
             fsm.step("eval_visual_answer")
             states.append(fsm.state.value)
@@ -1534,6 +1564,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
     force_next = False
     unresolved_ids: set[str] = set()
     termination_reason = "solver_round_budget_exhausted"
+    round_downgraded: set[str] = set()
 
     def step(event):
         fsm.step(event)
@@ -1544,7 +1575,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         ids, _ = cascade_invalidate(kernel, premise, registry=REGISTRY)
         profile, changed = downgrade_profile(
             getattr(scene, "evidence_profile", None), premise,
-            confirmed_invalid=confirmed)
+            confirmed_invalid=confirmed, excluded_capabilities=round_downgraded)
+        round_downgraded.update(changed)
         if profile is not None and scene is not None:
             scene = scene.model_copy(update={"evidence_profile": profile})
             scene, _ = scope_scene_to_question(
@@ -1565,6 +1597,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         return [o for o in collect_validated(kernel) if o.result_id not in unresolved_ids]
 
     for index in range(1, int(cfg.max_solver_rounds) + 1):
+        round_downgraded.clear()
         finalizing = force_next or (
             index > 1 and index > int(cfg.max_solver_rounds) - int(cfg.finalization_rounds))
         if finalizing:
@@ -1705,6 +1738,10 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                             "checks": {**verify.checks, "invalidated_reference": False},
                             "violations": list(verify.violations) + ["invalidated_reference"],
                             "issues": list(verify.issues) + reference_issues})
+                        verify.check_status["invalidated_reference"] = "fail"
+                        verify.check_details["invalidated_reference"] = {
+                            "execution_count": len(reference_issues),
+                            "result_ids": [i.result_id for i in reference_issues]}
                     replay = replay_derivation(
                         kernel.answer_slot.payload,
                         kernel.tool_results,
@@ -1734,6 +1771,18 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                             "checks": {**verify.checks, "derivation_replay": True},
                             "derivation_replay": replay.model_dump(mode="json"),
                         })
+                    performed = bool(replay.performed)
+                    verify.check_status["derivation_replay"] = (
+                        ("pass" if replay.passed else "fail") if performed else "not_performed")
+                    verify.check_details["derivation_replay"] = {
+                        "execution_count": int(performed), "input_result_ids": replay.input_result_ids,
+                        "op": replay.op,
+                        "reason": "" if performed else "no_completed_declared_derivation",
+                    }
+                    verify.checks["answer_contract"] = replay.passed
+                    verify.check_status["answer_contract"] = "pass" if replay.passed else "fail"
+                    verify.check_details["answer_contract"] = {
+                        "execution_count": 1, "reason": "; ".join(i.reason for i in replay.issues)}
                     outcome.verify = verify
                     record["geometry_verify"] = verify.model_dump(mode="json")
                     record["verification_result_ids"] = [r.result_id for r in scope.results]
@@ -1746,6 +1795,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         outcome.terminal_failure = {}
                         record["submission_accepted"] = True
                         outcome.used_result_ids = accepted_result_ids(kernel, scope)
+                        outcome.used_evidence_flags = used_evidence_flags(
+                            kernel, outcome.used_result_ids, handle)
                         step("pass")
                         return scene, handle, skills, kernel, trace
                     record["submission_accepted"] = False
@@ -1756,6 +1807,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         kernel, [i.result_id for i in verify.issues
                                  if i.result_id and i.invalidate_result],
                         reason=f"M11:round:{index}")
+                    for issue in verify.issues:
+                        cause = issue.failure_cause
+                        if cause and cause.scope == "local_object":
+                            ids.extend(invalidate_objects(
+                                kernel, cause.object_ids, reason=f"M11:{cause.code}"))
                     changes = {}
                     for premise in sorted({i.confirmed_shared_premise for i in verify.issues
                                            if i.confirmed_shared_premise}):
@@ -1806,15 +1862,29 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         outcome.tool_contract_hits += 1
                         outcome.recovery_count += 1
                         outcome.partial_tool_recovery = True
-                        premise = _premise_from_cell(cell, kernel)
-                        ids, changes = revoke_premise(premise) if premise else ([], {})
+                        cause = _cause_from_cell(cell)
+                        premises = list(cause.shared_premises) if cause else []
+                        ids, changes = [], {}
+                        for shared in premises:
+                            extra, changed = revoke_premise(shared)
+                            ids.extend(extra)
+                            changes.update(changed)
+                        if cause and cause.scope == "local_object":
+                            ids.extend(invalidate_objects(
+                                kernel, cause.object_ids, reason=cause.code))
+                        elif cause and cause.scope == "local_result":
+                            ids.extend(invalidate_results(
+                                kernel, cause.result_ids, reason=cause.code))
+                        ids = sorted(set(ids))
                         outcome.invalidated_result_ids.extend(ids)
                         record["invalidated_result_ids"] = ids
                         record["downgraded_capabilities"] = changes
+                        record["failure_cause"] = cause.model_dump(mode="json") if cause else None
                         plan = RecoveryPlan(
                             attempt=retry_counts.get(failure_key, 0) + 1,
                             failed_tool=_failed_tool_of(cell), failure_kind=str(error),
-                            premise=premise, validated=observations(),
+                            premise=next(iter(premises), None), failure_cause=cause,
+                            validated=observations(),
                             invalidated_result_ids=ids, downgraded_capabilities=changes)
                         feedback += "\n" + build_feedback(
                             plan, question_type=outcome.task, scope=outcome.question_tool_scope,
@@ -1993,12 +2063,17 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
     fault = bool((stats or {}).get("detector_fault", False))
     if m5_materialized is False:
         fault = True
-    tcm = (stats or {}).get("track_consensus") or {}
-    ratio = (stats or {}).get("track_stable_ratio")
-    n_tracks = len({str(o.track_id) for o in objs if getattr(o, "track_id", None)})
-    if n_tracks == 0 and objs:
-        # 未记录 track_id 时退回"去重后实例数"作 track 数（不伪造稳定占比）
-        n_tracks = len(objs)
+    from skill3d.segmentation.sam2_tracker import inventory_scope_statistics
+
+    base = (stats or {}).get("base_inventory") or {}
+    tcm = base.get("track_consensus") or (stats or {}).get("track_consensus") or {}
+    ratio = base.get("track_stable_ratio", (stats or {}).get("track_stable_ratio"))
+    base_objects = [o for o in objs if o.grounding_status == "base_list"]
+    n_tracks = base.get("n_tracks", len({o.track_id for o in base_objects if o.track_id}))
+    question = inventory_scope_statistics(
+        objs, n_frames=len(getattr(getattr(episode, "frame_set", None),
+                                    "readable_frame_ids", []) or []),
+        scope="question_inventory")
 
     def _opt(v):
         return None if v is None else float(v)
@@ -2026,6 +2101,11 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
         track_stable_ratio=(None if ratio is None else float(ratio)),
         track_fragmentation_ratio=_opt(tcm.get("track_fragmentation_ratio")),
         duplicate_suspect_ratio=_opt(tcm.get("duplicate_suspect_ratio")),
+        detection_scope="question_inventory",
+        track_scope="base_inventory" if base else "legacy_base_statistics",
+        base_inventory=base,
+        question_supplement=(stats or {}).get("question_supplement") or {},
+        question_inventory=question,
         grounding_pointed_hit=hit,
         grounding_conf=_opt(g.get("conf")),
         grounding_miss=miss,
@@ -2058,6 +2138,24 @@ def _configure_image_ledger(handle: Optional[SceneHandle], cfg: OnlineRunConfig,
         ledger.schema_version = f"{ledger.schema_version}+layout:{cfg.image_layout}"
 
 
+def _episode_frame_provenance(episode, pixels: Sequence[np.ndarray]) -> list[dict]:
+    """槽位只对应实际可读子集；缺失映射明确留空，禁止猜源帧。"""
+    fs = getattr(episode, "frame_set", None)
+    ids = list(getattr(fs, "readable_frame_ids", None) or [])
+    if not ids or len(ids) != len(pixels):
+        return [{"frame_slot": i, "source_frame_index": None, "timestamp": None,
+                 "mapping_status": "unavailable"} for i in range(len(pixels))]
+    all_ids = list(fs.frame_ids)
+    pos = {int(f): k for k, f in enumerate(all_ids)}
+    if (len(fs.source_frame_indices) != len(all_ids)
+            or len(fs.timestamps) != len(all_ids)
+            or any(int(f) not in pos for f in ids)):
+        raise ValueError("Readable pixels cannot be mapped to their frozen source frames")
+    return [{"frame_slot": i, "source_frame_index": fs.source_frame_indices[pos[int(fid)]],
+             "timestamp": fs.timestamps[pos[int(fid)]], "mapping_status": "frozen"}
+            for i, fid in enumerate(ids)]
+
+
 def _attach_episode_frames(handle: SceneHandle, episode, pixels: Sequence[np.ndarray]) -> None:
     """把 episode 的**实际可读帧**装进句柄图像账本（§9.4 唯一裁剪来源）。
 
@@ -2077,13 +2175,7 @@ def _attach_episode_frames(handle: SceneHandle, episode, pixels: Sequence[np.nda
     if not ids or len(ids) != len(pixels):
         # 锚不下来就宁可**不装**（避免把槽位与像素错配成假映射）
         return
-    all_ids = list(getattr(fs, "frame_ids", None) or [])
-    # 可读槽位 → 物理源帧号（readable_frame_ids 是 frame_ids 的子集，顺序一致）
-    pos = {int(f): k for k, f in enumerate(all_ids)}
-    sources = list(fs.source_frame_indices)
-    if len(sources) != len(all_ids) or any(int(f) not in pos for f in ids):
-        raise ValueError("Readable pixels cannot be mapped to their frozen source frames")
-    phys = [sources[pos[int(f)]] for f in ids]
+    phys = [row["source_frame_index"] for row in _episode_frame_provenance(episode, pixels)]
     handle._set_frames(list(range(len(pixels))), list(pixels),  # noqa: SLF001
                        source_frame_indices=phys)
 
@@ -2148,7 +2240,9 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
             # 不再需要 grid_transform 仿射映射（§20 废止表）
             grid_transform=None,
             point_conf=point_conf,
+            depth_conf=_load_npy(art.depth_conf),
             vlm_client=vlm_client,
+            model_weights_sha256=(cfg.model_weights_sha256 if cfg is not None else ""),
             # 场景清单缓存键：同一 (scene, FrameSet) 复用对象清单（M5 是 scene 级产物）
             frame_set_hash=str(getattr(art, "frame_set_hash", "") or ""),
             qa_id=str(getattr(episode, "qa_id", "") or ""),
@@ -2156,8 +2250,9 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
                 getattr(art, "reconstruction_input_identity", "")
                 or getattr(art, "frame_set_hash", "")
                 or getattr(art, "artifact_id", "")),
+            frame_provenance=_episode_frame_provenance(episode, pixels),
             # 请求级 seed：M5 的 VLM 框提示也要可复现（§7 复现纪律）
-            seed=int(cfg.seed),
+            seed=int(cfg.seed) if cfg is not None else None,
         )
     except Exception as exc:  # noqa: BLE001 - checkpoint/依赖/传播失败
         return [], {"binding_error": f"{type(exc).__name__}: {exc}",
@@ -2495,8 +2590,15 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
         skills, max_chars=(policy.method_context_max_chars if policy is not None else None))
     scene_summary = scene.summary if scene is not None else ""
     if handle is not None and handle.grounding_coverage:
+        coverage = handle.grounding_coverage
+        # Request/response histories stay in receipts; the prompt needs coverage facts.
+        public = {k: v for k, v in coverage.items() if k not in {
+            "phase_receipts", "noun_extraction", "stages", "request_identity", "elapsed_s"}}
+        public["requirements"] = [{
+            k: v for k, v in row.items() if k not in {"detector_errors", "vlm_errors"}
+        } for row in coverage.get("requirements", [])]
         scene_summary += "\nM5 initial object coverage (consult the tool inventory for subsequently added objects): " + json.dumps(
-            handle.grounding_coverage, ensure_ascii=False, sort_keys=True)
+            public, ensure_ascii=False, sort_keys=True)
     text = PromptBuilder().render(
         question=episode.question,
         scene_summary=scene_summary,
@@ -2549,6 +2651,19 @@ def _failed_tool_of(cell: CellResult) -> str:
     return ""
 
 
+def _cause_from_cell(cell: CellResult) -> Optional[FailureCause]:
+    violations = list(getattr(cell, "contract_violations", []) or [])
+    if not violations:
+        return None
+    violation = violations[-1]
+    if violation.get("failure_cause"):
+        return FailureCause.model_validate(violation["failure_cause"])
+    from skill3d.tools.contract import failure_cause_from_missing
+
+    return failure_cause_from_missing(
+        violation.get("missing_artifacts") or (), message=str(violation.get("error") or ""))
+
+
 def _premise_from_cell(cell: CellResult, kernel) -> Optional[str]:
     """§14.1：失败是否揭示共享前提失效；`None` = 局部失败（不级联撤销）。
 
@@ -2573,7 +2688,7 @@ def _premise_from_cell(cell: CellResult, kernel) -> Optional[str]:
     return premise_of_failure(
         error_code=str(v.get("error_code") or "tool_contract"),
         tool=name, requires_evidence=req,
-        missing_artifacts=arts, unmet_evidence=unmet)
+        missing_artifacts=arts, unmet_evidence=unmet, failure_cause=_cause_from_cell(cell))
 
 
 def _make_vllm_client(cfg: OnlineRunConfig):
@@ -2732,16 +2847,64 @@ def _is_zero_tool_answer_program(program: EpisodeProgram) -> bool:
 
 
 def _evaluate(episode: VSIBenchEpisode, answer: Optional[str], cls: TaskClassification):
-    """M12：MCA → Accuracy；NA → MRA。不可解析 → 记 wrong / MRA 0（§4 M12 字段 9）。"""
+    """兼容旧调用点；解析不依赖 reference，未评分时不产生占位分数。"""
+    values = _evaluation_values(episode, answer, cls)
+    return values["predicted"], values["correct"], values["mra_value"]
+
+
+def _evaluation_values(episode, answer, cls, *, incomplete=False, force_wrong=False):
+    """M12 的解析与评分独立；M11 的提交状态由真实验收另行记录。"""
+    no_answer = answer is None or not str(answer).strip()
     if cls.is_mca:
-        pred = extract_option_letter(answer) if answer is not None else None
-        correct = mca_correct(answer, episode.ground_truth) if answer is not None else False
-        return pred, correct, None
-    pred_f = parse_numeric_answer(answer)
-    gt_f = parse_numeric_answer(episode.ground_truth)
-    if pred_f is None or gt_f is None:
-        return None, False, 0.0
-    return f"{pred_f}", None, mra_single(pred_f, gt_f)
+        pred = extract_option_letter(answer) if not no_answer else None
+        allowed = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"[:len(episode.options or [])])
+        legal = pred is not None and pred in allowed
+    else:
+        numeric = parse_numeric_answer(answer)
+        pred = None if numeric is None else str(numeric)
+        legal = numeric is not None
+    values = {
+        "predicted": pred, "correct": None, "mra_value": None, "score": None,
+        "answer_parse_status": "no_answer" if no_answer else "parsed" if pred is not None else "unparsed",
+        "legal_answer": legal, "scoring_status": "reference_unavailable",
+    }
+    reference = str(episode.ground_truth or "").strip()
+    if incomplete:
+        values["scoring_status"] = "incomplete"
+        return values
+    if not reference:
+        return values
+    if cls.is_mca:
+        gt = extract_option_letter(reference) or reference.upper()
+        if gt not in allowed:
+            values["scoring_status"] = "invalid_reference"
+            return values
+        correct = bool(legal and pred == gt and not force_wrong)
+        values.update(correct=correct, score=float(correct), scoring_status="scored")
+    else:
+        gt = parse_numeric_answer(reference)
+        if gt is None or gt <= 0:
+            values["scoring_status"] = "invalid_reference"
+            return values
+        score = 0.0 if force_wrong or not legal else mra_single(float(pred), gt)
+        values.update(mra_value=score, score=score, scoring_status="scored")
+    return values
+
+
+def _record_evaluation(outcome, episode):
+    outcome.is_mca = classify(episode).is_mca
+    values = _evaluation_values(
+        episode, outcome.answer, classify(episode),
+        incomplete=outcome.final_state == "unavailable"
+        or any(row.get("service_errors") for row in outcome.rounds)
+        or bool(outcome.eval_visual_fallback.get("service_error")),
+        force_wrong=outcome.final_state in ("unanswerable", "abstain", "run_error", "input_error"))
+    for key, value in values.items():
+        setattr(outcome, key, value)
+    accepted = (bool(outcome.eval_visual_fallback.get("accepted"))
+                or any(row.get("submission_accepted") is True for row in outcome.rounds))
+    rejected = any(row.get("submission_accepted") is False for row in outcome.rounds)
+    outcome.submission_status = "accepted" if accepted else "rejected" if rejected else "not_submitted"
 
 
 # ------------------------------------------------------------------ 收尾落盘 ----
@@ -2782,13 +2945,6 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         cls = classify(episode)
         outcome.task = cls.task
         outcome.is_mca = cls.is_mca
-    if not outcome.is_mca and outcome.mra_value is None and outcome.correct is None:
-        cls = classify(episode)
-        outcome.is_mca = cls.is_mca
-        if outcome.answer is not None:
-            pred, correct, mra_value = _evaluate(episode, outcome.answer, cls)
-            outcome.predicted, outcome.correct, outcome.mra_value = pred, correct, mra_value
-
     # ---- v7 D1：有图必答 —— 已经产出答案就不允许停在 unanswerable/abstain ----
     # 旧口径里只要 FSM 曾转过 `error`/`contract_fail`，episode 就是 `unanswerable`
     # 并按错计；但兜底层可能**已经**在同一 episode 里产出了答案（实测 smoke：
@@ -2803,24 +2959,18 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
                                 if f not in ("abstain", "unanswerable")]
         if outcome.is_mca and outcome.predicted is None:
             outcome.answer_flags.append("answer_format_unparsed")
-        if not outcome.is_mca and outcome.mra_value in (None, 0.0):
+        if not outcome.is_mca and parse_numeric_answer(outcome.answer) is None:
             outcome.answer_flags.append("answer_numeric_unparsed")
 
     # v3 §4 M6 字段 9 / §5.1：abstain 与 unanswerable **主榜按错计**
     # （MRA=0 / exact_match=0，不刷分）；只有 unavailable（模型/服务不可用）不进分母。
     if outcome.final_state in ("unanswerable", "abstain", "run_error", "input_error"):
-        cls_wrong = classify(episode)
-        outcome.is_mca = cls_wrong.is_mca
-        if cls_wrong.is_mca:
-            outcome.correct = False
-            outcome.predicted = None
-        else:
-            outcome.mra_value = 0.0
-            outcome.correct = None
+        outcome.is_mca = classify(episode).is_mca
         if outcome.final_state not in ("run_error", "input_error"):
             outcome.abstained = True
             if "abstain" not in outcome.answer_flags:
                 outcome.answer_flags.append("abstain")
+    _record_evaluation(outcome, episode)
     outcome.episode_status = _episode_status_of(outcome.final_state)
 
     outcome.frame_set_hash = (episode.frame_set.frame_set_hash
@@ -2871,10 +3021,15 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         main_gate_passed=main_gate_passed,
         input_degradation_flags=sorted(set(outcome.input_degradation_flags or [])),
         answer_source=str(outcome.answer_source),
+        answer_parse_status=outcome.answer_parse_status,
+        submission_status=outcome.submission_status,
+        scoring_status=outcome.scoring_status,
+        score=outcome.score, legal_answer=outcome.legal_answer,
         input_error_reason=str(outcome.input_error_reason or ""),
         recovery_count=int(outcome.recovery_count),
         partial_tool_recovery=bool(outcome.partial_tool_recovery),
         used_result_ids=sorted(set(outcome.used_result_ids or [])),
+        used_evidence_flags=list(outcome.used_evidence_flags),
         invalidated_result_ids=sorted(set(outcome.invalidated_result_ids or [])),
         failure_code=outcome.failure_code,
         terminal_failure=dict(outcome.terminal_failure),
@@ -2981,10 +3136,15 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
             # 不落原始答案就分不开这两者（实测 2770 属 (b)，却只留下一只普通错题）。
             answer_text=outcome.answer,
             answer_source=str(outcome.answer_source or ""),
+            answer_parse_status=outcome.answer_parse_status,
+            submission_status=outcome.submission_status,
+            scoring_status=outcome.scoring_status,
+            score=outcome.score, legal_answer=outcome.legal_answer,
             episode_status=str(outcome.episode_status or ""),
             label_access=False,
             input_error_reason=str(outcome.input_error_reason or ""),
             derivation_replay=_final_derivation_replay(outcome),
+            used_evidence_flags=list(outcome.used_evidence_flags),
             abstained=bool(outcome.abstained),
             failure_code=outcome.failure_code,
             eval_visual_fallback=dict(outcome.eval_visual_fallback),
@@ -3072,8 +3232,11 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
     for o in outcomes:
         slot = per_task.setdefault(o.task or o.question_type,
                                    {"n": 0, "correct": 0, "mra_values": [],
-                                    "n_mca": 0, "n_na": 0, "n_unavailable": 0, "levels": {}})
+                                    "n_mca": 0, "n_na": 0, "n_unavailable": 0,
+                                    "n_scored": 0, "n_scored_mca": 0, "levels": {}})
         slot["n"] += 1
+        slot["n_scored"] += int(o.scoring_status == "scored")
+        slot["n_scored_mca"] += int(o.scoring_status == "scored" and o.is_mca)
         slot["n_unavailable"] += int(unavailable(o))
         slot["n_mca" if o.is_mca else "n_na"] += 1
         if o.correct:
@@ -3084,8 +3247,10 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
         lv = slot["levels"].setdefault(
             o.question_type or o.task,
             {"n": 0, "correct": 0, "mra_values": [], "n_mca": 0, "n_na": 0,
-             "n_unavailable": 0})
+             "n_unavailable": 0, "n_scored": 0, "n_scored_mca": 0})
         lv["n"] += 1
+        lv["n_scored"] += int(o.scoring_status == "scored")
+        lv["n_scored_mca"] += int(o.scoring_status == "scored" and o.is_mca)
         lv["n_unavailable"] += int(unavailable(o))
         lv["n_mca" if o.is_mca else "n_na"] += 1
         if o.correct:
@@ -3093,26 +3258,36 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
         if o.mra_value is not None:
             lv["mra_values"].append(o.mra_value)
     for slot in per_task.values():
-        slot["accuracy"] = (slot["correct"] / slot["n"]) if slot["n"] else None
+        slot["accuracy"] = (slot["correct"] / slot["n_scored_mca"]) if slot["n_scored_mca"] else None
         vals = slot.pop("mra_values")
         slot["mra"] = (sum(vals) / len(vals)) if vals else None
         for lv in slot["levels"].values():
-            lv["accuracy"] = (lv["correct"] / lv["n"]) if lv["n"] else None
+            lv["accuracy"] = (lv["correct"] / lv["n_scored_mca"]) if lv["n_scored_mca"] else None
             lvals = lv.pop("mra_values")
             lv["mra"] = (sum(lvals) / len(lvals)) if lvals else None
         for row in [slot, *slot["levels"].values()]:
             row["status"] = "incomplete" if row["n_unavailable"] else "completed"
+            row["n_unscored"] = row["n"] - row["n_scored"]
             if row["n_unavailable"]:
                 row["accuracy"] = row["mra"] = None
 
     na_scored = [o.mra_value for o in na if o.mra_value is not None]
+    mca_scored = [o for o in mca if o.scoring_status == "scored"]
+    scoring_counts = {
+        state: sum(o.scoring_status == state for o in outcomes)
+        for state in ("scored", "reference_unavailable", "invalid_reference", "incomplete")}
     run = EvaluationRun(
         run_id=run_id,
         status="incomplete" if n_unavailable or not outcomes else "completed",
         n_unavailable=n_unavailable,
+        n_scored=scoring_counts["scored"],
+        n_unscored=len(outcomes) - scoring_counts["scored"],
+        scoring_status_counts=scoring_counts,
+        formal_scoring_eligible=bool(outcomes) and scoring_counts["scored"] == len(outcomes),
         split=items[0].episode.split if items else "",
         n_episodes=len(outcomes),
-        accuracy=(sum(1 for o in mca if o.correct) / len(mca)) if mca and not n_unavailable else None,
+        accuracy=(sum(1 for o in mca_scored if o.correct) / len(mca_scored))
+                 if mca_scored and not n_unavailable else None,
         mra=(sum(na_scored) / len(na_scored)) if na_scored and not n_unavailable else None,
         per_task=per_task,
         active_snapshot_ref=cfg.active_snapshot_ref,
@@ -3132,6 +3307,9 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
             "n_episodes": len(outcomes), "split": run.split,
             "label_access": False,
             "n_unavailable": n_unavailable,
+            "n_scored": run.n_scored, "n_unscored": run.n_unscored,
+            "scoring_status_counts": scoring_counts,
+            "formal_scoring_eligible": run.formal_scoring_eligible,
             "n_unanswerable": sum(1 for o in outcomes if o.final_state == "unanswerable"),
             "n_input_error": sum(1 for o in outcomes if o.final_state == "input_error"),
             "deterministic_replay": cfg.deterministic_replay,

@@ -55,6 +55,7 @@ def test_rank_summary_keeps_incomplete_status_after_large_nested_audit():
 ])
 def test_trimming_is_explicit_and_preserves_parseable_values(payload):
     text = summarize_payload(payload, max_chars=300)
+    assert len(text) <= 300
     body, omission = text.split("\n", 1)
     parsed = json.loads(body)
     assert parsed
@@ -64,6 +65,61 @@ def test_trimming_is_explicit_and_preserves_parseable_values(payload):
     if "detections" in payload:
         assert parsed["service_healthy"] is False
         assert parsed["error"] == "detector offline"
+
+
+def test_long_binding_audit_keeps_both_tv_candidates_within_budget():
+    import copy
+    import hashlib
+    payload = [{
+        "obj_id": f"tv-{i}", "category_name": "television",
+        "track_id": f"qtrk-{i}", "grounding_status": "question_targeted_fill",
+        "det_conf": .85, "det_conf_source": "groundingdino",
+        "mask_support_ratio": .75, "duplicate_suspect": i == 1,
+        "binding_flags": [{"code": "semantic_label_mask_conflict",
+                           "audit_sha256": str(i) * 64, "endpoints": ["x" * 9000]}],
+        "binding_provenance": [{"prompt": "y" * 8000}],
+    } for i in range(2)]
+    original = copy.deepcopy(payload)
+    text = summarize_payload(payload, tool="list_objects", max_chars=1200)
+    assert len(text) <= 1200
+    data = json.loads(text)
+    assert [o["obj_id"] for o in data["objects"]] == ["tv-0", "tv-1"]
+    assert all(o["binding_flags"][0]["code"] == "semantic_label_mask_conflict"
+               for o in data["objects"])
+    assert data["audit_omitted"] is True and data["coverage_complete"] is True
+    assert data["payload_sha256"] == hashlib.sha256(json.dumps(
+        original, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+    assert payload == original
+
+
+@pytest.mark.parametrize("budget", [128, 256, 300, 1200])
+def test_list_summary_has_complete_prefix_and_truthful_omission_counts(budget):
+    payload = [{"obj_id": f"o{i}", "category_name": "chair", "visible_frames": list(range(32))}
+               for i in range(100)]
+    text = summarize_payload(payload, tool="list_objects", max_chars=budget)
+    assert len(text) <= budget
+    data = json.loads(text)
+    if "objects" in data:
+        assert data["shown"] + data["omitted"] == data["total"] == 100
+        assert data["coverage_complete"] is False
+        assert [o["obj_id"] for o in data["objects"]] == [
+            o["obj_id"] for o in payload[:data["shown"]]]
+    else:
+        assert data["omitted"]
+
+
+def test_summary_rejects_budget_below_minimum():
+    with pytest.raises(ValueError, match="128"):
+        summarize_payload([], max_chars=127)
+
+
+@pytest.mark.parametrize("error_type", ["NameError", "UnboundLocalError"])
+def test_name_errors_are_deterministic_but_timeouts_keep_retry(error_type):
+    from skill3d.online.recovery import deterministic_cell_failure
+    cell = SimpleNamespace(error_code="execution", error_type=error_type)
+    assert deterministic_cell_failure(cell, [])
+    result = SimpleNamespace(error="ConnectionError: endpoint unavailable", payload=None)
+    assert not deterministic_cell_failure(cell, [result])
 
 
 def test_only_identical_observations_share_a_summary_and_all_ids_remain_real():

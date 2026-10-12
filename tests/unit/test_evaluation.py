@@ -98,3 +98,52 @@ def test_mca_correct_and_accuracy():
     assert mca_correct("The answer is A", "A")
     assert not mca_correct("The answer is A", "B")
     assert mca_accuracy(["A", "B", "C"], ["A", "B", "D"]) == pytest.approx(2 / 3)
+
+
+@pytest.mark.parametrize("answer,parse_status,predicted,legal", [
+    ("3 m", "parsed", "3.0", True),
+    ("no measurement", "unparsed", None, False),
+    (None, "no_answer", None, False),
+])
+def test_missing_reference_preserves_parse_without_scores(answer, parse_status, predicted, legal):
+    from types import SimpleNamespace
+    from skill3d.online.runner import _evaluation_values
+    episode = SimpleNamespace(ground_truth="", options=[])
+    result = _evaluation_values(episode, answer, SimpleNamespace(is_mca=False))
+    assert result["predicted"] == predicted and result["answer_parse_status"] == parse_status
+    assert result["legal_answer"] is legal
+    assert result["scoring_status"] == "reference_unavailable"
+    assert result["score"] is result["correct"] is result["mra_value"] is None
+
+
+@pytest.mark.parametrize("reference,status", [("2", "scored"), ("0", "invalid_reference"),
+                                              ("not a reference", "invalid_reference")])
+def test_reference_validation_is_independent_of_prediction(reference, status):
+    from types import SimpleNamespace
+    from skill3d.online.runner import _evaluation_values
+    result = _evaluation_values(SimpleNamespace(ground_truth=reference, options=[]),
+                                "100 m", SimpleNamespace(is_mca=False))
+    assert result["predicted"] == "100.0" and result["answer_parse_status"] == "parsed"
+    assert result["scoring_status"] == status
+    assert result["score"] == (0.0 if status == "scored" else None)
+
+
+def test_mca_legal_range_uses_actual_options_and_missing_reference_is_unscored():
+    from types import SimpleNamespace
+    from skill3d.online.runner import _evaluation_values
+    episode = SimpleNamespace(ground_truth="", options=["near", "far"])
+    result = _evaluation_values(episode, "D", SimpleNamespace(is_mca=True))
+    assert result["predicted"] == "D" and result["answer_parse_status"] == "parsed"
+    assert not result["legal_answer"] and result["score"] is None
+    episode.ground_truth = "D"
+    assert _evaluation_values(episode, "A", SimpleNamespace(is_mca=True))[
+        "scoring_status"] == "invalid_reference"
+
+
+def test_unparsed_prediction_with_valid_reference_remains_zero():
+    from types import SimpleNamespace
+    from skill3d.online.runner import _evaluation_values
+    result = _evaluation_values(SimpleNamespace(ground_truth="2", options=[]),
+                                "unknown", SimpleNamespace(is_mca=False))
+    assert result["score"] == 0.0 and result["mra_value"] == 0.0
+    assert result["answer_parse_status"] == "unparsed" and result["correct"] is None

@@ -33,6 +33,7 @@ from .contract import (
     DomainValueError,
     route_aware_available,
 )
+from skill3d.schemas.tool import FailureCause
 
 PREPARED_ROOM_MEASUREMENT_VERSION = "prepared-room-measurement-v1"
 
@@ -127,6 +128,7 @@ class SceneHandle:
         # 否则读运行时 artifact。
         self._metric_scale = metric_scale
         self._objects = {o.obj_id: o for o in (objects or [])}
+        self._consumed_object_ids: list[str] = []
         # 硬约束 23：objects **产物是否已产出**与"产物里有没有对象"是两件事。
         # - M5 未跑/失败 → 产物不存在 → `objects` 不可用 → Tool 抛 ArtifactUnavailableError；
         # - M5 跑过但一个对象都没绑到 → 产物存在且为空 → `exists_in_scene` 返回 False。
@@ -359,6 +361,10 @@ class SceneHandle:
         return added
 
     # ---- 对象访问 ----
+    def _record_object_dependency(self, object_id: str) -> None:
+        if object_id not in self._consumed_object_ids:
+            self._consumed_object_ids.append(object_id)
+
     def list_objects(self) -> list[str]:
         return sorted(self._objects.keys())
 
@@ -412,7 +418,8 @@ class SceneHandle:
                 "resolve_object_id",
                 f"ambiguous_object: {name_or_id!r} matches multiple instances {cands}; "
                 "use list_objects to inspect visible frames, confirm the instance, then pass an explicit obj_id",
-                args={"name": name_or_id, "candidate_object_ids": cands})
+                args={"name": name_or_id, "candidate_object_ids": cands},
+                failure_cause=FailureCause(code="ambiguous_object", scope="local_call"))
         raise KeyError(f"Object does not exist: {name_or_id}")
 
     def get_object(self, name_or_id: str) -> ObjectRecord:

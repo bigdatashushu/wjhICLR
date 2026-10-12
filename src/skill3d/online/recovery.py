@@ -34,6 +34,7 @@ from typing import Optional
 
 from skill3d.schemas.evidence import EvidenceProfile
 from skill3d.schemas.reconstruction import SceneState
+from skill3d.schemas.tool import FailureCause
 from skill3d.tools.contract import EVIDENCE_METRIC_SCALE
 
 # 恢复重试上限（TODO_CALIBRATE：起始参考值，必须先标定再当结论）
@@ -41,10 +42,7 @@ MAX_RECOVERY_ATTEMPTS: int = 2   # TODO_CALIBRATE
 
 # 失败根因 → 失效的共享前提（能力名）。None = 局部失败，不动共享证据。
 #
-# 判据来源：
-# - `ArtifactUnavailableError` 的 missing 里若含深度/位姿/点云/对象 → 几何前提失效；
-# - `ConfidenceGateError` 在米制 Tool 上 → 米制尺度前提失效；
-# - 域值错误（负距离/点在相机后方）是**局部**的，不级联（§14.1 明文）。
+# 优先使用结构化事实；旧记录仅兼容明确缺失项，绝不从工具依赖猜根因。
 _PREMISE_BY_ARTIFACT: dict[str, str] = {
     "depth": "geometry_3d",
     "poses": "geometry_3d",
@@ -108,8 +106,62 @@ def _payload_of(result):
         return raw
 
 
+def _list_objects_summary(payload: list, max_chars: int) -> str:
+    """先装候选身份，再按列补质量；审计正文只通过完整 payload 摘要标识。"""
+    digest = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
+    rows = []
+    priority = (
+        "binding_flags", "grounding_status", "track_id", "det_conf", "det_conf_source",
+        "mask_support_ratio", "duplicate_suspect",
+    )
+    audit_omitted = any(o.get("binding_flags") or o.get("binding_provenance")
+                        or o.get("audit") for o in payload if isinstance(o, dict))
+
+    def encode():
+        omitted_fields = sum(
+            len(o) - len(row) for o, row in zip(payload, rows) if isinstance(o, dict))
+        body = {
+            "objects": rows, "total": len(payload), "shown": len(rows),
+            "omitted": len(payload) - len(rows), "fields_omitted": omitted_fields,
+            "coverage_complete": len(rows) == len(payload),
+            "audit_omitted": audit_omitted, "payload_sha256": digest,
+        }
+        return json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    for obj in payload:
+        if not isinstance(obj, dict):
+            break
+        identity = {k: obj[k] for k in ("obj_id", "category_name", "category") if k in obj}
+        rows.append(identity)
+        if len(encode()) > max_chars:
+            rows.pop()
+            break
+    if not rows and payload:
+        return json.dumps({"omitted": True, "payload_sha256": digest}, separators=(",", ":"))
+    for key in priority:
+        for source, row in zip(payload, rows):
+            if key not in source:
+                continue
+            value = source[key]
+            if key == "binding_flags":
+                value = [{k: flag[k] for k in ("code", "audit_id", "audit_sha256") if k in flag}
+                         for flag in value if isinstance(flag, dict)]
+            row[key] = value
+            if len(encode()) > max_chars:
+                row.pop(key)
+    return encode()
+
+
 def summarize_payload(payload: object, *, tool: str = "", max_chars: int = 1200) -> str:
     """按完整字段/列表项压缩，所有省略明示；不截断 JSON 或把省略误作空值。"""
+    if max_chars < 128:
+        raise ValueError("summary max_chars must be at least 128")
+    if tool == "list_objects" and isinstance(payload, list):
+        text = _list_objects_summary(payload, max_chars)
+        if len(text) <= max_chars:
+            return text
+        return '{"omitted":true,"coverage_complete":false}'
     omitted: list[str] = []
 
     def ordered(value, path=""):
@@ -167,15 +219,24 @@ def summarize_payload(payload: object, *, tool: str = "", max_chars: int = 1200)
         return None
 
     clean = ordered(payload)
-    reduced = fit(clean, max_chars)
-    text = _json(reduced) if reduced is not None or payload is None else "(content exceeds summary budget)"
-    if omitted:
-        shown = list(dict.fromkeys(omitted))
-        text += "\n  Summary omissions: " + ", ".join(shown[:8])
-        if len(shown) > 8:
-            text += f" ({len(shown)} omissions in total)"
-        text += "; omission does not mean an empty value or complete candidate/record coverage."
-    return text
+    original_omitted = list(omitted)
+    if not omitted and len(_json(clean)) <= max_chars:
+        return _json(clean)
+    # 固定预留省略说明预算，整个返回文本有界。路径只作例示，数量保留完整。
+    reserve = 110
+    reduced = fit(clean, max_chars - reserve)
+    text = _json(reduced)
+    shown = list(dict.fromkeys(omitted))
+    example = ", ".join(shown[:2])[:40]
+    note = (f"\nSummary omissions: {example}; total={len(shown)}; "
+            "coverage_complete=false.")
+    if len(text) + len(note) > max_chars:
+        omitted[:] = original_omitted
+        reduced = fit(clean, max_chars - len(note))
+        text = _json(reduced)
+    if len(text) + len(note) <= max_chars:
+        return text + note
+    return '{"omitted":true,"coverage_complete":false}'
 
 
 @dataclass
@@ -226,10 +287,12 @@ def failed_call_feedback(results) -> str:
     for result in results:
         if result.status == "ok" and result.error is None:
             continue
+        cause = (f"; failure_cause={_json(result.failure_cause.model_dump(mode='json'))}"
+                 if result.failure_cause else "")
         lines.append(
             f"Failed call: {result.source_tool or result.tool}({_json(result.args)})"
             f" [result_id={result.result_id}] error_code={result.error_code}"
-            f"; reason={result.error}")
+            f"; reason={result.error}{cause}")
     return "\n".join(lines)
 
 
@@ -278,6 +341,7 @@ def deterministic_cell_failure(cell, results) -> bool:
         return False
     return cell.error_type in {
         "KeyError", "AttributeError", "TypeError", "IndexError",
+        "UnboundLocalError", "NameError",
         "ToolContractError", "DomainValueError", "ArtifactUnavailableError",
         "ConfidenceGateError",
     }
@@ -317,6 +381,7 @@ class RecoveryPlan:
     failed_tool: str
     failure_kind: str                      # tool_contract / confidence_gate / domain_value
     premise: Optional[str]                 # 失效的共享前提（None = 局部失败）
+    failure_cause: Optional[FailureCause] = None
     validated: list[ValidatedObservation] = field(default_factory=list)
     invalidated_result_ids: list[str] = field(default_factory=list)
     invalidated_tools: list[str] = field(default_factory=list)
@@ -328,7 +393,8 @@ class RecoveryPlan:
 def premise_of_failure(*, error_code: str, tool: str,
                        requires_evidence: tuple[str, ...] = (),
                        missing_artifacts: tuple[str, ...] = (),
-                       unmet_evidence: tuple[str, ...] = ()) -> Optional[str]:
+                       unmet_evidence: tuple[str, ...] = (),
+                       failure_cause: Optional[FailureCause] = None) -> Optional[str]:
     """从失败事实推断失效的共享前提；`None` = 局部失败，不做级联（§14.1）。
 
     `unmet_evidence`：授权检查给出的**逐项未达标能力**（可能带
@@ -336,22 +402,18 @@ def premise_of_failure(*, error_code: str, tool: str,
     实测踩过的坑是"证据缺口"被当成"缺产物"从而一律退成 `geometry_3d`，
     级联撤销就把 geometry/world_frame/metric_scale 全部无差别降级了。
     """
-    # 证据缺口优先：取**具体**那个能力作前提（去掉括号后缀）
+    if failure_cause is not None:
+        return next(iter(failure_cause.shared_premises), None)
+    # 兼容无结构化原因的旧记录，只依据明确的未满足项恢复。
     for item in unmet_evidence:
         cap = str(item).split("(")[0].strip()
         if cap in _DEPENDENTS:
             return cap
-    if error_code == "confidence_gate":
-        if EVIDENCE_METRIC_SCALE in requires_evidence:
-            return EVIDENCE_METRIC_SCALE
-        # 其他局部质量门：不视为共享前提失效
-        return None
     if error_code == "tool_contract":
         for art in missing_artifacts:
             p = _PREMISE_BY_ARTIFACT.get(str(art))
             if p is not None:
                 return p
-        return "geometry_3d"      # 缺产物但没标注具体产物 → 保守按几何前提失效
     # domain_value / answer_already_given / 其他：局部失败
     return None
 
@@ -413,8 +475,16 @@ def cascade_invalidate(kernel, premise: str, *,
 
 
 def invalidate_results(kernel, result_ids: list[str], *, reason: str) -> list[str]:
-    """撤销已定位的局部结果，不推测它们与其他调用的共享依赖。"""
+    """撤销已定位的结果及显式派生引用，不推测共享依赖。"""
     wanted = set(result_ids)
+    while True:
+        dependents = {
+            r.result_id for r in kernel.tool_results
+            if wanted.intersection(r.result_dependencies)
+        }
+        if dependents.issubset(wanted):
+            break
+        wanted.update(dependents)
     invalidated = []
     for index, result in enumerate(kernel.tool_results):
         if result.result_id in wanted and result.status == "ok" and not result.invalidated_by:
@@ -424,8 +494,18 @@ def invalidate_results(kernel, result_ids: list[str], *, reason: str) -> list[st
     return invalidated
 
 
+def invalidate_objects(kernel, object_ids: list[str], *, reason: str) -> list[str]:
+    """只撤销实际消费这些对象的几何结果及其显式派生结果。"""
+    affected = set(object_ids)
+    return invalidate_results(kernel, [
+        r.result_id for r in kernel.tool_results
+        if affected.intersection(r.object_dependencies)
+    ], reason=reason)
+
+
 def downgrade_profile(profile: Optional[EvidenceProfile],
-                      premise: str, *, confirmed_invalid: bool = False
+                      premise: str, *, confirmed_invalid: bool = False,
+                      excluded_capabilities=()
                       ) -> tuple[Optional[EvidenceProfile], dict[str, str]]:
     """降级失效前提；M11 确证无效时直接收回对应能力。"""
     if profile is None:
@@ -434,6 +514,8 @@ def downgrade_profile(profile: Optional[EvidenceProfile],
     update: dict = {}
     reasons = dict(getattr(profile, "state_reasons", None) or {})
     for cap in _DEPENDENTS.get(str(premise), (str(premise),)):
+        if cap in excluded_capabilities:
+            continue
         cur = profile.state(cap)
         if confirmed_invalid and cur != "unavailable":
             update[cap] = "unavailable"
@@ -460,6 +542,8 @@ def build_feedback(plan: RecoveryPlan, *, question_type: str,
     lines = [
         f"Failed tool: {plan.failed_tool} ({plan.failure_kind})",
     ]
+    if plan.failure_cause:
+        lines.append(f"Failure facts: {_json(plan.failure_cause.model_dump(mode='json'))}")
     if plan.premise:
         lines.append(
             f"Cause: shared premise `{plan.premise}` is invalid. Dependent results were "
@@ -468,7 +552,10 @@ def build_feedback(plan: RecoveryPlan, *, question_type: str,
             f"{plan.downgraded_capabilities}")
         lines.append("Do not reuse the invalidated values above.")
     else:
-        lines.append("Cause: a local tool error (domain value/arguments); shared evidence remains valid.")
+        failure_scope = plan.failure_cause.scope if plan.failure_cause else "unknown"
+        lines.append(
+            f"Cause: a local tool error or unlocated failure (scope={failure_scope}); "
+            f"shared evidence remains valid. Invalidated result IDs: {plan.invalidated_result_ids}.")
     if include_observations:
         lines.append(observation_feedback(plan.validated))
     ending = (
@@ -501,6 +588,7 @@ __all__ = [
     "failed_call_feedback",
     "field_repair_instructions",
     "invalidate_results",
+    "invalidate_objects",
     "observation_feedback",
     "premise_of_failure",
     "recovery_exhausted",

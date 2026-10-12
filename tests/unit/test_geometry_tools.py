@@ -316,6 +316,45 @@ def test_semantic_mask_conflict_blocks_object_geometry_but_not_listing():
     blocked = call_tool("object_3d_extent", {"obj_id": "obj_0"}, handle)
     assert blocked.error_code == "confidence_gate"
     assert "semantic_label_mask_conflict" in blocked.error
+    assert blocked.failure_cause.scope == "local_object"
+    assert blocked.failure_cause.object_ids == ["obj_0"]
+    assert blocked.failure_cause.audit_ids == ["a" * 64]
+    assert not blocked.failure_cause.shared_premises
+
+
+def test_geometry_records_resolved_inputs_and_observations_have_no_dependencies():
+    objs = [_obj("a", "chair", (0, 0, 0)), _obj("b", "table", (2, 0, 0))]
+    handle = _handle(_scene(objs=objs), objs=objs)
+    first = call_tool("object_centroid", {"obj_id": "chair"}, handle)
+    assert first.object_dependencies == ["a"]
+    second = call_tool("object_centroid", {"obj_id": "table"}, handle)
+    assert second.object_dependencies == ["b"]
+    assert call_tool("list_objects", {}, handle).object_dependencies == []
+    assert first.failure_cause is None
+
+
+def test_scope_and_task_failures_do_not_claim_shared_scale_loss():
+    from skill3d.tools.contract import ConfidenceGateError, check_metric_task_contract
+
+    with pytest.raises(ToolContractError) as caught:
+        call_tool("object_3d_extent", {"obj_id": "a"}, _handle(_scene()))
+    assert caught.value.failure_cause.scope == "local_call"
+    assert caught.value.failure_cause.shared_premises == []
+    with pytest.raises(ConfidenceGateError) as caught:
+        check_metric_task_contract("test", ["object_size_estimation"],
+                                   ["room_size_estimation"], "room_size_estimation")
+    assert caught.value.failure_cause.scope == "local_call"
+
+
+def test_invalid_metric_scale_has_explicit_shared_cause():
+    handle = _handle(_scene(), metric_scale=-1)
+    from skill3d.tools.geometry_tools import _metric_scale_or_fail
+    from skill3d.tools.contract import DomainValueError
+
+    with pytest.raises(DomainValueError) as caught:
+        _metric_scale_or_fail(handle, "object_3d_extent")
+    assert caught.value.failure_cause.scope == "shared_evidence"
+    assert caught.value.failure_cause.shared_premises == ["metric_scale"]
 
 
 def test_count_objects_counts_distinct_tracks():
@@ -490,6 +529,8 @@ def test_prepared_room_measurement_tampering_fails_closed(tmp_path, tamper):
     result = call_tool("plane_fit_room_size", {}, handle)
     assert result.error_code == "confidence_gate"
     assert "recomputation" in result.error or "hash mismatch" in result.error
+    assert result.failure_cause.scope == "local_result"
+    assert not result.failure_cause.shared_premises
 
 
 def test_prepared_room_failure_is_shared_without_recomputation(
@@ -836,6 +877,14 @@ def test_partial_or_ambiguous_ranking_cannot_produce_winner(kwargs, status, miss
         assert rank["per_candidate"]["chair"] is None
         assert len(rank["candidates"][0]["instances"]) == 2
         assert "degraded" in rank["degradation_flags"]
+
+
+def test_rank_dependencies_exclude_instances_rejected_before_geometry():
+    handle = _ranking_handle(shared_track=True)
+    result = call_tool("relative_distance_rank", {
+        "reference": "desk", "candidate_categories": ["chair", "lamp"]}, handle)
+    assert result.status == "ok"
+    assert result.object_dependencies == ["ref", "a"]
 
 
 def test_self_candidate_and_same_reference_track_cannot_win():

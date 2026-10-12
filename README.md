@@ -7,7 +7,7 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
 
 当前在线合同使用 `program_synth_v11_5_en`、
-`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.4-binding-integrity`。类别匹配、对象覆盖、
+`solver-v11.5-core-engineering-repair` 和 `tool-docs-v11.5-core-engineering-repair`。类别匹配、对象覆盖、
 完整排名验收及检测器重试由两臂共用；评测时原 solver 失败后可预算外追加一次
 `eval-visual-v1` 请求，只携带冻结的 32 张原帧、问题、选项和答案格式。该路径不在
 `induction` 使用，正常提交但答错也不会触发。当前 active snapshot 为
@@ -19,12 +19,27 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 对象几何，原图视觉路径仍可用。授权房间题在 B01/B11 前共享一次带身份收据的预计算，
 不在两臂内重复拟合，也不计作 Skill 收益。
 
+当前 M5 对未解决类别检查全部可读冻结帧，先检测后定向 VLM，逐类停止并保留请求收据。
+高 IoU 仅在明确不相容关系时触发绑定硬门；局部对象失败只撤销相关结果，不撤全局尺度。
+答案解析、提交与评分分别记录，空 GT 保留预测与 null 得分；EpisodeTrace 版本为 9.2。
+完整扩容入口 `scripts/run_full_experiment_v11.py` 固定八类各24题，192道唯一题、
+两个seed同题单、B01/B11共768次。全部公共准备按场景审计封存后才逐对求解，
+首批32臂核查后自动继续，答案全冻结后独立评分。详见[扩大面板合同](docs/skill_ablation_v11.md)。
+
 2026-10-11 已在代码基线 `c020345dca6f3e34acd0883accc4d16956327773`
 完成英文面板 256 次求解和 128 组 B01/B11 配对。该实验固定使用
 `max_tokens=4096`；当前代码自 `e64fff5ee90713a5e9be5f189044685d0af051e7`
 起将后续 Qwen 请求的最大输出改为 8192，两种预算的结果不得静默合并。
 
 GPU 启动入口为 `./start_harness.sh`，与 `start_harness3d.sh` 共用同一流程。
+检测器地址按 `HARNESS3D_DETECTOR_ENDPOINT`、原 YAML
+`experiment.detector_endpoint`、`http://127.0.0.1:20022` 的顺序解析；
+派生 YAML 保存最终地址及 env/yaml/default 来源。显式空串关闭检测器，
+需同时设置 `HARNESS3D_REQUIRE_DETECTOR=0`；关闭配置会覆盖子进程继承的旧地址。
+M5 持久缓存要求 RGB、深度/位姿/K/置信度、实际模型权重/配置、seed 和源码内容
+身份完整；无法核验时仍运行推理并关闭持久复用。新数组存入独立身份目录，
+缓存读取校验每个引用的完整 SHA256。基础清单、题级补查和最终清单分别统计，
+track_consensus 的门和阈值沿用基础清单口径。
 MoGe-2 显式启用后使用与 VGGT 相同的裁剪网格；米制工具需要通过输入、模型、
 源数组及收据哈希校验。尺度融合仍属待验证分支，默认不开启。配置、缓存迁移和
 证据字段见[度量尺度链路说明](docs/metric_fusion_v11.md)。
@@ -41,7 +56,7 @@ MoGe-2 显式启用后使用与 VGGT 相同的裁剪网格；米制工具需要�
 | 分支 | `main` |
 | 当前代码提交 | 执行 `git rev-parse HEAD` 核对 |
 | 清理前回滚点 | `pre-cleanup-v11-20261012`（`e64fff5ee90713a5e9be5f189044685d0af051e7`） |
-| 文档状态日期 | 2026-10-12 |
+| 文档状态日期 | 2026-10-13 |
 | v11 默认配置 | `configs/gpu_experiment_v11.yaml` |
 | v11 运行器 | `scripts/run_gpu_experiment_v11.py` |
 | v11 配对协议 | `docs/skill_ablation_v11.md` |
@@ -113,7 +128,8 @@ SAM2         1.1.0（已补建并验证 sam2._C CUDA 后处理扩展）
 
 2026-10-12 的环境验收以服务器 `skill3d-exp` 为准。SAM2 扩展安装会启用掩码
 补洞，M5 清单缓存已升级为 `m5-inventory-9-sam2-runtime`，缓存键包含包版本和扩展
-SHA256；MoGe 米制缓存身份也记录 xFormers 版本。历史实验产物保持只读，新环境
+SHA256；当前缓存为 `m5-inventory-10-frozen-inputs`，同时核验完整输入与模型配置。
+MoGe 米制缓存身份也记录 xFormers 版本。历史实验产物保持只读，新环境
 验证使用独立工作目录，不能把环境修复解释为 Skill 收益。
 
 v11 默认环境要求见 `configs/gpu_experiment_v11.yaml`：

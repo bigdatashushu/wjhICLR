@@ -19,7 +19,7 @@ QWEN_GPU="${HARNESS3D_QWEN_GPU:-2}"
 GEOMETRY_GPU="${HARNESS3D_GEOMETRY_GPU:-3}"
 RESERVE_GPU="${HARNESS3D_RESERVE_GPU:-4}"
 MIN_FREE_GPU_MIB="${HARNESS3D_MIN_FREE_GPU_MIB:-18000}"
-DETECTOR_ENDPOINT="${HARNESS3D_DETECTOR_ENDPOINT:-http://127.0.0.1:20022}"
+DETECTOR_ENDPOINT=""
 REQUIRE_DETECTOR="${HARNESS3D_REQUIRE_DETECTOR:-1}"
 
 DRY_RUN=0
@@ -177,22 +177,33 @@ use_existing_dir MOGE2_EXISTING_PATH \
 export SAM2_CONFIG="${SAM2_CONFIG:-configs/sam2.1/sam2.1_hiera_l.yaml}"
 
 "$PYTHON_BIN" - "$CONFIG_SOURCE" "$GENERATED_CONFIG" \
-  "$QWEN_GPU" "$GEOMETRY_GPU" "$DETECTOR_ENDPOINT" "$SMOKE" "$DEV" "$DRY_RUN" "$ROOT" <<'PY'
+  "$QWEN_GPU" "$GEOMETRY_GPU" "$REQUIRE_DETECTOR" "$SMOKE" "$DEV" "$DRY_RUN" "$ROOT" <<'PY'
 import pathlib
 import sys
 sys.path.insert(0, str(pathlib.Path(sys.argv[9]) / "src"))
 import yaml
 from skill3d.infra.experiment_startup import configure_run
-from skill3d.online.config import load_yaml
+from skill3d.online.config import load_yaml, resolve_detector_endpoint
 
 source, target = map(pathlib.Path, sys.argv[1:3])
-qwen_gpu, geometry_gpu, detector, smoke, dev, dry_run = sys.argv[3:9]
+qwen_gpu, geometry_gpu, require_detector, smoke, dev, dry_run = sys.argv[3:9]
 cfg = configure_run(load_yaml(source), dev=dev == "1",
                     smoke=smoke == "1", dry_run=dry_run == "1")
 cfg["runtime"].update(qwen_gpu=int(qwen_gpu), geometry_gpu=int(geometry_gpu))
-cfg["experiment"]["detector_endpoint"] = detector
+detector = resolve_detector_endpoint(cfg["experiment"], require_detector=require_detector == "1")
+cfg["experiment"].update(detector_endpoint=detector["endpoint"],
+                         detector_endpoint_source=detector["source"])
 target.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
 PY
+
+DETECTOR_ENDPOINT="$("$PYTHON_BIN" - "$GENERATED_CONFIG" <<'PY'
+import sys
+import yaml
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(yaml.safe_load(stream)["experiment"]["detector_endpoint"])
+PY
+)"
+export SKILL3D_DETECTOR_ENDPOINT="$DETECTOR_ENDPOINT"
 
 if [[ "$MODE" == "formal" && "$DRY_RUN" -eq 0 && "$DOWNLOAD_ONLY" -eq 0 ]]; then
   "$PYTHON_BIN" - "$GENERATED_CONFIG" "$ROOT" "$CODE_REF" <<'PY'

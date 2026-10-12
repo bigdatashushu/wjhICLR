@@ -26,6 +26,18 @@ K = np.array([[500.0, 0.0, 320.0], [0.0, 500.0, 240.0], [0.0, 0.0, 1.0]])
 H, W = 480, 640
 
 
+class _InventoryVLM:
+    model = "fixture-vlm"
+    model_weights_sha256 = "c" * 64
+    temperature = 0.0
+    max_output_tokens = 512
+
+    def chat(self, messages, **kwargs):
+        if isinstance(messages[0]["content"], str):
+            return '["chair"]'
+        return '[{"name":"chair","bbox":[250,250,650,650]}]'
+
+
 # ------------------------------------------------------------------ 配置解析 ----
 
 def test_resolve_config_precedence(monkeypatch):
@@ -103,7 +115,7 @@ def _fake_predictor(n_frames=3):
             return {"n": n}
 
         def add_new_points_or_box(self, state, frame_idx, obj_id, box=None, **kw):
-            assert frame_idx == 0, "首帧给框提示"
+            assert 0 <= frame_idx < state["n"], "冻结帧内给框提示"
             state.setdefault("objs", []).append(obj_id)
 
         def propagate_in_video(self, state):
@@ -294,6 +306,25 @@ def test_bind_masks_to_world_unverified_when_no_valid_depth():
     assert objs[0].pointconf_world == ""
 
 
+def test_raw_prompt_label_and_absorbed_provenance_survive_binding_and_dedupe():
+    from skill3d.segmentation.sam2_tracker import _PromptLabel, _dedupe_by_world_centroid
+
+    mask = _square_mask()
+    depth = np.full((2, H, W), 3.0)
+    masks = [{0: mask, 1: mask}, {0: mask, 1: mask}]
+    objs = bind_masks_to_world(
+        masks, depth, np.stack([np.eye(4)] * 2), K,
+        class_hints=[_PromptLabel("Desk Counter"), _PromptLabel("Desk Counter")],
+        confidences=[0.9, 0.8], det_conf_sources=["groundingdino", "vlm_box"],
+        prompt_provenance=[{"frame_slot": 0}, {"frame_slot": 1}])
+    kept, n_dup, _ = _dedupe_by_world_centroid(objs, depth, masks_per_object=masks)
+    assert n_dup == 1 and kept[0].source_label == "Desk Counter"
+    assert kept[0].category_name == "desk_counter"
+    assert kept[0].det_conf_source == "groundingdino"
+    assert [p["frame_slot"] for p in kept[0].binding_provenance] == [0, 1]
+    assert kept[0].binding_provenance[1]["absorbed_obj_id"] == "obj_1"
+
+
 def test_bind_masks_to_world_skips_resolution_mismatch():
     masks = [{0: np.zeros((10, 10), dtype=bool)}]   # 与深度分辨率不一致
     objs = bind_masks_to_world(masks, np.ones((1, H, W)), np.eye(4)[None], K)
@@ -351,6 +382,7 @@ def test_bind_objects_for_scene_returns_g7_g9_stats(tmp_path):
         frames, None, "How many chair(s) are in this room?",
         depth_maps=depth, c2w_list=c2w, intrinsics=K,
         out_dir=tmp_path, scene_name="sc", predictor=_fake_predictor(3),
+        vlm_client=_InventoryVLM(),
     )
     assert objs and len(objs) == 1
     assert "track_ious" in stats and stats["track_ious"][0] == pytest.approx(1.0)
@@ -381,6 +413,7 @@ def test_bind_objects_for_scene_threads_point_conf_and_track_ids(tmp_path):
         frames, None, "How many chair(s) are in this room?",
         depth_maps=depth, c2w_list=c2w, intrinsics=K, out_dir=tmp_path,
         scene_name="sc", predictor=_fake_predictor(3), point_conf=conf,
+        vlm_client=_InventoryVLM(),
     )
     assert objs and all(o.track_id for o in objs)
     assert [o.track_id for o in objs] == [f"trk{i}" for i in range(len(objs))]
@@ -394,14 +427,14 @@ def test_bind_objects_for_scene_threads_point_conf_and_track_ids(tmp_path):
         frames, None, "How many chair(s) are in this room?",
         depth_maps=depth, c2w_list=c2w, intrinsics=K, out_dir=tmp_path,
         scene_name="sc2", predictor=_fake_predictor(3), depth_conf=conf,
-        use_inventory_cache=False,
+        use_inventory_cache=False, vlm_client=_InventoryVLM(),
     )
     assert objs2 and all(o.pointconf_world for o in objs2)
     objs3, _, _ = bind_objects_for_scene(
         frames, None, "How many chair(s) are in this room?",
         depth_maps=depth, c2w_list=c2w, intrinsics=K, out_dir=tmp_path,
         scene_name="sc3", predictor=_fake_predictor(3),
-        use_inventory_cache=False,
+        use_inventory_cache=False, vlm_client=_InventoryVLM(),
     )
     assert objs3 and all(o.pointconf_world == "" for o in objs3)
 
@@ -413,7 +446,8 @@ def _inst(iid, hint, centroid, conf=0.9):
 
     return ObjectRecord(obj_id=iid, category_name=hint, mask_per_frame="",
                         pointcloud_world="", centroid_world=list(centroid),
-                        bbox=[0.0] * 6, det_conf=conf)
+                        bbox=[0.0] * 6, det_conf=conf,
+                        visible_frames=[0], mask_support_ratio=1.0)
 
 
 def test_dedupe_merges_same_class_close_and_temporally_overlapping():
@@ -512,7 +546,72 @@ def test_semantic_mask_conflict_excludes_synonyms_and_requires_two_frames(tmp_pa
     phone = _targeted_with_mask(tmp_path, "c", "telephone", one)
     _, audits = audit_semantic_mask_conflicts(
         [("a", [tv]), ("c", [phone])], scene_identity="scene")
-    assert audits == []
+    assert len(audits) == 1
+    assert audits[0]["status"] == "skipped"
+    assert audits[0]["skip_reason"] == "insufficient_common_nonempty_frames"
+
+
+@pytest.mark.parametrize("left,right,relation,hard", [
+    ("door", "chair", "incompatible", True),
+    ("door", "drawer", "incompatible", True),
+    ("desk", "table", "compatible", False),
+    ("water bottle", "bottle", "compatible", False),
+    ("computer", "tv monitor", "compatible", False),
+    ("desk counter", "dresser", "compatible", False),
+    ("cabinet door", "chair", "unknown", False),
+    ("lamp", "chair", "unknown", False),
+])
+def test_mask_audit_covers_base_and_targeted_without_blanket_block(
+        tmp_path, left, right, relation, hard):
+    from skill3d.segmentation.sam2_tracker import audit_semantic_mask_conflicts
+
+    mask = np.ones((2, 8, 8), dtype=np.uint8)
+    base = _targeted_with_mask(tmp_path, "base", left, mask).model_copy(
+        update={"grounding_status": "base_list"})
+    target = _targeted_with_mask(tmp_path, "target", right, mask, "obj_1")
+    audited, audits = audit_semantic_mask_conflicts(
+        [("q", [base, target])], scene_identity="scene")
+    assert len(audits) == 1
+    assert audits[0]["relation"] == relation
+    assert audits[0]["hard_block"] == hard
+    assert all(bool(o.binding_flags) == hard for o in audited["q"])
+    assert len(audited["q"]) == 2
+
+
+def test_base_aliases_receive_conflict_flags_once_and_foreign_flags_survive(tmp_path):
+    from skill3d.segmentation.sam2_tracker import audit_semantic_mask_conflicts
+
+    mask = np.ones((2, 8, 8), dtype=np.uint8)
+    base = _targeted_with_mask(tmp_path, "base", "door", mask).model_copy(
+        update={"grounding_status": "base_list", "binding_flags": [{"code": "other"}]})
+    copied = base.model_copy(update={"obj_id": "copy"})
+    target = _targeted_with_mask(tmp_path, "target", "chair", mask)
+    audited, audits = audit_semantic_mask_conflicts(
+        [("a", [base]), ("b", [copied, target])], scene_identity="scene")
+    assert len(audits) == 1
+    assert len(audits[0]["endpoints"][0]["aliases"]) == 2
+    assert audited["a"][0].binding_flags[0] == {"code": "other"}
+    assert audited["b"][0].binding_flags[-1]["code"] == "semantic_label_mask_conflict"
+    again, repeated = audit_semantic_mask_conflicts(
+        list(audited.items()), scene_identity="scene")
+    assert repeated == audits
+    assert again["a"][0].binding_flags == audited["a"][0].binding_flags
+    _, base_only = audit_semantic_mask_conflicts(
+        [("q", [base, target.model_copy(update={"grounding_status": "base_list"})])],
+        scene_identity="scene")
+    assert base_only[0]["hard_block"] is False
+
+
+def test_unreadable_and_mismatched_masks_remain_skipped_diagnostics(tmp_path):
+    from skill3d.segmentation.sam2_tracker import audit_semantic_mask_conflicts
+
+    left = _targeted_with_mask(tmp_path, "a", "door", np.ones((2, 8, 8)))
+    right = _targeted_with_mask(tmp_path, "b", "chair", np.ones((2, 9, 8)))
+    missing = _inst("missing", "lamp", [0, 0, 0])
+    _, audits = audit_semantic_mask_conflicts(
+        [("q", [left, right, missing])], scene_identity="scene")
+    assert {a["skip_reason"] for a in audits} == {
+        "mask_shape_mismatch", "unreadable_or_invalid_mask"}
 
 
 def test_semantic_conflict_audit_identity_binds_scene_mask_and_contract(tmp_path):
@@ -853,9 +952,10 @@ def test_question_supplement_sets_grounding_status_and_track_namespace(tmp_path)
     assert o.grounding_status == "question_targeted_fill"
     assert o.category_name == "telephone"
     assert o.obj_id == "obj_2"                          # scene 内唯一（不覆盖已有 id）
-    # 三个探测帧给出 3 条候选、掩码完全重合 → 合并成 1 条 track（qtrk0）
-    assert o.track_id == "qtrk0"
-    assert o.duplicate_suspect is True                  # 清单曾被高估 → 计数降级信号
+    # 首次健康绑定后停止；后续槽位不会重复制造同一个候选。
+    assert o.track_id.startswith("qtrk:")
+    assert "vlm-slot0000-pass0000" in o.track_id
+    assert o.duplicate_suspect is False
     assert o.pointconf_world                            # 逐点 conf 随补漏对象一起落盘
     assert len(np.load(o.pointconf_world)) == len(np.load(o.pointcloud_world))
     assert stats["track_ious"] or stats == {}
@@ -898,6 +998,7 @@ def test_supplement_checks_options_and_partial_detector_coverage(tmp_path, monke
                 [(0, 0, [1., 1., 20., 20.])], [0.87])
 
     monkeypatch.setattr(tracker, "ovd_boxes_for_nouns", detect)
+    monkeypatch.setattr("skill3d.segmentation.open_vocab_detector.available", lambda: True)
     monkeypatch.setattr(tracker, "track_objects", lambda *a, **k: [{0: np.ones((2, 2))}])
     monkeypatch.setattr(tracker, "bind_masks_to_world", lambda *a, **k: [
         _inst("obj_0", "chair", [10., 0., 0.])])
@@ -959,3 +1060,174 @@ def test_question_supplement_never_overwrites_base_geometry_files(tmp_path):
     for field in ("pointcloud_world", "pointconf_world", "mask_per_frame"):
         path = Path(getattr(new[0], field))
         assert path.is_file() and path not in refs
+
+
+def _full_frame_supplement(tmp_path, monkeypatch, detector, *, n=32, existing=None,
+                           mask_factory=None, locator=None, required=("door", "clock")):
+    from skill3d.segmentation import sam2_tracker as tracker, open_vocab_detector as ovd
+    frames = [np.full((8, 8, 3), i, dtype=np.uint8) for i in range(n)]
+    monkeypatch.setattr(tracker, "question_object_names_from_vlm", lambda *a, **k: list(required))
+    monkeypatch.setattr(ovd, "available", lambda: True)
+    monkeypatch.setattr(ovd, "detect", detector)
+
+    def masks(frames, boxes, *a, prompts, **k):
+        result = []
+        for slot, index, box in prompts:
+            mask = (mask_factory(slot, box) if mask_factory else
+                    np.pad(np.ones((2, 2), bool), ((int(box[0]), 6-int(box[0])),
+                                                  (int(box[0]), 6-int(box[0])))))
+            result.append({i: mask for i in range(len(frames))})
+        return result
+
+    monkeypatch.setattr(tracker, "track_objects", masks)
+    monkeypatch.setattr(tracker, "box_prompts_from_vlm", locator or (lambda *a, **k: ([], [])))
+    base = list(existing or [])
+    return base, tracker._bind_question_supplement(
+        frames, [0, n // 2], "door and clock" if required else "locate mentioned item",
+        base, np.ones((n, 8, 8)), np.stack([np.eye(4)] * n), np.eye(3),
+        grid_transform=None, out_dir=tmp_path, scene_name="full",
+        predictor=object(), vlm_client=object(), handle=None, qa_id="full-q", seed=137,
+        frame_provenance=[{"frame_slot": i, "source_frame_index": 100 + i * 3,
+                           "timestamp": i / 2} for i in range(n)])
+
+
+def test_full_frame_fill_finds_clock_at_slot_27_after_door_resolved(tmp_path, monkeypatch):
+    from skill3d.segmentation import open_vocab_detector as ovd
+    calls = []
+
+    def detector(frame, prompt, **k):
+        slot = int(frame[0, 0, 0])
+        calls.append((slot, prompt))
+        ovd.detect.last_error = ""
+        return ([ovd.Detection("door", (0, 0, 3, 3), .9)] if slot == 0 else
+                [ovd.Detection("clock", (4, 4, 7, 7), .8)] if slot == 27 else [])
+
+    _, (new, stats, _) = _full_frame_supplement(tmp_path, monkeypatch, detector)
+    g = stats["grounding"]
+    assert {o.category_name for o in new} == {"door", "clock"}
+    assert g["binding_coverage_complete"] and g["category_coverage_complete"]
+    assert [s for s, _ in calls] == [0, 16] + list(range(1, 16)) + list(range(17, 28))
+    assert calls[0][1] == "door. clock."
+    assert all(prompt == "clock." for _, prompt in calls[1:])
+    assert len({o.track_id for o in new}) == len(new)
+    assert len({o.mask_per_frame for o in new}) == len(new)
+    receipt = next(r for r in g["phase_receipts"] if r["frame_slot"] == 27)
+    assert receipt["source_frame_index"] == 181 and receipt["timestamp"] == 13.5
+    assert receipt["unresolved_after"] == [] and receipt["new_object_ids"]
+    assert len(receipt["request_sha256"]) == 64
+    assert g["stages"][1]["reason"] == "bindings_resolved"
+
+
+def test_zero_detection_exhausts_both_phases_once_per_readable_slot(tmp_path, monkeypatch):
+    from skill3d.segmentation import open_vocab_detector as ovd
+    calls = []
+
+    def detector(frame, prompt, **k):
+        ovd.detect.last_error = ""
+        calls.append(int(frame[0, 0, 0]))
+        return []
+
+    _, (new, stats, _) = _full_frame_supplement(tmp_path, monkeypatch, detector, n=5)
+    g = stats["grounding"]
+    assert not new and g["unresolved_names"] == ["door", "clock"]
+    assert g["status"] == "missing" and not g["all_present"]
+    assert calls == [0, 2, 1, 3, 4]
+    assert len(g["phase_receipts"]) == 10
+    for phase in ("detector", "vlm"):
+        rows = [r for r in g["phase_receipts"] if r["phase"] == phase]
+        assert len(rows) == len({r["frame_slot"] for r in rows}) == 5
+    assert all(r["termination_reason"] == "all_readable_slots_exhausted"
+               for r in g["requirements"])
+
+
+def test_empty_mask_does_not_resolve_and_new_pass_has_unique_refs(tmp_path, monkeypatch):
+    from skill3d.segmentation import open_vocab_detector as ovd
+
+    def detector(frame, prompt, **k):
+        ovd.detect.last_error = ""
+        return [ovd.Detection("clock", (0, 0, 3, 3), .8)]
+
+    def mask(slot, box):
+        return np.full((8, 8), slot != 0, bool)
+
+    _, (new, stats, _) = _full_frame_supplement(
+        tmp_path, monkeypatch, detector, n=3, mask_factory=mask, required=("clock",))
+    assert len(new) == 2 and new[0].visible_frames == []
+    assert new[0].mask_per_frame != new[1].mask_per_frame
+    assert new[0].track_id != new[1].track_id
+    assert new[0].obj_id != new[1].obj_id
+    receipts = stats["grounding"]["phase_receipts"]
+    assert receipts[0]["unresolved_after"] == ["clock"]
+    assert receipts[1]["unresolved_after"] == []
+    assert stats["grounding"]["requirements"][0]["usable_object_ids"] == [new[1].obj_id]
+
+
+def test_conflicted_candidate_cannot_absorb_new_healthy_binding(tmp_path, monkeypatch):
+    from skill3d.segmentation import open_vocab_detector as ovd
+    m = np.zeros((3, 8, 8), bool)
+    m[:, :2, :2] = True
+    path = tmp_path / "base.npy"
+    np.save(path, m)
+    chair = _inst("obj_0", "chair", [1., 1., 1.]).model_copy(
+        update={"mask_per_frame": str(path)})
+    door = chair.model_copy(update={
+        "obj_id": "obj_1", "category_name": "door", "source_label": "door",
+        "grounding_status": "question_targeted_fill"})
+
+    def detector(frame, prompt, **k):
+        ovd.detect.last_error = ""
+        return [ovd.Detection("door", (4, 4, 7, 7), .8)]
+
+    base, (new, stats, _) = _full_frame_supplement(
+        tmp_path, monkeypatch, detector, n=3, existing=[chair, door], required=("door",))
+    assert len(new) == 1
+    assert any(f["code"] == "semantic_label_mask_conflict" for f in base[1].binding_flags)
+    assert not new[0].binding_flags
+    row = stats["grounding"]["requirements"][0]
+    assert row["conflicted_object_ids"] == ["obj_1"]
+    assert row["usable_object_ids"] == [new[0].obj_id]
+
+
+def test_detector_fault_skips_remaining_slots_and_enters_vlm(tmp_path, monkeypatch):
+    from skill3d.segmentation import open_vocab_detector as ovd
+    calls = []
+
+    def detector(frame, prompt, **k):
+        calls.append(int(frame[0, 0, 0]))
+        ovd.detect.last_error = "ConnectionError: refused after 3 attempts"
+        return []
+
+    _, (_, stats, _) = _full_frame_supplement(tmp_path, monkeypatch, detector, n=3)
+    g = stats["grounding"]
+    assert calls == [0]
+    assert g["stages"][0]["reason"] == "detector_unavailable_after_finite_transport_attempts"
+    assert g["stages"][1]["business_requests"] == 3
+    assert all(r["termination_reason"] == "unresolved_with_unavailable_stage"
+               for r in g["requirements"])
+
+
+def test_no_nouns_uses_finite_generic_vlm_only(tmp_path, monkeypatch):
+    def forbidden(*a, **k):
+        raise AssertionError("No detector request without required nouns")
+
+    _, (new, stats, _) = _full_frame_supplement(
+        tmp_path, monkeypatch, forbidden, n=3, required=())
+    g = stats["grounding"]
+    assert not new and g["status"] == "not_checked"
+    assert g["stages"][0]["reason"] == "no_required_names"
+    assert [r["frame_slot"] for r in g["phase_receipts"]] == [0, 1, 2]
+
+
+def test_final_audit_recomputes_coverage_without_requests():
+    from skill3d.segmentation.sam2_tracker import _grounding_coverage, refresh_grounding_coverage
+    obj = _inst("door", "door", [0., 0., 1.])
+    original = _grounding_coverage(["door"], [obj])
+    original["requirements"][0]["termination_reason"] = "resolved"
+    original["phase_receipts"] = [{"request": "already_performed"}]
+    conflicted = obj.model_copy(update={
+        "binding_flags": [{"code": "semantic_label_mask_conflict"}]})
+    final = refresh_grounding_coverage(original, [conflicted])
+    assert final["category_coverage_complete"] and not final["binding_coverage_complete"]
+    assert final["unresolved_names"] == ["door"] and not final["all_present"]
+    assert final["requirements"][0]["termination_reason"] == "unresolved_after_final_audit"
+    assert final["phase_receipts"] == original["phase_receipts"]

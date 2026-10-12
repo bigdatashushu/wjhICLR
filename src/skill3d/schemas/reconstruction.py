@@ -373,6 +373,8 @@ class ObjectRecord(Spec):
 
     obj_id: str                           # scene 级稳定 ID（跨 episode 不变）
     category_name: str                    # 自描述：消灭 "id 不含类别名" 误用面
+    source_label: str = ""                # 检测/VLM 返回的原始标签，规范名不能代替
+    binding_provenance: list[dict[str, Any]] = []
     visible_frames: list[int] = []         # 该对象在哪些帧可见（帧槽位序号，升序）
     centroid_ref: str = ""                # 3D 质心引用（世界系，审计用）
     track_id: Optional[str] = None        # 跨帧 track

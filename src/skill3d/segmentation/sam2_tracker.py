@@ -33,6 +33,7 @@ import contextlib
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -42,11 +43,17 @@ from skill3d.coords import vlm_box_to_pixels
 from skill3d.schemas.reconstruction import ObjectRecord
 from skill3d.tools.category_match import (
     CATEGORY_MATCH_VERSION,
+    MASK_LABEL_RELATION_VERSION,
     canonical,
+    mask_label_relation,
     matches,
+    normalize,
     option_category,
 )
-from .open_vocab_detector import capture_detector_failures, current_detector_failures
+from .open_vocab_detector import (
+    capture_detector_attempts, capture_detector_failures,
+    current_detector_failures,
+)
 
 # 场景清单缓存版本（改 M5 清单构造逻辑时递增 → 旧缓存自动失效，不会混用口径）
 # v2：`ObjectInstance` 增 `visible_frames`（逐帧可见性题型）→ 旧缓存缺该字段，必须失效
@@ -55,12 +62,11 @@ from .open_vocab_detector import capture_detector_failures, current_detector_fai
 #     （无 track，计数无法做 track 共识），必须失效重算。
 # v8：检测器置信度与非空 mask 支撑率分离，并记录置信度来源；旧缓存中
 #     `det_conf` 可能是含空掩码帧的传播字典长度，必须失效重算。
-# v9：缓存键纳入 SAM2 包版本与 CUDA 后处理扩展摘要；安装/替换扩展会改变
-#     hole filling 行为，不能复用扩展缺失时生成的 mask。
-_INVENTORY_VERSION = "m5-inventory-9-sam2-runtime"
+# v10：完整冻结输入/模型/源码身份、引用内容校验与独立产物目录。
+_INVENTORY_VERSION = "m5-inventory-10-frozen-inputs"
 
 # 只对可证明的异类 targeted-fill 掩码冲突执行硬拦；普通多实例不在此合同内。
-SEMANTIC_MASK_CONFLICT_VERSION = "semantic-mask-conflict-v1"
+SEMANTIC_MASK_CONFLICT_VERSION = "semantic-mask-conflict-v2"
 SEMANTIC_MASK_CONFLICT_IOU = 0.95
 SEMANTIC_MASK_CONFLICT_MIN_FRAMES = 2
 
@@ -68,6 +74,17 @@ SEMANTIC_MASK_CONFLICT_MIN_FRAMES = 2
 # 前缀把它隔开 —— 否则 `count_objects` 的 track 去重会把两条不同对象算成一条。
 TRACK_PREFIX_BASE_LIST = "trk"      # 场景基础清单（scene 级，可缓存）
 TRACK_PREFIX_QUESTION = "qtrk"      # 逐题补漏（题级，不复用基础清单的 track）
+# VLM **通用清单**问题（与具体题目无关 → 清单可跨 episode 复用/缓存）
+
+class _PromptLabel(str):
+    """在保持现有规范提示值的同时，携带模型返回的原始 phrase。"""
+
+    def __new__(cls, raw):
+        value = super().__new__(cls, normalize_hint(raw))
+        value.source_label = str(raw)
+        return value
+
+
 # VLM **通用清单**问题（与具体题目无关 → 清单可跨 episode 复用/缓存）
 _GENERIC_INVENTORY_QUESTION = (
     "List the main objects in this indoor photo (furniture, doors, windows, appliances, and common items). "
@@ -245,13 +262,17 @@ def box_prompts_from_vlm(frames: Sequence[np.ndarray], question: str, client,
 
     import cv2
 
+    box_prompts_from_vlm.last_error = ""
+    box_prompts_from_vlm.last_request_sha256 = ""
     if client is None or not len(frames):
+        box_prompts_from_vlm.last_error = "vlm_not_configured_or_no_frames"
         return [], []
     img = np.asarray(frames[min(frame_idx, len(frames) - 1)])
     h, w = int(img.shape[0]), int(img.shape[1])
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                            [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if not ok:
+        box_prompts_from_vlm.last_error = "jpeg_encoding_failed"
         return [], []
     b64 = base64.b64encode(buf.tobytes()).decode("ascii")
     prompt = (
@@ -266,6 +287,9 @@ def box_prompts_from_vlm(frames: Sequence[np.ndarray], question: str, client,
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
     ]}]
+    box_prompts_from_vlm.last_request_sha256 = hashlib.sha256(json.dumps(
+        {"messages": messages, "max_tokens": 512, "seed": seed},
+        sort_keys=True).encode()).hexdigest()
     try:
         # 请求级 seed：M5 的框提示也参与"同配置重复运行逐题一致"的复现要求
         text = client.chat(messages, max_tokens=512, seed=seed)
@@ -276,12 +300,12 @@ def box_prompts_from_vlm(frames: Sequence[np.ndarray], question: str, client,
 
     m = re.search(r"\[.*\]", text, re.DOTALL)
     if not m:
-        box_prompts_from_vlm.last_error = f"未找到 JSON 数组；raw={text[:200]!r}"
+        box_prompts_from_vlm.last_error = f"JSON array not found; raw={text[:200]!r}"
         return [], []
     try:
         items = json.loads(m.group(0))
     except Exception as exc:  # noqa: BLE001
-        box_prompts_from_vlm.last_error = f"JSON 解析失败: {exc}; raw={m.group(0)[:200]!r}"
+        box_prompts_from_vlm.last_error = f"JSON parsing failed: {exc}; raw={m.group(0)[:200]!r}"
         return [], []
     hints: list[str] = []
     boxes: list[list[float]] = []
@@ -300,7 +324,7 @@ def box_prompts_from_vlm(frames: Sequence[np.ndarray], question: str, client,
         x0, y0, x1, y1 = vlm_box_to_pixels([x0, y0, x1, y1], w, h)
         if x1 - x0 < 2 or y1 - y0 < 2:
             continue
-        hints.append(normalize_hint(name))
+        hints.append(_PromptLabel(name))
         boxes.append([x0, y0, x1, y1])
     return hints, boxes
 
@@ -625,6 +649,7 @@ def bind_masks_to_world(
     point_conf: Optional[np.ndarray] = None,
     track_prefix: str = TRACK_PREFIX_BASE_LIST,
     grounding_status: str = "base_list",
+    prompt_provenance: Optional[Sequence[dict]] = None,
 ) -> list[ObjectRecord]:
     """mask × 深度反投影 → 世界坐标点云绑定（numpy 真实实现，§4 M5）。
 
@@ -666,6 +691,13 @@ def bind_masks_to_world(
         conf_source = (str(det_conf_sources[prop_idx])
                        if det_conf_sources is not None
                        and prop_idx < len(det_conf_sources) else "unknown")
+        source_label = str(getattr(hint, "source_label", hint))
+        provenance = {
+            "source": grounding_status, "det_conf_source": conf_source,
+            "source_label": source_label, "prompt_category": str(hint),
+        }
+        if prompt_provenance is not None and prop_idx < len(prompt_provenance):
+            provenance.update(prompt_provenance[prop_idx])
         pts_world_all = []
         conf_all = []
         for frame_idx, mask in sorted(masks.items()):
@@ -696,14 +728,22 @@ def bind_masks_to_world(
         iid = f"obj_{prop_idx}"
         # v6 §5.6：跨帧 track 身份 = 产生该对象的 SAM2 传播序号（确定性）
         track_id = f"{track_prefix}{prop_idx}"
+        mask_ref = ""
+        if out_dir is not None:
+            d = Path(out_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            mask_path = d / f"{scene_name}_{iid}_mask.npy"
+            np.save(mask_path, _stack_masks(masks, len(depth_maps), depth_maps.shape[1:]))
+            mask_ref = str(mask_path)
         if not pts_world_all:
             # 分割失败 → 该对象标记 unverified（§4 M5 字段 9）
             instances.append(ObjectRecord(
                 obj_id=iid,
                 category_name=hint if class_hints else "unverified",
+                source_label=source_label, binding_provenance=[provenance],
                 track_id=track_id,
                 grounding_status=grounding_status,
-                mask_per_frame="",
+                mask_per_frame=mask_ref,
                 pointcloud_world="",
                 pointconf_world="",          # 无点云 → 无逐点 conf（不伪造）
                 centroid_ref="",
@@ -725,16 +765,13 @@ def bind_masks_to_world(
                 conf_pts = conf_pts[sel]     # 同一套下标 → 下采样后仍逐点对齐
         centroid = pts.mean(axis=0)
         pmin, pmax = pts.min(axis=0), pts.max(axis=0)
-        mask_ref, cloud_ref, conf_ref = "", "", ""
+        cloud_ref, conf_ref = "", ""
         if out_dir is not None:
             d = Path(out_dir)
             d.mkdir(parents=True, exist_ok=True)
-            mask_arr = _stack_masks(masks, len(depth_maps), depth_maps.shape[1:])
-            mask_path = d / f"{scene_name}_{iid}_mask.npy"
             cloud_path = d / f"{scene_name}_{iid}_points.npy"
-            np.save(mask_path, mask_arr)
             np.save(cloud_path, pts)
-            mask_ref, cloud_ref = str(mask_path), str(cloud_path)
+            cloud_ref = str(cloud_path)
             if conf_pts is not None:
                 conf_path = d / f"{scene_name}_{iid}_pointconf.npy"
                 np.save(conf_path, conf_pts)     # 与 pts 同长（逐点对齐）
@@ -743,6 +780,7 @@ def bind_masks_to_world(
         instances.append(ObjectRecord(
             obj_id=iid,
             category_name=hint,
+            source_label=source_label, binding_provenance=[provenance],
             track_id=track_id,
             grounding_status=grounding_status,
             mask_per_frame=mask_ref,
@@ -789,47 +827,100 @@ def audit_semantic_mask_conflicts(
     iou_threshold: float = SEMANTIC_MASK_CONFLICT_IOU,
     contract_version: str = SEMANTIC_MASK_CONFLICT_VERSION,
 ) -> tuple[dict[str, list[ObjectRecord]], list[dict]]:
-    """标记可证明的异类 targeted-fill 掩码冲突。
-
-    只比较规范类别不同的 `question_targeted_fill` 对象。两对象至少有两个共同
-    非空帧，且这些帧的堆叠 IoU 达到阈值时，给双方写入同一个版本化审计身份。
-    基础清单、同义词和普通同类多实例均不触发本硬门。
-    """
+    """审计全部可读 mask；明确不相容且至少一端 targeted-fill 才硬拦。"""
     threshold = float(iou_threshold)
     if not (0.0 <= threshold <= 1.0):
         raise ValueError(f"iou_threshold must be within [0,1], got {iou_threshold!r}")
 
     cleaned: dict[str, list[ObjectRecord]] = {}
-    candidates = []
+    candidates: dict[tuple, dict] = {}
+    audits: list[dict] = []
+
+    def publish(body):
+        audit_sha = hashlib.sha256(json.dumps(
+            body, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")).hexdigest()
+        audit = {**body, "audit_sha256": audit_sha}
+        audits.append(audit)
+        return audit
+
+    contract = {
+        "contract_version": str(contract_version),
+        "relation_rule_version": MASK_LABEL_RELATION_VERSION,
+        "scene_identity": str(scene_identity),
+        "iou_threshold": threshold,
+        "min_common_nonempty_frames": SEMANTIC_MASK_CONFLICT_MIN_FRAMES,
+    }
     for qa_id, objects in bindings:
         rows = []
         for index, obj in enumerate(objects):
             flags = [dict(flag) for flag in (obj.binding_flags or [])
-                     if flag.get("code") != "semantic_label_mask_conflict"]
+                     if not (
+                         flag.get("code") == "semantic_label_mask_conflict"
+                         and flag.get("contract_version") in (
+                             "semantic-mask-conflict-v1", SEMANTIC_MASK_CONFLICT_VERSION,
+                             contract_version))]
             current = obj.model_copy(update={"binding_flags": flags})
             rows.append(current)
             category = canonical(current.category_name)
             mask_path = Path(str(current.mask_per_frame or ""))
-            if (current.grounding_status != "question_targeted_fill"
-                    or not category or not mask_path.is_file()):
-                continue
+            endpoint = {
+                "qa_id": str(qa_id), "obj_id": current.obj_id,
+                "category_name": current.category_name,
+                "source_label": current.source_label or current.category_name,
+                "canonical_category": category, "source": current.grounding_status,
+            }
             try:
-                mask = np.asarray(np.load(mask_path, allow_pickle=False), dtype=bool)
-            except (OSError, ValueError):
+                from skill3d.tools.scene_handle import file_sha256
+                mask_sha = file_sha256(mask_path)
+                raw = normalize(endpoint["source_label"])
+                compound = raw if raw in ("desk counter", "table dresser") else ""
+                key = (category, compound, current.grounding_status, mask_sha)
+                mask = (candidates[key]["mask"] if key in candidates else
+                        np.load(mask_path, allow_pickle=False, mmap_mode="r"))
+                if mask.ndim != 3:
+                    raise ValueError(f"expected 3D mask, got {mask.shape}")
+            except (OSError, ValueError) as exc:
+                publish({
+                    **contract, "code": "semantic_mask_audit_skipped", "status": "skipped",
+                    "skip_reason": "unreadable_or_invalid_mask",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "endpoints": [endpoint], "qa_ids": [str(qa_id)],
+                    "object_ids": [current.obj_id],
+                })
                 continue
-            if mask.ndim != 3:
-                continue
-            candidates.append({
-                "qa_id": str(qa_id), "index": index, "object": current,
-                "category": category, "mask": mask,
-                "mask_sha256": hashlib.sha256(mask_path.read_bytes()).hexdigest(),
+            endpoint["mask_sha256"] = mask_sha
+            entry = candidates.setdefault(key, {
+                "object": current, "category": category, "mask": mask,
+                "endpoint": endpoint, "aliases": [],
             })
+            entry["aliases"].append({"qa_id": str(qa_id), "index": index,
+                                     "obj_id": current.obj_id,
+                                     "source_label": endpoint["source_label"],
+                                     "category_name": current.category_name})
         cleaned[str(qa_id)] = rows
 
-    audits: list[dict] = []
-    for left_index, left in enumerate(candidates):
-        for right in candidates[left_index + 1:]:
-            if left["category"] == right["category"]:
+    representatives = list(candidates.values())
+    for left_index, left in enumerate(representatives):
+        for right in representatives[left_index + 1:]:
+            relation = mask_label_relation(left["endpoint"]["source_label"],
+                                           right["endpoint"]["source_label"])
+            if relation == "equivalent":
+                continue
+            endpoints = sorted([
+                {**entry["endpoint"],
+                 "aliases": sorted(entry["aliases"], key=lambda a: (a["qa_id"], a["obj_id"]))}
+                for entry in (left, right)
+            ], key=lambda e: (e["qa_id"], e["obj_id"], e["canonical_category"], e["mask_sha256"]))
+            identity = {
+                **contract, "relation": relation, "endpoints": endpoints,
+                "qa_ids": sorted({a["qa_id"] for e in endpoints for a in e["aliases"]}),
+                "object_ids": sorted({a["obj_id"] for e in endpoints for a in e["aliases"]}),
+                "categories": [e["category_name"] for e in endpoints],
+            }
+            if left["mask"].shape[1:] != right["mask"].shape[1:]:
+                publish({**identity, "code": "semantic_mask_audit_skipped",
+                         "status": "skipped", "skip_reason": "mask_shape_mismatch"})
                 continue
             n_frames = min(len(left["mask"]), len(right["mask"]))
             common = [
@@ -838,6 +929,9 @@ def audit_semantic_mask_conflicts(
                 and left["mask"][frame].any() and right["mask"][frame].any()
             ]
             if len(common) < SEMANTIC_MASK_CONFLICT_MIN_FRAMES:
+                publish({**identity, "code": "semantic_mask_audit_skipped",
+                         "status": "skipped", "skip_reason": "insufficient_common_nonempty_frames",
+                         "common_nonempty_frames": common})
                 continue
             intersections = sum(
                 int(np.logical_and(left["mask"][frame], right["mask"][frame]).sum())
@@ -849,135 +943,130 @@ def audit_semantic_mask_conflicts(
             if stacked_iou < threshold:
                 continue
 
-            endpoints = sorted([
-                {
-                    "qa_id": left["qa_id"], "obj_id": left["object"].obj_id,
-                    "category_name": left["object"].category_name,
-                    "canonical_category": left["category"],
-                    "mask_sha256": left["mask_sha256"],
-                },
-                {
-                    "qa_id": right["qa_id"], "obj_id": right["object"].obj_id,
-                    "category_name": right["object"].category_name,
-                    "canonical_category": right["category"],
-                    "mask_sha256": right["mask_sha256"],
-                },
-            ], key=lambda item: (
-                item["qa_id"], item["obj_id"], item["canonical_category"],
-                item["mask_sha256"]))
-            identity = {
-                "contract_version": str(contract_version),
-                "scene_identity": str(scene_identity),
-                "iou_threshold": threshold,
-                "min_common_nonempty_frames": SEMANTIC_MASK_CONFLICT_MIN_FRAMES,
-                "endpoints": endpoints,
-            }
-            audit_sha = hashlib.sha256(json.dumps(
-                identity, ensure_ascii=False, sort_keys=True,
-                separators=(",", ":")).encode("utf-8")).hexdigest()
-            audit = {
-                "code": "semantic_label_mask_conflict",
-                **identity,
-                "audit_sha256": audit_sha,
-                "qa_ids": [item["qa_id"] for item in endpoints],
-                "object_ids": [item["obj_id"] for item in endpoints],
-                "categories": [item["category_name"] for item in endpoints],
+            hard_block = relation == "incompatible" and any(
+                e["source"] == "question_targeted_fill" for e in endpoints)
+            audit = publish({
+                **identity, "hard_block": hard_block, "status": "high_overlap",
+                "code": ("semantic_label_mask_conflict" if hard_block
+                         else "semantic_mask_overlap_audit"),
                 "common_nonempty_frames": common,
                 "stacked_iou": stacked_iou,
-            }
-            audits.append(audit)
+            })
+            if not hard_block:
+                continue
             for own, other in ((left, right), (right, left)):
-                flag = {
-                    **audit,
-                    "object_qa_id": own["qa_id"],
-                    "object_id": own["object"].obj_id,
-                    "counterpart_qa_id": other["qa_id"],
-                    "counterpart_object_id": other["object"].obj_id,
-                    "counterpart_category": other["object"].category_name,
-                }
-                row = cleaned[own["qa_id"]][own["index"]]
-                flags = list(row.binding_flags or [])
-                if not any(item.get("audit_sha256") == audit_sha for item in flags):
-                    cleaned[own["qa_id"]][own["index"]] = row.model_copy(
-                        update={"binding_flags": flags + [flag]})
+                for alias in own["aliases"]:
+                    flag = {
+                        **audit, "object_qa_id": alias["qa_id"], "object_id": alias["obj_id"],
+                        "counterpart_qa_id": other["endpoint"]["qa_id"],
+                        "counterpart_object_id": other["object"].obj_id,
+                        "counterpart_category": other["object"].category_name,
+                    }
+                    row = cleaned[alias["qa_id"]][alias["index"]]
+                    flags = list(row.binding_flags or [])
+                    if not any(item.get("audit_sha256") == audit["audit_sha256"] for item in flags):
+                        cleaned[alias["qa_id"]][alias["index"]] = row.model_copy(
+                            update={"binding_flags": flags + [flag]})
     audits.sort(key=lambda item: item["audit_sha256"])
     return cleaned, audits
 
 
-def _inventory_key(scene_name: str, frame_set_hash: str, depth_maps, n_frames: int) -> str:
-    """场景清单缓存键：scene + frame_set_hash + 产物形状 + SAM2 运行身份。
-
-    `frame_set_hash` 由调用方传入（M1 统一 FrameSet 的哈希）；缺失时用形状兜底，
-    仍然确定性，只是粒度更粗（换帧集但形状相同的场景会误命中 → 调用方应尽量传）。
-    """
-    import hashlib
+def _inventory_key(scene_name: str, frame_set_hash: str, depth_maps, n_frames: int,
+                   *, generation: dict | None = None) -> str:
+    """完整 SHA256；旧式调用只生成诊断身份，不授予缓存能力。"""
+    from skill3d.infra.m5_identity import array_identity, content_sha256
     from skill3d.infra.version_lock import sam2_runtime_identity
 
-    payload = json.dumps({
-        "v": _INVENTORY_VERSION,
-        "sam2_runtime": sam2_runtime_identity(),
-        "category_match_version": CATEGORY_MATCH_VERSION,
-        "scene": str(scene_name),
-        "fsh": str(frame_set_hash or ""),
-        "n_frames": int(n_frames),
-        "depth_shape": list(np.asarray(depth_maps).shape) if depth_maps is not None else None,
-        "vocab": sorted(OBJECT_VOCABULARY),
-    }, sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    if generation is not None:
+        return content_sha256({"version": _INVENTORY_VERSION,
+                               "generation_sha256": generation["sha256"]})
+    return content_sha256({
+        "version": _INVENTORY_VERSION, "scene": str(scene_name),
+        "frame_set_hash": str(frame_set_hash), "n_frames": int(n_frames),
+        "depth": array_identity(depth_maps), "sam2": sam2_runtime_identity(),
+        "incomplete_identity": True,
+    })
+
+
+def _cache_identity_valid(generation, key) -> bool:
+    from skill3d.infra.m5_identity import content_sha256
+
+    return bool(generation and generation.get("cache_eligible")
+                and not generation.get("missing")
+                and content_sha256(generation["identity"]) == generation["sha256"]
+                and _inventory_key("", "", None, 0, generation=generation) == key)
 
 
 def _load_inventory(out_dir: Optional[str | Path], scene_name: str,
-                    key: str) -> Optional[tuple[list[ObjectRecord], dict, str]]:
+                    key: str, *, generation: dict | None = None
+                    ) -> Optional[tuple[list[ObjectRecord], dict, str]]:
     """读场景清单缓存；返回 `(objects, stats_scalars, dynamic_masks_ref)` 或 None。"""
-    if not out_dir:
+    if not out_dir or not _cache_identity_valid(generation, key):
         return None
     p = Path(out_dir) / f"{scene_name}_inventory_{key}.json"
     if not p.exists():
         return None
     try:
         payload = json.loads(p.read_text())
-        if payload.get("inventory_version") != _INVENTORY_VERSION:
+        from skill3d.infra.m5_identity import content_sha256, file_identity
+        payload_sha256 = payload.pop("payload_sha256")
+        if (payload.get("inventory_version") != _INVENTORY_VERSION
+                or payload.get("key") != key or payload.get("generation") != generation
+                or content_sha256(payload) != payload_sha256):
             return None
         objects = [ObjectRecord.model_validate(o) for o in payload["objects"]]
+        expected_refs = {str(getattr(obj, name)) for obj in objects
+                         for name in ("mask_per_frame", "pointcloud_world",
+                                      "pointconf_world", "centroid_ref")
+                         if getattr(obj, name, "")}
+        g7_ref = str(payload.get("dynamic_masks_ref") or "")
+        if g7_ref:
+            expected_refs.add(g7_ref)
+        if expected_refs != set(payload["artifact_hashes"]):
+            return None
+        for ref in expected_refs:
+            if file_identity(ref) != payload["artifact_hashes"][ref]:
+                return None
     except Exception:  # noqa: BLE001 - 缓存损坏 → 当作未命中重算（不抛错阻断 episode）
         return None
-    # mask/点云/逐点 conf ref 必须仍然存在，否则缓存不可用（防止半写入/清理过的目录）
-    for o in objects:
-        if o.mask_per_frame and not Path(o.mask_per_frame).exists():
-            return None
-        if o.pointcloud_world and not Path(o.pointcloud_world).exists():
-            return None
-        if o.pointconf_world and not Path(o.pointconf_world).exists():
-            return None
     stats = dict(payload.get("stats") or {})
-    g7_ref = str(payload.get("dynamic_masks_ref") or "")
     if g7_ref:
-        if not Path(g7_ref).exists():
-            g7_ref = ""
-        else:
-            stats["dynamic_masks_ref"] = g7_ref
+        stats["dynamic_masks_ref"] = g7_ref
     return objects, stats, g7_ref
 
 
 def _save_inventory(out_dir: Optional[str | Path], scene_name: str, key: str,
                     objects: Sequence[ObjectRecord], stats: dict,
-                    dynamic_masks: Optional[np.ndarray]) -> Optional[str]:
+                    dynamic_masks: Optional[np.ndarray], *,
+                    generation: dict | None = None,
+                    artifact_dir: str | Path | None = None) -> Optional[str]:
     """写场景清单缓存（原子写）；返回 dynamic_masks ref（未给则空串）。"""
-    if not out_dir:
+    if not out_dir or not _cache_identity_valid(generation, key):
         return ""
+    from skill3d.infra.m5_identity import content_sha256, file_identity
+
     d = Path(out_dir)
     d.mkdir(parents=True, exist_ok=True)
     g7_ref = ""
     if dynamic_masks is not None and np.asarray(dynamic_masks).size:
-        g7_ref = str(d / f"{scene_name}_inventory_{key}_dyndyn.npy")
+        binary_dir = Path(artifact_dir) if artifact_dir else d / "inventory" / key
+        binary_dir.mkdir(parents=True, exist_ok=True)
+        g7_ref = str(binary_dir / "dynamic_masks.npy")
         np.save(g7_ref, np.asarray(dynamic_masks))
+    refs = {str(getattr(obj, name)) for obj in objects
+            for name in ("mask_per_frame", "pointcloud_world", "pointconf_world", "centroid_ref")
+            if getattr(obj, name, "")}
+    if g7_ref:
+        refs.add(g7_ref)
     payload = {
         "inventory_version": _INVENTORY_VERSION,
-        "scene_name": str(scene_name),
+        "scene_name": str(scene_name), "key": key, "generation": generation,
         "objects": [o.model_dump() for o in objects],
         "stats": {k: v for k, v in stats.items() if k != "dynamic_masks"},
         "dynamic_masks_ref": g7_ref,
+        "artifact_hashes": {ref: file_identity(ref) for ref in sorted(refs)},
     }
+    payload["payload_sha256"] = content_sha256(payload)
     p = d / f"{scene_name}_inventory_{key}.json"
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False))
@@ -1128,6 +1217,8 @@ def bind_objects_for_scene(
     seed: Optional[int] = None,
     point_conf: Optional[np.ndarray] = None,
     depth_conf: Optional[np.ndarray] = None,
+    frame_provenance: Optional[Sequence[dict]] = None,
+    model_weights_sha256: str = "",
 ) -> tuple[list[ObjectRecord], dict, list[str]]:
     """M5 端到端（在线）：提示 → SAM2 传播 → 世界点云绑定 → G7/G9 统计。
 
@@ -1153,8 +1244,7 @@ def bind_objects_for_scene(
       的均值）→ §7.1 `track_consensus`；`count_objects` 依赖它是 available/degraded
       而不是 unavailable（§7.2：required=unavailable 会直接隐藏该 Tool）。
 
-    注意：`point_conf` 只在**首次**（未命中缓存）计算时落盘 —— 命中缓存直接复用
-    清单与 ref，不会重算/改写（缓存键已含产物形状，换网格即失效重算）。
+    缓存复用要求模型、实际数组/RGB及源码内容身份完整，且产物引用逐字节匹配。
     """
     from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
 
@@ -1162,6 +1252,7 @@ def bind_objects_for_scene(
     stats: dict = {}
     if depth_maps is None or c2w_list is None:
         return [], {}, ["M5 跳过：无深度/位姿产物，无法把 mask 反投影到世界系"]
+    original_point_conf = point_conf
     if point_conf is None:
         point_conf = depth_conf          # 兼容两种命名；都缺省 → 不落 conf
 
@@ -1173,13 +1264,43 @@ def bind_objects_for_scene(
     # 4 帧 × 24 场景 = 67 min 只是基础检测。2 帧仍能给每帧 ~14 个检出，
     # 基础清单足够；题面点名的物体由逐题补漏单独保证（见那条路径的成本优化）。
     probe = sorted({0, n_frames // 2}) if n_frames else []
-    key = _inventory_key(scene_name, frame_set_hash, depth_maps, n_frames)
+    from skill3d.infra.m5_identity import inventory_generation_identity
+    from skill3d.segmentation import open_vocab_detector as ovd
+    import uuid
+
+    generation = inventory_generation_identity(
+        scene_name=scene_name, frame_set_hash=frame_set_hash, frames=frames,
+        depth_maps=depth_maps, c2w_list=c2w_list, intrinsics=intrinsics,
+        point_conf=original_point_conf, depth_conf=depth_conf,
+        grid_transform=grid_transform, frame_provenance=frame_provenance,
+        predictor=predictor, vlm_client=vlm_client, seed=seed,
+        model_weights_sha256=model_weights_sha256,
+        parameters={
+            "probe": probe, "vocabulary": list(OBJECT_VOCABULARY),
+            "inventory_prompt": _GENERIC_INVENTORY_QUESTION, "max_vlm_objects": 8,
+            "max_base_detections": MAX_BASE_DETECTIONS,
+            "max_box_area_fraction": MAX_BOX_AREA_FRACTION,
+            "category_match_version": CATEGORY_MATCH_VERSION,
+            "mask_label_relation_version": MASK_LABEL_RELATION_VERSION,
+            "detector_box_threshold": ovd.DEFAULT_BOX_THRESHOLD,
+            "handle_hints": object_prompts_from_handle(handle),
+        })
+    key = _inventory_key(scene_name, frame_set_hash, depth_maps, n_frames,
+                         generation=generation)
+    cache_enabled = bool(use_inventory_cache and generation["cache_eligible"])
+    if use_inventory_cache and not cache_enabled:
+        notes.append(f"M5 持久缓存关闭：无法核验身份 {generation['missing']}")
+    # Each publication owns fresh files, including after a corrupt cache miss.
+    generation_dir = (Path(out_dir) / "inventory" / key / uuid.uuid4().hex
+                      if out_dir is not None else None)
 
     objects: list[ObjectRecord] = []
     cached_stats: dict = {}
-    if use_inventory_cache:
-        cached = _load_inventory(out_dir, scene_name, key)
+    cache_hit = False
+    if cache_enabled:
+        cached = _load_inventory(out_dir, scene_name, key, generation=generation)
         if cached is not None:
+            cache_hit = True
             objects, cached_stats, g7_ref = cached
             stats.update({k: v for k, v in cached_stats.items() if k != "dynamic_masks_ref"})
             if g7_ref:
@@ -1188,7 +1309,7 @@ def bind_objects_for_scene(
                 f"M5 场景清单缓存命中（{scene_name}/{key}）：直接复用 {len(objects)} 个对象"
                 f"与 G7/G9 统计（零重算；对象是 scene 级产物）")
 
-    if not objects:
+    if not cache_hit:
         # ---- ① + ② 场景清单（与问题无关）：检测器全词表 ∪ VLM 通用清单 ----
         hints: list[str] = []
         boxes: list[list[float]] = []
@@ -1198,6 +1319,8 @@ def bind_objects_for_scene(
         if vlm_client is not None and n_frames:
             inv_hints, inv_boxes, used_frames = _vlm_inventory_pass(frames, probe,
                                                                    vlm_client, seed=seed)
+            stats["inventory_vlm_errors"] = list(
+                getattr(_vlm_inventory_pass, "last_errors", []))
             for (fi, h, b) in zip(used_frames, inv_hints, inv_boxes):
                 hints.append(h)
                 boxes.append(b)
@@ -1236,18 +1359,22 @@ def bind_objects_for_scene(
             notes.append("M5 场景清单为空（VLM 未给框且检测器不可用）→ 对象类 Tool 将 "
                          "fail-closed（不伪造'场景里没有'，硬约束 23）")
 
-        masks_per_object = track_objects(frames, boxes or None, predictor,
+        masks_per_object = (track_objects(frames, boxes, predictor,
                                          prompts=prompt_list or None,
-                                         handle=handle, question=question)
+                                         handle=handle, question="")
+                            if boxes else [])
         objects = bind_masks_to_world(masks_per_object, depth_maps, c2w_list, intrinsics,
                                       class_hints=hints or None,
                                       confidences=confidences or None,
                                       det_conf_sources=det_conf_sources or None,
-                                      out_dir=out_dir,
+                                      out_dir=generation_dir,
                                       scene_name=scene_name, grid_transform=grid_transform,
                                       point_conf=point_conf,
                                       track_prefix=TRACK_PREFIX_BASE_LIST,
-                                      grounding_status="base_list")
+                                      grounding_status="base_list",
+                                      prompt_provenance=[
+                                          {"stage": "base_inventory", "frame_slot": fi}
+                                          for fi, _oid, _box in prompt_list])
         # 去重（§3 M5 字段 5）：类别 + 世界质心距离 + 时序重叠三判据
         objects, n_dup, groups = _dedupe_by_world_centroid(
             objects, depth_maps, masks_per_object=masks_per_object)
@@ -1266,6 +1393,10 @@ def bind_objects_for_scene(
                                       n_frames=n_frames)
         if tcm is not None:
             stats["track_consensus"] = tcm
+        stats["base_inventory"] = inventory_scope_statistics(
+            objects, n_frames=n_frames, scope="base_inventory",
+            n_propagations=len(masks_per_object), n_dedup_groups=len(groups),
+            n_dedup_absorbed=n_dup, consensus=tcm)
         dyn, dnotes = dynamic_mask_from_rigidity(frames, depth_maps, c2w_list, intrinsics)
         notes.extend(dnotes)
         if dyn.size:
@@ -1274,18 +1405,15 @@ def bind_objects_for_scene(
         if ratio is not None:
             notes.append(f"M5 track 稳定占比={ratio:.3f}"
                          f"（每条 track 可见帧数/帧集帧数的均值 → §7.1 track_consensus）")
-        if use_inventory_cache and not stats.get("detector_fault"):
+        if (cache_enabled and not stats.get("detector_fault")
+                and not stats.get("inventory_vlm_errors")):
             _save_inventory(out_dir, scene_name, key, objects,
                             {k: v for k, v in stats.items() if k != "dynamic_masks"},
-                            stats.get("dynamic_masks"))
+                            stats.get("dynamic_masks"), generation=generation,
+                            artifact_dir=generation_dir)
     else:
         # 缓存命中：G9/G7 是 scene 级统计，直接复用缓存值（不重算、不回读掩码）——
         # 与首次计算口径完全一致；回读掩码重算会把"全零帧"算进 IoU 对，反而偏。
-        if "track_consensus" not in stats:
-            tcm = track_consensus_metrics(objects, n_propagations=len(objects),
-                                          n_frames=n_frames)
-            if tcm is not None:
-                stats["track_consensus"] = tcm
         if "track_stable_ratio" not in stats:
             # 老缓存缺该键（或调用方手写 stats）→ 由清单现算，保证证据不缺项
             ratio = track_stable_ratio(objects, n_frames)
@@ -1296,17 +1424,32 @@ def bind_objects_for_scene(
                      f"dynamic_ratio={'有' if 'dynamic_ratio' in stats else '无'}，"
                      f"dynamic_masks={'有' if 'dynamic_masks' in stats else '无'}）")
 
-    # ---- ③ 逐题补漏：问题里的目标物若不在清单中，补绑一次 ----
+    stats["generation_identity"] = generation
+    stats["inventory_key"] = key
+    stats["inventory_cache"] = {"enabled": cache_enabled, "hit": cache_hit,
+                                "missing_identity": generation["missing"]}
+    local_qa_id = str(qa_id or hashlib.sha256(json.dumps(
+        {"question": question, "options": list(options or [])},
+        ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16])
+    binding_scene_identity = str(scene_identity or frame_set_hash or scene_name)
+    audited, _ = audit_semantic_mask_conflicts(
+        [(local_qa_id, objects)], scene_identity=binding_scene_identity)
+    objects = audited[local_qa_id]
+
+    # ---- ③ 逐类别补漏：全部可读冻结帧，检测器阶段后才进入 VLM 阶段 ----
     if n_frames and (question or options):
         sup_objs, sup_stats, sup_note = _bind_question_supplement(
             frames, probe, question, objects, depth_maps, c2w_list, intrinsics,
             grid_transform=grid_transform, out_dir=out_dir, scene_name=scene_name,
             predictor=predictor, vlm_client=vlm_client, handle=handle, seed=seed,
-            point_conf=point_conf, question_type=question_type, options=options)
+            point_conf=point_conf, question_type=question_type, options=options,
+            qa_id=local_qa_id, scene_identity=binding_scene_identity,
+            frame_provenance=frame_provenance, generation_identity=generation["sha256"])
         if sup_note:
             notes.append(sup_note)
         if sup_stats.get("grounding"):
             stats["grounding"] = dict(sup_stats["grounding"])
+        stats["question_supplement"] = sup_stats.get("question_supplement", {})
         if sup_objs:
             objects = list(objects) + sup_objs
             extra = [float(v) for v in (sup_stats.get("track_ious") or [])]
@@ -1315,17 +1458,23 @@ def bind_objects_for_scene(
                 stats["track_ious"] = prev + extra
 
     # 单题内也复用同一冲突合同；paired driver 会在全部题绑定完成后再次跨题审计。
-    local_qa_id = str(qa_id or hashlib.sha256(json.dumps(
-        {"question": question, "options": list(options or [])},
-        ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16])
     audited, conflict_audits = audit_semantic_mask_conflicts(
         [(local_qa_id, objects)],
-        scene_identity=str(scene_identity or frame_set_hash or scene_name))
+        scene_identity=binding_scene_identity)
     objects = audited[local_qa_id]
+    stats["question_inventory"] = inventory_scope_statistics(
+        objects, n_frames=n_frames, scope="question_inventory")
+    stats.setdefault("question_supplement", inventory_scope_statistics(
+        [], n_frames=n_frames, scope="question_supplement", n_propagations=0,
+        n_dedup_groups=0, n_dedup_absorbed=0))
+    if stats.get("grounding"):
+        stats["grounding"] = refresh_grounding_coverage(stats["grounding"], objects)
     stats["semantic_conflict_audits"] = conflict_audits
-    if conflict_audits:
+    hard_conflicts = [a for a in conflict_audits
+                      if a.get("code") == "semantic_label_mask_conflict"]
+    if hard_conflicts:
         notes.append(
-            f"M5 绑定完整性审计：发现 {len(conflict_audits)} 组异类 mask 语义冲突；"
+            f"M5 绑定完整性审计：发现 {len(hard_conflicts)} 组明确不相容 mask 标签冲突；"
             "对象保留供视觉路径使用，依赖对象几何的 Tool fail-closed")
 
     if stats.get("track_ious"):
@@ -1367,11 +1516,15 @@ def _vlm_inventory_pass(frames: Sequence[np.ndarray], probe: Sequence[int], vlm_
     hints: list[str] = []
     boxes: list[list[float]] = []
     used: list[int] = []
+    _vlm_inventory_pass.last_errors = []
     for fi in probe:
         # 目标数下调（12 → 8，v7 成本控制）：基础清单只需覆盖"常见物体"，
         # 题面点名的物体由逐题补漏保证；成本随框数线性增长。
         h, b = box_prompts_from_vlm(frames, _GENERIC_INVENTORY_QUESTION, vlm_client,
                                     frame_idx=fi, max_objects=8, seed=seed)
+        if getattr(box_prompts_from_vlm, "last_error", ""):
+            _vlm_inventory_pass.last_errors.append({
+                "frame_slot": fi, "error": box_prompts_from_vlm.last_error})
         for hi, bi in zip(h, b):
             hints.append(hi)
             boxes.append(bi)
@@ -1393,7 +1546,10 @@ def question_object_names_from_vlm(question: str, client, *,
     import json as _json
     import re as _re
 
+    question_object_names_from_vlm.last_error = ""
+    question_object_names_from_vlm.last_request_sha256 = ""
     if client is None or not str(question).strip():
+        question_object_names_from_vlm.last_error = "vlm_not_configured_or_empty_question"
         return []
     prompt = (
         f"Question: {question}\n"
@@ -1402,17 +1558,23 @@ def question_object_names_from_vlm(question: str, client, *,
         '(such as telephone, cup, trash can). Output only a JSON array, '
         'for example ["telephone", "cup", "trash can"]. Do not explain.'
     )
+    question_object_names_from_vlm.last_request_sha256 = hashlib.sha256(json.dumps(
+        {"prompt": prompt, "seed": seed, "max_tokens": 128},
+        sort_keys=True).encode()).hexdigest()
     try:
         text = client.chat([{"role": "user", "content": prompt}],
                            max_tokens=128, seed=seed)
-    except Exception:  # noqa: BLE001 - 模型不可用 → 退回空表（调用方走通用提示）
+    except Exception as exc:  # noqa: BLE001
+        question_object_names_from_vlm.last_error = f"{type(exc).__name__}: {exc}"
         return []
     m = _re.search(r"\[.*\]", str(text), _re.DOTALL)
     if not m:
+        question_object_names_from_vlm.last_error = "no_json_array"
         return []
     try:
         items = _json.loads(m.group(0))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        question_object_names_from_vlm.last_error = f"invalid_json: {exc}"
         return []
     out: list[str] = []
     for it in items if isinstance(items, list) else []:
@@ -1461,197 +1623,363 @@ def ovd_boxes_for_nouns(frames: Sequence[np.ndarray], probe: Sequence[int],
             box = [float(v) for v in d.bbox_xyxy]
             if box[2] - box[0] < 2 or box[3] - box[1] < 2:
                 continue
-            hints.append(normalize_hint(d.label))
+            hints.append(_PromptLabel(d.label))
             boxes.append(box)
             prompt_list.append((idx, len(prompt_list), box))
             confidences.append(float(getattr(d, "confidence", 0.0)))
     return hints, boxes, prompt_list, confidences
 
 
+def _binding_conflicted(obj):
+    return any(flag.get("code") == "semantic_label_mask_conflict"
+               for flag in (obj.binding_flags or []))
+
+
+def _binding_usable(obj):
+    """二维非空支撑与绑定硬门；不把点云质量当成类别覆盖阈值。"""
+    if _binding_conflicted(obj):
+        return False
+    if obj.mask_per_frame:
+        try:
+            mask = np.load(obj.mask_per_frame, allow_pickle=False, mmap_mode="r")
+            return bool(mask.ndim == 3 and any(frame.any() for frame in mask))
+        except (OSError, ValueError):
+            return False
+    # 未落盘的直接内存接口仍有 bind_masks_to_world 计算的非空支撑证据。
+    return bool(obj.visible_frames and obj.mask_support_ratio > 0)
+
+
 def _grounding_coverage(names, objects, *, candidate_names=(), question_type=""):
-    """逐个核对需求；部分命中不冒充整题成功，多个候选实例允许取最近者。"""
     requirements = []
+    usable_ids = {o.obj_id for o in objects if _binding_usable(o)}
     for name in names:
         role = ("candidate" if any(matches(name, c) for c in candidate_names)
                 else "reference" if question_type == "object_rel_distance" else "target")
-        ids = sorted(o.obj_id for o in objects if matches(name, o.category_name))
-        status = ("missing" if not ids else "ambiguous"
-                  if role == "reference" and len(ids) > 1 else "present")
-        requirements.append({"name": name, "role": role, "object_ids": ids, "status": status})
-    missing = [r["name"] for r in requirements if r["status"] == "missing"]
+        candidates = [o for o in objects if matches(name, o.category_name)]
+        ids = sorted(o.obj_id for o in candidates)
+        usable = sorted(o.obj_id for o in candidates if o.obj_id in usable_ids)
+        conflicted = sorted(o.obj_id for o in candidates if _binding_conflicted(o))
+        status = ("missing" if not usable else "ambiguous"
+                  if role == "reference" and len(usable) > 1 else "present")
+        requirements.append({
+            "name": name, "role": role, "object_ids": ids, "status": status,
+            "candidate_count": len(ids), "usable_object_ids": usable,
+            "conflicted_object_ids": conflicted,
+            "instance_resolved": True if len(usable) == 1 else None,
+            "instance_resolution_reason": (
+                "single_usable_candidate" if len(usable) == 1 else
+                "multiple_candidates_not_disambiguated" if usable else "no_usable_candidate"),
+        })
+    missing = [r["name"] for r in requirements if not r["object_ids"]]
+    unresolved = [r["name"] for r in requirements if not r["usable_object_ids"]]
     ambiguous = [r["name"] for r in requirements if r["status"] == "ambiguous"]
-    present = any(r["object_ids"] for r in requirements)
+    present = any(r["usable_object_ids"] for r in requirements)
     reference_unresolved = (question_type == "object_rel_distance"
                             and not any(r["role"] == "reference" for r in requirements))
-    complete = bool(requirements) and not missing and not ambiguous and not reference_unresolved
+    binding_complete = bool(requirements) and not unresolved
+    complete = binding_complete and not ambiguous and not reference_unresolved
     status = ("not_checked" if not requirements else "complete" if complete else
-              "ambiguous" if ambiguous and not missing else "partial" if present else "missing")
+              "ambiguous" if ambiguous and not unresolved else "partial" if present else "missing")
     return {
         "attempted": bool(requirements), "status": status, "requirements": requirements,
         "required_names": list(names), "missing_names": missing, "ambiguous_names": ambiguous,
+        "candidate_names": list(candidate_names), "question_type": question_type,
+        "unresolved_names": unresolved,
+        "category_coverage_complete": bool(requirements) and not missing,
+        "binding_coverage_complete": binding_complete,
         "reference_unresolved": reference_unresolved,
         "all_present": complete, "miss": bool(requirements) and not present,
     }
 
 
+def refresh_grounding_coverage(grounding, objects):
+    """最后审计后重算事实，保留请求与探测历史，不隐式续补。"""
+    current = _grounding_coverage(
+        grounding.get("required_names", []), objects,
+        candidate_names=grounding.get("candidate_names", []),
+        question_type=grounding.get("question_type", ""))
+    previous = {r["name"]: r for r in grounding.get("requirements", [])}
+    for row in current["requirements"]:
+        history = previous.get(row["name"], {})
+        for key in ("probed_slots", "detector_errors", "vlm_errors", "termination_reason"):
+            if key in history:
+                row[key] = history[key]
+        if row["name"] in current["unresolved_names"] and (
+                row.get("termination_reason") == "resolved"):
+            row["termination_reason"] = "unresolved_after_final_audit"
+    return {**grounding, **current}
+
+
 def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w_list,
                               intrinsics, *, grid_transform, out_dir, scene_name,
                               predictor, vlm_client, handle, seed: Optional[int] = None,
-                              point_conf=None, question_type="", options=None
+                              point_conf=None, question_type="", options=None,
+                              qa_id="", scene_identity="", frame_provenance=None,
+                              generation_identity=""
                               ) -> tuple[list[ObjectRecord], dict, str]:
-    """逐题补漏：只把"清单里还没有"的问题目标物绑进来（不重算已有对象）。
+    """有限两阶段定位；每槽一次业务请求，健康绑定后逐类别移出。"""
+    from skill3d.segmentation import open_vocab_detector as ovd
+    from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
 
-    返回 `(新增对象, stats, note)`。判定"已有"用**类别 + 世界质心距离**（与 3D
-    去重同源口径），不再对全量对象重跑 SAM2 —— 这是 M5 复用（handoff 优先级 2）
-    的关键：同一 scene 的后续 episode 只需为补漏框付 GPU 成本。
-
-    v6：新增对象标 `grounding_status="question_targeted_fill"`（§5.6 / §7.1
-    `object_grounding` 的题级证据）；`track_id` 用 `qtrk*` 命名空间 —— 与基础清单的
-    `trk*` 不重名，否则 `count_objects` 的 track 去重会把两条不同对象并成一条。
-    """
-    hints: list[str] = []
-    boxes: list[list[float]] = []
-    confidences: list[float] = []
-    det_conf_sources: list[str] = []
-    prompt_list: list[tuple[int, int, list[float]]] = []
-    # ① 定向：先把题面点名的物体抽出来，再逐探测帧"只找这些物体"
-    #    （通用问法提示实测会漏掉题目要用的目标物 → 程序只能 abstain）
+    started = time.perf_counter()
+    import uuid
+    publication_id = uuid.uuid4().hex
     named = question_object_names_from_vlm(question, vlm_client, seed=seed)
+    extraction = {
+        "request_sha256": getattr(question_object_names_from_vlm, "last_request_sha256", ""),
+        "error": getattr(question_object_names_from_vlm, "last_error", ""),
+        "names": list(named),
+    }
     if not named:
-        # VLM 不可用 → 退回确定性词表抽取（够用作检测器提示）
         named = object_prompts_from_question(question)
-    # 相对距离选项本身就是候选类别，必须独立于 VLM 的题干名词抽取纳入需求。
+        extraction["fallback_names"] = list(named)
     candidate_names = ([option_category(o) for o in (options or [])]
                        if question_type == "object_rel_distance" else [])
     required = list(dict.fromkeys(str(n).strip() for n in [*named, *candidate_names]
                                  if str(n).strip()))
+    request_key = hashlib.sha256(json.dumps(
+        {"question": question, "options": list(options or []), "seed": seed, "qa_id": qa_id,
+         "existing_ids": sorted(o.obj_id for o in existing), "contract": "full-frame-fill-v1",
+         "generation_identity": generation_identity},
+        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    local_qa_id = str(qa_id or request_key)
+    current = list(existing)
+    initial_ids = {o.obj_id for o in existing}
+    receipts, stages, ious = [], [], []
+    total_boxes = total_propagations = 0
+    audited, _ = audit_semantic_mask_conflicts(
+        [(local_qa_id, current)], scene_identity=str(scene_identity or scene_name))
+    current = audited[local_qa_id]
+    readable = [i for i, frame in enumerate(frames)
+                if frame is not None and np.asarray(frame).ndim == 3 and np.asarray(frame).size]
+    # 首帧/中帧优先，其他可读槽位升序；probe 不扩展或重排冻结输入。
+    order = list(dict.fromkeys([i for i in (0, len(frames) // 2) if i in readable] + readable))
+    if frame_provenance is not None and len(frame_provenance) != len(frames):
+        raise ValueError("M5 frame provenance must align with readable pixel slots")
+    history = {name: {"probed_slots": {"detector": [], "vlm": []},
+                      "detector_errors": [], "vlm_errors": []} for name in required}
 
-    def coverage(objects, n_boxes=0, n_new=0):
-        return {**_grounding_coverage(required, objects, candidate_names=candidate_names,
-                                     question_type=question_type),
-                "n_boxes": n_boxes, "n_new": n_new}
-    # v7 成本控制（关键）：题面点名的物体**已经全在清单里** → 直接跳过检测。
-    # 依据：一次检测服务调用实测 42–59 s，而绝大多数题目的物体在场景基础清单里
-    # 已经有了（v6 的补漏是"先检测再判重"，等于每次都白付一次最贵的调用）。
-    # 语义不变：只有"确实缺物体"时才去检测，`all_present=True` 的申报口径与原来一致。
-    initial = coverage(existing)
-    if required and not initial["missing_names"]:
-        return [], {"grounding": {**initial, "skipped_detection": True}}, (
-            f"M5 逐题补漏：题面物体 {required} 均已在场景清单中（跳过检测调用）；"
-            f"歧义目标={initial['ambiguous_names']}")
-    named = initial["missing_names"]
-    if named:
-        # ①-a 确定性检测器（首选）：GroundingDINO 的定位是可靠的，
-        #     且直接吃"问题名词"，正是补漏需要的输入。
-        ovd_hints, ovd_boxes, ovd_prompt, ovd_conf = ovd_boxes_for_nouns(
-            frames, probe, named)
-        if ovd_boxes:
-            hints.extend(ovd_hints)
-            boxes.extend(ovd_boxes)
-            prompt_list.extend(ovd_prompt)
-            confidences.extend(ovd_conf)
-            det_conf_sources.extend(["groundingdino"] * len(ovd_boxes))
-        # ①-b VLM 框（次选）：仅在检测器没给出任何框时尝试（定位不稳，见模块头）
-        if not boxes:
-            ask = ("Locate the following objects in this indoor photo. Report all visible instances and omit objects you cannot see: "
-                   + ", ".join(named)
-                   + '. Output only a JSON array: [{"name": "object name", "bbox": [x0,y0,x1,y1]}], '
-                     "using integer coordinates normalized to 0-1000. If none are visible, output []. Do not explain.")
-            for fi in probe:
-                f_hints, f_boxes = box_prompts_from_vlm(frames, ask, vlm_client,
-                                                        frame_idx=fi, max_objects=8, seed=seed)
-                for h, b in zip(f_hints, f_boxes):
-                    hints.append(h)
-                    boxes.append(b)
-                    confidences.append(0.0)
-                    det_conf_sources.append("vlm_box")
-                    prompt_list.append((int(fi), len(prompt_list), b))
-    # ② 兜底：定向提示没抽到名字/没给框时，退回原来的"与问题相关"通用提示
-    if not boxes:
-        for fi in probe:
-            f_hints, f_boxes = box_prompts_from_vlm(frames, question, vlm_client,
-                                                    frame_idx=fi, max_objects=8, seed=seed)
-            for h, b in zip(f_hints, f_boxes):
-                hints.append(h)
-                boxes.append(b)
-                confidences.append(0.0)
-                det_conf_sources.append("vlm_box")
-                prompt_list.append((int(fi), len(prompt_list), b))
-    if not boxes:
-        # v6 证据：题面点名了物体但检测/VLM 一个框都没给出 → **明确未命中**。
-        # 必须报给 EvidenceProfile 的 `object_grounding=unavailable`，
-        # 不能让"没找到"静默退化成"没查"（§7.1 三值判定 + fail-closed）。
-        return [], {"grounding": coverage(existing)}, (
-            "M5 逐题补漏：题面点名物未检出（grounding_recall_miss）")
-    masks = track_objects(frames, boxes, predictor, prompts=prompt_list,
-                          handle=handle, question=question)
-    # 传播局部编号从 obj_0 开始；必须先隔离落盘路径，再重映射 scene 内的对象 ID，
-    # 否则补检的 obj_0 会覆盖基础清单仍在引用的点云、置信度和掩码。
-    supplement_dir = None
-    if out_dir is not None:
-        request_key = hashlib.sha256(json.dumps(
-            {"question": question, "options": list(options or []), "seed": seed,
-             "existing_ids": sorted(o.obj_id for o in existing)},
-            sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
-        supplement_dir = Path(out_dir) / "question_grounding" / request_key
-    cand = bind_masks_to_world(masks, depth_maps, c2w_list, intrinsics,
-                               class_hints=hints or None,
-                               confidences=confidences or None,
-                               det_conf_sources=det_conf_sources or None,
-                               out_dir=supplement_dir,
-                               scene_name=scene_name, grid_transform=grid_transform,
-                               point_conf=point_conf,
-                               track_prefix=TRACK_PREFIX_QUESTION,
-                               grounding_status="question_targeted_fill")
-    cand, n_dup, groups = _dedupe_by_world_centroid(cand, depth_maps,
-                                                    masks_per_object=masks)
+    def coverage():
+        return _grounding_coverage(required, current, candidate_names=candidate_names,
+                                   question_type=question_type)
+
     d = np.asarray(depth_maps, dtype=np.float64)
     d = d[np.isfinite(d) & (d > 0)]
-    tol = 0.15 * (float(np.median(d)) if d.size else 1.0)   # TODO_CALIBRATE：同 3D 去重口径
-
-    def _hint(o) -> str:
-        h = str(getattr(o, "category_name", "") or "").strip().lower()
-        return "" if h in ("unverified", "unknown") else h
-
-    kept: list[ObjectRecord] = []
-    kept_masks: list[dict] = []
-    base_ids = {o.obj_id for o in existing}
-    for o, g in zip(cand, groups):
-        co = np.asarray(o.centroid_world, dtype=np.float64)
-        dup = False
-        for b in existing:
-            if np.linalg.norm(co - np.asarray(b.centroid_world, dtype=np.float64)) >= tol:
-                continue
-            ho, hb = _hint(o), _hint(b)
-            if ho and hb and not matches(ho, hb):
-                continue
-            dup = True
-            break
-        if not dup:
-            kept.append(o)
-            kept_masks.append(_merge_mask_groups(masks, [g])[0])
-
-    if not kept:
-        return [], {"grounding": coverage(existing, len(boxes))}, (
-            f"M5 逐题补漏：{len(boxes)} 个框没有新增绑定；按实际对象清单复核覆盖情况")
-    out: list[ObjectRecord] = []
-    next_id = 0
-    for i, o in enumerate(kept):
-        while f"obj_{next_id}" in base_ids:
-            next_id += 1
-        new_id = f"obj_{next_id}"
-        base_ids.add(new_id)
-        # obj_id 换成 scene 内唯一的稳定 id；track_id / grounding_status /
-        # duplicate_suspect 原样保留（track 由本次传播产生，`qtrk*` 命名空间）
-        out.append(o.model_copy(update={"obj_id": new_id}))
-    stats: dict = {"grounding": coverage([*existing, *out], len(boxes), len(out))}
-    from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
-
-    ious = track_ious_from_masks(kept_masks)
+    tol = 0.15 * (float(np.median(d)) if d.size else 1.0)  # 原有去重数值合同
+    initial = coverage()
+    skipped = bool(required and not initial["unresolved_names"])
+    for phase in ("detector", "vlm"):
+        if skipped or (required and not coverage()["unresolved_names"]):
+            stages.append({"phase": phase, "status": "skipped", "reason": "bindings_resolved"})
+            continue
+        unavailable = ("no_required_names" if phase == "detector" and not required else
+                       "detector_not_configured" if phase == "detector" and not ovd.available() else
+                       "vlm_not_configured" if phase == "vlm" and vlm_client is None else "")
+        if unavailable:
+            stages.append({"phase": phase, "status": "not_performed", "reason": unavailable})
+            continue
+        phase_receipts = []
+        stage_reason = "all_readable_slots_exhausted" if order else "no_readable_frames"
+        for fi in order:
+            before = coverage()["unresolved_names"]
+            if required and not before:
+                stage_reason = "bindings_resolved"
+                break
+            if not required and any(_binding_usable(o) for o in current
+                                    if o.obj_id not in initial_ids):
+                stage_reason = "generic_binding_obtained"
+                break
+            ask = (ovd_prompt_from_nouns(before) if phase == "detector" else
+                   "Locate the following objects in this indoor photo. Report all visible "
+                   "instances and omit objects you cannot see: " + ", ".join(before)
+                   if required else question)
+            digest = hashlib.sha256()
+            rgb = np.ascontiguousarray(frames[fi])
+            digest.update(str((rgb.shape, rgb.dtype.str)).encode())
+            digest.update(memoryview(rgb).cast("B"))
+            receipt = {
+                "phase": phase, "frame_slot": fi, "pass_index": len(receipts),
+                "source_frame_index": None, "timestamp": None,
+                "required_names": required, "unresolved_before": list(before),
+                "prompt": ask, "prompt_sha256": hashlib.sha256(ask.encode()).hexdigest(),
+                "request_sha256": hashlib.sha256(json.dumps(
+                    {"rgb_sha256": digest.hexdigest(), "prompt": ask, "seed": seed,
+                     "phase": phase, "box_threshold": ovd.DEFAULT_BOX_THRESHOLD},
+                    sort_keys=True).encode()).hexdigest(),
+                "requested": True, "transport_attempts": [],
+            }
+            if frame_provenance is not None:
+                receipt.update(frame_provenance[fi])
+            pass_started = time.perf_counter()
+            error = ""
+            hints, boxes, confidences = [], [], []
+            try:
+                if phase == "detector":
+                    ovd.detect.last_error = ""
+                    with capture_detector_attempts() as attempts:
+                        hints, boxes, _prompts, confidences = ovd_boxes_for_nouns(
+                            frames, [fi], before)
+                    receipt["transport_attempts"] = list(attempts)
+                    receipt["actual_request_sha256"] = (
+                        attempts[0].get("request_sha256", "") if attempts else "")
+                    error = getattr(ovd.detect, "last_error", "")
+                else:
+                    box_prompts_from_vlm.last_error = ""
+                    box_prompts_from_vlm.last_request_sha256 = ""
+                    hints, boxes = box_prompts_from_vlm(
+                        frames, ask, vlm_client, frame_idx=fi, max_objects=8, seed=seed)
+                    confidences = [0.0] * len(boxes)
+                    error = getattr(box_prompts_from_vlm, "last_error", "")
+                    receipt["actual_request_sha256"] = getattr(
+                        box_prompts_from_vlm, "last_request_sha256", "")
+            except Exception as exc:  # noqa: BLE001 - finite stage and audited failure
+                error = f"{type(exc).__name__}: {exc}"
+            receipt["request_elapsed_s"] = time.perf_counter() - pass_started
+            receipt["error"] = error
+            receipt["n_boxes_raw"] = len(boxes)
+            selected = [i for i, hint in enumerate(hints)
+                        if not required or any(matches(hint, name) for name in before)]
+            hints = [hints[i] for i in selected]
+            boxes = [boxes[i] for i in selected]
+            confidences = [confidences[i] for i in selected]
+            receipt["n_boxes"] = len(boxes)
+            total_boxes += len(boxes)
+            for name in before:
+                history[name]["probed_slots"][phase].append(fi)
+                if error:
+                    history[name][phase + "_errors"].append({"frame_slot": fi, "error": error})
+            receipt["new_object_ids"] = []
+            receipt["sam2_elapsed_s"] = 0.0
+            if boxes:
+                bind_started = time.perf_counter()
+                pass_key = f"{phase}-slot{fi:04d}-pass{len(receipts):04d}"
+                supplement_dir = (Path(out_dir) / "question_grounding" / request_key
+                                  / publication_id / pass_key
+                                  if out_dir is not None else None)
+                try:
+                    prompts = [(fi, i, b) for i, b in enumerate(boxes)]
+                    masks = track_objects(frames, boxes, predictor, prompts=prompts,
+                                          handle=handle, question=question)
+                    total_propagations += len(masks)
+                    receipt["n_propagations"] = len(masks)
+                    prefix = f"{TRACK_PREFIX_QUESTION}:{request_key}:{pass_key}:"
+                    cand = bind_masks_to_world(
+                        masks, depth_maps, c2w_list, intrinsics, class_hints=hints,
+                        confidences=confidences,
+                        det_conf_sources=[("groundingdino" if phase == "detector" else "vlm_box")]
+                                         * len(boxes),
+                        out_dir=supplement_dir, scene_name=scene_name,
+                        grid_transform=grid_transform, point_conf=point_conf,
+                        track_prefix=prefix, grounding_status="question_targeted_fill",
+                        prompt_provenance=[{
+                            "stage": "question_supplement", "phase": phase,
+                            "frame_slot": fi, "pass_identity": pass_key,
+                            "request_sha256": receipt["request_sha256"],
+                            "required_names": list(before),
+                        } for _ in boxes])
+                    cand, n_dup, groups = _dedupe_by_world_centroid(
+                        cand, depth_maps, masks_per_object=masks)
+                    receipt["n_dedup_absorbed"] = n_dup
+                    receipt["n_dedup_groups"] = len(groups)
+                    existing_ids = {o.obj_id for o in current}
+                    next_id = 0
+                    kept_masks = []
+                    for obj, group in zip(cand, groups):
+                        if _binding_usable(obj) and any(
+                            _binding_usable(b) and matches(obj.category_name, b.category_name)
+                            and np.linalg.norm(np.asarray(obj.centroid_world) -
+                                               np.asarray(b.centroid_world)) < tol
+                            for b in current):
+                            continue
+                        while f"obj_{next_id}" in existing_ids:
+                            next_id += 1
+                        new_id = f"obj_{next_id}"
+                        existing_ids.add(new_id)
+                        current.append(obj.model_copy(update={"obj_id": new_id}))
+                        receipt["new_object_ids"].append(new_id)
+                        kept_masks.append(_merge_mask_groups(masks, [group])[0])
+                    ious.extend(track_ious_from_masks(kept_masks) or [])
+                    audited, audits = audit_semantic_mask_conflicts(
+                        [(local_qa_id, current)], scene_identity=str(scene_identity or scene_name))
+                    current = audited[local_qa_id]
+                    receipt["conflict_audit_ids"] = [
+                        a["audit_sha256"] for a in audits
+                        if a.get("code") == "semantic_label_mask_conflict"]
+                except Exception as exc:  # noqa: BLE001 - no fabricated binding success
+                    receipt["binding_error"] = f"{type(exc).__name__}: {exc}"
+                receipt["sam2_elapsed_s"] = time.perf_counter() - bind_started
+            receipt["unresolved_after"] = coverage()["unresolved_names"]
+            receipt["elapsed_s"] = time.perf_counter() - pass_started
+            receipts.append(receipt)
+            phase_receipts.append(receipt)
+            if error and phase == "detector":
+                stage_reason = "detector_unavailable_after_finite_transport_attempts"
+                break
+        stages.append({
+            "phase": phase, "status": "performed" if phase_receipts else "not_performed",
+            "reason": stage_reason, "business_requests": len(phase_receipts),
+            "slots": [r["frame_slot"] for r in phase_receipts],
+        })
+    final = coverage()
+    for row in final["requirements"]:
+        row.update(history[row["name"]])
+        row["termination_reason"] = (
+            "resolved" if row["usable_object_ids"] else
+            "no_readable_frames" if not order else
+            "all_readable_slots_exhausted"
+            if all(len(row["probed_slots"][p]) == len(order) for p in ("detector", "vlm"))
+            else "unresolved_with_unavailable_stage")
+    # Existing records receive newly discovered flags as well as newly added candidates.
+    if isinstance(existing, list):
+        existing[:] = [o for o in current if o.obj_id in initial_ids]
+    out = [o for o in current if o.obj_id not in initial_ids]
+    final.update({
+        "n_boxes": total_boxes, "n_new": len(out), "skipped_detection": skipped,
+        "readable_slots": readable, "probe_order": order, "stages": stages,
+        "phase_receipts": receipts, "noun_extraction": extraction,
+        "request_identity": request_key, "business_request_bound_per_phase": len(order),
+        "n_propagations": total_propagations, "elapsed_s": time.perf_counter() - started,
+    })
+    supplement_statistics = inventory_scope_statistics(
+        out, n_frames=len(frames), scope="question_supplement",
+        n_propagations=total_propagations,
+        n_dedup_groups=sum(r.get("n_dedup_groups", 0) for r in receipts),
+        n_dedup_absorbed=sum(r.get("n_dedup_absorbed", 0) for r in receipts))
+    supplement_statistics["passes"] = [{
+        key: r.get(key) for key in ("phase", "frame_slot", "n_propagations",
+                                    "n_dedup_groups", "n_dedup_absorbed", "new_object_ids",
+                                    "binding_error")} for r in receipts]
+    stats = {"grounding": final, "question_supplement": supplement_statistics}
     if ious:
         stats["track_ious"] = ious
-    return out, stats, (f"M5 逐题补漏：问题目标框 {len(boxes)} 个 → 新绑 {len(out)} 个"
-                        f"（{sorted({o.category_name for o in out})}）")
+    note = (f"M5 逐题补漏：题面物体 {required} 均已在场景清单中（跳过检测调用）"
+            if skipped else
+            f"M5 逐题补漏：{len(receipts)} 次槽位请求、{total_boxes} 个框 → 新绑 {len(out)} 个；"
+            f"未解决={final['unresolved_names']}")
+    return out, stats, note
+
+
+def inventory_scope_statistics(objects, *, n_frames, scope, n_propagations=None,
+                               n_dedup_groups=None, n_dedup_absorbed=None, consensus=None):
+    """Explicit denominators; multi-pass final fragmentation has no proven denominator."""
+    objects = list(objects)
+    n_suspect = sum(bool(o.duplicate_suspect) for o in objects)
+    return {
+        "scope": scope, "object_ids": sorted(o.obj_id for o in objects),
+        "n_objects": len(objects),
+        "n_tracks": len({o.track_id for o in objects if o.track_id}),
+        "n_propagations": n_propagations, "n_dedup_groups": n_dedup_groups,
+        "n_dedup_absorbed": n_dedup_absorbed, "n_suspect": n_suspect,
+        "duplicate_suspect_ratio": n_suspect / len(objects) if objects else None,
+        "track_stable_ratio": track_stable_ratio(objects, n_frames),
+        "visible_support": {o.obj_id: {
+            "visible_frames": list(o.visible_frames or []),
+            "mask_support_ratio": o.mask_support_ratio} for o in objects},
+        "track_fragmentation_ratio": (consensus or {}).get("track_fragmentation_ratio"),
+        "fragmentation_reason": ("base_consensus_denominator" if consensus is not None
+                                 else "no_unified_propagation_denominator"),
+        "track_consensus": consensus,
+    }
 
 
 def track_stable_ratio(objects: Sequence[ObjectRecord],
@@ -1829,6 +2157,19 @@ def _dedupe_by_world_centroid(objects, depth_maps, *, masks_per_object=None,
         o, suspect=k in suspect, track_id=group_track[k],
         visible_frames=group_frames[k], n_frames=len(np.asarray(depth_maps)))
             for k, o in enumerate(kept)]
+    for k, group in enumerate(groups):
+        if len(group) < 2 or not hasattr(kept[k], "binding_provenance"):
+            continue
+        provenance = list(kept[k].binding_provenance)
+        representative = group[0]
+        for index in group[1:]:
+            member = objects[index]
+            provenance.extend([
+                {**entry, "absorbed_obj_id": member.obj_id,
+                 "representative_obj_id": objects[representative].obj_id}
+                for entry in getattr(member, "binding_provenance", [])
+            ])
+        kept[k] = kept[k].model_copy(update={"binding_provenance": provenance})
     return kept, n_dup, groups
 
 

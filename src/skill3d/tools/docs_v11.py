@@ -1,12 +1,13 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.4-binding-integrity"
+TOOL_DOCS_VERSION = "tool-docs-v11.5-core-engineering-repair"
 
 
 DESCRIPTIONS = {
     "list_objects": (
         "Return object records as list[dict] with obj_id, category_name, visible_frames, track_id, "
-        "det_conf, det_conf_source, mask_support_ratio, binding_flags, grounding_status, and "
+        "source_label, binding_provenance, det_conf, det_conf_source, mask_support_ratio, "
+        "binding_flags, grounding_status, and "
         "duplicate_suspect. det_conf is detector confidence; mask_support_ratio is the fraction of "
         "frozen frames with a nonempty propagated mask. Never substitute one for the other. "
         "An empty filter returns all records. "
@@ -17,7 +18,10 @@ DESCRIPTIONS = {
         "2D-only candidates without measurable 3D geometry. An empty result does not prove scene-wide "
         "absence. Inspect all candidates and binding_flags; do not select the first record by default "
         "or align records with detections by list order. A semantic_label_mask_conflict blocks geometry "
-        "from that object but leaves frozen-image inspection available."),
+        "from that object but leaves frozen-image inspection available. "
+        "The conflict requires high mask overlap and explicitly incompatible complete labels, "
+        "with at least one question-targeted binding. Compatible and unknown overlap relations "
+        "remain audit diagnostics; they do not establish semantic correctness or merge instances."),
     "count_objects": (
         "Count instances using the same category rules as list_objects. Group records sharing a "
         "nonempty track_id; each untracked record forms its own group. Merge each group's point clouds, "

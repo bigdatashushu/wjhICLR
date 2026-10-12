@@ -135,7 +135,8 @@ def test_all_three_dry_run_entries_use_dirty_snapshot_without_environment(workin
         command = ["bash", str(working_repo / "scripts/bootstrap_and_run_v11.sh"), *common]
     else:
         command = [sys.executable, str(working_repo / "scripts/run_gpu_experiment_v11.py"), *common]
-    env = {**os.environ, "PYTHON_BIN": sys.executable, "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {**os.environ, "PYTHON_BIN": sys.executable, "PYTHONDONTWRITEBYTECODE": "1",
+           "HARNESS3D_REQUIRE_DETECTOR": "0"}
     env.pop("SKILL3D_CODE_RECEIPT", None)
     result = subprocess.run(command, env=env, cwd=working_repo,
                             capture_output=True, text=True, timeout=30)
@@ -175,7 +176,8 @@ def test_metric_panel_route_never_runs_learning_or_evolution(working_repo, tmp_p
     if smoke:
         command.append("--smoke")
     result = subprocess.run(command, cwd=working_repo,
-                            env={**os.environ, "PYTHON_BIN": sys.executable},
+                            env={**os.environ, "PYTHON_BIN": sys.executable,
+                                 "HARNESS3D_REQUIRE_DETECTOR": "0"},
                             text=True, capture_output=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = json.loads((work / "runs/panel/pipeline_manifest.json").read_text())

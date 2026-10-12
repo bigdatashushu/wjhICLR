@@ -24,6 +24,7 @@ from skill3d.schemas.evidence import (
     CAPABILITIES,
     EvidenceProfile,
 )
+from skill3d.schemas.tool import FailureCause
 
 if TYPE_CHECKING:
     from skill3d.schemas.authorization import AuthorizationDecision
@@ -69,6 +70,28 @@ QUESTION_TOOL_SCOPES: tuple[str, ...] = (
 # 用它替代 v5 的 `supported_metric_tasks` 作为"是否米制工具"的判据，
 # 使 Tool 暴露规则只有一条（证据），不必再维护第二份题型白名单。
 EVIDENCE_METRIC_SCALE = "metric_scale"
+
+SHARED_PREMISE_BY_REF = {
+    "geometry_3d": "geometry_3d", "depth": "geometry_3d",
+    "poses": "geometry_3d", "point_cloud": "geometry_3d",
+    "intrinsics": "geometry_3d", "world_frame": "world_frame",
+    "metric_scale": "metric_scale", "scale": "metric_scale",
+    "object_detection": "object_detection", "objects": "object_detection",
+}
+
+
+def failure_cause_from_missing(missing, *, message="") -> FailureCause:
+    """仅根据已定位的缺失项归因；未知能力、缺画像不证明共享证据失效。"""
+    premises = sorted({
+        SHARED_PREMISE_BY_REF[ref.split("(")[0].strip()]
+        for value in missing
+        if (ref := str(value)).split("(")[0].strip() in SHARED_PREMISE_BY_REF
+        and "no evidence profile" not in ref and "unknown capability" not in ref
+    })
+    return FailureCause(
+        code="missing_shared_evidence" if premises else "unlocated_contract_failure",
+        scope="shared_evidence" if premises else "unknown",
+        shared_premises=premises, message=message)
 
 
 def available_artifacts_for(route: str, *,
@@ -216,19 +239,22 @@ def check_metric_task_contract(
             tool,
             f"Tool {tool} requires metric scale, but this episode has no classified question type"
             " (metric tools are not authorized for unknown question types)",
-            args=args)
+            args=args, failure_cause=FailureCause(
+                code="question_type_unclassified", scope="local_call"))
     if qt not in allowed:
         raise ConfidenceGateError(
             tool,
             f"Tool {tool} requires metric scale, but question type {qt} is not authorized by this scale assessment"
             f" (allowed_metric_tasks={sorted(allowed)})",
-            args=args)
+            args=args, failure_cause=FailureCause(
+                code="question_type_unauthorized", scope="local_call"))
     if qt not in set(supported_metric_tasks):
         raise ConfidenceGateError(
             tool,
             f"Tool {tool} does not support question type {qt} (supported_metric_tasks="
             f"{sorted(supported_metric_tasks)})",
-            args=args)
+            args=args, failure_cause=FailureCause(
+                code="unsupported_question_type", scope="local_call"))
 
 
 def check_artifact_contract(
@@ -287,7 +313,9 @@ def check_evidence_contract(
             tool,
             f"Tool {tool} requires metric scale, but MetricEvidenceGate did not pass"
             " (§13.2 runtime recheck)",
-            args=args)
+            args=args, failure_cause=FailureCause(
+                code="metric_gate_failed", scope="shared_evidence",
+                shared_premises=["metric_scale"]))
 
 
 # --------------------------------------------------------------- 异常族 ----
@@ -299,7 +327,8 @@ class ToolContractError(Exception):
 
     def __init__(self, tool: str, message: str, *, args: Optional[dict] = None,
                  route: str = "", missing: Optional[Sequence[str]] = None,
-                 available: Optional[Iterable[str]] = None) -> None:
+                 available: Optional[Iterable[str]] = None,
+                 failure_cause: Optional[FailureCause] = None) -> None:
         super().__init__(message)
         self.tool = tool
         # 注意：不要赋值 self.args —— 那会覆盖 BaseException.args（异常消息会丢失）
@@ -307,6 +336,10 @@ class ToolContractError(Exception):
         self.route = route
         self.missing = sorted(missing or [])
         self.available = sorted(available or [])
+        self.failure_cause = failure_cause or FailureCause(
+            code="unlocated_tool_failure", scope="unknown", message=message)
+        if not self.failure_cause.message:
+            self.failure_cause = self.failure_cause.model_copy(update={"message": message})
 
     def detail(self) -> dict:
         return {
@@ -316,6 +349,7 @@ class ToolContractError(Exception):
             "missing": list(self.missing),
             "available": list(self.available),
             "message": str(self),
+            "failure_cause": self.failure_cause.model_dump(mode="json"),
         }
 
 
@@ -326,12 +360,15 @@ class ArtifactUnavailableError(ToolContractError):
 
     def __init__(self, tool: str, missing: Sequence[str], route: str = "",
                  available: Optional[Iterable[str]] = None,
-                 args: Optional[dict] = None) -> None:
+                 args: Optional[dict] = None,
+                 failure_cause: Optional[FailureCause] = None) -> None:
         msg = (f"Tool {tool} is missing required artifacts/evidence: {sorted(missing)}; "
                f"route={route or 'unknown'}, available artifacts={sorted(available or [])}"
                " (hard constraint 23: fail closed; never silently return False/0)")
         super().__init__(tool, msg, args=args, route=route, missing=sorted(missing),
-                         available=available)
+                         available=available,
+                         failure_cause=failure_cause or failure_cause_from_missing(
+                             missing, message=msg))
 
 
 class ConfidenceGateError(ToolContractError):

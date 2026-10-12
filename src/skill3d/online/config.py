@@ -172,6 +172,38 @@ def load_yaml(path: str | Path) -> dict:
     return expand_values(data)
 
 
+def resolve_detector_endpoint(experiment: dict | None = None, *, environ=None,
+                              require_detector: bool = False) -> dict:
+    """Resolve once: explicit launcher environment > original YAML > default."""
+    env = os.environ if environ is None else environ
+    experiment = experiment or {}
+    if "HARNESS3D_DETECTOR_ENDPOINT" in env:
+        value, source = env["HARNESS3D_DETECTOR_ENDPOINT"], "env"
+    elif "detector_endpoint" in experiment:
+        value = experiment["detector_endpoint"]
+        source = experiment.get("detector_endpoint_source", "yaml")
+    else:
+        value, source = "http://127.0.0.1:20022", "default"
+    if not isinstance(value, str):
+        raise ValueError("experiment.detector_endpoint must be a string; empty disables it")
+    endpoint = value.strip()
+    if endpoint:
+        try:
+            parsed = urlsplit(endpoint)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment
+                    or parsed.path not in ("", "/") or parsed.port is None
+                    or not 1 <= parsed.port <= 65535):
+                raise ValueError("expected http(s)://host:port")
+        except ValueError as exc:
+            raise ValueError(f"Invalid detector endpoint {endpoint!r}: {exc}") from exc
+    elif require_detector:
+        raise ValueError("Detector is explicitly disabled but REQUIRE_DETECTOR=true")
+    if source not in ("env", "yaml", "default"):
+        raise ValueError("Invalid detector endpoint source")
+    return {"endpoint": endpoint, "source": source, "enabled": bool(endpoint)}
+
+
 def _integer(value: Any, name: str, *, minimum: int = 1) -> None:
     if type(value) is not int or value < minimum:
         raise ValueError(f"{name} must be an integer >= {minimum}")

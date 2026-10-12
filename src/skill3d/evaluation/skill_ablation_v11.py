@@ -34,6 +34,7 @@ from skill3d.schemas import (
     SkillEvaluationBinding,
     SkillSpecV11,
 )
+from skill3d.schemas.trace import EVALUATION_CONTRACT_VERSION
 from skill3d.segmentation.open_vocab_detector import capture_detector_failures
 from skill3d.skills.v11_library import (
     _manifest_for,
@@ -335,7 +336,7 @@ def _rebase(value, source: Path, dest: Path):
     if isinstance(value, str):
         return value.replace(str(source) + "/", str(dest) + "/")
     if isinstance(value, dict):
-        return {k: _rebase(v, source, dest) for k, v in value.items()}
+        return {_rebase(k, source, dest): _rebase(v, source, dest) for k, v in value.items()}
     if isinstance(value, list):
         return [_rebase(v, source, dest) for v in value]
     return value
@@ -412,6 +413,34 @@ def _clone_tree(source: Path, dest: Path) -> None:
                                    ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
+def _copy_inventory_cache(source: Path, dest: Path) -> None:
+    """Carry only validated scene inventory refs into another private preparation."""
+    from skill3d.infra.m5_identity import content_sha256, file_identity
+
+    for path in sorted(source.glob("*_inventory_*.json")):
+        original = json.loads(path.read_bytes())
+        body = {k: v for k, v in original.items() if k != "payload_sha256"}
+        if content_sha256(body) != original.get("payload_sha256"):
+            continue
+        refs = body.get("artifact_hashes", {})
+        if any(
+                not Path(ref).resolve().is_relative_to(source)
+                or not Path(ref).is_file() or file_identity(ref) != identity
+                for ref, identity in refs.items()):
+            continue
+        for ref in refs:
+            p = Path(ref)
+            target = dest / p.relative_to(source)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() and file_identity(target) != refs[ref]:
+                raise PairingError(f"inventory cache target collision: {target}")
+            if not target.exists():
+                shutil.copyfile(p, target)
+        rebased = _rebase(body, source, dest)
+        _write(dest / path.name, {
+            **rebased, "payload_sha256": content_sha256(rebased)})
+
+
 def quality_contract() -> dict:
     """Record current code/thresholds; never claim TODO defaults are calibrated."""
     from skill3d.reconstruction_gate import m4_main_gate, scene_state
@@ -431,6 +460,9 @@ def quality_contract() -> dict:
         "reconstruction/vggt_runner.py", "reconstruction/metric_fusion.py",
         "reconstruction/metric_evidence.py", "reconstruction/image_grid.py",
         "sandbox/kernel.py", "sandbox/receipt.py",
+        "infra/m5_identity.py", "infra/version_lock.py", "coords.py",
+        "segmentation/groundingdino_startup.py", "schemas/reconstruction.py",
+        "schemas/tool.py", "schemas/trace.py",
     )
     from skill3d.reconstruction.metric_fusion import threshold_snapshot, METRIC_FUSION_VERSION
 
@@ -580,8 +612,8 @@ def _arm_result(
                    and len(visual_requests) <= 1
                    and (not successful or delivered == expected)
                    and set(out.delivered_skill_versions) == set(delivered))
-    score = None if incomplete else (
-        float(bool(out.correct)) if out.is_mca else float(out.mra_value or 0.0))
+    scoring_status = "incomplete" if incomplete else out.scoring_status
+    score = out.score if scoring_status == "scored" else None
     # Parsing is the same official parsing used by M12; it does not depend on GT.
     legal = out.answer is not None and out.predicted is not None
     if out.is_mca:
@@ -592,8 +624,12 @@ def _arm_result(
         "final_state": out.final_state, "answer": out.answer, "predicted": out.predicted,
         "task": out.task or canonical_task(out.question_type),
         "metric": "Accuracy" if out.is_mca else "MRA", "score": score,
-        "correct": None if incomplete else out.correct,
-        "mra_value": None if incomplete else out.mra_value,
+        "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
+        "answer_parse_status": out.answer_parse_status,
+        "submission_status": out.submission_status,
+        "scoring_status": scoring_status,
+        "correct": out.correct if scoring_status == "scored" else None,
+        "mra_value": out.mra_value if scoring_status == "scored" else None,
         "legal_answer": bool(legal),
         "program_error": bool(
             error_codes & _PROGRAM_ERROR_CODES
@@ -633,6 +669,9 @@ def _arm_result(
         "terminal_failure": dict(out.terminal_failure),
         "detector_attempts": list(out.detector_attempts),
         "answer_basis": out.answer_basis,
+        "used_result_ids": list(out.used_result_ids),
+        "used_evidence_flags": list(out.used_evidence_flags),
+        "geometry_verify": out.verify.model_dump(mode="json") if out.verify is not None else None,
         "delivered_skill_versions": out.delivered_skill_versions,
         "delivered_content_sha256": delivered, "delivery_ok": delivery_ok,
         "requests": client.requests,
@@ -653,6 +692,10 @@ def _incomplete_row(identity, *, task, is_mca, input_hash, config_hash, errors):
         "status": "incomplete", "final_state": "unavailable", "task": task,
         "metric": "Accuracy" if is_mca else "MRA",
         "answer": None, "score": None, "legal_answer": False,
+        "predicted": None, "correct": None, "mra_value": None,
+        "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
+        "answer_parse_status": "no_answer", "submission_status": "not_submitted",
+        "scoring_status": "incomplete",
         "program_error": False, "runtime_error": False, "input_error": False,
         "tool_contract_error": False, "geometry_rejection": False,
         "untrusted_geometry_used": False, "agent_rounds": 0, "yield_count": 0,
@@ -660,6 +703,7 @@ def _incomplete_row(identity, *, task, is_mca, input_hash, config_hash, errors):
         "program_request_count": 0, "eval_visual_request_count": 0,
         "eval_visual_accepted": False, "eval_visual_request_sha256": None,
         "eval_visual_fallback": {},
+        "used_result_ids": [], "used_evidence_flags": [], "geometry_verify": None,
         "original_score": None, "original_final_state": "unavailable",
         "input_error_reason": "", "episode_status": "run_error", "delivery_ok": True,
         "delivered_skill_versions": [], "delivered_content_sha256": {},
@@ -675,7 +719,7 @@ def pair_results(b01: Sequence[dict], b11: Sequence[dict], expected_qa_ids) -> l
     _same_ids(expected, right, "B11 results")
     pairs = []
     for qa_id in expected:
-        a, b = left[qa_id], right[qa_id]
+        a, b = (_result_states(left[qa_id]), _result_states(right[qa_id]))
         for key in ("input_sha256", "config_sha256", "task", "metric"):
             if not a.get(key) or a[key] != b.get(key):
                 raise PairingError(f"{qa_id}: paired {key} missing/mismatch")
@@ -689,6 +733,7 @@ def pair_results(b01: Sequence[dict], b11: Sequence[dict], expected_qa_ids) -> l
         if not a["delivery_ok"] or not b["delivery_ok"]:
             raise PairingError(f"{qa_id}: actual Skill delivery mismatch")
         completed = a["status"] == b["status"] == "completed"
+        scored = completed and a["scoring_status"] == b["scoring_status"] == "scored"
         input_error_pair = bool(a.get("input_error") and b.get("input_error"))
         pairs.append({
             "qa_id": qa_id, "task": a["task"], "metric": a["metric"],
@@ -698,9 +743,28 @@ def pair_results(b01: Sequence[dict], b11: Sequence[dict], expected_qa_ids) -> l
             "eval_visual_common_request_sha256": (
                 visual_prompts[0] if all(visual_prompts) else None),
             "arms": {"B01": a, "B11": b},
-            "delta": b["score"] - a["score"] if completed else None,
+            "scoring_status": ("scored" if scored else "incomplete" if not completed
+                               else "invalid_reference" if "invalid_reference" in
+                               (a["scoring_status"], b["scoring_status"])
+                               else "reference_unavailable"),
+            "delta": b["score"] - a["score"] if scored else None,
         })
     return pairs
+
+
+def _result_states(record):
+    """只为无新合同标记的历史/替身记录显式推导，禁止补写原记录。"""
+    if record.get("evaluation_contract_version") == EVALUATION_CONTRACT_VERSION:
+        if not all(key in record for key in
+                   ("answer_parse_status", "submission_status", "scoring_status")):
+            raise PairingError("current result lacks explicit evaluation states")
+        if (record["scoring_status"] == "scored") != (record.get("score") is not None):
+            raise PairingError("score conflicts with explicit scoring state")
+        return record
+    return {**record, "state_provenance": "legacy_score_status_adapter",
+            "scoring_status": record.get("scoring_status", (
+                "incomplete" if record.get("status") != "completed" else
+                "scored" if record.get("score") is not None else "reference_unavailable"))}
 
 
 def summarize_pairs(pairs: Sequence[dict]) -> dict:
@@ -731,13 +795,24 @@ def summarize_pairs(pairs: Sequence[dict]) -> dict:
     for name, rows in groups.items():
         arms = {}
         for arm in ARMS:
-            records = [p["arms"][arm] for p in rows]
-            scored = [r for r in records if r["score"] is not None]
+            records = [_result_states(p["arms"][arm]) for p in rows]
+            completed = [r for r in records if r["status"] == "completed"]
+            # Both arm means use exactly the same paired scoring subset.
+            scored = [_result_states(p["arms"][arm]) for p in rows if all(
+                _result_states(p["arms"][a])["scoring_status"] == "scored" for a in ARMS)
+                and p["status"] == "completed"]
             def mean(key, selected):
                 return sum(float(r[key]) for r in selected) / len(selected) if selected else None
             arms[arm] = {
                 "n_planned": len(records), "n_scored": len(scored),
-                "n_incomplete": len(records) - len(scored),
+                "n_completed": len(completed),
+                "n_unscored": sum(r["status"] == "completed"
+                                  and r["scoring_status"] != "scored" for r in records),
+                "n_incomplete": len(records) - len(completed),
+                "scoring_status_counts": {
+                    state: sum(r["scoring_status"] == state for r in records)
+                    for state in ("scored", "reference_unavailable", "invalid_reference", "incomplete")
+                },
                 "Accuracy": mean("score", [r for r in scored if r["metric"] == "Accuracy"]),
                 "MRA": mean("score", [r for r in scored if r["metric"] == "MRA"]),
                 "original_Accuracy": mean(
@@ -764,13 +839,13 @@ def summarize_pairs(pairs: Sequence[dict]) -> dict:
                     for basis in ("tool_derived", "visual_estimate", "mixed", "")
                 },
                 **{
-                    output: mean(field, scored)
+                    output: mean(field, completed)
                     for output, field in rate_fields.items()
                 },
                 **{
                     output: mean(
                         field,
-                        [record for record in records if record.get(field) is not None],
+                        [record for record in completed if record.get(field) is not None],
                     )
                     for output, field in mean_fields.items()
                 },
@@ -795,18 +870,24 @@ def summarize_pairs(pairs: Sequence[dict]) -> dict:
                               float(p["arms"]["B01"][field]) for p in selected) /
                           len(selected) if selected else None)
         report[name] = {"arms": arms, "B11_minus_B01": delta,
-                        "n_complete_pairs": len(complete)}
+                        "n_complete_pairs": len(complete),
+                        "n_scored_pairs": sum(p.get("delta") is not None for p in complete)}
     return {
         "status": "completed" if all(p["status"] == "completed" for p in pairs) else "incomplete",
         "n_pairs": len(pairs),
+        "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
+        "formal_scoring_eligible": all(
+            _result_states(p["arms"][arm])["scoring_status"] == "scored"
+            for p in pairs for arm in ARMS),
         "n_input_error_pairs": sum(
             1 for pair in pairs
             if all(pair["arms"][arm].get("input_error") for arm in ARMS)),
         "groups": report,
         "denominator_contract": (
             "Input/runtime/program/format failures score zero and remain in denominators. "
+            "Unavailable/invalid references have null scores; completed engineering pairs remain complete. "
             "Service failures have null scores and make the experiment incomplete. "
-            "Deltas use only the same completed pairs; partial rates are descriptive."),
+            "Scores use the same scored pair subset; process rates use completed records."),
     }
 
 
@@ -820,6 +901,9 @@ def run_skill_ablation_v11(
     quality_confirmation: dict | None = None,
     quality_confirmations: Mapping[str, dict] | None = None,
     reconstruction_costs: Mapping[str, float] | None = None,
+    prepare_only: bool = False,
+    prepared_manifest: str | Path | None = None,
+    prepared_room_cache: dict[str, dict] | None = None,
     _fixed_skill_arms: Mapping[str, SkillSpecV11] | None = None,
     _fixed_arm_snapshot_refs: Mapping[str, str] | None = None,
     _fixed_arm_manifest_hashes: Mapping[str, str] | None = None,
@@ -833,7 +917,8 @@ def run_skill_ablation_v11(
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=False)
     experiment_id = f"v11-{uuid.uuid4().hex}"
-    manifest = {"schema_version": "skill-ablation-v11/1.0",
+    manifest = {"schema_version": "skill-ablation-v11/1.1",
+                "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
                 "experiment_id": experiment_id, "status": "preparing", "seed": int(seed),
                 "run_mode": os.environ.get(MODE_ENV, "formal"),
                 "code_identity": current_code_identity(),
@@ -924,13 +1009,14 @@ def run_skill_ablation_v11(
             }
             fixed_identity_sha = _hash(identities_by_arm)
             snapshot = {
-                "schema_version": "fixed-skill-pair-v11/1.0",
+                "schema_version": "fixed-skill-pair-v11/1.1",
                 "snapshot_id": f"E11-{fixed_identity_sha[:20]}",
                 "manifest_hash": fixed_identity_sha,
                 "arms": identities_by_arm,
             }
             skill_manifest = {
-                "schema_version": "fixed-skill-pair-manifest-v11/1.0",
+                "schema_version": "fixed-skill-pair-manifest-v11/1.1",
+                "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
                 "manifest_sha256": fixed_identity_sha,
                 "arms": identities_by_arm,
             }
@@ -1059,6 +1145,23 @@ def run_skill_ablation_v11(
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(spec.skill_md, encoding="utf-8")
 
+        prior = None
+        if prepared_manifest is not None:
+            prior = json.loads(Path(prepared_manifest).read_bytes())
+            if prior.get("status") != "prepared":
+                raise PairingError("supplied preparation is not sealed")
+            for name, actual in (
+                ("seed", int(seed)), ("config_sha256", config_hash),
+                ("snapshot", snapshot), ("quality_contract", quality),
+                ("source_sha256", manifest["source_sha256"]),
+            ):
+                if prior.get(name) != actual:
+                    raise PairingError(f"supplied preparation {name} changed")
+            if not set(expected).issubset(prior.get("qa_ids", [])):
+                raise PairingError("supplied preparation does not cover selected questions")
+            if any(prior["inputs"].get(q) != identities[q] for q in expected):
+                raise PairingError("supplied preparation input identity changed")
+
         def client(phase, qa_id, store):
             inner = (client_factory(phase, qa_id) if client_factory
                      else runner._make_vllm_client(cfg))
@@ -1066,6 +1169,7 @@ def run_skill_ablation_v11(
 
         prepared, prepare_errors, preparation_detector_attempts = {}, {}, {}
         preparation_work = {}
+        inventory_sources = {}
         # Freeze *all* common inputs before starting either arm.
         for q in expected:
             item = chosen[q]
@@ -1077,7 +1181,25 @@ def run_skill_ablation_v11(
                 continue
             key = hashlib.sha256(q.encode()).hexdigest()
             frozen = root / "frozen" / key
+            if prior is not None:
+                original = prior["prepared"][q]
+                source = Path(original["directory"])
+                if tree_identity(source)["sha256"] != original["sha256"]:
+                    raise PairingError(f"{q}: supplied preparation tree changed")
+                _clone_tree(source, frozen)
+                prepared[q] = {**original, "directory": str(frozen)}
+                if tree_identity(frozen)["sha256"] != original["sha256"]:
+                    raise PairingError(f"{q}: copied preparation tree changed")
+                if q in prior.get("preparation_errors", {}):
+                    prepare_errors[q] = prior["preparation_errors"][q]
+                preparation_detector_attempts[q] = prior.get(
+                    "preparation_detector_attempts", {}).get(q, [])
+                continue
             art = _copy_base(Path(artifact_paths[q]).resolve(), frozen)
+            scene_key = (item.episode.dataset, art.scene_name,
+                         art.reconstruction_input_identity, art.artifact_version)
+            if scene_key in inventory_sources:
+                _copy_inventory_cache(inventory_sources[scene_key], frozen)
             _write(frozen / "episode.json", item.episode)
             for i, pixels in enumerate(item.pixels):
                 np.save(frozen / f"frame_{i:04d}.npy", pixels)
@@ -1105,9 +1227,12 @@ def run_skill_ablation_v11(
             preparation_work[q] = {
                 "artifact": art, "binding": binding, "frozen": frozen,
             }
+            inventory_sources[scene_key] = frozen
 
         # Cross-question M5 integrity audit runs before any frozen tree identity is computed.
-        from skill3d.segmentation.sam2_tracker import audit_semantic_mask_conflicts
+        from skill3d.segmentation.sam2_tracker import (
+            audit_semantic_mask_conflicts, refresh_grounding_coverage,
+        )
 
         scene_groups: dict[str, list[str]] = {}
         for q, work in preparation_work.items():
@@ -1130,10 +1255,21 @@ def run_skill_ablation_v11(
                 binding.objects = audited[q]
                 binding.stats["semantic_conflict_audits"] = [
                     audit for audit in audits if q in audit["qa_ids"]]
+                if binding.stats.get("grounding"):
+                    binding.stats["grounding"] = refresh_grounding_coverage(
+                        binding.stats["grounding"], binding.objects)
+                # M4 must consume the audited coverage, before the tree is frozen.
+                _, _, updated_art = runner._scene_from_artifact(
+                    preparation_work[q]["artifact"], chosen[q].pixels, binding.stats,
+                    binding.objects, chosen[q].episode,
+                    objects_materialized=binding.materialized, persist_quality=False)
+                preparation_work[q]["artifact"] = updated_art
 
         # Room measurements are scene-level deterministic infrastructure. Compute once per
         # request identity before either arm and freeze success/failure identically.
-        room_receipts: dict[str, dict] = {}
+        room_receipts: dict[str, dict] = (
+            prepared_room_cache if prepared_room_cache is not None else {})
+        new_room_receipts = []
         prepared_measurement_by_qa: dict[str, dict] = {}
         for q, work in sorted(preparation_work.items()):
             task = canonical_task(chosen[q].episode.question_type)
@@ -1152,6 +1288,7 @@ def run_skill_ablation_v11(
             if request_sha not in room_receipts:
                 room_receipts[request_sha] = _prepare_room_measurement(
                     art, timeout_s=300.0)
+                new_room_receipts.append(room_receipts[request_sha])
             receipt = copy.deepcopy(room_receipts[request_sha])
             work["binding"].prepared_measurements["plane_fit_room_size"] = receipt
             work["binding"].stats["prepared_measurement_receipts"] = {
@@ -1190,9 +1327,19 @@ def run_skill_ablation_v11(
                          "prepared_measurement_receipts": prepared_measurement_by_qa,
                          "prepared_measurement_cost_s": sum(
                              float(receipt["runtime_s"])
-                             for receipt in room_receipts.values()),
+                             for receipt in new_room_receipts),
                          "status": "running"})
         _write(root / "manifest.json", manifest)
+        if prepare_only:
+            manifest["status"] = "prepared"
+            _write(root / "manifest.json", manifest)
+            summary = {
+                "experiment_id": experiment_id, "status": "prepared",
+                "n_planned": len(expected), "n_solver_runs": 0,
+                "label_access": False,
+            }
+            _write(root / "summary.json", summary)
+            return summary
         results = {arm: [] for arm in ARMS}
         pairs = []
         for q in expected:
@@ -1374,6 +1521,7 @@ def run_skill_ablation_v11(
                         and os.environ.get(MODE_ENV) != "development"
                         and bool(cfg.model_weights_sha256) and bool(cfg.environment_sha256))
                         and summary["status"] == "completed"
+                        and summary["formal_scoring_eligible"]
                         and summary["n_input_error_pairs"] < summary["n_pairs"]
                         and all(p["comparable"] for p in pairs)})
         summary["run_mode"] = manifest["run_mode"]

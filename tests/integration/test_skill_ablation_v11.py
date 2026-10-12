@@ -151,6 +151,27 @@ def test_real_runner_seed_skill_geometry_and_recomputed_summary(panel, tmp_path)
     assert (artifact.parent / "stale_m5_cache.json").exists()
 
 
+def test_unlabelled_completed_pair_keeps_parse_submission_and_null_scores(panel, tmp_path):
+    item, _, _ = panel
+    item.episode.ground_truth = ""
+    result, pairs, _, root = run(panel, tmp_path)
+    pair = pairs[0]
+    assert pair["status"] == "completed" and pair["delta"] is None
+    assert pair["scoring_status"] == "reference_unavailable"
+    assert result["status"] == "completed" and not result["formal_scoring_eligible"]
+    for arm in ab.ARMS:
+        row = pair["arms"][arm]
+        assert row["predicted"] == "A" and row["legal_answer"]
+        assert row["answer_parse_status"] == "parsed"
+        assert row["submission_status"] == "accepted"
+        assert row["score"] is row["correct"] is row["mra_value"] is None
+        counts = result["groups"]["all"]["arms"][arm]
+        assert counts["n_completed"] == counts["n_unscored"] == 1
+        assert counts["n_scored"] == counts["n_incomplete"] == 0
+        assert counts["legal_answer_rate"] == 1
+    assert result["groups"]["all"]["B11_minus_B01"]["Accuracy"] is None
+
+
 def test_paired_preparation_audits_cross_question_mask_conflicts_before_hashing(
         panel, tmp_path, monkeypatch):
     item, artifact, _ = panel
@@ -676,9 +697,9 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
     assert manifest["common_config"]["seed"] == 137
     assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_5_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.4-eval-visual-fallback")
+        "solver-v11.5-core-engineering-repair")
     assert manifest["common_config"]["tool_docs_version"] == (
-        "tool-docs-v11.4-binding-integrity")
+        "tool-docs-v11.5-core-engineering-repair")
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-english"
 
 

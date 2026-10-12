@@ -22,6 +22,7 @@ from skill3d.segmentation.groundingdino_startup import (
     resolve_bert_snapshot,
     snapshot_identity,
 )
+from skill3d.infra.m5_identity import detector_startup_identity, process_identity
 
 
 def main(argv=None) -> int:
@@ -48,6 +49,10 @@ def main(argv=None) -> int:
         "python": sys.executable, "gpu": args.gpu, "port": args.port,
         "offline": True, "check_only": args.check_only, "status": "preparing",
     }
+    try:
+        receipt["process"] = process_identity(os.getpid())
+    except OSError:
+        receipt["process"] = None
 
     def save():
         receipt_path.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + "\n")
@@ -91,10 +96,25 @@ def main(argv=None) -> int:
         import groundingdino.util.get_tokenlizer as loaders
         bind_local_bert(loaders, snapshot, tokenizer, encoder)
         import groundingdino.util.inference as inference
+        import groundingdino
+        import transformers
+        model_config = service_root / (
+            "skill3d/external_experts/GroundingDINO/configs/GroundingDINO_SwinB_cfg.py")
+        generation, identity_files = detector_startup_identity(
+            service_root=service_root, checkpoint=checkpoint, model_config=model_config,
+            bert_snapshot=snapshot,
+            groundingdino_root=Path(groundingdino.__file__).parent,
+            transformers_root=Path(transformers.__file__).parent,
+            launcher=Path(__file__).resolve())
+        receipt.update(generation_identity=generation, identity_files=identity_files,
+                       service_root=str(service_root))
         original_load_model = inference.load_model
 
         def logged_load_model(*model_args, **model_kwargs):
             try:
+                if (Path(model_args[0]).resolve() != model_config.resolve()
+                        or Path(model_args[1]).resolve() != checkpoint.resolve()):
+                    raise DetectorStartupError("Actual detector load differs from startup identity")
                 return original_load_model(*model_args, **model_kwargs)
             except Exception:
                 # The external server catches this exception and exits with 1;

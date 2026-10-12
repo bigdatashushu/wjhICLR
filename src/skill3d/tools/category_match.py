@@ -172,6 +172,17 @@ SYNONYMS: dict[str, str] = {
 _WS = re.compile(r"[\s_\-/,]+")
 _TOKEN = re.compile(r"[a-z0-9]+")
 CATEGORY_MATCH_VERSION = "category-match-v11.2"
+MASK_LABEL_RELATION_VERSION = "mask-label-relation-v1"
+_MASK_COMPATIBLE_GROUPS = (
+    frozenset({"desk", "table", "counter"}),
+    frozenset({"water bottle", "bottle"}),
+    frozenset({"computer", "television", "monitor", "tv monitor"}),
+)
+_MASK_COMPOUND_EXCEPTIONS = frozenset({"desk counter", "table dresser"})
+_MASK_INCOMPATIBLE_PAIRS = frozenset(
+    frozenset({"door", other})
+    for other in ("chair", "drawer", "cabinet", "dresser", "desk", "table", "counter")
+) | {frozenset({"television", "phone"})}
 _APPEARANCE_PREFIXES = frozenset({
     "the", "a", "an", "black", "white", "blue", "red", "green", "yellow",
     "orange", "brown", "gray", "grey", "pink", "purple", "beige",
@@ -245,5 +256,25 @@ def matches(query: str, category_name: str) -> bool:
     return bool(q and c and q == c)
 
 
+def mask_label_relation(left: str, right: str) -> str:
+    """完整标签的掩码共存规则；不改变查询命中，也不证明同一实例。"""
+    raw_left, raw_right = normalize(left), normalize(right)
+    if not raw_left or not raw_right:
+        return "unknown"
+    if matches(left, right):
+        return "equivalent"
+    a, b = canonical(left), canonical(right)
+    if ((raw_left in _MASK_COMPOUND_EXCEPTIONS and b in {"desk", "table", "counter", "dresser"})
+            or (raw_right in _MASK_COMPOUND_EXCEPTIONS and a in {"desk", "table", "counter", "dresser"})):
+        return "compatible"
+    pair = frozenset({a, b})
+    if any(pair.issubset(group) for group in _MASK_COMPATIBLE_GROUPS):
+        return "compatible"
+    if pair in _MASK_INCOMPATIBLE_PAIRS:
+        return "incompatible"
+    return "unknown"
+
+
 __all__ = ["CATEGORY_MATCH_VERSION", "SYNONYMS", "canonical", "matches",
-           "normalize", "option_category", "tokens"]
+           "normalize", "option_category", "tokens",
+           "MASK_LABEL_RELATION_VERSION", "mask_label_relation"]

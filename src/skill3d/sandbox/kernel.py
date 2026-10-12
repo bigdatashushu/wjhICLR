@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from skill3d.schemas import AnswerPayload, ToolCall, ToolResult, parse_answer_payload
+from skill3d.schemas.tool import FailureCause
 from skill3d.tools.contract import (
     AnswerAlreadyGiven,
     ArtifactUnavailableError,
@@ -488,6 +489,7 @@ class RestrictedNamespaceKernel:
                 evidence_version=_evidence_version_of(self._scene),
                 request_digest=request_digest, latency_ms=0.0,
                 error=f"{type(exc).__name__}: {exc}", error_code=exc.error_code,  # type: ignore[arg-type]
+                failure_cause=exc.failure_cause,
                 missing_artifacts=list(exc.missing),
                 available_artifacts=list(exc.available))
             self.tool_calls.append(
@@ -517,7 +519,8 @@ class RestrictedNamespaceKernel:
             if not self._tools_enabled:
                 exc = ToolContractError(
                     name, f"Tool {name} cannot be called during finalization",
-                    route=self._scene.scene_route, args=kwargs if kwargs else {"args": list(args)})
+                    route=self._scene.scene_route, args=kwargs if kwargs else {"args": list(args)},
+                    failure_cause=FailureCause(code="finalization_denied", scope="local_call"))
                 self._record_failed_call(name, dict(kwargs), exc)
                 raise exc
             if self.answer_slot.given or self.yield_slot.given:
@@ -528,10 +531,18 @@ class RestrictedNamespaceKernel:
                     f" (submitted answer={self.answer_slot.answer!r}); "
                     "a control call ends the cell. Do not call tools afterward (§10.2).",
                     route=self._scene.scene_route,
-                    args=kwargs if kwargs else {"args": list(args)})
+                    args=kwargs if kwargs else {"args": list(args)},
+                    failure_cause=FailureCause(code="answer_already_given", scope="local_call"))
                 self._record_failed_call(name, dict(kwargs), exc)
                 raise exc
-            bound = sig.bind(self._scene, *args, **kwargs)
+            try:
+                bound = sig.bind(self._scene, *args, **kwargs)
+            except TypeError as error:
+                exc = DomainValueError(
+                    name, str(error), args=kwargs if kwargs else {"args": list(args)},
+                    failure_cause=FailureCause(code="invalid_tool_arguments", scope="local_call"))
+                self._record_failed_call(name, dict(kwargs), exc)
+                raise exc from error
             call_args = {k: v for k, v in bound.arguments.items()
                          if k not in ("handle", "scene")}
             try:
@@ -560,27 +571,26 @@ class RestrictedNamespaceKernel:
                 self.authorization_receipts.append(dict(result.authorization))
             if result.error_code == "tool_contract":
                 # D-3/硬约束 23：产物缺失等契约违规 → 确定性异常，绝不静默返回假值
-                self._record_failed_call(name, call_args, ArtifactUnavailableError(
+                exc = ArtifactUnavailableError(
                     name, result.missing_artifacts or ["(unspecified)"],
                     route=self._scene.scene_route,
                     available=result.available_artifacts,
-                    args=call_args), result=result)
-                raise ArtifactUnavailableError(
-                    name, result.missing_artifacts or ["(unspecified)"],
-                    route=self._scene.scene_route,
-                    available=result.available_artifacts,
-                    args=call_args)
+                    args=call_args, failure_cause=result.failure_cause)
+                self._record_failed_call(name, call_args, exc, result=result)
+                raise exc
             if result.error_code == "confidence_gate":
                 exc = ConfidenceGateError(
                     name, result.error or "Local quality gate failed",
                     route=self._scene.scene_route,
-                    available=result.available_artifacts, args=call_args)
+                    available=result.available_artifacts, args=call_args,
+                    failure_cause=result.failure_cause)
                 self._record_failed_call(name, call_args, exc, result=result)
                 raise exc
             if result.error_code == "domain_value":
                 exc = DomainValueError(
                     name, result.error or "Domain value error", route=self._scene.scene_route,
-                    available=result.available_artifacts, args=call_args)
+                    available=result.available_artifacts, args=call_args,
+                    failure_cause=result.failure_cause)
                 self._record_failed_call(name, call_args, exc, result=result)
                 raise exc
             if result.error is not None:

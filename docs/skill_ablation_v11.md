@@ -5,8 +5,8 @@
 `object_rel_distance`（S03），`--question-types` 接受逗号分隔的规范题型。
 
 两臂均通过真实 `run_episode` 生成、执行程序，默认共同使用
-`program_synth_v11_5_en`、`solver-v11.4-eval-visual-fallback` 和
-`tool-docs-v11.4-binding-integrity`，
+`program_synth_v11_5_en`、`solver-v11.5-core-engineering-repair` 和
+`tool-docs-v11.5-core-engineering-repair`，
 质量门始终开启。`ReturnAnswer` 先暂存提交；M11 通过后才进入评分，拒绝时在同一
 求解预算内撤销受影响结果并把结构化失败反馈给同一模型。声明了 `derivation` 时，
 M11 只使用登记操作确定性重放并核对答案；计算声明错误不会撤销本身有效的工具结果。
@@ -216,7 +216,7 @@ YAML 加载。两臂配置由同一份配置复制，
 都不再重试。`induction`、输入错误、原 solver 服务不可用及已通过验收的答案均不触发；
 因此也不会根据评分正确性决定是否补答。成功答案登记为 `visual_estimate` 和
 `direct_vlm_routed`，原失败快照、程序轮次及工具审计保留在 `eval_visual_fallback`。
-新增字段使用 `EpisodeTrace.schema_version=9.1`；旧 `9.0` trace 只能经 legacy reader
+新增字段使用 `EpisodeTrace.schema_version=9.2`；旧 `9.0/9.1` trace 只能经 legacy reader
 只读审计，不能把缺失字段默认解释为“当时未触发补答”。
 旧质量确认与旧运行结果不能证明本工程版本有效；需重新确认当前合同并另建 GPU 运行，
 结果变化不得与 Skill 演化收益混报。
@@ -224,8 +224,8 @@ YAML 加载。两臂配置由同一份配置复制，
 2026-10-12 米制可靠性修复属于两臂共享的工程基线，不修改冻结 Skill。M4 主门通过
 不代表对象语义绑定可靠；`det_conf` 只表示检测器原始置信度，
 `mask_support_ratio` 才表示非空传播 mask 的帧覆盖率。paired preparation 必须先完成
-全部题的 M5，再按冻结重建身份跨题审计 targeted-fill 对象。只有规范类别不同、至少
-两个共同非空帧且堆叠 mask IoU `>=0.95` 时，双方对象才标记
+全部题的 M5，再按冻结重建身份跨题审计所有可读 mask；至少一端为 targeted-fill、
+类别关系明确 incompatible、至少两个共同非空帧且堆叠 mask IoU `>=0.95` 时，双方对象才标记
 `semantic_label_mask_conflict` 并禁止对象几何工具；对象仍保留供原图视觉作答。
 普通多实例不是本轮硬门。
 
@@ -325,7 +325,7 @@ trace 分别计算。成功、失败或超时收据必须在两臂字节一致�
 Accuracy 和 MRA 使用现有 runner 的官方评分器。程序/格式失败或无答案计零，
 不从评分分母删除。程序错误率表示出现过执行错误、AST 拒绝或生成解析失败的题占比，
 即使之后恢复成功仍计入。服务失败保留 `score=null` 并将实验标为 `incomplete`；
-预登记题目的全部图像缺失或不可读时，两臂均生成 `input_error` 零分结果，不调用模型，
+预登记题目的全部图像缺失或不可读时，两臂均生成 `input_error`，有有效参考时计零分，不调用模型，
 并继续保留在配对分母。不能把服务失败运行的部分分数作为完整实验结论。
 差值只取两臂均完成的同一题集合。
 平分和负差值均是有效实验结果。
@@ -366,3 +366,43 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
 
 测试使用合成几何、可注入假模型客户端及 M5 夹具，真实执行 runner、工具、
 程序、质量路由与评分。它验证合同和隔离，不代表真实模型的 Skill 效果。
+
+## 2026-10-13 核心修复及扩大面板
+
+`FailureCause` 区分 local_object/local_result/local_call/shared_evidence/unknown。
+局部绑定错误只撤销消费相关对象的结果；真实共享尺度失效仍级联撤销米制结果。
+未知错误不推断尺度失效。成功几何结果记录实际 `object_dependencies`。
+M11 的 `execution_state` 区分已验证执行、证据缺失和纯视觉；没有适用调用时不填
+乐观 true。最终引用的降级与绑定 flags 来自完整结果链。
+
+补查逐类别进行：首帧、中帧后按槽位顺序检查全部可读冻结帧；检测耗尽后仍缺失的
+类别进入同样有界的定向 VLM 定位。非空 mask 且无硬冲突才结束该类别补查。
+coverage 表示候选覆盖，多实例未经独立选择时 `instance_resolved=null`。
+高 IoU 关系使用 `mask-label-relation-v1`/`semantic-mask-conflict-v2`，兼容或未知
+关系只审计、不合并实例。NameError/UnboundLocalError 同 AST×同证据执行前拒绝。
+候选摘要保留身份及 flag，完整 audit 留原轨迹，整体字符预算有界。
+
+解析、提交与评分分别记录 `answer_parse_status`、`submission_status`、
+`scoring_status`。空 GT 保留已解析预测，score/correct/mra_value 为 null，
+`reference_unavailable` 不作为非法答案或零分。正式独立评分在全部答案冻结后进行。
+M5 缓存使用完整 RGB/数组、模型/权重/配置、seed、源码及运行环境身份；缺身份关闭
+持久复用。base_inventory/question_supplement/question_inventory 各自统计，
+track_consensus 继续使用基础清单分母。
+
+完整入口为 `scripts/run_full_experiment_v11.py`，stage 支持
+run/register/prepare/solve/score/status。固定八类各24题、192道唯一题，sample seed137，
+solver seeds137/138 同一题单，每题每seed B01/B11，共384对768次。
+旧111道并集为锚点，新增81道按场景轮转、方向难度平衡选择；不使用 GT、视频存在性
+或推理结果筛选。新运行8192预算，与旧4096结果单独报告。
+
+入口先按场景准备两seed全部题级输入并完成跨题审计，封存逐文件 SHA256 的 gzip
+内容寻址包，再逐对还原并物理克隆两臂私有树。配对执行复用当前 runner、
+`_copy_base`/`_save_binding`/`_load_binding`/`tree_identity`/`pair_results`。
+首批16对32臂通过请求、Skill、输入与预算核查后自动继续其余368对。
+恢复只跳过同运行且收据/文件身份一致的完成结果；未决 in-flight 不隐式重发。
+进度、五秒资源采样及完整请求单独落盘，少于768次完成保持 incomplete。
+服务资源经过两次 GPU/PID 核验，只启动空闲卡，结束时按 PID/create_time/command
+核验后释放自有服务。代码必须为干净固定提交，依赖和权重只核验、不安装。
+
+当前扩容未包含多实例强制消歧、跨类合并、pointconf 滤点、门限标定、Skill 演化
+或 final_test；S0 正文、工具允许面和测量公式保持冻结。

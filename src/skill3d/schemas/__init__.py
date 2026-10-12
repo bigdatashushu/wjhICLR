@@ -95,7 +95,7 @@ from .retrieval import (
     SkillRetrievalRecord,
     short_method_summary,
 )
-from .tool import ToolCall, ToolResult, ToolSpec
+from .tool import FailureCause, ToolCall, ToolResult, ToolSpec
 from .program import ASTCheckResult, EpisodeProgram, ProgramExecutionTrace
 from .skill import (
     RetrievedSkill,

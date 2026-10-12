@@ -39,6 +39,7 @@ import numpy as np
 from skill3d.reconstruction_gate.world_frame import direction_of
 from skill3d.schemas import ToolSpec
 from skill3d.schemas.evidence import EvidenceProfile
+from skill3d.schemas.tool import FailureCause
 
 from .contract import (
     EVIDENCE_METRIC_SCALE,
@@ -84,19 +85,30 @@ BINDING_INTEGRITY_TOOLS = frozenset({
 })
 
 
+def _object_failure(code: str, *object_ids: str) -> FailureCause:
+    return FailureCause(code=code, scope="local_object", object_ids=list(object_ids))
+
+
+def _room_failure(code: str, receipt_sha256: str = "") -> FailureCause:
+    return FailureCause(code=code, scope="local_result",
+                        audit_ids=[receipt_sha256] if receipt_sha256 else [])
+
+
 def _as_point(p: list[float], name: str) -> np.ndarray:
     arr = np.asarray(p, dtype=np.float64)
     if arr.shape != (3,):
         raise DomainValueError(
             "argument_check", f"{name} must be a 3D point; got shape={arr.shape}",
-            args={"name": name})
+            args={"name": name}, failure_cause=FailureCause(
+                code="invalid_point_argument", scope="local_call"))
     if not np.all(np.isfinite(arr)):
         raise DomainValueError(
-            "argument_check", f"{name} contains NaN/Inf: {p!r}", args={"name": name})
+            "argument_check", f"{name} contains NaN/Inf: {p!r}", args={"name": name},
+            failure_cause=FailureCause(code="invalid_point_argument", scope="local_call"))
     return arr
 
 
-def _require_metric(value, tool: str, what: str):
+def _require_metric(value, tool: str, what: str, *, object_ids=()):
     """米制 Tool 的**非空米制值**校验（v7 §10.1 fail-closed）。
 
     实测根因（2026-09-22 真实 smoke）：`object_distance_m` 在点云有效点不足时会让
@@ -110,7 +122,9 @@ def _require_metric(value, tool: str, what: str):
             tool,
             f"{what} cannot provide a finite value ({value!r}): usually the object has too few valid 3D points "
             "or its point cloud is degraded. Do not treat this as 0. Use other available tools, "
-            "or estimate directly from the images and declare the answer as an estimate.")
+            "or estimate directly from the images and declare the answer as an estimate.",
+            failure_cause=(_object_failure("object_geometry_unusable", *object_ids)
+                           if object_ids else _room_failure("measurement_nonfinite")))
     return float(value)
 
 
@@ -124,18 +138,21 @@ def _metric_scale_or_fail(handle: SceneHandle, tool: str) -> float:
     if v is None or not np.isfinite(float(v)) or float(v) <= 0:
         raise DomainValueError(
             tool, f"No usable metric_scale (world units to meters conversion factor): {v!r}; "
-                  "metric tools must not present world units as metric units when scale fusion has not succeeded")
+                  "metric tools must not present world units as metric units when scale fusion has not succeeded",
+            failure_cause=FailureCause(code="metric_scale_invalid", scope="shared_evidence",
+                                       shared_premises=["metric_scale"]))
     return float(v)
 
 
-def _get_object(handle: SceneHandle, object_id: str, tool: str):
+def _get_object(handle: SceneHandle, object_id: str, tool: str, *, consume=True):
     """取对象；不存在 → DomainValueError（域值错误，不是契约缺失）。"""
     try:
         obj = handle.get_object(object_id)
     except KeyError as exc:
         raise DomainValueError(
             tool, f"Object does not exist: {object_id} (the objects artifact is available and all instances have been listed)",
-            args={"object_id": object_id}) from exc
+            args={"object_id": object_id}, failure_cause=FailureCause(
+                code="object_not_found", scope="local_call")) from exc
     if tool in BINDING_INTEGRITY_TOOLS:
         conflicts = [
             flag for flag in (obj.binding_flags or [])
@@ -151,7 +168,12 @@ def _get_object(handle: SceneHandle, object_id: str, tool: str):
                 f"Object {obj.obj_id} ({obj.category_name}) failed binding integrity: "
                 "semantic_label_mask_conflict. Geometry derived from this object is "
                 f"blocked; use the frozen images instead. audit_sha256={audit_ids}",
-                args={"object_id": obj.obj_id, "binding_flags": conflicts})
+                args={"object_id": obj.obj_id, "binding_flags": conflicts},
+                failure_cause=FailureCause(
+                    code="semantic_label_mask_conflict", scope="local_object",
+                    object_ids=[obj.obj_id], audit_ids=audit_ids))
+        if consume:
+            handle._record_object_dependency(obj.obj_id)
     return obj
 
 
@@ -230,6 +252,8 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
         out.append({
             "obj_id": o.obj_id,
             "category_name": o.category_name,
+            "source_label": o.source_label,
+            "binding_provenance": list(o.binding_provenance),
             "visible_frames": [int(i) for i in (o.visible_frames or [])],
             "track_id": o.track_id,
             "det_conf": float(o.det_conf),
@@ -369,11 +393,13 @@ def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
     if c.shape != (3,):
         raise DomainValueError("object_centroid",
                                f"Object {obj_id} has an invalid centroid shape: {obj.centroid_world}",
-                               args={"obj_id": obj_id})
+                               args={"obj_id": obj_id},
+                               failure_cause=_object_failure("invalid_centroid", obj.obj_id))
     if not np.all(np.isfinite(c)):
         raise DomainValueError("object_centroid",
                                f"Object {obj_id} centroid contains NaN/Inf: {obj.centroid_world}",
-                               args={"obj_id": obj_id})
+                               args={"obj_id": obj_id},
+                               failure_cause=_object_failure("invalid_centroid", obj.obj_id))
     scale = _metric_scale_if_authorized(handle)
     metric = (None if scale is None
               else [float(x) * float(scale) for x in c])
@@ -433,7 +459,8 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
                 f"Object {obj_id} ({obj.category_name}) has too few valid 3D points "
                 f"(n_valid={res.get('n_valid_points')}) to provide metric dimensions. "
                 "Do not treat missing values as 0. Use other tools or estimate from the images.",
-                args={"obj_id": obj_id})
+                args={"obj_id": obj_id},
+                failure_cause=_object_failure("object_geometry_unusable", obj.obj_id))
         return {
             "extent_normalized": res["extent_normalized"],
             "extent_metric": ext_m,
@@ -447,7 +474,8 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
         if np.any(ext < 0):
             raise DomainValueError("object_3d_extent",
                                    f"Object {obj_id} bbox bounds are reversed (negative extent)",
-                                   args={"obj_id": obj_id})
+                                   args={"obj_id": obj_id},
+                                   failure_cause=_object_failure("invalid_object_bbox", obj.obj_id))
         s = _metric_scale_or_fail(handle, "object_3d_extent")
         return {
             "extent_normalized": [float(x) for x in ext],
@@ -457,7 +485,8 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
         }
     raise DomainValueError("object_3d_extent",
                            f"Object {obj_id} has neither a point cloud nor a bbox; cannot measure size",
-                           args={"obj_id": obj_id})
+                           args={"obj_id": obj_id},
+                           failure_cause=_object_failure("object_geometry_missing", obj.obj_id))
 
 
 @REGISTRY.register(
@@ -496,7 +525,8 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
             raise ConfidenceGateError(
                 "plane_fit_room_size",
                 "Prepared room measurement receipt hash mismatch; refusing arm-local recomputation",
-                args={})
+                args={}, failure_cause=_room_failure("room_receipt_hash_mismatch",
+                                                    stored_receipt_sha))
         try:
             current_request = prepared_room_request(
                 point_map_sha256=handle.point_map_sha256,
@@ -508,14 +538,16 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
                 "plane_fit_room_size",
                 f"Prepared room measurement identity cannot be reconstructed: {exc}; "
                 "refusing arm-local recomputation",
-                args={}) from exc
+                args={}, failure_cause=_room_failure("room_identity_invalid",
+                                                    stored_receipt_sha)) from exc
         if prepared.get("request") != current_request:
             raise ConfidenceGateError(
                 "plane_fit_room_size",
                 "Prepared room measurement identity mismatch; refusing arm-local recomputation",
                 args={"expected_request_sha256": current_request["request_sha256"],
                       "stored_request_sha256": prepared.get("request", {}).get(
-                          "request_sha256")})
+                          "request_sha256")},
+                failure_cause=_room_failure("room_identity_mismatch", stored_receipt_sha))
         status = str(prepared.get("status") or "")
         if status != "success":
             raise ConfidenceGateError(
@@ -524,14 +556,16 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
                 f"{prepared.get('error') or 'no payload available'}; "
                 "both paired arms must consume the same failure without recomputation",
                 args={"prepared_status": status,
-                      "receipt_sha256": stored_receipt_sha})
+                      "receipt_sha256": stored_receipt_sha},
+                failure_cause=_room_failure("prepared_room_failed", stored_receipt_sha))
         payload = prepared.get("payload")
         if (not isinstance(payload, dict)
                 or canonical_payload_sha256(payload) != prepared.get("payload_sha256")):
             raise ConfidenceGateError(
                 "plane_fit_room_size",
                 "Prepared room measurement payload hash mismatch; refusing arm-local recomputation",
-                args={"receipt_sha256": stored_receipt_sha})
+                args={"receipt_sha256": stored_receipt_sha},
+                failure_cause=_room_failure("room_payload_hash_mismatch", stored_receipt_sha))
         res = payload
         measurement_source = "prepared_verified_cache"
         receipt_sha256 = stored_receipt_sha
@@ -541,7 +575,10 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
             raise DomainValueError(
                 "plane_fit_room_size",
                 "No world point map was provided; cannot fit planes "
-                "(missing reconstruction artifact)")
+                "(missing reconstruction artifact)",
+                failure_cause=FailureCause(
+                    code="point_map_missing", scope="shared_evidence",
+                    shared_premises=["geometry_3d"]))
         res = room_size_from_planes(
             np.asarray(pm, dtype=np.float64).reshape(-1, 3),
             metric_scale=scale, up_hint=handle.world_up)
@@ -740,10 +777,14 @@ def relative_distance_rank(handle: SceneHandle, reference: str,
             or not all(isinstance(c, str) and c.strip() for c in candidate_categories)):
         raise DomainValueError("relative_distance_rank",
                                "candidate_categories must contain at least two nonempty category names",
-                               args={"candidate_categories": candidate_categories})
+                               args={"candidate_categories": candidate_categories},
+                               failure_cause=FailureCause(
+                                   code="invalid_candidate_categories", scope="local_call"))
     categories = [c.strip() for c in candidate_categories]
     if any(matches(a, b) for i, a in enumerate(categories) for b in categories[i + 1:]):
-        raise DomainValueError("relative_distance_rank", "Candidate categories are duplicates or synonyms; cannot rank uniquely")
+        raise DomainValueError(
+            "relative_distance_rank", "Candidate categories are duplicates or synonyms; cannot rank uniquely",
+            failure_cause=FailureCause(code="duplicate_candidate_categories", scope="local_call"))
     ref = _get_object(handle, reference, "relative_distance_rank")
     ref_pts = handle.object_points(ref.obj_id)
     ranking: list[dict] = []
@@ -766,7 +807,7 @@ def relative_distance_rank(handle: SceneHandle, reference: str,
             flags.add("category_missing:" + cat)
             continue
         for oid in oids:
-            obj = _get_object(handle, oid, "relative_distance_rank")
+            obj = _get_object(handle, oid, "relative_distance_rank", consume=False)
             keys = [("object", oid)] + ([("track", obj.track_id)] if obj.track_id else [])
             collision = any(k in identities and identities[k] != cat for k in keys)
             for key in keys:
@@ -783,6 +824,7 @@ def relative_distance_rank(handle: SceneHandle, reference: str,
                 instance["degradation_flags"] = ["identity_collision"]
                 flags.add("identity_collision")
                 continue
+            handle._record_object_dependency(obj.obj_id)
             res = robust_distance_between_pointsets(
                 ref_pts, handle.object_points(oid),
                 metric_scale=None,
@@ -872,7 +914,8 @@ def object_distance_m(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
         metric_scale=scale, params=DistancePrimitiveParams(),
         duplicate_suspect=bool(a.duplicate_suspect or b.duplicate_suspect))
     d_m = _require_metric(res.distance_metric, "object_distance_m",
-                          f"Nearest distance between {a.category_name} and {b.category_name} (meters)")
+                          f"Nearest distance between {a.category_name} and {b.category_name} (meters)",
+                          object_ids=[a.obj_id, b.obj_id])
     return {
         "distance_m": d_m,
         "distance_normalized": res.distance_normalized,
@@ -943,7 +986,12 @@ def relative_direction_of(handle: SceneHandle, observer_id: str,
                                args={"observer_id": observer_id,
                                      "facing_at_id": facing_at_id,
                                      "target_id": target_id,
-                                     "difficulty": difficulty}) from exc
+                                     "difficulty": difficulty},
+                               failure_cause=FailureCause(
+                                   code="world_frame_missing", scope="shared_evidence",
+                                   shared_premises=["world_frame"])
+                               if handle.world_up is None or handle.handedness not in ("right", "left")
+                               else FailureCause(code="direction_arguments_invalid", scope="local_call")) from exc
     return {
         "direction": direction,
         "difficulty": str(difficulty).strip().lower(),

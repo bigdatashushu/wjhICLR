@@ -2,6 +2,8 @@
 
 from typing import Literal, Optional
 
+from pydantic import model_validator
+
 from . import Spec
 
 ToolSource = Literal["real", "mock_interface", "mock_replay", "mock_light"]
@@ -9,6 +11,33 @@ ToolSource = Literal["real", "mock_interface", "mock_replay", "mock_light"]
 # Tool 执行期失败归因（§4 M6 字段 9 / §5.4 / v6 §9.12）：与 ProgramExecutionTrace.error_code 同族
 ToolErrorCode = Literal["tool_contract", "confidence_gate", "domain_value",
                         "answer_already_given"]
+
+
+SharedPremise = Literal[
+    "geometry_3d", "world_frame", "metric_scale", "object_detection",
+]
+
+
+class FailureCause(Spec):
+    """失败的事实范围；工具依赖本身不能证明共享证据已失效。"""
+
+    code: str
+    scope: Literal[
+        "local_object", "local_result", "local_call", "shared_evidence", "unknown",
+    ]
+    object_ids: list[str] = []
+    result_ids: list[str] = []
+    shared_premises: list[SharedPremise] = []
+    audit_ids: list[str] = []
+    message: str = ""
+
+    @model_validator(mode="after")
+    def _scope_consistency(self):
+        if self.shared_premises and self.scope != "shared_evidence":
+            raise ValueError("Only shared_evidence failures may invalidate shared premises")
+        if self.scope == "shared_evidence" and not self.shared_premises:
+            raise ValueError("A shared_evidence failure must identify a shared premise")
+        return self
 
 
 class ToolSpec(Spec):
@@ -80,6 +109,11 @@ class ToolResult(Spec):
     authorization: dict = {}
     # 答案来自"降级证据"时的显式标记（§7.2：degraded 但容忍 → 暴露且带标记）
     degraded_evidence: list[str] = []
+    failure_cause: Optional[FailureCause] = None
+    # 名称解析后的实际几何输入；观察工具不声明对象几何依赖。
+    object_dependencies: list[str] = []
+    # 显式派生关系，用于对结果的传递撤销。
+    result_dependencies: list[str] = []
 
     # v5 审计字段（保留：receipts/回放/失败归因需要）
     tool: str = ""

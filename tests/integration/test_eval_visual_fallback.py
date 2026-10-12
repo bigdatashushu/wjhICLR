@@ -61,6 +61,22 @@ def run_case(source, tmp_path, replies, *, split="inner_validation", enabled=Tru
     return out, client
 
 
+def test_unlabelled_visual_fallback_preserves_numeric_parse_and_unscored_original(source, tmp_path):
+    item, artifact = source
+    clone = copy.deepcopy(item)
+    clone.episode.ground_truth = ""
+    out, _ = run_case((clone, artifact), tmp_path, ["ReturnAnswer(-1)", "ReturnAnswer(-1)", "3"])
+    assert out.answer == "3" and out.predicted == "3.0"
+    assert out.answer_parse_status == "parsed" and out.legal_answer
+    assert out.submission_status == "accepted"
+    assert out.scoring_status == "reference_unavailable"
+    assert out.score is out.correct is out.mra_value is None
+    original = out.eval_visual_fallback["original_result"]
+    assert original["score"] is None
+    assert original["scoring_status"] == "reference_unavailable"
+    assert out.episode_trace.scoring_status == out.scoring_status
+
+
 @pytest.mark.parametrize("split", ["inner_validation", "outer_holdout", "final_test"])
 def test_failure_gets_exactly_one_clean_visual_answer(source, tmp_path, split):
     out, client = run_case(
@@ -85,6 +101,10 @@ def test_failure_gets_exactly_one_clean_visual_answer(source, tmp_path, split):
     assert all(params["seed"] == 7 for _, _, params in client.calls)
     assert out.answer_basis == "visual_estimate" and out.answer_source == "direct_vlm_routed"
     assert out.used_result_ids == [] and not out.answer_untrusted
+    assert out.used_evidence_flags == []
+    assert out.verify.check_status["reprojection"] == "not_applicable"
+    assert out.verify.check_status["derivation_replay"] == "not_performed"
+    assert out.verify.check_status["answer_contract"] == "pass"
     assert out.attribution.ledger.ignored_result_ids
     assert out.attribution.ledger.verified_used_result_ids == []
     audit = out.eval_visual_fallback

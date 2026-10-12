@@ -335,7 +335,7 @@ def test_service_failure_makes_whole_run_incomplete_for_both_metrics(
         return SimpleNamespace(
             task=episode.question_type, question_type=episode.question_type,
             is_mca=is_mca, correct=None, mra_value=None, final_state="unavailable",
-            rounds=[])
+            scoring_status="incomplete", score=None, rounds=[])
     monkeypatch.setattr(runner, "run_episode", failed)
     _, run = run_split(
         items, OnlineRunConfig(mode="mock_light", trace_dir=str(tmp_path)))

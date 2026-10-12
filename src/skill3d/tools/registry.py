@@ -26,13 +26,14 @@ from typing import Any, Callable, Iterable, Optional
 from skill3d.schemas import ToolResult, ToolSpec
 from skill3d.schemas.evidence import CAPABILITIES, EvidenceProfile
 from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
-from skill3d.schemas.tool import ToolSource
+from skill3d.schemas.tool import FailureCause, ToolSource
 from skill3d.tools.contract import (
     EVIDENCE_METRIC_SCALE,
     KNOWN_ARTIFACTS,
     SCOPE_FALLBACK_2D_ONLY,
     SCOPE_FULL_3D,
     SCOPE_METRIC_ENABLED,
+    DomainValueError,
     ToolContractError,
     check_artifact_contract,
     check_evidence_contract,
@@ -57,8 +58,10 @@ class ToolNotFoundError(KeyError):
     pass
 
 
-class ToolArgValidationError(ValueError):
-    pass
+class ToolArgValidationError(DomainValueError, ValueError):
+    def __init__(self, message: str, *, tool: str = "", args=None):
+        super().__init__(tool, message, args=args, failure_cause=FailureCause(
+            code="invalid_tool_arguments", scope="local_call"))
 
 
 def _error_code_of(exc: BaseException) -> Optional[str]:
@@ -265,9 +268,11 @@ class ToolRegistry:
         missing = required - set(args)
         unknown = set(args) - allowed
         if missing:
-            raise ToolArgValidationError(f"Tool {spec_name} missing arguments: {sorted(missing)}")
+            raise ToolArgValidationError(f"Tool {spec_name} missing arguments: {sorted(missing)}",
+                                         tool=spec_name, args=args)
         if unknown:
-            raise ToolArgValidationError(f"Tool {spec_name} unknown arguments: {sorted(unknown)}")
+            raise ToolArgValidationError(f"Tool {spec_name} unknown arguments: {sorted(unknown)}",
+                                         tool=spec_name, args=args)
 
     # ---- 统一调用（§4 M6 伪代码）----
     def call_tool(
@@ -325,7 +330,8 @@ class ToolRegistry:
                 f"Tool {name} is not allowed in the current question_tool_scope={scope}"
                 " (§5.3: question-level scope can only narrow access; metric tools require metric_enabled)",
                 args=args, route=scene.scene_route,
-                missing=missing, available=available)
+                missing=missing, available=available, failure_cause=FailureCause(
+                    code="scope_denied", scope="local_call"))
 
         # ② 米制 Tool 的逐题授权（v5 HC33 语义的题型维度补充）
         check_metric_task_contract(
@@ -352,16 +358,21 @@ class ToolRegistry:
         t0 = time.perf_counter()
         error: Optional[str] = None
         error_code: Optional[str] = None
+        failure_cause = None
         missing: list[str] = []
+        scene._consumed_object_ids = []
         try:
             value = fn(scene, **args)
         except ToolContractError as exc:  # 确定性契约异常 → 进失败归因（§4 M6 字段 9）
             value, error, error_code = None, f"{type(exc).__name__}: {exc}", exc.error_code
             missing = list(exc.missing)
             available = list(exc.available or available)
+            failure_cause = exc.failure_cause
         except Exception as exc:  # noqa: BLE001 - 实现内部错误
             value, error = None, f"{type(exc).__name__}: {exc}"
             error_code = _error_code_of(exc)
+            failure_cause = FailureCause(
+                code=type(exc).__name__, scope="unknown", message=error)
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
         degraded = degraded_evidence_flags(entry.spec, profile)
@@ -382,6 +393,8 @@ class ToolRegistry:
             latency_ms=latency_ms,
             error=error,
             error_code=error_code,  # type: ignore[arg-type]
+            failure_cause=failure_cause,
+            object_dependencies=(list(scene._consumed_object_ids) if error is None else []),
             missing_artifacts=missing,
             available_artifacts=sorted(set(available)),
         )

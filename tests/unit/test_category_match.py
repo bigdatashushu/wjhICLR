@@ -93,6 +93,26 @@ def test_tokens_are_word_sets():
     assert tokens("trash_can") == {"trash", "can"}
 
 
+@pytest.mark.parametrize("left,right,relation", [
+    ("tv", "television", "equivalent"),
+    ("desk", "table", "compatible"), ("counter", "desk", "compatible"),
+    ("water bottle", "bottle", "compatible"), ("computer", "tv monitor", "compatible"),
+    ("desk counter", "dresser", "compatible"), ("table dresser", "desk", "compatible"),
+    ("door", "chair", "incompatible"), ("doorway", "drawers", "incompatible"),
+    ("television", "telephone", "incompatible"),
+    ("cabinet door", "cabinet", "unknown"), ("drawer door", "chair", "unknown"),
+    ("coffee table", "desk", "unknown"), ("chair mat", "chair", "unknown"),
+    ("", "door", "unknown"),
+])
+def test_mask_relations_use_full_labels_without_expanding_queries(left, right, relation):
+    from skill3d.tools.category_match import mask_label_relation
+
+    assert mask_label_relation(left, right) == relation
+    assert mask_label_relation(right, left) == relation
+    if relation != "equivalent":
+        assert not matches(left, right)
+
+
 def test_scene_handle_uses_normalized_matching():
     """端到端：SceneHandle.list_objects_by_name 与 resolve_object_id 都走归一化匹配。"""
     from skill3d.schemas import ObjectRecord, SceneState

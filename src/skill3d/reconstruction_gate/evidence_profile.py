@@ -48,7 +48,7 @@ TH_GROUNDING_MIN_CONF: float = 0.5     # TODO_CALIBRATE: 补绑置信度下限
 TH_SCALE_DISPERSION: float = 0.15      # TODO_CALIBRATE: τ_scale_disp（§13.1 子条件 4）
 TH_MIN_VALID_FRAME_RATIO: float = 0.75  # TODO_CALIBRATE: τ_frames（§13.1 子条件 3）
 
-EVIDENCE_PROFILE_BUILDER_VERSION: str = "evidence-builder-v6"
+EVIDENCE_PROFILE_BUILDER_VERSION: str = "evidence-builder-v6.1-m5-scopes"
 
 
 @dataclass
@@ -60,8 +60,8 @@ class M5EvidenceSummary:
     # （暗示"重试后仍零检出"，而实际根本没跑过）。
     m5_ran: bool = False
     detection_fault: bool = False          # 检测器服务故障
-    n_objects: int = 0                     # 基础清单对象数
-    n_tracks: int = 0                      # 去重后 track 数
+    n_objects: int = 0                     # 题级最终检测清单对象数
+    n_tracks: int = 0                      # 基础清单 track 数（原计数门口径）
     track_stable_ratio: Optional[float] = None  # 可见帧率（诊断量）
     # v6 判据输入（来自 M5 `stats["track_consensus"]`）
     track_fragmentation_ratio: Optional[float] = None   # 被去重合并的碎片占比
@@ -70,6 +70,11 @@ class M5EvidenceSummary:
     grounding_conf: Optional[float] = None
     grounding_miss: bool = False           # 明确未命中（grounding_recall_miss）
     grounding_filled: bool = False         # 走的是 question-targeted 补绑
+    detection_scope: str = "question_inventory"
+    track_scope: str = "base_inventory"
+    base_inventory: dict = field(default_factory=dict)
+    question_supplement: dict = field(default_factory=dict)
+    question_inventory: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -430,8 +435,13 @@ def build_evidence_profile(
                 "th_min_valid_frame_ratio": TH_MIN_VALID_FRAME_RATIO,
             },
             "object_detection": {"n_objects": int(m5.n_objects),
+                                 "scope": m5.detection_scope,
+                                 "inventory": m5.question_inventory,
                                  "warnings": det_warns + list(m5.notes)},
             "track_consensus": {
+                "scope": m5.track_scope,
+                "base_inventory": m5.base_inventory,
+                "question_supplement": m5.question_supplement,
                 "n_tracks": int(m5.n_tracks),
                 "track_fragmentation_ratio": m5.track_fragmentation_ratio,
                 "duplicate_suspect_ratio": m5.duplicate_suspect_ratio,

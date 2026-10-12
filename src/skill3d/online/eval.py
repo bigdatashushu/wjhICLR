@@ -337,6 +337,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\nEvaluationRun  run_id={run.run_id}  split={run.split}  n={run.n_episodes}")
     print(f"  accuracy(MCA) = {_fmt(run.accuracy)}   mra(NA) = {_fmt(run.mra)}")
+    print(f"  scored={run.n_scored} unscored={run.n_unscored} "
+          f"formal_scoring_eligible={run.formal_scoring_eligible}")
     print(f"  code_commit   = {run.code_commit}")
     print("\nper-task:")
     for qt in ALL_QUESTION_TYPES:
@@ -415,6 +417,9 @@ def main(argv: list[str] | None = None) -> int:
           f"方法上下文上限={_rp.method_context_max_chars} 字符")
     if run.status != "completed":
         print(f"[error] run incomplete: {run.n_unavailable} service-unavailable episodes")
+        return 1
+    if run.scoring_status_counts.get("invalid_reference"):
+        print("[error] invalid references: outputs retained; formal scoring rejected")
         return 1
     return 0
 
@@ -648,6 +653,9 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
                                   if args.sampling_per_task else "none"),
             "run_id": run.run_id, "split": split, "mode": args.mode,
             "baseline": args.baseline, "n_episodes": run.n_episodes,
+            "n_scored": run.n_scored, "n_unscored": run.n_unscored,
+            "scoring_status_counts": run.scoring_status_counts,
+            "formal_scoring_eligible": run.formal_scoring_eligible,
             "active_snapshot_ref": run.active_snapshot_ref,
             # 影响结果的推理参数必须记录（§16.4 / §7：冻结模型 + 一致推理环境）
             "vllm_model": run_cfg.vllm_model,

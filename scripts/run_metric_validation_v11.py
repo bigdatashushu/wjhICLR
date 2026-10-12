@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fixed-panel metric preparation and frozen B01/B11 development validation.
 
-Labels are absent from these inputs. Scores in the ablation engine are placeholders;
-an independent process must join labels only after all solver output is frozen.
+Labels are absent from these inputs; unscored outputs retain null scores.
+An independent process joins labels only after all solver output is frozen.
 """
 
 from __future__ import annotations
@@ -240,7 +240,7 @@ def solve(args, plan):
             expected_qa_ids=[r["qa_id"] for r in plan["questions"]],
             question_types=sorted({r["task"] for r in plan["questions"]}))
     ab._write(output / "solve_receipt.json",
-              {**result, "label_access": False, "scores_are_placeholders": True,
+              {**result, "label_access": False, "scoring_status": "reference_unavailable",
                "independent_scoring_required": True})
     require(result["status"] == "completed", "paired solver incomplete; inspect retained evidence")
 

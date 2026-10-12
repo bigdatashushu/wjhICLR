@@ -52,8 +52,12 @@ RoundTriggerValue = Literal["initial", "observation", "error_recovery", "finaliz
 # 6.0 与 9.0 语料由 `skill3d.legacy.readers.read_legacy_episode_trace` 只读解释；
 # **不得**直接 `model_validate` 成当前对象。9.1 新增评测视觉补答及原失败快照，
 # 旧记录缺该字段表示“当时未记录”，不能被默认空对象解释成“当时未触发”。
-EPISODE_TRACE_SCHEMA_VERSION = "9.1"
-LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS: tuple[str, ...] = ("6.0", "9.0")
+EPISODE_TRACE_SCHEMA_VERSION = "9.2"
+EVALUATION_CONTRACT_VERSION = "evaluation-v11.5-parse-submit-score"
+LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS: tuple[str, ...] = ("6.0", "9.0", "9.1")
+AnswerParseStatus = Literal["parsed", "unparsed", "no_answer"]
+SubmissionStatus = Literal["accepted", "rejected", "not_submitted"]
+ScoringStatus = Literal["scored", "reference_unavailable", "invalid_reference", "incomplete"]
 
 # 失败码（§5.9 / §19.1；不依赖重跑即可归因失败）
 FailureCode = Literal[
@@ -112,6 +116,13 @@ class EvaluationResultTrace(Spec):
     abstained: bool = False
     failure_code: Optional[str] = None
     eval_visual_fallback: dict = {}
+    evaluation_contract_version: str = EVALUATION_CONTRACT_VERSION
+    answer_parse_status: AnswerParseStatus = "no_answer"
+    submission_status: SubmissionStatus = "not_submitted"
+    scoring_status: ScoringStatus = "reference_unavailable"
+    score: Optional[float] = None
+    legal_answer: bool = False
+    used_evidence_flags: list[dict] = []
 
 
 class TraceRecord(Spec):
@@ -136,9 +147,16 @@ class TraceRecord(Spec):
     scene_route: str = ""
     question_tool_scope: str = ""
     answer_source: str = ""
+    evaluation_contract_version: str = EVALUATION_CONTRACT_VERSION
+    answer_parse_status: AnswerParseStatus = "no_answer"
+    submission_status: SubmissionStatus = "not_submitted"
+    scoring_status: ScoringStatus = "reference_unavailable"
+    score: Optional[float] = None
+    legal_answer: bool = False
     input_error_reason: str = ""
     label_access: Literal[False] = False
     used_result_ids: list[str] = []
+    used_evidence_flags: list[dict] = []
     recovery_count: int = 0
     partial_tool_recovery: bool = False
     invalidated_result_ids: list[str] = []
@@ -253,12 +271,19 @@ class EpisodeTrace(Spec):
     evidence_states: dict[str, str] = {}
     input_degradation_flags: list[str] = []
     answer_source: str = ""
+    evaluation_contract_version: str = EVALUATION_CONTRACT_VERSION
+    answer_parse_status: AnswerParseStatus = "no_answer"
+    submission_status: SubmissionStatus = "not_submitted"
+    scoring_status: ScoringStatus = "reference_unavailable"
+    score: Optional[float] = None
+    legal_answer: bool = False
     input_error_reason: str = ""
     label_access: Literal[False] = False
     # v6 D7：partial recovery 事实（§14.1）
     recovery_count: int = 0
     partial_tool_recovery: bool = False
     used_result_ids: list[str] = []
+    used_evidence_flags: list[dict] = []
     invalidated_result_ids: list[str] = []
     failure_code: Optional[str] = None
     terminal_failure: dict = {}
@@ -307,6 +332,11 @@ class EvaluationRun(Spec):
     run_id: str
     status: Literal["completed", "incomplete"] = "completed"
     n_unavailable: int = 0
+    n_scored: int = 0
+    n_unscored: int = 0
+    scoring_status_counts: dict[str, int] = {}
+    formal_scoring_eligible: bool = False
+    evaluation_contract_version: str = EVALUATION_CONTRACT_VERSION
     split: str
     n_episodes: int
     accuracy: Optional[float]

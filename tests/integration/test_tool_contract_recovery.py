@@ -318,6 +318,23 @@ def test_same_failed_ast_skips_tools_and_keeps_original_request_budget(tmp_path,
     assert out.final_state == "answer" and out.answer == "3.0"
 
 
+@pytest.mark.parametrize("failure", [
+    "missing_name\n",
+    "def broken():\n    x = x + 1\nbroken()\n",
+])
+def test_name_failure_with_unchanged_evidence_skips_repeat(tmp_path, episode_item, failure):
+    bad = "euclidean_distance([0, 0, 0], [1, 0, 0])\n" + failure
+    client = _FakeClient([bad, "# new comment\n" + bad, bad, 'ReturnAnswer("3.0")\n'])
+    cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=3)
+    cfg.max_solver_rounds = 4
+    out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
+    assert out.rounds[0]["executed"] and out.rounds[1]["executed"]
+    assert out.rounds[2]["executed"] is False
+    assert out.rounds[2]["repeated_failure"]["prior_round"] == 2
+    assert sum(len(r.get("results", [])) for r in out.rounds) == 2
+    assert out.final_state == "answer"
+
+
 def test_changed_observation_does_not_trip_failed_ast_guard(tmp_path, episode_item):
     bad = "euclidean_distance([0, 0, 0], [1, 0, 0])\nx = {}['obj_id']\n"
     observe = ("value = euclidean_distance([0, 0, 0], [2, 0, 0])\n"
@@ -330,3 +347,52 @@ def test_changed_observation_does_not_trip_failed_ast_guard(tmp_path, episode_it
     assert all(out.rounds[index]["executed"] for index in (0, 1, 2, 4))
     assert not out.rounds[2].get("repeated_failure")
     assert out.rounds[3]["repeated_failure"]["execution_skipped"]
+
+
+def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
+        tmp_path, episode_item, monkeypatch):
+    import skill3d.online.runner as runner
+    from skill3d.schemas import ObjectRecord
+
+    objs = [
+        ObjectRecord(obj_id="good", category_name="chair", centroid_world=[1, 0, 0]),
+        ObjectRecord(obj_id="bad", category_name="television", centroid_world=[0, 0, 1],
+                     binding_flags=[{"code": "semantic_label_mask_conflict",
+                                     "audit_sha256": "c" * 64}]),
+    ]
+    monkeypatch.setattr(runner, "_bind_objects_best_effort", lambda *a, **k: (
+        objs, {"grounding": {"attempted": True, "status": "partial"},
+               "track_stable_ratio": 1}, [], True))
+    client = _FakeClient([
+        "object_centroid('good')\nobject_3d_extent('bad')",
+        "ReturnAnswer('1.0')",
+    ])
+    cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=2)
+    out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
+    assert out.final_state == "answer"
+    assert out.evidence_profile.metric_scale == "available"
+    assert out.question_tool_scope == "metric_enabled"
+    assert out.invalidated_result_ids == []
+    first = out.rounds[0]
+    assert first["failure_cause"]["scope"] == "local_object"
+    assert first["failure_cause"]["object_ids"] == ["bad"]
+    assert first["downgraded_capabilities"] == {}
+    assert out.used_result_ids == first["recovery_observation_ids"]
+    assert len(out.used_result_ids) == 1
+
+
+def test_actual_derivation_replay_reports_execution_and_inputs(tmp_path, episode_item):
+    program = (
+        'r = plane_fit_room_size()\n'
+        'ReturnAnswer(AnswerPayload(value=r["room_area_m2"], unit="m2", basis="tool_derived", '
+        'used_result_ids=[r["result_id"]], derivation={"op": "field", '
+        '"input_result_ids": [r["result_id"]], "parameters": {"field": "room_area_m2"}}))\n')
+    client = _FakeClient([program])
+    cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=0)
+    out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
+    assert out.final_state == "answer" and out.verify.passed
+    assert out.verify.check_status["derivation_replay"] == "pass"
+    detail = out.verify.check_details["derivation_replay"]
+    assert detail["execution_count"] == 1 and detail["op"] == "field"
+    assert detail["input_result_ids"] == out.used_result_ids
+    assert out.verify.check_status["reprojection"] == "not_applicable"

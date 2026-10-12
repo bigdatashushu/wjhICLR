@@ -29,6 +29,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
 
 from skill3d.schemas import ProgramExecutionTrace
+from skill3d.schemas.tool import FailureCause
 from skill3d.tools.ranking_contract import ranking_problems
 from skill3d.tools.scene_handle import SceneHandle
 
@@ -80,6 +81,7 @@ class GeometryIssue(BaseModel):
     confirmed_shared_premise: Optional[Literal[
         "geometry_3d", "world_frame", "metric_scale", "object_detection"
     ]] = None
+    failure_cause: Optional[FailureCause] = None
 
 
 class GeometryVerifyResult(BaseModel):
@@ -89,6 +91,9 @@ class GeometryVerifyResult(BaseModel):
     qa_id: str = ""
     passed: bool
     checks: dict[str, bool]
+    check_status: dict[str, Literal["pass", "fail", "not_applicable", "not_performed"]] = Field(
+        default_factory=dict)
+    check_details: dict[str, dict] = Field(default_factory=dict)
     violations: list[str]
     issues: list[GeometryIssue] = Field(default_factory=list)
     # 只读诊断（进 trace，便于"M11 为什么这么判"的事后归因；不参与判定）
@@ -251,6 +256,10 @@ def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -
         if (result.status != "ok" or result.error is not None
                 or result.tool not in _OBJECT_GEOMETRY_ARGS):
             continue
+        if result.object_dependencies:
+            if conflict_ids.intersection(result.object_dependencies):
+                return False
+            continue
         if any(argument_conflicts(result.args.get(name))
                for name in _OBJECT_GEOMETRY_ARGS[result.tool]
                if name in result.args):
@@ -330,6 +339,9 @@ def geometry_verify(
     checks = dict.fromkeys((
         "valid_json", "no_negative_distance", "unit_consistent", "world_frame",
         "binding_integrity", "inside_bbox", "reprojection", "complete_ranking"), True)
+    details = {check: {"applicable_result_ids": [], "tools": [], "executed_result_ids": [],
+                      "object_ids": [], "execution_count": 0, "not_performed_reasons": []}
+               for check in checks}
     issues: list[GeometryIssue] = []
     reasons = {
         "valid_json": "A successful tool result is not valid finite JSON",
@@ -346,16 +358,56 @@ def geometry_verify(
         if result.status != "ok" or result.error is not None or result.invalidated_by:
             continue
         single = trace.model_copy(update={"results": [result]})
-        row = {
-            "valid_json": _valid_json_result(result.value),
-            "no_negative_distance": check_no_negative_distance(single),
-            "unit_consistent": check_unit_consistent(single, handle),
-            "world_frame": check_world_frame(single, handle),
-            "binding_integrity": check_binding_integrity(single, handle),
-            "inside_bbox": check_inside_bbox(single, handle),
-            "reprojection": check_reprojection(single, handle, threshold_px),
+        is_reproject = result.tool == "reproject"
+        applicable = {
+            "valid_json": True,
+            "no_negative_distance": result.tool in (
+                "euclidean_distance", "robust_distance", "camera_object_distance",
+                "surface_distance_between_objects", "object_3d_extent",
+                "plane_fit_room_size", "object_distance_m"),
+            "unit_consistent": result.tool in _METRIC_VALUE_KEYS,
+            "world_frame": result.tool in WORLD_FRAME_TOOLS,
+            "binding_integrity": result.tool in _OBJECT_GEOMETRY_ARGS,
+            "inside_bbox": is_reproject,
+            "reprojection": is_reproject,
+            "complete_ranking": result.tool == "relative_distance_rank",
         }
-        if result.tool == "relative_distance_rank" and row["valid_json"]:
+        functions = {
+            "valid_json": lambda: _valid_json_result(result.value),
+            "no_negative_distance": lambda: check_no_negative_distance(single),
+            "unit_consistent": lambda: check_unit_consistent(single, handle),
+            "world_frame": lambda: check_world_frame(single, handle),
+            "binding_integrity": lambda: check_binding_integrity(single, handle),
+            "inside_bbox": lambda: check_inside_bbox(single, handle),
+            "reprojection": lambda: check_reprojection(single, handle, threshold_px),
+        }
+        row = {}
+        for check, applies in applicable.items():
+            if not applies:
+                continue
+            detail = details[check]
+            detail["applicable_result_ids"].append(result.result_id)
+            detail["tools"].append(result.tool)
+            detail["object_ids"].extend(result.object_dependencies)
+            reason = ""
+            if check == "binding_integrity" and not hasattr(handle, "object_records"):
+                reason = "object_records_unavailable"
+            if check == "inside_bbox" and wf_ok:
+                try:
+                    handle.scene_bbox()
+                except ValueError:
+                    reason = "scene_bbox_unavailable"
+            if check == "complete_ranking" and not row.get("valid_json"):
+                reason = "rank_payload_not_decodable"
+            if reason:
+                detail["not_performed_reasons"].append({
+                    "result_id": result.result_id, "reason": reason})
+                continue
+            if check != "complete_ranking":
+                row[check] = functions[check]()
+            detail["executed_result_ids"].append(result.result_id)
+            detail["execution_count"] += 1
+        if applicable["complete_ranking"] and row.get("valid_json"):
             problems = ranking_problems(json.loads(result.value), options)
             row["complete_ranking"] = not problems
             reasons["complete_ranking"] = "; ".join(problems)
@@ -367,10 +419,43 @@ def geometry_verify(
             premise = ("world_frame" if not wf_ok and (
                 check == "world_frame" or
                 (check == "inside_bbox" and result.tool == "reproject")) else None)
+            conflicted = [
+                obj for obj in handle.object_records()
+                if _has_binding_conflict(obj)
+                and obj.obj_id in result.object_dependencies
+            ] if check == "binding_integrity" else []
+            cause = FailureCause(
+                code=check, scope="shared_evidence" if premise else
+                "local_object" if conflicted else "local_result",
+                shared_premises=[premise] if premise else [],
+                object_ids=[obj.obj_id for obj in conflicted],
+                result_ids=[result.result_id],
+                audit_ids=sorted({
+                    flag["audit_sha256"] for obj in conflicted
+                    for flag in obj.binding_flags
+                    if flag.get("code") == "semantic_label_mask_conflict"
+                    and flag.get("audit_sha256")
+                }), message=reasons[check])
             issues.append(GeometryIssue(
                 check=check, tool=result.tool, result_id=result.result_id,
-                reason=reasons[check], confirmed_shared_premise=premise))
+                reason=reasons[check], confirmed_shared_premise=premise,
+                failure_cause=cause))
     violations = [k for k, v in checks.items() if not v]
+    status = {}
+    for check, detail in details.items():
+        for key in ("tools", "object_ids"):
+            detail[key] = sorted(set(detail[key]))
+        if not detail["applicable_result_ids"]:
+            status[check] = "not_applicable"
+            detail["reason"] = "no_applicable_results"
+        elif not detail["execution_count"]:
+            status[check] = "not_performed"
+        elif not checks[check]:
+            status[check] = "fail"
+        elif detail["not_performed_reasons"]:
+            status[check] = "not_performed"
+        else:
+            status[check] = "pass"
     notes = [
         f"metric_evidence_authorized={authorized}"
         f" (gate_passed={bool(getattr(handle, 'metric_gate_passed', False))} and "
@@ -382,7 +467,8 @@ def geometry_verify(
     ]
     del answer  # 答案语义由在线提交验收处理；本模块保持纯几何
     return GeometryVerifyResult(
-        passed=not violations, checks=checks, violations=violations, issues=issues, notes=notes,
+        passed=not violations, checks=checks, check_status=status, check_details=details,
+        violations=violations, issues=issues, notes=notes,
         metric_evidence_authorized=authorized, world_frame_available=wf_ok)
 
 

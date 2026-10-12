@@ -27,6 +27,7 @@ from skill3d.infra.experiment_startup import (
 )
 from skill3d.online.config import (
     VLLMSettings, config_receipt, load_config, load_yaml, resolve_runtime,
+    resolve_detector_endpoint,
 )
 
 _COMMIT_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
@@ -38,6 +39,9 @@ class GPUExperimentError(RuntimeError):
 
 def _read_config(path: Path) -> dict:
     value = load_yaml(path)
+    detector = resolve_detector_endpoint(value.get("experiment"))
+    value["experiment"].update(detector_endpoint=detector["endpoint"],
+                               detector_endpoint_source=detector["source"])
     runtime = value["runtime"]
     # Validate the same request fields used by every Python entry point.
     runtime.setdefault("max_tokens", 8192)
@@ -340,9 +344,14 @@ def _command_env(
         "SKILL3D_SAM2_CONFIG": str(cfg["weights"]["sam2"]["config"]),
         "SKILL3D_ALLOW_HF_DOWNLOAD": "",
     })
-    detector = str(cfg["experiment"].get("detector_endpoint") or "")
-    if detector:
-        environment["SKILL3D_DETECTOR_ENDPOINT"] = detector
+    detector = resolve_detector_endpoint(cfg["experiment"])
+    environment["SKILL3D_DETECTOR_ENDPOINT"] = detector["endpoint"]
+    # Receipt matching is performed by M5 against the live process and endpoint.
+    receipt = cfg["experiment"].get("detector_receipt")
+    if receipt:
+        environment["SKILL3D_DETECTOR_RECEIPT"] = str(receipt)
+    else:
+        environment.pop("SKILL3D_DETECTOR_RECEIPT", None)
     if "moge2" in weights:
         environment["SKILL3D_MOGE2_CHECKPOINT"] = str(weights["moge2"] / "model.pt")
     return environment

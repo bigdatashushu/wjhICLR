@@ -233,6 +233,15 @@ def test_unknown_schema_version_fails_closed():
                            source_path="x.jsonl")
 
 
+def test_pre_state_9_1_trace_keeps_raw_fields_and_is_read_only():
+    legacy = _current_trace_payload() | {"schema_version": "9.1"}
+    with pytest.raises(LegacyEpisodeTraceError, match="read_legacy_episode_trace"):
+        read_episode_trace(legacy)
+    carrier = read_legacy_episode_trace(legacy)
+    assert carrier.raw_fields == legacy
+    assert any("scoring_status" in w for w in carrier.warnings)
+
+
 def test_trace_record_keeps_round_facts_separate_from_source():
     """`round_trigger`/`finalization_used` 与 `synthesis_source` 互不顶替（§12.2）。"""
     from skill3d.schemas.trace import TraceRecord
