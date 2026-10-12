@@ -517,10 +517,16 @@ def _pipeline(
     env[MODE_ENV] = experiment.get(
         "run_mode", "formal" if experiment.get("formal") else "development")
     from importlib.metadata import distributions
+    sam2_runtime = {"status": "not_probed_dry_run"}
+    if not dry_run:
+        # A dry-run must work before model dependencies are installed.
+        from skill3d.infra.version_lock import sam2_runtime_identity
+        sam2_runtime = sam2_runtime_identity()
     environment = {
         "python": sys.version, "platform": platform.platform(),
         "packages": sorted((dist.metadata["Name"], dist.version)
                            for dist in distributions() if dist.metadata["Name"]),
+        "sam2_runtime": sam2_runtime,
     }
     _write_json(run_root / "environment.json", environment)
     env["SKILL3D_ENVIRONMENT_SHA256"] = hashlib.sha256(_json_bytes(environment)).hexdigest()

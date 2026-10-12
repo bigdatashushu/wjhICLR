@@ -71,6 +71,28 @@ def test_inventory_cache_key_depends_on_frame_set_and_scene():
     assert len({a, b, c}) == 3
 
 
+def test_inventory_cache_invalidated_when_sam2_extension_changes(monkeypatch, tmp_path):
+    from skill3d.infra import version_lock
+
+    identity = {"version": "1.1.0", "extension_sha256": "absent"}
+    monkeypatch.setattr(version_lock, "sam2_runtime_identity", lambda: dict(identity))
+    depth = np.zeros((2, H, W))
+    before = _inventory_key("sc", "fsh", depth, 2)
+    _save_inventory(tmp_path, "sc", before, [_inst()], {}, None)
+    assert _load_inventory(tmp_path, "sc", before) is not None
+    identity["extension_sha256"] = "compiled-extension-a"
+    installed = _inventory_key("sc", "fsh", depth, 2)
+    assert installed != before
+    assert _load_inventory(tmp_path, "sc", installed) is None
+    identity["extension_sha256"] = "compiled-extension-b"
+    replaced = _inventory_key("sc", "fsh", depth, 2)
+    assert replaced not in {before, installed}
+    identity["version"] = "1.2.0"
+    assert _inventory_key("sc", "fsh", depth, 2) != replaced
+    # Runtime changes create a cache miss; historical files remain readable.
+    assert _load_inventory(tmp_path, "sc", before) is not None
+
+
 def test_inventory_cache_miss_when_mask_ref_missing(tmp_path):
     """缓存里的 mask ref 不存在（目录被清理/半写入）→ 视为未命中，不得半用。"""
     objs = [_inst()]

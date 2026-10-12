@@ -69,3 +69,35 @@ def test_inference_env_versions_includes_numpy_and_scipy():
     env = inference_env_versions()
     assert env.get("numpy") and env["numpy"] != "absent"
     assert env.get("scipy") and env["scipy"] != "absent"
+    assert "xformers" in env and "sam2_runtime" in env
+
+
+def test_sam2_identity_hashes_extension_without_loading_it(monkeypatch, tmp_path):
+    import hashlib
+    from importlib import metadata, util
+    from types import SimpleNamespace
+    from skill3d.infra.version_lock import sam2_runtime_identity
+
+    binary = tmp_path / "_C.so"
+    binary.write_bytes(b"first build")
+    monkeypatch.setattr(metadata, "version", lambda name: "1.1.0")
+    monkeypatch.setattr(util, "find_spec", lambda name: SimpleNamespace(origin=str(binary)))
+    first = sam2_runtime_identity()
+    assert first["version"] == "1.1.0"
+    assert first["extension_sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
+    binary.write_bytes(b"second build")
+    assert sam2_runtime_identity()["extension_sha256"] != first["extension_sha256"]
+
+
+def test_sam2_identity_distinguishes_absent_package_and_extension(monkeypatch):
+    from importlib import metadata, util
+    from skill3d.infra.version_lock import sam2_runtime_identity
+
+    monkeypatch.setattr(metadata, "version", lambda name: "1.1.0")
+    monkeypatch.setattr(util, "find_spec", lambda name: None)
+    assert sam2_runtime_identity() == {"version": "1.1.0", "extension_sha256": "absent"}
+    def missing(name):
+        raise metadata.PackageNotFoundError(name)
+    monkeypatch.setattr(metadata, "version", missing)
+    monkeypatch.setattr(util, "find_spec", lambda name: missing(name))
+    assert sam2_runtime_identity() == {"version": "absent", "extension_sha256": "absent"}

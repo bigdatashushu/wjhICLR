@@ -42,6 +42,8 @@ def test_existing_cache_uses_pinned_revision_not_main(tmp_path):
 
 
 def test_runtime_plan_freezes_budget_seed_and_private_library(tmp_path):
+    import json
+
     cfg = gpu._read_config(ROOT / "configs/gpu_experiment_v11.yaml")
     cfg["experiment"].update(video_root=str(tmp_path), run_evolution=True)
     cfg["runtime"].update(n_images=8, max_pixels=65536, max_model_len=16384)
@@ -53,6 +55,8 @@ def test_runtime_plan_freezes_budget_seed_and_private_library(tmp_path):
     assert frozen["vllm"]["max_model_len"] == 16384
     assert frozen["vllm"]["max_tokens"] == 8192
     assert frozen["paths"]["skill_library"] == str(tmp_path / "skill_library")
+    assert json.loads((tmp_path / "environment.json").read_text())[
+        "sam2_runtime"] == {"status": "not_probed_dry_run"}
     for row in commands:
         command = row["command"]
         if row["stage"] != "serve_qwen":
@@ -60,6 +64,23 @@ def test_runtime_plan_freezes_budget_seed_and_private_library(tmp_path):
             assert command[command.index("--config") + 1] == str(tmp_path / "runtime_config.yaml")
         if row["stage"] == "evolution":
             assert command[command.index("--library-root") + 1] == str(tmp_path / "skill_library")
+
+
+def test_real_pipeline_records_sam2_extension_before_execution(monkeypatch, tmp_path):
+    import json
+    from skill3d.infra import version_lock
+
+    identity = {"version": "1.1.0", "extension_sha256": "compiled-extension"}
+    monkeypatch.setattr(version_lock, "sam2_runtime_identity", lambda: identity)
+    cfg = gpu._read_config(ROOT / "configs/gpu_experiment_v11.yaml")
+    weights = {name: tmp_path / name for name in cfg["weights"]}
+    def stop_before_models(*args, **kwargs):
+        raise RuntimeError("stop before models")
+    monkeypatch.setattr(gpu.shutil, "copytree", stop_before_models)
+    with pytest.raises(RuntimeError, match="stop before models"):
+        gpu._pipeline(ROOT, tmp_path, cfg, weights, dry_run=False)
+    assert json.loads((tmp_path / "environment.json").read_text())[
+        "sam2_runtime"] == identity
 
 
 def test_vggt_uses_launcher_checkpoint(monkeypatch, tmp_path):

@@ -107,7 +107,14 @@ PyTorch      2.10.0+cu128
 CUDA runtime 12.8
 torch.cuda   available=True, device_count=8
 vLLM         0.19.1
+xFormers     0.0.34（匹配 PyTorch 2.10.0+cu128）
+SAM2         1.1.0（已补建并验证 sam2._C CUDA 后处理扩展）
 ```
+
+2026-10-12 的环境验收以服务器 `skill3d-exp` 为准。SAM2 扩展安装会启用掩码
+补洞，M5 清单缓存已升级为 `m5-inventory-9-sam2-runtime`，缓存键包含包版本和扩展
+SHA256；MoGe 米制缓存身份也记录 xFormers 版本。历史实验产物保持只读，新环境
+验证使用独立工作目录，不能把环境修复解释为 Skill 收益。
 
 v11 默认环境要求见 `configs/gpu_experiment_v11.yaml`：
 

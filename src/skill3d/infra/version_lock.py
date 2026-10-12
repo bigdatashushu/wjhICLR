@@ -57,6 +57,30 @@ def config_hash(config_path: str) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def sam2_runtime_identity() -> dict[str, str]:
+    """Record SAM2 postprocessing identity without loading its CUDA extension.
+
+    Installing ``sam2._C`` enables mask hole filling even when the Python package
+    version stays unchanged. A version-only inventory cache must not reuse masks
+    prepared while that extension was absent.
+    """
+    from importlib import metadata, util
+
+    try:
+        version = metadata.version("sam2")
+    except metadata.PackageNotFoundError:
+        version = "absent"
+    try:
+        spec = util.find_spec("sam2._C")
+        origin = spec.origin if spec is not None else None
+    except (ImportError, ValueError, AttributeError):
+        origin = None
+    return {
+        "version": version,
+        "extension_sha256": checkpoint_sha256(origin) if origin else "absent",
+    }
+
+
 def inference_env_versions() -> dict:
     """推理环境版本记录（§16.4：所有主结果必须记录推理环境）。
 
@@ -73,6 +97,12 @@ def inference_env_versions() -> dict:
             out[mod] = str(getattr(m, "__version__", "unknown"))
         except Exception:  # noqa: BLE001 - 未安装 → 显式 absent
             out[mod] = "absent"
+    from importlib import metadata
+    try:
+        out["xformers"] = metadata.version("xformers")
+    except metadata.PackageNotFoundError:
+        out["xformers"] = "absent"
+    out["sam2_runtime"] = sam2_runtime_identity()
     try:
         from skill3d.env_preflight import describe_environment
     except Exception:  # noqa: BLE001 - 环境模块不可用不阻断 manifest 落盘

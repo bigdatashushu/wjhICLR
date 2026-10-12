@@ -158,6 +158,35 @@ def test_cache_contract_changes_with_weights_and_pixels(frozen, tmp_path):
     assert plan_scene_jobs([item], tmp_path, "vggt", force=True)[0].status == "pending"
 
 
+def test_moge_identity_changes_with_attention_runtime(monkeypatch, tmp_path):
+    from importlib import metadata
+    from skill3d.reconstruction import metric_evidence
+
+    package = tmp_path / "moge"
+    model_source = package / "model/v2.py"
+    model_source.parent.mkdir(parents=True)
+    model_source.write_text("# frozen model source\n")
+    checkpoint = tmp_path / "model.pt"
+    checkpoint.write_bytes(b"frozen weights")
+    monkeypatch.setattr(metric_evidence.inspect, "getfile", lambda cls: str(model_source))
+    versions = {"torch": "2.10.0", "utils3d": "1.0", "moge": "2.0",
+                "xformers": "0.0.32.post1"}
+    monkeypatch.setattr(metadata, "version", versions.__getitem__)
+    before = metric_evidence.model_identity(MetricModel, checkpoint)
+    versions["xformers"] = "0.0.34"
+    after = metric_evidence.model_identity(MetricModel, checkpoint)
+    assert before["source_sha256"] == after["source_sha256"]
+    assert before["checkpoint_sha256"] == after["checkpoint_sha256"]
+    assert before != after
+    def without_xformers(name):
+        if name == "xformers":
+            raise metadata.PackageNotFoundError(name)
+        return versions[name]
+    monkeypatch.setattr(metadata, "version", without_xformers)
+    assert metric_evidence.model_identity(
+        MetricModel, checkpoint)["runtime_versions"]["xformers"] == "absent"
+
+
 def test_pinned_moge_api_uses_meter_depth_without_extra_scale():
     torch = pytest.importorskip("torch")
     from skill3d.reconstruction.metric_fusion import _MoGe2MetricModel

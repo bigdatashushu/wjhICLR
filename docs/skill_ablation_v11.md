@@ -41,6 +41,20 @@ VGGT/SAM2、GPU 4 预留 GroundingDINO 或故障切换。开发和冒烟可直�
 缺失视频、显存不足和不可达的检测服务。检测器部署在其它机器时设置
 `HARNESS3D_DETECTOR_ENDPOINT`；仅诊断时可显式传 `--skip-detector-check`。
 
+### 服务器扩展身份与覆盖率
+
+当前 `skill3d-exp` 使用 PyTorch `2.10.0+cu128` 与匹配的 xFormers `0.0.34`。
+SAM2 `1.1.0` 的 `_C` 扩展使用现有 `connected_components.cu` 补建，连通域和
+掩码补洞已在 GPU 3 验证。包版本不变不代表后处理不变；M5 清单缓存键包含
+SAM2 版本和扩展二进制 SHA256，MoGe 米制证据身份包含 xFormers 版本。扩展安装或
+替换后，新运行会产生缓存 miss；历史实验数组和冻结输入不能原地重写。
+
+覆盖率以服务器完整测试套件、`src/skill3d` 为测量范围，同时测量行和分支。
+使用 `pytest --cov=src/skill3d --cov-branch`，将 `COVERAGE_FILE`、JSON、HTML 和
+测试日志放在仓库外的新目录。项目没有定义百分比门槛；终端合并覆盖率、行覆盖率
+和分支覆盖率是三个不同口径，不能把测量结果称为百分比验收达标。Mac 不承担 GPU
+运行验收。
+
 ### 开发迭代与源码身份
 
 三个入口 `start_harness3d.sh`、`bootstrap_and_run_v11.sh`、

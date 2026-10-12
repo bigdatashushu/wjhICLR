@@ -34,15 +34,22 @@ def file_sha256(path) -> str:
 
 def model_identity(model_class, checkpoint: Path) -> dict:
     """Pin installed source bytes even when the package lacks VCS metadata."""
-    from importlib.metadata import version
+    from importlib.metadata import PackageNotFoundError, version
 
     package = Path(inspect.getfile(model_class)).resolve().parents[1]
+    runtime_versions = {name: version(name) for name in ("torch", "utils3d", "moge")}
+    # MoGe's DINO encoder selects xFormers when available. Changing that backend
+    # must invalidate its metric evidence even if the MoGe source stays unchanged.
+    try:
+        runtime_versions["xformers"] = version("xformers")
+    except PackageNotFoundError:
+        runtime_versions["xformers"] = "absent"
     return {
         "name": "moge2", "api": "moge.model.v2.MoGeModel.infer/meters",
         "checkpoint_sha256": file_sha256(checkpoint),
         "source_sha256": {str(p.relative_to(package)): file_sha256(p)
                           for p in sorted(package.rglob("*.py"))},
-        "runtime_versions": {name: version(name) for name in ("torch", "utils3d", "moge")},
+        "runtime_versions": runtime_versions,
     }
 
 

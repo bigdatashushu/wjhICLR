@@ -55,7 +55,9 @@ from .open_vocab_detector import capture_detector_failures, current_detector_fai
 #     （无 track，计数无法做 track 共识），必须失效重算。
 # v8：检测器置信度与非空 mask 支撑率分离，并记录置信度来源；旧缓存中
 #     `det_conf` 可能是含空掩码帧的传播字典长度，必须失效重算。
-_INVENTORY_VERSION = "m5-inventory-8-confidence"
+# v9：缓存键纳入 SAM2 包版本与 CUDA 后处理扩展摘要；安装/替换扩展会改变
+#     hole filling 行为，不能复用扩展缺失时生成的 mask。
+_INVENTORY_VERSION = "m5-inventory-9-sam2-runtime"
 
 # 只对可证明的异类 targeted-fill 掩码冲突执行硬拦；普通多实例不在此合同内。
 SEMANTIC_MASK_CONFLICT_VERSION = "semantic-mask-conflict-v1"
@@ -903,15 +905,17 @@ def audit_semantic_mask_conflicts(
 
 
 def _inventory_key(scene_name: str, frame_set_hash: str, depth_maps, n_frames: int) -> str:
-    """场景清单缓存键（确定性）：scene + frame_set_hash + 产物形状。
+    """场景清单缓存键：scene + frame_set_hash + 产物形状 + SAM2 运行身份。
 
     `frame_set_hash` 由调用方传入（M1 统一 FrameSet 的哈希）；缺失时用形状兜底，
     仍然确定性，只是粒度更粗（换帧集但形状相同的场景会误命中 → 调用方应尽量传）。
     """
     import hashlib
+    from skill3d.infra.version_lock import sam2_runtime_identity
 
     payload = json.dumps({
         "v": _INVENTORY_VERSION,
+        "sam2_runtime": sam2_runtime_identity(),
         "category_match_version": CATEGORY_MATCH_VERSION,
         "scene": str(scene_name),
         "fsh": str(frame_set_hash or ""),
