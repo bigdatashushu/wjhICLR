@@ -259,3 +259,40 @@ def test_runtime_envelope_keeps_services_out_of_strict_online_config(tmp_path):
     assert cfg.seed == 138 and cfg.vllm_endpoints == ["http://127.0.0.1:18110"]
     assert effective["experiment"] == raw["experiment"]
     assert "experiment" not in yaml.safe_load((tmp_path / "full.online.yaml").read_text())
+
+
+def test_legacy_geometry_migration_requires_original_pixel_and_array_evidence(panel, tmp_path):
+    item, artifact, _ = panel
+    from skill3d.schemas import ReconstructionArtifact
+    art = ReconstructionArtifact.model_validate_json(artifact.read_bytes())
+    art = art.model_copy(update={"reconstruction_input_identity": ""})
+    artifact.write_text(art.model_dump_json())
+    key = item.episode.frame_set.cache_identity()
+    pixels = ab._pixels_identity(item.pixels)
+    evidence = {
+        "artifact": {"sha256": full.file_hash(artifact)},
+        "cache_identity": key, "input_pixels": pixels,
+        "source_frame_indices": art.source_frame_indices,
+        "array_hashes": {name: {"sha256": full.file_hash(path)}
+                         for name, path in ab._artifact_files(art, artifact).items()},
+    }
+    evidence_path = tmp_path / "evidence.json"
+    full.write(evidence_path, evidence)
+    confirmation_path = tmp_path / "confirmation.json"
+    full.write(confirmation_path, {"evidence_ref": str(evidence_path),
+                                   "evidence_sha256": full.file_hash(evidence_path)})
+    entry = {"path": str(artifact), "sha256": full.file_hash(artifact),
+             "quality_confirmation": str(confirmation_path)}
+    migrated, provenance = full.verified_historical_geometry(
+        entry, item, {"cache_identity": key, "pixels": pixels}, tmp_path)
+    assert migrated.reconstruction_input_identity == key
+    assert provenance["legacy_input_identity_migrated"] is True
+    assert full.file_hash(artifact) == entry["sha256"]
+    with pytest.raises(full.FullExperimentError, match="content/input evidence mismatch"):
+        full.verified_historical_geometry(entry, item, {"cache_identity": "changed",
+                                                       "pixels": pixels}, tmp_path)
+    array_path = next(iter(ab._artifact_files(art, artifact).values()))
+    array_path.write_bytes(b"changed bytes")
+    with pytest.raises(full.FullExperimentError, match="content/input evidence mismatch"):
+        full.verified_historical_geometry(
+            entry, item, {"cache_identity": key, "pixels": pixels}, tmp_path)

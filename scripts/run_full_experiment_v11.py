@@ -559,6 +559,55 @@ def freeze_runtime_identity(args):
     return identity
 
 
+def verified_historical_geometry(entry, item, value, archive):
+    """Migrate a legacy missing input ID only from its content-bound evidence."""
+    from skill3d.evaluation import skill_ablation_v11 as ab
+    from skill3d.schemas import ReconstructionArtifact
+
+    source = archive_path(entry["path"], archive)
+    require(file_hash(source) == entry["sha256"], "historical geometry changed")
+    art = ReconstructionArtifact.model_validate_json(source.read_bytes())
+    data = art.model_dump()
+    for name in ab.ARTIFACT_REFS:
+        if data.get(name):
+            data[name] = str(archive_path(data[name], archive))
+    for name, ref in data["confidence"].items():
+        if ref:
+            data["confidence"][name] = str(archive_path(ref, archive))
+    art = ReconstructionArtifact.model_validate(data)
+    fs = item.episode.frame_set
+    slots = [fs.frame_ids.index(fid) for fid in fs.readable_frame_ids]
+    key = value["cache_identity"]
+    require(art.scene_name == item.episode.scene_name
+            and art.frame_set_hash == fs.frame_set_hash
+            and art.frame_ids == fs.readable_frame_ids
+            and art.source_frame_indices == [fs.source_frame_indices[i] for i in slots]
+            and art.timestamps == [fs.timestamps[i] for i in slots],
+            "historical geometry frame identity mismatch")
+    require(not art.reconstruction_input_identity or art.reconstruction_input_identity == key,
+            "historical geometry input mismatch")
+    require(bool(entry.get("quality_confirmation")), "historical geometry evidence missing")
+    confirmation_path = archive_path(entry["quality_confirmation"], archive)
+    confirmation = read(confirmation_path)
+    evidence_path = archive_path(confirmation["evidence_ref"], archive)
+    require(file_hash(evidence_path) == confirmation["evidence_sha256"],
+            "historical geometry evidence changed")
+    evidence = read(evidence_path)
+    actual = {name: file_hash(path) for name, path in ab._artifact_files(art, source).items()}
+    require(evidence["artifact"]["sha256"] == entry["sha256"]
+            and {name: row["sha256"] for name, row in evidence["array_hashes"].items()} == actual
+            and evidence["cache_identity"] == key
+            and evidence["input_pixels"] == value["pixels"] == ab._pixels_identity(item.pixels)
+            and evidence["source_frame_indices"] == art.source_frame_indices,
+            "historical geometry content/input evidence mismatch")
+    return art.model_copy(update={"reconstruction_input_identity": key}), {
+        "source": str(source), "sha256": entry["sha256"],
+        "evidence_ref": str(evidence_path), "evidence_sha256": file_hash(evidence_path),
+        "input_identity": key, "legacy_input_identity_migrated": not bool(
+            data.get("reconstruction_input_identity")),
+    }
+
+
 def _prepare_geometry(root, inputs, archive):
     from skill3d.evaluation import skill_ablation_v11 as ab
     from skill3d.reconstruction import metric_evidence as me
@@ -587,21 +636,8 @@ def _prepare_geometry(root, inputs, archive):
         started = time.monotonic()
         try:
             if q in old:
-                old_path = archive_path(old[q]["path"], archive)
-                require(file_hash(old_path) == old[q]["sha256"], "historical geometry changed")
-                old_art = ReconstructionArtifact.model_validate_json(old_path.read_bytes())
-                data = old_art.model_dump()
-                for name, ref in list(data.items()):
-                    if name in ab.ARTIFACT_REFS and ref:
-                        data[name] = str(archive_path(ref, archive))
-                for name, ref in data["confidence"].items():
-                    if ref:
-                        data["confidence"][name] = str(archive_path(ref, archive))
-                old_art = ReconstructionArtifact.model_validate(data)
-                require(old_art.frame_set_hash == item.episode.frame_set.frame_set_hash
-                        and old_art.reconstruction_input_identity == key, "historical geometry input mismatch")
+                old_art, provenance = verified_historical_geometry(old[q], item, value, archive)
                 art = me.copy_geometry(old_art, dest)
-                provenance = {"source": str(old_path), "sha256": old[q]["sha256"]}
             else:
                 art = reconstruct(item.pixels, item.episode.scene_name, dest,
                                   frame_set=item.episode.frame_set, compute_quality=False)
