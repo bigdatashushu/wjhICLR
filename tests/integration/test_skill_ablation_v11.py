@@ -12,11 +12,12 @@ import pytest
 
 from skill3d.adapters.episode_source import EpisodeItem, load_synthetic_items
 from skill3d.evaluation import skill_ablation_v11 as ab
-from skill3d.online.runner import OnlineRunConfig
+from skill3d.online.runner import OnlineRunConfig, PreparedObjectBinding
 from skill3d.reconstruction_gate.quality_metrics import compute_quality
 from skill3d.schemas import (
     ConfidenceMap,
     InputErrorRecord,
+    ObjectRecord,
     ReconstructionArtifact,
     SkillSpecV11,
 )
@@ -148,6 +149,168 @@ def test_real_runner_seed_skill_geometry_and_recomputed_summary(panel, tmp_path)
         rec = json.loads(path.read_text().splitlines()[0])
         assert rec["arm"] in ab.ARMS and rec["qa_id"] == item.episode.qa_id
     assert (artifact.parent / "stale_m5_cache.json").exists()
+
+
+def test_paired_preparation_audits_cross_question_mask_conflicts_before_hashing(
+        panel, tmp_path, monkeypatch):
+    item, artifact, _ = panel
+    qa_ids = ["mask-conflict-tv", "mask-conflict-phone"]
+    categories = {
+        qa_ids[0]: "tv",
+        qa_ids[1]: "telephone",
+    }
+    items = []
+    for qa_id in qa_ids:
+        cloned = copy.deepcopy(item)
+        frame_set = cloned.episode.frame_set.model_copy(update={"episode_id": qa_id})
+        cloned.episode = cloned.episode.model_copy(update={
+            "qa_id": qa_id,
+            "question": f"Measure the {categories[qa_id]}.",
+            "frame_set": frame_set,
+        })
+        items.append(cloned)
+
+    def bind(frames, handle, question, *, out_dir, qa_id, **kwargs):
+        root = Path(out_dir)
+        mask = np.zeros((len(frames), frames[0].shape[0], frames[0].shape[1]),
+                        dtype=np.uint8)
+        mask[:3, 20:80, 30:100] = 1
+        mask_path = root / f"{qa_id}_target_mask.npy"
+        np.save(mask_path, mask)
+        obj = ObjectRecord(
+            obj_id="obj_0", category_name=categories[qa_id],
+            grounding_status="question_targeted_fill",
+            mask_per_frame=str(mask_path), visible_frames=[0, 1, 2],
+            mask_support_ratio=3 / len(frames),
+            det_conf=0.87, det_conf_source="groundingdino",
+            centroid_world=[0.0, 0.0, 2.0], bbox=[0.0] * 6)
+        return [obj], {"track_ious": [1.0], "track_stable_ratio": 1.0}, []
+
+    monkeypatch.setattr(sam2_tracker, "bind_objects_for_scene", bind)
+    root = tmp_path / "cross-question-conflict"
+    result = ab.run_skill_ablation_v11(
+        items,
+        artifact_paths={qa_id: artifact for qa_id in qa_ids},
+        output_dir=root,
+        base_cfg=OnlineRunConfig(
+            mode="real", seed=0, max_solver_rounds=2,
+            max_retries_per_operation=0),
+        seed=137,
+        expected_qa_ids=qa_ids,
+        client_factory=lambda arm, qa: FakeClient(['ReturnAnswer("A")\n']))
+    assert result["status"] == "completed"
+    manifest = json.loads((root / "manifest.json").read_text())
+    audit_ids = set()
+    for qa_id in qa_ids:
+        frozen = Path(manifest["prepared"][qa_id]["directory"])
+        binding = ab._load_binding(frozen)
+        flags = binding.objects[0].binding_flags
+        assert flags and flags[0]["code"] == "semantic_label_mask_conflict"
+        audit_ids.add(flags[0]["audit_sha256"])
+        assert ab.tree_identity(frozen)["sha256"] == manifest["prepared"][qa_id]["sha256"]
+        arm_hashes = []
+        for arm in ab.ARMS:
+            arm_root = root / "arms" / arm / frozen.name / "artifacts"
+            arm_hashes.append(ab.tree_identity(arm_root)["sha256"])
+        assert arm_hashes == [manifest["prepared"][qa_id]["sha256"]] * 2
+    assert len(audit_ids) == 1
+
+
+def test_prepared_room_subprocess_receipt_is_byte_identical_across_arm_clones(
+        panel, tmp_path):
+    _, artifact_path, _ = panel
+    artifact = ReconstructionArtifact.model_validate_json(artifact_path.read_bytes())
+    artifact = artifact.model_copy(update={
+        "metric_scale": 2.0,
+        "scale_self_consistency": 0.01,
+        "scale_fusion_status": "success",
+        "reconstruction_input_identity": "prepared-room-input",
+    })
+    receipt = ab._prepare_room_measurement(artifact, timeout_s=30.0)
+    assert receipt["status"] == "success"
+    assert receipt["payload"]["room_area_m2"] is not None
+    assert receipt["payload_sha256"] == ab.canonical_payload_sha256(
+        receipt["payload"])
+    assert receipt["request"]["point_map_sha256"] == ab.file_sha256(
+        artifact.point_map)
+
+    frozen = tmp_path / "room-frozen"
+    frozen.mkdir()
+    ab._save_binding(
+        PreparedObjectBinding(
+            materialized=True,
+            prepared_measurements={"plane_fit_room_size": receipt}),
+        frozen)
+    arm_a, arm_b = tmp_path / "room-B01", tmp_path / "room-B11"
+    ab._clone_tree(frozen, arm_a)
+    ab._clone_tree(frozen, arm_b)
+    assert (arm_a / "binding.json").read_bytes() == (
+        arm_b / "binding.json").read_bytes()
+    loaded_a = ab._load_binding(arm_a).prepared_measurements["plane_fit_room_size"]
+    loaded_b = ab._load_binding(arm_b).prepared_measurements["plane_fit_room_size"]
+    assert loaded_a == loaded_b == receipt
+
+
+def test_room_pair_precomputes_once_and_both_arms_read_verified_receipt(
+        panel, tmp_path, monkeypatch):
+    item, artifact_path, binding_calls = panel
+    room_item = copy.deepcopy(item)
+    room_item.episode = room_item.episode.model_copy(update={
+        "question_type": "room_size_estimation",
+        "question": "What is the floor area of this room in square meters?",
+        "options": None,
+        "ground_truth": "20",
+    })
+    receipt_path = tmp_path / "metric-scale-receipt.json"
+    receipt_path.write_text(json.dumps({"valid_frame_ratio": 1.0}))
+    artifact = ReconstructionArtifact.model_validate_json(artifact_path.read_bytes())
+    artifact = artifact.model_copy(update={
+        "metric_scale": 1.0,
+        "scale_self_consistency": 0.01,
+        "per_frame_scale_ref": str(receipt_path),
+        "metric_model": "none",
+        "metric_fusion_version": "test-metric-fusion",
+        "scale_fusion_status": "success",
+        "reconstruction_input_identity": "room-pair-input",
+    })
+    metric_artifact = tmp_path / "metric-artifact.json"
+    metric_artifact.write_text(artifact.model_dump_json())
+
+    calls = {"n": 0}
+    original = ab._prepare_room_measurement
+
+    def counted(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ab, "_prepare_room_measurement", counted)
+    program = (
+        "room = plane_fit_room_size()\n"
+        "ReturnAnswer(str(room['room_area_m2']))\n")
+    result, pairs, _, root = run(
+        (room_item, metric_artifact, binding_calls), tmp_path,
+        programs={"B01": [program], "B11": [program]},
+        question_types=("room_size_estimation",))
+    assert result["status"] == "completed"
+    assert calls["n"] == 1
+    manifest = json.loads((root / "manifest.json").read_text())
+    prepared = manifest["prepared_measurement_receipts"][room_item.episode.qa_id]
+    assert prepared["status"] == "success"
+    assert manifest["prepared_measurement_cost_s"] == pytest.approx(
+        prepared["runtime_s"])
+    receipt_ids = set()
+    for arm in ab.ARMS:
+        outcome_path = next((root / "arms" / arm).glob("*/outcome.json"))
+        outcome = json.loads(outcome_path.read_text())
+        results = outcome["program_trace"]["results"]
+        room_result = next(row for row in results
+                           if row["tool"] == "plane_fit_room_size")
+        payload = json.loads(room_result["value"])
+        assert payload["measurement_source"] == "prepared_verified_cache"
+        receipt_ids.add(payload["prepared_receipt_sha256"])
+    assert receipt_ids == {prepared["receipt_sha256"]}
+    assert pairs[0]["arms"]["B01"]["initial_tree_sha256"] == (
+        pairs[0]["arms"]["B11"]["initial_tree_sha256"])
 
 
 def test_campaign_adapter_revalidates_cached_panel_and_summary(panel, tmp_path, monkeypatch):
@@ -514,7 +677,8 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
     assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_5_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
         "solver-v11.4-eval-visual-fallback")
-    assert manifest["common_config"]["tool_docs_version"] == "tool-docs-v11.3-en"
+    assert manifest["common_config"]["tool_docs_version"] == (
+        "tool-docs-v11.4-binding-integrity")
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-english"
 
 

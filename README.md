@@ -7,12 +7,17 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
 
 当前在线合同使用 `program_synth_v11_5_en`、
-`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.3-en`。类别匹配、对象覆盖、
+`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.4-binding-integrity`。类别匹配、对象覆盖、
 完整排名验收及检测器重试由两臂共用；评测时原 solver 失败后可预算外追加一次
 `eval-visual-v1` 请求，只携带冻结的 32 张原帧、问题、选项和答案格式。该路径不在
 `induction` 使用，正常提交但答错也不会触发。当前 active snapshot 为
 `S0-v11-english`；质量确认哈希包含相关源码和合同版本，旧确认会被拒绝。详见
 [配对运行合同](docs/skill_ablation_v11.md)。
+
+对象清单中的 `det_conf` 是检测器原始置信度，`mask_support_ratio` 是非空传播 mask
+覆盖率。paired 运行会在全部题完成 M5 后审计跨题异类 mask 冲突；冲突对象仅禁用
+对象几何，原图视觉路径仍可用。授权房间题在 B01/B11 前共享一次带身份收据的预计算，
+不在两臂内重复拟合，也不计作 Skill 收益。
 
 2026-10-11 已在代码基线 `c020345dca6f3e34acd0883accc4d16956327773`
 完成英文面板 256 次求解和 128 组 B01/B11 配对。该实验固定使用

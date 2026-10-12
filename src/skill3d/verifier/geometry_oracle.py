@@ -52,6 +52,17 @@ _METRIC_VALUE_KEYS: dict[str, str] = {
     "object_distance_m": "distance_m",
 }
 
+_OBJECT_GEOMETRY_ARGS: dict[str, tuple[str, ...]] = {
+    "object_centroid": ("obj_id",),
+    "object_3d_extent": ("obj_id",),
+    "robust_distance": ("reference", "target"),
+    "camera_object_distance": ("obj_id",),
+    "surface_distance_between_objects": ("obj_a", "obj_b"),
+    "relative_distance_rank": ("reference", "candidate_categories"),
+    "object_distance_m": ("obj_a", "obj_b"),
+    "relative_direction_of": ("observer_id", "facing_at_id", "target_id"),
+}
+
 # 合法手性取值（与 `reconstruction_gate/world_frame.py` 同一词汇表）
 KNOWN_HANDEDNESS: frozenset[str] = frozenset({"right", "left"})
 
@@ -194,6 +205,64 @@ def check_world_frame(trace: ProgramExecutionTrace, handle: SceneHandle) -> bool
     return _world_frame_available(handle)
 
 
+def _has_binding_conflict(obj) -> bool:
+    return any(
+        flag.get("code") == "semantic_label_mask_conflict"
+        for flag in (getattr(obj, "binding_flags", None) or [])
+    )
+
+
+def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -> bool:
+    """成功的对象几何结果不得引用已被 M5 审计判定冲突的对象。"""
+    if not hasattr(handle, "object_records"):
+        return True
+    conflict_ids = {
+        obj.obj_id for obj in handle.object_records() if _has_binding_conflict(obj)
+    }
+    if not conflict_ids:
+        return True
+
+    def argument_conflicts(value) -> bool:
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for item in values:
+            if not isinstance(item, str):
+                continue
+            if item in conflict_ids:
+                return True
+            if item.strip().lower() in (
+                    "camera", "observer", "agent", "self", "camera_center", "camera0"):
+                continue
+            if any(oid in conflict_ids for oid in handle.list_objects_by_name(item)):
+                return True
+        return False
+
+    def payload_conflicts(node) -> bool:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("obj_id", "object_id") and value in conflict_ids:
+                    return True
+                if payload_conflicts(value):
+                    return True
+        elif isinstance(node, list):
+            return any(payload_conflicts(value) for value in node)
+        return False
+
+    for result in trace.results:
+        if (result.status != "ok" or result.error is not None
+                or result.tool not in _OBJECT_GEOMETRY_ARGS):
+            continue
+        if any(argument_conflicts(result.args.get(name))
+               for name in _OBJECT_GEOMETRY_ARGS[result.tool]
+               if name in result.args):
+            return False
+        try:
+            if payload_conflicts(json.loads(result.value)):
+                return False
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return True
+
+
 def check_inside_bbox(
     trace: ProgramExecutionTrace, handle: SceneHandle, margin: float = BBOX_MARGIN
 ) -> bool:
@@ -260,13 +329,15 @@ def geometry_verify(
     wf_ok = _world_frame_available(handle)
     checks = dict.fromkeys((
         "valid_json", "no_negative_distance", "unit_consistent", "world_frame",
-        "inside_bbox", "reprojection", "complete_ranking"), True)
+        "binding_integrity", "inside_bbox", "reprojection", "complete_ranking"), True)
     issues: list[GeometryIssue] = []
     reasons = {
         "valid_json": "A successful tool result is not valid finite JSON",
         "no_negative_distance": "Distance, size, or area results contain negative or invalid numbers",
         "unit_consistent": "This question has no metric authorization, but the results contain absolute-unit values",
         "world_frame": "The world up direction or handedness contract is missing",
+        "binding_integrity": (
+            "The result references an object marked semantic_label_mask_conflict"),
         "inside_bbox": "The reprojection input point is outside the scene bounding box, or the world frame contract is missing",
         "reprojection": "The reprojection result cannot be reproduced using the same pose/intrinsics",
     }
@@ -280,6 +351,7 @@ def geometry_verify(
             "no_negative_distance": check_no_negative_distance(single),
             "unit_consistent": check_unit_consistent(single, handle),
             "world_frame": check_world_frame(single, handle),
+            "binding_integrity": check_binding_integrity(single, handle),
             "inside_bbox": check_inside_bbox(single, handle),
             "reprojection": check_reprojection(single, handle, threshold_px),
         }
@@ -322,6 +394,7 @@ __all__ = [
     "TH_REPROJ_PX",
     "WORLD_FRAME_TOOLS",
     "check_inside_bbox",
+    "check_binding_integrity",
     "check_no_negative_distance",
     "check_reprojection",
     "check_unit_consistent",

@@ -376,7 +376,14 @@ class ObjectRecord(Spec):
     visible_frames: list[int] = []         # 该对象在哪些帧可见（帧槽位序号，升序）
     centroid_ref: str = ""                # 3D 质心引用（世界系，审计用）
     track_id: Optional[str] = None        # 跨帧 track
+    # 检测器的原始置信度；没有检测器分数的来源必须保持 0，不得用传播覆盖率冒充。
     det_conf: float = 0.0
+    det_conf_source: Literal["groundingdino", "vlm_box",
+                             "handle_hint", "unknown"] = "unknown"
+    # 非空传播 mask 覆盖帧数 / 帧集总帧数，与 det_conf 的语义严格分离。
+    mask_support_ratio: float = 0.0
+    # M5 绑定审计发现的问题；对象保留供视觉路径使用，几何路径按 flag fail-closed。
+    binding_flags: list[dict[str, Any]] = []
     # v9 §9.1/§9.4：第三种来源 = 在线 `detect_objects` 的**工具补检**。
     # 与 M5 的两种分开记，避免"工具当场补检出来的对象"被误读成 M5 基础清单。
     grounding_status: Literal["base_list", "question_targeted_fill",

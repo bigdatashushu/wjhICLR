@@ -242,7 +242,9 @@ def test_bind_masks_to_world_centroid_in_front_of_camera(tmp_path):
                               out_dir=tmp_path, scene_name="sc")
     assert len(objs) == 1
     o = objs[0]
-    assert o.category_name == "sofa" and o.det_conf > 0
+    assert o.category_name == "sofa" and o.det_conf == 0.0
+    assert o.det_conf_source == "unknown"
+    assert o.mask_support_ratio == pytest.approx(1.0)
     # visible_frames 语义不变：帧槽位序号、升序
     assert o.visible_frames == [0, 1]
     # 相机在原点朝 +z 看，物体深度 3m → 世界 z ≈ +3
@@ -254,6 +256,32 @@ def test_bind_masks_to_world_centroid_in_front_of_camera(tmp_path):
     # v6 §5.6：未给逐点 conf 时写空 ref（不伪造），质心不写第二份文件
     assert o.pointconf_world == "" and o.centroid_ref == ""
     assert o.grounding_status == "base_list" and o.duplicate_suspect is False
+
+
+def test_bind_masks_to_world_separates_detector_confidence_from_mask_support():
+    empty = np.zeros((H, W), dtype=bool)
+    masks = [{0: _square_mask(), 1: empty}]
+    depth = np.full((2, H, W), 3.0)
+    objs = bind_masks_to_world(
+        masks, depth, np.stack([np.eye(4)] * 2), K,
+        class_hints=["telephone"], confidences=[0.87],
+        det_conf_sources=["groundingdino"])
+    o = objs[0]
+    assert o.det_conf == pytest.approx(0.87)
+    assert o.det_conf_source == "groundingdino"
+    assert o.visible_frames == [0]
+    assert o.mask_support_ratio == pytest.approx(0.5)
+
+
+def test_bind_masks_to_world_vlm_box_has_zero_detector_confidence():
+    masks = [{0: _square_mask()}]
+    objs = bind_masks_to_world(
+        masks, np.full((1, H, W), 3.0), np.eye(4)[None], K,
+        class_hints=["telephone"], confidences=[0.0],
+        det_conf_sources=["vlm_box"])
+    assert objs[0].det_conf == 0.0
+    assert objs[0].det_conf_source == "vlm_box"
+    assert objs[0].mask_support_ratio == pytest.approx(1.0)
 
 
 def test_bind_masks_to_world_unverified_when_no_valid_depth():
@@ -395,14 +423,118 @@ def test_dedupe_merges_same_class_close_and_temporally_overlapping():
     depth = np.full((4, 8, 8), 2.0)                 # 深度中位 2.0 → tol = 0.3
     objs = [_inst("a", "chair", [0.0, 0.0, 0.0], 0.9),
             _inst("b", "chair", [0.05, 0.0, 0.0], 0.5)]      # 近且同类
-    masks = [{0: np.zeros((8, 8), bool), 1: np.zeros((8, 8), bool)},   # a: 帧 0,1
-             {1: np.zeros((8, 8), bool), 2: np.zeros((8, 8), bool)}]   # b: 帧 1,2
+    masks = [{0: np.ones((8, 8), bool), 1: np.ones((8, 8), bool)},    # a: 帧 0,1
+             {1: np.ones((8, 8), bool), 2: np.ones((8, 8), bool)}]    # b: 帧 1,2
     kept, n_dup, groups = _dedupe_by_world_centroid(objs, depth, masks_per_object=masks)
     assert n_dup == 1 and len(kept) == 1 and groups == [[0, 1]]
     assert kept[0].obj_id == "a"                    # 保留置信度更高的
     # v6：合并组只有一条 track（幸存代表的身份），且该对象被标重复嫌疑
     assert kept[0].track_id == "trk0"
     assert kept[0].duplicate_suspect is True
+    assert kept[0].visible_frames == [0, 1, 2]
+    assert kept[0].mask_support_ratio == pytest.approx(0.75)
+
+
+def test_dedupe_empty_masks_do_not_create_temporal_overlap():
+    """SAM2 的空传播帧不能把两个先后可见的候选伪造成同时可见。"""
+    from skill3d.segmentation.sam2_tracker import _dedupe_by_world_centroid
+
+    depth = np.full((3, 8, 8), 2.0)
+    empty = np.zeros((8, 8), dtype=bool)
+    masks = [
+        {0: np.ones((8, 8), dtype=bool), 1: empty},
+        {0: empty, 1: np.ones((8, 8), dtype=bool)},
+    ]
+    kept, n_dup, _ = _dedupe_by_world_centroid(
+        [_inst("a", "chair", [0, 0, 0]), _inst("b", "chair", [0.1, 0, 0])],
+        depth, masks_per_object=masks)
+    assert n_dup == 0
+    assert len(kept) == 2
+
+
+def test_dedupe_known_all_empty_masks_do_not_overlap():
+    from skill3d.segmentation.sam2_tracker import _dedupe_by_world_centroid
+
+    depth = np.full((2, 8, 8), 2.0)
+    empty = np.zeros((8, 8), dtype=bool)
+    kept, n_dup, _ = _dedupe_by_world_centroid(
+        [_inst("a", "chair", [0, 0, 0]), _inst("b", "chair", [0.1, 0, 0])],
+        depth, masks_per_object=[{0: empty}, {0: empty}])
+    assert n_dup == 0
+    assert len(kept) == 2
+    assert all(obj.mask_support_ratio == 0.0 for obj in kept)
+
+
+def _targeted_with_mask(tmp_path, qa_id, category, mask, obj_id="obj_0"):
+    obj = _inst(obj_id, category, [0.0, 0.0, 2.0])
+    path = tmp_path / f"{qa_id}_{obj_id}_{category}.npy"
+    np.save(path, np.asarray(mask, dtype=np.uint8))
+    return obj.model_copy(update={
+        "grounding_status": "question_targeted_fill",
+        "mask_per_frame": str(path),
+    })
+
+
+def test_semantic_mask_conflict_marks_both_cross_question_objects(tmp_path):
+    from skill3d.segmentation.sam2_tracker import audit_semantic_mask_conflicts
+
+    mask = np.zeros((3, 8, 8), dtype=bool)
+    mask[:, 2:6, 2:6] = True
+    tv = _targeted_with_mask(tmp_path, "2241", "tv", mask)
+    phone = _targeted_with_mask(tmp_path, "2242", "telephone", mask)
+    audited, audits = audit_semantic_mask_conflicts(
+        [("2241", [tv]), ("2242", [phone])], scene_identity="scene-frozen")
+    assert len(audits) == 1
+    audit = audits[0]
+    assert audit["stacked_iou"] == pytest.approx(1.0)
+    assert audit["common_nonempty_frames"] == [0, 1, 2]
+    assert set(audit["qa_ids"]) == {"2241", "2242"}
+    left = audited["2241"][0].binding_flags
+    right = audited["2242"][0].binding_flags
+    assert left[0]["audit_sha256"] == right[0]["audit_sha256"]
+    assert left[0]["code"] == "semantic_label_mask_conflict"
+
+
+def test_semantic_mask_conflict_excludes_synonyms_and_requires_two_frames(tmp_path):
+    from skill3d.segmentation.sam2_tracker import audit_semantic_mask_conflicts
+
+    two = np.zeros((2, 8, 8), dtype=bool)
+    two[:, 1:5, 1:5] = True
+    tv = _targeted_with_mask(tmp_path, "a", "tv", two)
+    television = _targeted_with_mask(tmp_path, "b", "television", two)
+    audited, audits = audit_semantic_mask_conflicts(
+        [("a", [tv]), ("b", [television])], scene_identity="scene")
+    assert audits == []
+    assert not audited["a"][0].binding_flags
+
+    one = two.copy()
+    one[1] = False
+    phone = _targeted_with_mask(tmp_path, "c", "telephone", one)
+    _, audits = audit_semantic_mask_conflicts(
+        [("a", [tv]), ("c", [phone])], scene_identity="scene")
+    assert audits == []
+
+
+def test_semantic_conflict_audit_identity_binds_scene_mask_and_contract(tmp_path):
+    from skill3d.segmentation.sam2_tracker import audit_semantic_mask_conflicts
+
+    mask = np.ones((2, 8, 8), dtype=bool)
+    tv = _targeted_with_mask(tmp_path, "a", "tv", mask)
+    phone = _targeted_with_mask(tmp_path, "b", "telephone", mask)
+
+    def audit_id(scene, left=tv, version="v1"):
+        _, rows = audit_semantic_mask_conflicts(
+            [("a", [left]), ("b", [phone])],
+            scene_identity=scene, contract_version=version)
+        return rows[0]["audit_sha256"]
+
+    original = audit_id("scene-1")
+    assert audit_id("scene-2") != original
+    assert audit_id("scene-1", version="v2") != original
+    changed = mask.copy()
+    changed[:, 0, 0] = False
+    changed_tv = _targeted_with_mask(tmp_path, "changed", "tv", changed)
+    assert audit_id("scene-1", left=changed_tv) != original
 
 
 def test_dedupe_keeps_distinct_objects():
@@ -645,7 +777,8 @@ def test_bind_masks_to_world_resizes_mask_to_depth_grid():
     resized = bind_masks_to_world([{0: half}], np.full((1, H, W), 3.0),
                                   np.eye(4)[None], K)
     assert resized[0].centroid_world == pytest.approx(full[0].centroid_world)
-    assert resized[0].det_conf == full[0].det_conf > 0
+    assert resized[0].det_conf == full[0].det_conf == 0.0
+    assert resized[0].mask_support_ratio == full[0].mask_support_ratio == 1.0
 
 
 # ============ v6 §5.6：question_targeted_fill（逐题补漏的对象来源） ============
@@ -761,7 +894,8 @@ def test_supplement_checks_options_and_partial_detector_coverage(tmp_path, monke
 
     def detect(frames, probe, nouns):
         requested.extend(nouns)
-        return ["chair"], [[1., 1., 20., 20.]], [(0, 0, [1., 1., 20., 20.])]
+        return (["chair"], [[1., 1., 20., 20.]],
+                [(0, 0, [1., 1., 20., 20.])], [0.87])
 
     monkeypatch.setattr(tracker, "ovd_boxes_for_nouns", detect)
     monkeypatch.setattr(tracker, "track_objects", lambda *a, **k: [{0: np.ones((2, 2))}])

@@ -8,7 +8,7 @@ import pytest
 from skill3d.online.recovery import collect_validated, invalidate_results
 from skill3d.online.submission import invalid_reference_issues, submission_scope
 from skill3d.sandbox.kernel import AnswerTerminate, RestrictedNamespaceKernel
-from skill3d.schemas import AnswerPayload, ProgramExecutionTrace, ToolResult
+from skill3d.schemas import AnswerPayload, ObjectRecord, ProgramExecutionTrace, ToolResult
 from skill3d.tools import REGISTRY
 from skill3d.verifier.geometry_oracle import geometry_verify
 
@@ -56,6 +56,32 @@ def test_geometry_verify_locates_every_failed_check_at_result_level():
     assert {i.result_id for i in verify.issues} == {"bad-distance"}
     assert {i.tool for i in verify.issues} == {"object_distance_m"}
     assert all(i.confirmed_shared_premise is None for i in verify.issues)
+
+
+def test_m11_rejects_result_that_bypasses_binding_integrity_gate():
+    obj = ObjectRecord(
+        obj_id="obj_0", category_name="television",
+        centroid_world=[0.0, 0.0, 2.0],
+        binding_flags=[{
+            "code": "semantic_label_mask_conflict",
+            "audit_sha256": "a" * 64,
+        }])
+    handle = _handle(_scene(objs=[obj]), objs=[obj])
+    result = _result(
+        "bypassed", {
+            "centroid_normalized": [0.0, 0.0, 2.0],
+            "centroid_metric": None,
+            "category_name": "television",
+            "track_id": None,
+        }, tool="object_centroid")
+    result.args = {"obj_id": "obj_0"}
+    trace = ProgramExecutionTrace(
+        program_id="p", calls=[], results=[result], stdout_tail="",
+        error_code=None, steps=1, wallclock_s=0.0)
+    verified = geometry_verify(trace, handle)
+    assert not verified.passed
+    assert verified.violations == ["binding_integrity"]
+    assert verified.issues[0].result_id == "bypassed"
 
 
 def test_submission_scope_keeps_cross_round_results_unless_answer_is_visual_only():

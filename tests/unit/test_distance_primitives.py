@@ -536,9 +536,16 @@ def test_planarity_and_ground_on_synthetic_room():
     # `plane_inlier_ratio` 是**地面**平面内点率（真实房间里通常 0.2–0.5）；
     # 墙内点率与"地面∪墙"的联合覆盖率另见 wall_inlier_ratio / audit
     assert 0.2 < g["plane_inlier_ratio"] < 0.5
+    assert g["n_near_floor"] >= g["ground_plane"]["n_inliers"]
+    assert g["floor_fit_ratio"] == pytest.approx(
+        min(1.0, g["ground_plane"]["n_inliers"] / g["n_near_floor"]))
     assert g["wall_inlier_ratio"] > 0.2
     assert g["audit"]["room_surface_inlier_ratio"] > 0.6
-    assert g["fit_quality"] is not None and g["fit_quality"] > dp.TH_FIT_QUALITY_MIN
+    assert g["fit_quality"] == pytest.approx(
+        np.sqrt(g["floor_fit_ratio"] * g["ground_planarity"]))
+    assert g["fit_quality_formula_version"] == dp.ROOM_FIT_QUALITY_VERSION
+    assert g["audit"]["fit_quality_formula_version"] == dp.ROOM_FIT_QUALITY_VERSION
+    assert g["fit_quality"] > dp.TH_FIT_QUALITY_MIN
 
 
 def test_planarity_and_ground_accepts_up_hint_and_degrades_on_too_few_points():
@@ -570,6 +577,8 @@ def test_room_size_from_planes_diagonal_area_and_metric():
     assert bare["room_diagonal_metric"] == pytest.approx(norm["room_diagonal_normalized"] * 2.0)
     assert "degraded" not in norm["degradation_flags"]
     assert norm["plane_inlier_ratio"] > 0.2                    # 地面平面内点率
+    assert norm["floor_fit_ratio"] > norm["plane_inlier_ratio"]
+    assert norm["n_near_floor"] > 0
     assert norm["fit_quality"] is not None
     for key in ("quantile_q", "voxel_size", "conf_warp_version", "scale_version",
                 "n_valid_points", "degradation_flags"):

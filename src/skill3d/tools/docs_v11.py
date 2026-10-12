@@ -1,18 +1,23 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.3-en"
+TOOL_DOCS_VERSION = "tool-docs-v11.4-binding-integrity"
 
 
 DESCRIPTIONS = {
     "list_objects": (
         "Return object records as list[dict] with obj_id, category_name, visible_frames, track_id, "
-        "det_conf, grounding_status, and duplicate_suspect. An empty filter returns all records. "
+        "det_conf, det_conf_source, mask_support_ratio, binding_flags, grounding_status, and "
+        "duplicate_suspect. det_conf is detector confidence; mask_support_ratio is the fraction of "
+        "frozen frames with a nonempty propagated mask. Never substitute one for the other. "
+        "An empty filter returns all records. "
         "Category filtering matches complete categories after case, separator, number, and synonym "
         "normalization, optionally removing registered appearance prefixes. It does not use substring "
         "or word-intersection matching. obj_id does not encode category. Interfaces requiring a unique "
         "object raise an ambiguity error for categories with multiple instances. Records may include "
         "2D-only candidates without measurable 3D geometry. An empty result does not prove scene-wide "
-        "absence. Do not align these records with detections by list order."),
+        "absence. Inspect all candidates and binding_flags; do not select the first record by default "
+        "or align records with detections by list order. A semantic_label_mask_conflict blocks geometry "
+        "from that object but leaves frozen-image inspection available."),
     "count_objects": (
         "Count instances using the same category rules as list_objects. Group records sharing a "
         "nonempty track_id; each untracked record forms its own group. Merge each group's point clouds, "
@@ -35,8 +40,13 @@ DESCRIPTIONS = {
         "or measurable geometry is unavailable."),
     "plane_fit_room_size": (
         "Fit floor/wall planes to the scene point cloud. Return dict: room_diagonal_normalized, "
-        "room_area_m2 (square meters), plane_inlier_ratio, fit_quality ([0,1]), and degradation_flags. "
-        "Raise an error if no finite area is available."),
+        "room_area_m2 (square meters), plane_inlier_ratio (ground inliers/all points), "
+        "floor_fit_ratio (ground inliers/near-floor candidates), n_near_floor, fit_quality ([0,1], "
+        "sqrt(floor_fit_ratio*ground_planarity)), fit_quality_formula_version, degradation_flags, "
+        "measurement_source, and "
+        "prepared_receipt_sha256. measurement_source=prepared_verified_cache means paired arms read "
+        "the same identity-verified preparation result. plane_fit_low_quality remains an uncalibrated "
+        "audit flag, not an automatic rejection rule. Raise an error if no finite area is available."),
     "robust_distance": (
         "Low-quantile nearest-neighbor distance from the reference point to the target object's "
         "point set. reference=camera/observer/agent/self/camera_center/camera0 uses the first-frame "

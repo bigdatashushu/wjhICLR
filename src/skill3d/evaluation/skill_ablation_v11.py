@@ -11,8 +11,10 @@ import copy
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import shutil
+import time
 import uuid
 from dataclasses import asdict, fields, replace
 from pathlib import Path
@@ -44,6 +46,12 @@ from skill3d.synthesis.eval_visual_fallback import EVAL_VISUAL_PROMPT_VERSION
 from skill3d.synthesis.request_context import current_request_phase
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
+from skill3d.tools.scene_handle import (
+    canonical_payload_sha256,
+    file_sha256,
+    frozen_reconstruction_identity,
+    prepared_room_request,
+)
 from skill3d.trace.store import TraceStore
 from skill3d.infra.experiment_startup import MODE_ENV, current_code_identity
 
@@ -60,6 +68,90 @@ OBJECT_REFS = ("mask_per_frame", "pointcloud_world", "pointconf_world", "centroi
 
 class PairingError(ValueError):
     """Missing, duplicate or inconsistent experiment identity."""
+
+
+def _prepared_room_worker(connection, point_map_path: str, metric_scale: float,
+                          world_up: list[float] | None) -> None:
+    try:
+        from skill3d.tools.distance_primitives import room_size_from_planes
+
+        point_map = np.load(point_map_path, allow_pickle=False)
+        payload = room_size_from_planes(
+            np.asarray(point_map, dtype=np.float64).reshape(-1, 3),
+            metric_scale=float(metric_scale), up_hint=world_up)
+        connection.send({"status": "success", "payload": _clean(payload)})
+    except BaseException as exc:  # noqa: BLE001 - failure is frozen into a shared receipt
+        connection.send({
+            "status": "failure",
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+    finally:
+        connection.close()
+
+
+def _prepare_room_measurement(
+    artifact: ReconstructionArtifact,
+    *,
+    timeout_s: float = 300.0,
+) -> dict:
+    """Compute one deterministic room payload in a child process and bind its identity."""
+    point_map_path = Path(artifact.point_map)
+    scale = getattr(artifact, "metric_scale", None)
+    if not point_map_path.is_file() or scale is None:
+        raise PairingError("authorized room preparation requires point_map and metric_scale")
+    request = prepared_room_request(
+        point_map_sha256=file_sha256(point_map_path),
+        metric_scale=float(scale),
+        frozen_input_identity=frozen_reconstruction_identity(artifact),
+        world_up=artifact.world_up)
+    timeout = max(0.0, float(timeout_s))
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_prepared_room_worker,
+        args=(child, str(point_map_path), float(scale), request["world_up"]),
+        daemon=True)
+    started = time.perf_counter()
+    try:
+        process.start()
+    except BaseException as exc:  # noqa: BLE001 - startup failure is a shared fact
+        child.close()
+        parent.close()
+        outcome = {
+            "status": "failure",
+            "error": f"{type(exc).__name__}: failed to start prepared worker: {exc}",
+        }
+    else:
+        child.close()
+        process.join(timeout)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            outcome = {
+                "status": "timeout",
+                "error": f"prepared room measurement exceeded {timeout:.1f}s",
+            }
+        elif parent.poll():
+            outcome = parent.recv()
+        else:
+            outcome = {
+                "status": "failure",
+                "error": f"worker exited with code {process.exitcode} without a payload",
+            }
+        parent.close()
+    runtime_s = time.perf_counter() - started
+    receipt = {
+        "request": request,
+        "status": str(outcome["status"]),
+        "runtime_s": float(runtime_s),
+        "timeout_s": timeout,
+        "payload": outcome.get("payload"),
+        "payload_sha256": (
+            canonical_payload_sha256(outcome["payload"])
+            if outcome.get("status") == "success" else None),
+        "error": outcome.get("error"),
+    }
+    return {**receipt, "receipt_sha256": canonical_payload_sha256(receipt)}
 
 
 def _clean(value):
@@ -271,6 +363,8 @@ def _save_binding(binding: PreparedObjectBinding, root: Path) -> None:
     _write(root / "binding.json", {
         "objects": binding.objects, "stats": pack(binding.stats),
         "notes": binding.notes, "materialized": binding.materialized,
+        "prepared_measurements": pack(binding.prepared_measurements,
+                                      "prepared_measurements"),
     })
 
 
@@ -971,6 +1065,7 @@ def run_skill_ablation_v11(
             return _RecordingClient(inner, seed=cfg.seed, specs=specs, store=store)
 
         prepared, prepare_errors, preparation_detector_attempts = {}, {}, {}
+        preparation_work = {}
         # Freeze *all* common inputs before starting either arm.
         for q in expected:
             item = chosen[q]
@@ -1007,10 +1102,84 @@ def run_skill_ablation_v11(
                 objects_materialized=binding.materialized, persist_quality=False)
             if _pixels_identity(local_pixels) != identities[q]["pixels"]:
                 raise PairingError(f"{q}: preparation modified frozen pixels")
+            preparation_work[q] = {
+                "artifact": art, "binding": binding, "frozen": frozen,
+            }
+
+        # Cross-question M5 integrity audit runs before any frozen tree identity is computed.
+        from skill3d.segmentation.sam2_tracker import audit_semantic_mask_conflicts
+
+        scene_groups: dict[str, list[str]] = {}
+        for q, work in preparation_work.items():
+            art = work["artifact"]
+            scene_identity = str(
+                art.reconstruction_input_identity
+                or _hash({
+                    "artifact_id": art.artifact_id,
+                    "artifact_version": art.artifact_version,
+                    "frame_set_hash": art.frame_set_hash,
+                }))
+            work["scene_identity"] = scene_identity
+            scene_groups.setdefault(scene_identity, []).append(q)
+        for scene_identity, qa_ids in sorted(scene_groups.items()):
+            audited, audits = audit_semantic_mask_conflicts(
+                [(q, preparation_work[q]["binding"].objects) for q in sorted(qa_ids)],
+                scene_identity=scene_identity)
+            for q in qa_ids:
+                binding = preparation_work[q]["binding"]
+                binding.objects = audited[q]
+                binding.stats["semantic_conflict_audits"] = [
+                    audit for audit in audits if q in audit["qa_ids"]]
+
+        # Room measurements are scene-level deterministic infrastructure. Compute once per
+        # request identity before either arm and freeze success/failure identically.
+        room_receipts: dict[str, dict] = {}
+        prepared_measurement_by_qa: dict[str, dict] = {}
+        for q, work in sorted(preparation_work.items()):
+            task = canonical_task(chosen[q].episode.question_type)
+            if task != "room_size_estimation":
+                continue
+            art = work["artifact"]
+            scoped = runner.build_scene_state(art, question_type=task)
+            if not scoped.metric_task_authorized(task):
+                continue
+            request = prepared_room_request(
+                point_map_sha256=file_sha256(art.point_map),
+                metric_scale=float(art.metric_scale),
+                frozen_input_identity=frozen_reconstruction_identity(art),
+                world_up=art.world_up)
+            request_sha = request["request_sha256"]
+            if request_sha not in room_receipts:
+                room_receipts[request_sha] = _prepare_room_measurement(
+                    art, timeout_s=300.0)
+            receipt = copy.deepcopy(room_receipts[request_sha])
+            work["binding"].prepared_measurements["plane_fit_room_size"] = receipt
+            work["binding"].stats["prepared_measurement_receipts"] = {
+                "plane_fit_room_size": receipt["receipt_sha256"]}
+            work["binding"].notes.append(
+                "M6 room measurement prepared before paired solving: "
+                f"status={receipt['status']} receipt={receipt['receipt_sha256']}")
+            prepared_measurement_by_qa[q] = {
+                "tool": "plane_fit_room_size",
+                "status": receipt["status"],
+                "request_sha256": request_sha,
+                "receipt_sha256": receipt["receipt_sha256"],
+                "runtime_s": receipt["runtime_s"],
+            }
+
+        # Only audited bindings enter the immutable trees shared by B01 and B11.
+        for q in expected:
+            if q not in preparation_work:
+                continue
+            work = preparation_work[q]
+            art, binding, frozen = (
+                work["artifact"], work["binding"], work["frozen"])
             _save_binding(binding, frozen)
             (frozen / "artifact.json").write_text(art.model_dump_json(), encoding="utf-8")
             prepared[q] = {"directory": str(frozen), **tree_identity(frozen),
                            "gate_thresholds": art.quality.gate_thresholds if art.quality else None}
+            if q in prepared_measurement_by_qa:
+                prepared[q]["prepared_measurement"] = prepared_measurement_by_qa[q]
             confirmation = confirmation_by_qa[q]
             if confirmation and confirmation.get("confirmed") is True and (
                 prepared[q]["gate_thresholds"] != quality["default_thresholds"]
@@ -1018,6 +1187,10 @@ def run_skill_ablation_v11(
                 raise PairingError(f"{q}: artifact quality thresholds differ from confirmed contract")
         manifest.update({"prepared": prepared, "preparation_errors": prepare_errors,
                          "preparation_detector_attempts": preparation_detector_attempts,
+                         "prepared_measurement_receipts": prepared_measurement_by_qa,
+                         "prepared_measurement_cost_s": sum(
+                             float(receipt["runtime_s"])
+                             for receipt in room_receipts.values()),
                          "status": "running"})
         _write(root / "manifest.json", manifest)
         results = {arm: [] for arm in ARMS}

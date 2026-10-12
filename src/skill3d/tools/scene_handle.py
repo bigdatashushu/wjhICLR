@@ -34,6 +34,66 @@ from .contract import (
     route_aware_available,
 )
 
+PREPARED_ROOM_MEASUREMENT_VERSION = "prepared-room-measurement-v1"
+
+
+def canonical_payload_sha256(value) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, allow_nan=False,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def frozen_reconstruction_identity(artifact) -> str:
+    identity = str(getattr(artifact, "reconstruction_input_identity", "") or "")
+    if identity:
+        return identity
+    return canonical_payload_sha256({
+        "artifact_id": str(getattr(artifact, "artifact_id", "") or ""),
+        "artifact_version": str(getattr(artifact, "artifact_version", "") or ""),
+        "frame_set_hash": str(getattr(artifact, "frame_set_hash", "") or ""),
+    })
+
+
+def prepared_room_request(
+    *,
+    point_map_sha256: str,
+    metric_scale: float,
+    frozen_input_identity: str,
+    world_up,
+) -> dict:
+    from .distance_primitives import DistancePrimitiveParams
+
+    normalized_up = None
+    if world_up is not None:
+        up = np.asarray(world_up, dtype=np.float64)
+        if (up.shape != (3,) or not np.all(np.isfinite(up))
+                or np.linalg.norm(up) <= 1e-12):
+            raise ValueError(
+                "prepared room measurement world_up must be a finite nonzero 3-vector")
+        up = up / np.linalg.norm(up)
+        normalized_up = [float(value) for value in up]
+    implementation = Path(__file__).with_name("distance_primitives.py")
+    request = {
+        "contract_version": PREPARED_ROOM_MEASUREMENT_VERSION,
+        "tool": "plane_fit_room_size",
+        "point_map_sha256": str(point_map_sha256),
+        "metric_scale": float(metric_scale),
+        "distance_primitive_params": DistancePrimitiveParams().snapshot(),
+        "implementation_source_sha256": file_sha256(implementation),
+        "frozen_input_identity": str(frozen_input_identity),
+        "world_up": normalized_up,
+    }
+    return {**request, "request_sha256": canonical_payload_sha256(request)}
+
 
 class SceneHandle:
     """SceneState 的只读运行期句柄。
@@ -54,9 +114,15 @@ class SceneHandle:
         objects_materialized: Optional[bool] = None,
         metric_scale: Optional[float] = None,
         grounding_coverage: Optional[dict] = None,
+        prepared_measurements: Optional[dict] = None,
+        point_map_sha256: str = "",
+        frozen_input_identity: str = "",
     ) -> None:
         self._state = scene_state
         self.grounding_coverage = dict(grounding_coverage or {})
+        self._prepared_measurements = dict(prepared_measurements or {})
+        self._point_map_sha256 = str(point_map_sha256 or "")
+        self._frozen_input_identity = str(frozen_input_identity or "")
         # 世界系 → 米 的换算系数。优先用显式传入值（mock_light 的合成几何），
         # 否则读运行时 artifact。
         self._metric_scale = metric_scale
@@ -226,6 +292,18 @@ class SceneHandle:
     @property
     def frame_set_hash(self) -> str:
         return str(getattr(self._state, "frame_set_hash", "") or "")
+
+    @property
+    def point_map_sha256(self) -> str:
+        return self._point_map_sha256
+
+    @property
+    def frozen_input_identity(self) -> str:
+        return self._frozen_input_identity
+
+    def prepared_measurement(self, tool: str) -> Optional[dict]:
+        value = self._prepared_measurements.get(str(tool))
+        return None if value is None else dict(value)
 
     # ---- v9 §9.4 主动图像：冻结帧集 + episode 图像账本 ----
     #

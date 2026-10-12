@@ -259,6 +259,7 @@ class PreparedObjectBinding:
     stats: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     materialized: bool = False
+    prepared_measurements: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -1297,6 +1298,8 @@ def run_episode(
                 binding = deepcopy(prepared_binding)
                 m5_objects, m5_stats = binding.objects, binding.stats
                 m5_notes, m5_materialized = binding.notes, binding.materialized
+            prepared_measurements = (
+                {} if prepared_binding is None else binding.prepared_measurements)
             notes.extend(m5_notes)
             outcome.m5_notes = list(m5_notes)
             if prepared_binding is not None:
@@ -1304,6 +1307,7 @@ def run_episode(
             scene, handle, art = _scene_from_artifact(
                 art, pixels, m5_stats, m5_objects, episode, artifact_path=art_path,
                 objects_materialized=m5_materialized,
+                prepared_measurements=prepared_measurements,
                 # paired A/B 复用 frozen artifact（硬约束 18）时不得改写两臂共用文件
                 persist_quality=not bool(cfg.reuse_artifact))
             # v9 §9.4：把声明的布局/上限装进图像账本（在 M5/M4 之后、M7 之前）
@@ -1918,6 +1922,7 @@ def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
                          episode=None,
                          artifact_path: str = "",
                          objects_materialized: Optional[bool] = None,
+                         prepared_measurements: Optional[dict] = None,
                          persist_quality: bool = True
                          ) -> tuple[SceneState, SceneHandle, object]:
     """M4 真实路径：从 artifact 读数组 → v6 主门质量 → SceneState + SceneHandle。
@@ -1951,10 +1956,24 @@ def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
         objects=sorted(o.obj_id for o in (objects or [])),
         artifact_ref=art.artifact_id,
     )
+    from skill3d.tools.scene_handle import (
+        file_sha256,
+        frozen_reconstruction_identity,
+    )
+
+    point_map_sha256 = ""
+    try:
+        if art.point_map and Path(art.point_map).is_file():
+            point_map_sha256 = file_sha256(art.point_map)
+    except OSError:
+        point_map_sha256 = ""
     handle = SceneHandle(scene, objects=objects or [], c2w_list=c2w, intrinsics=intr,
                          quality_overall=_overall_of(art),
                          objects_materialized=objects_materialized,
-                         grounding_coverage=stats.get("grounding"))
+                         grounding_coverage=stats.get("grounding"),
+                         prepared_measurements=prepared_measurements,
+                         point_map_sha256=point_map_sha256,
+                         frozen_input_identity=frozen_reconstruction_identity(art))
     # 世界系点图注入句柄（平面拟合 / 连通性图的唯一数据入口）
     handle.set_point_map(point_map)
     # v9 §9.4：把**本 episode 实际可读的帧**装进句柄的图像账本 ——
@@ -2081,7 +2100,10 @@ def _retarget_handle(handle: Optional[SceneHandle], scene: SceneState) -> Option
                              quality_overall=handle.quality_overall,
                              objects_materialized=handle.objects_materialized,
                              metric_scale=handle.metric_scale,
-                             grounding_coverage=handle.grounding_coverage)
+                             grounding_coverage=handle.grounding_coverage,
+                             prepared_measurements=handle._prepared_measurements,  # noqa: SLF001
+                             point_map_sha256=handle.point_map_sha256,
+                             frozen_input_identity=handle.frozen_input_identity)
     new_handle.set_point_map(handle.get_point_map())
     # v9 §9.4：逐题 scope 重派生**不得丢**帧集与已产出的图像（同一 episode 的账本）
     new_handle._set_image_ledger(handle._ledger)  # noqa: SLF001
@@ -2129,6 +2151,11 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
             vlm_client=vlm_client,
             # 场景清单缓存键：同一 (scene, FrameSet) 复用对象清单（M5 是 scene 级产物）
             frame_set_hash=str(getattr(art, "frame_set_hash", "") or ""),
+            qa_id=str(getattr(episode, "qa_id", "") or ""),
+            scene_identity=str(
+                getattr(art, "reconstruction_input_identity", "")
+                or getattr(art, "frame_set_hash", "")
+                or getattr(art, "artifact_id", "")),
             # 请求级 seed：M5 的 VLM 框提示也要可复现（§7 复现纪律）
             seed=int(cfg.seed),
         )

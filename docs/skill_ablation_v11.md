@@ -5,7 +5,8 @@
 `object_rel_distance`（S03），`--question-types` 接受逗号分隔的规范题型。
 
 两臂均通过真实 `run_episode` 生成、执行程序，默认共同使用
-`program_synth_v11_5_en`、`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.3-en`，
+`program_synth_v11_5_en`、`solver-v11.4-eval-visual-fallback` 和
+`tool-docs-v11.4-binding-integrity`，
 质量门始终开启。`ReturnAnswer` 先暂存提交；M11 通过后才进入评分，拒绝时在同一
 求解预算内撤销受影响结果并把结构化失败反馈给同一模型。声明了 `derivation` 时，
 M11 只使用登记操作确定性重放并核对答案；计算声明错误不会撤销本身有效的工具结果。
@@ -25,13 +26,13 @@ VGGT/SAM2、GPU 4 预留 GroundingDINO 或故障切换。开发和冒烟可直�
 当前源码，先做小样本端到端检查：
 
 ```bash
-./start_harness3d.sh --smoke
+./start_harness.sh --smoke
 ```
 
 质量确认与当前合同一致后，直接运行正式配置：
 
 ```bash
-./start_harness3d.sh
+./start_harness.sh
 ```
 
 脚本默认使用 `/home/cvailab/experiments/harness3d-v11`，可通过
@@ -206,6 +207,21 @@ YAML 加载。两臂配置由同一份配置复制，
 旧质量确认与旧运行结果不能证明本工程版本有效；需重新确认当前合同并另建 GPU 运行，
 结果变化不得与 Skill 演化收益混报。
 
+2026-10-12 米制可靠性修复属于两臂共享的工程基线，不修改冻结 Skill。M4 主门通过
+不代表对象语义绑定可靠；`det_conf` 只表示检测器原始置信度，
+`mask_support_ratio` 才表示非空传播 mask 的帧覆盖率。paired preparation 必须先完成
+全部题的 M5，再按冻结重建身份跨题审计 targeted-fill 对象。只有规范类别不同、至少
+两个共同非空帧且堆叠 mask IoU `>=0.95` 时，双方对象才标记
+`semantic_label_mask_conflict` 并禁止对象几何工具；对象仍保留供原图视觉作答。
+普通多实例不是本轮硬门。
+
+授权房间场景在求解前由独立子进程预计算一次，300 秒超时；成功 payload 与失败状态都
+写入同一 prepared receipt，B01/B11 禁止各自重算。收据绑定 point-map、尺度、原语
+参数、实现源码、冻结输入和 payload 身份。房间 `fit_quality` 的公式为
+`sqrt(floor_fit_ratio * ground_planarity)`，`plane_inlier_ratio` 继续表示地面内点
+占全部点的比例；未标定的 `plane_fit_low_quality` 只作审计。该预计算耗时记共享准备
+成本，不属于任一实验臂，更不能解释为 B11 收益。
+
 预抽帧数据可使用：
 
 ```bash
@@ -259,7 +275,9 @@ PYTHONPATH=src python scripts/run_skill_ablation_v11.py --print-quality-contract
    时间戳、场景和基础产物所有非空引用。相同 artifact 身份对应不同内容时拒绝。
 2. 每题只复制声明的基础数组到私有目录，忽略源目录旧 M5 缓存。
    在无 Skill 的准备阶段执行一次 M5（含题目定向补漏），冻结对象记录、点云、
-   mask、统计和质量结果。所有题准备完成后才开始求解。
+   mask、统计和质量结果。全部题绑定完成后，先按冻结场景做跨题语义冲突审计，再计算
+   tree identity。授权房间场景在此阶段生成共享 prepared measurement 收据。
+   所有题准备完成后才开始求解。
 3. 每臂每题物理复制整个准备目录，重新定位 JSON 中的内部路径；
    不使用软链或硬链。`PreparedObjectBinding` 在 runner 内再次深复制，
    每次运行新建 SceneHandle、题级 SceneState、图像账本、kernel、答案/让出槽和结果登记
@@ -269,7 +287,8 @@ PYTHONPATH=src python scripts/run_skill_ablation_v11.py --print-quality-contract
    验证两臂初始树 hash、公共配置 hash，以及剥离完整 Skill 块后的首轮实际请求 hash。
    每臂结束后核对冻结树和原输入未被改写。
 
-M5 的耗时和请求只计在共享准备阶段，求解成本从两臂 trace 分别计算。
+M5 与 prepared room measurement 的耗时和请求只计在共享准备阶段，求解成本从两臂
+trace 分别计算。成功、失败或超时收据必须在两臂字节一致；任何身份不匹配均 fail-closed。
 当前为顺序运行 B01、B11；输出会记录顺序，不是延迟公平性实验。
 复制会占用约一份冻结输入加两份运行产物的空间，适合先做小规模切片。
 这不是容器安全平台。
@@ -277,7 +296,8 @@ M5 的耗时和请求只计在共享准备阶段，求解成本从两臂 trace �
 ## 输出与评分
 
 - `manifest.json`：实验 ID、预登记题单、实际 seed、公共配置、输入身份、
-  冻结 snapshot/manifest、代码 hash、质量配置及每题准备产物 hash。
+  冻结 snapshot/manifest、代码 hash、质量配置、每题准备产物 hash、语义冲突审计及
+  prepared measurement 状态／收据／共享准备耗时。
 - `skills/`、`frozen/`：实际使用的正文、图像、基础产物、对象绑定和质量结果。
 - `preparation/<qa哈希>/model_requests.jsonl`：共享准备阶段的请求收据。
 - `arms/B01|B11/<qa哈希>/result.json` 和 `trace/`：独立 run/qa/arm 身份、
@@ -321,6 +341,10 @@ PYTHONPATH=src .venv/bin/python -m pytest -q \
   tests/integration/test_eval_visual_boundaries.py \
   tests/integration/test_eval_visual_fallback.py \
   tests/unit/test_eval_visual_request.py \
+  tests/unit/test_sam2_tracker.py \
+  tests/unit/test_m5_inventory_cache.py \
+  tests/unit/test_geometry_tools.py \
+  tests/unit/test_distance_primitives.py \
   tests/unit/test_m11_submission.py \
   tests/unit/test_v11_prompt_contract.py \
   tests/unit/test_v11_tool_contract_repair.py

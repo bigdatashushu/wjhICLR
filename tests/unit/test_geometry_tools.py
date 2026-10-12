@@ -13,6 +13,7 @@ v6 工具面（14 个）与 v5 的差异是本文件的重心：
   且**执行期二次校验**（缺系数 → `domain_value`，scope 不符 → `tool_contract`）。
 """
 
+import copy
 import json
 
 import numpy as np
@@ -44,6 +45,11 @@ from skill3d.tools.contract import (
     question_tool_scope_of,
 )
 from skill3d.tools.registry import ToolArgValidationError, ToolNotFoundError
+from skill3d.tools.scene_handle import (
+    canonical_payload_sha256,
+    file_sha256,
+    prepared_room_request,
+)
 
 # v6 工具面（§8/§9 的 14 个 Tool）；出现别的名字说明工具面被改动了
 V6_TOOLS = {
@@ -128,12 +134,14 @@ def _scene(*, metric: bool = False, question_type: str = "",
 
 
 def _obj(oid: str, category: str, centroid, *, pts=None, track=None,
-         dup: bool = False, vis=None, bbox=None) -> ObjectRecord:
+         dup: bool = False, vis=None, bbox=None, binding_flags=None) -> ObjectRecord:
     return ObjectRecord(
         obj_id=oid, category_name=category, centroid_world=list(centroid),
         pointcloud_world=(_points_ref(oid, pts) if pts is not None else ""),
         track_id=track, duplicate_suspect=dup, visible_frames=vis or [0, 1],
-        bbox=list(bbox or [0.0] * 6), det_conf=0.9)
+        bbox=list(bbox or [0.0] * 6), det_conf=0.9,
+        det_conf_source="groundingdino", mask_support_ratio=0.5,
+        binding_flags=list(binding_flags or []))
 
 
 _POINT_DIR = None
@@ -154,9 +162,13 @@ def _points_ref(oid: str, pts) -> str:
 
 def _handle(scene: SceneState, *, objs=(), c2w=np.eye(4)[None, ...],
             intrinsics=_K, objects_materialized=True,
-            point_map=None, metric_scale=None) -> SceneHandle:
+            point_map=None, metric_scale=None, prepared_measurements=None,
+            point_map_sha256="", frozen_input_identity="") -> SceneHandle:
     h = SceneHandle(scene, objects=list(objs), c2w_list=c2w, intrinsics=intrinsics,
-                    objects_materialized=objects_materialized, metric_scale=metric_scale)
+                    objects_materialized=objects_materialized, metric_scale=metric_scale,
+                    prepared_measurements=prepared_measurements,
+                    point_map_sha256=point_map_sha256,
+                    frozen_input_identity=frozen_input_identity)
     if point_map is not None:
         h.set_point_map(point_map)
     return h
@@ -276,12 +288,34 @@ def test_list_objects_returns_self_describing_records():
     assert rec["category_name"] == "door"          # 自描述（v6 新增）
     assert rec["track_id"] == "t7"
     assert rec["visible_frames"] == [3, 4, 9]
+    assert rec["det_conf_source"] == "groundingdino"
+    assert rec["mask_support_ratio"] == pytest.approx(0.5)
+    assert rec["binding_flags"] == []
     assert "duplicate_suspect" in rec and "grounding_status" in rec
     # 类别筛选走 category_filter（子串、大小写不敏感）
     assert len(json.loads(call_tool("list_objects", {"category_filter": "DOOR"}, h).value)) == 1
     assert json.loads(call_tool("list_objects", {"category_filter": "chair"}, h).value) == []
     # id 是符号，不含类别名（不能拿 id 当类别判断）
     assert "door" not in rec["obj_id"]
+
+
+def test_semantic_mask_conflict_blocks_object_geometry_but_not_listing():
+    conflict = [{
+        "code": "semantic_label_mask_conflict",
+        "audit_sha256": "a" * 64,
+        "counterpart_category": "telephone",
+    }]
+    pts = _cluster((0.0, 0.0, 2.0))
+    obj = _obj("obj_0", "television", (0.0, 0.0, 2.0), pts=pts,
+               track="t0", binding_flags=conflict)
+    handle = _handle(
+        _scene(metric=True, question_type="object_size_estimation", objs=[obj]),
+        objs=[obj], metric_scale=2.0)
+    listed = json.loads(call_tool("list_objects", {}, handle).value)
+    assert listed[0]["binding_flags"] == conflict
+    blocked = call_tool("object_3d_extent", {"obj_id": "obj_0"}, handle)
+    assert blocked.error_code == "confidence_gate"
+    assert "semantic_label_mask_conflict" in blocked.error
 
 
 def test_count_objects_counts_distinct_tracks():
@@ -378,6 +412,111 @@ def test_plane_fit_room_size_area_scales_with_square():
                       metric_scale=scale)
     r = call_tool("plane_fit_room_size", {}, h_no_pm)
     assert r.error_code == "domain_value"
+
+
+def _prepared_room_receipt(tmp_path, *, scale=2.0):
+    from skill3d.tools.distance_primitives import room_size_from_planes
+
+    point_map = _room_point_map()
+    point_path = tmp_path / "point_map.npy"
+    np.save(point_path, point_map)
+    payload = room_size_from_planes(
+        point_map.reshape(-1, 3), metric_scale=scale, up_hint=UP)
+    request = prepared_room_request(
+        point_map_sha256=file_sha256(point_path),
+        metric_scale=scale,
+        frozen_input_identity="frozen-input",
+        world_up=UP)
+    receipt = {
+        "request": request,
+        "status": "success",
+        "runtime_s": 1.25,
+        "timeout_s": 300.0,
+        "payload": payload,
+        "payload_sha256": canonical_payload_sha256(payload),
+        "error": None,
+    }
+    receipt["receipt_sha256"] = canonical_payload_sha256(receipt)
+    return point_map, file_sha256(point_path), receipt
+
+
+def test_plane_fit_room_size_reads_verified_prepared_payload(tmp_path):
+    point_map, point_sha, receipt = _prepared_room_receipt(tmp_path)
+    handle = _handle(
+        _scene(metric=True, question_type="room_size_estimation"),
+        point_map=point_map, metric_scale=2.0,
+        prepared_measurements={"plane_fit_room_size": receipt},
+        point_map_sha256=point_sha,
+        frozen_input_identity="frozen-input")
+    result = json.loads(call_tool("plane_fit_room_size", {}, handle).value)
+    assert result["measurement_source"] == "prepared_verified_cache"
+    assert result["prepared_receipt_sha256"] == receipt["receipt_sha256"]
+    assert result["room_area_m2"] == pytest.approx(receipt["payload"]["room_area_m2"])
+    assert result["floor_fit_ratio"] == pytest.approx(
+        receipt["payload"]["floor_fit_ratio"])
+    assert result["n_near_floor"] == receipt["payload"]["n_near_floor"]
+
+
+@pytest.mark.parametrize("tamper", [
+    "point_map", "scale", "params", "implementation", "frozen_input", "payload",
+])
+def test_prepared_room_measurement_tampering_fails_closed(tmp_path, tamper):
+    point_map, point_sha, receipt = _prepared_room_receipt(tmp_path)
+    receipt = copy.deepcopy(receipt)
+    scale = 2.0
+    frozen = "frozen-input"
+    if tamper == "point_map":
+        point_sha = "0" * 64
+    elif tamper == "scale":
+        scale = 2.5
+    elif tamper == "frozen_input":
+        frozen = "other-input"
+    elif tamper == "params":
+        receipt["request"]["distance_primitive_params"]["quantile_q"] = 0.2
+    elif tamper == "implementation":
+        receipt["request"]["implementation_source_sha256"] = "1" * 64
+    elif tamper == "payload":
+        receipt["payload"]["room_area_m2"] += 1.0
+    if tamper in ("params", "implementation", "payload"):
+        receipt["receipt_sha256"] = canonical_payload_sha256({
+            key: value for key, value in receipt.items()
+            if key != "receipt_sha256"
+        })
+    handle = _handle(
+        _scene(metric=True, question_type="room_size_estimation"),
+        point_map=point_map, metric_scale=scale,
+        prepared_measurements={"plane_fit_room_size": receipt},
+        point_map_sha256=point_sha, frozen_input_identity=frozen)
+    result = call_tool("plane_fit_room_size", {}, handle)
+    assert result.error_code == "confidence_gate"
+    assert "recomputation" in result.error or "hash mismatch" in result.error
+
+
+def test_prepared_room_failure_is_shared_without_recomputation(
+        tmp_path, monkeypatch):
+    import skill3d.tools.geometry_tools as tools
+
+    point_map, point_sha, receipt = _prepared_room_receipt(tmp_path)
+    receipt.update({
+        "status": "timeout",
+        "payload": None,
+        "payload_sha256": None,
+        "error": "prepared room measurement exceeded 300.0s",
+    })
+    receipt["receipt_sha256"] = canonical_payload_sha256({
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    })
+    monkeypatch.setattr(
+        tools, "room_size_from_planes",
+        lambda *args, **kwargs: pytest.fail("arm-local recomputation is forbidden"))
+    handle = _handle(
+        _scene(metric=True, question_type="room_size_estimation"),
+        point_map=point_map, metric_scale=2.0,
+        prepared_measurements={"plane_fit_room_size": receipt},
+        point_map_sha256=point_sha, frozen_input_identity="frozen-input")
+    result = call_tool("plane_fit_room_size", {}, handle)
+    assert result.error_code == "confidence_gate"
+    assert "status=timeout" in result.error
 
 
 def test_object_visible_frames_from_binding():

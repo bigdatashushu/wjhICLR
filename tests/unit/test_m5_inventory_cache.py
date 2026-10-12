@@ -37,7 +37,11 @@ def _frames(n: int):
 def _inst(iid="obj_0", name="chair", centroid=(0.0, 0.0, 3.0), track_id="trk0"):
     return ObjectRecord(obj_id=iid, category_name=name, mask_per_frame="",
                         pointcloud_world="", centroid_world=list(centroid),
-                        bbox=[0.0] * 6, det_conf=1.0, track_id=track_id)
+                        bbox=[0.0] * 6, det_conf=0.87,
+                        det_conf_source="groundingdino",
+                        mask_support_ratio=0.5,
+                        binding_flags=[{"code": "test_flag"}],
+                        track_id=track_id)
 
 
 # ----------------------------------------------------------------- 缓存 ----
@@ -52,6 +56,10 @@ def test_inventory_cache_roundtrip(tmp_path):
     got, stats, g7 = loaded
     assert [o.obj_id for o in got] == ["obj_0"]
     assert got[0].track_id == "trk0" and got[0].category_name == "chair"
+    assert got[0].det_conf == pytest.approx(0.87)
+    assert got[0].det_conf_source == "groundingdino"
+    assert got[0].mask_support_ratio == pytest.approx(0.5)
+    assert got[0].binding_flags == [{"code": "test_flag"}]
     assert stats["track_ious"] == [0.5] and stats["dynamic_ratio"] == 0.1
     assert g7 == ""
 
@@ -90,6 +98,16 @@ def test_inventory_cache_miss_when_pointconf_ref_missing(tmp_path):
 def test_inventory_cache_corrupt_json_is_a_miss(tmp_path):
     key = _inventory_key("sc", "fsh", np.zeros((2, H, W)), 2)
     (tmp_path / f"sc_inventory_{key}.json").write_text("{not json")
+    assert _load_inventory(tmp_path, "sc", key) is None
+
+
+def test_inventory_cache_old_version_is_a_miss(tmp_path):
+    key = _inventory_key("sc", "fsh", np.zeros((2, H, W)), 2)
+    _save_inventory(tmp_path, "sc", key, [_inst()], {}, None)
+    p = tmp_path / f"sc_inventory_{key}.json"
+    payload = json.loads(p.read_text())
+    payload["inventory_version"] = "m5-inventory-7-en"
+    p.write_text(json.dumps(payload))
     assert _load_inventory(tmp_path, "sc", key) is None
 
 
@@ -186,6 +204,34 @@ def _fake_predictor(n_frames: int):
                     yield t, [oid], m[None].astype(np.float32)
 
     return _P()
+
+
+def test_bind_objects_preserves_groundingdino_confidence(tmp_path, monkeypatch):
+    from skill3d.segmentation import open_vocab_detector as ovd
+
+    class _D:
+        label = "chair"
+        bbox_xyxy = (10.0, 10.0, 50.0, 50.0)
+        confidence = 0.87
+
+    def fake_detect(frame, prompt, **kw):
+        ovd.detect.last_error = ""
+        return [_D()]
+
+    monkeypatch.setattr(ovd, "available", lambda: True)
+    monkeypatch.setattr(ovd, "detect", fake_detect)
+    frames = _frames(2)
+    objects, _, _ = bind_objects_for_scene(
+        frames, None, "How many chairs are visible?",
+        depth_maps=np.full((2, H, W), 3.0),
+        c2w_list=np.stack([np.eye(4)] * 2),
+        intrinsics=K, out_dir=tmp_path, scene_name="confidence",
+        predictor=_fake_predictor(2), frame_set_hash="fsh",
+        use_inventory_cache=False)
+    assert objects
+    assert all(o.det_conf == pytest.approx(0.87) for o in objects)
+    assert all(o.det_conf_source == "groundingdino" for o in objects)
+    assert all(o.mask_support_ratio == pytest.approx(1.0) for o in objects)
 
 
 def test_bind_objects_reuses_scene_inventory_cache(tmp_path):

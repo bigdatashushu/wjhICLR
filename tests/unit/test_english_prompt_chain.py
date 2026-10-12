@@ -52,7 +52,7 @@ def test_m5_inventory_noun_extraction_and_targeted_boxes_send_english(monkeypatc
     client = _M5Recorder()
     frames = [np.zeros((24, 32, 3), dtype=np.uint8)]
     m5.box_prompts_from_vlm(frames, m5._GENERIC_INVENTORY_QUESTION, client, seed=7)
-    monkeypatch.setattr(m5, "ovd_boxes_for_nouns", lambda *args: ([], [], []))
+    monkeypatch.setattr(m5, "ovd_boxes_for_nouns", lambda *args: ([], [], [], []))
     objects, stats, _ = m5._bind_question_supplement(
         frames, [0], "How many chairs are visible?", [], None, None, None,
         grid_transform=None, out_dir=None, scene_name="test", predictor=None,

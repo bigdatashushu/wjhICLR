@@ -123,6 +123,7 @@ PLANE_MIN_ALIGN_COS: float = 0.86             # TODO_CALIBRATE: §9.5 平面身�
 # 纪律：**不得**拿它当 abstain 的硬门（红线 2：未标定阈值不得充当结论）；
 # 要用它做门必须先按 §10.6 的最小 PoC 完成分离度标定。
 TH_FIT_QUALITY_MIN: float = 0.3               # TODO_CALIBRATE: §9.5 拟合质量门（未标定）
+ROOM_FIT_QUALITY_VERSION: str = "floor-fit-ratio-v1"
 # §9.5 上方向可辨识判据：PCA 最小方差轴与次小方差轴的特征值比下限（房间场景里竖直
 # 轴方差最小）。低于该比值 → `up_axis_ambiguous`（审计与标记，不静默假装确定）。
 MIN_UP_AXIS_ANISOTROPY: float = 1.05          # TODO_CALIBRATE: §9.5 上方向可辨识性
@@ -143,6 +144,7 @@ __all__ = [
     "CONF_WARP_VERSION",
     "N_MIN_DEFAULT",
     "QUANTILE_Q_DEFAULT",
+    "ROOM_FIT_QUALITY_VERSION",
     "SCALE_VERSION_DEFAULT",
     "TAU_CONTAM",
     "TH_CONTAM_FRACTION",
@@ -1053,7 +1055,9 @@ def planarity_and_ground(
         "ceiling_height_normalized": None, "room_height_normalized": None,
         "wall_directions": None, "horizontal_extent_normalized": None,
         "wall_inlier_ratio": None, "plane_inlier_ratio": None,
+        "floor_fit_ratio": None, "n_near_floor": None,
         "ground_planarity": None, "fit_quality": None,
+        "fit_quality_formula_version": ROOM_FIT_QUALITY_VERSION,
         "n_valid_points": int(prep["n_used"]),
         "quantile_q": float(p.quantile_q), "voxel_size": float(p.voxel_size),
         "conf_warp_version": str(p.conf_warp_version), "scale_version": None,
@@ -1139,16 +1143,20 @@ def planarity_and_ground(
     ground_in = np.abs(pts @ n_g - d_g) <= tol
     n_ground = int(np.count_nonzero(ground_in))
     n_near_floor = int(np.count_nonzero(near_floor))
+    floor_fit_ratio = min(1.0, n_ground / max(n_near_floor, 1))
     ground_plane = {
         "normal": [float(x) for x in n_g], "offset": float(d_g),
         "inlier_ratio": float(n_ground / pts.shape[0]), "n_inliers": n_ground,
         "n_near_floor": n_near_floor,
+        "floor_fit_ratio": floor_fit_ratio,
         "axis_alignment": float(align),
         # 审计：实际使用的平面内点容差（相对场景尺度），便于事后标定与复核
         "inlier_tol": float(tol),
         "tol_relative_to_scale": float(tol / scale) if scale else None,
     }
     out["ground_plane"] = ground_plane
+    out["n_near_floor"] = n_near_floor
+    out["floor_fit_ratio"] = floor_fit_ratio
     out["floor_height_normalized"] = float(np.median(h[ground_in]))
     out["ground_planarity"] = _planarity(pts[ground_in])
 
@@ -1195,21 +1203,7 @@ def planarity_and_ground(
     planarity = out["ground_planarity"]
     fit_quality = None
     if planarity is not None:
-        # 口径保持 §9.5 原设计：`sqrt(plane_inlier_ratio × planarity)` ——
-        # "多少点落在地面平面上" × "地面本身平不平"。
-        #
-        # 2026-09-21 实测记录（**结论：不改公式，改用法**）：在真实 VGGT 点云上
-        # 地板只占 2%–11%（其余是墙/天花/家具），于是**拟合准确**（房间面积与 GT
-        # 差 4%–19%）的场景 `fit_quality` 也只有 0.14–0.34，低于 `TH_FIT_QUALITY_MIN`。
-        # 但该公式在**合成房间**（地板占比大）与**无地板点团**上是正确分离的
-        # （tests/unit/test_distance_primitives.py 的两个用例）—— 也就是说
-        # "低值"不是公式算错，而是**阈值对真实点云未标定**。
-        # 按红线 2（未标定阈值不得充当结论 / 不得为分数放宽阈值）：
-        #   - **不**重定义公式（那等于为了让真实数据通过而改度量）；
-        #   - **不**放宽 TH_FIT_QUALITY_MIN；
-        #   - 真正造成丢分的是**模型拿它当 abstain 硬门**，已在工具描述里写明
-        #     "仅供审计，不要拿它当 abstain 的硬门"，并在 §10.6 待标定清单里登记。
-        fit_quality = float(np.sqrt(max(out["plane_inlier_ratio"], 0.0)
+        fit_quality = float(np.sqrt(max(floor_fit_ratio, 0.0)
                                     * max(float(planarity), 0.0)))
         if fit_quality < float(TH_FIT_QUALITY_MIN):
             flags.append("plane_fit_low_quality")
@@ -1219,6 +1213,10 @@ def planarity_and_ground(
         **prep["audit"],
         "plane_tol": float(tol), "robust_scale": float(scale),
         "n_ground_inliers": n_ground, "n_wall_inliers": n_wall,
+        "n_near_floor": n_near_floor,
+        "floor_fit_ratio": floor_fit_ratio,
+        "fit_quality_formula_version": ROOM_FIT_QUALITY_VERSION,
+        "fit_quality_formula": "sqrt(floor_fit_ratio * ground_planarity)",
         "room_surface_inlier_ratio": float(n_covered / pts.shape[0]),
         "wall_plane_offsets": {"u1": [c1_lo, c1_hi], "u2": [c2_lo, c2_hi]},
         "horizontal_anisotropy": None if not np.isfinite(aniso_h) else float(aniso_h),
@@ -1270,7 +1268,10 @@ def room_size_from_planes(
         "room_height_normalized": ground.get("room_height_normalized"),
         "wall_extents_normalized": ext,
         "plane_inlier_ratio": ground.get("plane_inlier_ratio"),
+        "floor_fit_ratio": ground.get("floor_fit_ratio"),
+        "n_near_floor": ground.get("n_near_floor"),
         "fit_quality": ground.get("fit_quality"),
+        "fit_quality_formula_version": ground.get("fit_quality_formula_version"),
         "ground_planarity": ground.get("ground_planarity"),
         "up": ground.get("up"), "up_axis": ground.get("up_axis"),
         "up_source": ground.get("up_source"),

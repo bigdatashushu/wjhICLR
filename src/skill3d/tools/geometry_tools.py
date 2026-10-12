@@ -43,6 +43,7 @@ from skill3d.schemas.evidence import EvidenceProfile
 from .contract import (
     EVIDENCE_METRIC_SCALE,
     AnswerAlreadyGiven,
+    ConfidenceGateError,
     DomainValueError,
 )
 from .distance_primitives import (
@@ -56,7 +57,11 @@ from .distance_primitives import (
 from .registry import REGISTRY
 from .category_match import matches
 from .ranking_contract import RANKING_CONTRACT_VERSION, UNCERTAIN_DISTANCE_FLAGS
-from .scene_handle import SceneHandle
+from .scene_handle import (
+    SceneHandle,
+    canonical_payload_sha256,
+    prepared_room_request,
+)
 
 # 实例整合的双向点云重合阈值（v7 §9.1）。
 # 实测分离度（scene 7b6477cb95 的 12 条 monitor 记录）：同一实例 0.38–0.69，
@@ -71,6 +76,12 @@ EV_DETECTION = "object_detection"
 EV_GROUNDING = "object_grounding"
 EV_TRACK = "track_consensus"
 EV_TEMPORAL = "temporal"
+
+BINDING_INTEGRITY_TOOLS = frozenset({
+    "object_centroid", "object_3d_extent", "robust_distance",
+    "camera_object_distance", "surface_distance_between_objects",
+    "relative_distance_rank", "object_distance_m", "relative_direction_of",
+})
 
 
 def _as_point(p: list[float], name: str) -> np.ndarray:
@@ -120,11 +131,28 @@ def _metric_scale_or_fail(handle: SceneHandle, tool: str) -> float:
 def _get_object(handle: SceneHandle, object_id: str, tool: str):
     """取对象；不存在 → DomainValueError（域值错误，不是契约缺失）。"""
     try:
-        return handle.get_object(object_id)
+        obj = handle.get_object(object_id)
     except KeyError as exc:
         raise DomainValueError(
             tool, f"Object does not exist: {object_id} (the objects artifact is available and all instances have been listed)",
             args={"object_id": object_id}) from exc
+    if tool in BINDING_INTEGRITY_TOOLS:
+        conflicts = [
+            flag for flag in (obj.binding_flags or [])
+            if flag.get("code") == "semantic_label_mask_conflict"
+        ]
+        if conflicts:
+            audit_ids = sorted({
+                str(flag.get("audit_sha256") or "") for flag in conflicts
+                if flag.get("audit_sha256")
+            })
+            raise ConfidenceGateError(
+                tool,
+                f"Object {obj.obj_id} ({obj.category_name}) failed binding integrity: "
+                "semantic_label_mask_conflict. Geometry derived from this object is "
+                f"blocked; use the frozen images instead. audit_sha256={audit_ids}",
+                args={"object_id": obj.obj_id, "binding_flags": conflicts})
+    return obj
 
 
 def _metric_scale_if_authorized(handle: SceneHandle) -> Optional[float]:
@@ -174,12 +202,12 @@ def _degraded_property(distance_result, *, metric_ok: bool) -> list[str]:
         description=("列出场景中的对象，返回一个 **dict 列表**，每项形如 "
                      "{'obj_id': 'obj_7', 'category_name': 'chair', "
                      "'visible_frames': [3,4,5], 'track_id': 'trk7', 'det_conf': 0.8, "
-                     "'grounding_status': 'base_list', 'duplicate_suspect': False}。"
-                     "用法照抄：`objs = list_objects('chair')` 后取 "
-                     "`objs[0]['obj_id']`；**列表元素是 dict，不是字符串**"
-                     "（写 `for o in objs: 'chair' in o` 会报错）。"
+                     "'det_conf_source': 'groundingdino', 'mask_support_ratio': 0.75, "
+                     "'binding_flags': [], 'grounding_status': 'base_list', "
+                     "'duplicate_suspect': False}。**列表元素是 dict，不是字符串**。"
                      "**obj_id 里不含类别名**，按类别筛选必须传 category_filter"
-                     "（规范类别与同义词匹配）。计数请改用 count_objects（它以 track 共识为准）"),
+                     "（规范类别与同义词匹配）。必须检查全部候选及 binding_flags，"
+                     "不要默认取第一条；计数请改用 count_objects（它以 track 共识为准）"),
         args_schema_ref="category_filter:str=''",
         returns_schema_ref="list[dict]",
         cost_estimate_ms=1.0,
@@ -205,6 +233,9 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
             "visible_frames": [int(i) for i in (o.visible_frames or [])],
             "track_id": o.track_id,
             "det_conf": float(o.det_conf),
+            "det_conf_source": o.det_conf_source,
+            "mask_support_ratio": float(o.mask_support_ratio),
+            "binding_flags": list(o.binding_flags or []),
             "grounding_status": o.grounding_status,
             "duplicate_suspect": bool(o.duplicate_suspect),
         })
@@ -434,7 +465,9 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
         name="plane_fit_room_size",
         description=("拟合地面/墙面 → 房间尺寸。返回 dict："
                      "{'room_diagonal_normalized': d, 'room_area_m2': A, "
-                     "'plane_inlier_ratio': r, 'fit_quality': q, 'degradation_flags': [...]}。"
+                     "'plane_inlier_ratio': r, 'floor_fit_ratio': f, "
+                     "'n_near_floor': n, 'fit_quality': q, "
+                     "'measurement_source': source, 'degradation_flags': [...]}。"
                      "房间面积题一律取 **`result['room_area_m2']`**（单位已是平方米，"
                      "**不要**再换算）；注意键名是 `room_area_m2`，不是 area_metric / "
                      "room_size / area。`fit_quality` 是 [0,1] 的拟合质量审计值"
@@ -450,21 +483,81 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
 )
 def plane_fit_room_size(handle: SceneHandle) -> dict:
     """平面拟合房间尺寸（§9.5）。"""
-    pm = handle.get_point_map()
-    if pm is None or pm.size == 0:
-        raise DomainValueError("plane_fit_room_size",
-                               "No world point map was provided; cannot fit planes (missing reconstruction artifact)")
-    res = room_size_from_planes(np.asarray(pm, dtype=np.float64).reshape(-1, 3),
-                               metric_scale=_metric_scale_or_fail(
-                                   handle, "plane_fit_room_size"))
+    scale = _metric_scale_or_fail(handle, "plane_fit_room_size")
+    prepared = handle.prepared_measurement("plane_fit_room_size")
+    measurement_source = "computed_in_tool"
+    receipt_sha256 = None
+    if prepared is not None:
+        stored_receipt_sha = str(prepared.get("receipt_sha256") or "")
+        receipt_body = {key: value for key, value in prepared.items()
+                        if key != "receipt_sha256"}
+        if (not stored_receipt_sha
+                or canonical_payload_sha256(receipt_body) != stored_receipt_sha):
+            raise ConfidenceGateError(
+                "plane_fit_room_size",
+                "Prepared room measurement receipt hash mismatch; refusing arm-local recomputation",
+                args={})
+        try:
+            current_request = prepared_room_request(
+                point_map_sha256=handle.point_map_sha256,
+                metric_scale=scale,
+                frozen_input_identity=handle.frozen_input_identity,
+                world_up=handle.world_up)
+        except (TypeError, ValueError) as exc:
+            raise ConfidenceGateError(
+                "plane_fit_room_size",
+                f"Prepared room measurement identity cannot be reconstructed: {exc}; "
+                "refusing arm-local recomputation",
+                args={}) from exc
+        if prepared.get("request") != current_request:
+            raise ConfidenceGateError(
+                "plane_fit_room_size",
+                "Prepared room measurement identity mismatch; refusing arm-local recomputation",
+                args={"expected_request_sha256": current_request["request_sha256"],
+                      "stored_request_sha256": prepared.get("request", {}).get(
+                          "request_sha256")})
+        status = str(prepared.get("status") or "")
+        if status != "success":
+            raise ConfidenceGateError(
+                "plane_fit_room_size",
+                f"Shared prepared room measurement status={status or 'invalid'}: "
+                f"{prepared.get('error') or 'no payload available'}; "
+                "both paired arms must consume the same failure without recomputation",
+                args={"prepared_status": status,
+                      "receipt_sha256": stored_receipt_sha})
+        payload = prepared.get("payload")
+        if (not isinstance(payload, dict)
+                or canonical_payload_sha256(payload) != prepared.get("payload_sha256")):
+            raise ConfidenceGateError(
+                "plane_fit_room_size",
+                "Prepared room measurement payload hash mismatch; refusing arm-local recomputation",
+                args={"receipt_sha256": stored_receipt_sha})
+        res = payload
+        measurement_source = "prepared_verified_cache"
+        receipt_sha256 = stored_receipt_sha
+    else:
+        pm = handle.get_point_map()
+        if pm is None or pm.size == 0:
+            raise DomainValueError(
+                "plane_fit_room_size",
+                "No world point map was provided; cannot fit planes "
+                "(missing reconstruction artifact)")
+        res = room_size_from_planes(
+            np.asarray(pm, dtype=np.float64).reshape(-1, 3),
+            metric_scale=scale, up_hint=handle.world_up)
     area = _require_metric(res.get("room_area_m2"), "plane_fit_room_size",
                            "Room area (square meters)")
     return {
         "room_diagonal_normalized": res.get("room_diagonal_normalized"),
         "room_area_m2": area,
         "plane_inlier_ratio": res.get("plane_inlier_ratio"),
+        "floor_fit_ratio": res.get("floor_fit_ratio"),
+        "n_near_floor": res.get("n_near_floor"),
         "fit_quality": res.get("fit_quality"),
+        "fit_quality_formula_version": res.get("fit_quality_formula_version"),
         "degradation_flags": list(res.get("degradation_flags") or []),
+        "measurement_source": measurement_source,
+        "prepared_receipt_sha256": receipt_sha256,
     }
 
 
@@ -673,7 +766,7 @@ def relative_distance_rank(handle: SceneHandle, reference: str,
             flags.add("category_missing:" + cat)
             continue
         for oid in oids:
-            obj = handle.get_object(oid)
+            obj = _get_object(handle, oid, "relative_distance_rank")
             keys = [("object", oid)] + ([("track", obj.track_id)] if obj.track_id else [])
             collision = any(k in identities and identities[k] != cat for k in keys)
             for key in keys:
