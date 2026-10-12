@@ -65,6 +65,52 @@ def run_mode(cfg: dict, *, dev=False, smoke=False, dry_run=False) -> str:
             or not cfg["experiment"].get("formal", False) else "formal")
 
 
+def validate_existing_environment(root: Path, cfg: dict) -> dict:
+    """Validate a user-selected interpreter without installing into it."""
+    from importlib.metadata import distributions, version
+    from packaging.requirements import Requirement
+
+    expected_python = str(cfg["environment"]["python"])
+    actual_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if expected_python != actual_python:
+        raise StartupError(f"Existing Python {actual_python} != required {expected_python}")
+    declarations = tomllib.loads((root / "pyproject.toml").read_text())["project"]["dependencies"]
+    pinned_exceptions = cfg["environment"].get("existing_dependency_versions", {})
+    exceptions = {}
+    for text in declarations:
+        requirement = Requirement(text)
+        if requirement.marker is not None and not requirement.marker.evaluate():
+            continue
+        installed = version(requirement.name)
+        if requirement.name in pinned_exceptions and pinned_exceptions[requirement.name] != installed:
+            raise StartupError(f"Existing {requirement.name} does not match its explicit version pin")
+        if requirement.specifier and installed not in requirement.specifier:
+            if pinned_exceptions.get(requirement.name) != installed:
+                raise StartupError(f"Existing {requirement.name}=={installed} does not satisfy {text}")
+            exceptions[requirement.name] = {"installed": installed, "declared": text}
+    if version("vllm") != str(cfg["environment"]["vllm_version"]):
+        raise StartupError("Existing vLLM version does not match configured version")
+    import importlib
+    import inspect
+
+    modules = ["sam2"]
+    if cfg["weights"]["moge2"].get("enabled"):
+        modules.append("moge.model.v2")
+    sources = {}
+    for name in modules:
+        module = importlib.import_module(name)
+        source = Path(inspect.getfile(module)).resolve()
+        sources[name] = {"path": str(source), "sha256": sha256(source)}
+    return {
+        "mode": "validated_existing", "python": sys.executable,
+        "python_version": sys.version, "contract": environment_contract(root, cfg),
+        "declared_dependency_exceptions": exceptions,
+        "packages": sorted((dist.metadata["Name"], dist.version) for dist in distributions()
+                           if dist.metadata["Name"]),
+        "import_sources": sources,
+    }
+
+
 def configure_run(cfg: dict, *, dev=False, smoke=False, dry_run=False) -> dict:
     value = copy.deepcopy(cfg)
     experiment = value["experiment"]
@@ -77,6 +123,10 @@ def configure_run(cfg: dict, *, dev=False, smoke=False, dry_run=False) -> dict:
     if smoke:
         experiment.update(induction_limit=2, inner_limit=2, post_publish_limit=1,
                           reconstruction_sampling_per_task=4, run_evolution=False)
+        if experiment.get("metric_validation"):
+            # This route validates one frozen scene before loading the solver.
+            experiment["metric_validation"]["prepare_only"] = True
+            experiment["metric_validation"]["first_scene_only"] = True
     return value
 
 
@@ -214,6 +264,7 @@ def environment_contract(root: Path, cfg: dict, python_version: str | None = Non
         "policy_version": "gpu-environment/2",
         "python_version": python_version or ".".join(map(str, sys.version_info[:2])),
         "configured_python": str(environment.get("python", "")),
+        "existing_dependency_versions": environment.get("existing_dependency_versions", {}),
         "project_dependencies": pyproject["project"]["dependencies"],
         "requires_python": pyproject["project"].get("requires-python"),
         "build_system": pyproject["build-system"],

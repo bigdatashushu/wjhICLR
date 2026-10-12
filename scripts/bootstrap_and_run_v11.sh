@@ -140,6 +140,18 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     --config "$CONFIG_PATH" --work-dir "$WORK_DIR" "${EXTRA_ARGS[@]}"
 fi
 
+if [[ -n "${HARNESS3D_EXISTING_PYTHON:-}" ]]; then
+  # Opt-in reuse of the pinned server environment; never pip-modify it.
+  PYTHON="$HARNESS3D_EXISTING_PYTHON"
+  [[ -x "$PYTHON" ]] || { echo "Existing Python is not executable: $PYTHON" >&2; exit 2; }
+  "$PYTHON" - "$SOURCE_DIR" "$CONFIG_PATH" "$ENV_RECEIPT_DIR/$RUN_ID-existing.json" <<'PY'
+import pathlib, sys, yaml
+from skill3d.infra.experiment_startup import validate_existing_environment, write_json
+receipt = validate_existing_environment(
+    pathlib.Path(sys.argv[1]), yaml.safe_load(pathlib.Path(sys.argv[2]).read_text()))
+write_json(pathlib.Path(sys.argv[3]), receipt)
+PY
+else
 if [[ ! -x "$VENV_DIR/bin/python" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
@@ -225,6 +237,7 @@ import hashlib, pathlib, sys
 print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 fi
+fi  # HARNESS3D_EXISTING_PYTHON
 
 # Always preflight the reused environment; an install marker is not a health check.
 "$PYTHON" - <<'PY'

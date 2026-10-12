@@ -45,7 +45,7 @@ import numpy as np
 # 版本与模型标识（进 trace / artifact，§5.2 / §19.2）
 # ---------------------------------------------------------------------------
 
-METRIC_FUSION_VERSION: str = "metric-fusion-v6"
+METRIC_FUSION_VERSION: str = "metric-fusion-v11-aligned-1"
 METRIC_MODEL_MOGE2 = "moge2"
 METRIC_MODEL_METRIC3D_V2 = "metric3d_v2"
 METRIC_MODEL_NONE = "none"
@@ -211,7 +211,7 @@ def per_frame_scale(
         vm = np.asarray(valid_mask)
         if vm.shape != dm.shape:
             return _empty_frame(frame_idx)      # 掩码不同网格 → fail-closed
-        ok &= vm.astype(bool)
+        ok &= np.isfinite(vm) & (vm > 0)
     if use_conf and vggt_conf is not None:
         cf = np.asarray(vggt_conf, dtype=np.float64)
         if cf.shape == dm.shape:
@@ -304,15 +304,16 @@ def fuse_metric_scale(
     n_total = len(depth_vggt_list)
     n_metric = len(depth_metric_list)
     n_mask = n_total if valid_masks is None else len(valid_masks)
+    n_conf = n_total if vggt_conf_list is None else len(vggt_conf_list)
 
     # ---- 契约前置检查：序列长度不一致 → 直接失败（不猜对齐方式）----
-    if len({n_total, n_metric, n_mask}) != 1:
+    if len({n_total, n_metric, n_mask, n_conf}) != 1:
         return ScaleFusionResult(
             status="failed", metric_scale=None, scale_self_consistency=None,
             n_frames_valid=0, n_frames_total=int(n_total), valid_frame_ratio=0.0,
             outlier_frames=[], per_frame=[], mad=None, model=str(model),
             note=(f"输入序列长度不一致（vggt={n_total} / metric={n_metric} / "
-                  f"mask={n_mask}）→ fail-closed，不猜帧对齐"))
+                  f"mask={n_mask} / conf={n_conf}）→ fail-closed，不猜帧对齐"))
     if n_total == 0:
         return ScaleFusionResult(
             status="failed", metric_scale=None, scale_self_consistency=None,
@@ -737,7 +738,7 @@ def _to_moge_tensor(rgb: np.ndarray, torch_mod: Any) -> Any:
         f = a.astype(np.float32) / 255.0
     else:
         f = a.astype(np.float32)
-        if float(np.max(f)) > 1.0 + 1e-3:  # 浮点输入必须是 [0,1]，不替调用方猜 0-255
+        if not np.all(np.isfinite(f)) or np.min(f) < 0 or np.max(f) > 1.0 + 1e-3:
             raise ValueError("浮点 rgb 必须已归一到 [0,1]；疑似 0–255 输入 → fail-closed")
     t = torch_mod.from_numpy(np.ascontiguousarray(f)).permute(2, 0, 1).unsqueeze(0)
     return t.contiguous()
@@ -751,20 +752,6 @@ def _black_border_mask(rgb: np.ndarray) -> np.ndarray:
     else:
         luma = a.astype(np.float64).mean(axis=2) * (255.0 if float(np.max(a)) <= 1.0 else 1.0)
     return luma > float(MOGE2_BLACK_LUMA_MAX)
-
-
-def _first_finite_scalar(v: Any) -> float:
-    """从张量/数组/标量里取第一个有限数（拿不到 → 1.0，即不额外折算）。
-
-    MoGe 的 `metric_scale` 是**逐图一个标量**（v1 口径 `depth × metric_scale`）；
-    这里只取第一个有限值，不做任何聚合猜测。
-    """
-    a = v.detach().float().cpu().numpy() if hasattr(v, "detach") else v
-    arr = np.asarray(a, dtype=np.float64).reshape(-1)
-    for x in arr:
-        if np.isfinite(x):
-            return float(x)
-    return 1.0
 
 
 class _MoGe2MetricModel:
@@ -786,16 +773,19 @@ class _MoGe2MetricModel:
               intrinsics: Optional[np.ndarray] = None) -> MetricDepthOutput:
         """单帧前向：米制深度 + (高置信 ∧ 非黑边) 掩码 + 内参/fov 审计字段。
 
-        `fov_x` 由 VGGT 的 K 换算后传入（§11.2 相机对齐）；权重自带的
-        ``metric_scale`` 系数按 MoGe 官方口径 ``depth × metric_scale`` 折算成米
-        （MoGe-2 该系数应≈1.0；若装包后与官方 API 不符，**只改这一处**）。
+        MoGe-2 v2.infer 已在内部应用 metric_scale；depth/points 直接以米返回。
+        不猜旧版本签名、不重复乘尺度，API 不符时保留明确失败。
         """
         torch = self._torch
         img = _to_moge_tensor(rgb, torch)
-        # 主点推导（尺度无关）；宽度仅作兜底，且必须是 K 所在网格的宽度。
-        # 注意 `img` 是**原图**分辨率，与 VGGT 深度网格不同 —— 只有主点路径
-        # 才对这个不一致免疫（见 fov_x_deg_from_intrinsics 的实测说明）。
-        fov_x_deg = fov_x_deg_from_intrinsics(intrinsics)
+        # Caller supplies the exact VGGT crop grid; K must describe that grid.
+        k = np.asarray(intrinsics, dtype=np.float64)
+        if k.shape != (3, 3) or not np.all(np.isfinite(k)) or min(k[0, 0], k[1, 1]) <= 0:
+            raise RuntimeError("MoGe-2 requires finite VGGT intrinsics on the input grid")
+        h, w = np.asarray(rgb).shape[:2]
+        if not np.allclose(k[:2, 2], [w / 2, h / 2], atol=1.0):
+            raise RuntimeError("MoGe-2 FOV alignment requires a centered VGGT camera")
+        fov_x_deg = fov_x_deg_from_intrinsics(k, image_width=w)
         fov_arg = fov_x_deg
         if fov_arg is not None and not MOGE2_FOV_UNIT_DEGREES:  # pragma: no cover
             fov_arg = float(np.radians(fov_x_deg))
@@ -803,19 +793,16 @@ class _MoGe2MetricModel:
             kwargs: dict[str, Any] = {}
             if fov_arg is not None:
                 kwargs["fov_x"] = fov_arg
-            try:
-                out = self._model.infer(img.to(self.device), use_fp16=MOGE2_USE_FP16,
-                                        **kwargs)
-            except TypeError:  # 老/新签名差异（如无 use_fp16）→ 退化为最小调用
-                out = self._model.infer(img.to(self.device), **kwargs)
+            out = self._model.infer(img.to(self.device), use_fp16=MOGE2_USE_FP16,
+                                    **kwargs)
         if not isinstance(out, Mapping) or "depth" not in out:
             raise RuntimeError(
                 "MoGe-2 输出缺 depth 键（API 变更？）→ 拒绝返回假深度")
         depth = _to_numpy_2d(out["depth"])
-        if depth is None:
+        if depth is None or depth.shape != (h, w):
             raise RuntimeError("MoGe-2 输出 depth 形状非法 → 拒绝返回假深度")
         if "metric_scale" in out:
-            depth = depth * _first_finite_scalar(out["metric_scale"])
+            raise RuntimeError("Unexpected metric_scale key: pinned MoGe-2 infer returns meters")
         finite = np.isfinite(depth) & (depth > 0.0)
         if not bool(finite.any()):
             raise RuntimeError("MoGe-2 输出 depth 全为非有限/非正 → 拒绝返回假深度")
@@ -825,7 +812,7 @@ class _MoGe2MetricModel:
         mask = _to_numpy_2d(out["mask"])
         if mask is None or mask.shape != depth.shape:
             raise RuntimeError("MoGe-2 输出 mask 与 depth 形状不一致 → 拒绝伪造掩码")
-        valid = finite & mask.astype(bool) & _black_border_mask(rgb)
+        valid = finite & np.isfinite(mask) & (mask > 0) & _black_border_mask(rgb)
         points = _to_numpy_3d(out.get("points"))
         intr = _to_numpy_2d(out.get("intrinsics"), allow_batch=True)
         return MetricDepthOutput(
@@ -908,6 +895,10 @@ def make_moge2_model(device: str = "cuda",
     if Path(ckpt).is_dir():
         # The pinned MoGe API loads a checkpoint file, not an HF snapshot directory.
         ckpt = str(Path(ckpt) / "model.pt")
+    elif not Path(ckpt).is_file():
+        from huggingface_hub import hf_hub_download
+
+        ckpt = hf_hub_download(repo_id=ckpt, filename="model.pt")
     try:
         model = MoGeModel.from_pretrained(ckpt)
     except Exception as exc:  # noqa: BLE001
@@ -916,7 +907,11 @@ def make_moge2_model(device: str = "cuda",
             "离线环境请先预下载权重；**不提供任何随机初始化/占位模型**，"
             "因为那会产出看着像米制、实则无意义的深度。") from exc
     model = model.to(dev).eval()
-    return _MoGe2MetricModel(model=model, torch_mod=torch, device=dev, checkpoint=ckpt)
+    wrapped = _MoGe2MetricModel(model=model, torch_mod=torch, device=dev, checkpoint=ckpt)
+    from skill3d.reconstruction.metric_evidence import model_identity
+
+    wrapped.identity = model_identity(MoGeModel, Path(ckpt))
+    return wrapped
 
 
 __all__ = [

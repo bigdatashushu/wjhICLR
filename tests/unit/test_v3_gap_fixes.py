@@ -320,7 +320,8 @@ def test_scale_artifact_requires_metric_gate_and_metric_question(tmp_path):
         "quality_status": "computed", "quality": _quality(),
         "metric_scale": 5.0, "scale_fusion_status": "success",
         "scale_self_consistency": 0.05, "per_frame_scale_ref": str(receipt),
-        "metric_model": "moge2", "metric_fusion_version": "metric-fusion-v6"})
+        # Synthetic gate fixture; real MoGe evidence requires bound source hashes.
+        "metric_model": "none", "metric_fusion_version": "metric-fusion-v6"})
     metric_scene = build_scene_state(fused, m5=_m5(), objects=["obj_0"],
                                      artifact_ref="a", question_type="object_abs_distance")
     assert metric_scene.metric_gate_passed is True

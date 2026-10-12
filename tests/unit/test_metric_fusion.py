@@ -479,7 +479,7 @@ def test_module_import_pulls_no_heavy_dependencies():
     code = ("import sys, skill3d.reconstruction.metric_fusion as m; "
             "assert 'torch' not in sys.modules, 'torch 被 import 期拉进来了'; "
             "assert 'moge' not in sys.modules, 'moge 被 import 期拉进来了'; "
-            "assert m.METRIC_FUSION_VERSION == 'metric-fusion-v6'")
+            f"assert m.METRIC_FUSION_VERSION == {METRIC_FUSION_VERSION!r}")
     env = {**os.environ, "PYTHONPATH": str(src) + os.pathsep + os.environ.get("PYTHONPATH", "")}
     p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
     assert p.returncode == 0, p.stderr

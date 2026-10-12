@@ -105,7 +105,13 @@ def _valid_frame_ratio(art: ReconstructionArtifact) -> float:
     try:
         from skill3d.reconstruction.metric_fusion import read_per_frame_receipt
 
-        rec = read_per_frame_receipt(ref)
+        if art.metric_model not in (None, "none"):
+            from skill3d.reconstruction.metric_evidence import validated_receipt
+
+            rec = validated_receipt(art)
+        else:
+            # Explicit synthetic fixtures have no real metric model or checkpoint.
+            rec = read_per_frame_receipt(ref)
     except Exception:  # noqa: BLE001 - 缺文件/坏 JSON → 视为无证据
         return 0.0
     try:

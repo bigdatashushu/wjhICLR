@@ -14,7 +14,7 @@ import math
 import os
 import shutil
 import uuid
-from dataclasses import fields, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -53,6 +53,7 @@ ARMS = ("B01", "B11")
 ARTIFACT_REFS = (
     "c2w_list", "intrinsics", "depth_maps", "point_map", "point_conf",
     "depth_conf", "track_list", "per_frame_scale_ref",
+    "metric_depth_maps", "metric_valid_masks",
 )
 OBJECT_REFS = ("mask_per_frame", "pointcloud_world", "pointconf_world", "centroid_ref")
 
@@ -177,7 +178,16 @@ def input_identity(item: EpisodeItem, artifact_path: str | Path) -> dict:
         raise PairingError(f"{ep.qa_id}: invalid RGB pixels")
     from skill3d.adapters.frame_set import with_pixel_identity
 
-    with_pixel_identity(fs, item.pixels)
+    actual_frames = with_pixel_identity(fs, item.pixels)
+    if art.metric_model not in (None, "none"):
+        from skill3d.reconstruction.metric_evidence import validated_receipt
+
+        if actual_frames.cache_identity() != art.metric_input_identity:
+            raise PairingError(f"{ep.qa_id}: metric input pixels mismatch")
+        try:
+            validated_receipt(art)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise PairingError(f"{ep.qa_id}: invalid metric evidence: {exc}") from exc
     for key, actual, expected in (
         ("dataset", fs.dataset_id, ep.dataset),
         ("scene", fs.scene_name, ep.scene_name),
@@ -299,7 +309,12 @@ def _clone_tree(source: Path, dest: Path) -> None:
     for path in dest.rglob("*.json"):
         # Runtime geometry schema uses NaN for unavailable diagnostic values.
         # Keep that existing serialization contract; report JSON uses null.
-        path.write_text(json.dumps(_rebase(json.loads(path.read_text()), source, dest),
+        value = json.loads(path.read_text())
+        # Metric receipts contain content hashes, not mutable file references.
+        # Keep their exact bytes: the artifact binds the receipt's SHA256.
+        if isinstance(value, dict) and value.get("request_sha256") and value.get("metric_fusion_version"):
+            continue
+        path.write_text(json.dumps(_rebase(value, source, dest),
                                    ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
@@ -319,11 +334,16 @@ def quality_contract() -> dict:
         "online/config.py", "online/recovery.py",
         "synthesis/program_assembler.py", "synthesis/prompt_builder.py", "tools/docs_v11.py",
         "adapters/frame_set.py", "adapters/episode_source.py",
-        "reconstruction/vggt_runner.py",
+        "reconstruction/vggt_runner.py", "reconstruction/metric_fusion.py",
+        "reconstruction/metric_evidence.py", "reconstruction/image_grid.py",
         "sandbox/kernel.py", "sandbox/receipt.py",
     )
+    from skill3d.reconstruction.metric_fusion import threshold_snapshot, METRIC_FUSION_VERSION
+
     value = {
         "enabled": True, "metric_version": m4_main_gate.M4_GATE_VERSION,
+        "metric_fusion_version": METRIC_FUSION_VERSION,
+        "metric_fusion_thresholds": threshold_snapshot(),
         "default_thresholds": m4_main_gate.default_thresholds(),
         "overall_quality_threshold": scene_state.TH_OVERALL_QUALITY,
         "source_sha256": {p.name: _file_hash(p) for p in sorted(root.glob("*.py"))},
@@ -1053,6 +1073,7 @@ def run_skill_ablation_v11(
                         llm=llm,
                         input_error=item.input_error,
                     )
+                    _write(arm_root / "outcome.json", asdict(out))
                     row = _arm_result(
                         out,
                         llm,
@@ -1133,6 +1154,7 @@ def run_skill_ablation_v11(
                                 [np.load(p, allow_pickle=False) for p in sorted(local.glob("frame_*.npy"))],
                                 arm_cfg, trace_store=trace, llm=llm, prepared_binding=_load_binding(local))
                         llm.failures.extend(detection_errors)
+                        _write(arm_root / "outcome.json", asdict(out))
                         row = _arm_result(
                             out, llm, identity, input_hash, config_hash,
                             ({

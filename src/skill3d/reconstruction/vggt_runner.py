@@ -148,11 +148,10 @@ def run_vggt(
     # ---------------- 第②层：世界系契约（D5）----------------
     wf = estimate_world_frame(preds["c2w"])
 
-    # ---------------- 第③层：度量尺度融合（D1/D2 [待实验]）----------------
-    fusion = _run_metric_fusion(
-        metric_depth_model, metric_model_name,
-        frames=frames, preds=preds, intrinsics=preds["intrinsic"],
-        out_dir=out, scene_name=storage_name)
+    # Release VGGT activations before the per-frame metric model uses this GPU.
+    del model, images
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     # ---- 落盘并组装 artifact（字段为数组文件 ref，见 §5.2）----
     def _save(name: str, arr) -> str:
@@ -171,13 +170,16 @@ def run_vggt(
 
     artifact = ReconstructionArtifact(
         artifact_id=f"vggt-{scene_name}",
-        artifact_version=_artifact_version(scene_name.encode() + str(len(frames)).encode()),
+        artifact_version=_artifact_version(
+            (cache_frames.cache_identity() + hashlib.sha256(
+                np.ascontiguousarray(preds["depth_map"]).tobytes()).hexdigest()).encode()),
         scene_name=scene_name,
         recon_method="vggt",
         frame_ids=frame_ids,
         source_frame_indices=source_frame_indices,
         timestamps=timestamps,
         frame_set_hash=fsh,
+        reconstruction_input_identity=cache_frames.cache_identity(),
         c2w_list=c2w_ref,
         intrinsics=intr_ref,
         depth_maps=depth_ref,
@@ -189,19 +191,19 @@ def run_vggt(
         world_up=wf.world_up,
         handedness=wf.handedness,      # type: ignore[arg-type]
         world_frame_status=wf.status,  # type: ignore[arg-type]
-        # 度量尺度融合（默认 not_run；PoC 通过前 metric_scale 必须为 None）
-        metric_scale=fusion.metric_scale,
-        scale_self_consistency=fusion.scale_self_consistency,
-        per_frame_scale_ref=fusion.receipt_ref,
-        metric_model=fusion.model,     # type: ignore[arg-type]
-        metric_fusion_version=fusion.version,
-        scale_fusion_status=fusion.status,  # type: ignore[arg-type]
+        # Metric evidence is attached only after source arrays have been persisted.
+        metric_model="none",
         quality_status="not_computed",
         quality=None,
         confidence=ConfidenceMap(per_point_confidence=pconf_ref,
                                  coverage_count_per_frame=""),
         # D11：G5 永久 not_available（本 Schema 已固定，无需显式赋值）
     )
+    if metric_depth_model is not None:
+        from skill3d.reconstruction.metric_evidence import attach_metric_evidence
+
+        artifact = attach_metric_evidence(
+            artifact, frames, cache_frames, metric_depth_model, out)
     if compute_quality:
         from skill3d.reconstruction_gate import quality_metrics as qm
 
@@ -212,94 +214,6 @@ def run_vggt(
             artifact_path=quality_artifact_path,
         )
     return artifact
-
-
-class _FusionOutcome:
-    """融合结果的 artifact 视图（把 `ScaleFusionResult` 映射到 §5.2 字段）。"""
-
-    __slots__ = ("status", "metric_scale", "scale_self_consistency",
-                 "receipt_ref", "version", "model")
-
-    def __init__(self, *, status: str, metric_scale: Optional[float],
-                 scale_self_consistency: Optional[float],
-                 receipt_ref: Optional[str], version: str, model: str) -> None:
-        self.status = status
-        self.metric_scale = metric_scale
-        self.scale_self_consistency = scale_self_consistency
-        self.receipt_ref = receipt_ref
-        self.version = version
-        self.model = model
-
-
-def _run_metric_fusion(model, model_name: str, *, frames, preds, intrinsics,
-                       out_dir: Path, scene_name: str) -> _FusionOutcome:
-    """逐帧度量深度 → 跨帧尺度融合（§11.1）；模型缺失即 `not_run`。
-
-    **绝不**在没有真模型时编造尺度（§11.4 失败纪律：不达标即关闭支路，
-    不回退多锚点/校准池）。
-    """
-    from skill3d.reconstruction import metric_fusion as mf
-
-    if model is None:
-        return _FusionOutcome(
-            status="not_run", metric_scale=None, scale_self_consistency=None,
-            receipt_ref=None, version=mf.METRIC_FUSION_VERSION, model="none")
-
-    depth_vggt = np.asarray(preds["depth_map"], dtype=np.float64)
-    n = depth_vggt.shape[0]
-    metric_list: list[Optional[np.ndarray]] = []
-    valid_masks: list[Optional[np.ndarray]] = []
-    conf_list: list[Optional[np.ndarray]] = []
-    dconf = preds.get("depth_conf")
-    for i in range(n):
-        K = np.asarray(intrinsics, dtype=np.float64)
-        K_i = K[i] if K.ndim == 3 else K
-        try:
-            out = model.infer(np.asarray(frames[i]), K_i)
-        except Exception:  # noqa: BLE001 - 单帧失败不阻断（该帧 s_k 记 None）
-            metric_list.append(None)
-            valid_masks.append(None)
-            conf_list.append(None)
-            continue
-        d = np.asarray(out.depth_metric, dtype=np.float64)
-        vggt_hw = depth_vggt[i].shape
-        if d.shape != vggt_hw:
-            # 度量模型输出在输入 RGB 分辨率；必须重采样到 VGGT 深度网格，
-            # 否则逐像素比值没有意义（§11.2 相机对齐的一部分）。
-            import cv2
-
-            d = cv2.resize(d, (vggt_hw[1], vggt_hw[0]), interpolation=cv2.INTER_LINEAR)
-            vm = np.asarray(out.valid_mask, dtype=np.uint8)
-            vm = cv2.resize(vm, (vggt_hw[1], vggt_hw[0]),
-                            interpolation=cv2.INTER_NEAREST).astype(bool)
-        else:
-            vm = np.asarray(out.valid_mask, dtype=bool)
-        metric_list.append(d)
-        valid_masks.append(vm)
-        conf_list.append(None if dconf is None else np.asarray(dconf[i], dtype=np.float64))
-
-    # conf 的 conf-warp 单调性自检属于 M4（需要 warp 残差，此时还没算）；
-    # 按 §10.3 的纪律，**未自检的 conf 不作任何过滤**（传 None = 保守不用）。
-    fusion = mf.fuse_metric_scale(
-        metric_list, [depth_vggt[i] for i in range(n)], valid_masks,
-        conf_list,
-        conf_warp_monotonic=None,
-        model=str(model_name or getattr(model, "name", "none")),
-    )
-    receipt_ref = None
-    try:
-        receipt_path = out_dir / f"{scene_name}_scale_receipt.json"
-        mf.write_per_frame_receipt(fusion, receipt_path)
-        receipt_ref = str(receipt_path)
-    except Exception:  # noqa: BLE001 - receipt 缺失 → valid_frame_ratio 读不到 → 门不通过
-        receipt_ref = None
-    return _FusionOutcome(
-        status=fusion.status,
-        metric_scale=fusion.metric_scale,
-        scale_self_consistency=fusion.scale_self_consistency,
-        receipt_ref=receipt_ref,
-        version=fusion.version,
-        model=fusion.model)
 
 
 def _to_numpy(x) -> np.ndarray:

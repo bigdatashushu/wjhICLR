@@ -16,6 +16,8 @@ dependencies = [
     "numpy>=2.0,<3",
     "scipy>=1.14,<2",
     "opencv-python>=4.8.0",
+    # Match the vendored VGGT PIL bicubic crop grid for metric depth and masks.
+    "Pillow>=10,<13",
     "pyarrow",
     "datasets",
     "jinja2",

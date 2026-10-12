@@ -174,6 +174,7 @@ class ReconstructionArtifact(Spec):
     source_frame_indices: list[int] = []
     timestamps: list[float] = []
     frame_set_hash: str = ""
+    reconstruction_input_identity: str = ""     # 源标识 + 实际可读像素，旧缓存不得猜配
 
     # ---- 几何产物 ref（VGGT 前馈）----
     c2w_list: str                         # camera→world；世界系=首帧相机系，c2w[0]=I
@@ -193,6 +194,11 @@ class ReconstructionArtifact(Spec):
     metric_scale: Optional[float] = None          # s_global = median_k(s_k)
     scale_self_consistency: Optional[float] = None  # 32 帧 s_k 的 std/median（离散度）
     per_frame_scale_ref: Optional[str] = None     # 32 个 s_k、离群帧列表（只读 receipt）
+    metric_depth_maps: Optional[str] = None      # 同 VGGT 网格的米制深度，失败帧保留 NaN
+    metric_valid_masks: Optional[str] = None     # 模型有效 ∧ 非边框 ∧ 有限正深度
+    metric_input_identity: str = ""             # 冻结源帧及像素身份
+    metric_request_sha256: str = ""             # 模型/权重/参数/源数组身份
+    metric_receipt_sha256: str = ""             # 收据与 artifact 绑定，防止跨场景移植
     metric_model: Optional[Literal["moge2", "metric3d_v2", "none"]] = None
     metric_fusion_version: Optional[str] = None
     scale_fusion_status: Literal["success", "failed", "not_run"] = "not_run"

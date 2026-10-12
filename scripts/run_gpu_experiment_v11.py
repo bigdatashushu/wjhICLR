@@ -445,6 +445,11 @@ def _start_vllm(
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    _write_json(run_root / "vllm_process.json", {
+        "pid": process.pid, "command": command,
+        "cuda_visible_devices": process_env["CUDA_VISIBLE_DEVICES"],
+        "started_unix": time.time(),
+    })
     base_url = f"http://{runtime['host']}:{runtime['port']}"
     try:
         _wait_vllm(
@@ -561,6 +566,43 @@ def _pipeline(
         dict(runtime_config), allow_unicode=True, sort_keys=True), encoding="utf-8")
     _write_json(run_root / "runtime_configuration.json", config_receipt(runtime_config))
     config_path = str(config_file)
+    validation = experiment.get("metric_validation")
+    if validation:
+        if experiment.get("formal") or experiment.get("run_evolution"):
+            raise GPUExperimentError("metric_validation requires development mode without evolution")
+        if not cfg["weights"]["moge2"].get("enabled"):
+            raise GPUExperimentError("metric_validation requires weights.moge2.enabled=true")
+        common = [
+            "--panel", str(validation["panel"]),
+            "--archive-root", str(validation["archive_root"]),
+            "--output", str(run_root / "metric_validation"),
+        ]
+        script = str(root / "scripts" / "run_metric_validation_v11.py")
+        prepare = [python, script, "prepare", *common]
+        if validation.get("first_scene_only"):
+            prepare.append("--first-scene-only")
+        if validation.get("prepared_cache"):
+            prepare.extend(["--prepared-cache", str(validation["prepared_cache"])])
+        _run(prepare, cwd=root, env=geometry_env, dry_run=dry_run,
+             commands=commands, stage="metric_prepare")
+        if validation.get("prepare_only"):
+            return commands
+        process = _start_vllm(root, run_root, cfg, weights, env,
+                             dry_run=dry_run, commands=commands)
+        try:
+            _run([python, script, "solve", *common, "--config", config_path,
+                  "--library-root", str(library)],
+                 cwd=root, env=geometry_env, dry_run=dry_run,
+                 commands=commands, stage="metric_b01_b11")
+        finally:
+            if process is not None and process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=30)
+        return commands
     recon_dir = run_root / "reconstructions"
     question_type = str(experiment["question_type"])
     datasets = str(experiment.get("datasets") or "")

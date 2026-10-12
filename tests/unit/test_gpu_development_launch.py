@@ -30,7 +30,7 @@ def working_repo(tmp_path):
     _git(repo, "config", "user.email", "tests@example.com")
     _git(repo, "config", "user.name", "Launcher Tests")
     names = [
-        "start_harness3d.sh", "scripts/bootstrap_and_run_v11.sh",
+        "start_harness.sh", "start_harness3d.sh", "scripts/bootstrap_and_run_v11.sh",
         "scripts/prepare_gpu_run_v11.py", "scripts/run_gpu_experiment_v11.py",
         "src/skill3d/__init__.py", "src/skill3d/infra/__init__.py",
         "src/skill3d/infra/experiment_startup.py", "pyproject.toml",
@@ -122,13 +122,15 @@ def test_install_identity_ignores_source_commit_and_runtime_budget(working_repo)
     assert environment_contract(working_repo, cfg)["sha256"] != original
 
 
-@pytest.mark.parametrize("entry", ["start", "bootstrap", "python"])
+@pytest.mark.parametrize("entry", ["start", "alias", "bootstrap", "python"])
 def test_all_three_dry_run_entries_use_dirty_snapshot_without_environment(working_repo, tmp_path, entry):
     work = tmp_path / f"{entry} output"
     cfg = working_repo / "configs/gpu_experiment_v11.yaml"
     common = ["--config", str(cfg), "--work-dir", str(work), "--run-id", "dirty", "--dry-run"]
     if entry == "start":
         command = ["bash", str(working_repo / "start_harness3d.sh"), *common]
+    elif entry == "alias":
+        command = ["bash", str(working_repo / "start_harness.sh"), *common]
     elif entry == "bootstrap":
         command = ["bash", str(working_repo / "scripts/bootstrap_and_run_v11.sh"), *common]
     else:
@@ -157,6 +159,31 @@ def test_formal_entry_rejects_dirty_tree_before_fetching(working_repo, tmp_path)
         env={**os.environ, "PYTHON_BIN": sys.executable}, capture_output=True, text=True)
     assert result.returncode == 2 and "working tree is dirty" in result.stderr
     assert not (tmp_path / "formal/source").exists()
+
+
+@pytest.mark.parametrize("smoke", [False, True])
+def test_metric_panel_route_never_runs_learning_or_evolution(working_repo, tmp_path, smoke):
+    path = working_repo / "configs/gpu_experiment_v11.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    cfg["weights"]["moge2"]["enabled"] = True
+    cfg["experiment"]["metric_validation"] = {
+        "panel": "/external/panel.json", "archive_root": "/external/archive"}
+    path.write_text(yaml.safe_dump(cfg))
+    work = tmp_path / "panel-run"
+    command = ["bash", str(working_repo / "start_harness.sh"), "--config", str(path),
+               "--work-dir", str(work), "--run-id", "panel", "--dry-run"]
+    if smoke:
+        command.append("--smoke")
+    result = subprocess.run(command, cwd=working_repo,
+                            env={**os.environ, "PYTHON_BIN": sys.executable},
+                            text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads((work / "runs/panel/pipeline_manifest.json").read_text())
+    stages = [row["stage"] for row in manifest["commands"]]
+    assert stages == (["metric_prepare"] if smoke else
+                      ["metric_prepare", "serve_qwen", "metric_b01_b11"])
+    assert ("--first-scene-only" in manifest["commands"][0]["command"]) == smoke
+    assert manifest["formal_result_eligible"] is False
 
 
 def test_bootstrap_reuses_environment_for_code_edit_and_updates_for_dependency_edit(
@@ -231,3 +258,30 @@ def test_mode_configuration_keeps_dev_budget_and_smoke_contract():
     assert (smoke["experiment"]["induction_limit"], smoke["experiment"]["inner_limit"]) == (2, 2)
     assert smoke["experiment"]["run_evolution"] is False
     assert dev["runtime"] == smoke["runtime"] == cfg["runtime"]
+
+
+def test_existing_environment_requires_explicit_dependency_exception(working_repo, monkeypatch):
+    import importlib.metadata as metadata
+    import types
+    from skill3d.infra.experiment_startup import validate_existing_environment
+
+    (working_repo / "pyproject.toml").write_text(
+        '[build-system]\nrequires=["setuptools"]\n[project]\n'
+        'dependencies=["pydantic>=2.13"]\nrequires-python=">=3.11"\n')
+    cfg = yaml.safe_load((ROOT / "configs/gpu_experiment_v11.yaml").read_text())
+    cfg["environment"]["python"] = f"{sys.version_info.major}.{sys.version_info.minor}"
+    versions = {"pydantic": "2.12.5", "vllm": cfg["environment"]["vllm_version"]}
+    monkeypatch.setattr(metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(metadata, "distributions", lambda: [])
+    sam = types.ModuleType("sam2")
+    sam.__file__ = __file__
+    monkeypatch.setitem(sys.modules, "sam2", sam)
+    with pytest.raises(StartupError, match="does not satisfy"):
+        validate_existing_environment(working_repo, cfg)
+    cfg["environment"]["existing_dependency_versions"] = {"pydantic": "2.12.5"}
+    receipt = validate_existing_environment(working_repo, cfg)
+    assert receipt["mode"] == "validated_existing"
+    assert receipt["declared_dependency_exceptions"]["pydantic"]["installed"] == "2.12.5"
+    versions["pydantic"] = "2.12.4"
+    with pytest.raises(StartupError, match="explicit version pin"):
+        validate_existing_environment(working_repo, cfg)

@@ -42,15 +42,16 @@ def test_plan_groups_by_scene():
     assert all(j.status == "pending" for j in jobs)
 
 
-def test_plan_skips_existing_artifact(tmp_path):
-    """已有 artifact → 默认跳过（断点恢复幂等）；--force 时重跑。"""
+def test_plan_rejects_unidentified_cache_without_overwriting(tmp_path):
+    """An existing filename alone cannot prove cache identity; --force is explicit."""
     items = [_item("scene-a", "a1")]
     out = artifact_path(tmp_path, "scene-a", "vggt")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("{}", encoding="utf-8")
 
     jobs = plan_scene_jobs(items, tmp_path, "vggt")
-    assert jobs[0].status == "skipped" and jobs[0].artifact_ref == str(out)
+    assert jobs[0].status == "failed" and "incompatible cache" in jobs[0].note
+    assert out.read_text() == "{}"
 
     jobs_force = plan_scene_jobs(items, tmp_path, "vggt", force=True)
     assert jobs_force[0].status == "pending"

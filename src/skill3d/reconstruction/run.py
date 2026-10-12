@@ -88,8 +88,9 @@ def resolve_artifact_path(recon_dir: str | Path, scene_name: str, method: str, *
 
 
 def plan_scene_jobs(items: Sequence[EpisodeItem], recon_dir: str | Path, method: str,
-                    force: bool = False) -> list[SceneJob]:
-    """按 scene 归并 episode → 场景作业表；已有 artifact 且 !force → 标 skipped。"""
+                    force: bool = False, *, metric_depth_model=None,
+                    metric_enabled: bool = False) -> list[SceneJob]:
+    """Only reuse a cache matching frozen pixels, fusion mode and model contract."""
     by_scene: dict[str, SceneJob] = {}
     for it in items:
         ep = it.episode
@@ -107,9 +108,36 @@ def plan_scene_jobs(items: Sequence[EpisodeItem], recon_dir: str | Path, method:
         p, _used_legacy = resolve_artifact_path(
             recon_dir, job.scene_name, method, frame_set=job.frame_set)
         if p.exists() and not force:
-            job.status = "skipped"
-            job.artifact_ref = str(p)
-            job.note = "artifact 已存在（断点恢复幂等，§4 M21）"
+            try:
+                from skill3d.reconstruction.metric_evidence import (
+                    GEOMETRY_REFS, fusion_contract, source_identity, validated_receipt,
+                )
+
+                art = ReconstructionArtifact.model_validate_json(p.read_bytes())
+                item = next(it for it in items if it.episode.scene_name == job.scene_name)
+                identity = source_identity(item.pixels, item.episode.frame_set)
+                if (art.scene_name != job.scene_name
+                        or art.reconstruction_input_identity != identity
+                        or art.frame_ids != list(item.episode.frame_set.readable_frame_ids)):
+                    raise ValueError("source/frame/pixel identity mismatch")
+                for key in GEOMETRY_REFS:
+                    ref = getattr(art, key)
+                    if ref and not Path(ref).is_file():
+                        raise ValueError(f"missing geometry array: {key}")
+                enabled = metric_enabled or metric_depth_model is not None
+                if enabled:
+                    rec = validated_receipt(art)
+                    if metric_depth_model is None or rec["request"]["contract"] != fusion_contract(
+                            metric_depth_model):
+                        raise ValueError("metric model/weights/parameters identity mismatch")
+                elif art.scale_fusion_status != "not_run" or art.metric_model not in (None, "none"):
+                    raise ValueError("requested fusion off but cache has metric evidence")
+                job.status, job.artifact_ref = "skipped", str(p)
+                job.note = "cache identity verified"
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                # Do not overwrite old evidence or silently rerun VGGT on a mismatched cache.
+                job.status = "failed"
+                job.note = f"incompatible cache; use a new recon-dir or explicit --force: {exc}"
     return jobs
 
 
@@ -301,7 +329,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # v6 §20：官方 VGGSfM BA 与 `vggt_sparse_ba` 已整体废止（生产 hard-disable 的依据
     # 与历史码归档在 `skill3d/legacy/retired/`），CLI 不再提供任何 BA 开关。
-    jobs = plan_scene_jobs(items, recon_dir, args.method, force=args.force)
+    metric_model = None if args.plan_only else _maybe_moge2(args)
+    jobs = plan_scene_jobs(items, recon_dir, args.method, force=args.force,
+                           metric_depth_model=metric_model, metric_enabled=args.moge2)
     if args.scene_shard:
         import hashlib as _hl
 
@@ -329,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     jobs = run_jobs(jobs, items_by_scene, recon_dir, args.method, gpus=gpus,
-                    metric_depth_model=_maybe_moge2(args),
+                    metric_depth_model=metric_model,
                     n_frames=args.n_frames)
     # 分片并行时**不得**都写 manifest.json（2026-09-22 实测：6 个 shard 互相覆盖，
     # 最终只剩最后一个 shard 的 5 条 job → 整批 24 个 scene 的 provenance 丢失）。

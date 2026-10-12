@@ -54,6 +54,7 @@ Environment overrides:
   HARNESS3D_DETECTOR_ENDPOINT, HARNESS3D_REQUIRE_DETECTOR
   HARNESS3D_MIN_FREE_GPU_MIB, HARNESS3D_CONFIG, HARNESS3D_WORK_DIR
   QWEN_EXISTING_PATH, VGGT_EXISTING_PATH, SAM2_EXISTING_PATH, SAM2_CONFIG
+  MOGE2_EXISTING_PATH, HARNESS3D_EXISTING_PYTHON (validated, never pip-modified)
   CODE_REF, REPO_URL, PYTHON_BIN
 
 Formal runs require a committed and pushed CODE_REF, licensed VSI-Bench videos,
@@ -171,6 +172,8 @@ use_existing_dir VGGT_EXISTING_PATH \
   "/home/cvailab/.cache/huggingface/geothinker/VGGT-1B"
 use_existing_dir SAM2_EXISTING_PATH \
   "/home/cvailab/.cache/huggingface/hub/models--facebook--sam2.1-hiera-large/snapshots/227a114a2f535cd147f82442e7d2038cdd2e5d68"
+use_existing_dir MOGE2_EXISTING_PATH \
+  "/home/cvailab/.cache/huggingface/hub/models--Ruicheng--moge-2-vitl/snapshots/39c4d5e957afe587e04eec59dc2bcc3be5ecd968"
 export SAM2_CONFIG="${SAM2_CONFIG:-configs/sam2.1/sam2.1_hiera_l.yaml}"
 
 "$PYTHON_BIN" - "$CONFIG_SOURCE" "$GENERATED_CONFIG" \

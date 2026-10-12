@@ -448,17 +448,14 @@ def _prompt_box(box: Sequence[float], predictor):
 
 def _resize_mask_to(mask: np.ndarray, shape: tuple[int, int],
                     transform: Optional[dict] = None) -> np.ndarray:
-    """把掩码最近邻缩放到目标 (H, W)（§9 坐标层：SAM2-mask → VGGT-depth-grid）。
-
-    v6 §20 已废止 BA / 正方形中心 pad 路线 → **唯一正确的映射是纯等比缩放**。
-    `transform` 形参保留只为签名兼容（`bind_masks_for_scene` / runner 仍按旧签名
-    传值），**不再应用 pad 仿射**：pad 形态的深度网格在 v6 不存在 ——
-    `ReconstructionArtifact.grid_transform` 已是 legacy-only 字段（出现即 hard fail），
-    故迁移后调用方只会传 `None`，本函数行为与旧实现的 `None` 分支逐位一致。
-    """
+    """原始 SAM2 掩码 → VGGT crop 网格；保留非 VGGT 合成测试网格。"""
     from skill3d.coords import mask_to_grid
 
-    del transform          # v6 §20：square-pad 已废止，纯缩放是唯一正确映射
+    del transform          # 不恢复已废止的 BA grid_transform 字段。
+    if int(shape[1]) == 518:
+        from skill3d.reconstruction.image_grid import mask_on_vggt_grid
+
+        return mask_on_vggt_grid(mask, shape)
     return mask_to_grid(mask, None, shape=(int(shape[0]), int(shape[1])))
 
 
@@ -654,10 +651,7 @@ def bind_masks_to_world(
             depth = depth_maps[frame_idx]
             K = intrinsics[min(frame_idx, len(intrinsics) - 1)]
             c2w = c2w_list[min(frame_idx, len(c2w_list) - 1)]
-            # SAM2 掩码在原始视频分辨率，VGGT 深度在预处理分辨率（518×392；v6 §20
-            # 已废止 BA 的 518×518 正方形 pad 网格）→ 按 §9 纯等比最近邻映射到深度
-            # 网格（硬约束：以重建产物为几何参考）。**无条件调用**：尺寸相同时
-            # `mask_to_grid` 原样返回。
+            # 原图掩码必须经过 VGGT 同样的缩放、中心裁剪及批内填充。
             m = _resize_mask_to(np.asarray(mask, dtype=bool), depth.shape, grid_transform)
             vs, us = np.nonzero(m)
             z = depth[vs, us]
@@ -755,7 +749,7 @@ def _stack_masks(masks: dict[int, np.ndarray], n_frames: int,
     （实测 7 个 scene、全部 54 个对象的 mask 数组 sum 均为 0），而清单里的
     `visible_frames` 由**未缩放的** mask 算出、依然非空 →
     落盘产物与清单自相矛盾，审计与回读（G9/掩码类复算）全部失真。
-    纯缩放是 v6 §20 的唯一正确映射（square-pad 仿射已废止）。
+    映射遵循 VGGT crop 预处理；不使用已废止的 BA square-pad 仿射。
     """
     out = np.zeros((n_frames, int(shape[0]), int(shape[1])), dtype=np.uint8)
     for idx, m in masks.items():
