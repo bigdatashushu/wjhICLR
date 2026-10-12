@@ -85,7 +85,7 @@ def test_only_authorized_evaluation_splits_receive_one_supplement(
         assert sum(p["type"] == "image_url" for p in parts) == 32
         text = "\n".join(p["text"] for p in parts if p["type"] == "text")
         assert all(s not in text for s in ("ReturnAnswer", "1001", "traceback", "SKILL", "import os"))
-        assert visual[0][2] == {"max_tokens": 4096, "seed": 17}
+        assert visual[0][2] == {"max_tokens": 8192, "seed": 17}
         saved = json.loads((tmp_path / "trace/episode_trace.jsonl").read_text().splitlines()[0])
         assert saved["eval_visual_fallback"]["accepted"]
         assert saved["answer_basis"] == "visual_estimate"

@@ -105,7 +105,7 @@ def _client(stream):
     sdk.chat.completions.create.return_value = stream
     client = VLLMClient.__new__(VLLMClient)
     client._clients, client._rr, client.model = [sdk], itertools.cycle([0]), "fixture"
-    client.temperature, client.max_output_tokens = 0.0, 4096
+    client.temperature, client.max_output_tokens = 0.0, 8192
     return client, sdk
 
 
@@ -113,7 +113,7 @@ def test_degenerate_stream_is_closed_without_second_request_or_fake_usage():
     stream = _Stream(["# The available images do not establish a reliable metric answer.\n"] * 250)
     client, sdk = _client(stream)
     with request_phase("program"):
-        text = client.chat([], max_tokens=4096, seed=137)
+        text = client.chat([], max_tokens=8192, seed=137)
     assert stream.closed and stream.consumed < 250
     assert text and len(text.splitlines()) == stream.consumed
     assert client.last_generation["stop_reason"] == "degenerate_repetition"
@@ -122,7 +122,7 @@ def test_degenerate_stream_is_closed_without_second_request_or_fake_usage():
     assert sdk.chat.completions.create.call_count == 1
     kwargs = sdk.chat.completions.create.call_args.kwargs
     assert kwargs["stream"] is True and kwargs["seed"] == 137
-    assert kwargs["max_tokens"] == 4096
+    assert kwargs["max_tokens"] == 8192
 
 
 def test_successful_stream_keeps_real_usage_and_complete_code():
@@ -134,6 +134,7 @@ def test_successful_stream_keeps_real_usage_and_complete_code():
     assert stream.closed and sdk.chat.completions.create.call_count == 1
     assert client.last_usage == usage
     assert client.last_generation["usage_status"] == "measured"
+    assert sdk.chat.completions.create.call_args.kwargs["max_tokens"] == 8192
 
 
 def test_nonstream_response_is_audited_without_retrying_request():

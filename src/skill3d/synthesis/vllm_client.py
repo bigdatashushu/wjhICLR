@@ -81,7 +81,7 @@ class VLLMClient:
         *,
         check_on_init: bool = False,
         temperature: float = 0.0,
-        max_output_tokens: int = 4096,
+        max_output_tokens: int = 8192,
         program_streaming: bool = True,
     ) -> None:
         from openai import OpenAI
@@ -125,7 +125,7 @@ class VLLMClient:
             return False, "；".join(problems)
         return True, f"{len(self._endpoints)} 个 endpoint 就绪（model={self.model}）"
 
-    def chat(self, messages: list[dict], max_tokens: int = 4096,
+    def chat(self, messages: list[dict], max_tokens: int = 8192,
              seed: Optional[int] = None) -> str:
         """greedy（temperature=0.0）生成，返回文本内容。
 

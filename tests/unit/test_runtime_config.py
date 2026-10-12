@@ -13,6 +13,20 @@ from skill3d.adapters.episode_source import (
 from skill3d.adapters import vsibench_loader
 
 
+def test_default_output_budget_is_8192(tmp_path):
+    path = tmp_path / "runtime.yaml"
+    path.write_text("{}\n")
+    settings = vllm_from(load_config(path))
+    assert settings.max_tokens == 8192
+
+
+def test_repository_runtime_config_freezes_output_budget():
+    path = Path(__file__).resolve().parents[2] / "configs/config.yaml"
+    config = load_config(path)
+    assert config["vllm"]["max_tokens"] == 8192
+    assert config.sources["vllm.max_tokens"] == "yaml"
+
+
 def test_endpoints_and_output_budget_are_effective(tmp_path):
     path = tmp_path / "runtime.yaml"
     path.write_text("seed: 137\nvllm:\n  endpoints: [http://localhost:18110]\n  max_tokens: 2048\n")

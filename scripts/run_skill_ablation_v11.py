@@ -144,7 +144,7 @@ def main(argv=None) -> int:
             vllm_endpoints=model["endpoints"],
             vllm_model=model["model"],
             max_images=int(model.get("n_frames", 32)), max_pixels=int(model["max_pixels"]),
-            max_model_len=int(model["max_model_len"]), max_tokens=int(model.get("max_tokens", 4096)),
+            max_model_len=int(model["max_model_len"]), max_tokens=int(model.get("max_tokens", 8192)),
             temperature=model["temperature"],
             cell_timeout_s=sandbox.cell_timeout_s, max_regen=sandbox.max_regenerate,
             max_solver_rounds=args.max_solver_rounds if args.max_solver_rounds is not None else raw["max_solver_rounds"],

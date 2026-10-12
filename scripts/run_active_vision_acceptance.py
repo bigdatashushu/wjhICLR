@@ -103,7 +103,7 @@ class ScriptedFirstClient:
         self.last_usage: dict = {}
         self.log: list[str] = []
 
-    def chat(self, messages, max_tokens: int = 4096, seed=None) -> str:
+    def chat(self, messages, max_tokens: int = 8192, seed=None) -> str:
         blob = json.dumps(messages, ensure_ascii=False)
         is_program_call = ("ReturnAnswer" in blob or "YieldObservations" in blob)
         if is_program_call:

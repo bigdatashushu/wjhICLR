@@ -378,7 +378,7 @@ class _RecordingClient:
     def last_generation(self):
         return getattr(self.client, "last_generation", {})
 
-    def chat(self, messages, max_tokens=4096, **kwargs):
+    def chat(self, messages, max_tokens=8192, **kwargs):
         plain = copy.deepcopy(messages)
         delivered = {}
         phase = current_request_phase()

@@ -51,6 +51,7 @@ def test_runtime_plan_freezes_budget_seed_and_private_library(tmp_path):
     assert frozen["frame_sampling"]["n_frames"] == frozen["vllm"]["n_frames"] == 8
     assert frozen["vllm"]["max_pixels"] == 65536
     assert frozen["vllm"]["max_model_len"] == 16384
+    assert frozen["vllm"]["max_tokens"] == 8192
     assert frozen["paths"]["skill_library"] == str(tmp_path / "skill_library")
     for row in commands:
         command = row["command"]

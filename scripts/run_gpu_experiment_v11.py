@@ -40,7 +40,7 @@ def _read_config(path: Path) -> dict:
     value = load_yaml(path)
     runtime = value["runtime"]
     # Validate the same request fields used by every Python entry point.
-    runtime.setdefault("max_tokens", 4096)
+    runtime.setdefault("max_tokens", 8192)
     VLLMSettings(model=runtime["served_model_name"],
                  n_frames=runtime["n_images"], max_pixels=runtime["max_pixels"],
                  max_model_len=runtime["max_model_len"], max_tokens=runtime["max_tokens"],
@@ -540,7 +540,7 @@ def _pipeline(
         "max_model_len": int(runtime["max_model_len"]),
         "model": str(runtime["served_model_name"]),
         "endpoints": [endpoint],
-        "max_tokens": runtime.get("max_tokens", 4096),
+        "max_tokens": runtime.get("max_tokens", 8192),
     })
     resolve_runtime(runtime_config, formal=bool(experiment.get("formal")) and not dry_run)
     for key in ("n_frames", "max_pixels", "max_model_len", "model", "endpoints", "max_tokens"):

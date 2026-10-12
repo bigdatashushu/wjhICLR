@@ -176,7 +176,7 @@ class OnlineRunConfig:
     metric_depth_model: object = None
     metric_model_name: str = "none"          # moge2 | metric3d_v2 | none
     reuse_artifact: Optional[str] = None    # 复用既有 artifact JSON（硬约束 18：A/B 同源）
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 0.0
     max_images: int = 32                    # M8 送进模型的最大帧数（与 §4 M1 对齐）
     max_pixels: int = 131072                # 实测起点：32 帧 ≈ 9.7k prompt tokens（A-4）

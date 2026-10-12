@@ -41,6 +41,7 @@ runtime:
   port: 8100
   served_model_name: qwen3vl-v11
   max_model_len: 32768
+  max_tokens: 8192
   gpu_memory_utilization: 0.90
   max_pixels: 131072
   n_images: 32

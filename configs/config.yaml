@@ -66,6 +66,7 @@ vllm:
   dp_world_size: 8
   base_port: 8100
   temperature: 0.0                      # greedy，保证同 seed 字节级一致
+  max_tokens: 8192                     # 单次 Qwen 请求的最大输出 token 数；输入 token 另计
 
 sandbox:
   cell_timeout_s: 120                   # TODO_CALIBRATE

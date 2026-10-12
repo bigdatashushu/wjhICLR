@@ -98,7 +98,7 @@ _FALLBACK: dict[str, Any] = {
         "dp_world_size": 8,
         "base_port": 8100,
         "temperature": 0.0,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "endpoints": [],
     },
     "sandbox": {
@@ -198,7 +198,7 @@ class VLLMSettings:
     dp_world_size: int = 8
     base_port: int = 8100
     temperature: float = 0.0
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     # 32 帧输入与单帧像素上限（§1.2 / §4 M1；实测 32 帧 @131072 → ~9703 prompt tokens）
     n_frames: int = 32
     max_pixels: int = 131072
