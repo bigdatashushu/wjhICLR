@@ -42,7 +42,6 @@ from skill3d.schemas.reconstruction import (
 
 # VGGT-1B 权重目录（本机已就位：weights 4.7GB + config.json）
 VGGT_CHECKPOINT: Optional[str] = "/home/cvailab/.cache/huggingface/geothinker/VGGT-1B"
-VGGT_DTYPE = "bfloat16"
 
 
 def _artifact_version(payload: bytes) -> str:

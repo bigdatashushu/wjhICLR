@@ -27,9 +27,6 @@ from skill3d.schemas import ASTCheckResult
 from skill3d.tools.registry import REGISTRY
 from skill3d.sandbox.safe_runtime import NUMERICAL_EXPORTS
 
-# 白名单 import 模块（§9.1）
-ALLOWED_MODULES = frozenset({"numpy", "scipy", "math", "statistics"})
-
 # 保留名：禁止 program 重赋值（§4 M10 字段 5）
 RESERVED_NAMES = frozenset(
     {"show", "ReturnAnswer", "YieldObservations", "AnswerPayload", "tools", "scene",

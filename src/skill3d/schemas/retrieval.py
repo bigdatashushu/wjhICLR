@@ -61,12 +61,6 @@ CANDIDATE_REASON_CODES: frozenset[str] = frozenset({
     "fixed_injection_not_applicable",
 })
 
-# 版本选择模式（§5.3-7 要求"版本选择原因"落盘；§8.2 要求固定注入可区分）
-SELECTION_MODES: frozenset[str] = frozenset({
-    "retrieval",                 # 正常检索选择
-    "fixed_skill_evaluation",    # §8.2 固定注入（只能用于候选效果评测）
-})
-
 # 谱系内版本选择的原因（§5.3-7："检索分数、稳定 tie-break 和版本选择原因必须落盘"）
 VERSION_SELECTION_REASONS: frozenset[str] = frozenset({
     "single_eligible_version",     # 该谱系只有一个可检索版本

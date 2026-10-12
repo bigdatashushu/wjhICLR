@@ -98,7 +98,6 @@ def build_frame_set(
     video_id: str = "",
     scene_name: str = "",
     frame_refs: Optional[Sequence[str]] = None,
-    decode_status: str = "ok",
     preprocessing_version: str = PREPROCESSING_VERSION,
     readable_frame_ids: Optional[Sequence[int]] = None,
 ) -> FrameSet:

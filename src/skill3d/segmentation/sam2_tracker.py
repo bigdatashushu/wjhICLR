@@ -182,14 +182,6 @@ def build_video_predictor(checkpoint: Optional[str] = None,
 
 # ------------------------------------------------------------------ 提示词来源 ----
 
-_GENERIC_NOUN_PATTERNS = (
-    r"how many\s+(.+?)\s+(?:are|is|do|does|can)\b",
-    r"what is the (?:size|length|width|height|distance) of (?:the\s+)?(.+?)[\?\.,]",
-    r"(?:is|are)\s+(?:there|the)\s+(.+?)\s+(?:in|on|near|next to|closest|farther|farthest)\b",
-    r"the\s+(.+?)\s+(?:that|which)\s+(?:is|are|appears?)\b",
-)
-
-
 def _singularize(noun: str) -> str:
     """轻量单数化（只处理规则复数；不做词形还原，避免引入不确定性）。"""
     w = str(noun).strip()
@@ -200,29 +192,6 @@ def _singularize(noun: str) -> str:
     if len(w) > 2 and w.lower().endswith("s") and not w.lower().endswith("ss"):
         return w[:-1]
     return w
-
-
-def object_prompts_from_question_generic(question: str) -> list[str]:
-    """通用名词短语抽取（不依赖固定词表；覆盖 "How many X are..." 等官方句式）。
-
-    为什么要它：固定词表遇到 `computer tower` 这类词直接抽空 → M5 拿不到任何提示 →
-    **整个 scene 的对象工具被收回**（fail-closed 的爆炸半径过大）。这里只做轻量清洗，
-    不做语义推断；抽不出来时返回空列表（由调用方走检测器/整帧兜底）。
-    """
-    import re as _re
-
-    q = str(question).strip()
-    out: list[str] = []
-    for pat in _GENERIC_NOUN_PATTERNS:
-        m = _re.search(pat, q, _re.IGNORECASE)
-        if not m:
-            continue
-        phrase = m.group(1).strip(" ?.,\"\'")
-        phrase = _re.sub(r"\(s\)$", "", phrase)          # "tower(s)" → "tower"
-        phrase = _re.sub(r"^(?:the|a|an)\s+", "", phrase, flags=_re.IGNORECASE)
-        if 0 < len(phrase) <= 60 and phrase.lower() not in {"room", "scene", "image"}:
-            out.append(phrase)
-    return list(dict.fromkeys(out))
 
 
 def object_prompts_from_question(question: str) -> list[str]:
@@ -1249,7 +1218,7 @@ def question_object_names_from_vlm(question: str, client, *,
 
     为什么不让正则抽：官方问法里 "If I am standing by the telephone and facing the cup,
     is the trash can to my left…"、"You are a robot beginning at the door with the clock
-    above it…" 都不落在既有 `_GENERIC_NOUN_PATTERNS` 里 → 正则给空 → 补漏框为空 →
+    above it…" 无法由固定句式稳定覆盖 → 正则给空 → 补漏框为空 →
     题目点名的物体没进清单 → 程序只能 abstain（inner_validation 1501–1504 实测）。
     这里只做"名词抽取"，不涉及几何、不涉及答案。
     """

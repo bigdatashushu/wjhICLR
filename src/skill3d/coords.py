@@ -74,11 +74,6 @@ def resize_mask_nearest(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return out.astype(bool) if m.dtype == bool else out
 
 
-def mask_to_depth_grid(mask: np.ndarray, depth: np.ndarray) -> np.ndarray:
-    """把 mask 对齐到 depth 网格（常用组合：mask 在原始分辨率、depth 在预处理分辨率）。"""
-    return resize_mask_nearest(mask, (int(depth.shape[0]), int(depth.shape[1])))
-
-
 # ------------------------------------------------ 原图 → 深度网格 的仿射映射 ----
 #
 # 为什么需要它（v4/A-8）：BA route 必须先做**正方形预处理**（官方
@@ -191,59 +186,12 @@ def mask_to_grid(mask: np.ndarray, transform: Optional[dict] = None,
     return out.astype(bool) if m.dtype == bool else out
 
 
-def box_to_grid(box: Sequence[float], transform: Optional[dict]) -> list[float]:
-    """把原图像素 bbox 映射到深度网格（含 pad）。"""
-    t = grid_transform_from_dict(transform)
-    x0, y0, x1, y1 = (float(v) for v in box)
-    if not t["padded_to_square"]:
-        return [x0 * t["scale_x"], y0 * t["scale_y"],
-                x1 * t["scale_x"], y1 * t["scale_y"]]
-    ox, oy = t["pad_offset_xy"]
-    sx, sy = t["scale_x"], t["scale_y"]
-    return [(x0 + ox) * sx, (y0 + oy) * sy, (x1 + ox) * sx, (y1 + oy) * sy]
-
-
 def depth_grid_shape(depth_maps: np.ndarray) -> tuple[int, int]:
     """VGGT 深度网格 (H, W)（支持 (N,H,W) / (H,W) 两种输入）。"""
     a = np.asarray(depth_maps)
     if a.ndim < 2:
         raise ValueError(f"depth_maps 维度异常: {a.shape}")
     return int(a.shape[-2]), int(a.shape[-1])
-
-
-def world_to_camera(points_world: np.ndarray, c2w: np.ndarray) -> np.ndarray:
-    """世界系 → 相机系（用 c2w 的逆；VGGT extrinsic 本身就是 world→camera）。"""
-    p = np.asarray(points_world, dtype=np.float64)
-    m = np.asarray(c2w, dtype=np.float64)
-    if m.shape != (4, 4):
-        raise ValueError(f"c2w 必须为 4x4, 实际 {m.shape}")
-    w2c = np.linalg.inv(m)
-    flat = p.reshape(-1, 3)
-    homo = np.concatenate([flat, np.ones((flat.shape[0], 1))], axis=1)
-    cam = (w2c @ homo.T).T
-    return cam[:, :3].reshape(p.shape)
-
-
-def camera_to_world(points_cam: np.ndarray, c2w: np.ndarray) -> np.ndarray:
-    """相机系 → 世界系（c2w 直乘）。"""
-    p = np.asarray(points_cam, dtype=np.float64)
-    m = np.asarray(c2w, dtype=np.float64)
-    if m.shape != (4, 4):
-        raise ValueError(f"c2w 必须为 4x4, 实际 {m.shape}")
-    flat = p.reshape(-1, 3)
-    homo = np.concatenate([flat, np.ones((flat.shape[0], 1))], axis=1)
-    world = (m @ homo.T).T
-    return world[:, :3].reshape(p.shape)
-
-
-def assert_first_frame_is_world_origin(c2w_list: np.ndarray, atol: float = 1e-5) -> None:
-    """世界系约定断言：`c2w[0] == I`（首帧相机系 = 世界系，C-10 实测印证）。"""
-    m = np.asarray(c2w_list, dtype=np.float64)
-    if m.ndim != 3 or m.shape[-2:] != (4, 4) or len(m) < 1:
-        raise ValueError(f"c2w_list 形状异常: {m.shape}")
-    if not np.allclose(m[0], np.eye(4), atol=atol):
-        raise ValueError(
-            "c2w[0] 不是单位阵：世界系与首帧相机系不一致（§9 约定 / C-10）")
 
 
 def optical_flow_on_depth_grid(frames: Sequence[np.ndarray], depth_shape: tuple[int, int],

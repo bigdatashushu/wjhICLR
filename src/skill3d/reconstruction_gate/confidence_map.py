@@ -52,22 +52,6 @@ def coverage_ratio(fused_conf: np.ndarray, conf_thresh: float = 0.5) -> float:
     return float(np.mean(f >= conf_thresh))
 
 
-def per_object_coverage(
-    fused_conf: np.ndarray,
-    object_point_indices: dict[str, np.ndarray],
-    conf_thresh: float = 0.5,
-) -> dict[str, float]:
-    """逐对象覆盖率（object_id -> 覆盖率）：按融合置信度对每对象取均值。"""
-    out: dict[str, float] = {}
-    for oid, idx in object_point_indices.items():
-        idx = np.asarray(idx)
-        if idx.size == 0:
-            out[oid] = 0.0
-            continue
-        out[oid] = float(np.mean(np.asarray(fused_conf).ravel()[idx] >= conf_thresh))
-    return out
-
-
 # --------------------------------------------------------------------- G9 ----
 
 

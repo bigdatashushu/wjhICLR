@@ -22,13 +22,11 @@ from typing import Optional, Sequence
 import numpy as np
 
 from skill3d.online import synthetic as _synth
-from skill3d.routing.task_classifier import QUESTION_TYPE_VALUES, TASK_TYPES
+from skill3d.routing.task_classifier import TASK_TYPES
 from skill3d.schemas import InputErrorRecord, VSIBenchEpisode
 
 # 8 个规范题型（§4 M7 / §16"8 任务分别准确率"）；合成数据在此 8 类上各造一条
 ALL_TASKS = TASK_TYPES
-# 官方 meta 的 10 个 question_type 原始取值（8 题型 + rel_direction 三档变体，§1.2）
-ALL_QUESTION_TYPE_VALUES = QUESTION_TYPE_VALUES
 # 兼容别名：规范题型集合（历史命名，等于 ALL_TASKS）
 ALL_QUESTION_TYPES = ALL_TASKS
 

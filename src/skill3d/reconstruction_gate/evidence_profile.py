@@ -43,18 +43,12 @@ TH_TRACK_FRAGMENTATION_DEGRADED: float = 0.10    # TODO_CALIBRATE: 碎片化率 
 TH_TRACK_FRAGMENTATION_UNAVAILABLE: float = 0.50  # TODO_CALIBRATE: 碎片化率 → unavailable
 TH_DUPLICATE_SUSPECT_DEGRADED: float = 0.10       # TODO_CALIBRATE: 重复嫌疑占比 → degraded
 TH_DUPLICATE_SUSPECT_UNAVAILABLE: float = 0.50    # TODO_CALIBRATE: 重复嫌疑占比 → unavailable
-# 旧口径的可见帧率下限（保留作诊断阈值，不再作判据）
-TH_TRACK_STABLE_RATIO: float = 0.6     # TODO_CALIBRATE: 可见帧率（诊断）
-TH_TRACK_MIN_RATIO: float = 0.2        # TODO_CALIBRATE: 可见帧率（诊断）
 TH_DETECTION_SPARSE: int = 3           # TODO_CALIBRATE: 检出对象数低于此视为稀疏
 TH_GROUNDING_MIN_CONF: float = 0.5     # TODO_CALIBRATE: 补绑置信度下限
 TH_SCALE_DISPERSION: float = 0.15      # TODO_CALIBRATE: τ_scale_disp（§13.1 子条件 4）
 TH_MIN_VALID_FRAME_RATIO: float = 0.75  # TODO_CALIBRATE: τ_frames（§13.1 子条件 3）
 
 EVIDENCE_PROFILE_BUILDER_VERSION: str = "evidence-builder-v6"
-
-# 记录 world_frame 的候选状态命名（诊断用）
-WORLD_FRAME_STATES = ("available", "degraded", "unavailable")
 
 
 @dataclass

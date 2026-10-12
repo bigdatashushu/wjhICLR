@@ -1,6 +1,6 @@
 # harness3D Skill Library
 
-当前 active snapshot 为 `S0-v11-contract-repair`。每个规范题型只有一条 active 方法，
+当前 active snapshot 为 `S0-v11-english`。每个规范题型只有一条 active 方法，
 运行对象仅接受 `SkillSpecV11`，快照 Schema 仅接受 `runtime-skill-snapshot/2.0`。
 
 ## 方法源与运行合同
@@ -10,7 +10,8 @@
 加载器核对 manifest、源文件路径、UTF-8/LF 和全文 hash 后，原样交付完整 `skill_md`。
 超出方法上下文上限时拒绝运行，不截断正文。方法内容不经 JSON SkillSpec 重编译。
 
-在线合同固定为 `program_synth_v11_2`、`solver-v11.2-m11-acceptance` 与 `tool-docs-v11.1`。
+在线合同固定为 `program_synth_v11_5_en`、`solver-v11.4-eval-visual-fallback` 与
+`tool-docs-v11.3-en`。
 B01 不交付 Skill；B11 交付当前题型的冻结 S0 方法。工具证据和权限由框架统一校验。
 
 ## 快照与发布
@@ -25,7 +26,7 @@ B01 不交付 Skill；B11 交付当前题型的冻结 S0 方法。工具证据�
 验证当前基线：
 
 ```bash
-PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py --profile contract-repair --check
+PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py --profile english --check
 ```
 
 修订入口为 `scripts/run_evolution_campaign_v11.py`，通过
@@ -33,8 +34,8 @@ PYTHONPATH=src .venv/bin/python scripts/build_skill_library_v11.py --profile con
 发布后正常 learning 未能确认新正文交付时回滚。旧快照只供审计，旧编译器的 `skills/` 与 `generated/` 已删除，旧格式不能在当前
 运行时加载；复现实验需 checkout 对应 Git 提交。
 
-`S0-v11-contract-repair` 是格式与接口修复基线，不是经真实 learning 晋升的性能版本。
-S01/S08 为 1.2.0，其余六条为 1.1.0；既有源文件和快照身份保持不变。
+`S0-v11-english` 是冻结英文方法基线，不是经真实 learning 晋升的性能版本。
+S01/S08 为 1.3.0，其余六条为 1.2.0；既有源文件和快照身份保持不变。
 
 ## 配对与标签隔离
 

@@ -16,10 +16,10 @@ decision_version`。提示词中的工具清单只是当前可发现的工具面
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Optional
 
 from . import Spec
-from .evidence import UNAVAILABLE_REASON_CODES, MetricGateStatus
+from .evidence import UNAVAILABLE_REASON_CODES  # re-exported compatibility vocabulary
 
 DECISION_VERSION = "tool-authorization-v9"
 

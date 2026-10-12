@@ -32,7 +32,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Optional
 
-from skill3d.schemas.evidence import CAPABILITY_ORDER, EvidenceProfile
+from skill3d.schemas.evidence import EvidenceProfile
 from skill3d.schemas.reconstruction import SceneState
 from skill3d.tools.contract import EVIDENCE_METRIC_SCALE
 
@@ -331,8 +331,8 @@ def premise_of_failure(*, error_code: str, tool: str,
                        unmet_evidence: tuple[str, ...] = ()) -> Optional[str]:
     """从失败事实推断失效的共享前提；`None` = 局部失败，不做级联（§14.1）。
 
-    `unmet_evidence`：证据门给出的**逐项未达标能力**（`contract.evidence_unmet`
-    的输出，可能带 `"(degraded 且不容忍)"` 之类的后缀）。**必须优先于产物判据**：
+    `unmet_evidence`：授权检查给出的**逐项未达标能力**（可能带
+    `"(degraded 且不容忍)"` 之类的后缀）。**必须优先于产物判据**：
     实测踩过的坑是"证据缺口"被当成"缺产物"从而一律退成 `geometry_3d`，
     级联撤销就把 geometry/world_frame/metric_scale 全部无差别降级了。
     """
@@ -486,14 +486,6 @@ def build_feedback(plan: RecoveryPlan, *, question_type: str,
 def recovery_exhausted(attempt: int, *, max_attempts: int = MAX_RECOVERY_ATTEMPTS) -> bool:
     """恢复次数是否已用尽（超限 → direct_vlm_routed / abstain，§6.4）。"""
     return int(attempt) > int(max_attempts)
-
-
-def worst_capability(states: list[str]) -> str:
-    """取最差状态（诊断用；与 `schemas.evidence.worst_state` 同口径）。"""
-    if not states:
-        return "unavailable"
-    return min((str(x) for x in states),
-               key=lambda x: CAPABILITY_ORDER.get(x, 0))
 
 
 __all__ = [

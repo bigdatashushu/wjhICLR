@@ -5,14 +5,18 @@
 `object_rel_distance`（S03），`--question-types` 接受逗号分隔的规范题型。
 
 两臂均通过真实 `run_episode` 生成、执行程序，默认共同使用
-`program_synth_v11_3`、`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.2`，
+`program_synth_v11_5_en`、`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.3-en`，
 质量门始终开启。`ReturnAnswer` 先暂存提交；M11 通过后才进入评分，拒绝时在同一
 求解预算内撤销受影响结果并把结构化失败反馈给同一模型。声明了 `derivation` 时，
 M11 只使用登记操作确定性重放并核对答案；计算声明错误不会撤销本身有效的工具结果。
 B01 的交付集合为空；
-B11 默认校验并加载 `S0-v11-contract-repair` 的 snapshot、manifest 和完整正文，
+B11 默认校验并加载 `S0-v11-english` 的 snapshot、manifest 和完整英文正文，
 经正常题型查找与交付路径选择 Skill。入口不读取或修改 active pointer，
 也不使用 v10 的 `evaluation_binding`。
+
+当前代码默认每次Qwen请求的最大输出为8192 token，输入token另计；M5显式小预算
+保持不变。2026-10-11完成的256次正式实验属于`c020345`与4096输出上限，不能与
+当前8192预算下的新运行静默合并。
 
 ## GPU 环境运行
 
@@ -174,7 +178,8 @@ YAML 加载。两臂配置由同一份配置复制，
 公共模板、执行协议、工具文档和 Skill 快照固定为当前合同，不提供 YAML 或 CLI
 版本选择。
 
-修订基线仅更新 S01/S08 为 1.2.0，其他六条仍为 1.1.0，修订记录不构成演化收益。
+当前英文快照中S01/S08为1.3.0，其余六条为1.2.0；这些版本来自英文方法冻结，
+不构成Skill演化收益。
 历史快照和历史提示词不再由当前入口加载；复现实验时 checkout 对应 Git 提交。
 模板版本、执行协议版本、工具文档版本与工具实现版本仍分别进入运行记录。
 

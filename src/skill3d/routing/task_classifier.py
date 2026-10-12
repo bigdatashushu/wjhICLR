@@ -71,15 +71,6 @@ NA_TASKS: frozenset[str] = frozenset({
     "room_size_estimation",
 })
 
-# 需要 metric 尺度才能作答的题（G-11：scale_confidence=low 时降级 2D-only）
-MEASUREMENT_TASKS: frozenset[str] = frozenset({
-    "object_abs_distance", "object_size_estimation", "room_size_estimation",
-})
-# 尺寸类题（原 G8 拒答门已删除；此处仅作题型分类）
-SIZE_TASKS: frozenset[str] = frozenset({
-    "object_size_estimation", "room_size_estimation",
-})
-
 # 官方取值 → 规范题型（**只认官方值**，§1.2 / B-5）
 # - 官方 meta 的 10 个取值各自映射到 8 个规范题型（rel_direction 三档归一类）；
 # - `object_rel_direction` 是规范聚合名（非 meta 取值），也接受，便于人工/Skill 侧引用。
@@ -90,11 +81,6 @@ for _t in TASK_TYPES:
     _ALIASES[_t] = _t
 for _q in QUESTION_TYPE_VALUES:
     _ALIASES[_q] = ("object_rel_direction" if _q.startswith("object_rel_direction") else _q)
-
-# 向后兼容别名（旧代码 import 的名字）：规范题型集合，语义见 MC_TASKS/NA_TASKS
-MCA_TYPES: frozenset[str] = MC_TASKS
-NA_TYPES: frozenset[str] = NA_TASKS
-
 
 class UnknownQuestionTypeError(ValueError):
     pass
@@ -128,16 +114,6 @@ def canonical_task(question_type: str) -> str:
             f"官方取值见 QUESTION_TYPE_VALUES（{len(QUESTION_TYPE_VALUES)} 个）"
         )
     return task
-
-
-def is_measurement_task(task_or_question_type: str) -> bool:
-    """是否需要 metric 尺度（G-11 门控用）。"""
-    return canonical_task(task_or_question_type) in MEASUREMENT_TASKS
-
-
-def is_size_task(task_or_question_type: str) -> bool:
-    """是否尺寸类题（保留作题型分类工具；原 G8 门控已随指标删除）。"""
-    return canonical_task(task_or_question_type) in SIZE_TASKS
 
 
 def classify_question_type(question_type: str) -> TaskClassification:

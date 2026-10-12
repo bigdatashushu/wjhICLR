@@ -6,15 +6,20 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
 
-2026-10-10 的工程基线使用 `program_synth_v11_3`、
-`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.2`。类别匹配、对象覆盖、
+当前在线合同使用 `program_synth_v11_5_en`、
+`solver-v11.4-eval-visual-fallback` 和 `tool-docs-v11.3-en`。类别匹配、对象覆盖、
 完整排名验收及检测器重试由两臂共用；评测时原 solver 失败后可预算外追加一次
 `eval-visual-v1` 请求，只携带冻结的 32 张原帧、问题、选项和答案格式。该路径不在
-`induction` 使用，正常提交但答错也不会触发。冻结 Skill 不变，质量确认哈希包含相关
-源码和合同版本，旧确认会被拒绝。真实准确率需另行运行 GPU 配对验证，详见
+`induction` 使用，正常提交但答错也不会触发。当前 active snapshot 为
+`S0-v11-english`；质量确认哈希包含相关源码和合同版本，旧确认会被拒绝。详见
 [配对运行合同](docs/skill_ablation_v11.md)。
 
-> **历史核查结论（2026-10-09）**：仓库代码与 v11 启动器已核查，v11 dry-run 已完成，正式 run `v11-s03-seed137` 已按真实入口执行，但在模型许可证门处退出。没有启动 vLLM，没有执行重建、induction、B01/B11 或演化，没有可报告的样本数、分数或 Skill 晋升结果。
+2026-10-11 已在代码基线 `c020345dca6f3e34acd0883accc4d16956327773`
+完成英文面板 256 次求解和 128 组 B01/B11 配对。该实验固定使用
+`max_tokens=4096`；当前代码自 `e64fff5ee90713a5e9be5f189044685d0af051e7`
+起将后续 Qwen 请求的最大输出改为 8192，两种预算的结果不得静默合并。
+
+> **历史核查结论（2026-10-09）**：当时的正式 run `v11-s03-seed137` 在模型许可证门处退出，未启动 GPU 阶段。下文第 3–10 节保留该次服务器审计记录，不代表当前运行状态。
 
 ## 1. 当前基线与证据口径
 
@@ -24,15 +29,15 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 | 基础 codebase | `Skill3D` |
 | 仓库 | `/nas/wangjh/harness3d/skill3d_codebase` |
 | 分支 | `main` |
-| 服务器核查时 Git commit | `a5f9e65be841c876beb8a586f77869b0188086e3`（当前代码请执行 `git rev-parse HEAD` 核对） |
-| 服务器核查时工作树 | 当时已核查为干净 |
-| 报告日期 | 2026-10-09 |
+| 当前代码提交 | 执行 `git rev-parse HEAD` 核对 |
+| 清理前回滚点 | `pre-cleanup-v11-20261012`（`e64fff5ee90713a5e9be5f189044685d0af051e7`） |
+| 文档状态日期 | 2026-10-12 |
 | v11 默认配置 | `configs/gpu_experiment_v11.yaml` |
 | v11 运行器 | `scripts/run_gpu_experiment_v11.py` |
 | v11 配对协议 | `docs/skill_ablation_v11.md` |
-| 当前 active snapshot | `S0-v11-contract-repair` |
+| 当前 active snapshot | `S0-v11-english` |
 | active snapshot 文件 | `skill_library/snapshots/active_snapshot.json` |
-| active snapshot SHA-256 | `b26e79126b47d9587a30cbcafeb4146929b4dbd84681dd675ede0f04d29960e3` |
+| active snapshot SHA-256 | `ac8accb533bee48a182ddcf2f3103dca2e66e0d1ec2fbc4d903d14834873bf1b` |
 
 本 README 中的“已核查”只表示有命令输出、代码收据或文件哈希支撑；“已缓存”只表示本机有文件；“机制可跑”只表示合同测试或确定性夹具覆盖。只有包含完整输入身份、权重身份、质量确认、运行清单和结果文件的正式 run，才可以被称为正式实验结果。
 
@@ -129,7 +134,9 @@ v11 默认环境要求见 `configs/gpu_experiment_v11.yaml`：
 | 仓库元数据 | `data/vsi_bench_meta/test.jsonl` |
 | 元数据 SHA-256 | `aa3ff8cc2010e555f4f865ff96483812ec0b275005b68562f53bb114ad4db9db` |
 
-仓库的 v11 真实入口只允许使用 `induction` 和 `inner_validation`。本次目标题型为 `object_rel_distance`，配置数据集为 `scannet,scannetpp`，不读取或运行 final split。
+一键实验入口只编排 `induction` 和 `inner_validation`；普通在线入口还支持
+`outer_holdout`，并仅在显式授权时允许 `final_test`。已完成的英文正式实验没有访问
+`final_test`。
 
 “视频文件存在”“视频可解码”“数据使用许可已确认”是三个不同状态。文件数量和路径核查不能替代 VSI-Bench 许可确认。
 
@@ -143,14 +150,14 @@ experiment:
   accept_vsi_bench_license: true
 ```
 
-这些字段只能在真实许可核对完成后设置为 `true`。不能用仓库 LICENSE、模型 README 或目录存在性替代当前使用场景的许可确认，也不能伪造确认文件。本次配置保持：
+这些字段只能在真实许可核对完成后设置为 `true`。不能用仓库 LICENSE、模型 README 或目录存在性替代当前使用场景的许可确认，也不能伪造确认文件。当前示例配置记录为：
 
 ```yaml
-accept_model_licenses: false
-accept_vsi_bench_license: false
+accept_model_licenses: true
+accept_vsi_bench_license: true
 ```
 
-因此正式入口在启动任何 GPU 阶段之前拒绝运行。
+换机器或改变使用范围时必须重新核对许可，不能沿用该布尔值替代真实授权。
 
 ## 5. 模型与权重
 
@@ -332,7 +339,7 @@ PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
 - 默认题型：`object_rel_distance`，S03。
 - 两臂都通过真实 runner、同一题单、同一输入和同一质量门。
 - B01 的交付 Skill 集合为空。
-- B11 默认加载 `S0-v11-contract-repair` 的 snapshot、manifest 和正文。
+- B11 默认加载 `S0-v11-english` 的 snapshot、manifest 和正文。
 - 当前入口不读取或修改 active pointer，不使用 v10 的 `evaluation_binding`。
 - 两臂按顺序运行，当前不是延迟公平性实验。
 - `seed` 进入准备阶段和模型请求，但不同 GPU 调度不承诺逐位一致。
@@ -362,27 +369,27 @@ summary.json
 PYTHONPATH=src python scripts/run_skill_ablation_v11.py --print-quality-contract
 ```
 
-当前代码打印的质量合同 SHA-256：
-
-```text
-d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678
-```
+质量合同包含相关源码身份，任何代码提交都可能改变其 SHA-256；不得把 README
+中的旧摘要当作当前值，必须在运行前执行上述命令取得。
 
 正式质量确认 JSON 必须是已有真实证据对应的文件，例如：
 
 ```json
 {
   "confirmed": true,
-  "sha256": "d877a72cc1d162d94e0453db5c08886f7c527dcfaf29d751e843e00cbcd5e678",
+  "sha256": "<上述命令输出的当前sha256>",
   "evidence_ref": "已有门限验证记录的位置"
 }
 ```
 
-该文件只确认合同身份和已有验证证据，不改变代码门限。缺文件、SHA 不匹配、`confirmed` 不是 `true` 或缺少 `evidence_ref` 时，不能声称 `formal_result_eligible=true`。本次没有这样的确认文件，因此本次没有正式结果资格。
+该文件只确认合同身份和已有验证证据，不改变代码门限。缺文件、SHA 不匹配、`confirmed`
+不是 `true` 或缺少 `evidence_ref` 时，不能声称 `formal_result_eligible=true`。
+2026-10-11 正式实验的确认只适用于其 `c020345` 代码与产物身份；当前代码合同变化后
+必须重新生成匹配确认，不能改写旧收据。
 
 机制已实现或合同测试通过，不代表真实 GPU、真实视频、真实模型和完整质量合同已经闭合，也不代表可以写入论文主表。
 
-## 10. 本次 v11 实验审计记录
+## 10. 2026-10-09 历史 v11 实验审计记录
 
 ### Dry-run
 
@@ -461,23 +468,20 @@ GPUExperimentError: formal run requires experiment.accept_model_licenses=true
 8. M11 是确定性硬门，不用第二个 VLM 作为裁判。
 9. Skill 候选不可变；promote 必须原子切换并可回滚。
 10. 配对实验复用同一题单、同一输入和同一基础产物，失败题仍留在分母。
-11. 本 v11 入口只允许 induction 和 inner_validation；最终评测是独立动作，不在本入口中运行。
+11. 一键实验入口只编排 induction 和 inner_validation；普通在线入口的
+    outer_holdout/final_test 仍受显式 split 授权与标签隔离约束。
 12. 不得用 mock、替代权重、伪造许可、伪造质量确认或缩小分母绕过失败。
 
 ## 12. 当前已知限制与待办
 
-以下事项在当前服务器核查中仍未闭合：
+当前仍需明确的边界：
 
-- **模型许可证确认**：`accept_model_licenses` 仍为 `false`。
-- **VSI-Bench 许可证确认**：`accept_vsi_bench_license` 仍为 `false`。
-- **质量确认**：没有与当前合同 SHA-256 匹配且带 `evidence_ref` 的确认 JSON。
-- **GPU 调度**：所有 GPU 在核查时均被其他任务占用，没有适合正式启动的空闲卡。
-- **VGGT 身份**：文件存在，但缓存没有可验证的 pinned revision metadata。
-- **MoGe-2 使用状态**：缓存已存在且 revision 匹配，但 v11 默认 disabled，尚未参与本次实验。
-- **正式 B01/B11**：尚未执行，因此没有正式配对分数。
-- **演化**：未执行；`DEEPSEEK_API_KEY` 未配置，且正式 B01/B11 和质量/许可门尚未通过。
-- **尺度标定**：若没有合规的非重叠 ARKitScenes 标定证据，未标定题型应保持低置信度，不得用默认常量升级。
-- **论文资格**：没有本次正式结果，不能写入论文主表或宣称 Skill gain。
+- **预算基线**：已完成的256次正式实验属于`c020345`与4096输出上限；当前8192代码需要新运行和新确认。
+- **质量确认**：当前合同摘要必须由入口实时生成，不能套用旧代码或不同产物身份的确认。
+- **MoGe-2**：默认 disabled，不属于已完成正式实验的方法变量。
+- **演化**：已完成实验只比较冻结S0有无，不构成Skill演化收益。
+- **尺度标定**：未标定题型保持低置信度，不得用默认常量升级。
+- **final_test**：已完成实验未访问；任何后续最终评测必须保持盲评和标签隔离。
 
 ## 13. 测试与复现
 

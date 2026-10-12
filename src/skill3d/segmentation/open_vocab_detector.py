@@ -207,20 +207,6 @@ def detect(frame: np.ndarray, prompt: str, *,
     return out
 
 
-def to_normalized_1000(dets: Sequence[Detection], frame_hw: tuple[int, int]
-                       ) -> list[tuple[str, list[float]]]:
-    """像素框 → VLM-normalized-1000（§9 坐标层口径；供统一处理与审计）。"""
-    h, w = int(frame_hw[0]), int(frame_hw[1])
-    out: list[tuple[str, list[float]]] = []
-    for d in dets:
-        x0, y0, x1, y1 = d.bbox_xyxy
-        out.append((d.label, [round(x0 / max(w, 1) * 1000, 1),
-                              round(y0 / max(h, 1) * 1000, 1),
-                              round(x1 / max(w, 1) * 1000, 1),
-                              round(y1 / max(h, 1) * 1000, 1)]))
-    return out
-
-
 def prompt_from_nouns(nouns: Sequence[str]) -> str:
     """问题名词 → 检测器文本提示（GroundingDINO 用句点分隔的类目串）。"""
     parts = [str(n).strip() for n in nouns if str(n).strip()]

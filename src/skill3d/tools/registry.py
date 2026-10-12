@@ -40,7 +40,6 @@ from skill3d.tools.contract import (
     degraded_evidence_flags,
     evidence_visible,
     scope_allows,
-    tool_allowed,
 )
 from skill3d.schemas.authorization import ToolAuthorizationReceipt
 from skill3d.tools.contract import authorize_tool_call
@@ -413,5 +412,4 @@ __all__ = [
     "SCOPE_FALLBACK_2D_ONLY",
     "SCOPE_FULL_3D",
     "SCOPE_METRIC_ENABLED",
-    "tool_allowed",
 ]

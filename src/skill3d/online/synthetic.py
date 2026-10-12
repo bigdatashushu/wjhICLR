@@ -789,16 +789,6 @@ def make_synthetic_episode(
 
 # ------------------------------------------------------- SceneState / 句柄 ----
 
-def synthetic_scale_known() -> bool:
-    """合成场景的尺度**按构造即为真值**（房间/物体尺寸与相机高都是米制设计值）。
-
-    v6 §20：v5 的"相对 CI 半宽 ≤ TH_SCALE_CI_REL"判据随校准路线整体废止（v6 无 CI
-    概念）；mock_light 改由 `synthetic_metric_gate` / `_synthetic_metric_fusion`
-    表达米制授权（**真跑**生产融合核与 §13.1 六项子条件），且只用于管道验证。
-    """
-    return True
-
-
 def synthetic_metric_tasks() -> set[str]:
     """mock_light 合成场景的米制题型授权（v6：由合成 MetricEvidenceGate 表达）。
 

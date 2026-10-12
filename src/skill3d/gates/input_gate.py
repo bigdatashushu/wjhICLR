@@ -83,12 +83,6 @@ def quality_weight_for(flags: Sequence[str]) -> float:
     return DEGRADED_FRAME_WEIGHT if flags else 1.0
 
 
-def _is_degraded(blur: float, p_over: float, p_under: float,
-                 blur_floor: float = TH_BLUR_VAR_ABS) -> bool:
-    """单帧是否劣化（兼容入口，语义 = degradation_flags 非空）。"""
-    return bool(degradation_flags(blur, p_over, p_under, blur_floor))
-
-
 def _illegal_frame_ids(frames: Sequence) -> list[int]:
     """输入合法性 hard fail 的帧（空帧 / 尺寸非法 / 损坏 / 无法解码）。
 
@@ -255,8 +249,3 @@ def annotate_frames(frames: Sequence[InputFrame],
             "quality_weight": quality_weight_for(fl),
         }))
     return out
-
-
-def frame_quality_scores(frames: Sequence[np.ndarray]) -> list[tuple[float, float, float]]:
-    """批量算 (blur, p_over, p_under)（供 M4 G1/G2 与审计复用）。"""
-    return [frame_quality(f) for f in frames]

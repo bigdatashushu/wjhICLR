@@ -308,7 +308,7 @@ def geometry_verify(
         f"（world_up={'set' if handle.world_up is not None else 'missing'}，"
         f"handedness={handle.handedness}）",
     ]
-    del answer  # 语义项（T2）在 verifier/t1_t4_checks.py；本模块保持纯几何
+    del answer  # 答案语义由在线提交验收处理；本模块保持纯几何
     return GeometryVerifyResult(
         passed=not violations, checks=checks, violations=violations, issues=issues, notes=notes,
         metric_evidence_authorized=authorized, world_frame_available=wf_ok)

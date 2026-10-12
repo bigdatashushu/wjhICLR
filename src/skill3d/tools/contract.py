@@ -18,14 +18,15 @@ v6（D4/D6/D7）三条纪律同时落地：
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 from skill3d.schemas.evidence import (
     CAPABILITIES,
-    CapabilityState,
     EvidenceProfile,
-    capability_at_least,
 )
+
+if TYPE_CHECKING:
+    from skill3d.schemas.authorization import AuthorizationDecision
 
 # 产物词汇表（与 SceneHandle / ReconstructionArtifact 的可用产物口径一致）
 ARTIFACT_FRAMES = "frames"
@@ -107,54 +108,7 @@ def question_tool_scope_of(scene_route: str, *,
     return SCOPE_FULL_3D
 
 
-def route_artifacts_for_question(
-    route: str,
-    allowed_metric_tasks: Optional[Iterable[str]] = None,
-    question_type: str = "",
-    *,
-    gate_passed: bool = False,
-) -> set[str]:
-    """逐题可用产物集（v6 §5.3；保留 v5 签名以便调用点平滑迁移）。
-
-    `allowed_metric_tasks` 是 v5 的逐题型授权集合；v6 用 `gate_passed` 表达同一件事
-    （gate 通过 ⟺ `metric_scale=available`）。为兼容既有调用点，两者取**逻辑与**：
-    只有同时满足"题型在授权集合内"与"gate 通过"才追加 `scale`。
-    传空授权集合（v5 默认）而 `gate_passed=True` 时按 v6 口径判（gate 说了算）。
-    """
-    base = set(available_artifacts_for(route))
-    if route != "full_3d":
-        return base
-    allowed = {str(t) for t in (allowed_metric_tasks or set())}
-    metric_q = bool(question_type) and (str(question_type) in allowed if allowed else False)
-    if gate_passed and metric_q:
-        return base | {ARTIFACT_SCALE}
-    return base
-
-
-def tool_allowed(requires_artifacts: Iterable[str], route: str) -> bool:
-    """该 Tool 在给定 route 下是否允许暴露/执行（两件判定的产物维度）。"""
-    return set(requires_artifacts).issubset(
-        available_artifacts_for(route, metric_question=True, gate_passed=True))
-
-
 # ------------------------------------------------- 证据驱动的 Tool 可见性 ----
-
-def evidence_unmet(spec, profile: Optional[EvidenceProfile]) -> list[str]:
-    """逐项列出未达标的能力（`evidence_visible` 的详细版，供归因/级联判前提）。"""
-    out: list[str] = []
-    for cap in (getattr(spec, "requires_evidence", None) or []):
-        if cap not in CAPABILITIES:
-            out.append(cap)
-            continue
-        if profile is None:
-            out.append(cap)
-            continue
-        state = profile.state(cap)
-        tolerates = set(getattr(spec, "tolerates_degraded", None) or [])
-        if state == "unavailable" or (state == "degraded" and cap not in tolerates):
-            out.append(cap)
-    return out
-
 
 def evidence_visible(spec, profile: Optional[EvidenceProfile]) -> bool:
     """§7.2 逐 Tool 判定：`requires_evidence` × `tolerates_degraded`。
@@ -404,14 +358,6 @@ class AnswerAlreadyGiven(ToolContractError):
     """
 
     error_code = "answer_already_given"
-
-
-_ERROR_CODE_BY_CLASS: Mapping[str, str] = {
-    "tool_contract": "tool_contract",
-    "confidence_gate": "confidence_gate",
-    "domain_value": "domain_value",
-    "answer_already_given": "answer_already_given",
-}
 
 
 # --------------------------------------------------- §6.4 单一授权判定函数 ----

@@ -1,6 +1,6 @@
-"""M20 8×RTX 4090 DP 调度（离线驱动）。
+"""M20 8×RTX 4090 DP 逻辑分配。
 
-- 阶段串行：重建期沙箱排队，反之亦然（同一时刻 GPU 只服务一个阶段）；
+- 阶段串行由实验驱动器负责，本模块只分配 GPU；
 - DP×8：每卡一个 vLLM 副本（--tensor-parallel-size 1），dp_partition 均匀切分；
 - 卡故障：剔除该卡继续 DP×7；
 - paired A/B 同 episode 固定同 gpu_rank（硬约束 18 配套）。
@@ -52,21 +52,3 @@ class GPUScheduler:
         for i, u in enumerate(units):
             buckets[i % len(self.active_gpus)].append(u)
         return buckets
-
-
-class PhaseGate:
-    """阶段串行门：重建期沙箱排队，沙箱期重建排队（M20）。"""
-
-    def __init__(self) -> None:
-        self._current_phase: str | None = None
-
-    def enter(self, phase: str) -> bool:
-        """同阶段可并行进入；异阶段返回 False（调用方排队等待）。"""
-        if self._current_phase is None or self._current_phase == phase:
-            self._current_phase = phase
-            return True
-        return False
-
-    def exit(self, phase: str) -> None:
-        if self._current_phase == phase:
-            self._current_phase = None
