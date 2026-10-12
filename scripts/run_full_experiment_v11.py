@@ -23,7 +23,8 @@ import time
 import urllib.request
 
 sys.path[:0] = [str(Path(__file__).resolve().parents[1] / "src"),
-                str(Path(__file__).resolve().parents[1])]
+                str(Path(__file__).resolve().parents[1]),
+                str(Path(__file__).resolve().parents[1] / "third_party/vggt")]
 
 TASKS = (
     "obj_appearance_order", "object_abs_distance", "object_counting",
@@ -267,7 +268,7 @@ def seal_tree(source, store, receipt_path, *, binary_only=False):
             blob.parent.mkdir(parents=True, exist_ok=True)
             tmp = blob.with_suffix(".tmp")
             with path.open("rb") as src, tmp.open("wb") as dst:
-                with gzip.GzipFile(fileobj=dst, mode="wb", mtime=0) as zipped:
+                with gzip.GzipFile(fileobj=dst, mode="wb", compresslevel=1, mtime=0) as zipped:
                     shutil.copyfileobj(src, zipped, 1024 * 1024)
                 dst.flush()
                 os.fsync(dst.fileno())
@@ -608,6 +609,30 @@ def verified_historical_geometry(entry, item, value, archive):
     }
 
 
+def historical_geometry_index(archive):
+    """Cache lookup follows frozen RGB identity across questions."""
+    from skill3d.evaluation import skill_ablation_v11 as ab
+
+    artifacts, inputs = read(archive / "artifact_manifest.json"), read(archive / "input_manifest.json")
+    by_input = {}
+    for q, entry in sorted(artifacts.items()):
+        require(q in inputs, "historical geometry has no frozen input")
+        path = archive_path(inputs[q]["path"], archive)
+        require(file_hash(path) == inputs[q]["sha256"], "historical cached input changed")
+        value = read(path)
+        require(value["sha256"] == ab._hash({k: v for k, v in value.items() if k != "sha256"}),
+                "historical cached input payload changed")
+        key = value.get("cache_identity")
+        if not key or value.get("input_error"):
+            continue
+        if key in by_input:
+            require(by_input[key]["sha256"] == entry["sha256"],
+                    "historical geometry identity has multiple contents")
+        else:
+            by_input[key] = {**entry, "historical_qa_id": q}
+    return by_input
+
+
 def _prepare_geometry(root, inputs, archive):
     from skill3d.evaluation import skill_ablation_v11 as ab
     from skill3d.reconstruction import metric_evidence as me
@@ -616,7 +641,7 @@ def _prepare_geometry(root, inputs, archive):
     from skill3d.reconstruction_gate.quality_metrics import compute_and_store_quality
     from skill3d.schemas import ReconstructionArtifact
     import numpy as np
-    old = read(archive / "artifact_manifest.json")
+    old = historical_geometry_index(archive)
     geometry = read(root / "geometry_manifest.json") if (root / "geometry_manifest.json").exists() else {}
     model = make_moge2_model(device="cuda:0")
     contract = me.fusion_contract(model)
@@ -635,8 +660,9 @@ def _prepare_geometry(root, inputs, archive):
         provenance = {}
         started = time.monotonic()
         try:
-            if q in old:
-                old_art, provenance = verified_historical_geometry(old[q], item, value, archive)
+            if key in old:
+                old_art, provenance = verified_historical_geometry(old[key], item, value, archive)
+                provenance["historical_qa_id"] = old[key]["historical_qa_id"]
                 art = me.copy_geometry(old_art, dest)
             else:
                 art = reconstruct(item.pixels, item.episode.scene_name, dest,

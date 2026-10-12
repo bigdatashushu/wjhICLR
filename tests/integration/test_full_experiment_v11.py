@@ -296,3 +296,28 @@ def test_legacy_geometry_migration_requires_original_pixel_and_array_evidence(pa
     with pytest.raises(full.FullExperimentError, match="content/input evidence mismatch"):
         full.verified_historical_geometry(
             entry, item, {"cache_identity": key, "pixels": pixels}, tmp_path)
+
+
+def test_scene_cache_index_is_independent_of_new_question_id_and_checks_content(tmp_path):
+    inputs, artifacts = {}, {}
+    for q in ("old1", "old2"):
+        payload = {"cache_identity": "same-frozen-rgb", "input_error": None, "qa_id": q}
+        payload["sha256"] = ab._hash(payload)
+        path = tmp_path / (q + ".json")
+        full.write(path, payload)
+        inputs[q] = {"path": str(path), "sha256": full.file_hash(path)}
+        artifacts[q] = {"path": "/old/scene/artifact.json", "sha256": "same-artifact"}
+    full.write(tmp_path / "input_manifest.json", inputs)
+    full.write(tmp_path / "artifact_manifest.json", artifacts)
+    index = full.historical_geometry_index(tmp_path)
+    assert list(index) == ["same-frozen-rgb"]
+    assert index["same-frozen-rgb"]["historical_qa_id"] == "old1"
+    artifacts["old2"]["sha256"] = "different-artifact"
+    full.write(tmp_path / "artifact_manifest.json", artifacts)
+    with pytest.raises(full.FullExperimentError, match="multiple contents"):
+        full.historical_geometry_index(tmp_path)
+
+
+def test_full_entry_imports_vggt_from_its_own_tracked_checkout():
+    from vggt.models import vggt
+    assert Path(vggt.__file__).resolve().is_relative_to(ROOT / "third_party/vggt")
