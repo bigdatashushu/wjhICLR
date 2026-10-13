@@ -36,7 +36,7 @@ from skill3d.online.config import (
 )
 from skill3d.reconstruction.vggt_runner import ReconstructionFailed, reconstruct
 from skill3d.scheduling.gpu_scheduler import GPUScheduler
-from skill3d.schemas import ReconstructionArtifact
+from skill3d.schemas import QUALITY_METRIC_VERSION, ReconstructionArtifact
 
 
 @dataclass
@@ -186,6 +186,9 @@ def run_jobs(jobs: list[SceneJob], items_by_scene: dict[str, list[EpisodeItem]],
                     art, frames=frames,
                     depth_maps=_load_npy(art.depth_maps),
                     c2w_list=_load_npy(art.c2w_list),
+                    intrinsics=_load_npy(art.intrinsics),
+                    point_map=_load_npy(art.point_map),
+                    depth_conf=_load_npy(art.depth_conf),
                     artifact_path=str(out))
         except Exception as exc:  # noqa: BLE001 - 质量算不出不阻断重建（P2 会按 fail-closed 降级）
             job.note = f"[warn] M4 质量写回失败: {type(exc).__name__}: {exc}"
@@ -374,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         "method": args.method, "splits": splits, "recon_dir": recon_dir,
         "moge2_enabled": bool(getattr(args, "moge2", False)),
         "schema_version": "6.0",
-        "quality_metric_version": "v6-m4-main-gate",
+        "quality_metric_version": QUALITY_METRIC_VERSION,
         "n_frames": args.n_frames,
         "seed": args.seed,
         "configuration": config_receipt(cfg),

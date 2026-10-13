@@ -33,8 +33,9 @@ from .evidence import (
 METRIC_TASK_TYPES: tuple[str, ...] = (
     "object_abs_distance", "object_size_estimation", "room_size_estimation")
 
-# v6 §5.2：质量指标版本标识（G5 永久 not_available、G8 退役、主门=warp+重叠）
-QUALITY_METRIC_VERSION: str = "v6-warp-overlap-no-g5"
+# 简化版整场四项门；旧两项门仅允许读取，不可直接用于当前路由。
+QUALITY_METRIC_VERSION: str = "v7-scene-warp-overlap-head-tail"
+LEGACY_QUALITY_METRIC_VERSION: str = "v6-warp-overlap-no-g5"
 
 # scene_route（只由 M4 质量决定）
 SceneRoute = Literal["full_3d", "fallback_2d_only", "unanswerable"]
@@ -53,9 +54,8 @@ class QualityMetrics(Spec):
 
     v6 结构（D11）：
 
-    - **主门**（§10.1）= 跨视图 warp 内点率 **且** 分组点云重叠率，两者都过才
-      `main_gate_passed=True`。**多指标不得单挑**（SysCON3D 依据：前馈 backbone
-      会幻觉跨视图一致性）；
+    - **主门** = warp、重叠、两头相对差 P95、邻域长尾四项逻辑与（简化版
+      2026-10-14）。仅输出整场资格，不增加对象/逐点门；
     - **诊断**（§10.2）：track 重投影残差、相邻帧旋转平滑 —— 只产告警，不决定主门；
     - **conf-warp 单调自检**（§10.3）：VGGT conf 分桶 vs warp 差中位数应单调，
       不单调则降权；conf **只作软权重，不作硬门**；
@@ -69,6 +69,9 @@ class QualityMetrics(Spec):
     warp_inlier_ratio: float              # 跨视图 warp 相对深度差内点率
     warp_photometric_inlier_ratio: float  # 跨视图 warp 光度内点率
     cloud_overlap_ratio: float            # 前 16 vs 后 16 帧分组点云双向重叠率
+    # NaN 默认仅用于读取旧记录；缺项的旧主门不得获得新版准入资格。
+    point_depth_relative_p95: float = float("nan")
+    cloud_neighbor_tail_ratio: float = float("nan")
     main_gate_passed: bool
     # 主门用的阈值快照（trace 可审计："这个 pass 是按哪版阈值判的"）
     gate_thresholds: dict[str, float] = {}
@@ -163,7 +166,9 @@ class ReconstructionArtifact(Spec):
 
     # ---- 版本字段（§5.2；与历史数据版本隔离，不兼容混写）----
     schema_version: Literal["6.0"] = "6.0"
-    quality_metric_version: Literal["v6-warp-overlap-no-g5"] = "v6-warp-overlap-no-g5"
+    quality_metric_version: Literal[
+        "v6-warp-overlap-no-g5", "v7-scene-warp-overlap-head-tail"
+    ] = "v7-scene-warp-overlap-head-tail"
     artifact_id: str
     artifact_version: str                 # 内容寻址哈希
     scene_name: str
@@ -425,6 +430,7 @@ __all__ = [
     "ObjectInstance",
     "ObjectRecord",
     "QUALITY_METRIC_VERSION",
+    "LEGACY_QUALITY_METRIC_VERSION",
     "QualityMetrics",
     "QuestionToolScope",
     "ReconstructionArtifact",

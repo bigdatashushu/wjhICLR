@@ -95,7 +95,7 @@ def evaluate_metric_gate(
     逐项：
 
     1. `scene_route == "full_3d"`；
-    2. M4 主门通过（warp 内点率 ≥ τ_warp **且** 分组点云重叠率 ≥ τ_cloud）；
+    2. M4 整场四项主门通过（简化版 2026-10-14）；
     3. 融合成功（`s_global` 有限、有效帧占比 ≥ τ_frames）；
     4. 尺度自洽（32 帧 `s_k` 的 `std/median` ≤ τ_scale_disp）；
     5. 输入/内参/坐标/数值全部有限（无 NaN/Inf）；
@@ -360,7 +360,7 @@ def build_evidence_profile(
         if not quality_computed:
             reasons["geometry_3d"] = "not_run"          # 质量根本没算 → 生产者未运行
         elif not main_ok:
-            # 质量真算了、值也有限，只是 M4 主门（warp 内点率/点云重叠率）未过
+            # 质量真算了、值也有限，只是 M4 四项整场主门未过
             reasons["geometry_3d"] = "quality_gate_not_passed"
     if metric != "available":
         if fusion_status == "not_run":

@@ -4,9 +4,8 @@
 
 1. `read_legacy_artifact(path)` —— 把旧 JSON 解析成 `LegacyArtifact`（只读审计）。
    只保存原值 + 告警：**不猜单位、不把百分数转分数、不用互相矛盾的字段推导新值**。
-2. `load_artifact_v5(path)` —— 当前运行时/路由/统计/主表加载器的**唯一** artifact
-   入口。`schema_version == "5.0"` 才返回 `ReconstructionArtifact`；否则 hard fail
-   （`LegacyArtifactError`），并指出需要重跑 v5 pipeline。
+2. `load_artifact_v5(path)` —— 当前 runtime 的 artifact 入口，读取 Schema 6.0
+   的旧两项门与新四项门。旧 quality 保留原版本，仅允许复用几何后重新计算质量。
 3. `detect_deprecated_fields(raw)` —— 识别旧尺度字段（`scale_ci` / `relative_ci`）、
    已退役 G8（`g8_bbox_coverage_min`）、`CoverageMap` 内部字段，以及"没有
    `quality_metric_version` 的旧 `overall_quality`"。
@@ -29,6 +28,8 @@ from skill3d.schemas.legacy import (
 )
 from skill3d.schemas.reconstruction import (
     LEGACY_ONLY_FIELDS,
+    LEGACY_QUALITY_METRIC_VERSION,
+    QUALITY_METRIC_VERSION,
     ReconstructionArtifact,
 )
 from skill3d.schemas.trace import (
@@ -41,7 +42,9 @@ CURRENT_SCHEMA_VERSION = "5.0"
 CURRENT_QUALITY_METRIC_VERSION = "v5-no-g8-g5-optional"
 # v6 当前 Schema（运行时**必须**能加载自己的产物；见 `load_artifact_v5` 注释）
 CURRENT_V6_SCHEMA_VERSION = "6.0"
-CURRENT_V6_QUALITY_METRIC_VERSION = "v6-warp-overlap-no-g5"
+SUPPORTED_QUALITY_METRIC_VERSIONS = (
+    LEGACY_QUALITY_METRIC_VERSION, QUALITY_METRIC_VERSION,
+)
 
 # 旧尺度字段（HC29/§10.2）：口径（百分数/分数、全宽/半宽、1σ/kσ）无法自证
 LEGACY_SCALE_FIELDS: tuple[str, ...] = (
@@ -105,8 +108,8 @@ def read_legacy_artifact(path: Union[str, Path]) -> LegacyArtifact:
 def load_artifact_v5(path: Union[str, Path]) -> ReconstructionArtifact:
     """当前 artifact 的唯一加载入口（fail-closed）。
 
-    接受 **当前 Schema**（`schema_version == "6.0"` 且
-    `quality_metric_version == "v6-warp-overlap-no-g5"`）；v5 及更早的 JSON
+    接受 Schema 6.0 的旧/新质量版本；旧版本仅为读取几何，M4 必须重算质量。
+    v5 及更早的 JSON
     一律 hard fail（含旧尺度/G8/BA 字段、缺版本字段、版本不符），错误信息给出
     可执行建议：用 `skill3d.legacy.readers` 只读审计，并重跑 v6 pipeline。
 
@@ -128,12 +131,12 @@ def load_artifact_v5(path: Union[str, Path]) -> ReconstructionArtifact:
                     f"{CURRENT_V6_SCHEMA_VERSION!r} 或 {CURRENT_SCHEMA_VERSION!r}）"))
     qmv = raw.get("quality_metric_version")
     if detected == CURRENT_V6_SCHEMA_VERSION:
-        if qmv != CURRENT_V6_QUALITY_METRIC_VERSION:
+        if qmv not in SUPPORTED_QUALITY_METRIC_VERSIONS:
             raise LegacyArtifactError(
                 source_path=str(p), deprecated_fields=detect_deprecated_fields(raw),
                 detail=(f"quality_metric_version={qmv!r}"
                         f"（{CURRENT_V6_SCHEMA_VERSION!r} 需要 "
-                        f"{CURRENT_V6_QUALITY_METRIC_VERSION!r}）"))
+                        f"{SUPPORTED_QUALITY_METRIC_VERSIONS!r}）"))
     elif qmv != CURRENT_QUALITY_METRIC_VERSION:
         raise LegacyArtifactError(
             source_path=str(p), deprecated_fields=detect_deprecated_fields(raw),

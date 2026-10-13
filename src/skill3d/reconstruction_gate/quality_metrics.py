@@ -1,8 +1,8 @@
-"""M4 质量指标计算（v6 §10：无真值质量门，D11）。
+"""M4 整场质量指标计算（简化版 2026-10-14，无真值）。
 
 v6 结构：
 
-- **主门**（§10.1）= 跨视图 warp 内点率 ≥ τ_warp **且** 分组点云重叠率 ≥ τ_cloud。
+- **主门** = warp / 重叠 / 两头相对差 P95 / 邻域长尾四项逻辑与。
   实测计算在 `reconstruction_gate.m4_main_gate`；本模块只负责组装、聚合与写回。
   **多指标不得单挑**（SysCON3D 依据：前馈 backbone 会幻觉跨视图一致性）；
 - **诊断**（§10.2）：track 重投影残差、相邻帧旋转平滑 —— 只产告警，不决定主门；
@@ -192,7 +192,7 @@ def compute_quality(
     dynamic_masks: Optional[np.ndarray] = None,
     track_ious: Optional[Sequence[float]] = None,
 ) -> QualityMetrics:
-    """计算 v6 质量指标（主门 + 诊断），算不出的项为 NaN / None，**不伪造**。
+    """计算整场四项质量门与既有诊断，算不出的项为 NaN / None，**不伪造**。
 
     `overall_quality` 的口径：**主门未过 → 0.0**；主门过了 → 有限诊断项的归一化均值。
     这样 `overall_quality` 单调反映主门，路由用它做 NaN 检查（§6.2 fail-closed）。
@@ -238,6 +238,8 @@ def compute_quality(
         "warp_photometric_inlier_ratio": float(
             gate_values.get("warp_photometric_inlier_ratio", NaN)),
         "cloud_overlap_ratio": float(gate_values.get("cloud_overlap_ratio", NaN)),
+        "point_depth_relative_p95": float(gate_values.get("point_depth_relative_p95", NaN)),
+        "cloud_neighbor_tail_ratio": float(gate_values.get("cloud_neighbor_tail_ratio", NaN)),
         "main_gate_passed": bool(gate.get("main_gate_passed", False)),
         "gate_thresholds": {k: float(v) for k, v in
                             (gate.get("thresholds") or {}).items()},
@@ -272,15 +274,28 @@ def compute_quality(
 # --------------------------------------------------- 质量写回（硬约束 22）----
 
 def quality_is_computed(art: Optional[ReconstructionArtifact]) -> bool:
-    """artifact 的质量是否可用（fail-closed 判定的唯一入口）。"""
+    """当前质量版本才可复用；旧重建数组仍可用于重算（简化版 §4）。"""
     if art is None:
         return False
     if getattr(art, "quality_status", "not_computed") != "computed":
         return False
+    if getattr(art, "quality_metric_version", "") != QUALITY_METRIC_VERSION:
+        return False
     q = getattr(art, "quality", None)
     if q is None:
         return False
+    if q.main_gate_passed and not all(np.isfinite(v) for v in (
+            q.warp_inlier_ratio, q.cloud_overlap_ratio,
+            q.point_depth_relative_p95, q.cloud_neighbor_tail_ratio)):
+        return False
     return bool(np.isfinite(float(q.overall_quality)))
+
+
+def current_quality_path(path: str | Path) -> Path:
+    """新版质量收据的独立路径；旧 artifact JSON 及其数组不覆盖。"""
+    p = Path(path)
+    suffix = f".quality-{QUALITY_METRIC_VERSION}"
+    return p if p.stem.endswith(suffix) else p.with_name(f"{p.stem}{suffix}{p.suffix}")
 
 
 def apply_quality(
@@ -295,11 +310,14 @@ def apply_quality(
     G5 在 v6 恒为 `not_available` + `None`（§10.4）：本函数**不再**读取或写入任何
     G5 标量，也不允许任何代理值进入。
     """
-    update: dict = {"quality_status": status,
+    update: dict = {"quality_status": status, "quality_metric_version": QUALITY_METRIC_VERSION,
                     "quality": q if status == "computed" else None}
     new_art = art.model_copy(update=update)
     if artifact_path:
-        write_artifact_json(new_art, artifact_path)
+        target = (current_quality_path(artifact_path)
+                  if art.quality_metric_version != QUALITY_METRIC_VERSION
+                  else Path(artifact_path))
+        write_artifact_json(new_art, target)
     return new_art
 
 
@@ -332,6 +350,32 @@ def compute_and_store_quality(
     `overall_quality=0.0` 会让场景被判 fallback —— 但那是"缺少输入"而不是"算过且差"。
     故这种情况记 `quality_status="failed"` + `quality=None`（route 必落 fallback）。
     """
+    if art.quality_metric_version != QUALITY_METRIC_VERSION and artifact_path:
+        # 同场景后续题复用独立收据，防止每题重复计算；身份必须仍与原几何一致。
+        receipt = current_quality_path(artifact_path)
+        if receipt.is_file():
+            try:
+                cached = ReconstructionArtifact.model_validate_json(receipt.read_bytes())
+                exclude = {"quality", "quality_status", "quality_metric_version"}
+                if (quality_is_computed(cached)
+                        and cached.model_dump(exclude=exclude) == art.model_dump(exclude=exclude)):
+                    return cached
+            except (OSError, ValueError):
+                pass  # 缺失/损坏/错场景收据不能复用，继续实算。
+    # 版本迁移只重算质量，不重新调用重建模型；通过已有 ref 读取同一冻结数组。
+    def _array(value: Optional[np.ndarray], ref: str) -> Optional[np.ndarray]:
+        if value is not None or not ref:
+            return value
+        try:
+            return np.load(ref, mmap_mode="r")
+        except (OSError, ValueError):
+            return None
+
+    depth_maps = _array(depth_maps, art.depth_maps)
+    c2w_list = _array(c2w_list, art.c2w_list)
+    intrinsics = _array(intrinsics, art.intrinsics)
+    point_map = _array(point_map, art.point_map)
+    depth_conf = _array(depth_conf, art.depth_conf)
     if frames is None and depth_maps is None:
         return apply_quality(art, None, status="failed", artifact_path=artifact_path)
     q = compute_quality(art, frames=frames, depth_maps=depth_maps, c2w_list=c2w_list,
@@ -346,6 +390,7 @@ __all__ = [
     "apply_quality",
     "compute_and_store_quality",
     "compute_quality",
+    "current_quality_path",
     "quality_is_computed",
     "write_artifact_json",
 ]

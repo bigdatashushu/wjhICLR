@@ -1,4 +1,4 @@
-"""M4 质量门单测（v6 §10，D11）：主门 = warp 内点率 ∧ 分组点云重叠率 + 诊断项。
+"""M4 质量门单测：整场四项逻辑与及既有诊断项。
 
 v6 与 v5 的口径差异（本文件的断言全部按 v6 写）：
 
@@ -21,7 +21,7 @@ from skill3d.reconstruction_gate.confidence_map import fuse_confidence
 from skill3d.schemas import ConfidenceMap, QualityMetrics, ReconstructionArtifact
 
 # 合成几何参数：正面平行平面（帧间同姿态）→ warp 残差恒 0、重叠率恒 1
-_HW = (16, 24)
+_HW = (64, 80)
 _N = 32
 _DEPTH = 2.0
 
@@ -55,12 +55,14 @@ def _perfect_geometry(n: int = _N, hw=_HW, depth_val: float = _DEPTH):
     K = _intrinsics(hw)
     depth = np.full((n, h, w), float(depth_val))
     c2w = np.tile(np.eye(4), (n, 1, 1))
+    c2w[:, 0, 3] = np.arange(n) * 0.002  # 避免 32 帧的全部重复样本使近邻中位距离为零
     ks = np.tile(K, (n, 1, 1))
     uu, vv = np.meshgrid(np.arange(w, dtype=np.float64), np.arange(h, dtype=np.float64))
     x = (uu - K[0, 2]) / K[0, 0] * depth_val
     y = (vv - K[1, 2]) / K[1, 1] * depth_val
     plane = np.stack([x, y, np.full_like(x, depth_val)], axis=-1)
     point_map = np.tile(plane[None], (n, 1, 1, 1))
+    point_map[..., 0] += c2w[:, 0, 3, None, None]
     return {"frames": _frames(n, hw), "depth_maps": depth, "c2w_list": c2w,
             "intrinsics": ks, "point_map": point_map}
 
@@ -141,6 +143,7 @@ def _artifact(**over) -> ReconstructionArtifact:
 def _quality_kwargs(**over) -> dict:
     base = dict(warp_inlier_ratio=0.9, warp_photometric_inlier_ratio=0.9,
                 cloud_overlap_ratio=0.9, main_gate_passed=True,
+                point_depth_relative_p95=0.02, cloud_neighbor_tail_ratio=1.5,
                 g1_blur_ok=1.0, g2_brightness=1.0, g3_motion_blur=0.0,
                 g4_frame_count=32, g6_depth_var_coeff=0.1, g7_dynamic_ratio=0.0,
                 g9_tracker_consistency=0.9, g10_baseline_quality=0.5,
@@ -190,24 +193,22 @@ def test_diagnostics_are_nan_without_data_and_measured_with_data():
 
 # --------------------------------------------------------------- 主门（§10.1）----
 
-def test_main_gate_is_and_of_two_submetrics():
-    """主门 = warp ∧ 重叠（多指标不得单挑）：任一单项满分都不算过。"""
-    both_ok = mg.main_gate({"warp_inlier_ratio": 0.9, "cloud_overlap_ratio": 0.9})
+def test_main_gate_is_and_of_four_submetrics():
+    """旧两项过不够：新增两项也必须满足上限。"""
+    extra = {"point_depth_relative_p95": 0.02, "cloud_neighbor_tail_ratio": 1.5}
+    both_ok = mg.main_gate({"warp_inlier_ratio": 0.9, "cloud_overlap_ratio": 0.9, **extra})
     assert both_ok["main_gate_passed"] is True
-    assert both_ok["sub_results"] == {"warp_inlier_ratio": True,
-                                      "cloud_overlap_ratio": True}
+    assert all(both_ok["sub_results"].values()) and len(both_ok["sub_results"]) == 4
 
     # warp 满分、重叠不过 → 必须 False（SysCON3D：自洽幻觉能骗过单项）
-    warp_only = mg.main_gate({"warp_inlier_ratio": 0.99, "cloud_overlap_ratio": 0.05})
+    warp_only = mg.main_gate({"warp_inlier_ratio": 0.99, "cloud_overlap_ratio": 0.05, **extra})
     assert warp_only["main_gate_passed"] is False
-    assert warp_only["sub_results"] == {"warp_inlier_ratio": True,
-                                        "cloud_overlap_ratio": False}
+    assert warp_only["sub_results"]["cloud_overlap_ratio"] is False
 
     # 重叠满分、warp 不过 → 同样必须 False
-    cloud_only = mg.main_gate({"warp_inlier_ratio": 0.05, "cloud_overlap_ratio": 0.99})
+    cloud_only = mg.main_gate({"warp_inlier_ratio": 0.05, "cloud_overlap_ratio": 0.99, **extra})
     assert cloud_only["main_gate_passed"] is False
-    assert cloud_only["sub_results"] == {"warp_inlier_ratio": False,
-                                         "cloud_overlap_ratio": True}
+    assert cloud_only["sub_results"]["warp_inlier_ratio"] is False
 
 
 def test_main_gate_fails_on_nan_inf_depth_without_exception():
@@ -245,20 +246,22 @@ def test_overall_quality_is_zero_when_main_gate_fails():
 
 
 def test_overall_quality_is_positive_when_main_gate_passes():
-    """主门过 → 有限诊断项归一化均值（完美几何每一项都满分 → 1.0）。"""
+    """主门过 → 沿用有限诊断项均值；小平移使基线诊断不满分。"""
     q = qm.compute_quality(**_perfect_geometry())
     assert q.main_gate_passed is True
-    assert q.overall_quality == pytest.approx(1.0)
+    assert q.overall_quality == pytest.approx(np.mean(qm._norm_scores(q.model_dump())))
+    assert q.overall_quality >= 0.5
 
 
 def test_compute_quality_reports_main_gate_metrics_not_nan():
     """主门实算的 warp/重叠比率必须写进 QualityMetrics（trace 的唯一事实源）。"""
     q = qm.compute_quality(**_perfect_geometry())
     assert q.warp_inlier_ratio == pytest.approx(1.0)
-    assert q.warp_photometric_inlier_ratio == pytest.approx(1.0)
-    assert q.cloud_overlap_ratio == pytest.approx(1.0)
-    assert q.gate_thresholds == {"warp_inlier_ratio": mg.TH_WARP_INLIER,
-                                 "cloud_overlap_ratio": mg.TH_CLOUD_OVERLAP}
+    assert q.warp_photometric_inlier_ratio > 0.9
+    assert q.cloud_overlap_ratio > 0.9
+    assert q.point_depth_relative_p95 == pytest.approx(0.0)
+    assert 1 <= q.cloud_neighbor_tail_ratio <= mg.TH_CLOUD_NEIGHBOR_TAIL
+    assert q.gate_thresholds == mg.default_thresholds()
 
 
 def test_compute_quality_separates_degraded_geometry_per_submetric():
@@ -276,9 +279,10 @@ def test_compute_quality_separates_degraded_geometry_per_submetric():
 def test_conf_warp_monotonic_is_soft_weight_not_gate():
     """conf 只作软权重（§10.3）：不单调只降权、不否决主门；未自检 ≠ 自检没过。"""
     geo = _perfect_geometry()
-    mono = mg.main_gate({"warp_inlier_ratio": 1.0, "cloud_overlap_ratio": 1.0,
+    extra = {"point_depth_relative_p95": 0.02, "cloud_neighbor_tail_ratio": 1.5}
+    mono = mg.main_gate({"warp_inlier_ratio": 1.0, "cloud_overlap_ratio": 1.0, **extra,
                          "conf_warp_monotonic": True})
-    broken = mg.main_gate({"warp_inlier_ratio": 1.0, "cloud_overlap_ratio": 1.0,
+    broken = mg.main_gate({"warp_inlier_ratio": 1.0, "cloud_overlap_ratio": 1.0, **extra,
                            "conf_warp_monotonic": False})
     assert mono["main_gate_passed"] and broken["main_gate_passed"]
     assert mono["conf_weight"] == 1.0

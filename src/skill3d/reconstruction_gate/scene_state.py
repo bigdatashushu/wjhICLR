@@ -22,6 +22,7 @@ from skill3d.routing.task_classifier import canonical_task
 from skill3d.schemas.evidence import EvidenceProfile, MetricEvidenceGateResult
 from skill3d.schemas.reconstruction import (
     METRIC_TASK_TYPES,
+    QUALITY_METRIC_VERSION,
     QualityMetrics,
     ReconstructionArtifact,
     SceneState,
@@ -48,6 +49,7 @@ def scene_route_from_quality(
     q: Optional[QualityMetrics],
     *,
     quality_status: str = "computed",
+    quality_metric_version: str = QUALITY_METRIC_VERSION,
 ) -> str:
     """§6.2 分流规则（单一事实源，**fail-closed**，硬约束 22）。
 
@@ -55,17 +57,22 @@ def scene_route_from_quality(
     NaN 或非有限值 → **不得**停在 `full_3d`，必须落到 `fallback_2d_only`
     或 `unanswerable`。
 
-    v6 主门（§10.1）取代 v5 的 G5 依赖：**主门通过** 且 输入质量达阈 → `full_3d`；
-    主门未过 → `fallback_2d_only`。**多指标不得单挑**：主门本身已是 warp ∧ 重叠。
+    简化版四项主门通过且输入质量达阈 → `full_3d`；旧质量版本不得直接准入。
     """
     if q is None or quality_status != "computed":
         return "fallback_2d_only"
     if int(q.g4_frame_count) < 1:
         return "unanswerable"           # G4：无可用帧
+    if quality_metric_version != QUALITY_METRIC_VERSION:
+        return "fallback_2d_only"
     overall = float(q.overall_quality)
     if not np.isfinite(overall):
         return "fallback_2d_only"
     if not bool(q.main_gate_passed):
+        return "fallback_2d_only"
+    if not all(np.isfinite(v) for v in (
+            q.warp_inlier_ratio, q.cloud_overlap_ratio,
+            q.point_depth_relative_p95, q.cloud_neighbor_tail_ratio)):
         return "fallback_2d_only"
     if overall < TH_OVERALL_QUALITY:
         return "fallback_2d_only"
@@ -158,7 +165,8 @@ def build_scene_state(
     """
     q = art.quality
     scene_route = scene_route_from_quality(
-        q, quality_status=str(getattr(art, "quality_status", "not_computed")))
+        q, quality_status=str(getattr(art, "quality_status", "not_computed")),
+        quality_metric_version=art.quality_metric_version)
     gate = make_metric_gate(art, scene_route=scene_route, question_type=question_type)
     profile = build_evidence_profile(
         artifact=art, scene_route=scene_route, question_type=question_type,
@@ -167,9 +175,9 @@ def build_scene_state(
 
     metric_q = str(question_type) in METRIC_TASK_TYPES
     scope = question_tool_scope_of(
-        scene_route, metric_question=metric_q, gate_passed=gate.gate_passed)
+        scene_route, metric_question=metric_q, gate_passed=bool(gate.gate_passed))
     avail = available_artifacts_for(scene_route, question_type=question_type,
-                                    gate_passed=gate.gate_passed,
+                                    gate_passed=bool(gate.gate_passed),
                                     metric_question=metric_q)
 
     summary = _scene_summary(art, scene_route=scene_route, scope=scope,
@@ -297,6 +305,8 @@ def _scene_summary(art, *, scene_route: str, scope: str,
         f"main_gate_passed={bool(q.main_gate_passed)} "
         f"warp_inlier={float(q.warp_inlier_ratio):.3f} "
         f"cloud_overlap={float(q.cloud_overlap_ratio):.3f} "
+        f"head_relative_p95={q.point_depth_relative_p95:.3f} "
+        f"cloud_neighbor_tail={q.cloud_neighbor_tail_ratio:.3f} "
         f"overall_quality={float(q.overall_quality):.3f} "
         f"world_frame={wf} metric_scale_status={getattr(art, 'scale_fusion_status', 'not_run')} "
         f"metric_gate={'passed' if (gate and gate.gate_passed) else 'not_passed'} "
@@ -317,11 +327,11 @@ def quality_gate(
     """M4 入口（保留 v5 名称以便平滑迁移）：artifact → SceneState。
 
     与 v5 的差异：不再有 G7/G9 增量补写（诊断项不影响主门）与 `scale_is_usable`
-    中间量；质量一旦 `computed` 即复用（硬约束 22 单一事实源）。
+    中间量；仅当前版本的实算质量可复用（硬约束 22 单一事实源）。
     """
-    from .quality_metrics import compute_and_store_quality
+    from .quality_metrics import compute_and_store_quality, quality_is_computed
 
-    if str(getattr(art, "quality_status", "not_computed")) != "computed":
+    if not quality_is_computed(art):
         art = compute_and_store_quality(
             art, artifact_path=(artifact_path if persist_quality else None))
     return build_scene_state(art, m5=m5, objects=objects,

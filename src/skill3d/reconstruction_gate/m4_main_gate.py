@@ -1,15 +1,14 @@
-"""M4 无真值质量门（v6 §10，D11）—— 主门 = warp 内点率 **且** 分组点云重叠率。
+"""M4 整场无真值质量门（简化版方案 2026-10-14）。
 
 纯几何实现：只吃 `frames / depth_maps / c2w_list / intrinsics / point_map /
 depth_conf`，不用真值、不加载任何额外模型、不读题目（§10.1/§10.5）。
 点云最近邻走 `scipy.spatial.cKDTree`，其余是纯 numpy 向量化；同一输入两次调用
 逐位一致（任何抽样都走固定种子，见 `_SUBSAMPLE_SEED`），32 帧 @518×392 秒级可跑。
 
-四条纪律（照抄 §10，不得"顺手优化"掉）：
+四条纪律：
 
-1. **多指标不得单挑**（§10.1）：`main_gate_passed` 恒为"warp 内点率 ≥ τ_warp"
-   **且**"分组点云重叠率 ≥ τ_cloud"的逻辑与。SysCON3D 依据：前馈 backbone 会
-   幻觉出跨视图一致性，任何单项都能被自洽的幻觉骗过。
+1. **整场四项逻辑与**：warp、分组重叠、两头相对差 P95、邻域距离长尾比全部满足
+   才通过。同场景共用一次结果，不增加对象门或逐点资格管理。
 2. **报率不报绝对距离**（§10.1/§10.6）：VGGT 点云是"中位归一化、无米制尺度"，
    点云重叠一律用**相对阈值**（场景稳健尺度的百分比）判内点，代码里**永不**出现
    米制绝对阈值，也禁止拿"室内 1–3m"当硬门。
@@ -19,9 +18,8 @@ depth_conf`，不用真值、不加载任何额外模型、不读题目（§10.1
 4. **未知 ≠ 坏值**（fail-closed，§10.5 诚实边界）：算不出来的量返回 `NaN`（不是 0、
    不是 False）并把原因写进 `warnings`/`reason`，由调用方决定怎么处置。
 
-阈值全部 `[TODO_CALIBRATE]`：给出的起始参考值只是让链路能跑起来，**必须**按 §10.6
-的最小 PoC（1 个好 episode + 抽稀 / 跨场景帧 / 运动模糊三种注入退化）在自有数据上
-重标后才能当门用。
+阈值全部 `[TODO_CALIBRATE]`：新增 0.15 / 3.0 为历史场景回放的候选值，
+须在未参与选择的真实场景上独立验证，不把回放命中率当作泛化效果。
 """
 
 from __future__ import annotations
@@ -33,7 +31,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 from scipy.stats import rankdata
 
-# 版本标识单一事实源（§5.2：`quality_metric_version="v6-warp-overlap-no-g5"`）
+# 质量版本与旧两项主门隔离；原重建数组可复用，旧 quality 不可直接准入。
 from skill3d.schemas.reconstruction import QUALITY_METRIC_VERSION as M4_GATE_VERSION
 
 NaN = float("nan")
@@ -48,6 +46,14 @@ _SUBSAMPLE_SEED: int = 0
 # ---- 主门阈值（§10.1）----
 TH_WARP_INLIER: float = 0.5       # TODO_CALIBRATE: warp 相对深度内点率下限（起始参考）
 TH_CLOUD_OVERLAP: float = 0.3     # TODO_CALIBRATE: 前/后子云双向重叠率下限（起始参考）
+TH_POINT_DEPTH_RELATIVE_P95: float = 0.15  # TODO_CALIBRATE: 两重建头相对差上限
+TH_CLOUD_NEIGHBOR_TAIL: float = 3.0  # TODO_CALIBRATE: 邻域平均距离 P95/P50 上限
+
+# 简化版固定采样口径：全部冻结帧，392×518 时共 26,400 候选点。
+SCENE_SAMPLE_STRIDE: int = 16
+SCENE_SAMPLE_OFFSET: int = 4
+SCENE_NEIGHBOR_COUNT: int = 20
+MIN_SCENE_SAMPLES: int = 100
 
 # ---- warp 口径 ----
 N_NEIGHBOR_FRAMES: int = 5        # 每帧取约 5 个近邻帧（§10.1 起始参考；是采样口径不是阈值）
@@ -85,6 +91,8 @@ __all__ = [
     "N_NEIGHBOR_FRAMES",
     "N_WARP_SAMPLES_PER_PAIR",
     "TH_CLOUD_OVERLAP",
+    "TH_POINT_DEPTH_RELATIVE_P95",
+    "TH_CLOUD_NEIGHBOR_TAIL",
     "TH_CLOUD_REL_TOL",
     "TH_CONF_DOWNWEIGHT",
     "TH_WARP_INLIER",
@@ -95,6 +103,8 @@ __all__ = [
     "cross_view_warp_inliers",
     "default_thresholds",
     "grouped_cloud_overlap",
+    "scene_head_disagreement",
+    "cloud_neighbor_tail_ratio",
     "main_gate",
     "warp_residual_map",
 ]
@@ -326,7 +336,7 @@ def cross_view_warp_inliers(
     - `per_pair` 是 JSON 友好的诊断列表（不含逐像素大数组）；每像素残差请用
       `warp_residual_map`（与这里同一个核心实现，口径唯一）。
     - 无光度信息（frames 传 None）时 `warp_photometric_inlier_ratio` 记 NaN：
-      它**不参与主门**（§10.1 主门只由深度内点率 + 重叠率决定），只作诊断。
+      它**不参与主门**，只作诊断。
     """
     depth, c2w, k, hw, frames_arr = _validate_geometry(frames, depth_maps, c2w_list, intrinsics)
     n = int(depth.shape[0])
@@ -523,6 +533,110 @@ def grouped_cloud_overlap(
 
 
 # ---------------------------------------------------------------------------
+# 简化版整场统计：同一固定网格、共同有效样本，不做置信度/离群过滤
+# ---------------------------------------------------------------------------
+
+def scene_head_disagreement(
+    depth_maps: np.ndarray,
+    c2w_list: np.ndarray,
+    intrinsics: np.ndarray,
+    point_map: np.ndarray,
+) -> dict:
+    """两头相对差 P95，同时返回供长尾统计临时复用的深度反投影采样点。
+
+    网格步长 16、偏移 4；全部帧参与。共同有效位置须有有限正深度、有限点云头与
+    反投影坐标。输出点集只在本次计算内复用，不落盘、不作为测量点云。
+    """
+    # 不把完整 depth/point_map 转为 float64，避免为抽样统计复制整段视频。
+    depth = np.asarray(depth_maps)
+    pm = np.asarray(point_map)
+    if depth.ndim != 3 or min(depth.shape) < 1:
+        raise ValueError(f"depth_maps 必须是非空 (N,H,W)，收到 {depth.shape}")
+    n, h, w = depth.shape
+    if pm.shape != (n, h, w, 3):
+        raise ValueError(f"point_map 与 depth_maps 网格不一致：{pm.shape} vs {depth.shape}")
+    gy, gx = np.meshgrid(
+        np.arange(SCENE_SAMPLE_OFFSET, h, SCENE_SAMPLE_STRIDE),
+        np.arange(SCENE_SAMPLE_OFFSET, w, SCENE_SAMPLE_STRIDE),
+        indexing="ij",
+    )
+    gy, gx = gy.ravel(), gx.ravel()
+    c2w = np.asarray(c2w_list, dtype=np.float64)
+    k = np.asarray(intrinsics, dtype=np.float64)
+    if k.shape == (3, 3):
+        k = np.broadcast_to(k, (n, 3, 3))
+    if c2w.shape != (n, 4, 4) or k.shape != (n, 3, 3):
+        raise ValueError("c2w_list / intrinsics 与深度帧数不一致")
+    if not np.isfinite(c2w).all() or not np.isfinite(k).all():
+        raise ValueError("c2w_list / intrinsics 含 NaN/Inf")
+    if np.any(k[:, 0, 0] <= 0) or np.any(k[:, 1, 1] <= 0):
+        raise ValueError("intrinsics 焦距必须为正")
+
+    distances: list[np.ndarray] = []
+    points: list[np.ndarray] = []
+    for i in range(n):
+        d = np.asarray(depth[i, gy, gx], dtype=np.float64)
+        head = np.asarray(pm[i, gy, gx], dtype=np.float64)
+        valid = np.isfinite(d) & (d > 0) & np.isfinite(head).all(axis=1)
+        d, head = d[valid], head[valid]
+        cam = np.column_stack((
+            (gx[valid] - k[i, 0, 2]) * d / k[i, 0, 0],
+            (gy[valid] - k[i, 1, 2]) * d / k[i, 1, 1],
+            d,
+        ))
+        with np.errstate(over="ignore", invalid="ignore"):
+            # 显式向量收缩，避免部分 Mac BLAS 后端对有限小矩阵误报浮点状态。
+            world = np.einsum("ij,kj->ik", cam, c2w[i, :3, :3]) + c2w[i, :3, 3]
+        valid_world = np.isfinite(world).all(axis=1)
+        world, head, d = world[valid_world], head[valid_world], d[valid_world]
+        with np.errstate(over="ignore", invalid="ignore"):
+            relative = np.linalg.norm(head - world, axis=1) / d
+        points.append(world)
+        distances.append(relative)
+    cloud = np.concatenate(points)
+    out = {"point_depth_relative_p95": NaN, "depth_points": cloud, "reason": ""}
+    if len(cloud) < MIN_SCENE_SAMPLES:
+        out["reason"] = "insufficient_common_samples"
+        return out
+    relative = np.concatenate(distances)
+    if not np.isfinite(relative).all():
+        out["reason"] = "non_finite_head_disagreement"
+        return out
+    out["point_depth_relative_p95"] = float(np.quantile(relative, 0.95))
+    return out
+
+
+def cloud_neighbor_tail_ratio(depth_points: np.ndarray) -> dict:
+    """共同有效的深度反投影样本：另 20 个近邻平均距离的 P95/P50。
+
+    不改变原点云，不做体素/离群/置信度过滤。整体缩放不改比值；中位距离为零
+    （例如全部重复点）时无法评估，返回 NaN 和原因，不用 epsilon 凑出比值。
+    """
+    cloud = np.asarray(depth_points, dtype=np.float64)
+    if cloud.ndim != 2 or cloud.shape[1] != 3:
+        raise ValueError(f"depth_points 必须是 (M,3)，收到 {cloud.shape}")
+    out = {"cloud_neighbor_tail_ratio": NaN, "reason": ""}
+    if len(cloud) < MIN_SCENE_SAMPLES:
+        out["reason"] = "insufficient_common_samples"
+        return out
+    if not np.isfinite(cloud).all():
+        out["reason"] = "non_finite_sample_points"
+        return out
+    distances, _ = cKDTree(cloud).query(cloud, k=SCENE_NEIGHBOR_COUNT + 1, workers=1)
+    # query 的类型声明也允许单点标量返回；这里输入 (M,3)，规范化为数组。
+    means = np.mean(np.asarray(distances)[:, 1:], axis=1)  # 去自身，剩余恰好 20 个邻点
+    if not np.isfinite(means).all():
+        out["reason"] = "non_finite_neighbor_distances"
+        return out
+    median, p95 = np.quantile(means, [0.50, 0.95])
+    if median <= 0:
+        out["reason"] = "zero_neighbor_median"
+        return out
+    out["cloud_neighbor_tail_ratio"] = float(p95 / median)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # §10.3 conf-warp 单调性自检（conf 只作软权重，不作硬门）
 # ---------------------------------------------------------------------------
 
@@ -652,6 +766,8 @@ def default_thresholds() -> dict[str, float]:
     return {
         "warp_inlier_ratio": float(TH_WARP_INLIER),
         "cloud_overlap_ratio": float(TH_CLOUD_OVERLAP),
+        "point_depth_relative_p95": float(TH_POINT_DEPTH_RELATIVE_P95),
+        "cloud_neighbor_tail_ratio": float(TH_CLOUD_NEIGHBOR_TAIL),
     }
 
 
@@ -682,9 +798,9 @@ def main_gate(
     *,
     thresholds: dict | None = None,
 ) -> dict:
-    """§10.1 主门 = warp 内点率 ≥ τ_warp **且** 分组点云重叠率 ≥ τ_cloud。
+    """整场主门：warp / 重叠下限与两头差 / 长尾上限，四项逻辑与。
 
-    **多指标不得单挑**（SysCON3D：前馈 backbone 会幻觉跨视图一致性）：两个子项都过
+    **多指标不得单挑**：四个子项都过
     `main_gate_passed` 才为 True，任一 NaN/非有限 → 该子项 False 且进 `warnings`
     （fail-closed）。本函数**不读真值、不读米制尺度**，也不把 conf 当门。
 
@@ -692,18 +808,19 @@ def main_gate(
 
     - 已算好的指标：`{"warp_inlier_ratio": f, "warp_photometric_inlier_ratio": f,
       "cloud_overlap_ratio": f, "conf_warp_monotonic": bool|None,
-      "conf_warp_spearman": f|None, ...}`（把 `cross_view_warp_inliers` /
-      `grouped_cloud_overlap` / `conf_warp_monotonic` 的返回合并进来即可）；
+      "point_depth_relative_p95": f, "cloud_neighbor_tail_ratio": f, ...}`；
     - 或原始数组：`frames / depth_maps / c2w_list / intrinsics` → 现场算 warp；
-      `point_map` → 现场算重叠率。原始数组路径内部**捕获异常**转 NaN + 告警
+      `point_map` → 现场算重叠率；depth/poses/K/point_map 共用固定网格算新增两项。
+      原始数组路径内部**捕获异常**转 NaN + 告警
       （坏输入 fail-closed，不让门把 episode 打崩）。
 
     返回
     ----
-    {"main_gate_passed": bool,           # 恒 = 两个子项的 AND
-     "sub_results": {"warp_inlier_ratio": bool, "cloud_overlap_ratio": bool},
+    {"main_gate_passed": bool,           # 恒 = 四个子项的 AND
+     "sub_results": {metric_name: bool, ...},
      "values": {"warp_inlier_ratio": f, "warp_photometric_inlier_ratio": f,
-                "cloud_overlap_ratio": f},     # 算不出的记 NaN
+                "cloud_overlap_ratio": f, "point_depth_relative_p95": f,
+                "cloud_neighbor_tail_ratio": f},     # 算不出的记 NaN
      "thresholds": {...},                # 本次判定实际用的阈值快照（写 gate_thresholds）
      "warnings": [str, ...],             # 异常（NaN/缺失/非法）**与**未过的原因
      "conf_weight": float,               # §10.3 软权重（见下），**不参与** AND
@@ -766,16 +883,48 @@ def main_gate(
         warnings.append("缺少 cloud_overlap_ratio（也未给 point_map）"
                         "→ 重叠率子项 fail-closed（不得单挑放行）")
 
+    # ---- 新增两项：整场、共同样本，仅保存标量与原因 ----
+    head_val = _to_float(qi.get("point_depth_relative_p95"))
+    tail_val = _to_float(qi.get("cloud_neighbor_tail_ratio"))
+    if not (_has_input(qi, "point_depth_relative_p95")
+            and _has_input(qi, "cloud_neighbor_tail_ratio")):
+        if _has_raw_arrays(qi, ("depth_maps", "c2w_list", "intrinsics", "point_map")):
+            try:
+                head = scene_head_disagreement(qi["depth_maps"], qi["c2w_list"],
+                                               qi["intrinsics"], qi["point_map"])
+                if not _has_input(qi, "point_depth_relative_p95"):
+                    head_val = float(head["point_depth_relative_p95"])
+                    if head["reason"]:
+                        warnings.append(f"point_depth_relative_p95: {head['reason']}")
+                if not _has_input(qi, "cloud_neighbor_tail_ratio"):
+                    tail = cloud_neighbor_tail_ratio(head["depth_points"])
+                    tail_val = float(tail["cloud_neighbor_tail_ratio"])
+                    if tail["reason"]:
+                        warnings.append(f"cloud_neighbor_tail_ratio: {tail['reason']}")
+            except Exception as exc:  # noqa: BLE001 - 坏输入使新增子项 fail-closed
+                warnings.append(f"整场几何统计失败（{type(exc).__name__}: {exc}）")
+        else:
+            warnings.append("缺少整场统计所需 depth_maps/c2w_list/intrinsics/point_map")
+
     sub: dict[str, bool] = {}
-    for name, val in (("warp_inlier_ratio", warp_val), ("cloud_overlap_ratio", cloud_val)):
+    for name, val, lower_bound in (
+        ("warp_inlier_ratio", warp_val, True),
+        ("cloud_overlap_ratio", cloud_val, True),
+        ("point_depth_relative_p95", head_val, False),
+        ("cloud_neighbor_tail_ratio", tail_val, False),
+    ):
         if not np.isfinite(val):
             sub[name] = False
             warnings.append(f"{name} 非有限（NaN/Inf）或缺失 → 子项 False（fail-closed；"
                             "未知不等于通过）")
             continue
-        sub[name] = bool(val >= th[name])
+        # 比率不得为负；warp/重叠不得超出 [0,1]。
+        valid = val >= 0 and (not lower_bound or val <= 1)
+        sub[name] = bool(valid and (val >= th[name] if lower_bound else val <= th[name]))
         if not sub[name]:
-            warnings.append(f"{name}={val:.4f} < 阈值 {th[name]:.4f} → 子项未过")
+            comparison = "<" if lower_bound else ">"
+            warnings.append(f"{name}={val:.4f} 非法或 {comparison} 阈值 "
+                            f"{th[name]:.4f} → 子项未过")
 
     # ---- §10.3 conf 软权重（只降权，不否决）----
     mono_src = qi.get("conf_warp_monotonic", None)
@@ -818,7 +967,7 @@ def main_gate(
                         f"{TH_PHOTO_WARN:.4f}（几何过、外观不过 → 疑似光照/动态/曝光变化；"
                         "仅告警，§10.2 不改变主门）")
 
-    passed = bool(sub["warp_inlier_ratio"] and sub["cloud_overlap_ratio"])   # 逻辑与，不得单挑
+    passed = all(sub.values())  # 简化版：四项全部通过，统一整场路由
     return {
         "main_gate_passed": passed,
         "sub_results": sub,
@@ -826,6 +975,8 @@ def main_gate(
             "warp_inlier_ratio": float(warp_val),
             "warp_photometric_inlier_ratio": float(photo_val),
             "cloud_overlap_ratio": float(cloud_val),
+            "point_depth_relative_p95": float(head_val),
+            "cloud_neighbor_tail_ratio": float(tail_val),
         },
         "thresholds": {k: float(v) for k, v in th.items()},
         "warnings": warnings,

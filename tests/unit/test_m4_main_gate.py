@@ -1,16 +1,4 @@
-"""v6 §10 M4 无真值主门单测（`reconstruction_gate/m4_main_gate.py`）。
-
-覆盖要求：
-- 完美合成几何（盒室解析渲染，两视角组）→ 内点率高、主门过；
-- 注入退化（随机深度 / 跨场景帧）→ 比率塌、主门不过；
-- NaN/Inf 深度 → 主门不过、warnings 非空、**不抛异常**；
-- **不得单挑**：warp 过而重叠不过、重叠过而 warp 不过，两种情形主门都必须 False；
-- `conf_warp_monotonic` 在退化/数据不足时返回 None（不是 False）；
-- 确定性：同一输入两次 → 逐位一致；点云重叠对尺度不变（报率不报绝对距离）。
-
-合成场景是**解析渲染**（轴对齐盒室的 ray-box 求交），带覆盖光照变化的平滑贴色，
-不含任何真值/学习模型 —— 与门本身的"纯几何"口径一致。
-"""
+"""整场四项无真值主门单测（简化版 2026-10-14）。"""
 
 from __future__ import annotations
 
@@ -22,7 +10,7 @@ import pytest
 
 from skill3d.reconstruction_gate import m4_main_gate as mg
 
-HW = (48, 64)                                  # 单测用小图（性能用例另用 518×392）
+HW = (64, 80)                                  # 固定网格样本 >=100；性能另用 518×392
 BOX_LO = np.array([-2.0, -1.5, -1.5])
 BOX_HI = np.array([2.0, 1.5, 1.5])
 
@@ -142,6 +130,11 @@ def _perfect(n: int = 8) -> dict:
     return {"frames": fr, "depth_maps": d, "c2w_list": c2w, "intrinsics": K, "point_map": pm}
 
 
+def _gate_inputs(**values):
+    """四项齐全的已测标量；缺项测试直接调用 main_gate，不使用此助手。"""
+    return {"point_depth_relative_p95": 0.02, "cloud_neighbor_tail_ratio": 1.5, **values}
+
+
 # --------------------------------------------------------------------------- #
 # 1. 完美几何 → 高内点率、主门通过
 # --------------------------------------------------------------------------- #
@@ -164,10 +157,11 @@ def test_perfect_geometry_warp_and_overlap_pass():
 
     gate = mg.main_gate(s)                                   # 原始数组路径
     assert gate["main_gate_passed"] is True
-    assert gate["sub_results"] == {"warp_inlier_ratio": True, "cloud_overlap_ratio": True}
+    assert gate["sub_results"] == {
+        "warp_inlier_ratio": True, "cloud_overlap_ratio": True,
+        "point_depth_relative_p95": True, "cloud_neighbor_tail_ratio": True}
     assert gate["warnings"] == []
-    assert gate["thresholds"] == {"warp_inlier_ratio": mg.TH_WARP_INLIER,
-                                  "cloud_overlap_ratio": mg.TH_CLOUD_OVERLAP}
+    assert gate["thresholds"] == mg.default_thresholds()
     assert gate["values"]["warp_inlier_ratio"] > 0.8
     assert gate["values"]["cloud_overlap_ratio"] > 0.6
     assert gate["conf_weight"] == 1.0                        # 未做自检 → 不加罚
@@ -178,7 +172,7 @@ def test_main_gate_accepts_precomputed_metrics():
     s = _perfect(8)
     warp = mg.cross_view_warp_inliers(s["frames"], s["depth_maps"], s["c2w_list"], s["intrinsics"])
     ov = mg.grouped_cloud_overlap(s["point_map"])
-    gate = mg.main_gate({**warp, **ov})
+    gate = mg.main_gate(_gate_inputs(**warp, **ov))
     assert gate["main_gate_passed"] is True
     assert gate["n_pairs"] == warp["n_pairs"]
 
@@ -216,9 +210,11 @@ def test_cross_scene_frames_collapse_cloud_overlap():
     assert ov["cloud_overlap_ratio"] <= 0.2                        # 分组重叠把它戳穿
     assert ov["cloud_overlap_ratio"] < mg.TH_CLOUD_OVERLAP
 
-    gate = mg.main_gate({**warp, **ov})
+    gate = mg.main_gate(_gate_inputs(**warp, **ov))
     assert gate["main_gate_passed"] is False
-    assert gate["sub_results"] == {"warp_inlier_ratio": True, "cloud_overlap_ratio": False}
+    assert gate["sub_results"] == {
+        "warp_inlier_ratio": True, "cloud_overlap_ratio": False,
+        "point_depth_relative_p95": True, "cloud_neighbor_tail_ratio": True}
     # 好场景对照：同一批次里若没有跨场景注入，两组子云是重叠的
     assert mg.grouped_cloud_overlap(_perfect(32)["point_map"])["cloud_overlap_ratio"] > 0.6
 
@@ -256,7 +252,7 @@ def test_nan_inf_depth_fails_closed_without_exception():
 def test_missing_inputs_and_bad_values_fail_closed():
     gate = mg.main_gate({})                                          # 什么都没给
     assert gate["main_gate_passed"] is False
-    assert gate["sub_results"] == {"warp_inlier_ratio": False, "cloud_overlap_ratio": False}
+    assert not any(gate["sub_results"].values())
     assert np.isnan(gate["values"]["warp_inlier_ratio"])
     assert np.isnan(gate["values"]["cloud_overlap_ratio"])
     assert len(gate["warnings"]) >= 2
@@ -264,14 +260,14 @@ def test_missing_inputs_and_bad_values_fail_closed():
     gate = mg.main_gate({"warp_inlier_ratio": float("inf"),
                          "cloud_overlap_ratio": float("nan")})
     assert gate["main_gate_passed"] is False
-    assert gate["sub_results"] == {"warp_inlier_ratio": False, "cloud_overlap_ratio": False}
+    assert not any(gate["sub_results"].values())
 
     gate = mg.main_gate({"warp_inlier_ratio": None, "cloud_overlap_ratio": "bad"})
     assert gate["main_gate_passed"] is False
     assert gate["warnings"]
 
-    gate = mg.main_gate({"warp_inlier_ratio": 0.9, "cloud_overlap_ratio": 0.9,
-                         "frames": None, "depth_maps": None})
+    gate = mg.main_gate(_gate_inputs(warp_inlier_ratio=0.9, cloud_overlap_ratio=0.9,
+                                    frames=None, depth_maps=None))
     assert gate["main_gate_passed"] is True                          # 显式值优先，None 不参与
     assert gate["warnings"] == []
 
@@ -292,10 +288,10 @@ def test_missing_inputs_and_bad_values_fail_closed():
                                                 (0.49, 0.29), (0.51, 0.0), (0.0, 0.51)])
 def test_neither_submetric_passes_alone(warp_val, cloud_val):
     """任一单项都不得单独放行：主门恒为两个子项的 AND（最多一个子项能过）。"""
-    vals = {"warp_inlier_ratio": warp_val, "cloud_overlap_ratio": cloud_val}
+    vals = _gate_inputs(warp_inlier_ratio=warp_val, cloud_overlap_ratio=cloud_val)
     gate = mg.main_gate(vals)
     assert gate["main_gate_passed"] is False                         # 最多只有一个过 → 仍不过
-    assert sum(gate["sub_results"].values()) <= 1
+    assert sum(gate["sub_results"].values()) <= 3
 
     # 阈值门槛严格更高 → 仍不过；阈值调到与观测值恰好相等（≥ 口径）→ 两个都过才过
     gate = mg.main_gate(vals, thresholds={"warp_inlier_ratio": warp_val + 1e-9,
@@ -334,8 +330,8 @@ def test_each_submetric_can_veto_but_never_alone():
 def test_conf_never_gates_main_gate():
     """§10.3/§10.4：conf 不能否决主门，也不是硬阈值。"""
     bad_conf = np.full((8, *HW), np.nan)                             # conf 全坏
-    gate = mg.main_gate({"warp_inlier_ratio": 0.9, "cloud_overlap_ratio": 0.9,
-                         "depth_conf": bad_conf, "point_conf": bad_conf})
+    gate = mg.main_gate(_gate_inputs(warp_inlier_ratio=0.9, cloud_overlap_ratio=0.9,
+                                    depth_conf=bad_conf, point_conf=bad_conf))
     assert gate["main_gate_passed"] is True
     assert gate["conf_warp_monotonic"] is None
 
@@ -358,16 +354,16 @@ def test_conf_warp_monotonic_true_false_and_downweight():
     assert len(good["bin_medians"]) >= mg.MIN_CONF_WARP_BINS
     assert np.all(np.diff(good["bin_medians"]) <= 0)
 
-    gate = mg.main_gate({"warp_inlier_ratio": 0.9, "cloud_overlap_ratio": 0.9,
-                         "conf_warp_monotonic": True})
+    gate = mg.main_gate(_gate_inputs(warp_inlier_ratio=0.9, cloud_overlap_ratio=0.9,
+                                    conf_warp_monotonic=True))
     assert gate["conf_weight"] == 1.0 and gate["main_gate_passed"] is True
 
     resid_bad = conf / 10.0 + rng.random(conf.shape) * 1e-3
     bad = mg.conf_warp_monotonic(conf, resid_bad, n_bins=5)
     assert bad["monotonic"] is False
-    gate = mg.main_gate({"warp_inlier_ratio": 0.9, "cloud_overlap_ratio": 0.9,
-                         "conf_warp_monotonic": False,
-                         "conf_warp_spearman": bad["spearman"]})
+    gate = mg.main_gate(_gate_inputs(warp_inlier_ratio=0.9, cloud_overlap_ratio=0.9,
+                                    conf_warp_monotonic=False,
+                                    conf_warp_spearman=bad["spearman"]))
     assert gate["conf_weight"] == mg.TH_CONF_DOWNWEIGHT              # 降权
     assert gate["main_gate_passed"] is True                          # 但**不否决**
     assert any("不单调" in w for w in gate["warnings"])
@@ -395,8 +391,8 @@ def test_conf_warp_monotonic_none_when_degenerate():
     assert const["monotonic"] is None and const["reason"] == "conf_constant"
 
     # None 进主门 → 降权，但不否决
-    gate = mg.main_gate({"warp_inlier_ratio": 0.9, "cloud_overlap_ratio": 0.9,
-                         "conf_warp_monotonic": None})
+    gate = mg.main_gate(_gate_inputs(warp_inlier_ratio=0.9, cloud_overlap_ratio=0.9,
+                                    conf_warp_monotonic=None))
     assert gate["conf_weight"] == mg.TH_CONF_DOWNWEIGHT
     assert gate["main_gate_passed"] is True
     assert any("证据不足" in w for w in gate["warnings"])
@@ -467,8 +463,10 @@ def test_warp_residual_map_shape_and_nan():
 def test_threshold_overrides_and_unknown_keys():
     default = mg.default_thresholds()
     assert default == {"warp_inlier_ratio": mg.TH_WARP_INLIER,
-                       "cloud_overlap_ratio": mg.TH_CLOUD_OVERLAP}
-    gate = mg.main_gate({"warp_inlier_ratio": 0.6, "cloud_overlap_ratio": 0.4},
+                       "cloud_overlap_ratio": mg.TH_CLOUD_OVERLAP,
+                       "point_depth_relative_p95": mg.TH_POINT_DEPTH_RELATIVE_P95,
+                       "cloud_neighbor_tail_ratio": mg.TH_CLOUD_NEIGHBOR_TAIL}
+    gate = mg.main_gate(_gate_inputs(warp_inlier_ratio=0.6, cloud_overlap_ratio=0.4),
                         thresholds={"warp_inlier_ratio": 0.7, "cloud_overlap_ratio": 0.4,
                                     "gate_thresholds_snapshot": 1.0})
     assert gate["thresholds"]["warp_inlier_ratio"] == 0.7
@@ -477,12 +475,12 @@ def test_threshold_overrides_and_unknown_keys():
     assert gate["main_gate_passed"] is False
     assert any("未知键" in w for w in gate["warnings"])
     # 非有限覆盖 → 忽略并告警（不静默改门）
-    gate = mg.main_gate({"warp_inlier_ratio": 0.6, "cloud_overlap_ratio": 0.6},
+    gate = mg.main_gate(_gate_inputs(warp_inlier_ratio=0.6, cloud_overlap_ratio=0.6),
                         thresholds={"warp_inlier_ratio": float("nan")})
     assert gate["thresholds"]["warp_inlier_ratio"] == mg.TH_WARP_INLIER
     assert gate["main_gate_passed"] is True
     assert any("非有限" in w for w in gate["warnings"])
-    assert gate["gate_version"] == "v6-warp-overlap-no-g5"
+    assert gate["gate_version"] == "v7-scene-warp-overlap-head-tail"
 
 
 def test_all_thresholds_annotated_todo_calibrate():
@@ -492,7 +490,8 @@ def test_all_thresholds_annotated_todo_calibrate():
     src = inspect.getsource(mg)
     for name in ("TH_WARP_INLIER", "TH_CLOUD_OVERLAP", "TH_WARP_REL_DEPTH_TOL",
                  "TH_WARP_PHOTO_TOL", "TH_CLOUD_REL_TOL", "MAX_CLOUD_POINTS",
-                 "TH_CONF_DOWNWEIGHT", "CONF_OPTIONAL_MASK_C", "TH_PHOTO_WARN"):
+                 "TH_CONF_DOWNWEIGHT", "CONF_OPTIONAL_MASK_C", "TH_PHOTO_WARN",
+                 "TH_POINT_DEPTH_RELATIVE_P95", "TH_CLOUD_NEIGHBOR_TAIL"):
         line = next(ln for ln in src.splitlines() if ln.startswith(f"{name}:"))
         assert "TODO_CALIBRATE" in line, f"{name} 缺 TODO_CALIBRATE 标注"
 

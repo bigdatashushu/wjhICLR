@@ -70,6 +70,7 @@ def _quality(**kw) -> QualityMetrics:
     base = dict(
         warp_inlier_ratio=0.9, warp_photometric_inlier_ratio=0.9,
         cloud_overlap_ratio=0.8, main_gate_passed=True,
+        point_depth_relative_p95=0.02, cloud_neighbor_tail_ratio=1.5,
         g1_blur_ok=1.0, g2_brightness=1.0, g3_motion_blur=0.0, g4_frame_count=32,
         g6_depth_var_coeff=0.1, g7_dynamic_ratio=0.0, g9_tracker_consistency=0.9,
         g10_baseline_quality=0.5, overall_quality=0.9)
@@ -101,7 +102,7 @@ def _scene(**kw) -> SceneState:
 def test_schema_version_is_6_and_recon_method_only_vggt():
     a = _art()
     assert a.schema_version == "6.0"
-    assert a.quality_metric_version == "v6-warp-overlap-no-g5"
+    assert a.quality_metric_version == "v7-scene-warp-overlap-head-tail"
     assert a.recon_method == "vggt"
     for bad in ("vggt_sparse_ba", "dust3r_mast3r", "colmap", "vggt_ba"):
         with pytest.raises(Exception):

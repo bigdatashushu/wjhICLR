@@ -1,7 +1,7 @@
 """合成几何 × M4 主门（v6 §10 / §6.2）—— mock_light 不许"绕过门"。
 
 背景：v6 把 M4 主门从 v5 的标量 `overall_quality` 阈值换成
-**跨视图 warp 内点率 ∧ 分组点云重叠率**（`reconstruction_gate/m4_main_gate.py`）。
+**warp ∧ 重叠 ∧ 两头差 ∧ 邻域长尾**（简化版 `reconstruction_gate/m4_main_gate.py`）。
 mock_light 的合成 bundle 必须**真的**满足这套约定，否则 `scene_route` 会落到
 `fallback_2d_only`、3D Tool 全被收回 → 每个 mock episode 都 unanswerable
 （这正是本次修复前的实际状态）。
@@ -71,11 +71,13 @@ def _backproject(depth: np.ndarray, c2w: np.ndarray, K: np.ndarray) -> np.ndarra
 # ------------------------------------------------- 1. 干净 bundle 必须过真门 ----
 
 def test_clean_bundle_passes_real_main_gate(bundle):
-    """主门（warp ∧ 重叠）真算通过；两个子项都不得靠"单挑"放行（§10.1）。"""
+    """整场四项主门真算通过，合成测试不绕过新增检查。"""
     g = bundle.geometry
     out = mg.main_gate(_gate_inputs(g, bundle.frames))
     assert out["main_gate_passed"] is True, out["warnings"]
-    assert out["sub_results"] == {"warp_inlier_ratio": True, "cloud_overlap_ratio": True}
+    assert out["sub_results"] == {
+        "warp_inlier_ratio": True, "cloud_overlap_ratio": True,
+        "point_depth_relative_p95": True, "cloud_neighbor_tail_ratio": True}
     # 余量：不是"刚过线"的脆弱构造（合成 bundle 是精确自洽的）
     assert out["values"]["warp_inlier_ratio"] >= 0.9
     assert out["values"]["cloud_overlap_ratio"] >= mg.TH_CLOUD_OVERLAP + 0.1

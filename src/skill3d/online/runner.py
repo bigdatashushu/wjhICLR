@@ -1995,10 +1995,9 @@ def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
                          prepared_measurements: Optional[dict] = None,
                          persist_quality: bool = True
                          ) -> tuple[SceneState, SceneHandle, object]:
-    """M4 真实路径：从 artifact 读数组 → v6 主门质量 → SceneState + SceneHandle。
+    """M4 真实路径：同一冻结数组的整场四项质量门 → SceneState + SceneHandle。
 
-    硬约束 22（质量单一事实源）：`quality_status == "computed"` 时直接复用落盘实算值
-    （P1 方案 X，零重算）；否则实算并**原子写回** `artifact_path`（方案 Y）。
+    仅复用当前质量版本。旧版本重算几何质量并另存收据，不重新调用重建模型。
 
     v6 数据源接线：主门用 frames/depth/poses/K/point_map/depth_conf；
     诊断用 M5 的 dynamic_masks / track_ious。G5/G8/G11 都已不存在，**不得**补位。
@@ -2010,9 +2009,9 @@ def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
 
     m5_summary = _m5_evidence_summary(stats, objects, episode, m5_materialized=objects_materialized)
 
-    if str(getattr(art, "quality_status", "not_computed")) != "computed":
-        from skill3d.reconstruction_gate import quality_metrics as qm
+    from skill3d.reconstruction_gate import quality_metrics as qm
 
+    if not qm.quality_is_computed(art):
         art = qm.compute_and_store_quality(
             art, frames=pixels, depth_maps=depth, c2w_list=c2w, intrinsics=intr,
             point_map=point_map, depth_conf=dconf,

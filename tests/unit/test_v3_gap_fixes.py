@@ -49,6 +49,7 @@ def _quality(**over) -> QualityMetrics:
     """v6 QualityMetrics：主门字段必填；G5/G8/G11 已不存在（出现即 hard fail）。"""
     base = dict(warp_inlier_ratio=0.9, warp_photometric_inlier_ratio=0.9,
                 cloud_overlap_ratio=0.9, main_gate_passed=True,
+                point_depth_relative_p95=0.02, cloud_neighbor_tail_ratio=1.5,
                 g1_blur_ok=1.0, g2_brightness=1.0, g3_motion_blur=0.0,
                 g4_frame_count=32, g6_depth_var_coeff=0.5, g7_dynamic_ratio=float("nan"),
                 g9_tracker_consistency=float("nan"), g10_baseline_quality=0.3,
