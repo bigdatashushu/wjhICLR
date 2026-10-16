@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from skill3d.online.config import (
-    config_receipt, load_config, load_yaml, m5_model_from, resolve_runtime, vllm_from,
+    config_receipt, load_config, load_yaml, online_model_from, resolve_runtime,
 )
 from skill3d.adapters.episode_source import (
     EpisodeSourceError, load_jsonl_items, load_vsi_bench_items,
@@ -18,35 +18,35 @@ from skill3d.adapters import vsibench_loader
 def test_default_output_budget_is_8192(tmp_path):
     path = tmp_path / "runtime.yaml"
     path.write_text("{}\n")
-    settings = vllm_from(load_config(path))
+    settings = online_model_from(load_config(path))
     assert settings.max_tokens == 8192
 
 
 def test_repository_runtime_config_freezes_output_budget():
     path = Path(__file__).resolve().parents[2] / "configs/config.yaml"
     config = load_config(path)
-    assert config["vllm"]["max_tokens"] == 8192
-    assert config.sources["vllm.max_tokens"] == "yaml"
-    m5 = m5_model_from(config)
-    assert m5.model == "qwen3.8-flash"
-    assert m5.api_key_env == "DASHSCOPE_API_KEY"
+    assert config["online_model"]["max_tokens"] == 8192
+    assert config.sources["online_model.max_tokens"] == "yaml"
+    model = online_model_from(config)
+    assert model.model == "qwen3.8-flash"
+    assert model.api_key_env == "DASHSCOPE_API_KEY"
 
 
 def test_m5_config_stores_only_key_environment_name(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "must-not-appear")
     path = tmp_path / "runtime.yaml"
-    path.write_text("m5_model: {model: qwen3.8-flash}\n")
+    path.write_text("online_model: {model: qwen3.8-flash}\n")
     receipt = config_receipt(load_config(path))
     text = json.dumps(receipt)
     assert "must-not-appear" not in text
     assert '"api_key_env": "<redacted>"' in text
 
 
-def test_endpoints_and_output_budget_are_effective(tmp_path):
+def test_online_model_output_budget_is_effective(tmp_path):
     path = tmp_path / "runtime.yaml"
-    path.write_text("seed: 137\nvllm:\n  endpoints: [http://localhost:18110]\n  max_tokens: 2048\n")
-    settings = vllm_from(load_config(path))
-    assert settings.endpoints == ["http://localhost:18110"]
+    path.write_text("seed: 137\nonline_model:\n  max_tokens: 2048\n")
+    settings = online_model_from(load_config(path))
+    assert settings.model == "qwen3.8-flash"
     assert settings.max_tokens == 2048
 
 
@@ -76,14 +76,12 @@ def test_missing_explicit_configs_fail(tmp_path):
 
 
 @pytest.mark.parametrize("section", [
-    {"vllm": {"unknown": 1}},
-    {"vllm": {"max_tokens": 0}},
-    {"vllm": {"endpoints": "http://localhost:18110"}},
-    {"vllm": {"endpoints": ["not-a-url"]}},
-    {"vllm": {"max_tokens": 32768}},
-    {"m5_model": {"base_url": "http://insecure.example/v1"}},
-    {"m5_model": {"min_pixels": 100, "max_pixels": 10}},
-    {"m5_model": {"provider": "unknown"}},
+    {"online_model": {"unknown": 1}},
+    {"online_model": {"max_tokens": 0}},
+    {"online_model": {"max_tokens": 32768}},
+    {"online_model": {"base_url": "http://insecure.example/v1"}},
+    {"online_model": {"audit_min_pixels": 100, "audit_max_pixels": 10}},
+    {"online_model": {"provider": "unknown"}},
     {"frame_sampling": {"n_frames": 33}},
     {"seed": True},
     {"paths": []},
@@ -136,15 +134,15 @@ def test_explicit_missing_metadata_never_uses_hf(tmp_path):
 
 def test_cli_seed_zero_capacity_and_sources(tmp_path, monkeypatch):
     path = tmp_path / "runtime.yaml"
-    path.write_text("seed: 137\nframe_sampling: {n_frames: 8}\nvllm:\n"
-                    "  endpoints: [http://localhost:18110]\n  max_tokens: 1024\n")
+    path.write_text("seed: 137\nframe_sampling: {n_frames: 8}\nonline_model:\n"
+                    "  max_tokens: 1024\n")
     monkeypatch.chdir(tmp_path)
-    cfg = resolve_runtime(load_config(path), seed=0, endpoints=[])
-    assert cfg["seed"] == 0 and cfg["vllm"]["endpoints"] == []
+    cfg = resolve_runtime(load_config(path), seed=0)
+    assert cfg["seed"] == 0
     assert cfg["frame_sampling"]["n_frames"] == 8
-    assert cfg.sources["seed"] == cfg.sources["vllm.endpoints"] == "cli"
-    assert cfg.sources["vllm.max_tokens"] == "yaml"
-    assert cfg.sources["vllm.max_model_len"] == "default"
+    assert cfg.sources["seed"] == "cli"
+    assert cfg.sources["online_model.max_tokens"] == "yaml"
+    assert cfg.sources["online_model.max_model_len"] == "default"
     # The same source can execute from a checkout or a frozen development snapshot.
     expected_root = Path(__file__).resolve().parents[2]
     assert Path(cfg["split_config"]) == expected_root / "configs/vsi_bench_split.yaml"
@@ -156,8 +154,8 @@ def test_online_cli_propagates_config_before_solver(tmp_path, monkeypatch):
     from skill3d.online import eval as cli
 
     path = tmp_path / "runtime.yaml"
-    path.write_text("seed: 137\nframe_sampling: {n_frames: 8}\nvllm:\n"
-                    "  endpoints: [http://localhost:18110]\n  max_tokens: 1024\n")
+    path.write_text("seed: 137\nframe_sampling: {n_frames: 8}\nonline_model:\n"
+                    "  max_tokens: 1024\n")
     captured = {}
 
     def load(split, **kwargs):
@@ -178,7 +176,7 @@ def test_online_cli_propagates_config_before_solver(tmp_path, monkeypatch):
     assert captured["sampling"]["n_frames"] == 8
     assert captured["sampling"]["seed"] == captured["solver"].seed == 0
     assert captured["solver"].max_tokens == 1024
-    assert captured["solver"].vllm_endpoints == ["http://localhost:18110"]
+    assert captured["solver"].online_model == "qwen3.8-flash"
 
 
 def test_reconstruction_cli_uses_yaml_frames(tmp_path, monkeypatch):

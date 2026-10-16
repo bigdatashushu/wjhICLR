@@ -88,8 +88,6 @@ def validate_existing_environment(root: Path, cfg: dict) -> dict:
             if pinned_exceptions.get(requirement.name) != installed:
                 raise StartupError(f"Existing {requirement.name}=={installed} does not satisfy {text}")
             exceptions[requirement.name] = {"installed": installed, "declared": text}
-    if version("vllm") != str(cfg["environment"]["vllm_version"]):
-        raise StartupError("Existing vLLM version does not match configured version")
     import importlib
     import inspect
 
@@ -268,7 +266,6 @@ def environment_contract(root: Path, cfg: dict, python_version: str | None = Non
         "project_dependencies": pyproject["project"]["dependencies"],
         "requires_python": pyproject["project"].get("requires-python"),
         "build_system": pyproject["build-system"],
-        "vllm_version": str(environment["vllm_version"]),
         "sam2_code_revision": str(environment["sam2_code_revision"]),
         "moge_enabled": bool(cfg["weights"]["moge2"].get("enabled")),
         "moge_code_revision": (str(environment["moge_code_revision"])

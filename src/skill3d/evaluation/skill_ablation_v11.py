@@ -426,7 +426,7 @@ def quality_contract() -> dict:
         "verifier/geometry_oracle.py", "verifier/derivation.py",
         "online/runner.py", "online/submission.py",
         "synthesis/eval_visual_fallback.py", "synthesis/request_context.py",
-        "synthesis/vllm_client.py", "fsm/online_fsm.py",
+        "synthesis/bailian_client.py", "synthesis/client_errors.py", "fsm/online_fsm.py",
         "online/config.py", "online/recovery.py",
         "synthesis/program_assembler.py", "synthesis/prompt_builder.py", "tools/docs_v11.py",
         "adapters/frame_set.py", "adapters/episode_source.py",
@@ -565,7 +565,7 @@ _PROGRAM_ERROR_CODES = frozenset({
     "no_answer",
     "violation_runtime",
     "violation_syntax",
-    "vllm_parse_error",
+    "online_model_parse_error",
 })
 
 
@@ -620,7 +620,7 @@ def _arm_result(
         "program_error": bool(
             error_codes & _PROGRAM_ERROR_CODES
             or out.static_check_errors
-            or out.synthesis_source == "vllm_parse_error"),
+            or out.synthesis_source == "online_model_parse_error"),
         "runtime_error": out.final_state == "run_error",
         "tool_contract_error": "tool_contract" in error_codes,
         "geometry_rejection": "geometry_rejected" in error_codes,
@@ -1118,7 +1118,7 @@ def run_skill_ablation_v11(
                     for c in confirmation_by_qa.values()
                 ) else "unconfirmed"),
             "reconstruction_costs_s": dict(sorted(costs.items())),
-            "client_mode": "injected" if client_factory else "vllm",
+            "client_mode": "injected" if client_factory else "bailian",
             "run_mode": os.environ.get(MODE_ENV, "formal"),
             "code_identity": current_code_identity(),
             "source_sha256": {str(p.relative_to(code_root)): _file_hash(p)
@@ -1150,8 +1150,7 @@ def run_skill_ablation_v11(
 
         def client(phase, qa_id, store):
             inner = (client_factory(phase, qa_id) if client_factory
-                     else (runner._make_m5_client(cfg) if phase == "prepare"
-                           else runner._make_vllm_client(cfg)))
+                     else runner._make_online_client(cfg))
             return _RecordingClient(inner, seed=cfg.seed, specs=specs, store=store)
 
         prepared, prepare_errors, preparation_detector_attempts = {}, {}, {}

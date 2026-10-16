@@ -13,7 +13,7 @@
   fail-closed（ArtifactUnavailableError）→ partial_tool_recovery 用尽 → 显式 abstain
   且主榜按错计；
 - 硬约束 9：final_test 默认拒绝；
-- 硬约束 1：real 模式缺 vLLM → 记 unavailable（不伪造答案）；
+- 硬约束 1：real 模式缺在线模型 → 记 unavailable（不伪造答案）；
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ def test_all_question_types_run_end_to_end(items, tmp_path):
         assert o.states == FULL_CHAIN, f"{o.question_type} 状态链不完整: {o.states}"
         assert o.receipts_ok, "receipt 哈希链校验失败"
         assert o.episode_trace is not None and o.episode_trace.failure is None
-        # v6 §19.3：mock_light 的程序来源显式标 mock_stub（绝不冒充 vllm_ok）
+        # v6 §19.3：mock_light 的程序来源显式标 mock_stub（绝不冒充模型成功）
         assert o.synthesis_source == "mock_stub", o.question_type
         # v6 §5.3：answer_source 只用四值词汇
         assert o.answer_source in ANSWER_SOURCES_V6, o.question_type
@@ -155,7 +155,7 @@ def test_diagnostic_experiment_blur_all_still_answers(tmp_path):
     """§5.1 的"独立诊断实验"入口：显式开启诊断后仍必须作答（不拒答）。
 
     同时守住 P0 的 trace 诚实性回归：收口答案的**程序来源**仍是 mock_stub，
-    不得冒充 `vllm_ok`；轮次原因分开记在 `finalization_used` / `round_trigger`。
+    不得冒充 `online_model_ok`；轮次原因分开记在 `finalization_used` / `round_trigger`。
     """
     items = load_synthetic_items("inner_validation", question_types=["room_size_estimation"],
                                  frame_size=FRAME_SIZE, degrade="blur_all",
@@ -248,13 +248,13 @@ def _test_double_artifact(path, episode) -> str:
     return str(p)
 
 
-def test_real_mode_without_vllm_is_unavailable_not_fake(items, tmp_path):
-    """硬约束 1/诚实性：real 模式缺 vLLM → 记 unavailable，绝不伪造答案。
+def test_real_mode_without_online_model_is_unavailable_not_fake(items, tmp_path):
+    """硬约束 1/诚实性：real 模式缺在线模型 → 记 unavailable，绝不伪造答案。
 
     用测试替身 artifact 走 reuse_artifact 路径（等价于已有真实重建产物的场景）。
     """
     it = items[0]
-    cfg = OnlineRunConfig(mode="real", vllm_endpoints=[],
+    cfg = OnlineRunConfig(mode="real", online_model_enabled=False,
                           reuse_artifact=_test_double_artifact(tmp_path, it.episode))
     out = run_episode(it.episode, it.pixels, cfg, geometry=it.geometry)
     assert out.states == FULL_CHAIN[:-1] + ["LOG_TRACE"] or "SYNTHESIZE_PROGRAM" in out.states

@@ -187,4 +187,4 @@ def test_root_gpu_launcher_has_valid_shell_and_documents_gpu_plan():
         cwd=root, timeout=30)
     assert help_result.returncode == 0, help_result.stderr
     assert all(label in help_result.stdout for label in (
-        "GPU 2", "GPU 3", "GPU 4", "--smoke", "--dry-run"))
+        "Qwen", "GPU 3", "GPU 4", "--smoke", "--dry-run"))

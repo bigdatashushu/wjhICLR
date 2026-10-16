@@ -171,11 +171,6 @@ if [[ ! -f "$MARKER" || "$(cat "$MARKER")" != "$INSTALL_ID" ]]; then
   "$PIP" install --upgrade pip setuptools wheel
   "$PIP" install "pyyaml>=6,<7"
 
-  VLLM_VERSION="$("$PYTHON" - "$CONFIG_PATH" <<'PY'
-import sys, yaml
-print(yaml.safe_load(open(sys.argv[1]))["environment"]["vllm_version"])
-PY
-)"
   SAM2_REVISION="$("$PYTHON" - "$CONFIG_PATH" <<'PY'
 import sys, yaml
 print(yaml.safe_load(open(sys.argv[1]))["environment"]["sam2_code_revision"])
@@ -192,7 +187,6 @@ print(yaml.safe_load(open(sys.argv[1]))["environment"]["moge_code_revision"])
 PY
 )"
 
-  "$PIP" install "vllm==$VLLM_VERSION"
   # Install declarations, not an editable pointer to an old run's snapshot.
   DEPENDENCIES=()
   while IFS= read -r dependency; do DEPENDENCIES+=("$dependency"); done < <(
@@ -223,11 +217,9 @@ PY
 
   "$PYTHON" - <<'PY'
 import torch
-import vllm
 if not torch.cuda.is_available():
     raise SystemExit("torch installed, but CUDA is not available")
 print("torch", torch.__version__, "cuda", torch.version.cuda)
-print("vllm", vllm.__version__)
 PY
   printf '%s\n' "$INSTALL_ID" > "$MARKER"
   "$PIP" freeze | LC_ALL=C sort > "$ENV_RECEIPT_DIR/pip_freeze.txt"
@@ -241,7 +233,7 @@ fi  # HARNESS3D_EXISTING_PYTHON
 
 # Always preflight the reused environment; an install marker is not a health check.
 "$PYTHON" - <<'PY'
-import torch, vllm
+import torch
 from skill3d.env_preflight import assert_runtime_dependencies
 assert_runtime_dependencies(context="gpu_bootstrap")
 if not torch.cuda.is_available():

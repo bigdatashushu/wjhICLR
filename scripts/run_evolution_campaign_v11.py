@@ -41,6 +41,7 @@ from skill3d.online.config import (
     resolve_runtime,
     retrieval_policy_from,
     sandbox_from,
+    online_model_from,
 )
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.reconstruction.run import resolve_artifact_path
@@ -187,8 +188,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--library-root", default="")
     parser.add_argument("--run-root", default="data/evolution/runs_v11")
     parser.add_argument("--max-revision-attempts", type=int, default=3)
-    parser.add_argument("--vllm-endpoint", action="append", default=None)
-    parser.add_argument("--vllm-model")
     parser.add_argument("--max-solver-rounds", type=int)
     parser.add_argument("--max-retries-per-operation", type=int)
     parser.add_argument("--finalization-rounds", type=int)
@@ -210,20 +209,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        raw = resolve_runtime(load_config(args.config), seed=args.seed,
-                              endpoints=args.vllm_endpoint, model=args.vllm_model)
+        raw = resolve_runtime(load_config(args.config), seed=args.seed)
         args.question_type = canonical_task(args.question_type)
         if args.inner_limit <= 0 or args.post_limit <= 0:
             raise V11CampaignCliError("inner-limit and post-limit must be positive")
         args.seed = raw["seed"]
         paths = raw.get("paths", {})
-        model = raw.get("vllm", {})
+        model = online_model_from(raw)
         sandbox = sandbox_from(raw)
         vision = active_vision_from(raw)
-        endpoints = model["endpoints"]
-        if not endpoints:
+        if model.enabled and not os.environ.get(model.api_key_env, "").strip():
             raise V11CampaignCliError(
-                "no vLLM endpoint; pass at least one --vllm-endpoint")
+                f"{model.api_key_env} is not configured")
         detector = raw.get("detection", {}).get("endpoint")
         if detector:
             os.environ.setdefault("SKILL3D_DETECTOR_ENDPOINT", str(detector))
@@ -294,13 +291,21 @@ def main(argv: list[str] | None = None) -> int:
             baseline="C1_tools_program",
             seed=args.seed,
             skills=[],
-            vllm_endpoints=endpoints,
-            vllm_model=model["model"],
-            max_images=int(model.get("n_frames", 32)),
-            max_pixels=int(model["max_pixels"]),
-            max_model_len=int(model["max_model_len"]),
-            max_tokens=int(model.get("max_tokens", 8192)),
-            temperature=model["temperature"],
+            online_model_enabled=model.enabled,
+            online_model_provider=model.provider,
+            online_model=model.model,
+            online_model_revision=model.model_revision,
+            online_base_url=model.base_url,
+            online_api_key_env=model.api_key_env,
+            online_timeout_s=model.timeout_s,
+            semantic_min_pixels=model.audit_min_pixels,
+            semantic_max_pixels=model.audit_max_pixels,
+            semantic_relation_batch_size=model.relation_batch_size,
+            max_images=model.n_frames,
+            max_pixels=model.max_pixels,
+            max_model_len=model.max_model_len,
+            max_tokens=model.max_tokens,
+            temperature=model.temperature,
             cell_timeout_s=int(sandbox.cell_timeout_s),
             max_regen=int(sandbox.max_regenerate),
             max_solver_rounds=(
@@ -340,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
             method_context_max_chars=(
                 base_cfg.retrieval_policy.method_context_max_chars),
             seed=args.seed,
-            model_id=base_cfg.vllm_model,
+            model_id=base_cfg.online_model,
             model_config_sha256=model_identity["sha256"],
             quality_contract_sha256=contract["sha256"],
             solver_config_sha256=solver_identity["sha256"],

@@ -134,7 +134,7 @@ def _real_cfg(tmp_path, art_path: str, **over) -> OnlineRunConfig:
     """注入客户端的 episode 必须用 mode="real"（mock_light 会忽略注入的 client），
     而 real 模式要求真实重建产物 → 走 `reuse_artifact`（与恢复测试同一路径）。"""
     return OnlineRunConfig(mode="real", reuse_artifact=art_path,
-                           vllm_endpoints=["http://fake"], deterministic_replay=True,
+                           deterministic_replay=True,
                            trace_dir=str(tmp_path / "t"), **over)
 
 

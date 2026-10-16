@@ -1030,7 +1030,7 @@ def synthetic_m5_summary(geometry: SyntheticGeometry) -> M5EvidenceSummary:
 
 # --------------------------------------------------------- 确定性 stub 程序 ----
 
-_STUB_BANNER = "# mock_light 确定性 stub（非 Qwen3-VL-8B 输出，仅管道验证）"
+_STUB_BANNER = "# mock_light 确定性 stub（非在线模型输出，仅管道验证）"
 
 
 def stub_program(question_type: str, episode: VSIBenchEpisode,

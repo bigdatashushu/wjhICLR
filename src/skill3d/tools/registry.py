@@ -1,7 +1,7 @@
 """Tool Registry（§4 M6 / v6 §7.2、§17.4）：预封装稳定函数注册表（硬约束 14）。
 
 Tool 是预先封装好的稳定 Python 函数，不是每题生成；
-Coding Agent（Qwen3-VL-8B）只生成编排这些 Tool 的 episode-specific program。
+Coding Agent（百炼 Qwen3.8-Flash）只生成编排这些 Tool 的 episode-specific program。
 
 v6 三条纪律：
 

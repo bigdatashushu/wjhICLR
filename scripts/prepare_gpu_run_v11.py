@@ -36,7 +36,7 @@ def prepare(args) -> dict:
         raise StartupError(f"Generated run config already exists: {config_path}")
     cfg = read_config(Path(args.config).expanduser().resolve())
     cfg = configure_run(cfg, dev=args.dev, smoke=args.smoke, dry_run=args.dry_run)
-    for key in ("qwen_gpu", "geometry_gpu"):
+    for key in ("geometry_gpu",):
         value = getattr(args, key)
         if value is not None:
             cfg["runtime"][key] = value
@@ -95,7 +95,6 @@ def main(argv=None) -> int:
     parser.add_argument("--dev", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--qwen-gpu", type=int)
     parser.add_argument("--geometry-gpu", type=int)
     parser.add_argument("--detector-endpoint")
     args = parser.parse_args(argv)

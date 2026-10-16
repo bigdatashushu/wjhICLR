@@ -83,13 +83,13 @@ def _safe_component(value: str) -> str:
 def model_config_identity_v11(cfg: OnlineRunConfig) -> dict:
     """Return the online model request configuration without raw endpoint URLs."""
     value = {
-        "model_id": cfg.vllm_model,
+        "provider": cfg.online_model_provider,
+        "model_id": cfg.online_model,
+        "model_revision": cfg.online_model_revision,
         "model_weights_sha256": cfg.model_weights_sha256,
         "environment_sha256": cfg.environment_sha256,
-        "endpoint_sha256": [
-            hashlib.sha256(str(endpoint).encode("utf-8")).hexdigest()
-            for endpoint in cfg.vllm_endpoints
-        ],
+        "endpoint_sha256": hashlib.sha256(
+            cfg.online_base_url.encode("utf-8")).hexdigest(),
         "max_tokens": int(cfg.max_tokens),
         "max_images": int(cfg.max_images),
         "max_pixels": int(cfg.max_pixels),
@@ -375,7 +375,7 @@ class V11PairedEvaluator:
         solver_identity = solver_config_identity_v11(self.base_cfg, seed=seed)
         quality_identity = quality_contract()
         expected_identities = {
-            "model_id": self.base_cfg.vllm_model,
+            "model_id": self.base_cfg.online_model,
             "model_config_sha256": model_identity["sha256"],
             "quality_contract_sha256": quality_identity["sha256"],
             "solver_config_sha256": solver_identity["sha256"],
@@ -457,7 +457,7 @@ class V11PairedEvaluator:
             "inputs": expected_inputs,
             "quality_contract": quality_identity,
             "quality_confirmation": self.quality_confirmation,
-            "client_mode": "injected" if self.client_factory else "vllm",
+            "client_mode": "injected" if self.client_factory else "bailian",
             "reconstruction_costs_s": dict(self.reconstruction_costs or {}),
             "source_sha256": {str(p.relative_to(code_root)): _file_hash(p)
                               for p in sorted(code_root.rglob("*.py"))},
@@ -548,7 +548,7 @@ class V11PairedEvaluator:
             question_type=parent.question_type,
             seed=seed,
             request_seed_observed=request_seed_observed,
-            model_id=self.base_cfg.vllm_model,
+            model_id=self.base_cfg.online_model,
             model_config_sha256=model_identity["sha256"],
             quality_contract_sha256=quality_identity["sha256"],
             solver_config_sha256=solver_identity["sha256"],

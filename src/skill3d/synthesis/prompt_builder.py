@@ -234,10 +234,10 @@ def build_image_messages(text: str, frames, *, max_images: int = 32,
         arr = [np.asarray(img) for _, img in extra] + arr
     n = len(arr)
     if n > max_images:
-        # 硬约束 26：不得静默丢帧 —— 帧数超过 vLLM 图像上限是配置错误，必须报错
+        # 硬约束 26：不得静默丢帧 —— 帧数超过在线模型图像上限必须报错
         raise ValueError(
             f"M8 收到 {n} 帧（含派生图）但 max_images={max_images}"
-            "（vLLM --limit-mm-per-prompt image 上限）：禁止静默丢帧/丢图，"
+            "（online_model.n_frames 上限）：禁止静默丢帧/丢图，"
             "请统一 FrameSet 帧数/布局或调大上限（硬约束 21/26；§9.4）")
     if n == 0:
         # 硬约束 26：M8 必须多模态（32 帧 + 文本），零帧等于退化成纯文本

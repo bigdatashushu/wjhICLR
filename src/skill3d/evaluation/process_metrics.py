@@ -10,8 +10,9 @@
 - 发现 bug 数（变形测试/反例挖掘；由离线侧注入）
 - 资源成本（wall-clock / tool 调用数；构建成本与推理成本分开报告）
 
-v6 增量（§19.3）：`synthesis_source` 拆 **6 类**（`vllm_ok` / `vllm_parse_error` /
-`vllm_service_error` / `m8_parse_recovered` / `direct_answer_fallback` /
+v6 增量（§19.3）：`synthesis_source` 拆 **6 类**（`online_model_ok` /
+`online_model_parse_error` / `online_model_service_error` / `m8_parse_recovered` /
+`direct_answer_fallback` /
 `partial_tool_recovery`）+ 显式非论文值 `mock_stub`。v5 的 `deterministic_stub`
 只作为**历史取值回读**保留识别（等价 `mock_stub`）；两者都不得进主表。
 `partial_tool_recovery` / `recovery_count`（§14.1）也在此逐 episode 计数。
@@ -178,7 +179,7 @@ def aggregate_process_metrics(
             tools.extend(r.tool for r in (trace.results or []))
             m.wallclock_s_total += float(getattr(trace, "wallclock_s", 0.0) or 0.0)
         regen.append(_regen_rounds(o))
-        # §19.3：按 6 类（+mock_stub）归一分桶；未知取值保守归到 vllm_ok 之外的空桶
+        # §19.3：按 6 类（+mock_stub）归一分桶；未知取值保守归到成功桶之外
         src = str(getattr(o, "synthesis_source", "") or "").strip()
         synth_counts[src or "(none)"] = synth_counts.get(src or "(none)", 0) + 1
         if src in MOCK_SYNTHESIS_SOURCES:

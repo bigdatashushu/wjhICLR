@@ -10,13 +10,10 @@ import os
 from pathlib import Path
 import platform
 import shutil
-import signal
 import subprocess
 import sys
 import time
 from typing import Any
-from urllib.error import URLError
-from urllib.request import urlopen
 
 import yaml
 
@@ -26,7 +23,7 @@ from skill3d.infra.experiment_startup import (
     verify_source_receipt,
 )
 from skill3d.online.config import (
-    VLLMSettings, config_receipt, load_config, load_yaml, resolve_runtime,
+    config_receipt, load_config, load_yaml, online_model_from, resolve_runtime,
     resolve_detector_endpoint,
 )
 
@@ -43,13 +40,8 @@ def _read_config(path: Path) -> dict:
     value["experiment"].update(detector_endpoint=detector["endpoint"],
                                detector_endpoint_source=detector["source"])
     runtime = value["runtime"]
-    # Validate the same request fields used by every Python entry point.
-    runtime.setdefault("max_tokens", 8192)
-    VLLMSettings(model=runtime["served_model_name"],
-                 n_frames=runtime["n_images"], max_pixels=runtime["max_pixels"],
-                 max_model_len=runtime["max_model_len"], max_tokens=runtime["max_tokens"],
-                 gpu_memory_utilization=runtime["gpu_memory_utilization"],
-                 endpoints=[f"http://{runtime['host']}:{runtime['port']}"])
+    if type(runtime.get("geometry_gpu")) is not int or runtime["geometry_gpu"] < 0:
+        raise GPUExperimentError("runtime.geometry_gpu must be a non-negative integer")
     if type(value["experiment"]["seed"]) is not int or value["experiment"]["seed"] < 0:
         raise GPUExperimentError("experiment.seed must be a non-negative integer")
     return value
@@ -168,30 +160,23 @@ def _preflight(
         raise GPUExperimentError(
             f"free disk {free_gib:.1f} GiB < required {required_disk:.1f} GiB")
     gpus = [] if dry_run else _gpu_inventory()
-    required_count = int(environment.get("min_gpu_count", 2))
+    required_count = int(environment.get("min_gpu_count", 1))
     required_memory = float(environment.get("min_gpu_memory_gib", 20)) * 1024
     if not dry_run and len(gpus) < required_count:
         raise GPUExperimentError(
             f"found {len(gpus)} GPUs, need at least {required_count}")
-    qwen_gpu = int(cfg["runtime"]["qwen_gpu"])
     geometry_gpu = int(cfg["runtime"]["geometry_gpu"])
-    if qwen_gpu == geometry_gpu:
-        raise GPUExperimentError(
-            "qwen_gpu and geometry_gpu must differ; Qwen/VGGT/SAM2 sharing is forbidden")
-    if not dry_run and (
-        qwen_gpu not in {gpu["index"] for gpu in gpus}
-        or geometry_gpu not in {gpu["index"] for gpu in gpus}
-    ):
+    if not dry_run and geometry_gpu not in {gpu["index"] for gpu in gpus}:
         raise GPUExperimentError("configured GPU index is absent")
-    selected = [
-        gpu for gpu in gpus
-        if gpu["index"] in {qwen_gpu, geometry_gpu}
-    ]
+    selected = [gpu for gpu in gpus if gpu["index"] == geometry_gpu]
     if not dry_run and any(
         gpu["memory_total_mib"] < required_memory for gpu in selected
     ):
         raise GPUExperimentError(
             f"selected GPUs need at least {required_memory / 1024:.1f} GiB")
+    if not dry_run and not os.environ.get("DASHSCOPE_API_KEY", "").strip():
+        raise GPUExperimentError(
+            "online qwen3.8-flash requires DASHSCOPE_API_KEY")
     receipt = (verify_source_receipt(Path(os.environ[RECEIPT_ENV]), root)
                if os.environ.get(RECEIPT_ENV) else None)
     commit = receipt["base_commit"] if receipt else _git(root, "rev-parse", "HEAD")
@@ -376,103 +361,6 @@ def _run(
             f"stage {stage} failed with exit code {result.returncode}")
 
 
-def _wait_vllm(base_url: str, model_name: str, timeout_s: float) -> None:
-    deadline = time.monotonic() + timeout_s
-    last_error = ""
-    while time.monotonic() < deadline:
-        try:
-            with urlopen(f"{base_url}/health", timeout=5) as response:
-                if response.status != 200:
-                    raise GPUExperimentError(
-                        f"vLLM health returned HTTP {response.status}")
-            with urlopen(f"{base_url}/v1/models", timeout=10) as response:
-                payload = json.load(response)
-            names = {
-                str(row.get("id") or "") for row in payload.get("data", [])
-            }
-            if model_name not in names:
-                raise GPUExperimentError(
-                    f"served model {model_name!r} not in {sorted(names)}")
-            return
-        except (OSError, URLError, ValueError, GPUExperimentError) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            time.sleep(5)
-    raise GPUExperimentError(
-        f"vLLM did not become ready within {timeout_s}s: {last_error}")
-
-
-def _start_vllm(
-    root: Path,
-    run_root: Path,
-    cfg: dict,
-    weights: dict[str, Path],
-    env: dict[str, str],
-    *,
-    dry_run: bool,
-    commands: list[dict],
-) -> subprocess.Popen | None:
-    runtime = cfg["runtime"]
-    command = [
-        sys.executable,
-        "-m",
-        "vllm.entrypoints.cli.main",
-        "serve",
-        str(weights["qwen"]),
-        "--served-model-name",
-        str(runtime["served_model_name"]),
-        "--tensor-parallel-size",
-        "1",
-        "--max-model-len",
-        str(runtime["max_model_len"]),
-        "--gpu-memory-utilization",
-        str(runtime["gpu_memory_utilization"]),
-        "--limit-mm-per-prompt",
-        json.dumps({
-            "image": int(runtime["n_images"]),
-            "video": 1,
-        }),
-        "--mm-processor-kwargs",
-        json.dumps({"max_pixels": int(runtime["max_pixels"])}),
-        "--host",
-        str(runtime["host"]),
-        "--port",
-        str(runtime["port"]),
-    ]
-    commands.append({"stage": "serve_qwen", "command": command})
-    print("+", " ".join(command), flush=True)
-    if dry_run:
-        return None
-    log_path = run_root / "vllm.log"
-    log = log_path.open("ab")
-    process_env = dict(env)
-    process_env["CUDA_VISIBLE_DEVICES"] = str(runtime["qwen_gpu"])
-    process = subprocess.Popen(
-        command,
-        cwd=root,
-        env=process_env,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    _write_json(run_root / "vllm_process.json", {
-        "pid": process.pid, "command": command,
-        "cuda_visible_devices": process_env["CUDA_VISIBLE_DEVICES"],
-        "started_unix": time.time(),
-    })
-    base_url = f"http://{runtime['host']}:{runtime['port']}"
-    try:
-        _wait_vllm(
-            base_url,
-            str(runtime["served_model_name"]),
-            float(runtime["startup_timeout_s"]),
-        )
-    except Exception:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=30)
-        raise
-    return process
-
-
 def _quality_confirmation_ok(path: Path) -> bool:
     from skill3d.evaluation.skill_ablation_v11 import quality_contract
 
@@ -539,32 +427,35 @@ def _pipeline(
     }
     _write_json(run_root / "environment.json", environment)
     env["SKILL3D_ENVIRONMENT_SHA256"] = hashlib.sha256(_json_bytes(environment)).hexdigest()
-    qwen_identity = (weight_manifest or {}).get("models", {}).get("qwen")
-    if qwen_identity:
-        env["SKILL3D_MODEL_WEIGHTS_SHA256"] = hashlib.sha256(_json_bytes({
-            key: qwen_identity[key] for key in ("repo_id", "revision", "files")
-        })).hexdigest()
-    else:
-        env.pop("SKILL3D_MODEL_WEIGHTS_SHA256", None)
-    geometry_env = dict(env)
-    geometry_env["CUDA_VISIBLE_DEVICES"] = str(runtime["geometry_gpu"])
-    endpoint = f"http://{runtime['host']}:{runtime['port']}"
     python = sys.executable
     video_root = str(Path(str(experiment["video_root"])).expanduser())
     runtime_config = load_config(root / "configs" / "config.yaml")
     runtime_config["seed"] = int(experiment["seed"])
     runtime_config.setdefault("frame_sampling", {})["n_frames"] = int(runtime["n_images"])
-    runtime_config.setdefault("vllm", {}).update({
+    runtime_config.setdefault("online_model", {}).update({
         "n_frames": int(runtime["n_images"]),
         "max_pixels": int(runtime["max_pixels"]),
         "max_model_len": int(runtime["max_model_len"]),
-        "model": str(runtime["served_model_name"]),
-        "endpoints": [endpoint],
         "max_tokens": runtime.get("max_tokens", 8192),
     })
     resolve_runtime(runtime_config, formal=bool(experiment.get("formal")) and not dry_run)
-    for key in ("n_frames", "max_pixels", "max_model_len", "model", "endpoints", "max_tokens"):
-        runtime_config.sources[f"vllm.{key}"] = "gpu.runtime"
+    model = online_model_from(runtime_config)
+    if model.model != "qwen3.8-flash" or model.provider != "bailian":
+        raise GPUExperimentError(
+            "GPU experiment requires shared Bailian qwen3.8-flash")
+    online_identity = {
+        "provider": model.provider,
+        "model": model.model,
+        "model_revision": model.model_revision,
+        "endpoint_sha256": hashlib.sha256(
+            model.base_url.encode("utf-8")).hexdigest(),
+    }
+    env["SKILL3D_MODEL_WEIGHTS_SHA256"] = hashlib.sha256(
+        _json_bytes(online_identity)).hexdigest()
+    geometry_env = dict(env)
+    geometry_env["CUDA_VISIBLE_DEVICES"] = str(runtime["geometry_gpu"])
+    for key in ("n_frames", "max_pixels", "max_model_len", "max_tokens"):
+        runtime_config.sources[f"online_model.{key}"] = "gpu.runtime"
     runtime_config.sources["seed"] = "gpu.experiment"
     runtime_config.sources["frame_sampling.n_frames"] = "gpu.runtime"
     library = run_root / "skill_library"
@@ -602,21 +493,10 @@ def _pipeline(
              commands=commands, stage="metric_prepare")
         if validation.get("prepare_only"):
             return commands
-        process = _start_vllm(root, run_root, cfg, weights, env,
-                             dry_run=dry_run, commands=commands)
-        try:
-            _run([python, script, "solve", *common, "--config", config_path,
-                  "--library-root", str(library)],
-                 cwd=root, env=geometry_env, dry_run=dry_run,
-                 commands=commands, stage="metric_b01_b11")
-        finally:
-            if process is not None and process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=60)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait(timeout=30)
+        _run([python, script, "solve", *common, "--config", config_path,
+              "--library-root", str(library)],
+             cwd=root, env=geometry_env, dry_run=dry_run,
+             commands=commands, stage="metric_b01_b11")
         return commands
     recon_dir = run_root / "reconstructions"
     question_type = str(experiment["question_type"])
@@ -667,163 +547,133 @@ def _pipeline(
         stage="reconstruction",
     )
 
-    process = _start_vllm(
-        root,
-        run_root,
-        cfg,
-        weights,
-        env,
+    parent_trace = run_root / "parent_learning_trace"
+    parent_manifest = run_root / "parent_learning_manifest.json"
+    parent = [
+        python,
+        "-m",
+        "skill3d.online.eval",
+        "--config",
+        config_path,
+        "--mode",
+        "real",
+        "--source",
+        "vsi_bench",
+        "--split",
+        "induction",
+        "--video-root",
+        video_root,
+        "--recon-dir",
+        str(recon_dir),
+        "--question-types",
+        question_type,
+        "--limit",
+        str(experiment["induction_limit"]),
+        "--seed",
+        str(seed),
+        "--trace-dir",
+        str(parent_trace),
+        "--run-manifest",
+        str(parent_manifest),
+    ]
+    if datasets:
+        parent.extend(["--datasets", datasets])
+    _run(
+        parent,
+        cwd=root,
+        env=geometry_env,
         dry_run=dry_run,
         commands=commands,
+        stage="parent_learning",
     )
-    try:
-        parent_trace = run_root / "parent_learning_trace"
-        parent_manifest = run_root / "parent_learning_manifest.json"
-        parent = [
-            python,
-            "-m",
-            "skill3d.online.eval",
-            "--config",
-            config_path,
-            "--mode",
-            "real",
-            "--source",
-            "vsi_bench",
-            "--split",
-            "induction",
-            "--video-root",
-            video_root,
-            "--recon-dir",
-            str(recon_dir),
-            "--question-types",
-            question_type,
-            "--limit",
-            str(experiment["induction_limit"]),
-            "--seed",
-            str(seed),
-            "--vllm-endpoint",
-            endpoint,
-            "--vllm-model",
-            str(runtime["served_model_name"]),
-            "--trace-dir",
-            str(parent_trace),
-            "--run-manifest",
-            str(parent_manifest),
-        ]
-        if datasets:
-            parent.extend(["--datasets", datasets])
-        _run(
-            parent,
-            cwd=root,
-            env=geometry_env,
-            dry_run=dry_run,
-            commands=commands,
-            stage="parent_learning",
-        )
 
-        ablation_dir = run_root / "b01_b11"
-        ablation = [
+    ablation_dir = run_root / "b01_b11"
+    ablation = [
+        python,
+        str(root / "scripts" / "run_skill_ablation_v11.py"),
+        "--config",
+        config_path,
+        "--source",
+        "vsi_bench",
+        "--split",
+        "inner_validation",
+        "--video-root",
+        video_root,
+        "--recon-dir",
+        str(recon_dir),
+        "--question-types",
+        question_type,
+        "--limit",
+        str(experiment["inner_limit"]),
+        "--seed",
+        str(seed),
+        "--library-root",
+        str(library),
+        "--output-dir",
+        str(ablation_dir),
+    ]
+    if datasets:
+        ablation.extend(["--datasets", datasets])
+    confirmation = str(experiment.get("quality_confirmation") or "")
+    if confirmation:
+        ablation.extend(["--quality-confirmation", confirmation])
+    _run(
+        ablation,
+        cwd=root,
+        env=geometry_env,
+        dry_run=dry_run,
+        commands=commands,
+        stage="b01_b11",
+    )
+    if experiment.get("formal") and not dry_run:
+        summary = json.loads((ablation_dir / "summary.json").read_bytes())
+        if summary.get("formal_result_eligible") is not True:
+            raise GPUExperimentError("B01/B11 completed without formal eligibility")
+
+    if experiment.get("run_evolution"):
+        if not os.environ.get("DEEPSEEK_API_KEY") and not dry_run:
+            raise GPUExperimentError(
+                "run_evolution=true requires DEEPSEEK_API_KEY")
+        campaign = [
             python,
-            str(root / "scripts" / "run_skill_ablation_v11.py"),
+            str(root / "scripts" / "run_evolution_campaign_v11.py"),
             "--config",
             config_path,
+            "--campaign-id",
+            str(experiment["campaign_id"]),
+            "--question-type",
+            question_type,
+            "--parent-trace-dir",
+            str(parent_trace),
             "--source",
             "vsi_bench",
-            "--split",
-            "inner_validation",
             "--video-root",
             video_root,
             "--recon-dir",
             str(recon_dir),
-            "--question-types",
-            question_type,
-            "--limit",
+            "--inner-limit",
             str(experiment["inner_limit"]),
+            "--post-limit",
+            str(experiment["post_publish_limit"]),
             "--seed",
             str(seed),
-            "--vllm-endpoint",
-            endpoint,
-            "--vllm-model",
-            str(runtime["served_model_name"]),
+            "--quality-confirmation",
+            confirmation,
             "--library-root",
             str(library),
-            "--output-dir",
-            str(ablation_dir),
+            "--run-root",
+            str(run_root / "evolution"),
         ]
         if datasets:
-            ablation.extend(["--datasets", datasets])
-        confirmation = str(experiment.get("quality_confirmation") or "")
-        if confirmation:
-            ablation.extend(["--quality-confirmation", confirmation])
+            campaign.extend(["--datasets", datasets])
         _run(
-            ablation,
+            campaign,
             cwd=root,
             env=geometry_env,
             dry_run=dry_run,
             commands=commands,
-            stage="b01_b11",
+            stage="evolution",
         )
-        if experiment.get("formal") and not dry_run:
-            summary = json.loads((ablation_dir / "summary.json").read_bytes())
-            if summary.get("formal_result_eligible") is not True:
-                raise GPUExperimentError("B01/B11 completed without formal eligibility")
-
-        if experiment.get("run_evolution"):
-            if not os.environ.get("DEEPSEEK_API_KEY") and not dry_run:
-                raise GPUExperimentError(
-                    "run_evolution=true requires DEEPSEEK_API_KEY")
-            campaign = [
-                python,
-                str(root / "scripts" / "run_evolution_campaign_v11.py"),
-                "--config",
-                config_path,
-                "--campaign-id",
-                str(experiment["campaign_id"]),
-                "--question-type",
-                question_type,
-                "--parent-trace-dir",
-                str(parent_trace),
-                "--source",
-                "vsi_bench",
-                "--video-root",
-                video_root,
-                "--recon-dir",
-                str(recon_dir),
-                "--inner-limit",
-                str(experiment["inner_limit"]),
-                "--post-limit",
-                str(experiment["post_publish_limit"]),
-                "--seed",
-                str(seed),
-                "--quality-confirmation",
-                confirmation,
-                "--library-root",
-                str(library),
-                "--run-root",
-                str(run_root / "evolution"),
-                "--vllm-endpoint",
-                endpoint,
-                "--vllm-model",
-                str(runtime["served_model_name"]),
-            ]
-            if datasets:
-                campaign.extend(["--datasets", datasets])
-            _run(
-                campaign,
-                cwd=root,
-                env=geometry_env,
-                dry_run=dry_run,
-                commands=commands,
-                stage="evolution",
-            )
-    finally:
-        if process is not None and process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=30)
     return commands
 
 

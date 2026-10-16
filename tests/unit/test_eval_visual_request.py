@@ -1,5 +1,3 @@
-import itertools
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -9,7 +7,6 @@ from skill3d.synthesis.eval_visual_fallback import (
     build_visual_prompt, parse_visual_answer, request_visual_answer,
 )
 from skill3d.synthesis.request_context import current_request_phase, request_phase
-from skill3d.synthesis.vllm_client import VLLMClient
 from skill3d.tools.image_ledger import ImageLedger
 
 
@@ -77,24 +74,9 @@ def test_output_templates_use_only_question_options_and_units():
     assert "AnswerPayload" not in prompt and "Skill" not in prompt
 
 
-def test_single_visual_request_disables_sdk_retries_and_restores_phase():
-    sdk = Mock()
-    one_shot = sdk.with_options.return_value
-    response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="3"))], usage=None)
-    sdk.chat.completions.create.return_value = response
-    one_shot.chat.completions.create.return_value = response
-    client = VLLMClient.__new__(VLLMClient)
-    client._clients, client._rr, client.model = [sdk], itertools.cycle([0]), "fixture"
-    client.temperature, client.max_output_tokens = 0.0, 8192
-    messages = [{"role": "user", "content": "query"}]
+def test_request_phase_restores_nested_phase():
     with request_phase("program"):
-        assert client.chat(messages, seed=7) == "3"
-        sdk.with_options.assert_not_called()
         with request_phase("eval_visual_fallback"):
-            assert client.chat(messages, seed=7) == "3"
+            assert current_request_phase() == "eval_visual_fallback"
         assert current_request_phase() == "program"
     assert current_request_phase() == "perception"
-    sdk.with_options.assert_called_once_with(max_retries=0)
-    assert sdk.chat.completions.create.call_count == 1
-    assert one_shot.chat.completions.create.call_count == 1

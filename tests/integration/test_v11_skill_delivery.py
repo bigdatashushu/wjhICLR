@@ -103,7 +103,6 @@ def test_v11_complete_source_reaches_runner_model_request_once():
     client = _FakeClient(['ReturnAnswer("A")\n'])
     cfg = OnlineRunConfig(
         mode="real",
-        vllm_endpoints=["http://fake"],
         skills=[source.spec],
         seed=0,
     )

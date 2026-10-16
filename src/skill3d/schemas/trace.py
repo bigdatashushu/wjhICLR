@@ -7,8 +7,7 @@ v6 新增三类**必须落盘**的内容（§19）：
 2. **证据与路由全状态**：EvidenceProfile、MetricEvidenceGateResult、
    `scene_route` × `question_tool_scope`、`answer_source`、`used_result_ids`、
    `recovery_count`、`partial_tool_recovery`、级联撤销列表；
-3. **`synthesis_source` 拆 6 类**（§19.3）：不再用一个 `vllm` 混为一谈 ——
-   v5 曾把 M8 解析失败的 episode 也记 `synthesis_source='vllm'`，与服务不可用混淆。
+3. **`synthesis_source` 拆 6 类**（§19.3）：区分在线模型成功、解析失败与服务不可用。
 
 `RunManifest` 另含 §19.2 的离线治理模型字段（`provider="deepseek"`、
 `model_id="deepseek-flash"`）；**认证值只从 `DEEPSEEK_API_KEY` 注入，绝不落盘**。
@@ -25,15 +24,15 @@ AnswerSourceValue = Literal["tool_program", "direct_vlm_routed", "abstain",
 # synthesis_source 六类（§19.3）+ 一个显式非论文值。
 #
 # `mock_stub` 是**实现补充**：`mode=mock_light` 下程序来自确定性 stub，既不是
-# VLLM 成功也不是任何失败，写成六类中的任何一个都是假话。它被明确排除在
+# 在线模型成功也不是任何失败，写成六类中的任何一个都是假话。它被明确排除在
 # paper-eligible 之外（§18.6 要求非 mock 证据），因此不削弱"6 类"的目的
 # （把解析失败与解析回退、服务不可用区分开）。
 SynthesisSourceValue = Literal[
-    "vllm_ok", "vllm_parse_error", "vllm_service_error",
+    "online_model_ok", "online_model_parse_error", "online_model_service_error",
     "m8_parse_recovered", "direct_answer_fallback", "partial_tool_recovery",
     "mock_stub",
 ]
-# 已知取值集合（供"不认识的取值不得被洗成 vllm_ok"的判定使用）。
+# 已知取值集合（供"不认识的取值不得被洗成 online_model_ok"的判定使用）。
 KNOWN_SYNTHESIS_SOURCES: frozenset[str] = frozenset(
     SynthesisSourceValue.__args__)  # type: ignore[attr-defined]
 
@@ -44,7 +43,7 @@ KNOWN_SYNTHESIS_SOURCES: frozenset[str] = frozenset(
 # 哪里来"（模型 / 解析回退 / mock stub），`round_trigger` 回答"这一轮为什么被
 # 生成"（首轮 / 观察回灌 / 错误恢复 / 收口）。把后者塞进前者会丢失程序血统 ——
 # v8 曾把 finalization/forced_answer 写进 `synthesis_source`，于是 mock_light 下
-# 的收口答案在 TraceRecord 里被记成 `vllm_ok`。
+# 的收口答案在 TraceRecord 里被误记为模型正常输出。
 RoundTriggerValue = Literal["initial", "observation", "error_recovery", "finalize"]
 
 # EpisodeTrace 的 Schema 身份（v9 §17.2：旧结果保留原身份，新结果用当前合同）。
@@ -161,7 +160,7 @@ class TraceRecord(Spec):
     partial_tool_recovery: bool = False
     invalidated_result_ids: list[str] = []
     # ---- synthesis_source 拆 6 类 ----
-    # 未知/空值**不再**冒充 `vllm_ok`：空串表示"没拿到可归因的来源"。已知取值
+    # 未知/空值**不再**冒充 `online_model_ok`：空串表示"没拿到可归因的来源"。已知取值
     # 见 `KNOWN_SYNTHESIS_SOURCES`。
     synthesis_source: str = ""
     # ---- v9 轮次事实（§12.2：与 synthesis_source 分开记）----
@@ -360,11 +359,13 @@ class RunManifest(Spec):
     split_config_hash: str = ""
     seed: Optional[int] = None
     inference_env: dict = {}
-    vllm_model: str = ""
+    online_model_provider: str = ""
+    online_model: str = ""
+    online_model_revision: str = ""
+    online_model_endpoint_sha256: str = ""
     n_frames: int = 0
     max_pixels: int = 0
     max_model_len: int = 0
-    vllm_endpoints: list[str] = []
     frame_set_hash: str = ""
     # ---- v6：重建/质量/证据版本（§19.2）----
     recon_method: str = "vggt"              # v6 只允许 vggt

@@ -114,9 +114,10 @@ def test_install_identity_ignores_source_commit_and_runtime_budget(working_repo)
     cfg["runtime"].update(port=18111, max_model_len=16384)
     cfg["environment"]["min_free_disk_gib"] = 10
     assert environment_contract(working_repo, cfg)["sha256"] == original
-    cfg["environment"]["vllm_version"] = "changed"
+    original_sam2 = cfg["environment"]["sam2_code_revision"]
+    cfg["environment"]["sam2_code_revision"] = "changed"
     assert environment_contract(working_repo, cfg)["sha256"] != original
-    cfg["environment"]["vllm_version"] = "0.19.1"
+    cfg["environment"]["sam2_code_revision"] = original_sam2
     path = working_repo / "pyproject.toml"
     path.write_text(path.read_text().replace("pydantic>=2.13", "pydantic>=2.14"))
     assert environment_contract(working_repo, cfg)["sha256"] != original
@@ -183,7 +184,7 @@ def test_metric_panel_route_never_runs_learning_or_evolution(working_repo, tmp_p
     manifest = json.loads((work / "runs/panel/pipeline_manifest.json").read_text())
     stages = [row["stage"] for row in manifest["commands"]]
     assert stages == (["metric_prepare"] if smoke else
-                      ["metric_prepare", "serve_qwen", "metric_b01_b11"])
+                      ["metric_prepare", "metric_b01_b11"])
     assert ("--first-scene-only" in manifest["commands"][0]["command"]) == smoke
     assert manifest["formal_result_eligible"] is False
 
@@ -200,7 +201,6 @@ def test_bootstrap_reuses_environment_for_code_edit_and_updates_for_dependency_e
         "import sys, types\n"
         "sys.modules['torch'] = types.SimpleNamespace(cuda=types.SimpleNamespace(is_available=lambda: True), "
         "__version__='test', version=types.SimpleNamespace(cuda='test'))\n"
-        "sys.modules['vllm'] = types.SimpleNamespace(__version__='test')\n"
         "import skill3d.env_preflight as preflight\n"
         "preflight.assert_runtime_dependencies=lambda **kwargs: {}\n"
         "exec(sys.stdin.read())\n")
@@ -272,7 +272,7 @@ def test_existing_environment_requires_explicit_dependency_exception(working_rep
         'dependencies=["pydantic>=2.13"]\nrequires-python=">=3.11"\n')
     cfg = yaml.safe_load((ROOT / "configs/gpu_experiment_v11.yaml").read_text())
     cfg["environment"]["python"] = f"{sys.version_info.major}.{sys.version_info.minor}"
-    versions = {"pydantic": "2.12.5", "vllm": cfg["environment"]["vllm_version"]}
+    versions = {"pydantic": "2.12.5"}
     monkeypatch.setattr(metadata, "version", versions.__getitem__)
     monkeypatch.setattr(metadata, "distributions", lambda: [])
     sam = types.ModuleType("sam2")

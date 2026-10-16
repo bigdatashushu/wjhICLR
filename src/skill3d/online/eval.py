@@ -19,6 +19,7 @@ python -m skill3d.online.eval --split test --active-snapshot data/active_snapsho
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -41,8 +42,7 @@ from skill3d.online.config import (
     paths_from,
     retrieval_policy_from,
     sandbox_from,
-    m5_model_from,
-    vllm_from,
+    online_model_from,
 )
 from skill3d.online.runner import (
     MAX_RECOVERY_ATTEMPTS,
@@ -95,9 +95,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deterministic-replay", action="store_true",
                    help="重放确定性：时间/id/latency 取确定性占位，保证同 seed 字节级一致")
     p.add_argument("--active-snapshot", default="", help="active snapshot 文件或目录（§13.5）")
-    p.add_argument("--vllm-endpoint", action="append", default=None,
-                   help="本地 vLLM endpoint（可重复，DP×8 时给 8 个）")
-    p.add_argument("--vllm-model", default=None, help="served model name")
     p.add_argument("--trace-dir", default="")
     p.add_argument("--recon-dir", default="")
     # v6 §11：零样本度量深度跨帧融合（首个 PoC = MoGe-2）。
@@ -154,8 +151,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[错误] {exc}", file=sys.stderr)
         return 2
     # M1: resolve once before sampling; explicit CLI seed=0 remains meaningful.
-    cfg_yaml = resolve_runtime(load_config(args.config), seed=args.seed,
-                              endpoints=args.vllm_endpoint, model=args.vllm_model)
+    cfg_yaml = resolve_runtime(load_config(args.config), seed=args.seed)
     args.seed = cfg_yaml["seed"]
     # M5 检测器兜底地址：config 里配了就用它（除非环境变量已显式指定）。
     # 纪律：检测器是确定性 Tool（非 LLM），只产出 SAM2 的 box prompt，不参与出答案。
@@ -165,8 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     # v6 §5.2：`recon_method` 受控枚举只有 `vggt`；旧 BA / colmap / dust3r 路线
     # 已整体废止（§20），CLI 不再提供开关，也不再 import 已归档模块。
     paths = paths_from(cfg_yaml)
-    vllm = vllm_from(cfg_yaml)
-    m5_model = m5_model_from(cfg_yaml)
+    online_model = online_model_from(cfg_yaml)
     sandbox = sandbox_from(cfg_yaml)
     active_vision = active_vision_from(cfg_yaml)
 
@@ -293,22 +288,19 @@ def main(argv: list[str] | None = None) -> int:
         cell_timeout_s=int(sandbox.cell_timeout_s),
         trace_dir=args.trace_dir or paths.trace_store,
         recon_dir=args.recon_dir or paths.reconstructions,
-        vllm_endpoints=list(vllm.endpoints),
-        vllm_model=vllm.model,
-        m5_model_enabled=m5_model.enabled,
-        m5_model_provider=m5_model.provider,
-        m5_model=m5_model.model,
-        m5_model_revision=m5_model.model_revision,
-        m5_base_url=m5_model.base_url,
-        m5_api_key_env=m5_model.api_key_env,
-        m5_timeout_s=m5_model.timeout_s,
-        m5_max_tokens=m5_model.max_tokens,
-        m5_min_pixels=m5_model.min_pixels,
-        m5_max_pixels=m5_model.max_pixels,
-        m5_relation_batch_size=m5_model.relation_batch_size,
-        max_images=int(getattr(vllm, "n_frames", 32)),
-        max_tokens=vllm.max_tokens,
-        temperature=vllm.temperature,
+        online_model_enabled=online_model.enabled,
+        online_model_provider=online_model.provider,
+        online_model=online_model.model,
+        online_model_revision=online_model.model_revision,
+        online_base_url=online_model.base_url,
+        online_api_key_env=online_model.api_key_env,
+        online_timeout_s=online_model.timeout_s,
+        semantic_min_pixels=online_model.audit_min_pixels,
+        semantic_max_pixels=online_model.audit_max_pixels,
+        semantic_relation_batch_size=online_model.relation_batch_size,
+        max_images=int(online_model.n_frames),
+        max_tokens=online_model.max_tokens,
+        temperature=online_model.temperature,
         recon_method=args.recon_method,
         metric_depth_model=_maybe_moge2(args),
         # v6 §20：BA（官方 VGGSfM / vggt_sparse_ba）与整套"需校准的尺度"路线已废止，
@@ -322,8 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         finalization_rounds=int(cfg_yaml.get("finalization_rounds", 1)),
         eval_visual_fallback=(args.eval_visual_fallback if args.eval_visual_fallback is not None
                               else bool(cfg_yaml["eval_visual_fallback"])),
-        max_pixels=int(getattr(vllm, "max_pixels", 131072) or 131072),
-        max_model_len=int(getattr(vllm, "max_model_len", 32768) or 32768),
+        max_pixels=int(online_model.max_pixels),
+        max_model_len=int(online_model.max_model_len),
         allow_final_test=args.allow_final_test,
         # §13.5：top-k／排序权重／方法上下文上限来自冻结配置（不在代码里另设一份）
         retrieval_policy=retrieval_policy_from(cfg_yaml),
@@ -331,9 +323,10 @@ def main(argv: list[str] | None = None) -> int:
         image_layout=active_vision.layout,
         max_derived_images=int(active_vision.max_derived_images),
     )
-    if not run_cfg.vllm_endpoints and args.mode == "real":
-        print("[warn] mode=real 但未给 --vllm-endpoint：program 生不出来的 episode 会记 "
-              "unavailable（§4 M8 字段 9）。离线起服务：bash scripts/serve_qwen3vl_dp8.sh",
+    if (run_cfg.online_model_enabled and args.mode == "real"
+            and not os.environ.get(run_cfg.online_api_key_env, "").strip()):
+        print(f"[warn] mode=real 但未设置 {run_cfg.online_api_key_env}：在线模型请求会记 "
+              "unavailable（§4 M8 字段 9）",
               file=sys.stderr)
 
     print("=" * 78)
@@ -594,12 +587,12 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
         split_cfg_path, split_version = "", ""
     try:
         m = build_run_manifest(
-            checkpoint_path=str((cfg_yaml.get("vllm") or {}).get("model", "")),
+            checkpoint_path=str((cfg_yaml.get("online_model") or {}).get("model", "")),
             config_path=args.config, repo_dir=".",
             split_version=split_version, seed=args.seed,
             split_config_path=split_cfg_path)
         out = args.run_manifest or "data/run_manifest.json"
-        vllm_cfg = cfg_yaml.get("vllm") or {}
+        online_model_cfg = cfg_yaml.get("online_model") or {}
         fsh, n_fsh = _frame_set_summary(items or [])
         from skill3d.reconstruction_gate.quality_metrics import (
             QUALITY_METRIC_VERSION,
@@ -671,11 +664,14 @@ def _write_manifest(args, cfg_yaml: dict, run, run_cfg, split: str, *,
             "formal_scoring_eligible": run.formal_scoring_eligible,
             "active_snapshot_ref": run.active_snapshot_ref,
             # 影响结果的推理参数必须记录（§16.4 / §7：冻结模型 + 一致推理环境）
-            "vllm_model": run_cfg.vllm_model,
-            "n_frames": vllm_cfg.get("n_frames"),
-            "max_pixels": vllm_cfg.get("max_pixels"),
-            "max_model_len": vllm_cfg.get("max_model_len"),
-            "vllm_endpoints": list(run_cfg.vllm_endpoints),
+            "online_model_provider": run_cfg.online_model_provider,
+            "online_model": run_cfg.online_model,
+            "online_model_revision": run_cfg.online_model_revision,
+            "online_model_endpoint_sha256": hashlib.sha256(
+                run_cfg.online_base_url.encode("utf-8")).hexdigest(),
+            "n_frames": online_model_cfg.get("n_frames"),
+            "max_pixels": online_model_cfg.get("max_pixels"),
+            "max_model_len": online_model_cfg.get("max_model_len"),
             "max_tokens": run_cfg.max_tokens,
             "runtime_configuration": config_receipt(cfg_yaml),
             # §7 / D-6 / A-8 / D-2：帧集身份（v6 不再记录 BA 开关与校准尺度来源）

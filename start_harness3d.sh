@@ -15,7 +15,6 @@ PYTHON_BIN="${PYTHON_BIN:-python3.11}"
 CODE_REF="${CODE_REF:-}"
 REPO_URL="${REPO_URL:-}"
 
-QWEN_GPU="${HARNESS3D_QWEN_GPU:-2}"
 GEOMETRY_GPU="${HARNESS3D_GEOMETRY_GPU:-3}"
 RESERVE_GPU="${HARNESS3D_RESERVE_GPU:-4}"
 MIN_FREE_GPU_MIB="${HARNESS3D_MIN_FREE_GPU_MIB:-18000}"
@@ -34,9 +33,9 @@ Usage:
   ./start_harness3d.sh [options]
 
 GPU plan:
-  GPU 2  Qwen3-VL / vLLM
   GPU 3  VGGT reconstruction + SAM2
   GPU 4  reserved for GroundingDINO or failover
+  Qwen    Bailian qwen3.8-flash (requires DASHSCOPE_API_KEY)
 
 Options:
   --config PATH          GPU experiment YAML
@@ -50,10 +49,10 @@ Options:
   -h, --help             show this help
 
 Environment overrides:
-  HARNESS3D_QWEN_GPU, HARNESS3D_GEOMETRY_GPU, HARNESS3D_RESERVE_GPU
+  HARNESS3D_GEOMETRY_GPU, HARNESS3D_RESERVE_GPU, DASHSCOPE_API_KEY
   HARNESS3D_DETECTOR_ENDPOINT, HARNESS3D_REQUIRE_DETECTOR
   HARNESS3D_MIN_FREE_GPU_MIB, HARNESS3D_CONFIG, HARNESS3D_WORK_DIR
-  QWEN_EXISTING_PATH, VGGT_EXISTING_PATH, SAM2_EXISTING_PATH, SAM2_CONFIG
+  VGGT_EXISTING_PATH, SAM2_EXISTING_PATH, SAM2_CONFIG
   MOGE2_EXISTING_PATH, HARNESS3D_EXISTING_PYTHON (validated, never pip-modified)
   CODE_REF, REPO_URL, PYTHON_BIN
 
@@ -118,12 +117,10 @@ done
 command -v git >/dev/null 2>&1 || die "git is required"
 command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Python executable not found: $PYTHON_BIN"
 [[ -f "$CONFIG_SOURCE" ]] || die "GPU config not found: $CONFIG_SOURCE"
-[[ "$QWEN_GPU" =~ ^[0-9]+$ ]] || die "HARNESS3D_QWEN_GPU must be an integer"
 [[ "$GEOMETRY_GPU" =~ ^[0-9]+$ ]] || die "HARNESS3D_GEOMETRY_GPU must be an integer"
 [[ "$RESERVE_GPU" =~ ^[0-9]+$ ]] || die "HARNESS3D_RESERVE_GPU must be an integer"
-[[ "$QWEN_GPU" != "$GEOMETRY_GPU" ]] || die "Qwen and geometry must use different GPUs"
-[[ "$RESERVE_GPU" != "$QWEN_GPU" && "$RESERVE_GPU" != "$GEOMETRY_GPU" ]] \
-  || die "reserved GPU must differ from Qwen and geometry GPUs"
+[[ "$RESERVE_GPU" != "$GEOMETRY_GPU" ]] \
+  || die "Reserve GPU must differ from geometry GPU"
 [[ "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]] \
   || die "run ID may contain only letters, digits, dot, underscore and hyphen"
 
@@ -166,8 +163,6 @@ use_existing_dir() {
   fi
 }
 
-use_existing_dir QWEN_EXISTING_PATH \
-  "/home/cvailab/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct-FP8"
 use_existing_dir VGGT_EXISTING_PATH \
   "/home/cvailab/.cache/huggingface/geothinker/VGGT-1B"
 use_existing_dir SAM2_EXISTING_PATH \
@@ -177,19 +172,19 @@ use_existing_dir MOGE2_EXISTING_PATH \
 export SAM2_CONFIG="${SAM2_CONFIG:-configs/sam2.1/sam2.1_hiera_l.yaml}"
 
 "$PYTHON_BIN" - "$CONFIG_SOURCE" "$GENERATED_CONFIG" \
-  "$QWEN_GPU" "$GEOMETRY_GPU" "$REQUIRE_DETECTOR" "$SMOKE" "$DEV" "$DRY_RUN" "$ROOT" <<'PY'
+  "$GEOMETRY_GPU" "$REQUIRE_DETECTOR" "$SMOKE" "$DEV" "$DRY_RUN" "$ROOT" <<'PY'
 import pathlib
 import sys
-sys.path.insert(0, str(pathlib.Path(sys.argv[9]) / "src"))
+sys.path.insert(0, str(pathlib.Path(sys.argv[8]) / "src"))
 import yaml
 from skill3d.infra.experiment_startup import configure_run
 from skill3d.online.config import load_yaml, resolve_detector_endpoint
 
 source, target = map(pathlib.Path, sys.argv[1:3])
-qwen_gpu, geometry_gpu, require_detector, smoke, dev, dry_run = sys.argv[3:9]
+geometry_gpu, require_detector, smoke, dev, dry_run = sys.argv[3:8]
 cfg = configure_run(load_yaml(source), dev=dev == "1",
                     smoke=smoke == "1", dry_run=dry_run == "1")
-cfg["runtime"].update(qwen_gpu=int(qwen_gpu), geometry_gpu=int(geometry_gpu))
+cfg["runtime"].update(geometry_gpu=int(geometry_gpu))
 detector = resolve_detector_endpoint(cfg["experiment"], require_detector=require_detector == "1")
 cfg["experiment"].update(detector_endpoint=detector["endpoint"],
                          detector_endpoint_source=detector["source"])
@@ -236,13 +231,14 @@ fi
 
 if [[ "$DRY_RUN" -eq 0 && "$DOWNLOAD_ONLY" -eq 0 ]]; then
   [[ "$(uname -s)" == "Linux" ]] || die "real GPU runs require Linux"
+  [[ -n "${DASHSCOPE_API_KEY:-}" ]] || die "DASHSCOPE_API_KEY is required"
   command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required"
 
   GPU_TABLE="$(nvidia-smi \
     --query-gpu=index,name,memory.total,memory.free \
     --format=csv,noheader,nounits)"
   printf '%s\n' "$GPU_TABLE" | awk -F, \
-    -v qwen="$QWEN_GPU" -v geometry="$GEOMETRY_GPU" -v reserve="$RESERVE_GPU" \
+    -v geometry="$GEOMETRY_GPU" -v reserve="$RESERVE_GPU" \
     -v minimum="$MIN_FREE_GPU_MIB" '
       {
         gpu_idx=$1; free_text=$4
@@ -252,13 +248,13 @@ if [[ "$DRY_RUN" -eq 0 && "$DOWNLOAD_ONLY" -eq 0 ]]; then
         free_mib[gpu_idx]=free_text+0
       }
       END {
-        if (!seen[qwen] || !seen[geometry] || !seen[reserve]) {
-          printf "required GPUs %s,%s,%s are not all visible\n", qwen, geometry, reserve > "/dev/stderr"
+        if (!seen[geometry] || !seen[reserve]) {
+          printf "required GPUs %s,%s are not all visible\n", geometry, reserve > "/dev/stderr"
           exit 2
         }
-        if (free_mib[qwen] < minimum || free_mib[geometry] < minimum) {
-          printf "GPU %s/%s need at least %s MiB free; observed %s/%s MiB\n",
-                 qwen, geometry, minimum, free_mib[qwen], free_mib[geometry] > "/dev/stderr"
+        if (free_mib[geometry] < minimum) {
+          printf "GPU %s needs at least %s MiB free; observed %s MiB\n",
+                 geometry, minimum, free_mib[geometry] > "/dev/stderr"
           exit 2
         }
       }' || die "GPU availability check failed"
@@ -294,7 +290,7 @@ printf '  config:        %s\n' "$GENERATED_CONFIG"
 printf '  work_dir:      %s\n' "$WORK_DIR"
 printf '  run_id:        %s\n' "$RUN_ID"
 printf '  mode:          %s\n' "$MODE"
-printf '  qwen_gpu:      %s\n' "$QWEN_GPU"
+printf '  online_model:  %s\n' "bailian/qwen3.8-flash"
 printf '  geometry_gpu:  %s\n' "$GEOMETRY_GPU"
 printf '  reserve_gpu:   %s\n' "$RESERVE_GPU"
 printf '  detector:      %s\n' "$DETECTOR_ENDPOINT"

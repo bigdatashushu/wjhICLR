@@ -9,7 +9,7 @@ from typing import Optional
 import urllib.error
 import urllib.request
 
-from .vllm_client import ServiceUnavailable
+from .client_errors import ServiceUnavailable
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen3.8-flash"
@@ -33,7 +33,7 @@ def _scrub(text: str, secret: str) -> str:
 
 
 class BailianClient:
-    """Qwen client with the same small ``chat`` contract used by M5.
+    """Shared Qwen client for M5, M8 and evaluation visual fallback.
 
     The API key is resolved at request time and is never retained in receipts or
     object identity. The model/base URL are public configuration; only a SHA-256

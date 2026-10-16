@@ -29,5 +29,5 @@ class GPUJob(Spec):
     """M20 调度单元。"""
 
     gpu_rank: int
-    role: Literal["reconstruct", "vllm", "eval"]
+    role: Literal["reconstruct", "eval"]
     paired_unit_id: str

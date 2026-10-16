@@ -1,6 +1,6 @@
 # harness3D
 
-harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感知 VLM 实验系统。Skill3D 是代码基础，不是当前系统名称。在线链使用本地 Qwen3-VL 生成并执行受限程序，离线链按采集、修订、评测、发布四阶段更新完整 Skill。当前实现以[系统架构 v11](系统架构v11.md)为准；本文保留的服务器核查路径和资源状态是历史记录。
+harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感知 VLM 实验系统。Skill3D 是代码基础，不是当前系统名称。在线链统一使用百炼 Qwen3.8-Flash 生成并执行受限程序、解析题目并审核对象语义；离线链按采集、修订、评测、发布四阶段更新完整 Skill。当前实现以[系统架构 v11](系统架构v11.md)为准；本文保留的服务器核查路径和资源状态是历史记录。
 
 当前 checkout 已删除原 Skill-3D 副本、退役 BA/标定实现、v9/v10 演化与发布链、向量检索和 Memory 平台。历史实现通过对应 Git 提交复现。VSI-Bench 数据读取、split、帧集、VGGT/MoGe-2 重建、SAM2 分割、质量门及已有数据产物保持原实现。
 
@@ -124,7 +124,6 @@ Python       3.11.14
 PyTorch      2.10.0+cu128
 CUDA runtime 12.8
 torch.cuda   available=True, device_count=8
-vLLM         0.19.1
 xFormers     0.0.34（匹配 PyTorch 2.10.0+cu128）
 SAM2         1.1.0（已补建并验证 sam2._C CUDA 后处理扩展）
 ```
@@ -138,11 +137,10 @@ MoGe 米制缓存身份也记录 xFormers 版本。历史实验产物保持只�
 v11 默认环境要求见 `configs/gpu_experiment_v11.yaml`：
 
 - Linux。
-- 至少 2 张 GPU。
-- 选用的 Qwen 卡和 VGGT/SAM2 卡分别至少有 20 GiB 总显存。
+- 至少 1 张 GPU。
+- 选用的 VGGT/SAM2 卡至少有 20 GiB 总显存。
 - 工作盘至少有 80 GiB 可用空间。
-- Qwen 与 VGGT/SAM2 必须分卡；配置中的 `qwen_gpu` 和 `geometry_gpu` 不得相同。
-- vLLM 使用单卡 tensor parallel（`tensor_parallel_size=1`），不是把几何重建和 Qwen 放在同一张卡上。
+- 在线模型需要通过环境变量提供 `DASHSCOPE_API_KEY`，密钥不得写入配置或收据。
 
 服务器有 8 张 NVIDIA GeForce RTX 4090，每张总显存 24564 MiB。核查时 GPU 均有其他任务占用：GPU 0 约使用 22115 MiB，GPU 1 约使用 23592 MiB，GPU 2-7 约使用 23800 MiB，部分卡利用率很高。因此“机器有足够总 GPU”不等于“本次有空闲 GPU”；本次没有终止或干扰其他进程，也没有在显存不足时强行启动服务。
 
@@ -211,16 +209,12 @@ accept_vsi_bench_license: true
 68e9c652b4ef97360ee9e46745743a4d862ff64fd3745239bb9d482060c8f35fe
 ```
 
-### Qwen3-VL-8B-Instruct-FP8
+### 在线 Qwen
 
-- Repo：`Qwen/Qwen3-VL-8B-Instruct-FP8`
-- Revision：`9cdc6310a8cb770ce18efaf4e9935334512aee45`
-- Snapshot：
-  `/home/cvailab/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct-FP8/snapshots/9cdc6310a8cb770ce18efaf4e9935334512aee45`
-- `refs/main` 与配置 revision 一致。
-- 两个主要 safetensors 分片：
-  - `model-00001-of-00002.safetensors`：`e2dea2e85e643ef7045c31a485a426631a1e0a84e463f8b2c7e9c6682a06eafd`
-  - `model-00002-of-00002.safetensors`：`3dc64ec934af27a7007d265014e907aff9e16658d409e5cd4cf79869bf2bd8c1`
+- Provider：阿里百炼 OpenAI 兼容接口。
+- Model：`qwen3.8-flash`。
+- M5 解析/语义审核、M8 程序生成及评测视觉补答共用同一模型配置。
+- API Key 只从 `DASHSCOPE_API_KEY` 读取。
 
 ### VGGT-1B
 
@@ -284,11 +278,9 @@ v11 有三个不同角色的配置，不能混用：
 
 ```yaml
 runtime:
-  qwen_gpu: 0
   geometry_gpu: 1
-  port: 18110
-  served_model_name: qwen3vl-v11
   max_model_len: 32768
+  max_tokens: 8192
   max_pixels: 131072
   n_images: 32
 
@@ -303,7 +295,7 @@ experiment:
   run_evolution: false
 ```
 
-端口必须先检查；冲突时只改外部副本并记录新端口。Qwen 服务和 VGGT/SAM2 必须分卡。实验目录必须是独立 work-dir，正式 run ID 不能复用已有目录。
+检测器端口必须先检查；冲突时只改外部副本并记录新端口。实验目录必须是独立 work-dir，正式 run ID 不能复用已有目录。
 
 ## 7. v11 运行流程
 
@@ -317,11 +309,10 @@ git status --short
 nvidia-smi
 df -h
 which python
-which vllm
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available(), torch.cuda.device_count())"
 ```
 
-在正式模式下还要确认：真实 VSI-Bench 视频、至少两张空闲且显存足够的卡、空闲端口、有效质量确认 JSON、模型与数据许可证已经真实核对。
+在正式模式下还要确认：真实 VSI-Bench 视频、至少一张空闲且显存足够的卡、检测器端口、`DASHSCOPE_API_KEY`、有效质量确认 JSON、模型与数据许可证已经真实核对。
 
 ### 7.2 Dry-run
 
@@ -335,11 +326,10 @@ PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
   --dry-run
 ```
 
-dry-run 应只打印将执行的命令并生成 `pipeline_manifest.json`，不下载权重、不启动 vLLM、不执行重建或评测。命令链应是：
+dry-run 应只打印将执行的命令并生成 `pipeline_manifest.json`，不下载权重、不执行重建或评测。命令链应是：
 
 ```text
 reconstruction
-serve_qwen
 parent_learning        # induction
 b01_b11                # inner_validation
 [evolution]            # 仅当 run_evolution=true 且前置条件满足
@@ -469,12 +459,12 @@ PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
 GPUExperimentError: formal run requires experiment.accept_model_licenses=true
 ```
 
-失败发生在许可证检查阶段，早于权重下载、GPU inventory 选择、重建和 vLLM 启动。最终状态：
+失败发生在许可证检查阶段，早于权重下载、GPU inventory 选择、重建和在线模型请求。最终状态：
 
 | 阶段 | 状态 |
 |---|---|
 | reconstruction | 未执行 |
-| Qwen/vLLM | 未启动 |
+| Qwen3.8-Flash | 未请求 |
 | parent learning / induction | 未执行 |
 | B01/B11 / inner_validation | 未执行 |
 | evolution | 未执行 |

@@ -195,8 +195,7 @@ def test_paired_evaluator_rejects_cache_without_actual_panel(tmp_path):
     cfg = OnlineRunConfig(
         mode="real",
         seed=seed,
-        vllm_endpoints=["http://127.0.0.1:8100"],
-        vllm_model="qwen-test",
+        online_model="qwen3.8-flash",
     )
     model_identity = adapters.model_config_identity_v11(cfg)
     solver_identity = adapters.solver_config_identity_v11(cfg, seed=seed)
@@ -231,7 +230,7 @@ def test_paired_evaluator_rejects_cache_without_actual_panel(tmp_path):
         evaluator(
             campaign_id="campaign-test", parent=parent, candidate=candidate,
             experience=_Experience(), question_type=parent.question_type, seed=seed,
-            model_id=cfg.vllm_model, model_config_sha256=model_identity["sha256"],
+            model_id=cfg.online_model, model_config_sha256=model_identity["sha256"],
             quality_contract_sha256=contract["sha256"],
             solver_config_sha256=solver_identity["sha256"],
             idempotency_key="campaign-test:evaluate",

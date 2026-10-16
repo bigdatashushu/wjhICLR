@@ -50,18 +50,18 @@ def test_runtime_plan_freezes_budget_seed_and_private_library(tmp_path):
     weights = {name: tmp_path / name for name in cfg["weights"]}
     commands = gpu._pipeline(ROOT, tmp_path, cfg, weights, dry_run=True)
     frozen = yaml.safe_load((tmp_path / "runtime_config.yaml").read_text())
-    assert frozen["frame_sampling"]["n_frames"] == frozen["vllm"]["n_frames"] == 8
-    assert frozen["vllm"]["max_pixels"] == 65536
-    assert frozen["vllm"]["max_model_len"] == 16384
-    assert frozen["vllm"]["max_tokens"] == 8192
+    assert frozen["frame_sampling"]["n_frames"] == frozen["online_model"]["n_frames"] == 8
+    assert frozen["online_model"]["max_pixels"] == 65536
+    assert frozen["online_model"]["max_model_len"] == 16384
+    assert frozen["online_model"]["max_tokens"] == 8192
+    assert frozen["online_model"]["model"] == "qwen3.8-flash"
     assert frozen["paths"]["skill_library"] == str(tmp_path / "skill_library")
     assert json.loads((tmp_path / "environment.json").read_text())[
         "sam2_runtime"] == {"status": "not_probed_dry_run"}
     for row in commands:
         command = row["command"]
-        if row["stage"] != "serve_qwen":
-            assert command[command.index("--seed") + 1] == "137"
-            assert command[command.index("--config") + 1] == str(tmp_path / "runtime_config.yaml")
+        assert command[command.index("--seed") + 1] == "137"
+        assert command[command.index("--config") + 1] == str(tmp_path / "runtime_config.yaml")
         if row["stage"] == "evolution":
             assert command[command.index("--library-root") + 1] == str(tmp_path / "skill_library")
 

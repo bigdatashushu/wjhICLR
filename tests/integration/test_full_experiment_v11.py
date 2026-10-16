@@ -99,13 +99,13 @@ def snapshot(busy=()):
 
 def test_two_gpu_snapshots_exclude_others_and_assign_distinct_roles():
     roles = full.select_gpus(snapshot((0, 1, 2)), snapshot((0, 1, 4)))
-    assert len({r["index"] for r in roles.values()}) == 3
+    assert len({r["index"] for r in roles.values()}) == 2
     assert {r["index"] for r in roles.values()}.isdisjoint({0, 1, 2, 4})
-    with pytest.raises(full.FullExperimentError, match="three unused GPUs"):
-        full.select_gpus(snapshot(range(6)), snapshot())
+    with pytest.raises(full.FullExperimentError, match="two unused GPUs"):
+        full.select_gpus(snapshot(range(7)), snapshot())
     before = snapshot()
-    before["gpus"][2]["total_mib"] = 16000
-    assert full.select_gpus(before, snapshot())["qwen"]["index"] != 2
+    before["gpus"][3]["total_mib"] = 16000
+    assert full.select_gpus(before, snapshot())["geometry"]["index"] != 3
 
 
 def test_preparation_gzip_cas_is_exact_and_corruption_refuses_restore(tmp_path):
@@ -234,15 +234,15 @@ def test_preparation_never_copies_legacy_inventory(panel, tmp_path):
 def test_runtime_envelope_keeps_services_out_of_strict_online_config(tmp_path):
     import yaml
     raw = yaml.safe_load((ROOT / "configs/config.yaml").read_text())
-    raw["vllm"].update(endpoints=["http://127.0.0.1:18110"], max_tokens=8192,
-                       n_frames=32, max_pixels=131072, max_model_len=32768)
+    raw["online_model"].update(max_tokens=8192, n_frames=32,
+                               max_pixels=131072, max_model_len=32768)
     raw.update(max_solver_rounds=6, max_retries_per_operation=3, finalization_rounds=1,
                eval_visual_fallback=True)
-    raw["experiment"] = {"full_services": {"qwen_command": ["python", "server.py"]}}
+    raw["experiment"] = {"full_services": {"detector_python": "python"}}
     path = tmp_path / "full.yaml"
     path.write_text(yaml.safe_dump(raw))
     cfg, effective = full.runtime_cfg(path, 138)
-    assert cfg.seed == 138 and cfg.vllm_endpoints == ["http://127.0.0.1:18110"]
+    assert cfg.seed == 138 and cfg.online_model == "qwen3.8-flash"
     assert effective["experiment"] == raw["experiment"]
     assert "experiment" not in yaml.safe_load((tmp_path / "full.online.yaml").read_text())
 

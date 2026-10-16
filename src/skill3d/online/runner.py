@@ -166,19 +166,16 @@ class OnlineRunConfig:
     trace_dir: str = "data/traces"
     recon_dir: str = "data/reconstructions"
     work_dir: str = "data/reconstructions/mock_light"
-    vllm_endpoints: list[str] = field(default_factory=list)
-    vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
-    m5_model_enabled: bool = True
-    m5_model_provider: str = "bailian"
-    m5_model: str = "qwen3.8-flash"
-    m5_model_revision: str = ""
-    m5_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    m5_api_key_env: str = "DASHSCOPE_API_KEY"
-    m5_timeout_s: float = 180.0
-    m5_max_tokens: int = 2048
-    m5_min_pixels: int = 65536
-    m5_max_pixels: int = 1048576
-    m5_relation_batch_size: int = 32
+    online_model_enabled: bool = True
+    online_model_provider: str = "bailian"
+    online_model: str = "qwen3.8-flash"
+    online_model_revision: str = ""
+    online_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    online_api_key_env: str = "DASHSCOPE_API_KEY"
+    online_timeout_s: float = 180.0
+    semantic_min_pixels: int = 65536
+    semantic_max_pixels: int = 1048576
+    semantic_relation_batch_size: int = 32
     model_weights_sha256: str = field(
         default_factory=lambda: os.environ.get("SKILL3D_MODEL_WEIGHTS_SHA256", ""))
     environment_sha256: str = field(
@@ -226,14 +223,14 @@ class OnlineRunConfig:
         for value in (self.model_weights_sha256, self.environment_sha256):
             if value and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value)):
                 raise ValueError("模型/环境身份必须是 SHA256")
-        if self.m5_model_provider != "bailian":
-            raise ValueError("M5 model provider must be bailian")
-        if not self.m5_model or not self.m5_base_url.startswith("https://"):
-            raise ValueError("M5 model and HTTPS base URL are required")
-        if self.m5_min_pixels <= 0 or self.m5_min_pixels > self.m5_max_pixels:
-            raise ValueError("invalid M5 image pixel budget")
-        if self.m5_relation_batch_size <= 0 or self.m5_max_tokens <= 0:
-            raise ValueError("invalid M5 request budget")
+        if self.online_model_provider != "bailian":
+            raise ValueError("online model provider must be bailian")
+        if not self.online_model or not self.online_base_url.startswith("https://"):
+            raise ValueError("online model and HTTPS base URL are required")
+        if self.semantic_min_pixels <= 0 or self.semantic_min_pixels > self.semantic_max_pixels:
+            raise ValueError("invalid semantic audit image pixel budget")
+        if self.semantic_relation_batch_size <= 0 or self.max_tokens <= 0:
+            raise ValueError("invalid online model request budget")
         if self.baseline != "C1_tools_program":
             raise ValueError("当前在线入口只支持 C1_tools_program")
         legacy = [type(skill).__name__ for skill in self.skills
@@ -306,7 +303,7 @@ class EpisodeOutcome:
     states: list[str] = field(default_factory=list)
     answer_flags: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
-    synthesis_source: str = "none"          # vllm | deterministic_stub | none
+    synthesis_source: str = "none"          # online model | deterministic stub | none
     program: Optional[EpisodeProgram] = None
     program_trace: Optional[ProgramExecutionTrace] = None
     verify: Optional[GeometryVerifyResult] = None
@@ -419,7 +416,8 @@ class FixedSkillInjectionError(RuntimeError):
 class _SynthResult:
     """M8 program generation result."""
     program: Optional[EpisodeProgram]
-    # §19.3 六类 + `mock_stub`：vllm_ok | vllm_parse_error | vllm_service_error |
+    # §19.3 六类 + `mock_stub`: online_model_ok | online_model_parse_error |
+    # online_model_service_error |
     # m8_parse_recovered | direct_answer_fallback | partial_tool_recovery | mock_stub
     source: str
     note: str
@@ -591,9 +589,15 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
 _RECOVERABLE_CONTRACT_ERRORS = ("tool_contract", "confidence_gate", "domain_value",
                                 "answer_already_given")
 
-_SYNTH_SOURCES = {"vllm_ok", "vllm_parse_error", "vllm_service_error",
+_SYNTH_SOURCES = {"online_model_ok", "online_model_parse_error",
+                  "online_model_service_error",
                   "m8_parse_recovered", "direct_answer_fallback",
                   "partial_tool_recovery", "mock_stub"}
+_LEGACY_SYNTH_SOURCES = {
+    "vllm_ok": "online_model_ok",
+    "vllm_parse_error": "online_model_parse_error",
+    "vllm_service_error": "online_model_service_error",
+}
 
 
 def _synthesis_source_enum(value: str) -> str:
@@ -601,22 +605,26 @@ def _synthesis_source_enum(value: str) -> str:
 
     - `mock_stub`（mock_light 确定性 stub，非模型输出）原样保留 —— v5 曾把它写成
       `deterministic_stub`，这里做别名归一；
-    - 空 / `none` / `unavailable`（M8 根本没跑）→ `vllm_service_error`：**只允许**
+    - 旧 `vllm_*` 收据映射到当前 `online_model_*` 名称；
+    - 空 / `none` / `unavailable`（M8 根本没跑）→ `online_model_service_error`：
+      **只允许**
       断言"没有拿到模型输出"；
     - 其他不认识的取值 → 空串（"来源未知"）。
 
-    **绝不**返回 `vllm_ok`。v5 的 vllm 混写正是 §19.3 要消灭的问题；v8 把
+    **绝不**把未知值返回为 `online_model_ok`。v5 的 vllm 混写正是 §19.3
+    要消灭的问题；v8 把
     `forced_answer` / `finalization` 塞进 `synthesis_source` 之后，又被这条兜底
     洗成"模型正常产出" —— mock_light 的收口答案因此在 TraceRecord 里冒充过
     真实模型输出。轮次原因改记在 `round_trigger` / `finalization_used`（§12.2）。
     """
     v = str(value or "").strip()
+    v = _LEGACY_SYNTH_SOURCES.get(v, v)
     if v in _SYNTH_SOURCES:
         return v
     if v == "deterministic_stub":        # v5 历史名 → v6 的 mock_stub
         return "mock_stub"
     if v in ("", "none", "unavailable"):
-        return "vllm_service_error"
+        return "online_model_service_error"
     return ""
 
 
@@ -1100,8 +1108,8 @@ def run_episode(
 ) -> EpisodeOutcome:
     """跑完一条在线链 episode。
 
-    llm：可注入的 `synthesis.vllm_client.VLLMClient` 兼容对象（测试用 fake）；
-    为 None 且 `mode="real"` 时按 `cfg.vllm_endpoints` 构造；`mock_light` 下不需要。
+    llm：可注入的 `chat` 兼容对象（测试用 fake）；为 None 且 `mode="real"` 时
+    按共享的百炼在线模型配置构造；`mock_light` 下不需要。
     """
     if any(not isinstance(skill, SkillSpecV11) for skill in cfg.skills):
         raise ValueError(
@@ -1349,9 +1357,9 @@ def run_episode(
                             or art.artifact_id),
                         seed=int(cfg.seed), model_weights_sha256="",
                         parameters=binding_parameters(
-                            semantic_min_pixels=cfg.m5_min_pixels,
-                            semantic_max_pixels=cfg.m5_max_pixels,
-                            semantic_relation_batch_size=cfg.m5_relation_batch_size))
+                            semantic_min_pixels=cfg.semantic_min_pixels,
+                            semantic_max_pixels=cfg.semantic_max_pixels,
+                            semantic_relation_batch_size=cfg.semantic_relation_batch_size))
                 m5_objects, m5_stats = binding.objects, binding.stats
                 m5_notes, m5_materialized = binding.notes, binding.materialized
             prepared_measurements = (
@@ -1507,7 +1515,7 @@ def run_episode(
             question=episode.question, options=list(episode.options or []),
             question_type=str(outcome.task or canonical_task(episode.question_type)),
             ledger=getattr(handle, "_ledger", None),
-            client=llm if llm is not None else _make_vllm_client(cfg),
+            client=llm if llm is not None else _make_online_client(cfg),
             round_index=outcome.agent_rounds + 1, max_images=cfg.max_images,
             max_tokens=cfg.max_tokens, seed=int(cfg.seed))
         outcome.eval_visual_fallback = {**audit, "original_result": original}
@@ -1694,7 +1702,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             record["error_code"] = res.source
             feedback = f"The previous program generation failed: {res.note}."
             failure_key = "synthesis"
-            if res.source in ("none", "vllm_service_error"):
+            if res.source in ("none", "online_model_service_error"):
                 outcome.final_state = "unavailable"
                 termination_reason = "synthesis_unavailable"
                 break
@@ -2284,7 +2292,7 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
     # 冻结 Qwen 只读取题目文本；真实候选框由 GroundingDINO 全帧扫描生成。
     vlm_client = None
     if cfg is not None and cfg.mode == "real":
-        vlm_client = llm if llm is not None else _make_m5_client(cfg)
+        vlm_client = llm if llm is not None else _make_online_client(cfg)
     try:
         objects, stats, notes = bind_objects_for_scene(
             pixels, None, episode.question, depth_maps=depth, c2w_list=c2w,
@@ -2312,10 +2320,10 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
             frame_provenance=_episode_frame_provenance(episode, pixels),
             # 问题对象解析使用请求级 seed（§7 复现纪律）。
             seed=int(cfg.seed) if cfg is not None else None,
-            semantic_min_pixels=(cfg.m5_min_pixels if cfg is not None else None),
-            semantic_max_pixels=(cfg.m5_max_pixels if cfg is not None else None),
+            semantic_min_pixels=(cfg.semantic_min_pixels if cfg is not None else None),
+            semantic_max_pixels=(cfg.semantic_max_pixels if cfg is not None else None),
             semantic_relation_batch_size=(
-                cfg.m5_relation_batch_size if cfg is not None else None),
+                cfg.semantic_relation_batch_size if cfg is not None else None),
         )
     except Exception as exc:  # noqa: BLE001 - checkpoint/依赖/传播失败
         return [], {"binding_error": f"{type(exc).__name__}: {exc}",
@@ -2469,7 +2477,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             assemble_program(src, []),
             "mock_stub",
             "M8 mock_light 确定性 stub program"
-            "（非 Qwen3-VL-8B 输出，仅管道验证）",
+            "（非在线模型输出，仅管道验证）",
             response_text=src,
         )
 
@@ -2481,13 +2489,13 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                                             None if prior_program is not None
                                             else traceback_feedback),
                                         policy=cfg.retrieval_policy)
-    client = llm if llm is not None else _make_vllm_client(cfg)
+    client = llm if llm is not None else _make_online_client(cfg)
     if client is None:
         # §13.6：prompt 里放了方法，但**没有发出任何请求** → 一条都不算"已交付"。
-        delivery.channel_note = "M8 vLLM 未配置：方法进了 prompt 但未发出模型请求"
+        delivery.channel_note = "M8 百炼模型未配置：方法进了 prompt 但未发出模型请求"
         return _SynthResult(None, "none",
-                            "M8 vLLM 未配置：用 --vllm-endpoint 指定本地 Qwen3-VL-8B endpoint"
-                            "（bash scripts/serve_qwen3vl_dp8.sh）；§4 M8 字段 9 → 记 unavailable",
+                            "M8 百炼模型未配置：请设置 DASHSCOPE_API_KEY；"
+                            "§4 M8 字段 9 → 记 unavailable",
                             prompt=prompt, delivery=delivery)
     # ---- v9 §9.4：主动图像的布局规划（声明布局，图数不超过服务上限）----
     ledger = getattr(handle, "_ledger", None) if handle is not None else None  # noqa: SLF001
@@ -2525,11 +2533,11 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         if traceback_feedback:
             messages.append({"role": "user", "content": traceback_feedback})
     try:
-        # 请求级 seed：钉住 vLLM 采样随机性（§7 复现纪律）
+        # 请求级 seed：钉住在线模型采样随机性（§7 复现纪律）
         with request_phase("program"):
             text = client.chat(messages, max_tokens=cfg.max_tokens, seed=int(cfg.seed))
     except Exception as exc:  # noqa: BLE001 - 网络/服务不可用
-        from skill3d.synthesis.vllm_client import ServiceUnavailable
+        from skill3d.synthesis.client_errors import ServiceUnavailable
 
         # §13.6：请求失败不能记成"已交付"（模型可能根本没收到正文）。
         delivery.mark_request_failed(f"{type(exc).__name__}: {exc}")
@@ -2537,11 +2545,11 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             # §9.4：请求失败 → 本轮图像保持 **unobserved**，并写明原因（不静默）
             ledger.mark_round_failed(int(round_index), f"{type(exc).__name__}: {exc}")
         if isinstance(exc, ServiceUnavailable):
-            return _SynthResult(None, "vllm_service_error",
+            return _SynthResult(None, "online_model_service_error",
                                 f"M8 service_unavailable（§6.1：服务故障不静默降级）: {exc}",
                                 prompt=prompt, n_images=n_images, delivery=delivery)
-        return _SynthResult(None, "vllm_service_error",
-                            f"M8 vLLM 调用失败: {type(exc).__name__}: {exc}",
+        return _SynthResult(None, "online_model_service_error",
+                            f"M8 百炼调用失败: {type(exc).__name__}: {exc}",
                             prompt=prompt, n_images=n_images, delivery=delivery)
 
     # 请求已发出且模型有返回 → 此刻方法正文确实送达（§13.6"已交付"）
@@ -2561,7 +2569,8 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
               else degenerate_reason(text))
     if reason is not None:
         return _SynthResult(
-            None, "vllm_parse_error", f"M8 degenerate output: {reason} (retry through the bounded solver loop)",
+            None, "online_model_parse_error",
+            f"M8 degenerate output: {reason} (retry through the bounded solver loop)",
             prompt=prompt, n_images=n_images, delivery=delivery,
             image_round=_round_dict(ledger, round_index), response_text=text,
             generation=generation)
@@ -2576,7 +2585,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
     except SynthesisError as exc:
         return _SynthResult(
             None,
-            "vllm_parse_error",
+            "online_model_parse_error",
             f"M8 program parsing failed: {exc}",
             prompt=prompt,
             n_images=n_images,
@@ -2586,7 +2595,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             generation=generation,
         )
     # §15.2：解析回退单列 m8_parse_recovered，与"真解析不出来"区分开
-    source = "m8_parse_recovered" if recovered else "vllm_ok"
+    source = "m8_parse_recovered" if recovered else "online_model_ok"
     return _SynthResult(
         program,
         source,
@@ -2754,30 +2763,23 @@ def _premise_from_cell(cell: CellResult, kernel) -> Optional[str]:
         missing_artifacts=arts, unmet_evidence=unmet, failure_cause=_cause_from_cell(cell))
 
 
-def _make_vllm_client(cfg: OnlineRunConfig):
-    if not cfg.vllm_endpoints:
+def _make_online_client(cfg: OnlineRunConfig):
+    """Build the one shared Qwen client used by every online model phase."""
+    if not cfg.online_model_enabled:
         return None
-    from skill3d.synthesis.vllm_client import VLLMClient
-
-    return VLLMClient(cfg.vllm_endpoints, cfg.vllm_model,
-                      temperature=cfg.temperature, max_output_tokens=cfg.max_tokens)
-
-
-def _make_m5_client(cfg: OnlineRunConfig):
-    if not cfg.m5_model_enabled:
-        return None
-    if cfg.m5_model_provider != "bailian":
-        raise ValueError(f"unsupported M5 model provider: {cfg.m5_model_provider}")
+    if cfg.online_model_provider != "bailian":
+        raise ValueError(
+            f"unsupported online model provider: {cfg.online_model_provider}")
     from skill3d.synthesis.bailian_client import BailianClient
 
     client = BailianClient(
-        model=cfg.m5_model,
-        model_revision=cfg.m5_model_revision,
-        base_url=cfg.m5_base_url,
-        api_key_env=cfg.m5_api_key_env,
-        timeout_s=cfg.m5_timeout_s,
-        temperature=0.0,
-        max_output_tokens=cfg.m5_max_tokens,
+        model=cfg.online_model,
+        model_revision=cfg.online_model_revision,
+        base_url=cfg.online_base_url,
+        api_key_env=cfg.online_api_key_env,
+        timeout_s=cfg.online_timeout_s,
+        temperature=cfg.temperature,
+        max_output_tokens=cfg.max_tokens,
     )
     return client if client.configured else None
 

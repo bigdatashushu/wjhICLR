@@ -4,7 +4,7 @@
 规范原文（§18 阶段 1 交付证据）："八题型真实模型求解覆盖、实际方法正文输入；
 **至少一条真实 crop→下一模型请求→下一程序→答案链**；S0 冻结记录。"
 
-本脚本跑**真实**链路（真实 vLLM endpoint + 真实视频帧 + 真实重建 artifact）：
+本脚本跑**真实**链路（百炼 qwen3.8-flash + 真实视频帧 + 真实重建 artifact）：
 
 1. 取一条真实 episode（真实 VSI-Bench video + 复用既有 VGGT artifact）；
 2. 第 1 轮：程序调用 `inspect_frames` 裁剪真实像素 → `YieldObservations` 让出；
@@ -22,7 +22,7 @@
 用法：
   EXP=/home/cvailab/anaconda3/envs/skill3d-exp/bin/python
   PYTHONPATH=src $EXP scripts/run_active_vision_acceptance.py \
-      --endpoint http://127.0.0.1:8100 --qa-id 2487 --model-rounds scripted-first
+      --qa-id 2487 --model-rounds scripted-first
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def _n_images(messages) -> int:
 
 
 class ScriptedFirstClient:
-    """第 1 轮返回固定程序，之后**全部转真实** VLLMClient（含图像的真实请求）。"""
+    """第 1 轮返回固定程序，之后全部转真实百炼客户端。"""
 
     def __init__(self, real_client, first_program: str = SCRIPTED_FIRST_PROGRAM) -> None:
         self._real = real_client
@@ -127,8 +127,7 @@ class ScriptedFirstClient:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--endpoint", default="http://127.0.0.1:8100")
-    ap.add_argument("--model", default="qwen3vl-8b-r0")
+    ap.add_argument("--config", default="configs/config.yaml")
     ap.add_argument("--qa-id", default="2487", help="VSI-Bench meta 的题目 id")
     ap.add_argument("--artifact", default="data/reconstructions/vggt/7b6477cb95.json")
     ap.add_argument("--model-rounds", choices=["real", "scripted-first"],
@@ -141,17 +140,30 @@ def main(argv: list[str] | None = None) -> int:
 
     from skill3d.adapters import vsibench_loader as vl
     from skill3d.adapters.episode_source import load_vsi_bench_items
-    from skill3d.online.config import load_config, paths_from
-    from skill3d.online.runner import OnlineRunConfig, run_episode
-    from skill3d.synthesis.vllm_client import VLLMClient, probe_service
+    from skill3d.online.config import load_config, online_model_from, paths_from
+    from skill3d.online.runner import OnlineRunConfig, _make_online_client, run_episode
 
-    cfg_yaml = load_config(REPO / "configs/config.yaml")
+    cfg_yaml = load_config(REPO / args.config)
     paths = paths_from(cfg_yaml)
+    model = online_model_from(cfg_yaml)
 
-    # §15.2 preflight：服务必须真的在（不在就明确报错，不静默降级）
-    probe = probe_service(args.endpoint, args.model)
-    print(f"[preflight] {json.dumps(probe, ensure_ascii=False)}")
-    if not probe.get("healthy"):
+    # §15.2 preflight：凭据必须可用（缺失就明确报错，不静默降级）。
+    probe_cfg = OnlineRunConfig(
+        online_model_enabled=model.enabled,
+        online_model_provider=model.provider,
+        online_model=model.model,
+        online_model_revision=model.model_revision,
+        online_base_url=model.base_url,
+        online_api_key_env=model.api_key_env,
+        online_timeout_s=model.timeout_s,
+        max_tokens=model.max_tokens,
+        temperature=model.temperature,
+    )
+    real = _make_online_client(probe_cfg)
+    probe = real.check_service() if real is not None else (
+        False, f"{model.api_key_env} is not configured")
+    print(f"[preflight] ready={probe[0]} reason={probe[1]}")
+    if not probe[0]:
         print("[错误] 模型服务不可用：§18 阶段 1 的证据不能由 mock 代替", file=sys.stderr)
         return 2
 
@@ -181,15 +193,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_video:
         return 0
 
-    real = VLLMClient([args.endpoint], args.model)
     client = real if args.model_rounds == "real" else ScriptedFirstClient(real)
     cfg = OnlineRunConfig(
-        mode="real", vllm_endpoints=[args.endpoint], vllm_model=args.model,
+        mode="real",
+        online_model_enabled=model.enabled,
+        online_model_provider=model.provider,
+        online_model=model.model,
+        online_model_revision=model.model_revision,
+        online_base_url=model.base_url,
+        online_api_key_env=model.api_key_env,
+        online_timeout_s=model.timeout_s,
+        semantic_min_pixels=model.audit_min_pixels,
+        semantic_max_pixels=model.audit_max_pixels,
+        semantic_relation_batch_size=model.relation_batch_size,
         reuse_artifact=str(REPO / args.artifact) if args.artifact else None,
         seed=0, trace_dir=str(REPO / "data/traces_real"),
-        max_images=int((cfg_yaml.get("vllm") or {}).get("n_frames", 32) or 32),
-        max_pixels=int((cfg_yaml.get("vllm") or {}).get("max_pixels", 131072) or 131072),
-        max_model_len=int((cfg_yaml.get("vllm") or {}).get("max_model_len", 32768) or 32768),
+        max_images=model.n_frames,
+        max_pixels=model.max_pixels,
+        max_model_len=model.max_model_len,
+        max_tokens=model.max_tokens,
+        temperature=model.temperature,
         active_snapshot_ref="S0-seed-20260925-v1",
     )
     out = run_episode(item.episode, item.pixels, cfg, llm=client)
@@ -210,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         "honesty_note": ("第 1 轮由脚本程序触发（未发真实请求）→ 该轮交付/观察标记已撤回；"
                          "第 2 轮起的请求、图像与程序均为真实"
                          if scripted else "全部轮次均由真实模型生成"),
-        "endpoint": args.endpoint, "model": args.model,
+        "provider": model.provider, "model": model.model,
         "final_state": out.final_state, "answer": out.answer,
         "ground_truth": row.get("ground_truth"),
         "correct": out.correct, "mra_value": out.mra_value,

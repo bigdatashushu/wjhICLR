@@ -87,21 +87,7 @@ _FALLBACK: dict[str, Any] = {
         "config_version": "ret-v11-deterministic-1",
         "method_context_max_chars": 8000,
     },
-    "vllm": {
-        "model": "Qwen/Qwen3-VL-8B-Instruct-FP8",
-        "quantization": "none",
-        "max_model_len": 32768,
-        "gpu_memory_utilization": 0.90,
-        "n_frames": 32,
-        "max_pixels": 131072,
-        "tensor_parallel_size": 1,
-        "dp_world_size": 8,
-        "base_port": 8100,
-        "temperature": 0.0,
-        "max_tokens": 8192,
-        "endpoints": [],
-    },
-    "m5_model": {
+    "online_model": {
         "enabled": True,
         "provider": "bailian",
         "model": "qwen3.8-flash",
@@ -110,9 +96,12 @@ _FALLBACK: dict[str, Any] = {
         "api_key_env": "DASHSCOPE_API_KEY",
         "timeout_s": 180.0,
         "temperature": 0.0,
-        "max_tokens": 2048,
-        "min_pixels": 65536,
-        "max_pixels": 1048576,
+        "max_tokens": 8192,
+        "max_model_len": 32768,
+        "n_frames": 32,
+        "max_pixels": 131072,
+        "audit_min_pixels": 65536,
+        "audit_max_pixels": 1048576,
         "relation_batch_size": 32,
     },
     "sandbox": {
@@ -149,7 +138,7 @@ def load_config(path: Optional[str | Path] = None) -> dict:
         raise ValueError(f"Unknown runtime configuration fields: {sorted(unknown)}")
     cfg = RuntimeConfig(_deep_merge(deepcopy(_FALLBACK), loaded),
                         path=cfg_path, sources={})
-    for section in ("paths", "frame_sampling", "vllm", "m5_model",
+    for section in ("paths", "frame_sampling", "online_model",
                     "sandbox", "active_vision", "retrieval"):
         if not isinstance(cfg[section], dict):
             raise ValueError(f"{section} must be a mapping")
@@ -169,8 +158,7 @@ def load_config(path: Optional[str | Path] = None) -> dict:
     if not isinstance(cfg["split_config"], str) or not cfg["split_config"]:
         raise ValueError("split_config must be a non-empty path")
     cfg["split_config"] = str(resolve_path(cfg["split_config"]))
-    cfg["vllm"] = asdict(vllm_from(cfg))
-    cfg["m5_model"] = asdict(m5_model_from(cfg))
+    cfg["online_model"] = asdict(online_model_from(cfg))
     sandbox_from(cfg)
     active_vision_from(cfg)
     resolve_runtime(cfg)
@@ -235,64 +223,8 @@ def _settings(kind, data: Any, section: str):
 
 
 @dataclass
-class VLLMSettings:
-    """§4 M8：本地 vLLM（DP×8，不 TP）。endpoints 为空 = 未配置。"""
-
-    model: str = "Qwen/Qwen3-VL-8B-Instruct"
-    quantization: str = "awq"
-    max_model_len: int = 32768
-    gpu_memory_utilization: float = 0.92
-    tensor_parallel_size: int = 1
-    dp_world_size: int = 8
-    base_port: int = 8100
-    temperature: float = 0.0
-    max_tokens: int = 8192
-    # 32 帧输入与单帧像素上限（§1.2 / §4 M1；实测 32 帧 @131072 → ~9703 prompt tokens）
-    n_frames: int = 32
-    max_pixels: int = 131072
-    endpoints: list[str] = field(default_factory=list)
-
-    def __post_init__(self):
-        for name in ("max_model_len", "max_tokens", "n_frames", "max_pixels",
-                     "tensor_parallel_size", "dp_world_size", "base_port"):
-            _integer(getattr(self, name), f"vllm.{name}")
-        if self.base_port > 65535:
-            raise ValueError("vllm.base_port must be <= 65535")
-        if self.max_tokens >= self.max_model_len:
-            raise ValueError("vllm.max_tokens must leave a positive input context budget")
-        for name, low, high in (("temperature", 0, 2), ("gpu_memory_utilization", 0, 1)):
-            value = getattr(self, name)
-            if (type(value) not in (int, float) or not math.isfinite(value)
-                    or not low <= value <= high
-                    or (name == "gpu_memory_utilization" and value == 0)):
-                raise ValueError(f"vllm.{name} is outside its valid range")
-        if not isinstance(self.model, str) or not self.model:
-            raise ValueError("vllm.model must be non-empty")
-        if not isinstance(self.quantization, str) or not self.quantization:
-            raise ValueError("vllm.quantization must be non-empty")
-        if not isinstance(self.endpoints, list):
-            raise ValueError("vllm.endpoints must be a list of URLs")
-        for endpoint in self.endpoints:
-            if not isinstance(endpoint, str):
-                raise ValueError("vllm.endpoints must contain URLs")
-            parsed = urlsplit(endpoint)
-            if parsed.scheme not in ("http", "https") or not parsed.hostname:
-                raise ValueError(f"Invalid vLLM endpoint: {endpoint}")
-            if parsed.username or parsed.password:
-                raise ValueError("vLLM endpoint credentials must not be embedded in URLs")
-            try:
-                parsed.port
-            except ValueError as exc:
-                raise ValueError("Invalid vLLM endpoint port") from exc
-
-    @property
-    def configured(self) -> bool:
-        return bool(self.endpoints)
-
-
-@dataclass
-class M5ModelSettings:
-    """Independent cloud model used only for M5 parsing and mask semantics."""
+class OnlineModelSettings:
+    """Shared Bailian model for M5 parsing/audit, M8 synthesis and visual fallback."""
 
     enabled: bool = True
     provider: str = "bailian"
@@ -302,37 +234,47 @@ class M5ModelSettings:
     api_key_env: str = "DASHSCOPE_API_KEY"
     timeout_s: float = 180.0
     temperature: float = 0.0
-    max_tokens: int = 2048
-    min_pixels: int = 65536
-    max_pixels: int = 1048576
+    max_tokens: int = 8192
+    max_model_len: int = 32768
+    n_frames: int = 32
+    max_pixels: int = 131072
+    audit_min_pixels: int = 65536
+    audit_max_pixels: int = 1048576
     relation_batch_size: int = 32
 
     def __post_init__(self):
         if not isinstance(self.enabled, bool):
-            raise ValueError("m5_model.enabled must be boolean")
+            raise ValueError("online_model.enabled must be boolean")
         if self.provider != "bailian":
-            raise ValueError("m5_model.provider must be bailian")
+            raise ValueError("online_model.provider must be bailian")
         for name in ("model", "base_url", "api_key_env"):
             if not isinstance(getattr(self, name), str) or not getattr(self, name):
-                raise ValueError(f"m5_model.{name} must be non-empty")
+                raise ValueError(f"online_model.{name} must be non-empty")
+        if not isinstance(self.model_revision, str):
+            raise ValueError("online_model.model_revision must be a string")
         parsed = urlsplit(self.base_url)
         if parsed.scheme != "https" or not parsed.hostname:
-            raise ValueError("m5_model.base_url must be an HTTPS URL")
+            raise ValueError("online_model.base_url must be an HTTPS URL")
         if parsed.username or parsed.password:
-            raise ValueError("m5_model.base_url must not contain credentials")
+            raise ValueError("online_model.base_url must not contain credentials")
         if not self.base_url.rstrip("/").endswith("/v1"):
-            raise ValueError("m5_model.base_url must end with /v1")
-        for name in ("max_tokens", "min_pixels", "max_pixels", "relation_batch_size"):
-            _integer(getattr(self, name), f"m5_model.{name}")
-        if self.min_pixels > self.max_pixels:
-            raise ValueError("m5_model.min_pixels must not exceed max_pixels")
+            raise ValueError("online_model.base_url must end with /v1")
+        for name in ("max_tokens", "max_model_len", "n_frames", "max_pixels",
+                     "audit_min_pixels", "audit_max_pixels", "relation_batch_size"):
+            _integer(getattr(self, name), f"online_model.{name}")
+        if self.max_tokens >= self.max_model_len:
+            raise ValueError(
+                "online_model.max_tokens must leave a positive input context budget")
+        if self.audit_min_pixels > self.audit_max_pixels:
+            raise ValueError(
+                "online_model.audit_min_pixels must not exceed audit_max_pixels")
         if (type(self.timeout_s) not in (int, float) or self.timeout_s <= 0
                 or not math.isfinite(self.timeout_s)):
-            raise ValueError("m5_model.timeout_s must be positive and finite")
+            raise ValueError("online_model.timeout_s must be positive and finite")
         if (type(self.temperature) not in (int, float)
                 or not 0 <= self.temperature < 2
                 or not math.isfinite(self.temperature)):
-            raise ValueError("m5_model.temperature is outside its valid range")
+            raise ValueError("online_model.temperature is outside its valid range")
 
 
 @dataclass
@@ -374,16 +316,12 @@ def paths_from(cfg: dict) -> PathSettings:
     return settings
 
 
-def vllm_from(cfg: dict) -> VLLMSettings:
-    return _settings(VLLMSettings, cfg.get("vllm", {}), "vllm")
+def online_model_from(cfg: dict) -> OnlineModelSettings:
+    return _settings(OnlineModelSettings, cfg.get("online_model", {}), "online_model")
 
 
-def m5_model_from(cfg: dict) -> M5ModelSettings:
-    return _settings(M5ModelSettings, cfg.get("m5_model", {}), "m5_model")
-
-
-def resolve_runtime(cfg: dict, *, seed=None, n_frames=None, endpoints=None,
-                    model=None, formal: bool = False) -> dict:
+def resolve_runtime(cfg: dict, *, seed=None, n_frames=None,
+                    formal: bool = False) -> dict:
     """M1 precedence: explicit CLI overrides YAML/default; preserve 0 and []."""
     sources = getattr(cfg, "sources", {})
     if seed is not None:
@@ -399,13 +337,7 @@ def resolve_runtime(cfg: dict, *, seed=None, n_frames=None, endpoints=None,
     _integer(sampling["n_frames"], "frame_sampling.n_frames")
     if sampling.get("strategy", "uniform") != "uniform":
         raise ValueError("frame_sampling.strategy must be uniform")
-    if endpoints is not None:
-        cfg["vllm"]["endpoints"] = endpoints
-        sources["vllm.endpoints"] = "cli"
-    if model is not None:
-        cfg["vllm"]["model"] = model
-        sources["vllm.model"] = "cli"
-    settings = vllm_from(cfg)
+    settings = online_model_from(cfg)
     if sampling["n_frames"] > settings.n_frames:
         raise ValueError("Input frame count exceeds the configured model image capacity")
     if formal and (sampling["n_frames"] != 32 or settings.n_frames < 32):

@@ -1,8 +1,6 @@
 """M4: distinguish output loops and failed programs from useful evidence updates."""
 
-import itertools
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import pytest
 
@@ -13,8 +11,6 @@ from skill3d.schemas import ToolResult
 from skill3d.synthesis.program_assembler import (
     executable_ast_fingerprint, streaming_degenerate_reason,
 )
-from skill3d.synthesis.request_context import request_phase
-from skill3d.synthesis.vllm_client import VLLMClient
 
 
 def test_ast_identity_ignores_only_comments_formatting_and_docstrings():
@@ -81,79 +77,3 @@ def test_transient_service_failure_is_not_a_deterministic_program_loop():
     assert not deterministic_cell_failure(cell, [timeout])
     cell.error_code = "timeout"
     assert not deterministic_cell_failure(cell, [])
-
-
-class _Stream:
-    def __init__(self, texts, usage=None):
-        self.texts, self.usage = texts, usage
-        self.closed, self.consumed = False, 0
-
-    def __iter__(self):
-        for text in self.texts:
-            self.consumed += 1
-            yield SimpleNamespace(choices=[SimpleNamespace(
-                delta=SimpleNamespace(content=text), finish_reason=None)], usage=None)
-        if self.usage is not None:
-            yield SimpleNamespace(choices=[], usage=self.usage)
-
-    def close(self):
-        self.closed = True
-
-
-def _client(stream):
-    sdk = Mock()
-    sdk.chat.completions.create.return_value = stream
-    client = VLLMClient.__new__(VLLMClient)
-    client._clients, client._rr, client.model = [sdk], itertools.cycle([0]), "fixture"
-    client.temperature, client.max_output_tokens = 0.0, 8192
-    return client, sdk
-
-
-def test_degenerate_stream_is_closed_without_second_request_or_fake_usage():
-    stream = _Stream(["# The available images do not establish a reliable metric answer.\n"] * 250)
-    client, sdk = _client(stream)
-    with request_phase("program"):
-        text = client.chat([], max_tokens=8192, seed=137)
-    assert stream.closed and stream.consumed < 250
-    assert text and len(text.splitlines()) == stream.consumed
-    assert client.last_generation["stop_reason"] == "degenerate_repetition"
-    assert client.last_generation["usage_status"] == "unknown"
-    assert client.last_usage == {}
-    assert sdk.chat.completions.create.call_count == 1
-    kwargs = sdk.chat.completions.create.call_args.kwargs
-    assert kwargs["stream"] is True and kwargs["seed"] == 137
-    assert kwargs["max_tokens"] == 8192
-
-
-def test_successful_stream_keeps_real_usage_and_complete_code():
-    usage = {"prompt_tokens": 200, "completion_tokens": 11, "total_tokens": 211}
-    stream = _Stream(["Return", "Answer('3')\n"], usage)
-    client, sdk = _client(stream)
-    with request_phase("program"):
-        assert client.chat([]) == "ReturnAnswer('3')\n"
-    assert stream.closed and sdk.chat.completions.create.call_count == 1
-    assert client.last_usage == usage
-    assert client.last_generation["usage_status"] == "measured"
-    assert sdk.chat.completions.create.call_args.kwargs["max_tokens"] == 8192
-
-
-def test_nonstream_response_is_audited_without_retrying_request():
-    response = SimpleNamespace(choices=[SimpleNamespace(
-        message=SimpleNamespace(content="ReturnAnswer('3')\n"))], usage=None)
-    client, sdk = _client(response)
-    with request_phase("program"):
-        assert client.chat([]) == "ReturnAnswer('3')\n"
-    assert client.last_generation["mode"] == "nonstream_response"
-    assert sdk.chat.completions.create.call_count == 1
-
-
-def test_known_nonstream_service_uses_post_generation_path_once():
-    response = SimpleNamespace(choices=[SimpleNamespace(
-        message=SimpleNamespace(content="ReturnAnswer('3')\n"))], usage=None)
-    client, sdk = _client(response)
-    client.program_streaming = False
-    with request_phase("program"):
-        assert client.chat([]) == "ReturnAnswer('3')\n"
-    assert client.last_generation["mode"] == "nonstream"
-    assert "stream" not in sdk.chat.completions.create.call_args.kwargs
-    assert sdk.chat.completions.create.call_count == 1

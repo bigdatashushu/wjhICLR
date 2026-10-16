@@ -1,8 +1,8 @@
-"""M20 8×RTX 4090 DP 逻辑分配。
+"""M20 多 GPU 几何任务逻辑分配。
 
 - 阶段串行由实验驱动器负责，本模块只分配 GPU；
-- DP×8：每卡一个 vLLM 副本（--tensor-parallel-size 1），dp_partition 均匀切分；
-- 卡故障：剔除该卡继续 DP×7；
+- 多卡重建任务由 dp_partition 均匀切分；
+- 卡故障：剔除该卡后继续；
 - paired A/B 同 episode 固定同 gpu_rank（硬约束 18 配套）。
 """
 
@@ -33,7 +33,7 @@ class GPUScheduler:
         self._rr %= len(self.active_gpus)
 
     # ---------- 分配 ----------
-    def assign(self, paired_unit_id: str, role: str = "vllm") -> GPUJob:
+    def assign(self, paired_unit_id: str, role: str = "reconstruct") -> GPUJob:
         """分配实验单元：同一 paired_unit_id 永远固定同一 gpu_rank。"""
         if paired_unit_id in self._paired_pin:
             rank = self._paired_pin[paired_unit_id]

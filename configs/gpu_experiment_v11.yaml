@@ -7,17 +7,12 @@ code:
 environment:
   python: "3.11"
   min_free_disk_gib: 80
-  min_gpu_count: 2
+  min_gpu_count: 1
   min_gpu_memory_gib: 20
-  vllm_version: "0.19.1"
   sam2_code_revision: 2b90b9f5ceec907a1c18123530e92e794ad901a4
   moge_code_revision: 74fbce054ebed49800de42d0ad0e83495065719a
 
 weights:
-  qwen:
-    repo_id: Qwen/Qwen3-VL-8B-Instruct-FP8
-    revision: 9cdc6310a8cb770ce18efaf4e9935334512aee45
-    existing_path: /home/cvailab/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct-FP8
   vggt:
     repo_id: facebook/VGGT-1B
     revision: 860abec7937da0a4c03c41d3c269c366e82abdf9
@@ -35,17 +30,11 @@ weights:
     existing_path: ${MOGE2_EXISTING_PATH:-}
 
 runtime:
-  qwen_gpu: 0
   geometry_gpu: 1
-  host: 127.0.0.1
-  port: 8100
-  served_model_name: qwen3vl-v11
   max_model_len: 32768
   max_tokens: 8192
-  gpu_memory_utilization: 0.90
   max_pixels: 131072
   n_images: 32
-  startup_timeout_s: 900
 
 experiment:
   # Formal mode never manufactures these prerequisites. The launcher fails if

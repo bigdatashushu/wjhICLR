@@ -219,7 +219,7 @@ def gpu_snapshot():
     return {"time": time.time(), "gpus": gpus, "processes": processes}
 
 
-def select_gpus(before, after, preferred=(2, 3, 4)):
+def select_gpus(before, after, preferred=(3, 4)):
     def free(snapshot):
         busy = {p["gpu_uuid"] for p in snapshot["processes"]}
         return {g["index"]: g for g in snapshot["gpus"]
@@ -227,10 +227,10 @@ def select_gpus(before, after, preferred=(2, 3, 4)):
     a, b = free(before), free(after)
     available = {i: b[i] for i in set(a) & set(b) if a[i]["uuid"] == b[i]["uuid"]}
     roles, used = {}, set()
-    for role, candidate in zip(("qwen", "geometry", "detector"), preferred):
+    for role, candidate in zip(("geometry", "detector"), preferred):
         options = ([candidate] if candidate in available else []) + sorted(available)
         idx = next((i for i in options if i not in used), None)
-        require(idx is not None, "waiting for three unused GPUs with at least 20 GiB each")
+        require(idx is not None, "waiting for two unused GPUs with at least 20 GiB each")
         roles[role] = available[idx]
         used.add(idx)
     return roles
@@ -417,7 +417,8 @@ def freeze_inputs(root, rows, archive, raw_cfg):
 
 def runtime_cfg(path, seed):
     from skill3d.online.config import (load_config, resolve_runtime, sandbox_from,
-                                      active_vision_from, retrieval_policy_from)
+                                      active_vision_from, retrieval_policy_from,
+                                      online_model_from)
     from skill3d.online.runner import OnlineRunConfig
     import yaml
     envelope = yaml.safe_load(Path(path).read_text())
@@ -428,12 +429,23 @@ def runtime_cfg(path, seed):
     else:
         online_path.write_text(yaml.safe_dump(envelope, sort_keys=False))
     raw = resolve_runtime(load_config(online_path), seed=seed, formal=False)
-    vision, sandbox, model = active_vision_from(raw), sandbox_from(raw), raw["vllm"]
+    vision, sandbox = active_vision_from(raw), sandbox_from(raw)
+    model = online_model_from(raw)
     cfg = OnlineRunConfig(
-        mode="real", seed=seed, vllm_endpoints=model["endpoints"], vllm_model=model["model"],
-        max_images=model["n_frames"], max_pixels=model["max_pixels"],
-        max_model_len=model["max_model_len"], max_tokens=model["max_tokens"],
-        temperature=model["temperature"], cell_timeout_s=sandbox.cell_timeout_s,
+        mode="real", seed=seed,
+        online_model_enabled=model.enabled,
+        online_model_provider=model.provider,
+        online_model=model.model,
+        online_model_revision=model.model_revision,
+        online_base_url=model.base_url,
+        online_api_key_env=model.api_key_env,
+        online_timeout_s=model.timeout_s,
+        semantic_min_pixels=model.audit_min_pixels,
+        semantic_max_pixels=model.audit_max_pixels,
+        semantic_relation_batch_size=model.relation_batch_size,
+        max_images=model.n_frames, max_pixels=model.max_pixels,
+        max_model_len=model.max_model_len, max_tokens=model.max_tokens,
+        temperature=model.temperature, cell_timeout_s=sandbox.cell_timeout_s,
         max_regen=sandbox.max_regenerate, max_solver_rounds=raw["max_solver_rounds"],
         max_retries_per_operation=raw["max_retries_per_operation"],
         finalization_rounds=raw["finalization_rounds"], eval_visual_fallback=raw["eval_visual_fallback"],
@@ -445,7 +457,7 @@ def runtime_cfg(path, seed):
              cfg.temperature, cfg.max_solver_rounds, cfg.max_retries_per_operation,
              cfg.finalization_rounds) == (32, 131072, 32768, 8192, 0, 6, 3, 1),
             "full experiment budget changed")
-    require(len(cfg.vllm_endpoints) == 1 and cfg.eval_visual_fallback
+    require(cfg.online_model == "qwen3.8-flash" and cfg.eval_visual_fallback
             and not cfg.allow_final_test, "full experiment endpoint/fallback/split changed")
     raw["experiment"] = extension
     return cfg, raw
@@ -506,7 +518,8 @@ def freeze_runtime_identity(args):
     from skill3d.evaluation import skill_ablation_v11 as ab
     root, manifest = verify_run(args)
     code = Path(__file__).resolve().parents[1]
-    settings = yaml.safe_load(Path(args.config).read_text())["experiment"]["full_services"]
+    raw = yaml.safe_load(Path(args.config).read_text())
+    settings = raw["experiment"]["full_services"]
     weights = read(settings["weights_manifest"])
     verified = []
     for name, model in weights["models"].items():
@@ -517,9 +530,15 @@ def freeze_runtime_identity(args):
             verified.append({"model": name, "path": str(path), **record})
     detector = weights["detector"]
     require(file_hash(detector["path"]) == detector["sha256"], "detector weight changed")
-    qwen = weights["models"]["qwen"]
-    model_id = {k: qwen[k] for k in ("repo_id", "revision")}
-    model_id["files"] = [{k: r[k] for k in ("path", "size", "sha256")} for r in qwen["files"]]
+    online = raw["online_model"]
+    require(online["provider"] == "bailian" and online["model"] == "qwen3.8-flash",
+            "full experiment requires Bailian qwen3.8-flash")
+    model_id = {
+        "provider": online["provider"],
+        "model": online["model"],
+        "model_revision": online.get("model_revision", ""),
+        "endpoint_sha256": digest(str(online["base_url"]).rstrip("/")),
+    }
     model_sha = digest(model_id)
     environment = {
         "python": sys.executable, "version": sys.version,
@@ -1002,42 +1021,39 @@ def monitor(root, stop):
 
 
 def start_services(args):
-    """Commands/weights are explicit configuration; never attach to an unrelated service."""
+    """Start the owned detector; qwen3.8-flash is provided by Bailian."""
     import yaml
     import psutil
     root, manifest = verify_run(args)
     raw = yaml.safe_load(Path(args.config).read_text())
     settings = raw["experiment"]["full_services"]
-    require(raw["vllm"]["endpoints"] == [f"http://127.0.0.1:{args.qwen_port}"],
-            "config endpoint differs from requested Qwen port")
+    require(raw["online_model"]["model"] == "qwen3.8-flash",
+            "config online model differs from qwen3.8-flash")
+    require(os.environ.get("DASHSCOPE_API_KEY", "").strip(),
+            "DASHSCOPE_API_KEY is required")
     while True:
         before = gpu_snapshot()
         time.sleep(5)
         after = gpu_snapshot()
         write(root / "gpu_checks" / (str(time.time_ns()) + ".json"), {"before": before, "after": after})
         try:
-            roles = select_gpus(before, after, (args.qwen_gpu, args.geometry_gpu, args.detector_gpu))
+            roles = select_gpus(before, after, (args.geometry_gpu, args.detector_gpu))
             break
         except FullExperimentError as exc:
             write(root / "waiting.json", {"status": "waiting_for_gpus", "reason": str(exc)})
             print(str(exc), flush=True)
             time.sleep(55)
-    require(port_available(args.qwen_port) and port_available(args.detector_port), "requested service port busy")
+    require(port_available(args.detector_port), "requested detector port busy")
     require(select_gpus(after, gpu_snapshot(), tuple(r["index"] for r in roles.values())) == roles,
             "GPU allocation changed before startup")
     env = dict(os.environ, HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
                PYTHONDONTWRITEBYTECODE="1", TOKENIZERS_PARALLELISM="false")
-    qcommand = list(settings["qwen_command"])
-    for flag, value in (("--port", args.qwen_port), ("--max-model-len", 32768),
-                        ("--tensor-parallel-size", 1)):
-        require(flag in qcommand, f"Qwen command lacks {flag}")
-        qcommand[qcommand.index(flag) + 1] = str(value)
     dcommand = [settings["detector_python"], str(Path(__file__).with_name("serve_groundingdino.py")),
                 "--gpu", str(roles["detector"]["index"]), "--port", str(args.detector_port),
                 "--checkpoint-path", settings["detector_checkpoint"],
                 "--log-dir", str(root / "services/detector")]
     processes = {}
-    for role, command in (("qwen", qcommand), ("detector", dcommand)):
+    for role, command in (("detector", dcommand),):
         log = root / "services" / (role + ".log")
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open("ab") as stream:
@@ -1052,8 +1068,7 @@ def start_services(args):
     os.environ["SKILL3D_DETECTOR_RECEIPT"] = str(
         root / "services/detector/groundingdino_startup.json")
     deadline = time.monotonic() + 900
-    urls = [f"http://127.0.0.1:{args.qwen_port}/health",
-            f"http://127.0.0.1:{args.detector_port}/health"]
+    urls = [f"http://127.0.0.1:{args.detector_port}/health"]
     while time.monotonic() < deadline:
         require(all(psutil.Process(p["pid"]).is_running() for p in processes.values()),
                 "new service exited; inspect retained log")
@@ -1095,10 +1110,8 @@ def parser():
     p.add_argument("--sampling-seed", type=int, default=137)
     p.add_argument("--per-task", type=int, default=24)
     p.add_argument("--seeds", type=lambda s: [int(x) for x in s.split(",")], default=[137, 138])
-    p.add_argument("--qwen-gpu", type=int, default=2)
     p.add_argument("--geometry-gpu", type=int, default=3)
     p.add_argument("--detector-gpu", type=int, default=4)
-    p.add_argument("--qwen-port", type=int, default=18110)
     p.add_argument("--detector-port", type=int, default=20024)
     return p
 

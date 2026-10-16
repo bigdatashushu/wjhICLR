@@ -84,14 +84,14 @@ def sam2_runtime_identity() -> dict[str, str]:
 def inference_env_versions() -> dict:
     """推理环境版本记录（§16.4：所有主结果必须记录推理环境）。
 
-    取 vLLM / torch / transformers 版本；未安装记 "absent"（不虚构版本号）。
+    取 torch / transformers 等本地推理依赖版本；未安装记 "absent"（不虚构版本号）。
     v9 §17.1：numpy/scipy 同属"环境依赖" —— 它们的版本组合决定 M4 主门与距离
     原语是否真的可用，只记模型框架会漏掉这一层。
     """
     import importlib
 
     out: dict = {}
-    for mod in ("vllm", "torch", "transformers", "sam2", "pycolmap"):
+    for mod in ("torch", "transformers", "sam2", "pycolmap"):
         try:
             m = importlib.import_module(mod)
             out[mod] = str(getattr(m, "__version__", "unknown"))

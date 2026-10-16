@@ -437,7 +437,7 @@ def test_campaign_adapter_revalidates_cached_panel_and_summary(panel, tmp_path, 
     kwargs = dict(
         campaign_id="campaign", parent=parent, candidate=candidate,
         experience=SimpleNamespace(parent_snapshot_id="parent-test", cases=[]),
-        question_type=parent.question_type, seed=137, model_id=cfg.vllm_model,
+        question_type=parent.question_type, seed=137, model_id=cfg.online_model,
         model_config_sha256=adapters.model_config_identity_v11(cfg)["sha256"],
         quality_contract_sha256=ab.quality_contract()["sha256"],
         solver_config_sha256=adapters.solver_config_identity_v11(cfg, seed=137)["sha256"])
@@ -609,7 +609,7 @@ def test_service_failure_is_incomplete_and_never_fabricates_score(panel, tmp_pat
         assert pairs[0]["arms"][arm]["score"] is None
         assert pairs[0]["arms"][arm]["service_errors"]
         if failed_arm != "prepare":
-            assert pairs[0]["arms"][arm]["failure_code"] == "vllm_service_error"
+            assert pairs[0]["arms"][arm]["failure_code"] == "online_model_service_error"
             assert pairs[0]["arms"][arm]["terminal_failure"]["stage"] == "M8"
     assert pairs[0]["delta"] is None
     assert result["groups"]["all"]["B11_minus_B01"]["Accuracy"] is None
@@ -745,7 +745,7 @@ def test_detector_transport_attempts_reach_pair_and_online_trace(panel, tmp_path
 def test_synthesis_service_error_keeps_specific_terminal_reason(panel, tmp_path):
     _, pairs, _, _ = run(panel, tmp_path, programs={"B01": [ConnectionError("unavailable")]})
     row = pairs[0]["arms"]["B01"]
-    assert row["failure_code"] == "vllm_service_error"
+    assert row["failure_code"] == "online_model_service_error"
     assert row["terminal_failure"]["stage"] == "M8"
     assert row["terminal_failure"]["termination_reason"] == "synthesis_unavailable"
     assert row["score"] is None
@@ -761,19 +761,21 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
     cli = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cli)
     item, artifact, _ = panel
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-only")
     mapping = tmp_path / "artifacts.json"
     mapping.write_text(json.dumps({item.episode.qa_id: str(artifact)}))
     monkeypatch.setattr(cli, "load_jsonl_items", lambda *a, **k: [item])
-    monkeypatch.setattr(ab.runner, "_make_m5_client",
-                        lambda cfg: FakeClient(["{}\n"]))
-    monkeypatch.setattr(ab.runner, "_make_vllm_client",
-                        lambda cfg: FakeClient(['ReturnAnswer("A")\n']))
+    clients = iter([
+        FakeClient(["{}\n"]),
+        FakeClient(['ReturnAnswer("A")\n']),
+        FakeClient(['ReturnAnswer("A")\n']),
+    ])
+    monkeypatch.setattr(ab.runner, "_make_online_client", lambda cfg: next(clients))
     config = ROOT / "configs/config.yaml"
     output = tmp_path / "cli-result"
     assert cli.main([
         "--source", "jsonl", "--episodes-jsonl", "injected.jsonl",
-        "--artifacts-json", str(mapping), "--config", str(config),
-        "--vllm-endpoint", "http://fake", "--seed", "137",
+        "--artifacts-json", str(mapping), "--config", str(config), "--seed", "137",
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
@@ -872,11 +874,11 @@ def test_confirmed_contract_with_low_geometry_is_formal_eligible(panel, tmp_path
     artifact.write_text(art.model_dump_json())
     assert art.quality.main_gate_passed is False
     monkeypatch.setenv("SKILL3D_RUN_MODE", "formal")
-    monkeypatch.setattr(ab.runner, "_make_m5_client",
-                        lambda cfg: FakeClient(["{}\n"]))
-    monkeypatch.setattr(ab.runner, "_make_vllm_client", lambda cfg: FakeClient([
-        'ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
-        'used_result_ids=[], derivation=None))\n']))
+    answer = ('ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
+              'used_result_ids=[], derivation=None))\n')
+    clients = iter([
+        FakeClient(["{}\n"]), FakeClient([answer]), FakeClient([answer])])
+    monkeypatch.setattr(ab.runner, "_make_online_client", lambda cfg: next(clients))
     result = ab.run_skill_ablation_v11(
         [item], artifact_paths={item.episode.qa_id: artifact},
         output_dir=tmp_path / "formal-low-quality",
@@ -895,11 +897,11 @@ def test_development_run_cannot_gain_formal_eligibility(panel, tmp_path, monkeyp
     monkeypatch.setenv("SKILL3D_RUN_MODE", "development")
     monkeypatch.setenv("SKILL3D_MODEL_WEIGHTS_SHA256", "a" * 64)
     monkeypatch.setenv("SKILL3D_ENVIRONMENT_SHA256", "b" * 64)
-    monkeypatch.setattr(ab.runner, "_make_m5_client",
-                        lambda _cfg: FakeClient(["{}\n"]))
-    monkeypatch.setattr(ab.runner, "_make_vllm_client", lambda _cfg: FakeClient([
-        'ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
-        'used_result_ids=[], derivation=None))\n']))
+    answer = ('ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
+              'used_result_ids=[], derivation=None))\n')
+    clients = iter([
+        FakeClient(["{}\n"]), FakeClient([answer]), FakeClient([answer])])
+    monkeypatch.setattr(ab.runner, "_make_online_client", lambda _cfg: next(clients))
     item, artifact, _ = panel
     result = ab.run_skill_ablation_v11(
         [item], artifact_paths={item.episode.qa_id: artifact},

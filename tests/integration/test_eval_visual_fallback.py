@@ -10,7 +10,7 @@ from skill3d.evaluation import skill_ablation_v11 as ab
 from skill3d.online import runner
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.synthesis.request_context import current_request_phase
-from skill3d.synthesis.vllm_client import ServiceUnavailable
+from skill3d.synthesis.client_errors import ServiceUnavailable
 from skill3d.trace.store import TraceStore
 
 from test_tool_contract_recovery import _write_v6_artifact

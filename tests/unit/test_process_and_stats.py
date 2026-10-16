@@ -51,14 +51,14 @@ class _Outcome:
     answer_flags: list = field(default_factory=list)
     states: list = field(default_factory=list)
     scene_route: str = "full_3d"
-    synthesis_source: str = "vllm"
+    synthesis_source: str = "online_model_ok"
     program_trace: object = None
     verify: object = None
 
 
 def _outcome(final_state="answer", correct=True, is_mca=True, mra=None,
              tools=("euclidean_distance",), error=None, verify=True,
-             flags=(), states=(), source="vllm", steps=2) -> _Outcome:
+             flags=(), states=(), source="online_model_ok", steps=2) -> _Outcome:
     return _Outcome(
         final_state=final_state, is_mca=is_mca, correct=correct, mra_value=mra,
         answer_flags=list(flags), states=list(states), synthesis_source=source,
@@ -187,7 +187,7 @@ class _Outcome:
         self.correct = None
         self.mra_value = None
         self.answer_flags = []
-        self.synthesis_source = "vllm"
+        self.synthesis_source = "online_model_ok"
         self.program_trace = None
         self.verify = None
         self.scene_route = ""

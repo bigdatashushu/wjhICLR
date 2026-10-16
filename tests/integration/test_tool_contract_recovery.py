@@ -37,7 +37,7 @@ FRAME_SIZE = (120, 160)
 
 
 class _FakeClient:
-    """假 vLLM 客户端：**只对 M8（program 合成）调用**按序返回预设 program。
+    """假在线模型客户端：只对 M8（program 合成）调用按序返回预设 program。
 
     真实链路里 M5 的对象清单阶段会复用同一个客户端（`_vlm_inventory_pass`）：
     这里对它返回空串，让 M5 走"绑定不可用"的降级分支（与缺 SAM2 checkpoint 的
@@ -119,7 +119,7 @@ def episode_item():
 
 def _cfg(tmp_path, art_path: str, *, max_recovery: int) -> OnlineRunConfig:
     return OnlineRunConfig(mode="real", reuse_artifact=art_path,
-                           vllm_endpoints=["http://fake"], deterministic_replay=True,
+                           deterministic_replay=True,
                            trace_dir=str(tmp_path / "t"),
                            max_retries_per_operation=max_recovery, max_images=32)
 

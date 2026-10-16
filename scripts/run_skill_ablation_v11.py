@@ -18,7 +18,7 @@ from skill3d.evaluation.skill_ablation_v11 import (
 )
 from skill3d.online.config import (
     active_vision_from, config_receipt, load_config, load_yaml, resolve_runtime,
-    retrieval_policy_from, sandbox_from,
+    retrieval_policy_from, sandbox_from, online_model_from,
 )
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.reconstruction.run import resolve_artifact_path
@@ -72,8 +72,6 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--expected-qa-ids", help="JSON list of preregistered qa_id values")
     parser.add_argument("--library-root", default=str(DEFAULT_LIBRARY))
-    parser.add_argument("--vllm-endpoint", action="append", default=None)
-    parser.add_argument("--vllm-model")
     parser.add_argument("--max-solver-rounds", type=int)
     parser.add_argument("--max-retries-per-operation", type=int)
     parser.add_argument("--finalization-rounds", type=int)
@@ -95,12 +93,11 @@ def main(argv=None) -> int:
     sampling, exclusions = {}, []
     try:
         raw = resolve_runtime(load_config(args.config), seed=args.seed,
-                              endpoints=args.vllm_endpoint, model=args.vllm_model,
                               formal=bool(args.quality_confirmation)
                               and os.environ.get("SKILL3D_RUN_MODE") != "development")
         seed = raw["seed"]
         paths = raw.get("paths", {})
-        model = raw.get("vllm", {})
+        model = online_model_from(raw)
         vision, sandbox = active_vision_from(raw), sandbox_from(raw)
         tasks = [canonical_task(t.strip()) for t in args.question_types.split(",") if t.strip()]
         if not tasks:
@@ -141,11 +138,19 @@ def main(argv=None) -> int:
                     else sampling.get("qa_ids"))
         cfg = OnlineRunConfig(
             mode="real", seed=seed, allow_final_test=args.allow_final_test,
-            vllm_endpoints=model["endpoints"],
-            vllm_model=model["model"],
-            max_images=int(model.get("n_frames", 32)), max_pixels=int(model["max_pixels"]),
-            max_model_len=int(model["max_model_len"]), max_tokens=int(model.get("max_tokens", 8192)),
-            temperature=model["temperature"],
+            online_model_enabled=model.enabled,
+            online_model_provider=model.provider,
+            online_model=model.model,
+            online_model_revision=model.model_revision,
+            online_base_url=model.base_url,
+            online_api_key_env=model.api_key_env,
+            online_timeout_s=model.timeout_s,
+            semantic_min_pixels=model.audit_min_pixels,
+            semantic_max_pixels=model.audit_max_pixels,
+            semantic_relation_batch_size=model.relation_batch_size,
+            max_images=model.n_frames, max_pixels=model.max_pixels,
+            max_model_len=model.max_model_len, max_tokens=model.max_tokens,
+            temperature=model.temperature,
             cell_timeout_s=sandbox.cell_timeout_s, max_regen=sandbox.max_regenerate,
             max_solver_rounds=args.max_solver_rounds if args.max_solver_rounds is not None else raw["max_solver_rounds"],
             max_retries_per_operation=(args.max_retries_per_operation
@@ -156,8 +161,9 @@ def main(argv=None) -> int:
             image_layout=vision.layout, max_derived_images=vision.max_derived_images,
             retrieval_policy=retrieval_policy_from(raw),
         )
-        if not cfg.vllm_endpoints:
-            raise PairingError("no vLLM endpoint; supply --vllm-endpoint")
+        if cfg.online_model_enabled and not os.environ.get(
+                cfg.online_api_key_env, "").strip():
+            raise PairingError(f"{cfg.online_api_key_env} is not configured")
         if args.artifacts_json:
             artifacts = json.loads(Path(args.artifacts_json).read_text())
         else:

@@ -19,7 +19,8 @@
 仍然抛 SynthesisError；解析出的 program 照旧过 M9 AST 白名单与 M10 沙箱。
 
 v6 §15.2/§19.3：**解析回退必须单列**为 `m8_parse_recovered`，与
-`vllm_parse_error`（真的解析不出来）和 `vllm_service_error`（服务故障）区分开 ——
+`online_model_parse_error`（真的解析不出来）和
+`online_model_service_error`（服务故障）区分开 ——
 否则"回退救回来多少题"这件事在 trace 里看不见。
 
 v6 §15.3：**退化输出触发重生成** —— 20 KB 重复段落 / 超长无意义输出 /
@@ -195,7 +196,7 @@ def extract_program_source_ex(text: str) -> tuple[str, bool]:
     # §11.3（规范原文）："无围栏但完整程序**不计**解析恢复。"
     # 这里既没有截断，也没有丢弃内容，更没有补造答案 —— 只是没写围栏，属正常产出，
     # 因此返回 False（干净路径）。此前返回 True 会把这类 episode 记成
-    # `m8_parse_recovered`，虚增回退率并低估 `vllm_ok`。
+    # `m8_parse_recovered`，虚增回退率并低估 `online_model_ok`。
     return stripped, False
 
 

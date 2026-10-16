@@ -7,7 +7,9 @@ import urllib.error
 import pytest
 
 from skill3d.synthesis.bailian_client import BailianClient
-from skill3d.synthesis.vllm_client import ServiceUnavailable
+from skill3d.synthesis.client_errors import ServiceUnavailable
+from skill3d.synthesis.program_assembler import assemble_program_ex
+from skill3d.online.runner import OnlineRunConfig, _make_online_client
 
 
 class Response:
@@ -70,3 +72,43 @@ def test_bailian_missing_or_rejected_key_is_service_unavailable(monkeypatch):
     with pytest.raises(ServiceUnavailable) as error:
         BailianClient(opener=rejected).chat([{"role": "user", "content": "hello"}])
     assert "do-not-leak" not in str(error.value)
+
+
+def test_runner_uses_one_flash_client_for_all_online_phases(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-only")
+    cfg = OnlineRunConfig(max_tokens=8192)
+    client = _make_online_client(cfg)
+    assert isinstance(client, BailianClient)
+    assert client.model == "qwen3.8-flash"
+    assert client.max_output_tokens == 8192
+    assert _make_online_client(
+        OnlineRunConfig(online_model_enabled=False)) is None
+
+
+def test_bailian_multimodal_program_response_matches_m8_contract(monkeypatch):
+    captured = {}
+
+    def opener(request, timeout):
+        captured["payload"] = json.loads(request.data)
+        return Response({
+            "choices": [{"message": {
+                "content": "```python\nReturnAnswer('A')\n```"},
+                "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 8},
+        })
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-only")
+    client = BailianClient(opener=opener, max_output_tokens=8192)
+    text = client.chat([{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Write the program."},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64,AA=="}},
+        ],
+    }], max_tokens=8192, seed=137)
+    program, recovered = assemble_program_ex(text, [])
+    assert not recovered
+    assert program.program_source.strip() == "ReturnAnswer('A')"
+    assert captured["payload"]["model"] == "qwen3.8-flash"
+    assert captured["payload"]["max_tokens"] == 8192

@@ -202,7 +202,8 @@ def raw_requests(output):
 
 def solve(args, plan):
     from skill3d.online.config import (
-        load_config, resolve_runtime, sandbox_from, active_vision_from, retrieval_policy_from)
+        load_config, resolve_runtime, sandbox_from, active_vision_from,
+        retrieval_policy_from, online_model_from)
     from skill3d.online.runner import OnlineRunConfig
 
     output = Path(args.output)
@@ -213,12 +214,23 @@ def solve(args, plan):
     require(set(prepared["artifacts"]) == {r["qa_id"] for r in plan["questions"]},
             "preparation does not cover exact panel")
     raw = resolve_runtime(load_config(args.config), seed=plan["seed"], formal=False)
-    vision, sandbox, model = active_vision_from(raw), sandbox_from(raw), raw["vllm"]
+    vision, sandbox = active_vision_from(raw), sandbox_from(raw)
+    model = online_model_from(raw)
     cfg = OnlineRunConfig(
-        mode="real", seed=plan["seed"], vllm_endpoints=model["endpoints"],
-        vllm_model=model["model"], max_images=model["n_frames"], max_pixels=model["max_pixels"],
-        max_model_len=model["max_model_len"], max_tokens=model["max_tokens"],
-        temperature=model["temperature"], cell_timeout_s=sandbox.cell_timeout_s,
+        mode="real", seed=plan["seed"],
+        online_model_enabled=model.enabled,
+        online_model_provider=model.provider,
+        online_model=model.model,
+        online_model_revision=model.model_revision,
+        online_base_url=model.base_url,
+        online_api_key_env=model.api_key_env,
+        online_timeout_s=model.timeout_s,
+        semantic_min_pixels=model.audit_min_pixels,
+        semantic_max_pixels=model.audit_max_pixels,
+        semantic_relation_batch_size=model.relation_batch_size,
+        max_images=model.n_frames, max_pixels=model.max_pixels,
+        max_model_len=model.max_model_len, max_tokens=model.max_tokens,
+        temperature=model.temperature, cell_timeout_s=sandbox.cell_timeout_s,
         max_regen=sandbox.max_regenerate, max_solver_rounds=raw["max_solver_rounds"],
         max_retries_per_operation=raw["max_retries_per_operation"],
         finalization_rounds=raw["finalization_rounds"], eval_visual_fallback=raw["eval_visual_fallback"],

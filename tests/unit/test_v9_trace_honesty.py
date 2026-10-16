@@ -2,7 +2,7 @@
 
 本文件守三类**已发生过的失真**：
 
-1. `synthesis_source` 兜底把不认识的取值洗成 `vllm_ok` —— mock_light 的收口答案
+1. `synthesis_source` 兜底把不认识的取值洗成模型成功 —— mock_light 的收口答案
    因此在 TraceRecord 里冒充过真实模型输出（§19.3 要消灭的正是这种混写）；
 2. 执行前被拒绝的调用被记成 `status="ok"`、`result_id=""` —— 可能作为"有效观测"
    回灌给模型（§14.1 / §17.1"失败也有 result_id"）；
@@ -59,22 +59,28 @@ def test_v5_alias_maps_to_mock_stub_not_model_output():
     assert _synthesis_source_enum("deterministic_stub") == "mock_stub"
 
 
-def test_no_model_output_aliases_are_not_claimed_as_vllm_ok():
+def test_legacy_vllm_sources_map_to_provider_neutral_names():
+    assert _synthesis_source_enum("vllm_ok") == "online_model_ok"
+    assert _synthesis_source_enum("vllm_parse_error") == "online_model_parse_error"
+    assert _synthesis_source_enum("vllm_service_error") == "online_model_service_error"
+
+
+def test_no_model_output_aliases_are_not_claimed_as_online_model_ok():
     """空/none/unavailable 只允许断言"没拿到模型输出"。"""
     for value in ("", "none", "unavailable", None):
-        assert _synthesis_source_enum(value) == "vllm_service_error"
+        assert _synthesis_source_enum(value) == "online_model_service_error"
 
 
 @pytest.mark.parametrize("value", ["forced_answer", "forced_answer_final", "finalization",
                                    "mystery_source", "vllm"])
-def test_unknown_source_is_never_rewritten_to_vllm_ok(value):
-    """不认识的取值 → 空串（来源未知）。**绝不**冒充 `vllm_ok`。
+def test_unknown_source_is_never_rewritten_to_online_model_ok(value):
+    """不认识的取值 → 空串（来源未知）。绝不冒充 `online_model_ok`。
 
     `forced_answer` / `finalization` 是 v8 写进 `synthesis_source` 的轮次原因：
     回读旧 trace 时无法判定其真实来源，只能记"未知"。
     """
     got = _synthesis_source_enum(value)
-    assert got != "vllm_ok"
+    assert got != "online_model_ok"
     assert got == ""
 
 
@@ -253,7 +259,7 @@ def test_trace_record_keeps_round_facts_separate_from_source():
     assert rec.finalization_used is True
 
     default = TraceRecord(episode_id="qa-1")
-    assert default.synthesis_source == "", "未知来源不得默认成 vllm_ok"
+    assert default.synthesis_source == "", "未知来源不得默认成 online_model_ok"
     assert default.round_trigger == "initial"
     assert default.finalization_used is False
 

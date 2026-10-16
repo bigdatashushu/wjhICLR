@@ -46,31 +46,16 @@ retrieval:
   method_context_max_chars: 8000
 
 # v9 §9.4 主动图像（inspect_frames / detect_objects）：图像布局必须**事先声明**。
-# 服务实测：8100 的 vLLM 是 `--limit-mm-per-prompt {"image": 32}`，一个请求最多 32 张图
-# （实测 33 张 → 400 "At most 32 image(s) may be provided in one prompt"）。
-# 因此观察轮用声明布局 `derived_plus_originals_v1`：派生图（裁剪）优先占位，其余名额
-# 按帧序补原帧；被省略的原帧已在更早请求里交付过，被省略的派生图保持 unobserved。
+# 单次请求上限冻结为 32 张图。观察轮用声明布局 `derived_plus_originals_v1`：
+# 派生图（裁剪）优先占位，其余名额按帧序补原帧；被省略的原帧已在更早请求里
+# 交付过，被省略的派生图保持 unobserved。
 active_vision:
   layout: derived_plus_originals_v1
   max_derived_images: 8        # 单次请求里派生图的占位上限（服务上限内）
 
-vllm:
-  model: Qwen/Qwen3-VL-8B-Instruct-FP8  # 实测：BF16(17GB) 与共用卡时 OOM，主线用官方 FP8（9.9GB）
-  quantization: none                    # FP8 自带量化；社区 AWQ 需 --quantization awq 且用 FP8 交叉验证
-  max_model_len: 32768
-  gpu_memory_utilization: 0.90
-  # 32 帧输入（§1.2 / §4 M1）；实测 32 帧 @max_pixels=131072 → ~9703 prompt tokens
-  n_frames: 32
-  max_pixels: 131072
-  tensor_parallel_size: 1               # DP×8 不 TP（ADR-2）
-  dp_world_size: 8
-  base_port: 8100
-  temperature: 0.0                      # greedy，保证同 seed 字节级一致
-  max_tokens: 8192                     # 单次 Qwen 请求的最大输出 token 数；输入 token 另计
-
-# M5 专用多模态模型：题目对象解析、目标盲审和类别关系判断。
+# M5 题目解析与语义审核、M8 程序生成、评测视觉补答共用同一个百炼模型。
 # 密钥只从 api_key_env 指定的环境变量读取，不得写入 YAML 或收据。
-m5_model:
+online_model:
   enabled: true
   provider: bailian
   model: qwen3.8-flash
@@ -79,9 +64,14 @@ m5_model:
   api_key_env: DASHSCOPE_API_KEY
   timeout_s: 180.0
   temperature: 0.0
-  max_tokens: 2048
-  min_pixels: 65536
-  max_pixels: 1048576
+  max_tokens: 8192                     # M8 单次最大输出；M5 各调用仍使用更小的请求级上限
+  max_model_len: 32768
+  # M8 32 帧输入（§1.2 / §4 M1）
+  n_frames: 32
+  max_pixels: 131072
+  # M5 单候选审核图的缩放范围
+  audit_min_pixels: 65536
+  audit_max_pixels: 1048576
   relation_batch_size: 32
 
 sandbox:
