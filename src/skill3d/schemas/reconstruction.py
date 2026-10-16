@@ -93,6 +93,16 @@ class QualityMetrics(Spec):
     # ---- 聚合（仅用于路由/报告；== NaN 时路由必须 fail-closed）----
     overall_quality: float
 
+    @field_validator(
+        "warp_inlier_ratio", "warp_photometric_inlier_ratio", "cloud_overlap_ratio",
+        "point_depth_relative_p95", "cloud_neighbor_tail_ratio", "g1_blur_ok",
+        "g2_brightness", "g3_motion_blur", "g6_depth_var_coeff", "g7_dynamic_ratio",
+        "g9_tracker_consistency", "g10_baseline_quality", "overall_quality", mode="before")
+    @classmethod
+    def _restore_unknown_json_metric(cls, value: Any) -> Any:
+        """JSON uses null for nonfinite metrics; restore unknown, never a passing value."""
+        return float("nan") if value is None else value
+
     @model_validator(mode="before")
     @classmethod
     def _reject_retired_metrics(cls, data: Any) -> Any:
@@ -322,7 +332,7 @@ class SceneState(Spec):
     answer_source: AnswerSource = "abstain"
 
     # 对象与摘要
-    objects: list[str] = []               # scene 级基础清单的 obj_id 列表
+    objects: list[str] = []               # 当前问题构建的 obj_id 列表
     summary: str = ""
     # 本题规范题型（逐题 scope 派生的第二维；空 = 未分类 → 米制 Tool 全拒）
     question_type: str = ""
@@ -366,20 +376,32 @@ class SceneState(Spec):
 
 
 # ---------------------------------------------------------------------------
-# §5.6 对象记录（scene 级基础清单，自描述）
+# §5.6 本题对象记录；历史来源仅供只读审计
 # ---------------------------------------------------------------------------
 
+class BindingValidation(Spec):
+    version: str
+    status: Literal["validated", "unavailable", "suspect"]
+    checks: dict[str, bool] = {}
+    errors: list[str] = []
+    generation_sha256: str = ""
+    files: dict[str, dict[str, Any]] = {}
+
+
 class ObjectRecord(Spec):
-    """scene 级基础清单的记录（§5.6）。
+    """带候选、track 与本题角色身份的对象记录（§5.6）。
 
     **自描述**是硬要求（`category_name` 必须落盘）：v5 实测过"模型把 `obj_7`
     当类别名"的误用面 —— id 不含类别名，程序路径就会拿 id 去匹配类别。
     """
 
-    obj_id: str                           # scene 级稳定 ID（跨 episode 不变）
+    obj_id: str                           # 本题稳定 ID；由生成身份隔离跨题 track
     category_name: str                    # 自描述：消灭 "id 不含类别名" 误用面
     source_label: str = ""                # 检测/VLM 返回的原始标签，规范名不能代替
     binding_provenance: list[dict[str, Any]] = []
+    question_roles: list[dict[str, str]] = []
+    candidate_ids: list[str] = []
+    binding_validation: Optional[BindingValidation] = None
     visible_frames: list[int] = []         # 该对象在哪些帧可见（帧槽位序号，升序）
     centroid_ref: str = ""                # 3D 质心引用（世界系，审计用）
     track_id: Optional[str] = None        # 跨帧 track
@@ -394,7 +416,7 @@ class ObjectRecord(Spec):
     # v9 §9.1/§9.4：第三种来源 = 在线 `detect_objects` 的**工具补检**。
     # 与 M5 的两种分开记，避免"工具当场补检出来的对象"被误读成 M5 基础清单。
     grounding_status: Literal["base_list", "question_targeted_fill",
-                              "tool_detection"] = "base_list"
+                              "tool_detection", "question_driven"] = "base_list"
     duplicate_suspect: bool = False       # D6：重复嫌疑（计数降级信号）
     # ---- 运行时产物引用（M5 全量绑定产物；Tool 经 SceneHandle 只读访问）----
     mask_per_frame: str = ""              # mask 数组文件 ref
@@ -424,6 +446,7 @@ ObjectInstance = ObjectRecord
 
 __all__ = [
     "AnswerSource",
+    "BindingValidation",
     "ConfidenceMap",
     "LEGACY_ONLY_FIELDS",
     "METRIC_TASK_TYPES",

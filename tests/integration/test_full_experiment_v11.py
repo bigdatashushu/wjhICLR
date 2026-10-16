@@ -219,30 +219,16 @@ def test_score_refuses_unfrozen_or_changed_answers(tmp_path, monkeypatch):
         full.score(args)
 
 
-def test_inventory_copy_rebases_hash_keys_and_preserves_base_ref_bytes(tmp_path):
-    from skill3d.infra.m5_identity import content_sha256, file_identity
-    source, dest = tmp_path / "first", tmp_path / "second"
-    source.mkdir()
-    dest.mkdir()
-    path = source / "inventory" / "identity" / "mask.npy"
-    path.parent.mkdir(parents=True)
-    np.save(path, np.ones((2, 4, 4), dtype=bool))
-    body = {
-        "inventory_version": "m5-inventory-10-frozen-inputs",
-        "generation": {"sha256": "identity"}, "key": "key",
-        "artifact_hashes": {str(path): file_identity(path)},
-        "objects": [{"mask_per_frame": str(path)}],
-    }
-    full.write(source / "scene_inventory_key.json", {
-        **body, "payload_sha256": content_sha256(body)})
-    ab._copy_inventory_cache(source, dest)
-    copied = json.loads((dest / "scene_inventory_key.json").read_text())
-    target = dest / "inventory/identity/mask.npy"
-    assert set(copied["artifact_hashes"]) == {str(target)}
-    assert target.read_bytes() == path.read_bytes()
-    assert copied["objects"][0]["mask_per_frame"] == str(target)
-    assert copied["payload_sha256"] == content_sha256({
-        k: v for k, v in copied.items() if k != "payload_sha256"})
+def test_preparation_never_copies_legacy_inventory(panel, tmp_path):
+    _, artifact, _ = panel
+    legacy = artifact.parent / "scene_inventory_key.json"
+    legacy.write_text('{"inventory_version":"m5-inventory-10-frozen-inputs"}')
+    dest = tmp_path / "private-preparation"
+    copied = ab._copy_base(artifact, dest)
+    assert not (dest / legacy.name).exists()
+    assert not (dest / "stale_m5_cache.json").exists()
+    assert np.array_equal(np.load(copied.depth_maps),
+                          np.load(json.loads(artifact.read_text())["depth_maps"]))
 
 
 def test_runtime_envelope_keeps_services_out_of_strict_online_config(tmp_path):
@@ -319,5 +305,6 @@ def test_scene_cache_index_is_independent_of_new_question_id_and_checks_content(
 
 
 def test_full_entry_imports_vggt_from_its_own_tracked_checkout():
+    pytest.importorskip("torch")
     from vggt.models import vggt
     assert Path(vggt.__file__).resolve().is_relative_to(ROOT / "third_party/vggt")

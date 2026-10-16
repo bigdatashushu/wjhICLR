@@ -67,20 +67,69 @@ def panel(tmp_path, monkeypatch, request):
     binding_calls = []
 
     def bind(frames, handle, question, *, out_dir, vlm_client, seed, **kwargs):
+        from skill3d.infra.m5_identity import generation_identity
+        from skill3d.segmentation.binding_validation import validate_binding
+        from skill3d.segmentation.question_binding import (
+            M5_BINDING_VERSION, PARAMETERS, refresh_coverage,
+        )
         root = Path(out_dir)
         assert not (root / "stale_m5_cache.json").exists()
         binding_calls.append(root)
-        vlm_client.chat([{"role": "user", "content": "prepare inventory"}], seed=seed)
+        vlm_client.chat([{"role": "user", "content": "prepare question objects"}], seed=seed)
+        generation = generation_identity(
+            scene_name=kwargs["scene_name"], frame_set_hash=kwargs["frame_set_hash"],
+            frames=frames, depth_maps=kwargs["depth_maps"], c2w_list=kwargs["c2w_list"],
+            intrinsics=kwargs["intrinsics"], point_conf=kwargs["point_conf"],
+            depth_conf=kwargs["depth_conf"], point_map=kwargs["point_map"],
+            question=question, question_type=kwargs["question_type"],
+            options=kwargs["options"], reconstruction_identity=kwargs["scene_identity"],
+            parameters=PARAMETERS, model={"fixture": True, "seed": seed,
+                                         "weights_sha256": kwargs["model_weights_sha256"]},
+            detector={"fixture": True}, sam2={"fixture": True})
         objects = copy.deepcopy(g.objects)
-        for obj in objects:
+        for index, obj in enumerate(objects):
             path = root / f"{obj.obj_id}_points.npy"
             np.save(path, g.object_points[obj.obj_id])
             obj.pointcloud_world = str(path)
-            obj.mask_per_frame = ""
+            mask = np.zeros_like(kwargs["depth_maps"], dtype=np.uint8)
+            locations = np.argwhere(np.isfinite(kwargs["depth_maps"][0])
+                                    & (kwargs["depth_maps"][0] > 0))
+            y, x = locations[index]
+            mask[:, y, x] = 1
+            mask_path = root / f"{obj.obj_id}_mask.npy"
+            np.save(mask_path, mask)
+            obj.mask_per_frame = str(mask_path)
+            obj.visible_frames = list(range(len(frames)))
+            obj.mask_support_ratio = 1.0
             obj.centroid_ref = ""
-        (root / "m5_inventory.json").write_text(
+            pts = g.object_points[obj.obj_id]
+            obj.centroid_world = pts.mean(axis=0).tolist()
+            obj.bbox = np.r_[pts.min(axis=0), pts.max(axis=0)].tolist()
+            obj.grounding_status = "question_driven"
+            obj.candidate_ids = [f"fixture:{obj.obj_id}"]
+            obj.track_id = f"fixture:{obj.obj_id}"
+            obj.question_roles = [{"category": obj.category_name,
+                                   "role": "reference" if index == 1 else "candidate",
+                                   "source_text": obj.category_name}]
+            obj.binding_provenance = [{
+                "semantic_relation": "match",
+                "semantic_visual_request_sha256": "a" * 64,
+                "semantic_relation_request_sha256": "b" * 64,
+            }]
+            obj.binding_validation = validate_binding(
+                obj, generation_sha256=generation["sha256"])
+        grounding = refresh_coverage({
+            "version": M5_BINDING_VERSION, "attempted": True,
+            "requirements": [{"name": o.category_name, "scan_complete": True,
+                              "binding_failures": []} for o in objects]}, objects)
+        (root / "m5_question_binding.json").write_text(
             json.dumps({"objects": [o.model_dump() for o in objects]}))
-        return objects, {"track_ious": [0.95], "track_stable_ratio": 1.0}, ["synthetic M5"]
+        return objects, {
+            "version": M5_BINDING_VERSION, "generation": generation,
+            "materialized": True, "grounding": grounding,
+            "track_ious": [0.95], "track_stable_ratio": 1.0,
+            "track_consensus": {"track_fragmentation_ratio": 0, "duplicate_suspect_ratio": 0},
+        }, ["synthetic question M5"]
 
     monkeypatch.setattr(sam2_tracker, "bind_objects_for_scene", bind)
     return item, artifact, binding_calls
@@ -192,20 +241,48 @@ def test_paired_preparation_audits_cross_question_mask_conflicts_before_hashing(
         items.append(cloned)
 
     def bind(frames, handle, question, *, out_dir, qa_id, **kwargs):
+        from skill3d.infra.m5_identity import generation_identity
+        from skill3d.segmentation.binding_validation import validate_binding
+        from skill3d.segmentation.question_binding import (
+            M5_BINDING_VERSION, PARAMETERS, refresh_coverage,
+        )
         root = Path(out_dir)
         mask = np.zeros((len(frames), frames[0].shape[0], frames[0].shape[1]),
                         dtype=np.uint8)
         mask[:3, 20:80, 30:100] = 1
         mask_path = root / f"{qa_id}_target_mask.npy"
         np.save(mask_path, mask)
-        obj = ObjectRecord(
-            obj_id="obj_0", category_name=categories[qa_id],
-            grounding_status="question_targeted_fill",
-            mask_per_frame=str(mask_path), visible_frames=[0, 1, 2],
-            mask_support_ratio=3 / len(frames),
-            det_conf=0.87, det_conf_source="groundingdino",
-            centroid_world=[0.0, 0.0, 2.0], bbox=[0.0] * 6)
-        return [obj], {"track_ious": [1.0], "track_stable_ratio": 1.0}, []
+        generation = generation_identity(
+            scene_name=kwargs["scene_name"], frame_set_hash=kwargs["frame_set_hash"],
+            frames=frames, depth_maps=kwargs["depth_maps"], c2w_list=kwargs["c2w_list"],
+            intrinsics=kwargs["intrinsics"], point_conf=kwargs["point_conf"],
+            depth_conf=kwargs["depth_conf"], point_map=kwargs["point_map"],
+            question=question, question_type=kwargs["question_type"], options=kwargs["options"],
+            reconstruction_identity=kwargs["scene_identity"], parameters=PARAMETERS,
+            model={"fixture": True, "seed": kwargs["seed"]},
+            detector={"fixture": True}, sam2={"fixture": True})
+        obj = sam2_tracker.bind_masks_to_world(
+            [{i: m for i, m in enumerate(mask)}], kwargs["depth_maps"],
+            kwargs["c2w_list"], kwargs["intrinsics"], class_hints=[categories[qa_id]],
+            out_dir=root, grounding_status="question_driven")[0].model_copy(update={
+                "candidate_ids": [qa_id], "question_roles": [{
+                    "category": categories[qa_id], "role": "target",
+                    "source_text": categories[qa_id]}],
+                "binding_provenance": [{
+                    "semantic_relation": "match",
+                    "semantic_visual_request_sha256": "a" * 64,
+                    "semantic_relation_request_sha256": "b" * 64,
+                }]})
+        obj = obj.model_copy(update={
+            "binding_validation": validate_binding(obj, generation_sha256=generation["sha256"])})
+        grounding = refresh_coverage({
+            "version": M5_BINDING_VERSION, "attempted": True,
+            "requirements": [{"name": categories[qa_id], "scan_complete": True,
+                              "binding_failures": []}]}, [obj])
+        return [obj], {
+            "version": M5_BINDING_VERSION, "generation": generation,
+            "materialized": True, "grounding": grounding,
+            "track_ious": [1.0], "track_stable_ratio": 1.0}, []
 
     monkeypatch.setattr(sam2_tracker, "bind_objects_for_scene", bind)
     root = tmp_path / "cross-question-conflict"
@@ -495,7 +572,8 @@ def test_state_observation_namespace_and_disk_are_isolated(panel, tmp_path, monk
              'secret = 123\n'
              'im = inspect_frames([0])\n'
              'return YieldObservations([im], "look")\n')
-    second = 'ReturnAnswer("A")\n'
+    second = ('ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
+              'used_result_ids=[], derivation=None))\n')
     other = ('objects = list_objects()\n'
              'answer = "A"\n'
              'for o in objects:\n'
@@ -508,6 +586,8 @@ def test_state_observation_namespace_and_disk_are_isolated(panel, tmp_path, monk
     assert a["answer"] == b["answer"] == "A"
     assert len(a["requests"]) == 2 and len(b["requests"]) == 1
     assert len(kernels) == 2
+    assert not kernels[0]._scene.binding_usable(obj)
+    assert kernels[1]._scene.binding_usable(obj)
     assert kernels[0]._ns is not kernels[1]._ns
     assert kernels[0]._scene._state is not kernels[1]._scene._state
     assert kernels[0].answer_slot is not kernels[1].answer_slot
@@ -684,6 +764,8 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
     mapping = tmp_path / "artifacts.json"
     mapping.write_text(json.dumps({item.episode.qa_id: str(artifact)}))
     monkeypatch.setattr(cli, "load_jsonl_items", lambda *a, **k: [item])
+    monkeypatch.setattr(ab.runner, "_make_m5_client",
+                        lambda cfg: FakeClient(["{}\n"]))
     monkeypatch.setattr(ab.runner, "_make_vllm_client",
                         lambda cfg: FakeClient(['ReturnAnswer("A")\n']))
     config = ROOT / "configs/config.yaml"
@@ -790,6 +872,8 @@ def test_confirmed_contract_with_low_geometry_is_formal_eligible(panel, tmp_path
     artifact.write_text(art.model_dump_json())
     assert art.quality.main_gate_passed is False
     monkeypatch.setenv("SKILL3D_RUN_MODE", "formal")
+    monkeypatch.setattr(ab.runner, "_make_m5_client",
+                        lambda cfg: FakeClient(["{}\n"]))
     monkeypatch.setattr(ab.runner, "_make_vllm_client", lambda cfg: FakeClient([
         'ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
         'used_result_ids=[], derivation=None))\n']))
@@ -811,6 +895,8 @@ def test_development_run_cannot_gain_formal_eligibility(panel, tmp_path, monkeyp
     monkeypatch.setenv("SKILL3D_RUN_MODE", "development")
     monkeypatch.setenv("SKILL3D_MODEL_WEIGHTS_SHA256", "a" * 64)
     monkeypatch.setenv("SKILL3D_ENVIRONMENT_SHA256", "b" * 64)
+    monkeypatch.setattr(ab.runner, "_make_m5_client",
+                        lambda _cfg: FakeClient(["{}\n"]))
     monkeypatch.setattr(ab.runner, "_make_vllm_client", lambda _cfg: FakeClient([
         'ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
         'used_result_ids=[], derivation=None))\n']))

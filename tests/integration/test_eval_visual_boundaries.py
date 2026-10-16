@@ -2,6 +2,7 @@
 
 import copy
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -50,9 +51,15 @@ def run_case(visual_scene, tmp_path, client, *, split="inner_validation",
         finalization_rounds=1, max_regen=max_regen, max_images=32, seed=17,
         eval_visual_fallback=enabled, allow_final_test=allow_final_test,
         trace_dir=str(tmp_path / "trace"))
+    from skill3d.online import runner
+    from skill3d.schemas import ReconstructionArtifact
+    art = ReconstructionArtifact.model_validate_json(Path(artifact).read_text())
+    art = runner._prepare_m4_quality(art, item.pixels, persist_quality=False)
+    binding = PreparedObjectBinding(*runner._bind_objects_best_effort(
+        art, item.pixels, None, episode, cfg, client))
     out = run_episode(
         episode, item.pixels, cfg, llm=client,
-        prepared_binding=PreparedObjectBinding(),
+        prepared_binding=binding,
         trace_store=TraceStore(cfg.trace_dir))
     return out
 

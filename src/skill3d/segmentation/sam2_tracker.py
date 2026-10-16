@@ -1,30 +1,7 @@
-"""M5 对象绑定/分割：SAM2 视频 mask 传播 + mask×深度反投影绑定世界点云（§4 M5）。
+"""SAM2 propagation, world backprojection and whole-object conflict audit.
 
-在线模块，严禁任何 GPT-6 相关依赖（硬约束 1）。
-sam2/torch 未安装，lazy import；mask→世界点云绑定与 G7/G9 统计为 numpy 真实实现。
-（G8 包围盒覆盖已按附录 A 删除，本模块不再计算它。）
-
-G-19 已核验配置（§7.1）：`sam2==1.1.0` + checkpoint `facebook/sam2.1_hiera-tiny`
-（~33.5M encoder，适合在线），启动时预拉取到本地 cache。
-
-产物去向：
-- `ObjectRecord`（v6 §5.6：点云/bbox/质心 + `track_id`/`duplicate_suspect`/
-  `pointconf_world`/`grounding_status`）→ `SceneHandle`（硬约束 17：Tool 只经句柄访问）；
-- `track_ious`（G9）→ M4 质量门禁；
-- `track_stable_ratio`（§7.1 `track_consensus` 的占比输入）→ M4 证据画像；
-- `dynamic_masks`（G7）→ 重建污染检测（`dynamic_masks_from_rigidity`）。
-
-v6 证据字段（本模块的落点）：
-
-- `track_id`：**跨帧 track 身份** = 产生该对象的 SAM2 传播序号（确定性字符串）。
-  去重合并后，一组里只有幸存代表留在清单中，故 `count_objects`（§9.2
-  "track 共识计数，不数清单长度"）按 `track_id` 去重即得 `n_distinct_tracks`；
-- `duplicate_suspect`：去重**吸收**了 ≥2 条候选（清单长度被高估的直接证据），
-  或去重后仍有两个同类对象的世界质心落在同一容差内（时序不重叠 → 没合并，
-  但"同地同类不同时"仍有重复嫌疑）→ 计数必须降级输出（§7.1 track_consensus）；
-- `pointconf_world`：与 `pointcloud_world` **逐点 1:1 对齐**的 VGGT 逐点置信度 ref。
-  调用方不给 `point_conf` 时写空串（**绝不伪造**置信度，§12.2 软权重来源）；
-- `grounding_status`：场景清单 = `base_list`，逐题补漏 = `question_targeted_fill`。
+Question parsing and the sole online M5 path live in question_binding.py.
+G7/G9 remain diagnostics; geometry confidence never certifies object semantics.
 """
 
 from __future__ import annotations
@@ -33,62 +10,26 @@ import contextlib
 import hashlib
 import json
 import os
-import time
 from pathlib import Path
 from typing import Optional, Sequence
 
 import numpy as np
 
-from skill3d.coords import vlm_box_to_pixels
 from skill3d.schemas.reconstruction import ObjectRecord
 from skill3d.tools.category_match import (
-    CATEGORY_MATCH_VERSION,
     MASK_LABEL_RELATION_VERSION,
     canonical,
     mask_label_relation,
-    matches,
     normalize,
-    option_category,
-)
-from .open_vocab_detector import (
-    capture_detector_attempts, capture_detector_failures,
-    current_detector_failures,
 )
 
-# 场景清单缓存版本（改 M5 清单构造逻辑时递增 → 旧缓存自动失效，不会混用口径）
-# v2：`ObjectInstance` 增 `visible_frames`（逐帧可见性题型）→ 旧缓存缺该字段，必须失效
-# v3：v6 §5.6 字段改名（obj_id/category_name/det_conf）+ 新增 track_id /
-#     duplicate_suspect / pointconf_world / grounding_status → 旧缓存是 v5 口径
-#     （无 track，计数无法做 track 共识），必须失效重算。
-# v8：检测器置信度与非空 mask 支撑率分离，并记录置信度来源；旧缓存中
-#     `det_conf` 可能是含空掩码帧的传播字典长度，必须失效重算。
-# v10：完整冻结输入/模型/源码身份、引用内容校验与独立产物目录。
-_INVENTORY_VERSION = "m5-inventory-10-frozen-inputs"
 
-# 只对可证明的异类 targeted-fill 掩码冲突执行硬拦；普通多实例不在此合同内。
-SEMANTIC_MASK_CONFLICT_VERSION = "semantic-mask-conflict-v2"
+# 明确不相容的新题级绑定共享同一 mask 时硬拦；历史来源只读。
+SEMANTIC_MASK_CONFLICT_VERSION = "semantic-mask-conflict-v3-question-driven"
 SEMANTIC_MASK_CONFLICT_IOU = 0.95
 SEMANTIC_MASK_CONFLICT_MIN_FRAMES = 2
 
-# `track_id` 命名空间（v6 §5.6）：不同 pass 的传播序号会重名（都从 0 起），
-# 前缀把它隔开 —— 否则 `count_objects` 的 track 去重会把两条不同对象算成一条。
-TRACK_PREFIX_BASE_LIST = "trk"      # 场景基础清单（scene 级，可缓存）
-TRACK_PREFIX_QUESTION = "qtrk"      # 逐题补漏（题级，不复用基础清单的 track）
-# VLM **通用清单**问题（与具体题目无关 → 清单可跨 episode 复用/缓存）
-
-class _PromptLabel(str):
-    """在保持现有规范提示值的同时，携带模型返回的原始 phrase。"""
-
-    def __new__(cls, raw):
-        value = super().__new__(cls, normalize_hint(raw))
-        value.source_label = str(raw)
-        return value
-
-
-# VLM **通用清单**问题（与具体题目无关 → 清单可跨 episode 复用/缓存）
-_GENERIC_INVENTORY_QUESTION = (
-    "List the main objects in this indoor photo (furniture, doors, windows, appliances, and common items). "
-    "Do not restrict the list to objects relevant to a particular question.")
+TRACK_PREFIX_BASE_LIST = "trk"  # primitive default for historical read-only records
 
 # G-19 档位（本机实测，2026-09-18）：可用权重为 SAM2.1 Hiera-Large 与 Hiera-Base+，
 # **Tiny 未下载**。实测加载峰值显存：Large 0.98 GiB / Base+ 0.44 GiB（权重部分）。
@@ -104,40 +45,6 @@ SAM2_LOCAL_CACHE: str = "data/checkpoints"                      # 预拉取目�
 _ENV_CHECKPOINT = "SKILL3D_SAM2_CHECKPOINT"
 _ENV_CONFIG = "SKILL3D_SAM2_CONFIG"
 _ENV_ALLOW_DOWNLOAD = "SKILL3D_ALLOW_HF_DOWNLOAD"
-
-# VSI-Bench 问题文本中的常见物体名词（确定性提示词抽取，非 VLM；VLM 路径见 docstring）
-#
-# v7 扩表（2026-09-22，真实实测根因）：旧表只有 40 条，而 VSI-Bench 问题实际点名
-# 的类别里有相当一部分不在表内 → GroundingDINO 根本不会被问到它们 → 清单缺失 →
-# **题面点名的物体解析失败**。实测 inner 档 16 道 rel_direction 有 13 道因此拿不到
-# 参照物（'power strip'/'ceiling light'/'coat rack'/'paper bag'/'exhaust fan'
-# 都不在表内），计数题里 'ceiling light'(GT=4)/'heater'(GT=2)/'bucket'(GT=2)
-# 全部返回 0。这类失败会同时打穿 rel_direction / rel_distance /
-# appearance_order / 计数 / 尺寸 / 绝对距离六类题型，是工具臂最上游的瓶颈。
-#
-# 取值口径：用**单数、小写**的规范名，且尽量与 `tools.category_match.SYNONYMS`
-# 的规范值对齐（例如问题里的 "telephone" 规范为 "phone"、"ceiling light" 规范为
-# "ceiling lamp"），这样检测器产出的标签能直接被题面匹配到。
-OBJECT_VOCABULARY: tuple[str, ...] = (
-    "sofa", "couch", "chair", "table", "desk", "bed", "door", "doorway",
-    "cabinet", "counter", "countertop", "stool", "shelf", "lamp", "plant",
-    "tv", "monitor", "fridge", "refrigerator", "microwave", "oven", "sink",
-    "toilet", "bathtub", "mirror", "painting", "window", "rug", "pillow",
-    "box", "bottle", "cup", "bowl", "book", "bag", "basket", "trash",
-    "nightstand", "dresser", "wardrobe", "bench",
-    # 注：**故意不收 `wall`/`floor`/`ceiling`** —— 它们的 mask 覆盖整个视野，
-    # 单条 SAM2 传播实测比普通物体慢一个数量级（1.4 it/s vs 13 it/s），
-    # 而 inner 档只有 2 道题提到 wall。确实需要时由**逐题补漏**按题面名词补检，
-    # 不必让每个场景都为它付传播成本。
-    # ---- v7 新增：VSI-Bench 高频点名但旧表缺失的类别 ----
-    "phone", "ceiling lamp", "suitcase", "keyboard", "mouse", "power strip",
-    "laptop", "computer", "computer tower", "printer", "whiteboard", "clock",
-    "heater", "fan", "pan", "pot", "cutting board", "bookshelf", "bookcase",
-    "coat rack", "paper bag", "backpack", "bucket", "column",
-    "pen", "tray", "water bottle", "coffee maker", "doorknob", "drawer",
-    "camera", "hanger", "shower", "board", "speaker", "projector", "blinds",
-    "curtain", "towel", "blanket", "vase",
-)
 
 # G7 刚性残差阈值（px）：观测光流与自运动预测光流之差超此值记为动态（TODO_CALIBRATE）
 TH_RIGIDITY_RESIDUAL_PX: float = 3.0
@@ -211,141 +118,49 @@ def build_video_predictor(checkpoint: Optional[str] = None,
     return build_sam2_video_predictor(cfg, local)
 
 
-# ------------------------------------------------------------------ 提示词来源 ----
-
-def _singularize(noun: str) -> str:
-    """轻量单数化（只处理规则复数；不做词形还原，避免引入不确定性）。"""
-    w = str(noun).strip()
-    if len(w) > 3 and w.lower().endswith("ies"):
-        return w[:-3] + "y"
-    if len(w) > 3 and w.lower().endswith(("ses", "xes", "zes", "ches", "shes")):
-        return w[:-2]
-    if len(w) > 2 and w.lower().endswith("s") and not w.lower().endswith("ss"):
-        return w[:-1]
-    return w
-
-
-def object_prompts_from_question(question: str) -> list[str]:
-    """从问题文本抽取候选物体名词（确定性，VLM 无关）。
-
-    在线正解由 Qwen3-VL-8B 给出"对象名 + bbox"提示（§4 M5 字段 12，非 GPT-6）；
-    本函数是无需模型的确定性兜底，覆盖 VSI-Bench 问题的常见名词。
-    """
-    text = str(question).lower()
-    hits: list[str] = []
-    for word in OBJECT_VOCABULARY:
-        if word in text and word not in hits:
-            # 避免 "chair" 命中 "chairman" 类误报：要求词边界
-            idx = text.find(word)
-            left_ok = idx == 0 or not text[idx - 1].isalpha()
-            right_ok = idx + len(word) >= len(text) or not text[idx + len(word)].isalpha()
-            if left_ok and right_ok:
-                hits.append(word)
-    return hits
-
-
-def box_prompts_from_vlm(frames: Sequence[np.ndarray], question: str, client,
-                         *, frame_idx: int = 0,
-                         max_objects: int = 6,
-                         seed: Optional[int] = None) -> tuple[list[str], list[list[float]]]:
-    """用**在线 Qwen3-VL-8B**给出对象名 + 像素 bbox 提示（§4 M5 字段 12，非 GPT-6）。
-
-    这是 SAM2 提示的正解来源：文本抽名词只能给类别、给不出框，整帧当框会让 SAM2
-    退化成"分割整幅图"。返回 `(class_hints, boxes)`；模型不可用/解析失败返回 `([], [])`
-    由调用方走降级路径（不臆造框）。
-
-    bbox 约定 `[x0, y0, x1, y1]`（像素，左上原点），与 SAM2 box prompt 一致。
-    """
-    import base64
-    import json
-    import re
-
-    import cv2
-
-    box_prompts_from_vlm.last_error = ""
-    box_prompts_from_vlm.last_request_sha256 = ""
-    if client is None or not len(frames):
-        box_prompts_from_vlm.last_error = "vlm_not_configured_or_no_frames"
-        return [], []
-    img = np.asarray(frames[min(frame_idx, len(frames) - 1)])
-    h, w = int(img.shape[0]), int(img.shape[1])
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-                           [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-    if not ok:
-        box_prompts_from_vlm.last_error = "jpeg_encoding_failed"
-        return [], []
-    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-    prompt = (
-        f"This is an indoor photograph. Question: {question}\n"
-        f"Identify at most {max_objects} relevant objects and provide their names and bounding boxes.\n"
-        'Output only a JSON array: [{"name": "table", "bbox": [x0, y0, x1, y1]}]\n'
-        "Coordinates must be normalized integers from 0 to 1000, with top-left (0,0) "
-        "and bottom-right (1000,1000), x0<x1, y0<y1. If no relevant objects are visible, "
-        "output []. Do not explain."
-    )
-    messages = [{"role": "user", "content": [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-    ]}]
-    box_prompts_from_vlm.last_request_sha256 = hashlib.sha256(json.dumps(
-        {"messages": messages, "max_tokens": 512, "seed": seed},
-        sort_keys=True).encode()).hexdigest()
+def build_image_predictor(model=None, checkpoint: Optional[str] = None,
+                          config: Optional[str] = None):
+    """Build SAM2's still-image predictor over the same frozen model weights."""
+    if model is not None and all(hasattr(model, name) for name in ("set_image", "predict")):
+        return model
+    if model is None:
+        model = build_video_predictor(checkpoint, config)
     try:
-        # 请求级 seed：M5 的框提示也参与"同配置重复运行逐题一致"的复现要求
-        text = client.chat(messages, max_tokens=512, seed=seed)
-    except Exception as exc:  # noqa: BLE001 - 模型不可用 → 降级
-        box_prompts_from_vlm.last_error = f"{type(exc).__name__}: {exc}"
-        return [], []
-    box_prompts_from_vlm.last_raw = text
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+    except ImportError as exc:
+        raise RuntimeError(f"SAM2 image predictor unavailable: {exc}") from exc
+    return SAM2ImagePredictor(model)
 
-    m = re.search(r"\[.*\]", text, re.DOTALL)
-    if not m:
-        box_prompts_from_vlm.last_error = f"JSON array not found; raw={text[:200]!r}"
-        return [], []
+
+def segment_frame_boxes(frame: np.ndarray, boxes: Sequence[Sequence[float]],
+                        predictor) -> list[np.ndarray]:
+    """Segment all NMS-kept boxes in one frame without temporal propagation."""
+    prompts = [np.asarray(box, dtype=np.float32) for box in boxes]
+    if not prompts:
+        return []
+    image = np.asarray(frame)
+    if image.ndim != 3 or image.shape[2] != 3 or not image.size:
+        raise ValueError("SAM2 image segmentation requires a readable RGB frame")
     try:
-        items = json.loads(m.group(0))
-    except Exception as exc:  # noqa: BLE001
-        box_prompts_from_vlm.last_error = f"JSON parsing failed: {exc}; raw={m.group(0)[:200]!r}"
-        return [], []
-    hints: list[str] = []
-    boxes: list[list[float]] = []
-    for it in items if isinstance(items, list) else []:
-        if not isinstance(it, dict):
-            continue
-        box = it.get("bbox") or it.get("box")
-        name = str(it.get("name") or it.get("label") or "").strip()
-        if not name or not isinstance(box, (list, tuple)) or len(box) != 4:
-            continue
-        try:
-            x0, y0, x1, y1 = (float(v) for v in box)
-        except (TypeError, ValueError):
-            continue
-        # §9 坐标适配层：VLM-normalized-1000 → original 像素（C-6/实测 999 量级）
-        x0, y0, x1, y1 = vlm_box_to_pixels([x0, y0, x1, y1], w, h)
-        if x1 - x0 < 2 or y1 - y0 < 2:
-            continue
-        hints.append(_PromptLabel(name))
-        boxes.append([x0, y0, x1, y1])
-    return hints, boxes
+        import torch
 
-
-def normalize_hint(name: str) -> str:
-    """对象名归一（小写、去空白），与 G-11 的类先验查表口径一致。"""
-    return str(name).strip().lower().replace(" ", "_")
-
-
-def object_prompts_from_handle(handle) -> tuple[list[str], list[list[float]]]:
-    """由 SceneHandle 现有对象给出 (class_hints, box_prompts)（重跑/增量场景）。"""
-    hints: list[str] = []
-    boxes: list[list[float]] = []
-    if handle is None or not hasattr(handle, "list_objects"):
-        return hints, boxes
-    for oid in handle.list_objects():
-        obj = handle.get_object(oid)
-        if len(obj.bbox) == 6:
-            hints.append(str(obj.category_name))
-            boxes.append([float(v) for v in obj.bbox])
-    return hints, boxes
+        inference = torch.inference_mode()
+    except Exception:  # pragma: no cover - fake/CPU-only test environment
+        inference = contextlib.nullcontext()
+    results = []
+    with inference, _autocast_ctx():
+        predictor.set_image(image)
+        for box in prompts:
+            masks, _scores, _logits = predictor.predict(
+                box=box, multimask_output=False)
+            mask = np.asarray(masks)
+            if mask.ndim == 3:
+                mask = mask[0]
+            if mask.shape != image.shape[:2]:
+                raise ValueError(
+                    f"SAM2 image mask shape {mask.shape} != frame {image.shape[:2]}")
+            results.append(mask.astype(bool, copy=False))
+    return results
 
 
 def track_objects(
@@ -362,88 +177,65 @@ def track_objects(
 ) -> list[dict[int, np.ndarray]]:
     """SAM2 视频 mask 传播（§4 M5 伪代码）。
 
-    `box_prompts`：每个对象一个 [x0,y0,x1,y1] 提示框。为 None 时按以下顺序取提示：
-    ① `handle` 中已有对象（增量场景）；② 由 `question` 抽取的对象名词（无框提示）。
-    两者都不可得时抛 RuntimeError（SAM2 需要框/点提示，不臆造分割结果）。
+    `box_prompts`：每个候选一个真实 [x0,y0,x1,y1] 检测框，无框则不可用。
 
     返回 per-object `{frame_idx: mask(H,W) bool}`。
     """
-    hints = list(class_hints or [])
     boxes = list(box_prompts) if box_prompts is not None else []
-    if not boxes and handle is not None:
-        h_hints, h_boxes = object_prompts_from_handle(handle)
-        hints, boxes = h_hints, h_boxes
-    if not boxes and question:
-        hints = object_prompts_from_question(question)
-        if not hints:
-            raise RuntimeError(
-                f"SAM2 提示不可得：问题中未识别到候选物体（{question[:40]!r}），"
-                "且无既有对象/框提示（在线正解由 Qwen3-VL-8B 给对象名+bbox 提示）"
-            )
-        # 无数值提示框：以全帧为框（退化为整帧分割，仅用于拿到候选 mask）
-        h = int(np.asarray(frames[0]).shape[0]) if len(frames) else 1
-        w = int(np.asarray(frames[0]).shape[1]) if len(frames) else 1
-        boxes = [[0.0, 0.0, float(w), float(h)] for _ in hints]
     if not boxes:
-        raise RuntimeError("SAM2 需要 box_prompts 或可解析的既有对象（§4 M5 伪代码）")
+        raise RuntimeError("SAM2 requires actual detector box prompts")
 
     if predictor is None:
         predictor = build_video_predictor(checkpoint, config)
     # 已核验的官方 API：init_state 接受 **MP4 或 JPEG 文件夹路径**（不接受 ndarray），
     # 故把帧写到临时 JPEG 目录；帧名需为连续数字（load_video_frames 的约定）。
     frames_dir = _write_jpeg_sequence(frames)
-    # 官方 demo 会在调用前**全局进入 bf16 autocast**；不进入会出现
-    # "mat1 and mat2 must have the same dtype, but got BFloat16 and Float"。
-    with _autocast_ctx():
-        state = predictor.init_state(
-            frames_dir, offload_video_to_cpu=True, offload_state_to_cpu=True)
-    # 提示形式：`prompts=[(frame_idx, obj_id, box)]`（多帧各自给框，SAM2 从该帧起传播）
-    # 或退化形式 `boxes=[box,...]`（统一在第 0 帧给框）
-    prompt_list = ([(int(fi), int(oid), box) for fi, oid, box in prompts]
-                   if prompts else [(0, i, b) for i, b in enumerate(boxes)])
-    n_objects = max([oid for _fi, oid, _b in prompt_list], default=-1) + 1
-    for fi, oid, box in prompt_list:
-        # 已核验签名：add_new_points_or_box(state, frame_idx, obj_id, box=...)
-        # dtype 必须与模型参数一致（SAM2 在 bf16 下运行；传 float32 会
-        # "mat1 and mat2 must have the same dtype"）
+    try:
+        # 官方 demo 会在调用前**全局进入 bf16 autocast**；不进入会出现
+        # "mat1 and mat2 must have the same dtype, but got BFloat16 and Float"。
         with _autocast_ctx():
-            predictor.add_new_points_or_box(state, frame_idx=fi, obj_id=oid,
-                                            box=_prompt_box(box, predictor))
-    # propagate_in_video 产出 (frame_idx, obj_ids, video_res_masks)
-    per_object: list[dict[int, np.ndarray]] = [dict() for _ in range(max(n_objects, 1))]
-    for frame_idx, obj_ids, mask_logits in _propagate_bidirectional(predictor, state):
-        for oid, logits in zip(obj_ids, mask_logits):
-            mask = _to_bool_mask(logits)
-            if mask.ndim == 3:        # (1,H,W) → (H,W)
-                mask = mask[0]
-            per_object[int(oid)][int(frame_idx)] = mask
-    return per_object
+            state = predictor.init_state(
+                frames_dir, offload_video_to_cpu=True, offload_state_to_cpu=True)
+        # 提示形式：`prompts=[(frame_idx, obj_id, box)]`（多帧各自给框，SAM2 从该帧起传播）
+        # 或退化形式 `boxes=[box,...]`（统一在第 0 帧给框）
+        prompt_list = ([(int(fi), int(oid), box) for fi, oid, box in prompts]
+                       if prompts else [(0, i, b) for i, b in enumerate(boxes)])
+        n_objects = max([oid for _fi, oid, _b in prompt_list], default=-1) + 1
+        for fi, oid, box in prompt_list:
+            # 已核验签名：add_new_points_or_box(state, frame_idx, obj_id, box=...)
+            # dtype 必须与模型参数一致（SAM2 在 bf16 下运行；传 float32 会
+            # "mat1 and mat2 must have the same dtype"）
+            with _autocast_ctx():
+                predictor.add_new_points_or_box(state, frame_idx=fi, obj_id=oid,
+                                                box=_prompt_box(box, predictor))
+        # propagate_in_video 产出 (frame_idx, obj_ids, video_res_masks)
+        per_object: list[dict[int, np.ndarray]] = [dict() for _ in range(max(n_objects, 1))]
+        for frame_idx, obj_ids, mask_logits in _propagate_bidirectional(predictor, state):
+            for oid, logits in zip(obj_ids, mask_logits):
+                mask = _to_bool_mask(logits)
+                if mask.ndim == 3:        # (1,H,W) → (H,W)
+                    mask = mask[0]
+                per_object[int(oid)][int(frame_idx)] = mask
+        return per_object
+    finally:
+        import shutil
+        shutil.rmtree(frames_dir, ignore_errors=True)
 
 
 def _propagate_bidirectional(predictor, state):
     """SAM2 **双向**传播（§4 M5 字段 7 / D-1）：先正向，再逆向补齐提示帧之前的帧。
 
     只正向传播时，在第 n-1 帧给框的对象拿不到之前的 mask（单帧漏检 = 对象不存在），
-    这正是 C-9 要避免的失败模式。逆向 pass 不可用（旧版 API / 测试替身）时静默跳过：
-    反向缺口由 3D 质心去重与多探测帧兜底，不影响正确性。
+    逆向 pass 失败使该候选不可用，不以正向结果冒充双向成功。
     """
-    yielded = False
     # C-4：mask decoder 在 bf16 下计算，传播**也必须**在 autocast 内，否则
     # "mat1 and mat2 must have the same dtype, but got BFloat16 and Float"。
     with _autocast_ctx():
         for item in predictor.propagate_in_video(state):
-            yielded = True
             yield item
-        try:
-            for item in predictor.propagate_in_video(state, reverse=True):
-                yield item
-        except TypeError:
-            # 替身/旧版签名不支持 reverse → 只保留正向结果
-            return
-        except Exception:  # noqa: BLE001 - 逆向失败不阻断（正向结果已产出）
-            if not yielded:
-                raise
-            return
+        # A failed reverse pass invalidates this candidate; forward-only is not success.
+        for item in predictor.propagate_in_video(state, reverse=True):
+            yield item
 
 
 def _autocast_ctx():
@@ -662,10 +454,8 @@ def bind_masks_to_world(
     - point_conf: (N,H,W) 或 (H,W) **逐点** VGGT 置信度（与 `depth_maps` 同网格）。
       给出时按与点云**同一套有效掩码/同一套下采样下标**取点，落盘 `pointconf_world`
       并与 `pointcloud_world` 逐点 1:1 对齐；**不给则写空 ref**（不伪造置信度）。
-    - track_prefix: `track_id` 命名空间（基础清单 `trk*` / 逐题补漏 `qtrk*`）；
-      `track_id = f"{track_prefix}{传播序号}"` —— 确定性、可复现，合并组内统一为
-      幸存代表的 track（见 `_dedupe_by_world_centroid`）。
-    - grounding_status: §5.6 的 `base_list` / `question_targeted_fill`。
+    - track_prefix: 本题生成身份与候选序号的命名空间；历史原语默认前缀只供审计。
+    - grounding_status: 新 M5 为 `question_driven`；历史来源可读取，不授予在线准入。
     - confidences / det_conf_sources: 与候选严格对齐的检测置信度及来源。没有检测器
       分数时置信度固定为 0；传播覆盖率单独写入 `mask_support_ratio`。
 
@@ -682,8 +472,9 @@ def bind_masks_to_world(
     instances: list[ObjectRecord] = []
     for prop_idx, masks in enumerate(masks_per_object):
         # 有效支撑帧（掩码非空）→ 供"逐帧可见性"类题型程序化作答
-        vis_frames = sorted(int(fi) for fi, m in masks.items()
-                            if np.asarray(m).any())
+        saved_masks = _stack_masks(masks, len(depth_maps), depth_maps.shape[1:])
+        masks = {i: mask.astype(bool) for i, mask in enumerate(saved_masks)}
+        vis_frames = np.flatnonzero(saved_masks.any(axis=(1, 2))).tolist()
         support_ratio = min(1.0, len(vis_frames) / max(1, len(depth_maps)))
         hint = class_hints[prop_idx] if class_hints and prop_idx < len(class_hints) else "unknown"
         conf = (float(confidences[prop_idx])
@@ -701,7 +492,7 @@ def bind_masks_to_world(
         pts_world_all = []
         conf_all = []
         for frame_idx, mask in sorted(masks.items()):
-            if frame_idx >= len(depth_maps):
+            if not 0 <= frame_idx < len(depth_maps):
                 continue
             depth = depth_maps[frame_idx]
             K = intrinsics[min(frame_idx, len(intrinsics) - 1)]
@@ -733,7 +524,7 @@ def bind_masks_to_world(
             d = Path(out_dir)
             d.mkdir(parents=True, exist_ok=True)
             mask_path = d / f"{scene_name}_{iid}_mask.npy"
-            np.save(mask_path, _stack_masks(masks, len(depth_maps), depth_maps.shape[1:]))
+            np.save(mask_path, saved_masks)
             mask_ref = str(mask_path)
         if not pts_world_all:
             # 分割失败 → 该对象标记 unverified（§4 M5 字段 9）
@@ -827,7 +618,7 @@ def audit_semantic_mask_conflicts(
     iou_threshold: float = SEMANTIC_MASK_CONFLICT_IOU,
     contract_version: str = SEMANTIC_MASK_CONFLICT_VERSION,
 ) -> tuple[dict[str, list[ObjectRecord]], list[dict]]:
-    """审计全部可读 mask；明确不相容且至少一端 targeted-fill 才硬拦。"""
+    """审计全部可读 mask；明确不相容且至少一端新题级绑定时硬拦。"""
     threshold = float(iou_threshold)
     if not (0.0 <= threshold <= 1.0):
         raise ValueError(f"iou_threshold must be within [0,1], got {iou_threshold!r}")
@@ -858,7 +649,8 @@ def audit_semantic_mask_conflicts(
                      if not (
                          flag.get("code") == "semantic_label_mask_conflict"
                          and flag.get("contract_version") in (
-                             "semantic-mask-conflict-v1", SEMANTIC_MASK_CONFLICT_VERSION,
+                             "semantic-mask-conflict-v1", "semantic-mask-conflict-v2",
+                             SEMANTIC_MASK_CONFLICT_VERSION,
                              contract_version))]
             current = obj.model_copy(update={"binding_flags": flags})
             rows.append(current)
@@ -905,6 +697,12 @@ def audit_semantic_mask_conflicts(
         for right in representatives[left_index + 1:]:
             relation = mask_label_relation(left["endpoint"]["source_label"],
                                            right["endpoint"]["source_label"])
+            if any(entry["object"].grounding_status == "question_driven"
+                   for entry in (left, right)):
+                requested_relation = mask_label_relation(
+                    left["object"].category_name, right["object"].category_name)
+                if requested_relation == "incompatible":
+                    relation = "incompatible"
             if relation == "equivalent":
                 continue
             endpoints = sorted([
@@ -944,7 +742,8 @@ def audit_semantic_mask_conflicts(
                 continue
 
             hard_block = relation == "incompatible" and any(
-                e["source"] == "question_targeted_fill" for e in endpoints)
+                e["source"] in ("question_targeted_fill", "question_driven")
+                for e in endpoints)
             audit = publish({
                 **identity, "hard_block": hard_block, "status": "high_overlap",
                 "code": ("semantic_label_mask_conflict" if hard_block
@@ -971,992 +770,10 @@ def audit_semantic_mask_conflicts(
     return cleaned, audits
 
 
-def _inventory_key(scene_name: str, frame_set_hash: str, depth_maps, n_frames: int,
-                   *, generation: dict | None = None) -> str:
-    """完整 SHA256；旧式调用只生成诊断身份，不授予缓存能力。"""
-    from skill3d.infra.m5_identity import array_identity, content_sha256
-    from skill3d.infra.version_lock import sam2_runtime_identity
-
-    if generation is not None:
-        return content_sha256({"version": _INVENTORY_VERSION,
-                               "generation_sha256": generation["sha256"]})
-    return content_sha256({
-        "version": _INVENTORY_VERSION, "scene": str(scene_name),
-        "frame_set_hash": str(frame_set_hash), "n_frames": int(n_frames),
-        "depth": array_identity(depth_maps), "sam2": sam2_runtime_identity(),
-        "incomplete_identity": True,
-    })
-
-
-def _cache_identity_valid(generation, key) -> bool:
-    from skill3d.infra.m5_identity import content_sha256
-
-    return bool(generation and generation.get("cache_eligible")
-                and not generation.get("missing")
-                and content_sha256(generation["identity"]) == generation["sha256"]
-                and _inventory_key("", "", None, 0, generation=generation) == key)
-
-
-def _load_inventory(out_dir: Optional[str | Path], scene_name: str,
-                    key: str, *, generation: dict | None = None
-                    ) -> Optional[tuple[list[ObjectRecord], dict, str]]:
-    """读场景清单缓存；返回 `(objects, stats_scalars, dynamic_masks_ref)` 或 None。"""
-    if not out_dir or not _cache_identity_valid(generation, key):
-        return None
-    p = Path(out_dir) / f"{scene_name}_inventory_{key}.json"
-    if not p.exists():
-        return None
-    try:
-        payload = json.loads(p.read_text())
-        from skill3d.infra.m5_identity import content_sha256, file_identity
-        payload_sha256 = payload.pop("payload_sha256")
-        if (payload.get("inventory_version") != _INVENTORY_VERSION
-                or payload.get("key") != key or payload.get("generation") != generation
-                or content_sha256(payload) != payload_sha256):
-            return None
-        objects = [ObjectRecord.model_validate(o) for o in payload["objects"]]
-        expected_refs = {str(getattr(obj, name)) for obj in objects
-                         for name in ("mask_per_frame", "pointcloud_world",
-                                      "pointconf_world", "centroid_ref")
-                         if getattr(obj, name, "")}
-        g7_ref = str(payload.get("dynamic_masks_ref") or "")
-        if g7_ref:
-            expected_refs.add(g7_ref)
-        if expected_refs != set(payload["artifact_hashes"]):
-            return None
-        for ref in expected_refs:
-            if file_identity(ref) != payload["artifact_hashes"][ref]:
-                return None
-    except Exception:  # noqa: BLE001 - 缓存损坏 → 当作未命中重算（不抛错阻断 episode）
-        return None
-    stats = dict(payload.get("stats") or {})
-    if g7_ref:
-        stats["dynamic_masks_ref"] = g7_ref
-    return objects, stats, g7_ref
-
-
-def _save_inventory(out_dir: Optional[str | Path], scene_name: str, key: str,
-                    objects: Sequence[ObjectRecord], stats: dict,
-                    dynamic_masks: Optional[np.ndarray], *,
-                    generation: dict | None = None,
-                    artifact_dir: str | Path | None = None) -> Optional[str]:
-    """写场景清单缓存（原子写）；返回 dynamic_masks ref（未给则空串）。"""
-    if not out_dir or not _cache_identity_valid(generation, key):
-        return ""
-    from skill3d.infra.m5_identity import content_sha256, file_identity
-
-    d = Path(out_dir)
-    d.mkdir(parents=True, exist_ok=True)
-    g7_ref = ""
-    if dynamic_masks is not None and np.asarray(dynamic_masks).size:
-        binary_dir = Path(artifact_dir) if artifact_dir else d / "inventory" / key
-        binary_dir.mkdir(parents=True, exist_ok=True)
-        g7_ref = str(binary_dir / "dynamic_masks.npy")
-        np.save(g7_ref, np.asarray(dynamic_masks))
-    refs = {str(getattr(obj, name)) for obj in objects
-            for name in ("mask_per_frame", "pointcloud_world", "pointconf_world", "centroid_ref")
-            if getattr(obj, name, "")}
-    if g7_ref:
-        refs.add(g7_ref)
-    payload = {
-        "inventory_version": _INVENTORY_VERSION,
-        "scene_name": str(scene_name), "key": key, "generation": generation,
-        "objects": [o.model_dump() for o in objects],
-        "stats": {k: v for k, v in stats.items() if k != "dynamic_masks"},
-        "dynamic_masks_ref": g7_ref,
-        "artifact_hashes": {ref: file_identity(ref) for ref in sorted(refs)},
-    }
-    payload["payload_sha256"] = content_sha256(payload)
-    p = d / f"{scene_name}_inventory_{key}.json"
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False))
-    tmp.replace(p)
-    return g7_ref
-
-
-# 基础清单的检测框上限（按检测置信度取最高的 N 条；[TODO_CALIBRATE]）。
-# 依据：M5 成本 ≈ 线性于 SAM2 传播条数（单条实测 2–25 s），未截断时单场景
-# 可达 83 条 → 单场景 25 min。截断后 24 个场景才可跑。
-# 截断**不丢题面物体**：逐题补漏会按题面名词补检（见 _bind_question_supplement）。
-MAX_BASE_DETECTIONS = 24
-
-# 单框面积占比上限：超过它的框按"场景尺度表面"处理，不进基础清单（[TODO_CALIBRATE]）。
-# 依据：这类框（wall/floor/大面积台面）的 mask 覆盖整个视野，SAM2 传播实测
-# 1.4 it/s（普通物体 13–31 it/s），是单场景耗时的主要来源；而它们几乎从不是
-# VSI-Bench 题面要点（inner 档只有 2 道题提到 wall，且都能用视觉估计作答）。
-# 需要时仍可由**逐题补漏**按题面名词补检，不受此上限约束。
-MAX_BOX_AREA_FRACTION = 0.45
-
-
-def _frame_hw(frames) -> Optional[tuple[int, int]]:
-    """探测帧的 (H, W)；取不到返回 None（此时面积过滤自动失效，不丢框）。"""
-    try:
-        a = np.asarray(frames[0])
-        return int(a.shape[0]), int(a.shape[1])
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _cap_detections(det, notes: list, frame_hw=None,
-                    cap: int = MAX_BASE_DETECTIONS,
-                    max_area_frac: float = MAX_BOX_AREA_FRACTION) -> list:
-    """把检测框按置信度截断到 `cap` 条（跨探测帧统一排序，保留高置信的）。
-
-    `det` 的元素是 `(frame_idx, label, box, conf)`；没有置信度时按**输入顺序**
-    截断（保证确定性，且不会因缺字段丢框）。
-    """
-    items = list(det or [])
-    if not items:
-        return items
-
-    def _conf(it):
-        # 四元组 (fi, label, box, conf) → 置信度；否则视为并列（保持原序）
-        return float(it[3]) if len(it) >= 4 and isinstance(it[3], (int, float)) else 1.0
-
-    # ① 场景尺度表面过滤：大框既慢又不是题面要点，交给逐题补漏按需补检
-    kept_idx = [i for i, it in enumerate(items)
-                if _box_area_fraction(it, frame_hw) <= max_area_frac]
-    n_dropped_area = len(items) - len(kept_idx)
-    if not kept_idx:                       # 全是超大框 → 不能清空，退回原集合
-        kept_idx = list(range(len(items)))
-        n_dropped_area = 0
-    items = [items[i] for i in kept_idx]
-
-    # ② 按置信度截断
-    if len(items) <= cap:
-        out = items
-    elif any(len(it) >= 4 and isinstance(it[3], (int, float)) for it in items):
-        order = sorted(range(len(items)), key=lambda i: (-_conf(items[i]), i))
-        out = [items[i] for i in sorted(order[:cap])]
-    else:
-        out = items[:cap]
-
-    notes.append(f"M5 检测框过滤 {len(kept_idx) + n_dropped_area} → {len(out)} 条"
-                 f"（先按面积占比 ≤{max_area_frac} 丢掉 {n_dropped_area} 个场景尺度"
-                 f"表面，再按置信度截断到 MAX_BASE_DETECTIONS={cap}；"
-                 "题面点名的物体由逐题补漏按需补检）")
-    return out
-
-
-def _box_area_fraction(item, frame_hw) -> float:
-    """框面积占整帧比例（无法判断时返回 0，即"不丢框"）。"""
-    if not frame_hw:
-        return 0.0
-    try:
-        h, w = float(frame_hw[0]), float(frame_hw[1])
-        box = item[2]
-        x0, y0, x1, y1 = (float(v) for v in box[:4])
-    except Exception:  # noqa: BLE001 - 结构不符即不参与过滤
-        return 0.0
-    if h <= 0 or w <= 0:
-        return 0.0
-    return max(0.0, (x1 - x0)) * max(0.0, (y1 - y0)) / (h * w)
-
-
-def _detector_boxes(frames: Sequence[np.ndarray], probe: Sequence[int],
-                    text_prompt: str, notes: list[str], *,
-                    stats: Optional[dict] = None) -> list[tuple[int, str, list[float], float]]:
-    """检测器探测（**失败要出声**）：返回 `(frame_idx, label, box, conf)` 列表。
-
-    置信度随框一起返回：基础清单要按它截断（`_cap_detections`），
-    否则无法在"保留最有把握的物体"和"控制 SAM2 传播成本"之间做取舍。
-    
-
-    历史缺陷（2026-09-21 实测）：`ovd.detect` 在服务不可用/超时时**静默返回 `[]`**，
-    调用方只在"新增了框"时才记 note → 检测器整段不可用时对象清单悄悄退化成
-    "只有 VLM 框"（outer_holdout 实测：同一 scene 一题只剩 2 个对象，程序路径直接不可答），
-    而日志里看不出任何异常。传输重试统一在 `ovd.detect` 内执行；逐帧保留最终
-    错误，不让后续健康帧覆盖，也不额外重试业务错误或健康空检测。
-    """
-    from skill3d.segmentation import open_vocab_detector as ovd
-
-    if not ovd.available() or not text_prompt:
-        return []
-    out: list[tuple[int, str, list[float], float]] = []
-    errors = []
-    for fi in probe:
-        for d in ovd.detect(frames[fi], text_prompt):
-            x0, y0, x1, y1 = d.bbox_xyxy
-            out.append((int(fi), d.label or "object", [x0, y0, x1, y1],
-                        float(getattr(d, "confidence", 0.0))))
-        err = str(getattr(ovd.detect, "last_error", "") or "")
-        if err:
-            errors.append(f"frame={fi}: {err}")
-    if errors:
-        if stats is not None:
-            stats["detector_fault"] = True
-        notes.append(
-            f"M5 检测器返回 {len(out)} 个框；**检测器侧降级**：{'; '.join(errors)}；"
-            "不得据此判定场景中不存在某物体")
-    elif not out:
-        notes.append("M5 检测器本轮探测无检出"
-                     "（服务正常，本轮确实没检出）")
-    return out
-
-
-@capture_detector_failures()
-def bind_objects_for_scene(
-    frames: Sequence[np.ndarray],
-    handle,
-    question: str = "",
-    *,
-    question_type: str = "",
-    options: Optional[Sequence[str]] = None,
-    depth_maps: Optional[np.ndarray] = None,
-    c2w_list: Optional[np.ndarray] = None,
-    intrinsics: Optional[np.ndarray] = None,
-    grid_transform: Optional[dict] = None,
-    out_dir: Optional[str | Path] = None,
-    scene_name: str = "scene",
-    predictor=None,
-    vlm_client=None,
-    frame_set_hash: str = "",
-    qa_id: str = "",
-    scene_identity: str = "",
-    use_inventory_cache: bool = True,
-    seed: Optional[int] = None,
-    point_conf: Optional[np.ndarray] = None,
-    depth_conf: Optional[np.ndarray] = None,
-    frame_provenance: Optional[Sequence[dict]] = None,
-    model_weights_sha256: str = "",
-) -> tuple[list[ObjectRecord], dict, list[str]]:
-    """M5 端到端（在线）：提示 → SAM2 传播 → 世界点云绑定 → G7/G9 统计。
-
-    返回 `(objects, stats, notes)`；`stats` 键：`track_ious`(G9)、
-    `dynamic_ratio`(G7)、`dynamic_masks`(G7)，
-    直接喂给 M4 的 `quality_gate`（G-18 数据源接线）。
-
-    **场景清单（v5.1 修订，2026-09-21）**：对象清单是 **scene 级产物**，由
-    ① 确定性检测器（完整室内词表，**与问题无关**）与 ② VLM 通用清单提示共同产生，
-    按 `(scene, frame_set_hash)` 缓存复用；③ 问题里的目标物再走一次**逐题补漏**
-    （只补清单里没有的），从而：
-    - 同一 scene 的多个 episode 看到**同一份对象清单**（id 稳定、可复现）；
-    - 检测器一旦不可用不再悄悄让清单塌缩（见 `_detector_boxes`）；
-    - 重复跑同一配置（噪声底/多 seed）不必重付 M5 的 GPU 成本。
-
-    v6 证据输入：
-    - `point_conf` / `depth_conf`：与 `depth_maps` 同网格的逐点 VGGT 置信度
-      （`point_conf` 优先；都缺省 → `pointconf_world` 写空串，不伪造），
-      随对象点云逐点落盘供 §12.2 的距离原语做软权重；
-    - 基础清单对象 `grounding_status="base_list"`、`track_id` 前缀 `trk`；
-      逐题补漏对象 `grounding_status="question_targeted_fill"`、前缀 `qtrk`；
-    - `stats["track_stable_ratio"]`：跨帧 track 稳定占比（每条 track 可见帧数/帧集帧数
-      的均值）→ §7.1 `track_consensus`；`count_objects` 依赖它是 available/degraded
-      而不是 unavailable（§7.2：required=unavailable 会直接隐藏该 Tool）。
-
-    缓存复用要求模型、实际数组/RGB及源码内容身份完整，且产物引用逐字节匹配。
-    """
-    from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
-
-    notes: list[str] = []
-    stats: dict = {}
-    if depth_maps is None or c2w_list is None:
-        return [], {}, ["M5 跳过：无深度/位姿产物，无法把 mask 反投影到世界系"]
-    original_point_conf = point_conf
-    if point_conf is None:
-        point_conf = depth_conf          # 兼容两种命名；都缺省 → 不落 conf
-
-    n_frames = len(frames)
-    # 4 个时间均匀探测帧（D-1）：单帧常常看不到目标物（实测同一视频帧 8/31 有桌子、
-    # 帧 0/16/24 没有）。
-    # v7 成本控制：探测帧从 4 帧降到 2 帧（首帧 + 中帧）。
-    # 依据：单次检测服务调用实测 **42–59 s**（GroundingDINO，82 类词表），
-    # 4 帧 × 24 场景 = 67 min 只是基础检测。2 帧仍能给每帧 ~14 个检出，
-    # 基础清单足够；题面点名的物体由逐题补漏单独保证（见那条路径的成本优化）。
-    probe = sorted({0, n_frames // 2}) if n_frames else []
-    from skill3d.infra.m5_identity import inventory_generation_identity
-    from skill3d.segmentation import open_vocab_detector as ovd
-    import uuid
-
-    generation = inventory_generation_identity(
-        scene_name=scene_name, frame_set_hash=frame_set_hash, frames=frames,
-        depth_maps=depth_maps, c2w_list=c2w_list, intrinsics=intrinsics,
-        point_conf=original_point_conf, depth_conf=depth_conf,
-        grid_transform=grid_transform, frame_provenance=frame_provenance,
-        predictor=predictor, vlm_client=vlm_client, seed=seed,
-        model_weights_sha256=model_weights_sha256,
-        parameters={
-            "probe": probe, "vocabulary": list(OBJECT_VOCABULARY),
-            "inventory_prompt": _GENERIC_INVENTORY_QUESTION, "max_vlm_objects": 8,
-            "max_base_detections": MAX_BASE_DETECTIONS,
-            "max_box_area_fraction": MAX_BOX_AREA_FRACTION,
-            "category_match_version": CATEGORY_MATCH_VERSION,
-            "mask_label_relation_version": MASK_LABEL_RELATION_VERSION,
-            "detector_box_threshold": ovd.DEFAULT_BOX_THRESHOLD,
-            "handle_hints": object_prompts_from_handle(handle),
-        })
-    key = _inventory_key(scene_name, frame_set_hash, depth_maps, n_frames,
-                         generation=generation)
-    cache_enabled = bool(use_inventory_cache and generation["cache_eligible"])
-    if use_inventory_cache and not cache_enabled:
-        notes.append(f"M5 持久缓存关闭：无法核验身份 {generation['missing']}")
-    # Each publication owns fresh files, including after a corrupt cache miss.
-    generation_dir = (Path(out_dir) / "inventory" / key / uuid.uuid4().hex
-                      if out_dir is not None else None)
-
-    objects: list[ObjectRecord] = []
-    cached_stats: dict = {}
-    cache_hit = False
-    if cache_enabled:
-        cached = _load_inventory(out_dir, scene_name, key, generation=generation)
-        if cached is not None:
-            cache_hit = True
-            objects, cached_stats, g7_ref = cached
-            stats.update({k: v for k, v in cached_stats.items() if k != "dynamic_masks_ref"})
-            if g7_ref:
-                stats["dynamic_masks"] = np.load(g7_ref)
-            notes.append(
-                f"M5 场景清单缓存命中（{scene_name}/{key}）：直接复用 {len(objects)} 个对象"
-                f"与 G7/G9 统计（零重算；对象是 scene 级产物）")
-
-    if not cache_hit:
-        # ---- ① + ② 场景清单（与问题无关）：检测器全词表 ∪ VLM 通用清单 ----
-        hints: list[str] = []
-        boxes: list[list[float]] = []
-        confidences: list[float] = []
-        det_conf_sources: list[str] = []
-        prompt_list: list[tuple[int, int, list[float]]] = []
-        if vlm_client is not None and n_frames:
-            inv_hints, inv_boxes, used_frames = _vlm_inventory_pass(frames, probe,
-                                                                   vlm_client, seed=seed)
-            stats["inventory_vlm_errors"] = list(
-                getattr(_vlm_inventory_pass, "last_errors", []))
-            for (fi, h, b) in zip(used_frames, inv_hints, inv_boxes):
-                hints.append(h)
-                boxes.append(b)
-                confidences.append(0.0)
-                det_conf_sources.append("vlm_box")
-                prompt_list.append((fi, len(prompt_list), b))
-            if inv_hints:
-                notes.append(f"M5 VLM 通用清单：{len(inv_hints)} 个框"
-                             f"（{sorted(set(inv_hints))[:8]}）")
-        text_prompt = ovd_prompt_full_vocabulary()
-        det = _detector_boxes(frames, probe, text_prompt, notes, stats=stats)
-        # v7 成本控制：基础清单按检测置信度**截断**。
-        # 为什么安全：M5 的成本几乎线性于 SAM2 传播条数（实测单条 2–25 s），
-        # 而未截断时一个场景可达 80+ 条 → 单场景 25 min，24 个场景不可接受。
-        # 截断不会漏掉题目要用的物体：**逐题补漏**（`_bind_question_supplement`）
-        # 会按题面名词再用确定性检测器补检一次，那是"按需付费"。
-        det = _cap_detections(det, notes, _frame_hw(frames))
-        for (fi, label, b, conf) in det:
-            hints.append(label)
-            boxes.append(b)
-            confidences.append(float(conf))
-            det_conf_sources.append("groundingdino")
-            prompt_list.append((fi, len(prompt_list), b))
-        if det:
-            notes.append(f"M5 检测器（全词表 {len(OBJECT_VOCABULARY)} 类）在 {len(probe)} 个"
-                         f"探测帧给出 {len(det)} 个框"
-                         f"（{sorted(set(h for _, h, _b, _c in det))[:8]}）")
-        if not boxes:
-            h_hints, h_boxes = object_prompts_from_handle(handle)
-            if h_boxes:
-                hints, boxes = h_hints, h_boxes
-                confidences = [0.0] * len(boxes)
-                det_conf_sources = ["handle_hint"] * len(boxes)
-                prompt_list = [(0, i, b) for i, b in enumerate(boxes)]
-        if not boxes and n_frames:
-            notes.append("M5 场景清单为空（VLM 未给框且检测器不可用）→ 对象类 Tool 将 "
-                         "fail-closed（不伪造'场景里没有'，硬约束 23）")
-
-        masks_per_object = (track_objects(frames, boxes, predictor,
-                                         prompts=prompt_list or None,
-                                         handle=handle, question="")
-                            if boxes else [])
-        objects = bind_masks_to_world(masks_per_object, depth_maps, c2w_list, intrinsics,
-                                      class_hints=hints or None,
-                                      confidences=confidences or None,
-                                      det_conf_sources=det_conf_sources or None,
-                                      out_dir=generation_dir,
-                                      scene_name=scene_name, grid_transform=grid_transform,
-                                      point_conf=point_conf,
-                                      track_prefix=TRACK_PREFIX_BASE_LIST,
-                                      grounding_status="base_list",
-                                      prompt_provenance=[
-                                          {"stage": "base_inventory", "frame_slot": fi}
-                                          for fi, _oid, _box in prompt_list])
-        # 去重（§3 M5 字段 5）：类别 + 世界质心距离 + 时序重叠三判据
-        objects, n_dup, groups = _dedupe_by_world_centroid(
-            objects, depth_maps, masks_per_object=masks_per_object)
-        kept_masks = _merge_mask_groups(masks_per_object, groups)
-        n_suspect = sum(1 for o in objects if o.duplicate_suspect)
-        notes.append(f"M5 场景清单绑定 {len(objects)} 个对象"
-                     f"（SAM2 传播 {len(masks_per_object)} 条，3D 去重 {n_dup} 个，"
-                     f"重复嫌疑 {n_suspect} 个 → count_objects 按 track 共识计数）")
-        ious = track_ious_from_masks(kept_masks)
-        if ious:
-            stats["track_ious"] = ious
-        ratio = track_stable_ratio(objects, n_frames)
-        if ratio is not None:
-            stats["track_stable_ratio"] = ratio
-        tcm = track_consensus_metrics(objects, n_propagations=len(masks_per_object),
-                                      n_frames=n_frames)
-        if tcm is not None:
-            stats["track_consensus"] = tcm
-        stats["base_inventory"] = inventory_scope_statistics(
-            objects, n_frames=n_frames, scope="base_inventory",
-            n_propagations=len(masks_per_object), n_dedup_groups=len(groups),
-            n_dedup_absorbed=n_dup, consensus=tcm)
-        dyn, dnotes = dynamic_mask_from_rigidity(frames, depth_maps, c2w_list, intrinsics)
-        notes.extend(dnotes)
-        if dyn.size:
-            stats["dynamic_ratio"] = float(dyn.mean())
-            stats["dynamic_masks"] = dyn
-        if ratio is not None:
-            notes.append(f"M5 track 稳定占比={ratio:.3f}"
-                         f"（每条 track 可见帧数/帧集帧数的均值 → §7.1 track_consensus）")
-        if (cache_enabled and not stats.get("detector_fault")
-                and not stats.get("inventory_vlm_errors")):
-            _save_inventory(out_dir, scene_name, key, objects,
-                            {k: v for k, v in stats.items() if k != "dynamic_masks"},
-                            stats.get("dynamic_masks"), generation=generation,
-                            artifact_dir=generation_dir)
-    else:
-        # 缓存命中：G9/G7 是 scene 级统计，直接复用缓存值（不重算、不回读掩码）——
-        # 与首次计算口径完全一致；回读掩码重算会把"全零帧"算进 IoU 对，反而偏。
-        if "track_stable_ratio" not in stats:
-            # 老缓存缺该键（或调用方手写 stats）→ 由清单现算，保证证据不缺项
-            ratio = track_stable_ratio(objects, n_frames)
-            if ratio is not None:
-                stats["track_stable_ratio"] = ratio
-        notes.append(f"M5 复用缓存 G7/G9 统计（track_ious="
-                     f"{'有' if stats.get('track_ious') else '无'}，"
-                     f"dynamic_ratio={'有' if 'dynamic_ratio' in stats else '无'}，"
-                     f"dynamic_masks={'有' if 'dynamic_masks' in stats else '无'}）")
-
-    stats["generation_identity"] = generation
-    stats["inventory_key"] = key
-    stats["inventory_cache"] = {"enabled": cache_enabled, "hit": cache_hit,
-                                "missing_identity": generation["missing"]}
-    local_qa_id = str(qa_id or hashlib.sha256(json.dumps(
-        {"question": question, "options": list(options or [])},
-        ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16])
-    binding_scene_identity = str(scene_identity or frame_set_hash or scene_name)
-    audited, _ = audit_semantic_mask_conflicts(
-        [(local_qa_id, objects)], scene_identity=binding_scene_identity)
-    objects = audited[local_qa_id]
-
-    # ---- ③ 逐类别补漏：全部可读冻结帧，检测器阶段后才进入 VLM 阶段 ----
-    if n_frames and (question or options):
-        sup_objs, sup_stats, sup_note = _bind_question_supplement(
-            frames, probe, question, objects, depth_maps, c2w_list, intrinsics,
-            grid_transform=grid_transform, out_dir=out_dir, scene_name=scene_name,
-            predictor=predictor, vlm_client=vlm_client, handle=handle, seed=seed,
-            point_conf=point_conf, question_type=question_type, options=options,
-            qa_id=local_qa_id, scene_identity=binding_scene_identity,
-            frame_provenance=frame_provenance, generation_identity=generation["sha256"])
-        if sup_note:
-            notes.append(sup_note)
-        if sup_stats.get("grounding"):
-            stats["grounding"] = dict(sup_stats["grounding"])
-        stats["question_supplement"] = sup_stats.get("question_supplement", {})
-        if sup_objs:
-            objects = list(objects) + sup_objs
-            extra = [float(v) for v in (sup_stats.get("track_ious") or [])]
-            if extra:
-                prev = list(stats.get("track_ious") or [])
-                stats["track_ious"] = prev + extra
-
-    # 单题内也复用同一冲突合同；paired driver 会在全部题绑定完成后再次跨题审计。
-    audited, conflict_audits = audit_semantic_mask_conflicts(
-        [(local_qa_id, objects)],
-        scene_identity=binding_scene_identity)
-    objects = audited[local_qa_id]
-    stats["question_inventory"] = inventory_scope_statistics(
-        objects, n_frames=n_frames, scope="question_inventory")
-    stats.setdefault("question_supplement", inventory_scope_statistics(
-        [], n_frames=n_frames, scope="question_supplement", n_propagations=0,
-        n_dedup_groups=0, n_dedup_absorbed=0))
-    if stats.get("grounding"):
-        stats["grounding"] = refresh_grounding_coverage(stats["grounding"], objects)
-    stats["semantic_conflict_audits"] = conflict_audits
-    hard_conflicts = [a for a in conflict_audits
-                      if a.get("code") == "semantic_label_mask_conflict"]
-    if hard_conflicts:
-        notes.append(
-            f"M5 绑定完整性审计：发现 {len(hard_conflicts)} 组明确不相容 mask 标签冲突；"
-            "对象保留供视觉路径使用，依赖对象几何的 Tool fail-closed")
-
-    if stats.get("track_ious"):
-        notes.append(f"G9 跟踪 IoU 均值={float(np.mean(stats['track_ious'])):.3f}"
-                     "（去重后对象集）")
-    stats["detector_errors"] = current_detector_failures()
-    stats["detector_fault"] = bool(stats.get("detector_fault") or stats["detector_errors"])
-    return objects, stats, notes
-
-
-def ovd_prompt_from_nouns(nouns: Sequence[str]) -> str:
-    """共用入口：名词 → 检测器文本 prompt（单数化 + 去重 + 保序）。"""
-    from skill3d.segmentation import open_vocab_detector as ovd
-
-    sing = [_singularize(n) for n in nouns if str(n).strip()]
-    return ovd.prompt_from_nouns(list(dict.fromkeys(sing))) if sing else ""
-
-
-def ovd_prompt_full_vocabulary() -> str:
-    """场景清单用的**完整**室内词表 prompt（与问题无关 → 可缓存、可复现）。
-
-    历史缺陷（2026-09-21 实测）：旧实现只把 `OBJECT_VOCABULARY[:12]` 补进 prompt，
-    且以问题名词为主 → 与问题无关的类别（chair/table/counter…）大量缺失，
-    计数题的 `count_objects` 直接失真。这里改用完整词表。
-    """
-    from skill3d.segmentation import open_vocab_detector as ovd
-
-    return ovd.prompt_from_nouns(list(OBJECT_VOCABULARY))
-
-
-def _vlm_inventory_pass(frames: Sequence[np.ndarray], probe: Sequence[int], vlm_client,
-                        *, seed: Optional[int] = None
-                        ) -> tuple[list[str], list[list[float]], list[int]]:
-    """VLM **通用清单**（与问题无关）：在 4 个探测帧上问"有哪些主要物体"。
-
-    与逐题补漏（`_bind_question_supplement`）配合：通用清单保证 scene 级清单完整、
-    可缓存；补漏保证题目点名的物体一定在清单里。
-    """
-    hints: list[str] = []
-    boxes: list[list[float]] = []
-    used: list[int] = []
-    _vlm_inventory_pass.last_errors = []
-    for fi in probe:
-        # 目标数下调（12 → 8，v7 成本控制）：基础清单只需覆盖"常见物体"，
-        # 题面点名的物体由逐题补漏保证；成本随框数线性增长。
-        h, b = box_prompts_from_vlm(frames, _GENERIC_INVENTORY_QUESTION, vlm_client,
-                                    frame_idx=fi, max_objects=8, seed=seed)
-        if getattr(box_prompts_from_vlm, "last_error", ""):
-            _vlm_inventory_pass.last_errors.append({
-                "frame_slot": fi, "error": box_prompts_from_vlm.last_error})
-        for hi, bi in zip(h, b):
-            hints.append(hi)
-            boxes.append(bi)
-            used.append(int(fi))
-    return hints, boxes, used
-
-
-def question_object_names_from_vlm(question: str, client, *,
-                                   seed: Optional[int] = None,
-                                   max_names: int = 6) -> list[str]:
-    """用在线 VLM 从题面抽出**被点名的物体名**（不依赖正则句式，覆盖 VSI-Bench 各种问法）。
-
-    为什么不让正则抽：官方问法里 "If I am standing by the telephone and facing the cup,
-    is the trash can to my left…"、"You are a robot beginning at the door with the clock
-    above it…" 无法由固定句式稳定覆盖 → 正则给空 → 补漏框为空 →
-    题目点名的物体没进清单 → 程序只能 abstain（inner_validation 1501–1504 实测）。
-    这里只做"名词抽取"，不涉及几何、不涉及答案。
-    """
-    import json as _json
-    import re as _re
-
-    question_object_names_from_vlm.last_error = ""
-    question_object_names_from_vlm.last_request_sha256 = ""
-    if client is None or not str(question).strip():
-        question_object_names_from_vlm.last_error = "vlm_not_configured_or_empty_question"
-        return []
-    prompt = (
-        f"Question: {question}\n"
-        "List objects mentioned or referred to in the question, for locating them in indoor images. "
-        f"Include at most {max_names} names, using common English singular object names "
-        '(such as telephone, cup, trash can). Output only a JSON array, '
-        'for example ["telephone", "cup", "trash can"]. Do not explain.'
-    )
-    question_object_names_from_vlm.last_request_sha256 = hashlib.sha256(json.dumps(
-        {"prompt": prompt, "seed": seed, "max_tokens": 128},
-        sort_keys=True).encode()).hexdigest()
-    try:
-        text = client.chat([{"role": "user", "content": prompt}],
-                           max_tokens=128, seed=seed)
-    except Exception as exc:  # noqa: BLE001
-        question_object_names_from_vlm.last_error = f"{type(exc).__name__}: {exc}"
-        return []
-    m = _re.search(r"\[.*\]", str(text), _re.DOTALL)
-    if not m:
-        question_object_names_from_vlm.last_error = "no_json_array"
-        return []
-    try:
-        items = _json.loads(m.group(0))
-    except Exception as exc:  # noqa: BLE001
-        question_object_names_from_vlm.last_error = f"invalid_json: {exc}"
-        return []
-    out: list[str] = []
-    for it in items if isinstance(items, list) else []:
-        name = str(it).strip().strip('"').lower()
-        if 0 < len(name) <= 40 and name not in out:
-            out.append(name)
-    return out[:max_names]
-
-
-def ovd_boxes_for_nouns(frames: Sequence[np.ndarray], probe: Sequence[int],
-                        nouns: Sequence[str], *,
-                        box_threshold: Optional[float] = None
-                        ) -> tuple[list[str], list[list[float]],
-                                   list[tuple[int, int, list[float]]], list[float]]:
-    """用**确定性检测器**（GroundingDINO）按给定名词在探测帧上定位。
-
-    为什么必须有这条路（2026-09-22 真实实测，根因）：逐题补漏此前**只**走
-    `box_prompts_from_vlm`，而本模块 `open_vocab_detector` 的文件头已记录该 8B 模型
-    "纯文本列举能说出物体名，一旦要求输出 0–1000 JSON bbox 就返回 `[]`"。
-    后果实测：inner 档 16 道 rel_direction 里 **13 道**因为题面点名的参照物
-    （power strip / ceiling light / coat rack / paper bag / exhaust fan）
-    没能进清单而整题作废；计数题里 ceiling light(GT=4)、heater(GT=2)、
-    bucket(GT=2) 全部返回 0。检测器是确定性的、且本就以"问题名词"为输入，
-    用它做补漏比让 VLM 吐框可靠得多。
-
-    返回 `(class_hints, boxes, prompt_list, confidences)`；`boxes` 是**像素**框
-    （与 `box_prompts_from_vlm` 的返回口径一致），`prompt_list` 为
-    `(frame_idx, box_index, box)` 三元组，供 SAM2 逐帧提示；`confidences`
-    与候选严格对齐，保留 GroundingDINO 原始置信度。
-    """
-    from skill3d.segmentation import open_vocab_detector as ovd
-
-    hints: list[str] = []
-    boxes: list[list[float]] = []
-    prompt_list: list[tuple[int, int, list[float]]] = []
-    confidences: list[float] = []
-    prompt = ovd_prompt_from_nouns(nouns)
-    if not prompt or not ovd.available():
-        return hints, boxes, prompt_list, confidences
-    thr = (ovd.DEFAULT_BOX_THRESHOLD if box_threshold is None else float(box_threshold))
-    for fi in probe:
-        idx = int(fi)
-        if idx < 0 or idx >= len(frames):
-            continue
-        for d in ovd.detect(frames[idx], prompt, box_threshold=thr):
-            box = [float(v) for v in d.bbox_xyxy]
-            if box[2] - box[0] < 2 or box[3] - box[1] < 2:
-                continue
-            hints.append(_PromptLabel(d.label))
-            boxes.append(box)
-            prompt_list.append((idx, len(prompt_list), box))
-            confidences.append(float(getattr(d, "confidence", 0.0)))
-    return hints, boxes, prompt_list, confidences
-
-
-def _binding_conflicted(obj):
-    return any(flag.get("code") == "semantic_label_mask_conflict"
-               for flag in (obj.binding_flags or []))
-
-
-def _binding_usable(obj):
-    """二维非空支撑与绑定硬门；不把点云质量当成类别覆盖阈值。"""
-    if _binding_conflicted(obj):
-        return False
-    if obj.mask_per_frame:
-        try:
-            mask = np.load(obj.mask_per_frame, allow_pickle=False, mmap_mode="r")
-            return bool(mask.ndim == 3 and any(frame.any() for frame in mask))
-        except (OSError, ValueError):
-            return False
-    # 未落盘的直接内存接口仍有 bind_masks_to_world 计算的非空支撑证据。
-    return bool(obj.visible_frames and obj.mask_support_ratio > 0)
-
-
-def _grounding_coverage(names, objects, *, candidate_names=(), question_type=""):
-    requirements = []
-    usable_ids = {o.obj_id for o in objects if _binding_usable(o)}
-    for name in names:
-        role = ("candidate" if any(matches(name, c) for c in candidate_names)
-                else "reference" if question_type == "object_rel_distance" else "target")
-        candidates = [o for o in objects if matches(name, o.category_name)]
-        ids = sorted(o.obj_id for o in candidates)
-        usable = sorted(o.obj_id for o in candidates if o.obj_id in usable_ids)
-        conflicted = sorted(o.obj_id for o in candidates if _binding_conflicted(o))
-        status = ("missing" if not usable else "ambiguous"
-                  if role == "reference" and len(usable) > 1 else "present")
-        requirements.append({
-            "name": name, "role": role, "object_ids": ids, "status": status,
-            "candidate_count": len(ids), "usable_object_ids": usable,
-            "conflicted_object_ids": conflicted,
-            "instance_resolved": True if len(usable) == 1 else None,
-            "instance_resolution_reason": (
-                "single_usable_candidate" if len(usable) == 1 else
-                "multiple_candidates_not_disambiguated" if usable else "no_usable_candidate"),
-        })
-    missing = [r["name"] for r in requirements if not r["object_ids"]]
-    unresolved = [r["name"] for r in requirements if not r["usable_object_ids"]]
-    ambiguous = [r["name"] for r in requirements if r["status"] == "ambiguous"]
-    present = any(r["usable_object_ids"] for r in requirements)
-    reference_unresolved = (question_type == "object_rel_distance"
-                            and not any(r["role"] == "reference" for r in requirements))
-    binding_complete = bool(requirements) and not unresolved
-    complete = binding_complete and not ambiguous and not reference_unresolved
-    status = ("not_checked" if not requirements else "complete" if complete else
-              "ambiguous" if ambiguous and not unresolved else "partial" if present else "missing")
-    return {
-        "attempted": bool(requirements), "status": status, "requirements": requirements,
-        "required_names": list(names), "missing_names": missing, "ambiguous_names": ambiguous,
-        "candidate_names": list(candidate_names), "question_type": question_type,
-        "unresolved_names": unresolved,
-        "category_coverage_complete": bool(requirements) and not missing,
-        "binding_coverage_complete": binding_complete,
-        "reference_unresolved": reference_unresolved,
-        "all_present": complete, "miss": bool(requirements) and not present,
-    }
-
-
 def refresh_grounding_coverage(grounding, objects):
-    """最后审计后重算事实，保留请求与探测历史，不隐式续补。"""
-    current = _grounding_coverage(
-        grounding.get("required_names", []), objects,
-        candidate_names=grounding.get("candidate_names", []),
-        question_type=grounding.get("question_type", ""))
-    previous = {r["name"]: r for r in grounding.get("requirements", [])}
-    for row in current["requirements"]:
-        history = previous.get(row["name"], {})
-        for key in ("probed_slots", "detector_errors", "vlm_errors", "termination_reason"):
-            if key in history:
-                row[key] = history[key]
-        if row["name"] in current["unresolved_names"] and (
-                row.get("termination_reason") == "resolved"):
-            row["termination_reason"] = "unresolved_after_final_audit"
-    return {**grounding, **current}
-
-
-def _bind_question_supplement(frames, probe, question, existing, depth_maps, c2w_list,
-                              intrinsics, *, grid_transform, out_dir, scene_name,
-                              predictor, vlm_client, handle, seed: Optional[int] = None,
-                              point_conf=None, question_type="", options=None,
-                              qa_id="", scene_identity="", frame_provenance=None,
-                              generation_identity=""
-                              ) -> tuple[list[ObjectRecord], dict, str]:
-    """有限两阶段定位；每槽一次业务请求，健康绑定后逐类别移出。"""
-    from skill3d.segmentation import open_vocab_detector as ovd
-    from skill3d.reconstruction_gate.confidence_map import track_ious_from_masks
-
-    started = time.perf_counter()
-    import uuid
-    publication_id = uuid.uuid4().hex
-    named = question_object_names_from_vlm(question, vlm_client, seed=seed)
-    extraction = {
-        "request_sha256": getattr(question_object_names_from_vlm, "last_request_sha256", ""),
-        "error": getattr(question_object_names_from_vlm, "last_error", ""),
-        "names": list(named),
-    }
-    if not named:
-        named = object_prompts_from_question(question)
-        extraction["fallback_names"] = list(named)
-    candidate_names = ([option_category(o) for o in (options or [])]
-                       if question_type == "object_rel_distance" else [])
-    required = list(dict.fromkeys(str(n).strip() for n in [*named, *candidate_names]
-                                 if str(n).strip()))
-    request_key = hashlib.sha256(json.dumps(
-        {"question": question, "options": list(options or []), "seed": seed, "qa_id": qa_id,
-         "existing_ids": sorted(o.obj_id for o in existing), "contract": "full-frame-fill-v1",
-         "generation_identity": generation_identity},
-        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    local_qa_id = str(qa_id or request_key)
-    current = list(existing)
-    initial_ids = {o.obj_id for o in existing}
-    receipts, stages, ious = [], [], []
-    total_boxes = total_propagations = 0
-    audited, _ = audit_semantic_mask_conflicts(
-        [(local_qa_id, current)], scene_identity=str(scene_identity or scene_name))
-    current = audited[local_qa_id]
-    readable = [i for i, frame in enumerate(frames)
-                if frame is not None and np.asarray(frame).ndim == 3 and np.asarray(frame).size]
-    # 首帧/中帧优先，其他可读槽位升序；probe 不扩展或重排冻结输入。
-    order = list(dict.fromkeys([i for i in (0, len(frames) // 2) if i in readable] + readable))
-    if frame_provenance is not None and len(frame_provenance) != len(frames):
-        raise ValueError("M5 frame provenance must align with readable pixel slots")
-    history = {name: {"probed_slots": {"detector": [], "vlm": []},
-                      "detector_errors": [], "vlm_errors": []} for name in required}
-
-    def coverage():
-        return _grounding_coverage(required, current, candidate_names=candidate_names,
-                                   question_type=question_type)
-
-    d = np.asarray(depth_maps, dtype=np.float64)
-    d = d[np.isfinite(d) & (d > 0)]
-    tol = 0.15 * (float(np.median(d)) if d.size else 1.0)  # 原有去重数值合同
-    initial = coverage()
-    skipped = bool(required and not initial["unresolved_names"])
-    for phase in ("detector", "vlm"):
-        if skipped or (required and not coverage()["unresolved_names"]):
-            stages.append({"phase": phase, "status": "skipped", "reason": "bindings_resolved"})
-            continue
-        unavailable = ("no_required_names" if phase == "detector" and not required else
-                       "detector_not_configured" if phase == "detector" and not ovd.available() else
-                       "vlm_not_configured" if phase == "vlm" and vlm_client is None else "")
-        if unavailable:
-            stages.append({"phase": phase, "status": "not_performed", "reason": unavailable})
-            continue
-        phase_receipts = []
-        stage_reason = "all_readable_slots_exhausted" if order else "no_readable_frames"
-        for fi in order:
-            before = coverage()["unresolved_names"]
-            if required and not before:
-                stage_reason = "bindings_resolved"
-                break
-            if not required and any(_binding_usable(o) for o in current
-                                    if o.obj_id not in initial_ids):
-                stage_reason = "generic_binding_obtained"
-                break
-            ask = (ovd_prompt_from_nouns(before) if phase == "detector" else
-                   "Locate the following objects in this indoor photo. Report all visible "
-                   "instances and omit objects you cannot see: " + ", ".join(before)
-                   if required else question)
-            digest = hashlib.sha256()
-            rgb = np.ascontiguousarray(frames[fi])
-            digest.update(str((rgb.shape, rgb.dtype.str)).encode())
-            digest.update(memoryview(rgb).cast("B"))
-            receipt = {
-                "phase": phase, "frame_slot": fi, "pass_index": len(receipts),
-                "source_frame_index": None, "timestamp": None,
-                "required_names": required, "unresolved_before": list(before),
-                "prompt": ask, "prompt_sha256": hashlib.sha256(ask.encode()).hexdigest(),
-                "request_sha256": hashlib.sha256(json.dumps(
-                    {"rgb_sha256": digest.hexdigest(), "prompt": ask, "seed": seed,
-                     "phase": phase, "box_threshold": ovd.DEFAULT_BOX_THRESHOLD},
-                    sort_keys=True).encode()).hexdigest(),
-                "requested": True, "transport_attempts": [],
-            }
-            if frame_provenance is not None:
-                receipt.update(frame_provenance[fi])
-            pass_started = time.perf_counter()
-            error = ""
-            hints, boxes, confidences = [], [], []
-            try:
-                if phase == "detector":
-                    ovd.detect.last_error = ""
-                    with capture_detector_attempts() as attempts:
-                        hints, boxes, _prompts, confidences = ovd_boxes_for_nouns(
-                            frames, [fi], before)
-                    receipt["transport_attempts"] = list(attempts)
-                    receipt["actual_request_sha256"] = (
-                        attempts[0].get("request_sha256", "") if attempts else "")
-                    error = getattr(ovd.detect, "last_error", "")
-                else:
-                    box_prompts_from_vlm.last_error = ""
-                    box_prompts_from_vlm.last_request_sha256 = ""
-                    hints, boxes = box_prompts_from_vlm(
-                        frames, ask, vlm_client, frame_idx=fi, max_objects=8, seed=seed)
-                    confidences = [0.0] * len(boxes)
-                    error = getattr(box_prompts_from_vlm, "last_error", "")
-                    receipt["actual_request_sha256"] = getattr(
-                        box_prompts_from_vlm, "last_request_sha256", "")
-            except Exception as exc:  # noqa: BLE001 - finite stage and audited failure
-                error = f"{type(exc).__name__}: {exc}"
-            receipt["request_elapsed_s"] = time.perf_counter() - pass_started
-            receipt["error"] = error
-            receipt["n_boxes_raw"] = len(boxes)
-            selected = [i for i, hint in enumerate(hints)
-                        if not required or any(matches(hint, name) for name in before)]
-            hints = [hints[i] for i in selected]
-            boxes = [boxes[i] for i in selected]
-            confidences = [confidences[i] for i in selected]
-            receipt["n_boxes"] = len(boxes)
-            total_boxes += len(boxes)
-            for name in before:
-                history[name]["probed_slots"][phase].append(fi)
-                if error:
-                    history[name][phase + "_errors"].append({"frame_slot": fi, "error": error})
-            receipt["new_object_ids"] = []
-            receipt["sam2_elapsed_s"] = 0.0
-            if boxes:
-                bind_started = time.perf_counter()
-                pass_key = f"{phase}-slot{fi:04d}-pass{len(receipts):04d}"
-                supplement_dir = (Path(out_dir) / "question_grounding" / request_key
-                                  / publication_id / pass_key
-                                  if out_dir is not None else None)
-                try:
-                    prompts = [(fi, i, b) for i, b in enumerate(boxes)]
-                    masks = track_objects(frames, boxes, predictor, prompts=prompts,
-                                          handle=handle, question=question)
-                    total_propagations += len(masks)
-                    receipt["n_propagations"] = len(masks)
-                    prefix = f"{TRACK_PREFIX_QUESTION}:{request_key}:{pass_key}:"
-                    cand = bind_masks_to_world(
-                        masks, depth_maps, c2w_list, intrinsics, class_hints=hints,
-                        confidences=confidences,
-                        det_conf_sources=[("groundingdino" if phase == "detector" else "vlm_box")]
-                                         * len(boxes),
-                        out_dir=supplement_dir, scene_name=scene_name,
-                        grid_transform=grid_transform, point_conf=point_conf,
-                        track_prefix=prefix, grounding_status="question_targeted_fill",
-                        prompt_provenance=[{
-                            "stage": "question_supplement", "phase": phase,
-                            "frame_slot": fi, "pass_identity": pass_key,
-                            "request_sha256": receipt["request_sha256"],
-                            "required_names": list(before),
-                        } for _ in boxes])
-                    cand, n_dup, groups = _dedupe_by_world_centroid(
-                        cand, depth_maps, masks_per_object=masks)
-                    receipt["n_dedup_absorbed"] = n_dup
-                    receipt["n_dedup_groups"] = len(groups)
-                    existing_ids = {o.obj_id for o in current}
-                    next_id = 0
-                    kept_masks = []
-                    for obj, group in zip(cand, groups):
-                        if _binding_usable(obj) and any(
-                            _binding_usable(b) and matches(obj.category_name, b.category_name)
-                            and np.linalg.norm(np.asarray(obj.centroid_world) -
-                                               np.asarray(b.centroid_world)) < tol
-                            for b in current):
-                            continue
-                        while f"obj_{next_id}" in existing_ids:
-                            next_id += 1
-                        new_id = f"obj_{next_id}"
-                        existing_ids.add(new_id)
-                        current.append(obj.model_copy(update={"obj_id": new_id}))
-                        receipt["new_object_ids"].append(new_id)
-                        kept_masks.append(_merge_mask_groups(masks, [group])[0])
-                    ious.extend(track_ious_from_masks(kept_masks) or [])
-                    audited, audits = audit_semantic_mask_conflicts(
-                        [(local_qa_id, current)], scene_identity=str(scene_identity or scene_name))
-                    current = audited[local_qa_id]
-                    receipt["conflict_audit_ids"] = [
-                        a["audit_sha256"] for a in audits
-                        if a.get("code") == "semantic_label_mask_conflict"]
-                except Exception as exc:  # noqa: BLE001 - no fabricated binding success
-                    receipt["binding_error"] = f"{type(exc).__name__}: {exc}"
-                receipt["sam2_elapsed_s"] = time.perf_counter() - bind_started
-            receipt["unresolved_after"] = coverage()["unresolved_names"]
-            receipt["elapsed_s"] = time.perf_counter() - pass_started
-            receipts.append(receipt)
-            phase_receipts.append(receipt)
-            if error and phase == "detector":
-                stage_reason = "detector_unavailable_after_finite_transport_attempts"
-                break
-        stages.append({
-            "phase": phase, "status": "performed" if phase_receipts else "not_performed",
-            "reason": stage_reason, "business_requests": len(phase_receipts),
-            "slots": [r["frame_slot"] for r in phase_receipts],
-        })
-    final = coverage()
-    for row in final["requirements"]:
-        row.update(history[row["name"]])
-        row["termination_reason"] = (
-            "resolved" if row["usable_object_ids"] else
-            "no_readable_frames" if not order else
-            "all_readable_slots_exhausted"
-            if all(len(row["probed_slots"][p]) == len(order) for p in ("detector", "vlm"))
-            else "unresolved_with_unavailable_stage")
-    # Existing records receive newly discovered flags as well as newly added candidates.
-    if isinstance(existing, list):
-        existing[:] = [o for o in current if o.obj_id in initial_ids]
-    out = [o for o in current if o.obj_id not in initial_ids]
-    final.update({
-        "n_boxes": total_boxes, "n_new": len(out), "skipped_detection": skipped,
-        "readable_slots": readable, "probe_order": order, "stages": stages,
-        "phase_receipts": receipts, "noun_extraction": extraction,
-        "request_identity": request_key, "business_request_bound_per_phase": len(order),
-        "n_propagations": total_propagations, "elapsed_s": time.perf_counter() - started,
-    })
-    supplement_statistics = inventory_scope_statistics(
-        out, n_frames=len(frames), scope="question_supplement",
-        n_propagations=total_propagations,
-        n_dedup_groups=sum(r.get("n_dedup_groups", 0) for r in receipts),
-        n_dedup_absorbed=sum(r.get("n_dedup_absorbed", 0) for r in receipts))
-    supplement_statistics["passes"] = [{
-        key: r.get(key) for key in ("phase", "frame_slot", "n_propagations",
-                                    "n_dedup_groups", "n_dedup_absorbed", "new_object_ids",
-                                    "binding_error")} for r in receipts]
-    stats = {"grounding": final, "question_supplement": supplement_statistics}
-    if ious:
-        stats["track_ious"] = ious
-    note = (f"M5 逐题补漏：题面物体 {required} 均已在场景清单中（跳过检测调用）"
-            if skipped else
-            f"M5 逐题补漏：{len(receipts)} 次槽位请求、{total_boxes} 个框 → 新绑 {len(out)} 个；"
-            f"未解决={final['unresolved_names']}")
-    return out, stats, note
+    """Refresh audited question coverage without model requests."""
+    from .question_binding import refresh_coverage
+    return refresh_coverage(grounding, objects)
 
 
 def inventory_scope_statistics(objects, *, n_frames, scope, n_propagations=None,
@@ -1976,7 +793,7 @@ def inventory_scope_statistics(objects, *, n_frames, scope, n_propagations=None,
             "visible_frames": list(o.visible_frames or []),
             "mask_support_ratio": o.mask_support_ratio} for o in objects},
         "track_fragmentation_ratio": (consensus or {}).get("track_fragmentation_ratio"),
-        "fragmentation_reason": ("base_consensus_denominator" if consensus is not None
+        "fragmentation_reason": ("question_candidate_denominator" if consensus is not None
                                  else "no_unified_propagation_denominator"),
         "track_consensus": consensus,
     }
@@ -1993,184 +810,13 @@ def track_stable_ratio(objects: Sequence[ObjectRecord],
     这个量回答的是"物体可见多久"，**不是**"同一实例是否被跨帧一致地跟成一条 track"。
     用它当门会让 `count_objects` 结构性不可用（counting 题的程序路径直接没了），
     而 v5 实测的计数失败根因是**重复实例**（清单 12 个重复）与**碎片化**，
-    不是"可见帧少"。故改为记录为诊断量，判据见 `track_consensus_metrics`。
+    不是"可见帧少"。故仅作为可见帧率诊断，计数统计使用本题候选失败与存疑实例。
     """
     if n_frames <= 0 or not objects:
         return None
     vals = [min(1.0, len(set(int(i) for i in (o.visible_frames or []))) / float(n_frames))
             for o in objects]
     return float(sum(vals) / len(vals))
-
-
-def track_consensus_metrics(objects: Sequence[ObjectRecord], *,
-                            n_propagations: int,
-                            n_frames: int) -> Optional[dict]:
-    """`track_consensus` 的判据输入（§7.1；阈值 `[TODO_CALIBRATE]`）。
-
-    两个信号，直接对应 v5 [已实测] 的计数失败模式：
-
-    - `track_fragmentation_ratio` = `n_dup / n_propagations`：SAM2 传播了多少条
-      被 3D 去重合并掉的**碎片**。越高说明同一实例被切成多条 track 越严重；
-    - `duplicate_suspect_ratio` = `n_suspect / n_objects`：去重后仍留在清单里的
-      重复嫌疑对象占比。越高说明"清单长度"越不能当计数答案（v5 实测 12 个重复）。
-
-    同时保留 `track_stable_ratio`（可见帧率）作**诊断**，便于事后比较两种口径。
-
-    `n_propagations <= 0` 或无对象 → `None`（证据侧按 unavailable，**不伪造 0**）。
-    """
-    if n_propagations <= 0 or not objects:
-        return None
-    n_objects = len(objects)
-    n_suspect = sum(1 for o in objects if bool(getattr(o, "duplicate_suspect", False)))
-    n_dup = max(0, int(n_propagations) - n_objects)
-    return {
-        "track_fragmentation_ratio": float(n_dup) / float(n_propagations),
-        "duplicate_suspect_ratio": float(n_suspect) / float(n_objects),
-        "n_propagations": int(n_propagations),
-        "n_objects": int(n_objects),
-        "n_suspect": int(n_suspect),
-        "track_stable_ratio": track_stable_ratio(list(objects), n_frames),
-    }
-
-
-def _with_dedup_verdict(o, *, suspect: bool, track_id: str,
-                        visible_frames: Optional[Sequence[int]] = None,
-                        n_frames: int = 0):
-    """把 v6 去重结论（`duplicate_suspect` / `track_id`）写回对象。
-
-    优先 `model_copy`（不改动调用方传入的原对象）；鸭子类型替身退回 `setattr`。
-    """
-    updates = {"duplicate_suspect": bool(suspect), "track_id": track_id}
-    if visible_frames is not None:
-        visible = sorted(set(int(frame) for frame in visible_frames))
-        updates.update({
-            "visible_frames": visible,
-            "mask_support_ratio": min(1.0, len(visible) / max(1, int(n_frames))),
-        })
-    if hasattr(o, "model_copy"):
-        return o.model_copy(update=updates)
-    for k, v in updates.items():                        # pragma: no cover - 替身
-        setattr(o, k, v)
-    return o
-
-
-def _dedupe_by_world_centroid(objects, depth_maps, *, masks_per_object=None,
-                              rel_tol: float = 0.15):
-    """3D 去重（§3 M5 字段 5）：**类别 + 世界质心距离 + 时序重叠**三判据。
-
-    - 类别：`category_name` 大小写不敏感相等（任一侧为空/unknown 视为通配，不否决）；
-    - 质心：距离 < `场景深度中位 × rel_tol`（[TODO_CALIBRATE] 起始参考 0.15）；
-    - 时序重叠：两份候选的支撑帧集合有交集（同一时刻同位置才判同一实例；
-      支撑帧未知时退化为只看前两条）。
-
-    三判据**同时**满足才合并 —— 只按质心合并会误合并"先后出现在同一位置"的不同物体
-    （C-9：单帧常看不到目标，靠多帧提示补齐，故必须区分"同物多帧"与"多物同地"）。
-
-    v6 证据（§5.6 / §7.1 track_consensus）：
-
-    - `track_id`：保留对象的跨帧 track 身份 = **幸存代表的传播身份**（已有则原样保留，
-      缺省时按输入下标补 `trk<idx>`，确定性）。被合并的候选只是代表的同一条 track
-      的重复观测，不构成新 track —— `count_objects` 靠这一点"不数清单长度"；
-    - `duplicate_suspect`：① 该组吸收了 ≥2 条候选（清单长度确定被高估）；
-      ② 去重后仍有两对象**同类且世界质心落在同一容差内**（时序不重叠 → 按纪律
-      不合并，但"同地同类不同时"仍有重复绑定嫌疑）→ 两条都标嫌疑。
-      两条规则的阈值口径与合并判据同源（`rel_tol`），[TODO_CALIBRATE]。
-
-    返回 `(kept_objects, n_dup, groups)`；`groups[k]` 为保留对象 k 吸收的原始下标列表
-    （含代表自身，故 `len(groups[k]) >= 2` ⇔ 发生过合并），
-    供调用方在去重后的对象集上重算 G9。
-    """
-    if not objects:
-        return [], 0, []
-    d = np.asarray(depth_maps, dtype=np.float64)
-    d = d[np.isfinite(d) & (d > 0)]
-    med = float(np.median(d)) if d.size else 1.0
-    tol = rel_tol * med
-
-    def _frames_of(idx: int) -> Optional[set[int]]:
-        if masks_per_object is None or idx >= len(masks_per_object):
-            return None
-        m = masks_per_object[idx]
-        if not hasattr(m, "items"):
-            return None
-        return {int(fi) for fi, mask in m.items() if np.asarray(mask).any()}
-
-    def _hint_of(o) -> str:
-        h = str(getattr(o, "category_name", "") or "").strip().lower()
-        return "" if h in ("unverified", "unknown") else h
-
-    def _repr_track(o, idx: int) -> str:
-        tid = getattr(o, "track_id", None)
-        return str(tid) if tid else f"{TRACK_PREFIX_BASE_LIST}{idx}"
-
-    kept: list = []
-    groups: list[list[int]] = []
-    group_frames: list[Optional[set[int]]] = []  # None=支撑未知；空 set=已知无非空 mask
-    group_track: list[str] = []            # 每个保留组的 track 身份（幸存代表）
-    n_dup = 0
-    for idx, o in sorted(enumerate(objects), key=lambda kv: -float(kv[1].det_conf)):
-        c = np.asarray(o.centroid_world, dtype=np.float64)
-        frames = _frames_of(idx)
-        hit = -1
-        for k, ko in enumerate(kept):
-            kc = np.asarray(ko.centroid_world, dtype=np.float64)
-            if np.linalg.norm(c - kc) >= tol:
-                continue
-            ho, hk = _hint_of(o), _hint_of(ko)
-            if ho and hk and ho != hk:
-                continue                       # 类别不同 → 不是同一实例
-            kframes = group_frames[k]
-            if frames is not None and kframes is not None and not (frames & kframes):
-                continue                       # 时序不重叠 → 不是同一实例
-            hit = k
-            break
-        if hit >= 0:
-            groups[hit].append(idx)
-            if group_frames[hit] is None or frames is None:
-                group_frames[hit] = None
-            else:
-                group_frames[hit] |= frames
-            n_dup += 1
-            continue
-        kept.append(o)
-        groups.append([idx])
-        group_frames.append(None if frames is None else set(frames))
-        group_track.append(_repr_track(o, idx))
-
-    # ---- v6：把去重结论写成证据字段（track_id 统一为组内幸存代表 + 重复嫌疑）----
-    suspect = {k for k, g in enumerate(groups) if len(g) >= 2}
-    # 去重后仍"同类 + 质心过近"的两条（时序不重叠故未合并）→ 都标嫌疑。
-    # 类别为空（unverified/unknown）不参与该判据：那类对象的质心是占位 [0,0,0]。
-    for a in range(len(kept)):
-        ha = _hint_of(kept[a])
-        if not ha:
-            continue
-        ca = np.asarray(kept[a].centroid_world, dtype=np.float64)
-        for b in range(a + 1, len(kept)):
-            if _hint_of(kept[b]) != ha:
-                continue
-            cb = np.asarray(kept[b].centroid_world, dtype=np.float64)
-            if np.linalg.norm(ca - cb) < tol:
-                suspect.add(a)
-                suspect.add(b)
-    kept = [_with_dedup_verdict(
-        o, suspect=k in suspect, track_id=group_track[k],
-        visible_frames=group_frames[k], n_frames=len(np.asarray(depth_maps)))
-            for k, o in enumerate(kept)]
-    for k, group in enumerate(groups):
-        if len(group) < 2 or not hasattr(kept[k], "binding_provenance"):
-            continue
-        provenance = list(kept[k].binding_provenance)
-        representative = group[0]
-        for index in group[1:]:
-            member = objects[index]
-            provenance.extend([
-                {**entry, "absorbed_obj_id": member.obj_id,
-                 "representative_obj_id": objects[representative].obj_id}
-                for entry in getattr(member, "binding_provenance", [])
-            ])
-        kept[k] = kept[k].model_copy(update={"binding_provenance": provenance})
-    return kept, n_dup, groups
 
 
 def _merge_mask_groups(masks_per_object, groups) -> list[dict]:
@@ -2199,3 +845,9 @@ def _merge_mask_groups(masks_per_object, groups) -> list[dict]:
 def _bbox_of(pts: np.ndarray) -> list[float]:
     pmin, pmax = pts.min(axis=0), pts.max(axis=0)
     return [float(v) for v in list(pmin) + list(pmax)]
+
+
+def bind_objects_for_scene(frames, predictor=None, question="", **kwargs):
+    """Shared ordinary/paired M5 entry point; legacy inventory has no online path."""
+    from .question_binding import bind_question_objects
+    return bind_question_objects(frames, predictor, question, **kwargs)

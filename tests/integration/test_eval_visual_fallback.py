@@ -41,12 +41,6 @@ def source(tmp_path_factory):
     return item, artifact
 
 
-@pytest.fixture(autouse=True)
-def no_m5_requests(monkeypatch):
-    monkeypatch.setattr(runner, "_bind_objects_best_effort",
-                        lambda *args, **kwargs: ([], {}, [], False))
-
-
 def run_case(source, tmp_path, replies, *, split="inner_validation", enabled=True,
              max_rounds=2):
     item, artifact = source

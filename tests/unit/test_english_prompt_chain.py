@@ -7,7 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-from skill3d.segmentation import sam2_tracker as m5
+from skill3d.segmentation import question_binding as m5
+from skill3d.infra.m5_identity import generation_identity
 from skill3d.skills.v11_library import validate_v11_snapshot
 
 LIBRARY = Path(__file__).resolve().parents[2] / "skill_library"
@@ -45,23 +46,20 @@ class _M5Recorder:
 
     def chat(self, messages, **kwargs):
         self.calls.append((messages, kwargs))
-        return '["chair"]' if isinstance(messages[0]["content"], str) else "[]"
+        return '{"objects":[{"category":"chair","role":"target","source_text":"chairs"}]}'
 
 
-def test_m5_inventory_noun_extraction_and_targeted_boxes_send_english(monkeypatch):
+def test_m5_question_object_parse_sends_english_text_only():
     client = _M5Recorder()
-    frames = [np.zeros((24, 32, 3), dtype=np.uint8)]
-    m5.box_prompts_from_vlm(frames, m5._GENERIC_INVENTORY_QUESTION, client, seed=7)
-    monkeypatch.setattr(m5, "ovd_boxes_for_nouns", lambda *args: ([], [], [], []))
-    objects, stats, _ = m5._bind_question_supplement(
-        frames, [0], "How many chairs are visible?", [], None, None, None,
-        grid_transform=None, out_dir=None, scene_name="test", predictor=None,
-        vlm_client=client, handle=None, seed=7, question_type="object_counting")
-    assert objects == [] and stats["grounding"]["missing_names"]
+    inputs = m5.question_input("How many chairs are visible?", "object_counting", [])
+    identity = generation_identity(
+        scene_name="s", frame_set_hash="f", frames=[], depth_maps=None)
+    objects, receipt = m5.parse_question_objects(inputs, client, seed=7, identity=identity)
+    assert objects[0]["category"] == "chair" and receipt["status"] == "parsed"
     text = json.dumps([messages for messages, _ in client.calls], ensure_ascii=False)
     assert not CJK.search(text)
-    assert m5._GENERIC_INVENTORY_QUESTION in text
-    assert "common English singular object names" in text
-    assert "Locate the following objects" in text
+    assert "common English" in text
     assert "How many chairs are visible?" in text
     assert all(kwargs["seed"] == 7 for _, kwargs in client.calls)
+    assert all(kwargs["temperature"] == 0 for _, kwargs in client.calls)
+    assert all(isinstance(m["content"], str) for messages, _ in client.calls for m in messages)

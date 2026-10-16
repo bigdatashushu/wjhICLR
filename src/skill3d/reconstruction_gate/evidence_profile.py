@@ -48,7 +48,7 @@ TH_GROUNDING_MIN_CONF: float = 0.5     # TODO_CALIBRATE: 补绑置信度下限
 TH_SCALE_DISPERSION: float = 0.15      # TODO_CALIBRATE: τ_scale_disp（§13.1 子条件 4）
 TH_MIN_VALID_FRAME_RATIO: float = 0.75  # TODO_CALIBRATE: τ_frames（§13.1 子条件 3）
 
-EVIDENCE_PROFILE_BUILDER_VERSION: str = "evidence-builder-v6.1-m5-scopes"
+EVIDENCE_PROFILE_BUILDER_VERSION: str = "evidence-builder-v7-question-binding"
 
 
 @dataclass
@@ -61,10 +61,10 @@ class M5EvidenceSummary:
     m5_ran: bool = False
     detection_fault: bool = False          # 检测器服务故障
     n_objects: int = 0                     # 题级最终检测清单对象数
-    n_tracks: int = 0                      # 基础清单 track 数（原计数门口径）
+    n_tracks: int = 0                      # 本题可用实例的 track 数
     track_stable_ratio: Optional[float] = None  # 可见帧率（诊断量）
     # v6 判据输入（来自 M5 `stats["track_consensus"]`）
-    track_fragmentation_ratio: Optional[float] = None   # 被去重合并的碎片占比
+    track_fragmentation_ratio: Optional[float] = None   # 新版：失败候选/扫描候选
     duplicate_suspect_ratio: Optional[float] = None     # 清单里的重复嫌疑占比
     grounding_pointed_hit: Optional[bool] = None  # 题面点名物是否命中
     grounding_conf: Optional[float] = None
@@ -72,9 +72,11 @@ class M5EvidenceSummary:
     grounding_filled: bool = False         # 走的是 question-targeted 补绑
     detection_scope: str = "question_inventory"
     track_scope: str = "base_inventory"
+    # Historical summary fields remain readable; the new runner never fills these.
     base_inventory: dict = field(default_factory=dict)
     question_supplement: dict = field(default_factory=dict)
     question_inventory: dict = field(default_factory=dict)
+    question_binding: dict = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -231,6 +233,8 @@ def detection_capability(summary: M5EvidenceSummary) -> tuple[CapabilityState, l
         return "unavailable", ["detector_fault"]
     if int(summary.n_objects) <= 0:
         return "unavailable", ["zero_detection_after_retry"]
+    if summary.detection_scope == "question_binding":
+        return "available", notes
     if int(summary.n_objects) < TH_DETECTION_SPARSE:
         notes.append(f"检出稀疏（{summary.n_objects} < {TH_DETECTION_SPARSE}）")
         return "degraded", notes
@@ -248,6 +252,8 @@ def track_capability(summary: M5EvidenceSummary) -> tuple[CapabilityState, list[
     """
     if not summary.m5_ran:
         return "unavailable", ["m5_not_run"]      # §6.1：未运行 ≠ 运行了没统计
+    if summary.detection_fault:
+        return "unavailable", ["m5_binding_unavailable"]
     if int(summary.n_tracks) <= 0:
         return "unavailable", ["no_track_statistics"]
     frag, dup = summary.track_fragmentation_ratio, summary.duplicate_suspect_ratio
@@ -436,10 +442,12 @@ def build_evidence_profile(
             },
             "object_detection": {"n_objects": int(m5.n_objects),
                                  "scope": m5.detection_scope,
-                                 "inventory": m5.question_inventory,
+                                 "inventory": (m5.question_binding if m5.detection_scope
+                                               == "question_binding" else m5.question_inventory),
                                  "warnings": det_warns + list(m5.notes)},
             "track_consensus": {
                 "scope": m5.track_scope,
+                "question_binding": m5.question_binding,
                 "base_inventory": m5.base_inventory,
                 "question_supplement": m5.question_supplement,
                 "n_tracks": int(m5.n_tracks),

@@ -68,13 +68,28 @@ vllm:
   temperature: 0.0                      # greedy，保证同 seed 字节级一致
   max_tokens: 8192                     # 单次 Qwen 请求的最大输出 token 数；输入 token 另计
 
+# M5 专用多模态模型：题目对象解析、目标盲审和类别关系判断。
+# 密钥只从 api_key_env 指定的环境变量读取，不得写入 YAML 或收据。
+m5_model:
+  enabled: true
+  provider: bailian
+  model: qwen3.8-flash
+  model_revision: ""                   # 固定版本可填；空别名禁用跨运行磁盘缓存
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  timeout_s: 180.0
+  temperature: 0.0
+  max_tokens: 2048
+  min_pixels: 65536
+  max_pixels: 1048576
+  relation_batch_size: 32
+
 sandbox:
   cell_timeout_s: 120                   # TODO_CALIBRATE
   max_regenerate: 3                     # AST 失败有限重生成 TODO_CALIBRATE
 
-# M5 检测兜底：本地开放词表检测器（GroundingDINO 服务；确定性 Tool，非 LLM）
-# 规程：VLM 给对象名+bbox 提示为正解；VLM 定位失败时用本检测器兜底，避免对象类 Tool
-# 被整场景收回。留空 = 不启用兜底。
+# M5 开放词表检测器（GroundingDINO 服务；确定性 Tool，非 LLM）。
+# Qwen3.8-Flash 只解析题目对象并审核 SAM2 mask，不生成检测框。
 detection:
   endpoint: http://127.0.0.1:20022     # TODO_USER_INPUT：检测器服务地址（组内服务）
   box_threshold: 0.25                  # TODO_CALIBRATE

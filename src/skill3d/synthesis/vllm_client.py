@@ -126,7 +126,9 @@ class VLLMClient:
         return True, f"{len(self._endpoints)} 个 endpoint 就绪（model={self.model}）"
 
     def chat(self, messages: list[dict], max_tokens: int = 8192,
-             seed: Optional[int] = None) -> str:
+             seed: Optional[int] = None, temperature: Optional[float] = None,
+             response_format: Optional[dict] = None,
+             enable_thinking: bool = False) -> str:
         """greedy（temperature=0.0）生成，返回文本内容。
 
         **复现性注意（实测）**：即使 temperature=0，vLLM 在连续批处理 + 多副本
@@ -142,17 +144,22 @@ class VLLMClient:
         """
         client = self._clients[next(self._rr)]
         # 评测增量请求最多发一次；避免 OpenAI SDK 隐式重试突破该上限。
-        if current_request_phase() == "eval_visual_fallback":
+        if current_request_phase() in (
+                "eval_visual_fallback", "m5_object_parse",
+                "m5_mask_visual", "m5_mask_relation"):
             client = client.with_options(max_retries=0)
         self.last_usage = {}
         self.last_generation = {"mode": "nonstream", "stop_reason": "",
                                 "usage_status": "unknown", "server_abort_verified": False}
         kwargs: dict = {"model": self.model, "messages": messages,
-                        "temperature": self.temperature,
+                        "temperature": self.temperature if temperature is None else temperature,
                         # M1: specialized M5 budgets remain bounded by runtime max_tokens.
                         "max_tokens": min(max_tokens, self.max_output_tokens)}
         if seed is not None:
             kwargs["seed"] = int(seed)
+        if response_format is not None:
+            kwargs["response_format"] = response_format
+        del enable_thinking  # local vLLM service is already frozen in instruct mode
         streaming = (current_request_phase() == "program"
                      and getattr(self, "program_streaming", True))
         if streaming:

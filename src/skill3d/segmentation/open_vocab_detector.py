@@ -1,21 +1,7 @@
-"""开放词表检测器客户端（GroundingDINO 服务；**确定性 Tool**，非 LLM）。
+"""GroundingDINO client for exhaustive question-category scans.
 
-**为什么需要它**（2026-09-20 真实链实测）：
-
-M5 的对象绑定正解来源是"在线 Qwen3-VL-8B 给对象名 + bbox 提示"（§4 M5 字段 12）。
-实测该 8B 模型在**定位**上不可靠：对同一帧，纯文本列举能说出"电脑主机"，但一旦要求
-输出 0–1000 归一化 JSON bbox 就返回 `[]` 或 `NONE`（连"不确定也给最可能的框"都不行）。
-后果不是"少检出一个对象"，而是 M5 抛错 → `materialized=False` → **整个 scene 的对象类
-Tool 被 fail-closed 收回**（计数、相对方向、路线规划、外观顺序全线退化）。
-
-因此加一层**确定性检测器兜底**：VLM 提示为空时，用本地 GroundingDINO 服务按问题名词
-做开放词表检测，拿到真实框再做 SAM2 传播。检测器不是 LLM，不进"在线链无 GPT-6"的
-约束范围（硬约束 1 只禁 GPT-6）；它的输出仍然只作为 SAM2 的 box prompt，
-不参与任何答案生成。
-
-服务契约（组内 `grounding_dino_server.py`）：`POST /infer`
-`{"image": <base64 jpg>, "text_prompt": "a. b. c.", "box_threshold": 0.25}`
-→ `{"success": bool, "detections": [{"label","bbox":[x0,y0,x1,y1] 像素,"confidence"}]}`
+POST /infer returns scored pixel boxes. Candidates never certify semantics.
+Finite transport retries are accounted separately from final stage failures.
 """
 
 from __future__ import annotations
@@ -136,7 +122,8 @@ def detect(frame: np.ndarray, prompt: str, *,
         return _failed("invalid detector retry budget")
     body = {"image": base64.b64encode(buf.tobytes()).decode("ascii"),
             "text_prompt": prompt, "box_threshold": float(box_threshold)}
-    digest = hashlib.sha256(buf.tobytes() + prompt.encode()).hexdigest()
+    from skill3d.infra.m5_identity import content_sha256
+    digest = content_sha256(body)
     deadline = time.monotonic() + total_timeout_s
     data = None
     for attempt in range(1, max_attempts + 1):
@@ -183,18 +170,22 @@ def detect(frame: np.ndarray, prompt: str, *,
             "status": "ok" if data["detections"] else "empty",
             "http_status": status_code, "recovered": attempt > 1,
             "n_detections": len(data["detections"]),
+            "raw_detections": data["detections"],
             "elapsed_s": time.monotonic() - started,
         })
         break
     out: list[Detection] = []
+    invalid_rows = 0
     h, w = img.shape[0], img.shape[1]
     for d in (data.get("detections") or []):
         try:
             x0, y0, x1, y1 = [float(v) for v in d["bbox"]]
             confidence = float(d.get("confidence", 0.0))
             if not np.all(np.isfinite([x0, y0, x1, y1, confidence])):
+                invalid_rows += 1
                 continue
         except Exception:  # noqa: BLE001
+            invalid_rows += 1
             continue
         # 裁到图像范围内，保证 SAM2 box prompt 合法
         x0, x1 = sorted((max(0.0, min(x0, w - 1)), max(0.0, min(x1, w - 1))))
@@ -204,6 +195,8 @@ def detect(frame: np.ndarray, prompt: str, *,
         out.append(Detection(label=str(d.get("label", "")).strip(),
                              bbox_xyxy=(x0, y0, x1, y1),
                              confidence=confidence))
+    if invalid_rows:
+        _failed(f"invalid detector rows: {invalid_rows}")
     return out
 
 

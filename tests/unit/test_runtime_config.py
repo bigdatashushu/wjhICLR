@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 import yaml
 
-from skill3d.online.config import load_config, load_yaml, resolve_runtime, vllm_from
+from skill3d.online.config import (
+    config_receipt, load_config, load_yaml, m5_model_from, resolve_runtime, vllm_from,
+)
 from skill3d.adapters.episode_source import (
     EpisodeSourceError, load_jsonl_items, load_vsi_bench_items,
 )
@@ -25,6 +27,19 @@ def test_repository_runtime_config_freezes_output_budget():
     config = load_config(path)
     assert config["vllm"]["max_tokens"] == 8192
     assert config.sources["vllm.max_tokens"] == "yaml"
+    m5 = m5_model_from(config)
+    assert m5.model == "qwen3.8-flash"
+    assert m5.api_key_env == "DASHSCOPE_API_KEY"
+
+
+def test_m5_config_stores_only_key_environment_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "must-not-appear")
+    path = tmp_path / "runtime.yaml"
+    path.write_text("m5_model: {model: qwen3.8-flash}\n")
+    receipt = config_receipt(load_config(path))
+    text = json.dumps(receipt)
+    assert "must-not-appear" not in text
+    assert '"api_key_env": "<redacted>"' in text
 
 
 def test_endpoints_and_output_budget_are_effective(tmp_path):
@@ -66,6 +81,9 @@ def test_missing_explicit_configs_fail(tmp_path):
     {"vllm": {"endpoints": "http://localhost:18110"}},
     {"vllm": {"endpoints": ["not-a-url"]}},
     {"vllm": {"max_tokens": 32768}},
+    {"m5_model": {"base_url": "http://insecure.example/v1"}},
+    {"m5_model": {"min_pixels": 100, "max_pixels": 10}},
+    {"m5_model": {"provider": "unknown"}},
     {"frame_sampling": {"n_frames": 33}},
     {"seed": True},
     {"paths": []},

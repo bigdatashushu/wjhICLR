@@ -41,6 +41,7 @@ from skill3d.online.config import (
     paths_from,
     retrieval_policy_from,
     sandbox_from,
+    m5_model_from,
     vllm_from,
 )
 from skill3d.online.runner import (
@@ -165,6 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     # 已整体废止（§20），CLI 不再提供开关，也不再 import 已归档模块。
     paths = paths_from(cfg_yaml)
     vllm = vllm_from(cfg_yaml)
+    m5_model = m5_model_from(cfg_yaml)
     sandbox = sandbox_from(cfg_yaml)
     active_vision = active_vision_from(cfg_yaml)
 
@@ -293,6 +295,17 @@ def main(argv: list[str] | None = None) -> int:
         recon_dir=args.recon_dir or paths.reconstructions,
         vllm_endpoints=list(vllm.endpoints),
         vllm_model=vllm.model,
+        m5_model_enabled=m5_model.enabled,
+        m5_model_provider=m5_model.provider,
+        m5_model=m5_model.model,
+        m5_model_revision=m5_model.model_revision,
+        m5_base_url=m5_model.base_url,
+        m5_api_key_env=m5_model.api_key_env,
+        m5_timeout_s=m5_model.timeout_s,
+        m5_max_tokens=m5_model.max_tokens,
+        m5_min_pixels=m5_model.min_pixels,
+        m5_max_pixels=m5_model.max_pixels,
+        m5_relation_batch_size=m5_model.relation_batch_size,
         max_images=int(getattr(vllm, "n_frames", 32)),
         max_tokens=vllm.max_tokens,
         temperature=vllm.temperature,

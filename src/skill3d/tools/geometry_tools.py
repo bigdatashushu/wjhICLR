@@ -82,6 +82,7 @@ BINDING_INTEGRITY_TOOLS = frozenset({
     "object_centroid", "object_3d_extent", "robust_distance",
     "camera_object_distance", "surface_distance_between_objects",
     "relative_distance_rank", "object_distance_m", "relative_direction_of",
+    "count_objects", "object_visible_frames",
 })
 
 
@@ -172,6 +173,19 @@ def _get_object(handle: SceneHandle, object_id: str, tool: str, *, consume=True)
                 failure_cause=FailureCause(
                     code="semantic_label_mask_conflict", scope="local_object",
                     object_ids=[obj.obj_id], audit_ids=audit_ids))
+        if not handle.binding_usable(obj.obj_id):
+            raise ConfidenceGateError(
+                tool, f"Object {obj.obj_id} has no usable verified M5 binding; "
+                "use the frozen images.",
+                args={"object_id": obj.obj_id},
+                failure_cause=FailureCause(code="object_binding_unavailable",
+                    scope="local_object", object_ids=[obj.obj_id]))
+        if (handle.require_question_binding
+                and not handle.category_binding_complete(obj.category_name)):
+            raise ConfidenceGateError(
+                tool, f"M5 category {obj.category_name} has unresolved scan or binding failures.",
+                failure_cause=FailureCause(code="object_binding_unavailable",
+                    scope="local_object", object_ids=[obj.obj_id]))
         if consume:
             handle._record_object_dependency(obj.obj_id)
     return obj
@@ -260,6 +274,10 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
             "det_conf_source": o.det_conf_source,
             "mask_support_ratio": float(o.mask_support_ratio),
             "binding_flags": list(o.binding_flags or []),
+            "question_roles": list(o.question_roles),
+            "binding_validation": ({"status": o.binding_validation.status,
+                                    "errors": list(o.binding_validation.errors)}
+                                   if o.binding_validation else None),
             "grounding_status": o.grounding_status,
             "duplicate_suspect": bool(o.duplicate_suspect),
         })
@@ -300,12 +318,17 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
     v7 在 track 去重之上再加一道**几何重合**整合（与帧无关），
     阈值有实测分离度支撑（同实例 0.38–0.69 vs 不同实例 ≤0.14）。
     """
+    if not handle.category_binding_complete(category_name):
+        raise ConfidenceGateError(
+            "count_objects", f"M5 did not establish all usable instances of {category_name}; "
+            "detection failure or zero usable candidates cannot be reported as zero.",
+            failure_cause=FailureCause(code="object_binding_unavailable", scope="local_call"))
     oids = handle.list_objects_by_name(category_name)
     groups: dict[tuple[str, str], list[str]] = {}
     n_no_track = 0
     dup = False
     for oid in oids:
-        o = handle.get_object(oid)
+        o = _get_object(handle, oid, "count_objects")
         tid = o.track_id
         if tid:
             key = ("track", str(tid))
@@ -336,7 +359,7 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
             point_sets[str(index)] = np.concatenate(clouds, axis=0)
     n_geometric_merges = 0
     n_final = n_track_distinct
-    if len(point_sets) >= 2:
+    if len(point_sets) >= 2 and not handle.require_question_binding:
         try:
             cons = consolidate_instances(
                 point_sets,
@@ -361,7 +384,8 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
         "duplicate_suspect": bool(dup),
         "evidence_degraded": evidence_degraded,
         "instance_consolidation": {
-            "method": "track_then_bidirectional_nn_pointcloud_overlap_v11",
+            "method": ("verified_m5_instances" if handle.require_question_binding
+                       else "track_then_bidirectional_nn_pointcloud_overlap_v11"),
             "min_overlap": float(INSTANCE_OVERLAP_THRESHOLD),
             "error": merge_error,
         },
@@ -1077,6 +1101,11 @@ def exists_in_scene(handle: SceneHandle, name: str) -> bool:
         raise ArtifactUnavailableError(
             tool="exists_in_scene", missing=["objects"], available=[],
             route=handle.scene_route, args={"name": name})
+    if not handle.category_binding_complete(name):
+        raise ConfidenceGateError(
+            "exists_in_scene", f"M5 has no complete usable binding for {name}; "
+            "failure does not mean absence.",
+            failure_cause=FailureCause(code="object_binding_unavailable", scope="local_call"))
     return bool(handle.exists(name))
 
 

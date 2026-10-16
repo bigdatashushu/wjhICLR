@@ -118,8 +118,10 @@ class SceneHandle:
         prepared_measurements: Optional[dict] = None,
         point_map_sha256: str = "",
         frozen_input_identity: str = "",
+        require_question_binding: bool = False,
     ) -> None:
         self._state = scene_state
+        self.require_question_binding = require_question_binding
         self.grounding_coverage = dict(grounding_coverage or {})
         self._prepared_measurements = dict(prepared_measurements or {})
         self._point_map_sha256 = str(point_map_sha256 or "")
@@ -280,7 +282,9 @@ class SceneHandle:
             declared -= {ARTIFACT_POSES}
         if self._k is None:
             declared -= {ARTIFACT_INTRINSICS, ARTIFACT_POSES}
-        if not self._objects_materialized:
+        if not self._objects_materialized or (
+                self.require_question_binding
+                and not any(self.binding_usable(o.obj_id) for o in self._objects.values())):
             declared -= {ARTIFACT_OBJECTS}
         if not self._state.metric_task_authorized(self.question_type):
             declared -= {ARTIFACT_SCALE}
@@ -290,6 +294,27 @@ class SceneHandle:
     def objects_materialized(self) -> bool:
         """objects 产物是否已产出（决定 `exists_in_scene` 返回 False 还是抛错）。"""
         return self._objects_materialized
+
+    def binding_usable(self, object_id: str) -> bool:
+        from skill3d.segmentation.binding_validation import binding_is_usable
+        obj = self._objects.get(object_id)
+        return bool(obj and binding_is_usable(obj, strict=self.require_question_binding))
+
+    def category_binding_complete(self, name: str) -> bool:
+        """A full scan with usable instances is required; failure is not absence."""
+        if not self.require_question_binding:
+            return self._objects_materialized
+        if name in self._objects:
+            name = self._objects[name].category_name
+        from skill3d.tools.category_match import matches
+        rows = [row for row in self.grounding_coverage.get("requirements", [])
+                if matches(row["name"], name)]
+        return bool(rows) and all(
+            row.get("scan_complete") and row.get("status") == "resolved"
+            and not row.get("binding_failures")
+            and bool(row.get("usable_object_ids"))
+            and all(self.binding_usable(oid) for oid in row["usable_object_ids"])
+            for row in rows)
 
     @property
     def frame_set_hash(self) -> str:
@@ -433,6 +458,8 @@ class SceneHandle:
         **不**在这里伪造点）。
         """
         oid = self.resolve_object_id(name_or_id)
+        if self.require_question_binding and not self.binding_usable(oid):
+            raise ValueError(f"Unverified M5 object point cloud: {oid}")
         if oid in self._points_cache:
             return self._points_cache[oid]
         ref = str(getattr(self._objects[oid], "pointcloud_world", "") or "")

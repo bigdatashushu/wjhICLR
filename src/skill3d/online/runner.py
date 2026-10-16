@@ -168,6 +168,17 @@ class OnlineRunConfig:
     work_dir: str = "data/reconstructions/mock_light"
     vllm_endpoints: list[str] = field(default_factory=list)
     vllm_model: str = "Qwen/Qwen3-VL-8B-Instruct"
+    m5_model_enabled: bool = True
+    m5_model_provider: str = "bailian"
+    m5_model: str = "qwen3.8-flash"
+    m5_model_revision: str = ""
+    m5_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    m5_api_key_env: str = "DASHSCOPE_API_KEY"
+    m5_timeout_s: float = 180.0
+    m5_max_tokens: int = 2048
+    m5_min_pixels: int = 65536
+    m5_max_pixels: int = 1048576
+    m5_relation_batch_size: int = 32
     model_weights_sha256: str = field(
         default_factory=lambda: os.environ.get("SKILL3D_MODEL_WEIGHTS_SHA256", ""))
     environment_sha256: str = field(
@@ -215,6 +226,14 @@ class OnlineRunConfig:
         for value in (self.model_weights_sha256, self.environment_sha256):
             if value and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value)):
                 raise ValueError("模型/环境身份必须是 SHA256")
+        if self.m5_model_provider != "bailian":
+            raise ValueError("M5 model provider must be bailian")
+        if not self.m5_model or not self.m5_base_url.startswith("https://"):
+            raise ValueError("M5 model and HTTPS base URL are required")
+        if self.m5_min_pixels <= 0 or self.m5_min_pixels > self.m5_max_pixels:
+            raise ValueError("invalid M5 image pixel budget")
+        if self.m5_relation_batch_size <= 0 or self.m5_max_tokens <= 0:
+            raise ValueError("invalid M5 request budget")
         if self.baseline != "C1_tools_program":
             raise ValueError("当前在线入口只支持 C1_tools_program")
         legacy = [type(skill).__name__ for skill in self.skills
@@ -1075,6 +1094,7 @@ def run_episode(
     geometry: Optional[synth.SyntheticGeometry] = None,
     trace_store: Optional[TraceStore] = None,
     llm=None,
+    m5_llm=None,
     prepared_binding: Optional[PreparedObjectBinding] = None,
     input_error: Optional[InputErrorRecord] = None,
 ) -> EpisodeOutcome:
@@ -1302,14 +1322,36 @@ def run_episode(
         m5_stats: dict = {}
         m5_materialized = False
         if art is not None:
-            # M5 先于 M4 统计：对象绑定产物是 G7/G9 的数据源（G-18 接线）
+            art = _prepare_m4_quality(
+                art, pixels, artifact_path=art_path,
+                persist_quality=not bool(cfg.reuse_artifact))
             if prepared_binding is None:
                 m5_objects, m5_stats, m5_notes, m5_materialized = _bind_objects_best_effort(
-                    art, pixels, None, episode, cfg, llm)
+                    art, pixels, None, episode, cfg, m5_llm)
             else:
                 from copy import deepcopy
 
                 binding = deepcopy(prepared_binding)
+                if cfg.mode == "real":
+                    from skill3d.segmentation.question_binding import (
+                        binding_parameters, question_input, validate_prepared_binding,
+                    )
+                    validate_prepared_binding(
+                        binding, frames=pixels, depth=_load_npy(art.depth_maps),
+                        c2w=_load_npy(art.c2w_list), intrinsics=_load_npy(art.intrinsics),
+                        point_conf=_load_npy(art.depth_conf),
+                        depth_conf=_load_npy(art.depth_conf),
+                        point_map=_load_npy(art.point_map),
+                        inputs=question_input(episode.question,
+                            canonical_task(episode.question_type), episode.options),
+                        scene_identity=str(
+                            art.reconstruction_input_identity or art.frame_set_hash
+                            or art.artifact_id),
+                        seed=int(cfg.seed), model_weights_sha256="",
+                        parameters=binding_parameters(
+                            semantic_min_pixels=cfg.m5_min_pixels,
+                            semantic_max_pixels=cfg.m5_max_pixels,
+                            semantic_relation_batch_size=cfg.m5_relation_batch_size))
                 m5_objects, m5_stats = binding.objects, binding.stats
                 m5_notes, m5_materialized = binding.notes, binding.materialized
             prepared_measurements = (
@@ -1987,6 +2029,18 @@ def _resolve_existing_artifact(cfg: OnlineRunConfig, episode) -> tuple[str, bool
     return str(p), used_legacy
 
 
+def _prepare_m4_quality(art, pixels, *, artifact_path="", persist_quality=True):
+    """Compute the independent scene gate before running object perception."""
+    from skill3d.reconstruction_gate import quality_metrics as qm
+    if qm.quality_is_computed(art):
+        return art
+    return qm.compute_and_store_quality(
+        art, frames=pixels, depth_maps=_load_npy(art.depth_maps),
+        c2w_list=_load_npy(art.c2w_list), intrinsics=_load_npy(art.intrinsics),
+        point_map=_load_npy(art.point_map), depth_conf=_load_npy(art.depth_conf),
+        artifact_path=artifact_path if persist_quality else None)
+
+
 def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
                          objects: Optional[list] = None,
                          episode=None,
@@ -2003,22 +2057,24 @@ def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
     诊断用 M5 的 dynamic_masks / track_ious。G5/G8/G11 都已不存在，**不得**补位。
     """
     stats = m5_stats or {}
+    art = _prepare_m4_quality(
+        art, pixels, artifact_path=artifact_path, persist_quality=persist_quality)
+    if art.quality is not None:
+        diagnostics = {}
+        g7, g9 = stats.get("g7_dynamic_ratio"), _mean_track_iou(stats)
+        if g7 is not None and np.isfinite(g7):
+            diagnostics["g7_dynamic_ratio"] = float(g7)
+        if g9 is not None and np.isfinite(g9):
+            diagnostics["g9_tracker_consistency"] = float(g9)
+        if diagnostics:
+            art = art.model_copy(update={
+                "quality": art.quality.model_copy(update=diagnostics)})
     depth, c2w, intr = (_load_npy(art.depth_maps), _load_npy(art.c2w_list),
                         _load_npy(art.intrinsics))
     point_map, dconf = _load_npy(art.point_map), _load_npy(art.depth_conf)
 
     m5_summary = _m5_evidence_summary(stats, objects, episode, m5_materialized=objects_materialized)
 
-    from skill3d.reconstruction_gate import quality_metrics as qm
-
-    if not qm.quality_is_computed(art):
-        art = qm.compute_and_store_quality(
-            art, frames=pixels, depth_maps=depth, c2w_list=c2w, intrinsics=intr,
-            point_map=point_map, depth_conf=dconf,
-            dynamic_masks=stats.get("dynamic_masks"),
-            track_ious=stats.get("track_ious"),
-            artifact_path=(artifact_path if persist_quality else None),
-        )
     scene = build_scene_state(
         art,
         m5=m5_summary,
@@ -2038,6 +2094,7 @@ def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
         point_map_sha256 = ""
     handle = SceneHandle(scene, objects=objects or [], c2w_list=c2w, intrinsics=intr,
                          quality_overall=_overall_of(art),
+                         require_question_binding=True,
                          objects_materialized=objects_materialized,
                          grounding_coverage=stats.get("grounding"),
                          prepared_measurements=prepared_measurements,
@@ -2064,15 +2121,15 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
         fault = True
     from skill3d.segmentation.sam2_tracker import inventory_scope_statistics
 
-    base = (stats or {}).get("base_inventory") or {}
-    tcm = base.get("track_consensus") or (stats or {}).get("track_consensus") or {}
-    ratio = base.get("track_stable_ratio", (stats or {}).get("track_stable_ratio"))
-    base_objects = [o for o in objs if o.grounding_status == "base_list"]
-    n_tracks = base.get("n_tracks", len({o.track_id for o in base_objects if o.track_id}))
+    tcm = (stats or {}).get("track_consensus") or {}
+    ratio = (stats or {}).get("track_stable_ratio")
+    from skill3d.segmentation.binding_validation import binding_is_usable
+    usable = [o for o in objs if binding_is_usable(o, strict=True)]
+    n_tracks = len({o.track_id for o in usable if o.track_id})
     question = inventory_scope_statistics(
-        objs, n_frames=len(getattr(getattr(episode, "frame_set", None),
+        usable, n_frames=len(getattr(getattr(episode, "frame_set", None),
                                     "readable_frame_ids", []) or []),
-        scope="question_inventory")
+        scope="question_binding", consensus=tcm)
 
     def _opt(v):
         return None if v is None else float(v)
@@ -2095,16 +2152,14 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
         # v9 §6.1：这里是把 M5 汇总成证据摘要的地方 —— 它被调用即说明 M5 运行过
         m5_ran=True,
         detection_fault=fault,
-        n_objects=len(objs),
+        n_objects=len(usable),
         n_tracks=int(n_tracks),
         track_stable_ratio=(None if ratio is None else float(ratio)),
         track_fragmentation_ratio=_opt(tcm.get("track_fragmentation_ratio")),
         duplicate_suspect_ratio=_opt(tcm.get("duplicate_suspect_ratio")),
-        detection_scope="question_inventory",
-        track_scope="base_inventory" if base else "legacy_base_statistics",
-        base_inventory=base,
-        question_supplement=(stats or {}).get("question_supplement") or {},
-        question_inventory=question,
+        detection_scope="question_binding",
+        track_scope="question_binding",
+        question_binding=question,
         grounding_pointed_hit=hit,
         grounding_conf=_opt(g.get("conf")),
         grounding_miss=miss,
@@ -2190,6 +2245,7 @@ def _retarget_handle(handle: Optional[SceneHandle], scene: SceneState) -> Option
                              c2w_list=handle._c2w, intrinsics=handle._k,     # noqa: SLF001
                              quality_overall=handle.quality_overall,
                              objects_materialized=handle.objects_materialized,
+                             require_question_binding=handle.require_question_binding,
                              metric_scale=handle.metric_scale,
                              grounding_coverage=handle.grounding_coverage,
                              prepared_measurements=handle._prepared_measurements,  # noqa: SLF001
@@ -2225,10 +2281,10 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
         point_conf = _load_npy(art.depth_conf) if art.depth_conf else None
     if depth is None or c2w is None:
         return [], {}, ["M5 跳过：artifact 缺深度/位姿数组（无法反投影到世界系）"], False
-    # VLM 框提示：真实模式且有 vLLM 时，由在线 Qwen3-VL-8B 给对象名+bbox（§4 M5 字段 12）
+    # 冻结 Qwen 只读取题目文本；真实候选框由 GroundingDINO 全帧扫描生成。
     vlm_client = None
     if cfg is not None and cfg.mode == "real":
-        vlm_client = llm if llm is not None else _make_vllm_client(cfg)
+        vlm_client = llm if llm is not None else _make_m5_client(cfg)
     try:
         objects, stats, notes = bind_objects_for_scene(
             pixels, None, episode.question, depth_maps=depth, c2w_list=c2w,
@@ -2239,10 +2295,14 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
             # 不再需要 grid_transform 仿射映射（§20 废止表）
             grid_transform=None,
             point_conf=point_conf,
+            point_map=_load_npy(art.point_map),
+            geometry_usable=bool(art.quality and art.quality.main_gate_passed),
             depth_conf=_load_npy(art.depth_conf),
             vlm_client=vlm_client,
-            model_weights_sha256=(cfg.model_weights_sha256 if cfg is not None else ""),
-            # 场景清单缓存键：同一 (scene, FrameSet) 复用对象清单（M5 是 scene 级产物）
+            # Bailian is identified by provider/model/revision/endpoint hash; the
+            # local M8 checkpoint hash is a different model and must not leak in.
+            model_weights_sha256="",
+            # 缓存绑定本题、冻结帧顺序及重建和模型身份。
             frame_set_hash=str(getattr(art, "frame_set_hash", "") or ""),
             qa_id=str(getattr(episode, "qa_id", "") or ""),
             scene_identity=str(
@@ -2250,19 +2310,23 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
                 or getattr(art, "frame_set_hash", "")
                 or getattr(art, "artifact_id", "")),
             frame_provenance=_episode_frame_provenance(episode, pixels),
-            # 请求级 seed：M5 的 VLM 框提示也要可复现（§7 复现纪律）
+            # 问题对象解析使用请求级 seed（§7 复现纪律）。
             seed=int(cfg.seed) if cfg is not None else None,
+            semantic_min_pixels=(cfg.m5_min_pixels if cfg is not None else None),
+            semantic_max_pixels=(cfg.m5_max_pixels if cfg is not None else None),
+            semantic_relation_batch_size=(
+                cfg.m5_relation_batch_size if cfg is not None else None),
         )
     except Exception as exc:  # noqa: BLE001 - checkpoint/依赖/传播失败
         return [], {"binding_error": f"{type(exc).__name__}: {exc}",
                     "detector_attempts": current_detector_attempts()}, [
                         f"M5 对象绑定不可用（{type(exc).__name__}: {exc}）→ "
-                        "相关 Tool 查询回退全场景（TODO_USER_INPUT: SAM2 checkpoint，§7.1 G-19）"], False
-    stats["detector_attempts"] = current_detector_attempts()
+                        "相关对象几何不可用，回退冻结图像二维求解"], False
+    stats["detector_attempts"] = stats.get("detector_attempts") or current_detector_attempts()
     if any(a.get("status") == "error" and not a.get("will_retry")
            for a in stats["detector_attempts"]):
         stats["detector_fault"] = True
-    return objects, stats, notes, True
+    return objects, stats, notes, bool(stats.get("materialized", True))
 
 
 def _m5_out_dir(art) -> Optional[str]:
@@ -2697,6 +2761,25 @@ def _make_vllm_client(cfg: OnlineRunConfig):
 
     return VLLMClient(cfg.vllm_endpoints, cfg.vllm_model,
                       temperature=cfg.temperature, max_output_tokens=cfg.max_tokens)
+
+
+def _make_m5_client(cfg: OnlineRunConfig):
+    if not cfg.m5_model_enabled:
+        return None
+    if cfg.m5_model_provider != "bailian":
+        raise ValueError(f"unsupported M5 model provider: {cfg.m5_model_provider}")
+    from skill3d.synthesis.bailian_client import BailianClient
+
+    client = BailianClient(
+        model=cfg.m5_model,
+        model_revision=cfg.m5_model_revision,
+        base_url=cfg.m5_base_url,
+        api_key_env=cfg.m5_api_key_env,
+        timeout_s=cfg.m5_timeout_s,
+        temperature=0.0,
+        max_output_tokens=cfg.m5_max_tokens,
+    )
+    return client if client.configured else None
 
 
 def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, receipts,

@@ -110,24 +110,36 @@ def test_detector_receipt_requires_matching_lifetime_port_and_files(tmp_path, mo
     assert identity.detector_identity("http://127.0.0.1:20024", path) is None
 
 
-def test_final_scope_keeps_base_gate_denominators():
+def test_final_scope_uses_only_verified_question_binding_denominators(tmp_path):
     from skill3d.online.runner import _m5_evidence_summary
     from skill3d.schemas import ObjectRecord
+    from skill3d.segmentation.binding_validation import validate_binding
 
-    def obj(name, source, suspect):
-        return ObjectRecord(obj_id=name, category_name="chair", track_id=name,
-                            grounding_status=source, duplicate_suspect=suspect,
-                            visible_frames=[0], mask_per_frame="", pointcloud_world="")
-    base = [obj("base", "base_list", True)]
-    final = base + [obj(f"q{i}", "question_targeted_fill", False) for i in range(3)]
-    consensus = st.track_consensus_metrics(base, n_propagations=2, n_frames=2)
-    stats = {"base_inventory": st.inventory_scope_statistics(
-        base, n_frames=2, scope="base_inventory", n_propagations=2,
-        n_dedup_groups=1, n_dedup_absorbed=1, consensus=consensus)}
+    final = [ObjectRecord(obj_id="old", category_name="chair", track_id="old")]
+    for i in range(3):
+        obj = st.bind_masks_to_world(
+            [{0: np.ones((2, 2), bool)}], np.ones((2, 2, 2)),
+            np.repeat(np.eye(4)[None], 2, axis=0), np.eye(3),
+            class_hints=["chair"], out_dir=tmp_path / str(i),
+            grounding_status="question_driven")[0].model_copy(update={
+                "obj_id": f"q{i}", "track_id": f"q{i}", "candidate_ids": [f"c{i}"],
+                "question_roles": [{"category": "chair", "role": "target",
+                                    "source_text": "chair"}],
+                "binding_provenance": [{
+                    "semantic_relation": "match",
+                    "semantic_visual_request_sha256": "a" * 64,
+                    "semantic_relation_request_sha256": "b" * 64,
+                }]})
+        obj = obj.model_copy(update={
+            "binding_validation": validate_binding(obj, generation_sha256="e" * 64)})
+        final.append(obj)
+    stats = {"track_consensus": {"track_fragmentation_ratio": .25,
+                                 "duplicate_suspect_ratio": 0}}
     episode = SimpleNamespace(frame_set=SimpleNamespace(readable_frame_ids=[0, 1]))
     summary = _m5_evidence_summary(stats, final, episode)
-    assert summary.n_objects == 4 and summary.n_tracks == 1
-    assert summary.duplicate_suspect_ratio == 1
-    assert summary.track_fragmentation_ratio == .5
-    assert summary.question_inventory["duplicate_suspect_ratio"] == .25
-    assert summary.question_inventory["track_fragmentation_ratio"] is None
+    assert summary.n_objects == 3 and summary.n_tracks == 3
+    assert summary.track_scope == "question_binding" and summary.base_inventory == {}
+    assert summary.duplicate_suspect_ratio == 0
+    assert summary.track_fragmentation_ratio == .25
+    assert summary.question_binding["track_fragmentation_ratio"] == .25
+    assert summary.question_inventory == {}

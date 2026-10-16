@@ -198,7 +198,7 @@ YAML 加载。两臂配置由同一份配置复制，
 历史快照和历史提示词不再由当前入口加载；复现实验时 checkout 对应 Git 提交。
 模板版本、执行协议版本、工具文档版本与工具实现版本仍分别进入运行记录。
 
-2026-10-10 候选完整性修复形成新工程基线，冻结 Skill 正文和快照不变。M5 按角色记录
+历史 2026-10-10 候选完整性修复形成工程基线，冻结 Skill 正文和快照不变。当时 M5 按角色记录
 对象覆盖并把全部选项纳入补检；排名保留逐实例测量、缺失与几何不可测状态，M11 按实际
 选项拒绝部分排序、身份冲突和并列最小值。补检点云、掩码与置信度写入独立请求目录，
 避免局部 obj_0 编号覆盖基础清单仍引用的几何文件。两臂共用这些规则，有可读图时仍允许在后续
@@ -224,7 +224,7 @@ YAML 加载。两臂配置由同一份配置复制，
 2026-10-12 米制可靠性修复属于两臂共享的工程基线，不修改冻结 Skill。M4 主门通过
 不代表对象语义绑定可靠；`det_conf` 只表示检测器原始置信度，
 `mask_support_ratio` 才表示非空传播 mask 的帧覆盖率。paired preparation 必须先完成
-全部题的 M5，再按冻结重建身份跨题审计所有可读 mask；至少一端为 targeted-fill、
+全部题的 M5，再按冻结重建身份跨题审计所有可读 mask；至少一端为 question-driven、
 类别关系明确 incompatible、至少两个共同非空帧且堆叠 mask IoU `>=0.95` 时，双方对象才标记
 `semantic_label_mask_conflict` 并禁止对象几何工具；对象仍保留供原图视觉作答。
 普通多实例不是本轮硬门。
@@ -288,7 +288,7 @@ PYTHONPATH=src python scripts/run_skill_ablation_v11.py --print-quality-contract
 1. 校验所有题目、实际 RGB 像素（形状、dtype、内容 hash）、帧顺序、源帧号、
    时间戳、场景和基础产物所有非空引用。相同 artifact 身份对应不同内容时拒绝。
 2. 每题只复制声明的基础数组到私有目录，忽略源目录旧 M5 缓存。
-   在无 Skill 的准备阶段执行一次 M5（含题目定向补漏），冻结对象记录、点云、
+   在无 Skill 的准备阶段按 M4 → 本题 M5 执行一次，冻结对象记录、点云、
    mask、统计和质量结果。全部题绑定完成后，先按冻结场景做跨题语义冲突审计，再计算
    tree identity。授权房间场景在此阶段生成共享 prepared measurement 收据。
    所有题准备完成后才开始求解。
@@ -378,16 +378,17 @@ M11 的 `execution_state` 区分已验证执行、证据缺失和纯视觉；没
 补查逐类别进行：首帧、中帧后按槽位顺序检查全部可读冻结帧；检测耗尽后仍缺失的
 类别进入同样有界的定向 VLM 定位。非空 mask 且无硬冲突才结束该类别补查。
 coverage 表示候选覆盖，多实例未经独立选择时 `instance_resolved=null`。
-高 IoU 关系使用 `mask-label-relation-v1`/`semantic-mask-conflict-v2`，兼容或未知
+高 IoU 关系使用 `mask-label-relation-v1`/`semantic-mask-conflict-v3-question-driven`，兼容或未知
 关系只审计、不合并实例。NameError/UnboundLocalError 同 AST×同证据执行前拒绝。
 候选摘要保留身份及 flag，完整 audit 留原轨迹，整体字符预算有界。
 
 解析、提交与评分分别记录 `answer_parse_status`、`submission_status`、
 `scoring_status`。空 GT 保留已解析预测，score/correct/mra_value 为 null，
 `reference_unavailable` 不作为非法答案或零分。正式独立评分在全部答案冻结后进行。
-M5 缓存使用完整 RGB/数组、模型/权重/配置、seed、源码及运行环境身份；缺身份关闭
-持久复用。base_inventory/question_supplement/question_inventory 各自统计，
-track_consensus 继续使用基础清单分母。
+M5 先在 M4 主门后解析本题对象，再逐类别扫描全部冻结帧，双向 SAM2 后验证最终保存的
+mask、点云、置信度、可见帧、质心和 bbox。解析与本题绑定分层缓存，身份覆盖问题/选项、
+RGB/重建数组、模型、seed、参数、源码和环境；旧基础清单不准入。track_consensus 使用本题
+候选失败和存疑实例分母，正常重复观测合并不算碎片；两臂只消费同一份冻结结果。
 
 完整入口为 `scripts/run_full_experiment_v11.py`，stage 支持
 run/register/prepare/solve/score/status。固定八类各24题、192道唯一题，sample seed137，

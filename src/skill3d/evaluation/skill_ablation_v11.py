@@ -413,34 +413,6 @@ def _clone_tree(source: Path, dest: Path) -> None:
                                    ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
 
-def _copy_inventory_cache(source: Path, dest: Path) -> None:
-    """Carry only validated scene inventory refs into another private preparation."""
-    from skill3d.infra.m5_identity import content_sha256, file_identity
-
-    for path in sorted(source.glob("*_inventory_*.json")):
-        original = json.loads(path.read_bytes())
-        body = {k: v for k, v in original.items() if k != "payload_sha256"}
-        if content_sha256(body) != original.get("payload_sha256"):
-            continue
-        refs = body.get("artifact_hashes", {})
-        if any(
-                not Path(ref).resolve().is_relative_to(source)
-                or not Path(ref).is_file() or file_identity(ref) != identity
-                for ref, identity in refs.items()):
-            continue
-        for ref in refs:
-            p = Path(ref)
-            target = dest / p.relative_to(source)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists() and file_identity(target) != refs[ref]:
-                raise PairingError(f"inventory cache target collision: {target}")
-            if not target.exists():
-                shutil.copyfile(p, target)
-        rebased = _rebase(body, source, dest)
-        _write(dest / path.name, {
-            **rebased, "payload_sha256": content_sha256(rebased)})
-
-
 def quality_contract() -> dict:
     """Record current code/thresholds; never claim TODO defaults are calibrated."""
     from skill3d.reconstruction_gate import m4_main_gate, scene_state
@@ -450,6 +422,7 @@ def quality_contract() -> dict:
         "tools/category_match.py", "tools/scene_handle.py", "tools/geometry_tools.py",
         "tools/distance_primitives.py", "tools/ranking_contract.py",
         "segmentation/sam2_tracker.py", "segmentation/open_vocab_detector.py",
+        "segmentation/question_binding.py", "segmentation/binding_validation.py",
         "verifier/geometry_oracle.py", "verifier/derivation.py",
         "online/runner.py", "online/submission.py",
         "synthesis/eval_visual_fallback.py", "synthesis/request_context.py",
@@ -523,6 +496,19 @@ class _RecordingClient:
     @property
     def last_generation(self):
         return getattr(self.client, "last_generation", {})
+
+    @property
+    def last_response_identity(self):
+        return getattr(self.client, "last_response_identity", {})
+
+    @property
+    def model(self):
+        return str(getattr(self.client, "model", ""))
+
+    def audit_identity(self, *, seed=None):
+        method = getattr(self.client, "audit_identity", None)
+        return (method(seed=seed) if callable(method)
+                else {"model": self.model, "seed": seed, "cache_eligible": False})
 
     def chat(self, messages, max_tokens=8192, **kwargs):
         plain = copy.deepcopy(messages)
@@ -1164,12 +1150,12 @@ def run_skill_ablation_v11(
 
         def client(phase, qa_id, store):
             inner = (client_factory(phase, qa_id) if client_factory
-                     else runner._make_vllm_client(cfg))
+                     else (runner._make_m5_client(cfg) if phase == "prepare"
+                           else runner._make_vllm_client(cfg)))
             return _RecordingClient(inner, seed=cfg.seed, specs=specs, store=store)
 
         prepared, prepare_errors, preparation_detector_attempts = {}, {}, {}
         preparation_work = {}
-        inventory_sources = {}
         # Freeze *all* common inputs before starting either arm.
         for q in expected:
             item = chosen[q]
@@ -1196,10 +1182,7 @@ def run_skill_ablation_v11(
                     "preparation_detector_attempts", {}).get(q, [])
                 continue
             art = _copy_base(Path(artifact_paths[q]).resolve(), frozen)
-            scene_key = (item.episode.dataset, art.scene_name,
-                         art.reconstruction_input_identity, art.artifact_version)
-            if scene_key in inventory_sources:
-                _copy_inventory_cache(inventory_sources[scene_key], frozen)
+            art = runner._prepare_m4_quality(art, item.pixels, persist_quality=False)
             _write(frozen / "episode.json", item.episode)
             for i, pixels in enumerate(item.pixels):
                 np.save(frozen / f"frame_{i:04d}.npy", pixels)
@@ -1227,7 +1210,6 @@ def run_skill_ablation_v11(
             preparation_work[q] = {
                 "artifact": art, "binding": binding, "frozen": frozen,
             }
-            inventory_sources[scene_key] = frozen
 
         # Cross-question M5 integrity audit runs before any frozen tree identity is computed.
         from skill3d.segmentation.sam2_tracker import (
@@ -1253,6 +1235,13 @@ def run_skill_ablation_v11(
             for q in qa_ids:
                 binding = preparation_work[q]["binding"]
                 binding.objects = audited[q]
+                from skill3d.segmentation.binding_validation import validate_binding
+                binding.objects = [
+                    obj.model_copy(update={"binding_validation": validate_binding(
+                        obj, generation_sha256=(binding.stats.get("generation") or {}).get(
+                            "sha256", ""))})
+                    if obj.grounding_status == "question_driven" else obj
+                    for obj in binding.objects]
                 binding.stats["semantic_conflict_audits"] = [
                     audit for audit in audits if q in audit["qa_ids"]]
                 if binding.stats.get("grounding"):

@@ -62,6 +62,9 @@ _OBJECT_GEOMETRY_ARGS: dict[str, tuple[str, ...]] = {
     "relative_distance_rank": ("reference", "candidate_categories"),
     "object_distance_m": ("obj_a", "obj_b"),
     "relative_direction_of": ("observer_id", "facing_at_id", "target_id"),
+    "count_objects": ("category_name",),
+    "exists_in_scene": ("name",),
+    "object_visible_frames": ("obj_id",),
 }
 
 # 合法手性取值（与 `reconstruction_gate/world_frame.py` 同一词汇表）
@@ -217,14 +220,21 @@ def _has_binding_conflict(obj) -> bool:
     )
 
 
+def _binding_unavailable(handle, obj) -> bool:
+    return (_has_binding_conflict(obj) or not handle.binding_usable(obj.obj_id)
+            or (handle.require_question_binding
+                and not handle.category_binding_complete(obj.category_name)))
+
+
 def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -> bool:
     """成功的对象几何结果不得引用已被 M5 审计判定冲突的对象。"""
     if not hasattr(handle, "object_records"):
         return True
     conflict_ids = {
-        obj.obj_id for obj in handle.object_records() if _has_binding_conflict(obj)
+        obj.obj_id for obj in handle.object_records()
+        if _binding_unavailable(handle, obj)
     }
-    if not conflict_ids:
+    if not conflict_ids and not handle.require_question_binding:
         return True
 
     def argument_conflicts(value) -> bool:
@@ -256,6 +266,11 @@ def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -
         if (result.status != "ok" or result.error is not None
                 or result.tool not in _OBJECT_GEOMETRY_ARGS):
             continue
+        if (result.tool in ("count_objects", "exists_in_scene")
+                and handle.require_question_binding
+                and not handle.category_binding_complete(str(result.args.get(
+                    "category_name" if result.tool == "count_objects" else "name", "")))):
+            return False
         if result.object_dependencies:
             if conflict_ids.intersection(result.object_dependencies):
                 return False
@@ -349,7 +364,7 @@ def geometry_verify(
         "unit_consistent": "This question has no metric authorization, but the results contain absolute-unit values",
         "world_frame": "The world up direction or handedness contract is missing",
         "binding_integrity": (
-            "The result references an object marked semantic_label_mask_conflict"),
+            "The result references an unavailable or inconsistent object binding"),
         "inside_bbox": "The reprojection input point is outside the scene bounding box, or the world frame contract is missing",
         "reprojection": "The reprojection result cannot be reproduced using the same pose/intrinsics",
     }
@@ -421,7 +436,7 @@ def geometry_verify(
                 (check == "inside_bbox" and result.tool == "reproject")) else None)
             conflicted = [
                 obj for obj in handle.object_records()
-                if _has_binding_conflict(obj)
+                if _binding_unavailable(handle, obj)
                 and obj.obj_id in result.object_dependencies
             ] if check == "binding_integrity" else []
             cause = FailureCause(

@@ -101,6 +101,20 @@ _FALLBACK: dict[str, Any] = {
         "max_tokens": 8192,
         "endpoints": [],
     },
+    "m5_model": {
+        "enabled": True,
+        "provider": "bailian",
+        "model": "qwen3.8-flash",
+        "model_revision": "",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "api_key_env": "DASHSCOPE_API_KEY",
+        "timeout_s": 180.0,
+        "temperature": 0.0,
+        "max_tokens": 2048,
+        "min_pixels": 65536,
+        "max_pixels": 1048576,
+        "relation_batch_size": 32,
+    },
     "sandbox": {
         "cell_timeout_s": 120,
         "max_regenerate": 3,
@@ -135,7 +149,8 @@ def load_config(path: Optional[str | Path] = None) -> dict:
         raise ValueError(f"Unknown runtime configuration fields: {sorted(unknown)}")
     cfg = RuntimeConfig(_deep_merge(deepcopy(_FALLBACK), loaded),
                         path=cfg_path, sources={})
-    for section in ("paths", "frame_sampling", "vllm", "sandbox", "active_vision", "retrieval"):
+    for section in ("paths", "frame_sampling", "vllm", "m5_model",
+                    "sandbox", "active_vision", "retrieval"):
         if not isinstance(cfg[section], dict):
             raise ValueError(f"{section} must be a mapping")
     for key, value in cfg.items():
@@ -155,6 +170,7 @@ def load_config(path: Optional[str | Path] = None) -> dict:
         raise ValueError("split_config must be a non-empty path")
     cfg["split_config"] = str(resolve_path(cfg["split_config"]))
     cfg["vllm"] = asdict(vllm_from(cfg))
+    cfg["m5_model"] = asdict(m5_model_from(cfg))
     sandbox_from(cfg)
     active_vision_from(cfg)
     resolve_runtime(cfg)
@@ -275,6 +291,51 @@ class VLLMSettings:
 
 
 @dataclass
+class M5ModelSettings:
+    """Independent cloud model used only for M5 parsing and mask semantics."""
+
+    enabled: bool = True
+    provider: str = "bailian"
+    model: str = "qwen3.8-flash"
+    model_revision: str = ""
+    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    api_key_env: str = "DASHSCOPE_API_KEY"
+    timeout_s: float = 180.0
+    temperature: float = 0.0
+    max_tokens: int = 2048
+    min_pixels: int = 65536
+    max_pixels: int = 1048576
+    relation_batch_size: int = 32
+
+    def __post_init__(self):
+        if not isinstance(self.enabled, bool):
+            raise ValueError("m5_model.enabled must be boolean")
+        if self.provider != "bailian":
+            raise ValueError("m5_model.provider must be bailian")
+        for name in ("model", "base_url", "api_key_env"):
+            if not isinstance(getattr(self, name), str) or not getattr(self, name):
+                raise ValueError(f"m5_model.{name} must be non-empty")
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme != "https" or not parsed.hostname:
+            raise ValueError("m5_model.base_url must be an HTTPS URL")
+        if parsed.username or parsed.password:
+            raise ValueError("m5_model.base_url must not contain credentials")
+        if not self.base_url.rstrip("/").endswith("/v1"):
+            raise ValueError("m5_model.base_url must end with /v1")
+        for name in ("max_tokens", "min_pixels", "max_pixels", "relation_batch_size"):
+            _integer(getattr(self, name), f"m5_model.{name}")
+        if self.min_pixels > self.max_pixels:
+            raise ValueError("m5_model.min_pixels must not exceed max_pixels")
+        if (type(self.timeout_s) not in (int, float) or self.timeout_s <= 0
+                or not math.isfinite(self.timeout_s)):
+            raise ValueError("m5_model.timeout_s must be positive and finite")
+        if (type(self.temperature) not in (int, float)
+                or not 0 <= self.temperature < 2
+                or not math.isfinite(self.temperature)):
+            raise ValueError("m5_model.temperature is outside its valid range")
+
+
+@dataclass
 class PathSettings:
     """§2 数据/产物路径。"""
 
@@ -315,6 +376,10 @@ def paths_from(cfg: dict) -> PathSettings:
 
 def vllm_from(cfg: dict) -> VLLMSettings:
     return _settings(VLLMSettings, cfg.get("vllm", {}), "vllm")
+
+
+def m5_model_from(cfg: dict) -> M5ModelSettings:
+    return _settings(M5ModelSettings, cfg.get("m5_model", {}), "m5_model")
 
 
 def resolve_runtime(cfg: dict, *, seed=None, n_frames=None, endpoints=None,

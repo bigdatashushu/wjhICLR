@@ -69,6 +69,21 @@ def _perfect_geometry(n: int = _N, hw=_HW, depth_val: float = _DEPTH):
 
 # ------------------------------------------------------------------ 单项诊断 ----
 
+def test_pre_m5_unknown_metrics_survive_paired_json_roundtrip():
+    from skill3d.evaluation.skill_ablation_v11 import _encoded
+
+    quality = qm.compute_quality(**_perfect_geometry())
+    restored = QualityMetrics.model_validate_json(_encoded(quality))
+    assert np.isnan(restored.g7_dynamic_ratio)
+    assert np.isnan(restored.g9_tracker_consistency)
+    assert restored.main_gate_passed
+    payload = restored.model_dump()
+    payload["point_depth_relative_p95"] = None
+    missing = QualityMetrics.model_validate(payload)
+    assert np.isnan(missing.point_depth_relative_p95)
+    assert not mg.main_gate(missing.model_dump())["main_gate_passed"]
+
+
 def test_g6_depth_var_coeff_synthetic():
     """合成深度图验证 G6 σ/μ。"""
     # 恒定深度 2.0 → σ/μ = 0

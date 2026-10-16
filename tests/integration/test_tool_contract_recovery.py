@@ -353,6 +353,7 @@ def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
         tmp_path, episode_item, monkeypatch):
     import skill3d.online.runner as runner
     from skill3d.schemas import ObjectRecord
+    from skill3d.segmentation.binding_validation import validate_binding
 
     objs = [
         ObjectRecord(obj_id="good", category_name="chair", centroid_world=[1, 0, 0]),
@@ -360,8 +361,27 @@ def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
                      binding_flags=[{"code": "semantic_label_mask_conflict",
                                      "audit_sha256": "c" * 64}]),
     ]
+    mask_path, points_path = tmp_path / "good_mask.npy", tmp_path / "good_points.npy"
+    np.save(mask_path, np.ones((len(episode_item.pixels), 1, 1), dtype=np.uint8))
+    np.save(points_path, np.array([[1., 0., 0.]]))
+    objs[0] = objs[0].model_copy(update={
+        "grounding_status": "question_driven", "mask_per_frame": str(mask_path),
+        "pointcloud_world": str(points_path), "visible_frames": list(range(len(episode_item.pixels))),
+        "mask_support_ratio": 1., "bbox": [1, 0, 0, 1, 0, 0], "track_id": "good",
+        "candidate_ids": ["good"], "question_roles": [{"category": "chair", "role": "target",
+                                                       "source_text": "chair"}],
+        "binding_provenance": [{
+            "semantic_relation": "match",
+            "semantic_visual_request_sha256": "a" * 64,
+            "semantic_relation_request_sha256": "b" * 64,
+        }]})
+    objs[0] = objs[0].model_copy(update={
+        "binding_validation": validate_binding(objs[0], generation_sha256="f" * 64)})
     monkeypatch.setattr(runner, "_bind_objects_best_effort", lambda *a, **k: (
-        objs, {"grounding": {"attempted": True, "status": "partial"},
+        objs, {"grounding": {"attempted": True, "status": "partial",
+                            "requirements": [{"name": "chair", "scan_complete": True,
+                                              "status": "resolved", "binding_failures": [],
+                                              "usable_object_ids": ["good"]}]},
                "track_stable_ratio": 1}, [], True))
     client = _FakeClient([
         "object_centroid('good')\nobject_3d_extent('bad')",

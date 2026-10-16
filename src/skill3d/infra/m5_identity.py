@@ -11,15 +11,18 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-M5_IDENTITY_VERSION = "m5-generation-identity-v1"
+M5_IDENTITY_VERSION = "m5-generation-identity-v2-question-driven"
 HASH_BLOCK_BYTES = 8 * 1024 * 1024
 SOURCE_REFS = (
     "infra/m5_identity.py", "infra/version_lock.py",
     "segmentation/sam2_tracker.py", "segmentation/open_vocab_detector.py",
+    "segmentation/question_binding.py", "segmentation/binding_validation.py",
+    "segmentation/mask_semantic_review.py",
     "segmentation/groundingdino_startup.py", "coords.py",
     "reconstruction/image_grid.py", "tools/category_match.py",
     "reconstruction_gate/confidence_map.py",
     "schemas/reconstruction.py", "synthesis/vllm_client.py",
+    "synthesis/bailian_client.py",
 )
 
 
@@ -99,7 +102,8 @@ def package_identity(name: str, *, suffixes=(".py", ".yaml", ".so")):
         return None
 
 
-def sam2_identity(checkpoint, config, predictor=None) -> dict | None:
+def sam2_identity(checkpoint, config, predictor=None,
+                  inference_mode: str = "video_bidirectional") -> dict | None:
     if predictor is not None:
         # A custom predictor is never identified by its class name or shape.
         return getattr(predictor, "_skill3d_m5_identity", None)
@@ -123,13 +127,19 @@ def sam2_identity(checkpoint, config, predictor=None) -> dict | None:
         ]
         resolved = OmegaConf.to_container(compose(config_name=config, overrides=overrides),
                                          resolve=True)
+        settings = {
+            "mode": "eval", "apply_postprocessing": True,
+            "vos_optimized": False, "autocast": "cuda:bfloat16",
+            "inference_api": str(inference_mode),
+        }
+        if inference_mode == "video_bidirectional":
+            settings.update(
+                offload_video_to_cpu=True, offload_state_to_cpu=True,
+                propagation="forward_then_reverse", jpeg_quality=92)
         return {
             "checkpoint": file_identity(checkpoint), "config": resolved,
             "package": package, "runtime": sam2_runtime_identity(),
-            "settings": {"mode": "eval", "apply_postprocessing": True,
-                         "vos_optimized": False, "autocast": "cuda:bfloat16",
-                         "offload_video_to_cpu": True, "offload_state_to_cpu": True,
-                         "propagation": "forward_then_reverse", "jpeg_quality": 92},
+            "settings": settings,
         }
     except Exception:  # noqa: BLE001 - usable inference need not imply cache eligibility
         return None
@@ -223,17 +233,23 @@ def detector_startup_identity(*, service_root: Path, checkpoint: Path,
 def generation_identity(*, scene_name, frame_set_hash, frames, depth_maps,
                         c2w_list=None, intrinsics=None, point_conf=None, depth_conf=None,
                         grid_transform=None, frame_provenance=None, model=None,
-                        detector=None, sam2=None, parameters=None, sources=None) -> dict:
+                        detector=None, sam2=None, parameters=None, sources=None,
+                        question="", question_type="", options=None,
+                        reconstruction_identity="", point_map=None) -> dict:
     identity = {
         "version": M5_IDENTITY_VERSION, "scene": str(scene_name),
         "frame_set_hash": str(frame_set_hash or ""),
+        "question": {"question": str(question), "question_type": str(question_type),
+                     "options": options or []},
+        "reconstruction_identity": str(reconstruction_identity),
         "frames": [array_identity(frame) for frame in frames],
         "frame_provenance": [
             {k: v for k, v in row.items() if k != "qa_id"}
             for row in (frame_provenance or [])],
         "geometry": {name: array_identity(value) for name, value in (
             ("depth", depth_maps), ("c2w", c2w_list), ("intrinsics", intrinsics),
-            ("point_conf", point_conf), ("depth_conf", depth_conf))},
+            ("point_conf", point_conf), ("depth_conf", depth_conf),
+            ("point_map", point_map))},
         "grid_contract": "rgb-mask-vggt-crop-or-nearest-v1",
         "grid_transform": grid_transform,
         "sam2": sam2, "vlm": model, "detector": detector,
@@ -246,6 +262,8 @@ def generation_identity(*, scene_name, frame_set_hash, frames, depth_maps,
     }
     missing = [name for name, value in (("sam2", sam2), ("vlm", model),
                                         ("detector", detector)) if value is None]
+    if isinstance(model, dict) and not model.get("cache_eligible", True):
+        missing.append("mutable_vlm_model")
     if any(value is None for value in identity["sources"].values()):
         missing.append("source_files")
     if depth_maps is None or c2w_list is None:
@@ -265,7 +283,9 @@ def _package_version(name):
 def inventory_generation_identity(*, scene_name, frame_set_hash, frames, depth_maps,
                                   c2w_list, intrinsics, point_conf, depth_conf,
                                   grid_transform, frame_provenance, predictor,
-                                  vlm_client, seed, parameters, model_weights_sha256=""):
+                                  vlm_client, seed, parameters, model_weights_sha256="",
+                                  question="", question_type="", options=None,
+                                  reconstruction_identity="", point_map=None):
     from skill3d.segmentation import sam2_tracker as st, open_vocab_detector as ovd
 
     checkpoint, config = st.resolve_sam2_config()
@@ -276,11 +296,17 @@ def inventory_generation_identity(*, scene_name, frame_set_hash, frames, depth_m
         weights = (model_weights_sha256
                    or getattr(actual_client, "model_weights_sha256", "")
                    or os.environ.get("SKILL3D_MODEL_WEIGHTS_SHA256", ""))
-        if len(weights) == 64 and all(c in "0123456789abcdef" for c in weights):
+        audit_identity = getattr(actual_client, "audit_identity", None)
+        if callable(audit_identity):
+            model = audit_identity(seed=seed)
+        if model is None and len(weights) == 64 and all(
+                c in "0123456789abcdef" for c in weights):
             model = {"enabled": True, "model": str(getattr(actual_client, "model", "")),
                      "weights_sha256": weights, "seed": seed,
-                     "temperature": float(getattr(actual_client, "temperature", 0.0)),
-                     "max_tokens": min(512, int(getattr(actual_client, "max_output_tokens", 512)))}
+                     "temperature": 0.0,
+                     "max_tokens": min(2048, int(getattr(
+                         actual_client, "max_output_tokens", 2048))),
+                     "cache_eligible": True}
             if not model["model"]:
                 model = None
     return generation_identity(
@@ -290,5 +316,10 @@ def inventory_generation_identity(*, scene_name, frame_set_hash, frames, depth_m
         frame_provenance=frame_provenance, model=model,
         detector=detector_identity(ovd.detector_endpoint(),
                                    os.environ.get("SKILL3D_DETECTOR_RECEIPT")),
-        sam2=sam2_identity(checkpoint, config, predictor),
-        parameters=parameters)
+        sam2=sam2_identity(
+            checkpoint, config, predictor,
+            inference_mode=str((parameters or {}).get(
+                "segmentation_mode", "video_bidirectional"))),
+        parameters=parameters, question=question, question_type=question_type,
+        options=options, reconstruction_identity=reconstruction_identity,
+        point_map=point_map)
