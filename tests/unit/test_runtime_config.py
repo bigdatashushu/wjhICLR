@@ -223,3 +223,19 @@ def test_binary_mask_configuration_needs_explicit_operating_point():
         with pytest.raises(ValueError):OnlineModelSettings(mask_review=broken)
     with pytest.raises(ValueError):
         OnlineModelSettings(mask_review={**configuration,'yes_threshold':float('nan')})
+
+
+def test_main_binary_defaults_and_explicit_qwen_override():
+    from skill3d.online.config import OnlineModelSettings,load_config,online_model_from
+    from skill3d.online.runner import OnlineRunConfig
+    from skill3d.segmentation.intern_binary_review import default_mask_review
+    config=default_mask_review()
+    assert OnlineModelSettings().mask_review==config
+    assert online_model_from(load_config()).mask_review==config
+    assert OnlineRunConfig().semantic_review_config==config
+    assert OnlineModelSettings(mask_review=None).mask_review is None
+    assert OnlineRunConfig(semantic_review_config=None).semantic_review_config is None
+    assert 'quality_manifest' not in config
+    for key in ['yes_threshold','prompt_version']:
+        with pytest.raises(ValueError):OnlineModelSettings(mask_review={k:v for k,v in config.items() if k!=key})
+    with pytest.raises(ValueError):OnlineModelSettings(mask_review={**config,'quality_manifest':'unexpected'})

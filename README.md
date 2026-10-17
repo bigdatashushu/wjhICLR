@@ -213,8 +213,17 @@ accept_vsi_bench_license: true
 
 - Provider：阿里百炼 OpenAI 兼容接口。
 - Model：`qwen3.8-flash`。
-- M5 解析/语义审核、M8 程序生成及评测视觉补答共用同一模型配置。
+- M5 题目解析、M8 程序生成及评测视觉补答共用同一模型配置。
 - API Key 只从 `DASHSCOPE_API_KEY` 读取。
+
+### M5 本地类别审核
+
+- 默认使用原生 `internlm/Intern-Decision-4B`，P1 三图 yes/no，`p(yes) >= 0.77`。
+- 只确认 mask 下物体的类别，不输出或推定掩码纯净度、可见性、完整性。
+- 无需历史质量收据；类别通过后执行现有点云及绑定验证。
+- 服务监听 `127.0.0.1:18445`，权重和运行时独立于主项目 Python 环境。
+- `online_model.mask_review: null` 显式切回 Qwen 的盲审、关系和质量准入。
+- 部署、调用和真实 M5 检查见 [Intern 脚本说明](scripts/intern_decision/README.md)。
 
 ### VGGT-1B
 

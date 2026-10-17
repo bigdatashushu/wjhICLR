@@ -1,6 +1,7 @@
 # Intern-Decision M5 实验服务
 
-默认 M5 仍使用百炼 Qwen。此目录的 GPU 依赖仅安装到仓库外的独立 Python 3.12 环境。
+默认 M5 使用下文的 Intern P1 / .77 类别准入；Qwen 保留题目解析、M8 与视觉补答。
+此目录的 GPU 依赖仅安装到仓库外的独立 Python 3.12 环境。
 `serve.py` 导入所选模型包的原版 `inference.py`，使用官方 compiler、masked assistant
 skeleton、marker 前一位置 logits 和合法单 token 选项，保留未校准及 release 温度结果。
 
@@ -48,7 +49,7 @@ ssh -N -L 18445:127.0.0.1:18445 cvailab@10.10.0.198
 parser、M8 和补答继续由原来的 online_model 控制。普通 runner 和 paired preparation
 共用实际 M5 入口。实验缓存禁用；不复用 Qwen 收据。
 
-未知类别、未知质量、格式/概率/身份异常或服务失败均关闭相关几何。Intern 观察不
+下述历史 observation 模式中，未知类别、未知质量、格式/概率/身份异常或服务失败均关闭相关几何。Intern 观察不
 生成 free-form alternate_object；名称来自固定 60 项选项映射。规则未覆盖的自由名词
 保留 uncertain。完整性只判断可见轮廓，实验没有概率准入阈值。
 
@@ -85,7 +86,7 @@ fixed model-package temperature is retained and T=1 probabilities are saved.
 Threshold search starts at .50, brackets with .70/.90/.95/.99, then bisects to
 .01. It uses saved probabilities, not repeated inference for each threshold.
 
-`mode: binary` is opt-in in `online_model.mask_review`, with explicit
+The historical `frozen-quality` experiment uses `mode: binary` in `online_model.mask_review`, with explicit
 `prompt_version`, `yes_threshold`, `quality_manifest` and
 `quality_manifest_sha256`. The quality manifest must refer to the exact same
 candidate ID and JPEG hashes. This first experiment reuses explicitly pinned
@@ -117,3 +118,37 @@ The M5 CLI accepts `--binary-operating-point` and
 `--frozen-quality-manifest` for this same optional protocol. A historical parser
 receipt can still be supplied explicitly if the DashScope environment key is
 absent. It is never used to answer a new binary vision request.
+
+## Main M5 category-only admission
+
+The main YAML, `OnlineModelSettings` and `OnlineRunConfig` select P1 / .77
+with `admission_policy: category-only`. The image compiler and prompt are unchanged.
+Only the native `target_match` noul question is sent. No category name is
+fabricated as an independent observation; no quality question is sent.
+`p(yes)` uses the pinned model-package temperature, not the saved T=1 diagnostic.
+
+This admission policy has its own version and identity. It does not read a
+quality manifest. Receipts contain `quality_assessed: false`, empty observation,
+exact candidate/frame/bbox and JPEG hashes, plus the original native response.
+Pointcloud admission requires `p(yes) >= .77` and a valid native response; existing
+depth, pointcloud, instance and binding validation still apply. These checks do
+not establish mask purity/completeness. Unknown/failed service responses close
+admission. Qwen remains responsible for question parsing, M8 and visual fallback.
+
+Run the actual configured M5 on 32 frozen real frames with live GroundingDINO,
+frame-independent SAM2 and live Intern:
+
+```bash
+SKILL3D_DETECTOR_ENDPOINT=http://127.0.0.1:20022 \
+CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src /path/to/skill3d-exp/bin/python \
+  scripts/intern_decision/run_m5.py --main-config configs/config.yaml \
+  --frozen /path/to/frozen/input --output /path/to/new/result \
+  --historical-parser-result /path/to/actual-flash-result.json
+```
+
+The parser argument is only needed when `DASHSCOPE_API_KEY` is absent and must
+match the exact question. It never substitutes for live detection, masks or
+Intern decisions. Choose a free GPU before starting SAM2/Intern. Set
+`online_model.mask_review: null` (or `OnlineRunConfig(semantic_review_config=None)`)
+to explicitly use the Qwen path. Old prepared bindings/caches cannot serve the
+new policy because configuration and implementation identities differ.

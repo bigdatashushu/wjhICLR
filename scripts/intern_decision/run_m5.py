@@ -57,7 +57,10 @@ def main():
     p.add_argument('--historical-parser-result', type=Path)
     p.add_argument('--binary-operating-point', type=Path)
     p.add_argument('--frozen-quality-manifest', type=Path)
+    p.add_argument('--main-config', type=Path, help='Use actual main M5 configuration; excludes binary-operating-point')
     args = p.parse_args()
+    if args.main_config and (args.binary_operating_point or args.frozen_quality_manifest):
+        p.error('--main-config cannot be combined with frozen binary experiment options')
     episode = VSIBenchEpisode.model_validate_json((args.frozen / 'episode.json').read_text())
     artifact = ReconstructionArtifact.model_validate_json((args.frozen / 'artifact.json').read_text())
     frames = [np.load(path, allow_pickle=False) for path in sorted(args.frozen.glob('frame_*.npy'))]
@@ -65,16 +68,27 @@ def main():
         raise ValueError('Require all 32 frozen frames')
     cloud = BailianClient()
     parser = HistoricalParser(args.historical_parser_result) if args.historical_parser_result else cloud
-    if not args.binary_operating_point and args.relation == 'qwen' and not cloud.configured:
+    main_config = None
+    if args.main_config:
+        from skill3d.online.config import load_config, online_model_from
+        main_config = online_model_from(load_config(args.main_config)).mask_review
+        if not main_config or main_config.get('mode') != 'binary':
+            raise ValueError('--main-config requires the actual binary M5 review configuration')
+    if not (args.binary_operating_point or main_config) and args.relation == 'qwen' and not cloud.configured:
         raise ValueError('DASHSCOPE_API_KEY absent for requested Qwen relation')
     if not args.historical_parser_result and not cloud.configured:
         raise ValueError('DASHSCOPE_API_KEY absent; supply explicit historical parser receipt')
     # Historical parser cannot serve the Qwen relation stage.
-    if not args.binary_operating_point and args.historical_parser_result and args.relation != 'frozen-rules':
+    if not (args.binary_operating_point or main_config) and args.historical_parser_result and args.relation != 'frozen-rules':
         raise ValueError('Use live parser for Qwen relation or explicit frozen-rules experiment')
+    if main_config:
+        args.endpoint = main_config['endpoint']
+        args.identity = main_config['expected_identity_sha256']
     identity = InternDecisionClient(args.endpoint, expected_identity_sha256=args.identity).identity()
     config = {'provider': 'intern-decision', 'endpoint': args.endpoint, 'timeout_s': 60,
               'expected_identity_sha256': content_sha256(identity), 'relation': args.relation}
+    if main_config:
+        config = main_config
     if args.binary_operating_point:
         from skill3d.segmentation.intern_binary_review import PROTOCOL_SHA256
         frozen = json.loads(args.binary_operating_point.read_text())

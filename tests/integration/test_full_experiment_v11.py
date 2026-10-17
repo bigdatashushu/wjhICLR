@@ -169,7 +169,7 @@ def test_unresolved_pair_is_never_implicitly_replayed(tmp_path):
 def test_real_executor_seals_before_solver_then_consumes_same_tree_without_rebinding(panel, tmp_path):
     item, artifact, bindings = panel
     item.episode.ground_truth = ""
-    cfg = fixtures.OnlineRunConfig(mode="real", seed=137, max_solver_rounds=3,
+    cfg = fixtures.OnlineRunConfig(semantic_review_config=None, mode="real", seed=137, max_solver_rounds=3,
                                   max_retries_per_operation=0)
     phases = []
 
@@ -199,7 +199,7 @@ def test_real_executor_seals_before_solver_then_consumes_same_tree_without_rebin
     with pytest.raises(ab.PairingError, match="config_sha256 changed"):
         ab.run_skill_ablation_v11(
             [item], artifact_paths={item.episode.qa_id: artifact}, output_dir=tmp_path / "changed",
-            base_cfg=fixtures.OnlineRunConfig(mode="real", max_tokens=999), seed=137,
+            base_cfg=fixtures.OnlineRunConfig(semantic_review_config=None, mode="real", max_tokens=999), seed=137,
             client_factory=client, prepared_manifest=source / "manifest.json")
     assert len(bindings) == 1
 

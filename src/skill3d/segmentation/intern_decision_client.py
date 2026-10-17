@@ -150,11 +150,17 @@ def review_config(config=None):
     if config.get("relation", "qwen") not in {"qwen", "frozen-rules"}:
         raise ValueError("unsupported M5 relation provider")
     allowed = {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation",
-               "mode", "prompt_version", "yes_threshold", "quality_manifest", "quality_manifest_sha256"}
+               "mode", "prompt_version", "yes_threshold", "quality_manifest", "quality_manifest_sha256",
+               "admission_policy"}
     if config.get("mode", "observation") not in {"observation", "binary"}:
         raise ValueError("unsupported Intern visual mode")
     if config.get("mode") == "binary" and config.get("provider") != "intern-decision":
         raise ValueError("binary mode requires Intern provider")
+    if config.get("admission_policy", "frozen-quality") not in {"category-only", "frozen-quality"}:
+        raise ValueError("unsupported binary admission policy")
+    if config.get("admission_policy") == "category-only" and (
+            config.get("mode") != "binary" or config.get("quality_manifest") or config.get("quality_manifest_sha256")):
+        raise ValueError("category-only requires binary mode without frozen quality")
     if set(config) - allowed:
         raise ValueError("unknown M5 review configuration")
     return config
@@ -172,7 +178,8 @@ def make_review_client(config=None):
             expected_identity_sha256=config.get("expected_identity_sha256", ""),
             prompt_version=config.get("prompt_version"), yes_threshold=config["yes_threshold"],
             quality_manifest=config.get("quality_manifest"),
-            quality_manifest_sha256=config.get("quality_manifest_sha256", ""))
+            quality_manifest_sha256=config.get("quality_manifest_sha256", ""),
+            admission_policy=config.get("admission_policy", "frozen-quality"))
     return InternDecisionClient(config.get("endpoint", "http://127.0.0.1:18445"),
         timeout_s=config.get("timeout_s", 60),
         expected_identity_sha256=config.get("expected_identity_sha256", ""))

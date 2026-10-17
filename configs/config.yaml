@@ -53,7 +53,7 @@ active_vision:
   layout: derived_plus_originals_v1
   max_derived_images: 8        # 单次请求里派生图的占位上限（服务上限内）
 
-# M5 题目解析与语义审核、M8 程序生成、评测视觉补答共用同一个百炼模型。
+# M5 题目解析、M8 程序生成、评测视觉补答使用百炼；M5 类别审核独立配置。
 # 密钥只从 api_key_env 指定的环境变量读取，不得写入 YAML 或收据。
 online_model:
   enabled: true
@@ -73,17 +73,17 @@ online_model:
   audit_min_pixels: 65536
   audit_max_pixels: 1048576
   relation_batch_size: 32
-  # Opt-in M5 experiment only; parser, M8 and fallback retain online_model above.
-  mask_review: null
-  # mask_review:
-  #   provider: intern-decision
-  #   endpoint: http://127.0.0.1:18445
-  #   timeout_s: 60
-  #   expected_identity_sha256: "<verified service identity hash>"
-  #   relation: qwen  # frozen-rules is a separately recorded experiment
-  # Binary experiment additionally requires mode: binary, explicit prompt_version
-  # and yes_threshold, plus exact-image quality_manifest + quality_manifest_sha256.
-  # The threshold is frozen by the experiment; no production default is inferred.
+  # M5 仅审核类别；没有可见性/纯净度/完整性的模型质量结论。
+  # 显式设为 null 可切回 Qwen 的盲审 + 关系 + 质量准入。
+  mask_review:
+    provider: intern-decision
+    endpoint: http://127.0.0.1:18445
+    timeout_s: 60
+    expected_identity_sha256: aa1a6239ae7883717e649f829bf2d200be7d851fb4db2701ac6900c4ddc2d9c2
+    mode: binary
+    prompt_version: P1
+    yes_threshold: 0.77
+    admission_policy: category-only
 
 sandbox:
   cell_timeout_s: 120                   # TODO_CALIBRATE

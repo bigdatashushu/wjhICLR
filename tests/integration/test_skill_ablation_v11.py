@@ -158,7 +158,7 @@ def run(panel, tmp_path, *, programs=None, **kwargs):
     root = tmp_path / "experiment"
     result = ab.run_skill_ablation_v11(
         [item], artifact_paths={item.episode.qa_id: artifact}, output_dir=root,
-        base_cfg=OnlineRunConfig(mode="real", seed=0, max_solver_rounds=3,
+        base_cfg=OnlineRunConfig(semantic_review_config=None, mode="real", seed=0, max_solver_rounds=3,
                                  max_retries_per_operation=0),
         seed=137, client_factory=factory, **kwargs)
     pairs = [json.loads(line) for line in (root / "paired_results.jsonl").read_text().splitlines()]
@@ -290,7 +290,7 @@ def test_paired_preparation_audits_cross_question_mask_conflicts_before_hashing(
         items,
         artifact_paths={qa_id: artifact for qa_id in qa_ids},
         output_dir=root,
-        base_cfg=OnlineRunConfig(
+        base_cfg=OnlineRunConfig(semantic_review_config=None,
             mode="real", seed=0, max_solver_rounds=2,
             max_retries_per_operation=0),
         seed=137,
@@ -428,7 +428,7 @@ def test_campaign_adapter_revalidates_cached_panel_and_summary(panel, tmp_path, 
         candidate_id="candidate-test", parent_snapshot_id="parent-test",
         parent_skill_version="S03@1.1.0", full_skill_spec=spec,
         modification_reason="clarify", source_run_ref="test:revision")
-    cfg = OnlineRunConfig(mode="real", seed=137, max_retries_per_operation=0)
+    cfg = OnlineRunConfig(semantic_review_config=None, mode="real", seed=137, max_retries_per_operation=0)
     evaluator = adapters.V11PairedEvaluator(
         items=[item], artifact_paths={item.episode.qa_id: artifact}, base_cfg=cfg,
         output_root=tmp_path / "adapter", library_root=tmp_path / "library",
@@ -497,7 +497,7 @@ def test_e11_fixed_parent_candidate_injection_is_auditable(panel, tmp_path):
         [item],
         artifact_paths={item.episode.qa_id: artifact},
         output_dir=root,
-        base_cfg=OnlineRunConfig(
+        base_cfg=OnlineRunConfig(semantic_review_config=None,
             mode="real",
             seed=0,
             max_solver_rounds=3,
@@ -657,7 +657,7 @@ def test_input_error_creates_zero_score_rows_for_both_arms(tmp_path):
         [item],
         artifact_paths={},
         output_dir=root,
-        base_cfg=OnlineRunConfig(mode="real", seed=0),
+        base_cfg=OnlineRunConfig(semantic_review_config=None, mode="real", seed=0),
         seed=137,
         expected_qa_ids=["missing-input"],
         client_factory=factory,
@@ -771,7 +771,11 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         FakeClient(['ReturnAnswer("A")\n']),
     ])
     monkeypatch.setattr(ab.runner, "_make_online_client", lambda cfg: next(clients))
-    config = ROOT / "configs/config.yaml"
+    import yaml
+    raw_config = yaml.safe_load((ROOT / "configs/config.yaml").read_text())
+    raw_config["online_model"]["mask_review"] = None
+    config = tmp_path / "qwen-fixture.yaml"
+    config.write_text(yaml.safe_dump(raw_config))
     output = tmp_path / "cli-result"
     assert cli.main([
         "--source", "jsonl", "--episodes-jsonl", "injected.jsonl",
@@ -815,7 +819,7 @@ def test_invalid_inputs_fail_before_model_and_write_receipt(panel, tmp_path, dam
         ab.run_skill_ablation_v11(
             items, expected_qa_ids=expected,
             artifact_paths={it.episode.qa_id: path for it in items}, output_dir=tmp_path / "bad",
-            base_cfg=OnlineRunConfig(mode="real"), seed=137)
+            base_cfg=OnlineRunConfig(semantic_review_config=None, mode="real"), seed=137)
     assert not calls
     assert json.loads((tmp_path / "bad/failure.json").read_text())["status"] == "invalid"
 
@@ -882,7 +886,7 @@ def test_confirmed_contract_with_low_geometry_is_formal_eligible(panel, tmp_path
     result = ab.run_skill_ablation_v11(
         [item], artifact_paths={item.episode.qa_id: artifact},
         output_dir=tmp_path / "formal-low-quality",
-        base_cfg=OnlineRunConfig(mode="real", seed=137,
+        base_cfg=OnlineRunConfig(semantic_review_config=None, mode="real", seed=137,
                                  model_weights_sha256="a" * 64, environment_sha256="b" * 64),
         seed=137, quality_confirmation={
             "confirmed": True, "sha256": ab.quality_contract()["sha256"],
@@ -906,7 +910,7 @@ def test_development_run_cannot_gain_formal_eligibility(panel, tmp_path, monkeyp
     result = ab.run_skill_ablation_v11(
         [item], artifact_paths={item.episode.qa_id: artifact},
         output_dir=tmp_path / "development",
-        base_cfg=OnlineRunConfig(mode="real", seed=137), seed=137,
+        base_cfg=OnlineRunConfig(semantic_review_config=None, mode="real", seed=137), seed=137,
         quality_confirmation={"confirmed": True, "sha256": ab.quality_contract()["sha256"],
                               "evidence_ref": "test-only"})
     assert result["status"] == "completed" and result["run_mode"] == "development"
@@ -1023,6 +1027,6 @@ def test_normal_solver_rejects_wrong_explicit_artifact_before_requests(panel, ch
     with pytest.raises(ValueError, match="artifact .*mismatch"):
         run_episode(
             item.episode, item.pixels,
-            OnlineRunConfig(mode="real", reuse_artifact=str(path)), llm=llm)
+            OnlineRunConfig(semantic_review_config=None, mode="real", reuse_artifact=str(path)), llm=llm)
     assert llm.calls == []
     assert calls == []

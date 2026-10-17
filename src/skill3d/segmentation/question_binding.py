@@ -82,8 +82,10 @@ def binding_parameters(*, semantic_min_pixels=None, semantic_max_pixels=None,
         from .intern_decision_protocol import PROTOCOL_SHA256, RELATION_IDENTITY
         result["experimental_semantic_review"] = review_config(semantic_review_config)
         if semantic_review_config.get("mode") == "binary":
-            from .intern_binary_review import PROTOCOL_SHA256 as binary_sha
+            from .intern_binary_review import PROTOCOL_SHA256 as binary_sha, admission_identity
             result["experimental_visual_protocol_sha256"] = binary_sha
+            result["binary_admission_identity"] = admission_identity(
+                semantic_review_config.get("admission_policy", "frozen-quality"))
         else:
             result["experimental_visual_protocol_sha256"] = PROTOCOL_SHA256
         result["experimental_relation_rules_sha256"] = content_sha256(RELATION_IDENTITY)
@@ -650,6 +652,10 @@ def bind_question_objects(
             for row in rows_by_id.values()),
         "n_relation_requests": relation_stats["actual_requests"],
         "n_relation_batches": relation_stats["n_batches"],
+        "admission_policy": (semantic_review_config or {}).get("admission_policy", "frozen-quality")
+                            if binary_mode else "visual-quality-and-relation",
+        "quality_assessed": not (binary_mode and (semantic_review_config or {}).get(
+            "admission_policy") == "category-only"),
     }
     stats["actual_model_requests"] += (
         stats["semantic_review"]["n_visual_requests"]
@@ -665,13 +671,20 @@ def bind_question_objects(
             "status": "unavailable", "relation": "uncertain"})
         row["semantic_relation"] = relation
         quality = visual["observation"]
+        category_only = binary_mode and (semantic_review_config or {}).get("admission_policy") == "category-only"
+        if category_only:
+            from .intern_binary_review import admission_identity
+            evidence_ok = (visual.get("admission") == admission_identity("category-only")
+                           and quality == {} and not visual.get("frozen_quality"))
+        else:
+            evidence_ok = ((binary_mode or quality.get("observed_object") not in {None, "other", "unknown"})
+                          and quality.get("visibility") in {"clear", "partial"}
+                          and quality.get("mask_purity") == "clean"
+                          and quality.get("mask_completeness") in {"whole", "major_part"})
         semantic_ok = (
             relation.get("status") == "reviewed"
             and relation.get("relation") == "match"
-            and (binary_mode or quality["observed_object"] not in {"other", "unknown"})
-            and quality["visibility"] in {"clear", "partial"}
-            and quality["mask_purity"] == "clean"
-            and quality["mask_completeness"] in {"whole", "major_part"})
+            and evidence_ok)
         if not semantic_ok:
             if relation.get("status") == "reviewed" and relation.get(
                     "relation") == "mismatch":
@@ -683,9 +696,9 @@ def bind_question_objects(
             row["error"] = (
                 relation.get("error")
                 or f"semantic relation={relation.get('relation')}; "
-                   f"visibility={quality['visibility']}; "
-                   f"purity={quality['mask_purity']}; "
-                   f"completeness={quality['mask_completeness']}")
+                   f"visibility={quality.get('visibility', 'not_assessed')}; "
+                   f"purity={quality.get('mask_purity', 'not_assessed')}; "
+                   f"completeness={quality.get('mask_completeness', 'not_assessed')}")
             observation["req"]["binding_failures"].append({
                 "candidate_id": candidate["candidate_id"],
                 "error": row["error"], "blocking": True})
@@ -707,6 +720,10 @@ def bind_question_objects(
                 "semantic_binary_review": visual.get("binary_review", {}),
                 "semantic_binary_review_sha256": visual.get("binary_review_sha256", ""),
                 "semantic_frozen_quality": visual.get("frozen_quality", {}),
+                "semantic_admission": visual.get("admission", {}),
+                "semantic_binary_response": visual.get("raw_response", {}) if category_only else {},
+                "semantic_binary_response_sha256": content_sha256(visual.get("raw_response", {}))
+                                                  if category_only else "",
                 "semantic_request_identity": visual.get("request_identity", {}),
                 "semantic_observation_sha256": visual.get("observation_sha256", ""),
                 "semantic_model_identity_sha256": visual.get("model_identity_sha256", ""),

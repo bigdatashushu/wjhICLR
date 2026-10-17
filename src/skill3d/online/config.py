@@ -13,6 +13,15 @@ from urllib.parse import urlsplit
 
 import yaml
 
+
+def default_mask_review():
+    """Lightweight defaults, usable by launchers before inference imports."""
+    return {"provider": "intern-decision", "endpoint": "http://127.0.0.1:18445",
+            "timeout_s": 60,
+            "expected_identity_sha256": "aa1a6239ae7883717e649f829bf2d200be7d851fb4db2701ac6900c4ddc2d9c2",
+            "mode": "binary", "prompt_version": "P1", "yes_threshold": .77,
+            "admission_policy": "category-only"}
+
 DEFAULT_CONFIG = "configs/config.yaml"
 SOURCE_ROOT = Path(__file__).resolve().parents[3]
 _PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}")
@@ -103,6 +112,7 @@ _FALLBACK: dict[str, Any] = {
         "audit_min_pixels": 65536,
         "audit_max_pixels": 1048576,
         "relation_batch_size": 32,
+        "mask_review": default_mask_review(),
     },
     "sandbox": {
         "cell_timeout_s": 120,
@@ -241,7 +251,7 @@ class OnlineModelSettings:
     audit_min_pixels: int = 65536
     audit_max_pixels: int = 1048576
     relation_batch_size: int = 32
-    mask_review: dict | None = None
+    mask_review: dict | None = field(default_factory=default_mask_review)
 
     def __post_init__(self):
         if self.mask_review is not None:
@@ -249,7 +259,8 @@ class OnlineModelSettings:
                 raise ValueError("online_model.mask_review must be a mapping")
             review = self.mask_review
             if set(review) - {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation",
-                              "mode", "prompt_version", "yes_threshold", "quality_manifest", "quality_manifest_sha256"}:
+                              "mode", "prompt_version", "yes_threshold", "quality_manifest", "quality_manifest_sha256",
+                              "admission_policy"}:
                 raise ValueError("unknown mask_review fields")
             if review.get("provider", "qwen") not in {"qwen", "intern-decision"}:
                 raise ValueError("unsupported mask_review provider")
@@ -263,8 +274,15 @@ class OnlineModelSettings:
                     raise ValueError("binary review requires explicit threshold in [.50,.99]")
                 if review.get("prompt_version") not in {"P0", "P1", "P2"}:
                     raise ValueError("binary review requires an explicit prompt version")
-                if not review.get("quality_manifest") or not review.get("quality_manifest_sha256"):
-                    raise ValueError("binary review requires pinned frozen quality")
+                policy = review.get("admission_policy", "frozen-quality")
+                if policy not in {"category-only", "frozen-quality"}:
+                    raise ValueError("unsupported binary admission policy")
+                if policy == "frozen-quality" and (not review.get("quality_manifest") or not review.get("quality_manifest_sha256")):
+                    raise ValueError("binary frozen-quality review requires pinned quality")
+                if policy == "category-only" and (review.get("quality_manifest") or review.get("quality_manifest_sha256")):
+                    raise ValueError("category-only review must not use frozen quality")
+            elif "admission_policy" in review:
+                raise ValueError("admission_policy requires binary mode")
             if review.get("relation", "qwen") not in {"qwen", "frozen-rules"}:
                 raise ValueError("unsupported mask_review relation")
         if not isinstance(self.enabled, bool):

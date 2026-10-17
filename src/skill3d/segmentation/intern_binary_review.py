@@ -1,4 +1,4 @@
-"""Opt-in target-conditioned binary review; frozen independent quality evidence.
+"""Native target-conditioned category review, with explicit admission policy.
 
 Only the target and the unchanged three images enter the semantic request.
 No observation name is synthesized from a yes/no answer.
@@ -15,6 +15,9 @@ from skill3d.infra.m5_identity import content_sha256, file_identity
 from .intern_decision_client import InternDecisionClient
 
 BINARY_VERSION = "m5-target-binary-v1"
+ADMISSION_VERSION = "m5-binary-category-admission-v1"
+ADMISSION_POLICIES = {"category-only", "frozen-quality"}
+RENDERING = "candidate_images:jpeg95:margin0.20:turquoise0.58"
 QUALITY_FIELDS = ("visibility", "mask_purity", "mask_completeness")
 STATE = """The three images depict one candidate region, in this exact order:
 1. full scene with an orange bounding rectangle;
@@ -36,6 +39,20 @@ PROTOCOL = {"version": BINARY_VERSION, "state": STATE, "prompts": PROMPTS,
             "yes": "The physical object primarily covered by the turquoise mask belongs to the target category.",
             "no": "The physical object primarily covered by the turquoise mask does not belong to the target category."}
 PROTOCOL_SHA256 = content_sha256(PROTOCOL)
+
+
+def default_mask_review():
+    """A fresh mapping for the selected main M5 operating point."""
+    from skill3d.online.config import default_mask_review as defaults
+    return defaults()
+
+
+def admission_identity(policy):
+    if policy not in ADMISSION_POLICIES:
+        raise ValueError("unsupported binary admission policy")
+    return {"version": ADMISSION_VERSION, "policy": policy,
+            "category_protocol_sha256": PROTOCOL_SHA256,
+            "quality_assessed": policy == "frozen-quality"}
 
 
 def binary_request(images, target_category, prompt_version):
@@ -110,7 +127,8 @@ class InternBinaryClient(InternDecisionClient):
     target_binary = True
 
     def __init__(self, endpoint, *, prompt_version="P1", yes_threshold=None,
-                 quality_manifest=None, quality_manifest_sha256="", **kwargs):
+                 quality_manifest=None, quality_manifest_sha256="",
+                 admission_policy="frozen-quality", **kwargs):
         super().__init__(endpoint, **kwargs)
         if prompt_version not in PROMPTS:
             raise ValueError("unknown binary prompt version")
@@ -118,12 +136,16 @@ class InternBinaryClient(InternDecisionClient):
         self.yes_threshold = None if yes_threshold is None else validate_threshold(yes_threshold)
         self.quality_manifest = Path(quality_manifest) if quality_manifest else None
         self.quality_manifest_sha256 = quality_manifest_sha256
+        self.admission = admission_identity(admission_policy)
+        if admission_policy == "category-only" and (quality_manifest or quality_manifest_sha256):
+            raise ValueError("category-only review must not use frozen quality")
         self._quality = None
 
     def audit_identity(self, *, seed=None):
         return {**super().audit_identity(seed=seed), "provider": self.provider,
                 "protocol_sha256": PROTOCOL_SHA256, "prompt_version": self.prompt_version,
-                "yes_threshold": self.yes_threshold, "quality_manifest_sha256": self.quality_manifest_sha256}
+                "yes_threshold": self.yes_threshold, "admission": self.admission,
+                "quality_manifest_sha256": self.quality_manifest_sha256}
 
     def review_binary(self, images, target_category):
         identity = self.identity()
@@ -173,25 +195,41 @@ class InternBinaryClient(InternDecisionClient):
         from .mask_semantic_review import candidate_images, _write
         cid = str(candidate["candidate_id"])
         receipt = {"version": BINARY_VERSION, "candidate_id": cid,
-                   "provider": self.provider, "status": "unavailable"}
+                   "provider": self.provider, "status": "unavailable",
+                   "admission": dict(self.admission)}
         start = time.perf_counter()
         try:
             threshold = validate_threshold(self.yes_threshold)
             images = candidate_images(frame, candidate["bbox"], mask)
-            quality, quality_source = self._frozen_quality(cid, images)
+            quality, quality_source = {}, {}
+            if self.admission["policy"] == "frozen-quality":
+                quality, quality_source = self._frozen_quality(cid, images)
+            if out_dir is not None:
+                request_path = Path(out_dir) / "requests" / f"{cid}.json"
+                _write(request_path, binary_request([r["url"] for r in images],
+                                                    candidate["category"], self.prompt_version))
+                receipt["request_file"] = str(request_path)
+                receipt["request_file_identity"] = file_identity(request_path)
             receipt["request_sent"] = True
             binary, body, sha = self.review_binary(images, candidate["category"])
-            decision = {**binary, "threshold": threshold, "semantic_pass": binary["p_yes"] >= threshold}
+            decision = {**binary, "threshold": threshold, "semantic_pass": binary["p_yes"] >= threshold,
+                        "admission_policy": self.admission["policy"]}
             receipt.update(status="observed", observation=quality, binary_review=decision,
                 frozen_quality=quality_source, raw_response=body, request_sha256=sha,
                 request_identity={"protocol_sha256": PROTOCOL_SHA256, "model": self.identity(),
                     "prompt_version": self.prompt_version, "target_category": candidate["category"],
                     "images": [r["identity"] for r in images],
+                    "candidate_id": cid, "frame_slot": candidate["frame_slot"],
+                    "bbox": list(candidate["bbox"]), "rendering": RENDERING,
+                    "admission": dict(self.admission), "yes_threshold": threshold,
                     "quality_manifest_sha256": self.quality_manifest_sha256},
                 observation_sha256=content_sha256(quality), model_identity_sha256=content_sha256(self.identity()),
                 binary_review_sha256=content_sha256(decision),
-                normalization_sources={"observation": "only quality from exact-image frozen receipt",
-                    "observed_object": "absent; binary answer does not name an independently observed class"})
+                normalization_sources={"observation": "quality not assessed" if not quality else
+                    "only quality from exact-image frozen receipt",
+                    "observed_object": "absent; binary answer does not name an independently observed class"},
+                admission_reason=("category_confirmed" if decision["semantic_pass"] else
+                                  "category_not_established"))
         except Exception as exc:
             receipt["error"] = f"{type(exc).__name__}: {exc}"
         receipt["elapsed_s"] = time.perf_counter() - start
@@ -208,6 +246,52 @@ def binary_relation(receipt):
     return {"status": "reviewed", "relation": "match" if binary["semantic_pass"] else "uncertain",
             "request_sha256": receipt["request_sha256"], "provider": "binary-threshold",
             "p_yes": binary["p_yes"], "threshold": binary["threshold"], "version": BINARY_VERSION}
+
+
+def validate_category_receipt(row, object_category):
+    """Validate native evidence without claiming an unmeasured mask quality."""
+    binary = row["semantic_binary_review"]
+    identity = row["semantic_request_identity"]
+    admission = row["semantic_admission"]
+    body = row["semantic_binary_response"]
+    threshold = validate_threshold(binary["threshold"])
+    expected = admission_identity("category-only")
+    model = identity["model"]
+    probabilities = _binary_answer(body["result"])
+    raw = _binary_answer(body["uncalibrated_result"])
+    vision = body["vision_evidence"]
+    images = identity["images"]
+    return bool(
+        admission == expected and identity.get("admission") == expected
+        and binary.get("admission_policy") == "category-only"
+        and identity.get("yes_threshold") == threshold
+        and identity.get("candidate_id") == row.get("candidate_id")
+        and identity.get("frame_slot") == row.get("frame_slot")
+        and identity.get("bbox") == list(row.get("bbox", []))
+        and identity.get("rendering") == RENDERING
+        and len(images) == 3 and all(re.fullmatch(r"[0-9a-f]{64}", im.get("sha256", "")) for im in images)
+        and binary["p_yes"] == probabilities["yes"] and binary["p_no"] == probabilities["no"]
+        and binary.get("raw_p_yes") == raw["yes"] and binary.get("raw_p_no") == raw["no"]
+        and binary.get("decision") == body["result"]["answers"]["target_match"]["decision"]
+        and binary["p_yes"] >= threshold and binary.get("semantic_pass") is True
+        and binary.get("target_category") == object_category == identity.get("target_category")
+        and binary.get("prompt_version") in PROMPTS
+        and binary.get("prompt_version") == identity.get("prompt_version")
+        and binary.get("protocol_sha256") == identity.get("protocol_sha256") == PROTOCOL_SHA256
+        and body.get("request_sha256") == row.get("semantic_visual_request_sha256")
+        == row.get("semantic_relation_request_sha256")
+        and body.get("identity_sha256") == content_sha256(model)
+        == row.get("semantic_model_identity_sha256")
+        and body["result"].get("calibration") == model.get("calibration")
+        and body["uncalibrated_result"].get("calibration", {}).get("temperature") == 1
+        and vision.get("image_count") == 3 and vision.get("image_token_count", 0) > 0
+        and bool(vision.get("pixel_values_shape")) and len(vision.get("image_grid_thw", [])) == 3
+        and len(vision.get("decision_logit_positions", [])) == 1
+        and row.get("semantic_binary_review_sha256") == content_sha256(binary)
+        and row.get("semantic_binary_response_sha256") == content_sha256(body)
+        and row.get("semantic_observation") == {}
+        and row.get("semantic_observation_sha256") == content_sha256({})
+        and not row.get("semantic_frozen_quality") and not identity.get("quality_manifest_sha256"))
 
 
 def threshold_search(samples):

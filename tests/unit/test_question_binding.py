@@ -418,3 +418,46 @@ def test_binary_m5_uses_threshold_and_independent_quality(harness,monkeypatch,p_
         changed[0]['semantic_binary_review']['threshold']=.9
         altered=obj.model_copy(update={'binding_provenance':changed})
         assert validate_binding(altered).status=='unavailable'
+
+
+@pytest.mark.parametrize('p_yes,expected',[(.77,True),(.769999,False)])
+def test_main_binary_m5_only_category_admits_geometry_and_validates_receipts(harness,monkeypatch,p_yes,expected):
+    from skill3d.infra.m5_identity import content_sha256
+    from skill3d.segmentation import intern_decision_client as local
+    from skill3d.segmentation.intern_binary_review import InternBinaryClient,default_mask_review
+    client=InternBinaryClient('http://127.0.0.1:18445',prompt_version='P1',yes_threshold=.77,
+                             admission_policy='category-only')
+    client._identity={'model':'internlm/Intern-Decision-4B','calibration':{'temperature':1.99241824}}
+    def answer(p):
+        return {'model':'Intern-Decision-4B','backend':'hf','answers':{'target_match':{
+            'type':'noul','probabilities':{'no':1-p,'yes':p},'decision':'yes','confidence':p,'noul':p}}}
+    def call(path,body):
+        return {'request_sha256':body['request_sha256'],'identity_sha256':content_sha256(client._identity),
+                'result':{**answer(p_yes),'calibration':client._identity['calibration']},
+                'uncalibrated_result':{**answer(.9),'calibration':{'temperature':1}},
+                'vision_evidence':{'image_count':3,'image_token_count':44,'pixel_values_shape':[1,1],
+                                  'image_grid_thw':[[1,2,2]]*3,'decision_logit_positions':[100]}}
+    client._call=call
+    monkeypatch.setattr(local,'make_review_client',lambda config:client)
+    calls=[]
+    original=st.bind_masks_to_world
+    def bind(*args,**kwargs):
+        if args[0]:
+            calls.append(True)
+        return original(*args,**kwargs)
+    monkeypatch.setattr(st,'bind_masks_to_world',bind)
+    objects,stats,_=qb.bind_question_objects(**harness.args,semantic_review_config=default_mask_review())
+    assert bool(objects)==expected and bool(calls)==expected
+    assert list(harness.args['vlm_client'].phase_calls)==['m5_object_parse']
+    assert stats['semantic_review']['quality_assessed'] is False
+    assert stats['semantic_review']['n_relation_requests']==0
+    if expected:
+        obj=objects[0]
+        assert obj.binding_validation.checks['intern_binary_integrity']
+        assert obj.binding_provenance[0]['semantic_observation']=={}
+        for key,value in [('candidate_id','wrong'),('frame_slot',31),('bbox',[0,0,1,1])]:
+            changed=copy.deepcopy(obj.binding_provenance);changed[0]['semantic_request_identity'][key]=value
+            assert validate_binding(obj.model_copy(update={'binding_provenance':changed})).status=='unavailable'
+        changed=copy.deepcopy(obj.binding_provenance)
+        changed[0]['semantic_binary_response']['result']['answers']['target_match']['probabilities']['yes']=.9
+        assert validate_binding(obj.model_copy(update={'binding_provenance':changed})).status=='unavailable'

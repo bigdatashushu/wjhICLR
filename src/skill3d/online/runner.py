@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
+from skill3d.online.config import default_mask_review
 
 from skill3d.evaluation.accuracy import extract_option_letter
 from skill3d.evaluation.mra import mra_single, parse_numeric_answer
@@ -176,7 +177,7 @@ class OnlineRunConfig:
     semantic_min_pixels: int = 65536
     semantic_max_pixels: int = 1048576
     semantic_relation_batch_size: int = 32
-    semantic_review_config: dict | None = None
+    semantic_review_config: dict | None = field(default_factory=default_mask_review)
     model_weights_sha256: str = field(
         default_factory=lambda: os.environ.get("SKILL3D_MODEL_WEIGHTS_SHA256", ""))
     environment_sha256: str = field(

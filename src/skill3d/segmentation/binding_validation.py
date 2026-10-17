@@ -88,6 +88,15 @@ def validate_binding(obj, *, depth_maps=None, n_frames=None,
     for row in obj.binding_provenance or []:
         if row.get("semantic_provider") == "intern-decision-binary-local":
             from .intern_binary_review import PROTOCOL_SHA256 as binary_protocol_sha, quality_passes, validate_threshold
+            if row.get("semantic_admission", {}).get("policy") == "category-only":
+                from .intern_binary_review import validate_category_receipt
+                try:
+                    checks["intern_binary_integrity"] = validate_category_receipt(row, obj.category_name)
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    checks["intern_binary_integrity"] = False
+                if not checks["intern_binary_integrity"]:
+                    break
+                continue
             observation = row.get("semantic_observation") or {}
             identity = row.get("semantic_request_identity") or {}
             binary = row.get("semantic_binary_review") or {}
