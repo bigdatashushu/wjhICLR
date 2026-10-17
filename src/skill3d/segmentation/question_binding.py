@@ -75,8 +75,14 @@ def question_input(question, question_type, options):
 
 
 def binding_parameters(*, semantic_min_pixels=None, semantic_max_pixels=None,
-                       semantic_relation_batch_size=None):
+                       semantic_relation_batch_size=None, semantic_review_config=None):
     result = dict(PARAMETERS)
+    if semantic_review_config:
+        from .intern_decision_client import review_config
+        from .intern_decision_protocol import PROTOCOL_SHA256, RELATION_IDENTITY
+        result["experimental_semantic_review"] = review_config(semantic_review_config)
+        result["experimental_visual_protocol_sha256"] = PROTOCOL_SHA256
+        result["experimental_relation_rules_sha256"] = content_sha256(RELATION_IDENTITY)
     overrides = {
         "semantic_min_pixels": semantic_min_pixels,
         "semantic_max_pixels": semantic_max_pixels,
@@ -397,7 +403,7 @@ def bind_question_objects(
     scene_identity="", frame_provenance=None, model_weights_sha256="",
     point_map=None, geometry_usable=True,
     semantic_min_pixels=None, semantic_max_pixels=None,
-    semantic_relation_batch_size=None,
+    semantic_relation_batch_size=None, semantic_review_config=None,
 ):
     from . import sam2_tracker as st
 
@@ -406,7 +412,8 @@ def bind_question_objects(
     parameters = binding_parameters(
         semantic_min_pixels=semantic_min_pixels,
         semantic_max_pixels=semantic_max_pixels,
-        semantic_relation_batch_size=semantic_relation_batch_size)
+        semantic_relation_batch_size=semantic_relation_batch_size,
+        semantic_review_config=semantic_review_config)
     generation = inventory_generation_identity(
         scene_name=scene_name, frame_set_hash=frame_set_hash, frames=frames,
         depth_maps=depth_maps, c2w_list=c2w_list, intrinsics=intrinsics,
@@ -415,6 +422,13 @@ def bind_question_objects(
         seed=seed, parameters=parameters, model_weights_sha256=model_weights_sha256,
         question=question, question_type=question_type, options=options,
         reconstruction_identity=scene_identity, point_map=point_map)
+    from .intern_decision_client import make_review_client, compare_fixed_categories
+    from .intern_decision_protocol import RELATION_VERSION
+    visual_client = make_review_client(semantic_review_config) or vlm_client
+    if semantic_review_config:
+        # No Qwen cache can serve an experimental protocol, including failed service calls.
+        generation["cache_eligible"] = False
+        generation["missing"] = [*generation["missing"], "experimental review disk reuse disabled"]
     key = generation["sha256"]
     root = Path(out_dir) / "question_bindings" / key if out_dir else None
     cache = root / "binding.json" if root else None
@@ -592,7 +606,7 @@ def bind_question_objects(
         candidate, row = observation["candidate"], observation["row"]
         visual = msr.observe_candidate(
             candidate, frames[candidate["frame_slot"]], observation["raw_mask"],
-            vlm_client, seed=seed,
+            visual_client, seed=seed,
             min_pixels=parameters["semantic_min_pixels"],
             max_pixels=parameters["semantic_max_pixels"],
             out_dir=(work / "semantic_reviews") if work else None)
@@ -608,13 +622,19 @@ def bind_question_objects(
             observation["req"]["binding_failures"].append({
                 "candidate_id": candidate["candidate_id"],
                 "error": row["error"], "blocking": True})
-    relations, relation_stats = msr.compare_categories(
+    relation_fn = msr.compare_categories
+    if (semantic_review_config or {}).get("relation") == "frozen-rules":
+        relation_fn = lambda rows, *_args, **kwargs: compare_fixed_categories(
+            rows, out_dir=kwargs.get("out_dir"))
+    relations, relation_stats = relation_fn(
         relation_input, vlm_client, seed=seed,
         batch_size=parameters["semantic_relation_batch_size"],
         out_dir=(work / "semantic_reviews") if work else None)
     stats["semantic_review"] = {
-        "visual_version": msr.VISUAL_REVIEW_VERSION,
-        "relation_version": msr.RELATION_REVIEW_VERSION,
+        "visual_version": parameters.get("experimental_visual_protocol_sha256", msr.VISUAL_REVIEW_VERSION),
+        "experimental_config": semantic_review_config or {},
+        "relation_version": (RELATION_VERSION if (semantic_review_config or {}).get("relation")
+                             == "frozen-rules" else msr.RELATION_REVIEW_VERSION),
         "n_visual_requests": sum(bool(
             row.get("semantic_visual", {}).get("request_sent"))
             for row in rows_by_id.values()),
@@ -638,7 +658,8 @@ def bind_question_objects(
         semantic_ok = (
             relation.get("status") == "reviewed"
             and relation.get("relation") == "match"
-            and quality["visibility"] != "insufficient"
+            and quality["observed_object"] not in {"other", "unknown"}
+            and quality["visibility"] in {"clear", "partial"}
             and quality["mask_purity"] == "clean"
             and quality["mask_completeness"] in {"whole", "major_part"})
         if not semantic_ok:
@@ -672,6 +693,10 @@ def bind_question_objects(
                 **candidate,
                 "semantic_visual_request_sha256": visual["request_sha256"],
                 "semantic_observation": quality,
+                "semantic_provider": visual.get("provider", "bailian"),
+                "semantic_request_identity": visual.get("request_identity", {}),
+                "semantic_observation_sha256": visual.get("observation_sha256", ""),
+                "semantic_model_identity_sha256": visual.get("model_identity_sha256", ""),
                 "semantic_relation": relation["relation"],
                 "semantic_relation_request_sha256": relation["request_sha256"],
             }

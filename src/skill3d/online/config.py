@@ -241,8 +241,19 @@ class OnlineModelSettings:
     audit_min_pixels: int = 65536
     audit_max_pixels: int = 1048576
     relation_batch_size: int = 32
+    mask_review: dict | None = None
 
     def __post_init__(self):
+        if self.mask_review is not None:
+            if not isinstance(self.mask_review, dict):
+                raise ValueError("online_model.mask_review must be a mapping")
+            review = self.mask_review
+            if set(review) - {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation"}:
+                raise ValueError("unknown mask_review fields")
+            if review.get("provider", "qwen") not in {"qwen", "intern-decision"}:
+                raise ValueError("unsupported mask_review provider")
+            if review.get("relation", "qwen") not in {"qwen", "frozen-rules"}:
+                raise ValueError("unsupported mask_review relation")
         if not isinstance(self.enabled, bool):
             raise ValueError("online_model.enabled must be boolean")
         if self.provider != "bailian":

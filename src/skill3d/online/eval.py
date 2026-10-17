@@ -298,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         semantic_min_pixels=online_model.audit_min_pixels,
         semantic_max_pixels=online_model.audit_max_pixels,
         semantic_relation_batch_size=online_model.relation_batch_size,
+        semantic_review_config=online_model.mask_review,
         max_images=int(online_model.n_frames),
         max_tokens=online_model.max_tokens,
         temperature=online_model.temperature,

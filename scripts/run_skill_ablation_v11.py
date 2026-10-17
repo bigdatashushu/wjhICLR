@@ -148,6 +148,7 @@ def main(argv=None) -> int:
             semantic_min_pixels=model.audit_min_pixels,
             semantic_max_pixels=model.audit_max_pixels,
             semantic_relation_batch_size=model.relation_batch_size,
+            semantic_review_config=model.mask_review,
             max_images=model.n_frames, max_pixels=model.max_pixels,
             max_model_len=model.max_model_len, max_tokens=model.max_tokens,
             temperature=model.temperature,

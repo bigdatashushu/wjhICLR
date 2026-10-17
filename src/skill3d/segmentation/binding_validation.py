@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from skill3d.infra.m5_identity import file_identity
+from skill3d.infra.m5_identity import file_identity, content_sha256
 from skill3d.schemas.reconstruction import BindingValidation
 
 BINDING_VALIDATION_VERSION = "m5-binding-validation-v2-semantic-review"
@@ -70,6 +70,21 @@ def validate_binding(obj, *, depth_maps=None, n_frames=None,
             and row.get("semantic_visual_request_sha256")
             and row.get("semantic_relation_request_sha256")
             for row in obj.binding_provenance)))
+    for row in obj.binding_provenance or []:
+        if row.get("semantic_provider") == "intern-decision-local":
+            from .intern_decision_protocol import PROTOCOL_SHA256
+            observation = row.get("semantic_observation") or {}
+            identity = row.get("semantic_request_identity") or {}
+            checks["intern_observation_integrity"] = bool(
+                observation.get("observed_object") not in {None, "other", "unknown"}
+                and observation.get("visibility") in {"clear", "partial"}
+                and observation.get("mask_purity") == "clean"
+                and observation.get("mask_completeness") in {"whole", "major_part"}
+                and row.get("semantic_observation_sha256") == content_sha256(observation)
+                and identity.get("protocol_sha256") == PROTOCOL_SHA256
+                and row.get("semantic_model_identity_sha256") == content_sha256(identity.get("model")))
+            if not checks["intern_observation_integrity"]:
+                break
     if check_receipt:
         receipt = obj.binding_validation
         checks["receipt"] = bool(

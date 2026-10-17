@@ -73,6 +73,14 @@ online_model:
   audit_min_pixels: 65536
   audit_max_pixels: 1048576
   relation_batch_size: 32
+  # Opt-in M5 experiment only; parser, M8 and fallback retain online_model above.
+  mask_review: null
+  # mask_review:
+  #   provider: intern-decision
+  #   endpoint: http://127.0.0.1:18445
+  #   timeout_s: 60
+  #   expected_identity_sha256: "<verified service identity hash>"
+  #   relation: qwen  # frozen-rules is a separately recorded experiment
 
 sandbox:
   cell_timeout_s: 120                   # TODO_CALIBRATE

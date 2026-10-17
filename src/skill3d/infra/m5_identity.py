@@ -18,6 +18,7 @@ SOURCE_REFS = (
     "segmentation/sam2_tracker.py", "segmentation/open_vocab_detector.py",
     "segmentation/question_binding.py", "segmentation/binding_validation.py",
     "segmentation/mask_semantic_review.py",
+    "segmentation/intern_decision_client.py", "segmentation/intern_decision_protocol.py",
     "segmentation/groundingdino_startup.py", "coords.py",
     "reconstruction/image_grid.py", "tools/category_match.py",
     "reconstruction_gate/confidence_map.py",

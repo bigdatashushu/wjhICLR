@@ -206,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
         semantic_min_pixels=model.audit_min_pixels,
         semantic_max_pixels=model.audit_max_pixels,
         semantic_relation_batch_size=model.relation_batch_size,
+        semantic_review_config=model.mask_review,
         reuse_artifact=str(REPO / args.artifact) if args.artifact else None,
         seed=0, trace_dir=str(REPO / "data/traces_real"),
         max_images=model.n_frames,

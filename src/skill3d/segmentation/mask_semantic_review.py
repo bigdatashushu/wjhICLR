@@ -182,6 +182,9 @@ def _response_identity(client) -> dict:
 
 def observe_candidate(candidate, frame, mask, client, *, seed, min_pixels,
                       max_pixels, out_dir=None):
+    if hasattr(client, "observe_candidate"):
+        return client.observe_candidate(candidate, frame, mask, seed=seed,
+            min_pixels=min_pixels, max_pixels=max_pixels, out_dir=out_dir)
     candidate_id = str(candidate["candidate_id"])
     receipt = {
         "version": VISUAL_REVIEW_VERSION,

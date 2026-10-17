@@ -176,6 +176,7 @@ class OnlineRunConfig:
     semantic_min_pixels: int = 65536
     semantic_max_pixels: int = 1048576
     semantic_relation_batch_size: int = 32
+    semantic_review_config: dict | None = None
     model_weights_sha256: str = field(
         default_factory=lambda: os.environ.get("SKILL3D_MODEL_WEIGHTS_SHA256", ""))
     environment_sha256: str = field(
@@ -1359,7 +1360,8 @@ def run_episode(
                         parameters=binding_parameters(
                             semantic_min_pixels=cfg.semantic_min_pixels,
                             semantic_max_pixels=cfg.semantic_max_pixels,
-                            semantic_relation_batch_size=cfg.semantic_relation_batch_size))
+                            semantic_relation_batch_size=cfg.semantic_relation_batch_size,
+                            semantic_review_config=cfg.semantic_review_config))
                 m5_objects, m5_stats = binding.objects, binding.stats
                 m5_notes, m5_materialized = binding.notes, binding.materialized
             prepared_measurements = (
@@ -2324,6 +2326,7 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
             semantic_max_pixels=(cfg.semantic_max_pixels if cfg is not None else None),
             semantic_relation_batch_size=(
                 cfg.semantic_relation_batch_size if cfg is not None else None),
+            semantic_review_config=(cfg.semantic_review_config if cfg is not None else None),
         )
     except Exception as exc:  # noqa: BLE001 - checkpoint/依赖/传播失败
         return [], {"binding_error": f"{type(exc).__name__}: {exc}",

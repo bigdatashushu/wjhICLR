@@ -336,3 +336,47 @@ def test_cache_rejects_legacy_version_and_escaped_references(harness):
     qb._save_envelope(cache, rebuilt["generation"]["sha256"], payload)
     _, rebuilt_again, _ = qb.bind_question_objects(**harness.args)
     assert not rebuilt_again["cache_hit"] and len(harness.calls) == 96
+
+@pytest.mark.parametrize('label,purity,complete,visibility,accepted',[
+    ('chair','clean','whole','clear',True),('chair','mixed','whole','clear',False),
+    ('chair','clean','fragment','clear',False),('chair','unknown','whole','clear',False),
+    ('chair','clean','whole','insufficient',False),('unknown','clean','whole','clear',False),
+])
+def test_experimental_provider_runs_m5_and_gates_geometry(harness,monkeypatch,label,purity,complete,visibility,accepted):
+    from skill3d.segmentation import intern_decision_client as local
+    class Visual:
+        def observe_candidate(self,candidate,*args,**kwargs):
+            return {'version':'experimental','provider':'test-experimental','status':'observed',
+                'request_sent':True,'request_sha256':'a'*64,'observation':{
+                'observed_object':label,'mask_purity':purity,'mask_completeness':complete,
+                'visibility':visibility}}
+    monkeypatch.setattr(local,'make_review_client',lambda config:Visual())
+    objects,stats,_=qb.bind_question_objects(**harness.args,
+        semantic_review_config={'provider':'intern-decision','relation':'frozen-rules'})
+    assert bool(objects)==accepted
+    assert stats['generation']['cache_eligible'] is False
+    assert 'experimental_semantic_review' in stats['generation']['identity']['parameters']
+    assert list(harness.args['vlm_client'].phase_calls)==['m5_object_parse']
+    if accepted:
+        assert all(o.binding_validation.status=='validated' for o in objects)
+
+
+def test_intern_binding_receipt_rejects_changed_observation(harness):
+    from skill3d.infra.m5_identity import content_sha256
+    from skill3d.segmentation.intern_decision_protocol import PROTOCOL_SHA256
+    objects, _, _ = qb.bind_question_objects(**harness.args)
+    obj = objects[0]
+    observation = {"observed_object": "chair", "visibility": "clear",
+                   "mask_purity": "clean", "mask_completeness": "whole"}
+    model = {"model": "internlm/Intern-Decision-4B", "revision": "frozen"}
+    provenance = [{**r, "semantic_provider": "intern-decision-local",
+        "semantic_observation": observation,
+        "semantic_observation_sha256": content_sha256(observation),
+        "semantic_request_identity": {"model": model, "protocol_sha256": PROTOCOL_SHA256},
+        "semantic_model_identity_sha256": content_sha256(model)} for r in obj.binding_provenance]
+    good = obj.model_copy(update={"binding_provenance": provenance})
+    assert validate_binding(good).status == "validated"
+    changed = copy.deepcopy(provenance)
+    changed[0]["semantic_observation"]["mask_completeness"] = "fragment"
+    bad = good.model_copy(update={"binding_provenance": changed})
+    assert validate_binding(bad).status == "unavailable"
