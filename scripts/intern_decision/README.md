@@ -76,3 +76,44 @@ PYTHONPATH=src /path/to/skill3d-exp/bin/python scripts/intern_decision/run_m5.py
 
 历史复用只允许真实成功的 Flash parser 收据，严格匹配问题输入；不能用它回放视觉审核。
 有 `DASHSCOPE_API_KEY` 时省略历史 parser 参数，默认关系为 Qwen。
+
+## Target-conditioned yes/no experiment
+
+`run_binary_experiment.py` runs P0/P1/P2 on the exact same three JPEGs. Native
+`noul` returns both probabilities; it does not generate an object name. The
+fixed model-package temperature is retained and T=1 probabilities are saved.
+Threshold search starts at .50, brackets with .70/.90/.95/.99, then bisects to
+.01. It uses saved probabilities, not repeated inference for each threshold.
+
+`mode: binary` is opt-in in `online_model.mask_review`, with explicit
+`prompt_version`, `yes_threshold`, `quality_manifest` and
+`quality_manifest_sha256`. The quality manifest must refer to the exact same
+candidate ID and JPEG hashes. This first experiment reuses explicitly pinned
+old target-blind quality receipts, so semantic and final admission metrics must
+be reported separately. A below-threshold score establishes uncertainty, not
+physical absence. Missing/changed quality closes geometry admission.
+
+Development scenes are chair/fridge (112); validation scenes are paper bag and
+computer tower/heater (98). Prompt/threshold selection must finish before the
+validation stage. `score_binary_experiment.py` produces candidate-level results
+and pessimistic repeat summaries. A Codex visual review is required before
+selection; it is not substituted for human reference labels.
+
+A native binary request can be made with the same three-image CLI:
+
+```bash
+.venv/bin/python scripts/intern_decision/call.py context.jpg crop.jpg overlay.jpg \
+  --target 'chair' --prompt-version P1 --identity '<service identity_sha256>' \
+  --output binary-receipt.json
+```
+
+Do not infer binary probabilities from the earlier 60-category softmax. The
+binary protocol issues a new native `noul` request with only `target_match`.
+`P(yes) >= yes_threshold` is the explicit acceptance predicate. The operating
+point is chosen on development scenes and frozen before validation. Missing or
+changed candidates/images in the frozen quality manifest fail closed.
+
+The M5 CLI accepts `--binary-operating-point` and
+`--frozen-quality-manifest` for this same optional protocol. A historical parser
+receipt can still be supplied explicitly if the DashScope environment key is
+absent. It is never used to answer a new binary vision request.

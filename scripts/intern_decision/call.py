@@ -15,11 +15,19 @@ def main():
     p.add_argument('--endpoint', default='http://127.0.0.1:18445')
     p.add_argument('--identity', default='')
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--target', help='Optional target for native binary review')
+    p.add_argument('--prompt-version', choices=['P0','P1','P2'], default='P1')
     args = p.parse_args()
     client = InternDecisionClient(args.endpoint, expected_identity_sha256=args.identity)
     images = [{'url': 'data:image/jpeg;base64,' + base64.b64encode(path.read_bytes()).decode(),
                'identity': file_identity(path)} for path in args.images]
-    observation, raw, request_sha = client.observe(images)
+    if args.target:
+        from skill3d.segmentation.intern_binary_review import InternBinaryClient
+        client = InternBinaryClient(args.endpoint, expected_identity_sha256=args.identity,
+                                    prompt_version=args.prompt_version)
+        observation, raw, request_sha = client.review_binary(images, args.target)
+    else:
+        observation, raw, request_sha = client.observe(images)
     with args.output.open('x') as stream:
         json.dump({'observation': observation, 'raw_response': raw,
                    'request_sha256': request_sha, 'images': [r['identity'] for r in images]},

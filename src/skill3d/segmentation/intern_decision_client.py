@@ -149,7 +149,12 @@ def review_config(config=None):
         raise ValueError("unsupported M5 visual provider")
     if config.get("relation", "qwen") not in {"qwen", "frozen-rules"}:
         raise ValueError("unsupported M5 relation provider")
-    allowed = {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation"}
+    allowed = {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation",
+               "mode", "prompt_version", "yes_threshold", "quality_manifest", "quality_manifest_sha256"}
+    if config.get("mode", "observation") not in {"observation", "binary"}:
+        raise ValueError("unsupported Intern visual mode")
+    if config.get("mode") == "binary" and config.get("provider") != "intern-decision":
+        raise ValueError("binary mode requires Intern provider")
     if set(config) - allowed:
         raise ValueError("unknown M5 review configuration")
     return config
@@ -159,6 +164,15 @@ def make_review_client(config=None):
     config = review_config(config)
     if config.get("provider", "qwen") == "qwen":
         return None
+    if config.get("mode") == "binary":
+        from .intern_binary_review import InternBinaryClient, validate_threshold
+        validate_threshold(config.get("yes_threshold"))
+        return InternBinaryClient(config.get("endpoint", "http://127.0.0.1:18445"),
+            timeout_s=config.get("timeout_s", 60),
+            expected_identity_sha256=config.get("expected_identity_sha256", ""),
+            prompt_version=config.get("prompt_version"), yes_threshold=config["yes_threshold"],
+            quality_manifest=config.get("quality_manifest"),
+            quality_manifest_sha256=config.get("quality_manifest_sha256", ""))
     return InternDecisionClient(config.get("endpoint", "http://127.0.0.1:18445"),
         timeout_s=config.get("timeout_s", 60),
         expected_identity_sha256=config.get("expected_identity_sha256", ""))

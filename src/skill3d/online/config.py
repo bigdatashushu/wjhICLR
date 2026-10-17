@@ -248,10 +248,23 @@ class OnlineModelSettings:
             if not isinstance(self.mask_review, dict):
                 raise ValueError("online_model.mask_review must be a mapping")
             review = self.mask_review
-            if set(review) - {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation"}:
+            if set(review) - {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation",
+                              "mode", "prompt_version", "yes_threshold", "quality_manifest", "quality_manifest_sha256"}:
                 raise ValueError("unknown mask_review fields")
             if review.get("provider", "qwen") not in {"qwen", "intern-decision"}:
                 raise ValueError("unsupported mask_review provider")
+            if review.get("mode", "observation") not in {"observation", "binary"}:
+                raise ValueError("unsupported mask_review mode")
+            if review.get("mode") == "binary":
+                if review.get("provider") != "intern-decision":
+                    raise ValueError("binary review requires Intern provider")
+                threshold = review.get("yes_threshold")
+                if type(threshold) not in (int, float) or not math.isfinite(threshold) or not .5 <= threshold <= .99:
+                    raise ValueError("binary review requires explicit threshold in [.50,.99]")
+                if review.get("prompt_version") not in {"P0", "P1", "P2"}:
+                    raise ValueError("binary review requires an explicit prompt version")
+                if not review.get("quality_manifest") or not review.get("quality_manifest_sha256"):
+                    raise ValueError("binary review requires pinned frozen quality")
             if review.get("relation", "qwen") not in {"qwen", "frozen-rules"}:
                 raise ValueError("unsupported mask_review relation")
         if not isinstance(self.enabled, bool):

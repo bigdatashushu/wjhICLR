@@ -81,7 +81,11 @@ def binding_parameters(*, semantic_min_pixels=None, semantic_max_pixels=None,
         from .intern_decision_client import review_config
         from .intern_decision_protocol import PROTOCOL_SHA256, RELATION_IDENTITY
         result["experimental_semantic_review"] = review_config(semantic_review_config)
-        result["experimental_visual_protocol_sha256"] = PROTOCOL_SHA256
+        if semantic_review_config.get("mode") == "binary":
+            from .intern_binary_review import PROTOCOL_SHA256 as binary_sha
+            result["experimental_visual_protocol_sha256"] = binary_sha
+        else:
+            result["experimental_visual_protocol_sha256"] = PROTOCOL_SHA256
         result["experimental_relation_rules_sha256"] = content_sha256(RELATION_IDENTITY)
     overrides = {
         "semantic_min_pixels": semantic_min_pixels,
@@ -602,6 +606,7 @@ def bind_question_objects(
             rows_by_id[candidate["candidate_id"]]["sam2_frame_elapsed_s"] = elapsed
 
     relation_input = []
+    binary_mode = bool(getattr(visual_client, "target_binary", False))
     for observation in observations:
         candidate, row = observation["candidate"], observation["row"]
         visual = msr.observe_candidate(
@@ -611,29 +616,34 @@ def bind_question_objects(
             max_pixels=parameters["semantic_max_pixels"],
             out_dir=(work / "semantic_reviews") if work else None)
         row["semantic_visual"] = visual
-        if visual["status"] == "observed":
+        if visual["status"] == "observed" and not binary_mode:
             relation_input.append({
                 "candidate_id": candidate["candidate_id"],
                 "category": candidate["category"],
                 "observation": visual["observation"],
             })
-        else:
+        elif visual["status"] != "observed":
             row["error"] = visual.get("error", "semantic visual review unavailable")
             observation["req"]["binding_failures"].append({
                 "candidate_id": candidate["candidate_id"],
                 "error": row["error"], "blocking": True})
-    relation_fn = msr.compare_categories
-    if (semantic_review_config or {}).get("relation") == "frozen-rules":
-        relation_fn = lambda rows, *_args, **kwargs: compare_fixed_categories(
-            rows, out_dir=kwargs.get("out_dir"))
-    relations, relation_stats = relation_fn(
-        relation_input, vlm_client, seed=seed,
-        batch_size=parameters["semantic_relation_batch_size"],
-        out_dir=(work / "semantic_reviews") if work else None)
+    if binary_mode:
+        from .intern_binary_review import binary_relation
+        relations = {cid: binary_relation(row.get("semantic_visual") or {})
+                     for cid, row in rows_by_id.items()}
+        relation_stats = {"actual_requests": 0, "n_batches": 0}
+    elif (semantic_review_config or {}).get("relation") == "frozen-rules":
+        relations, relation_stats = compare_fixed_categories(
+            relation_input, out_dir=(work / "semantic_reviews") if work else None)
+    else:
+        relations, relation_stats = msr.compare_categories(
+            relation_input, vlm_client, seed=seed,
+            batch_size=parameters["semantic_relation_batch_size"],
+            out_dir=(work / "semantic_reviews") if work else None)
     stats["semantic_review"] = {
         "visual_version": parameters.get("experimental_visual_protocol_sha256", msr.VISUAL_REVIEW_VERSION),
         "experimental_config": semantic_review_config or {},
-        "relation_version": (RELATION_VERSION if (semantic_review_config or {}).get("relation")
+        "relation_version": ("m5-target-binary-v1" if binary_mode else RELATION_VERSION if (semantic_review_config or {}).get("relation")
                              == "frozen-rules" else msr.RELATION_REVIEW_VERSION),
         "n_visual_requests": sum(bool(
             row.get("semantic_visual", {}).get("request_sent"))
@@ -658,7 +668,7 @@ def bind_question_objects(
         semantic_ok = (
             relation.get("status") == "reviewed"
             and relation.get("relation") == "match"
-            and quality["observed_object"] not in {"other", "unknown"}
+            and (binary_mode or quality["observed_object"] not in {"other", "unknown"})
             and quality["visibility"] in {"clear", "partial"}
             and quality["mask_purity"] == "clean"
             and quality["mask_completeness"] in {"whole", "major_part"})
@@ -694,6 +704,9 @@ def bind_question_objects(
                 "semantic_visual_request_sha256": visual["request_sha256"],
                 "semantic_observation": quality,
                 "semantic_provider": visual.get("provider", "bailian"),
+                "semantic_binary_review": visual.get("binary_review", {}),
+                "semantic_binary_review_sha256": visual.get("binary_review_sha256", ""),
+                "semantic_frozen_quality": visual.get("frozen_quality", {}),
                 "semantic_request_identity": visual.get("request_identity", {}),
                 "semantic_observation_sha256": visual.get("observation_sha256", ""),
                 "semantic_model_identity_sha256": visual.get("model_identity_sha256", ""),

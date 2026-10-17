@@ -85,6 +85,41 @@ def validate_binding(obj, *, depth_maps=None, n_frames=None,
                 and row.get("semantic_model_identity_sha256") == content_sha256(identity.get("model")))
             if not checks["intern_observation_integrity"]:
                 break
+    for row in obj.binding_provenance or []:
+        if row.get("semantic_provider") == "intern-decision-binary-local":
+            from .intern_binary_review import PROTOCOL_SHA256 as binary_protocol_sha, quality_passes, validate_threshold
+            observation = row.get("semantic_observation") or {}
+            identity = row.get("semantic_request_identity") or {}
+            binary = row.get("semantic_binary_review") or {}
+            frozen = row.get("semantic_frozen_quality") or {}
+            try:
+                threshold = validate_threshold(binary.get("threshold"))
+                probabilities_ok = (type(binary.get("p_yes")) in (int, float)
+                    and type(binary.get("p_no")) in (int, float)
+                    and np.isfinite([binary["p_yes"], binary["p_no"]]).all()
+                    and 0 <= binary["p_yes"] <= 1 and 0 <= binary["p_no"] <= 1
+                    and abs(binary["p_yes"] + binary["p_no"] - 1) <= 1e-5)
+                checks["intern_binary_integrity"] = bool(
+                    probabilities_ok and binary["p_yes"] >= threshold and binary.get("semantic_pass") is True
+                    and binary.get("target_category") == obj.category_name
+                    and binary.get("target_category") == identity.get("target_category")
+                    and binary.get("prompt_version") == identity.get("prompt_version")
+                    and binary.get("protocol_sha256") == binary_protocol_sha
+                    and identity.get("protocol_sha256") == binary_protocol_sha
+                    and row.get("semantic_binary_review_sha256") == content_sha256(binary)
+                    and row.get("semantic_observation_sha256") == content_sha256(observation)
+                    and row.get("semantic_model_identity_sha256") == content_sha256(identity.get("model"))
+                    and "observed_object" not in observation and quality_passes(observation)
+                    and frozen.get("manifest_sha256") == identity.get("quality_manifest_sha256")
+                    and frozen.get("manifest_sha256") and frozen.get("entry_sha256") == content_sha256(frozen.get("entry"))
+                    and frozen["entry"]["candidate_id"] == row.get("candidate_id")
+                    and frozen["entry"]["image_sha256"] == [im["sha256"] for im in identity["images"]]
+                    and all(frozen["entry"]["observation"].get(k) == observation[k]
+                            for k in ("visibility", "mask_purity", "mask_completeness")))
+            except (ValueError, TypeError, KeyError):
+                checks["intern_binary_integrity"] = False
+            if not checks["intern_binary_integrity"]:
+                break
     if check_receipt:
         receipt = obj.binding_validation
         checks["receipt"] = bool(

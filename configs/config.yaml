@@ -81,6 +81,9 @@ online_model:
   #   timeout_s: 60
   #   expected_identity_sha256: "<verified service identity hash>"
   #   relation: qwen  # frozen-rules is a separately recorded experiment
+  # Binary experiment additionally requires mode: binary, explicit prompt_version
+  # and yes_threshold, plus exact-image quality_manifest + quality_manifest_sha256.
+  # The threshold is frozen by the experiment; no production default is inferred.
 
 sandbox:
   cell_timeout_s: 120                   # TODO_CALIBRATE

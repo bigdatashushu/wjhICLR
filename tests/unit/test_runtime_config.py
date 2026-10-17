@@ -209,3 +209,17 @@ def test_jsonl_identity_arrays_are_checked_before_decode(tmp_path, monkeypatch, 
     monkeypatch.setattr(cv2, "imread", lambda *a: pytest.fail("bad identity reached decoding"))
     with pytest.raises(EpisodeSourceError):
         load_jsonl_items(path, "induction")
+
+
+def test_binary_mask_configuration_needs_explicit_operating_point():
+    import pytest
+    from skill3d.online.config import OnlineModelSettings
+    configuration={'provider':'intern-decision','mode':'binary','prompt_version':'P1',
+                   'yes_threshold':.8,'quality_manifest':'quality.json',
+                   'quality_manifest_sha256':'a'*64}
+    assert OnlineModelSettings(mask_review=configuration).mask_review==configuration
+    for key in ['yes_threshold','prompt_version','quality_manifest','quality_manifest_sha256']:
+        broken={k:v for k,v in configuration.items() if k!=key}
+        with pytest.raises(ValueError):OnlineModelSettings(mask_review=broken)
+    with pytest.raises(ValueError):
+        OnlineModelSettings(mask_review={**configuration,'yes_threshold':float('nan')})

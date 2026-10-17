@@ -55,6 +55,8 @@ def main():
     p.add_argument('--identity', default='')
     p.add_argument('--relation', choices=['qwen', 'frozen-rules'], default='qwen')
     p.add_argument('--historical-parser-result', type=Path)
+    p.add_argument('--binary-operating-point', type=Path)
+    p.add_argument('--frozen-quality-manifest', type=Path)
     args = p.parse_args()
     episode = VSIBenchEpisode.model_validate_json((args.frozen / 'episode.json').read_text())
     artifact = ReconstructionArtifact.model_validate_json((args.frozen / 'artifact.json').read_text())
@@ -63,16 +65,27 @@ def main():
         raise ValueError('Require all 32 frozen frames')
     cloud = BailianClient()
     parser = HistoricalParser(args.historical_parser_result) if args.historical_parser_result else cloud
-    if args.relation == 'qwen' and not cloud.configured:
+    if not args.binary_operating_point and args.relation == 'qwen' and not cloud.configured:
         raise ValueError('DASHSCOPE_API_KEY absent for requested Qwen relation')
     if not args.historical_parser_result and not cloud.configured:
         raise ValueError('DASHSCOPE_API_KEY absent; supply explicit historical parser receipt')
     # Historical parser cannot serve the Qwen relation stage.
-    if args.historical_parser_result and args.relation != 'frozen-rules':
+    if not args.binary_operating_point and args.historical_parser_result and args.relation != 'frozen-rules':
         raise ValueError('Use live parser for Qwen relation or explicit frozen-rules experiment')
     identity = InternDecisionClient(args.endpoint, expected_identity_sha256=args.identity).identity()
     config = {'provider': 'intern-decision', 'endpoint': args.endpoint, 'timeout_s': 60,
               'expected_identity_sha256': content_sha256(identity), 'relation': args.relation}
+    if args.binary_operating_point:
+        from skill3d.segmentation.intern_binary_review import PROTOCOL_SHA256
+        frozen = json.loads(args.binary_operating_point.read_text())
+        if (frozen.get('status') != 'frozen' or frozen.get('protocol_sha256') != PROTOCOL_SHA256
+                or frozen.get('model_identity_sha256') != content_sha256(identity)
+                or not args.frozen_quality_manifest):
+            raise ValueError('binary operating point or quality identity unavailable')
+        config.update(mode='binary', prompt_version=frozen['prompt_version'],
+            yes_threshold=frozen['threshold'], quality_manifest=str(args.frozen_quality_manifest),
+            quality_manifest_sha256=file_identity(args.frozen_quality_manifest)['sha256'])
+        config.pop('relation')
     args.output.mkdir(parents=True, exist_ok=False)
     arrays = {name: np.load(getattr(artifact, name), allow_pickle=False) for name in
               ['depth_maps', 'c2w_list', 'intrinsics', 'depth_conf', 'point_map']}

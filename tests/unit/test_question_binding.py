@@ -380,3 +380,41 @@ def test_intern_binding_receipt_rejects_changed_observation(harness):
     changed[0]["semantic_observation"]["mask_completeness"] = "fragment"
     bad = good.model_copy(update={"binding_provenance": changed})
     assert validate_binding(bad).status == "unavailable"
+
+@pytest.mark.parametrize('p_yes,expected',[(.8,True),(.799999,False)])
+def test_binary_m5_uses_threshold_and_independent_quality(harness,monkeypatch,p_yes,expected):
+    from skill3d.segmentation import intern_decision_client as local
+    from skill3d.infra.m5_identity import content_sha256
+    from skill3d.segmentation.intern_binary_review import PROTOCOL_SHA256,quality_from_receipt
+    class Binary:
+        target_binary=True
+        def observe_candidate(self,candidate,*args,**kwargs):
+            quality={'visibility':'clear','mask_purity':'clean','mask_completeness':'whole'}
+            binary={'p_yes':p_yes,'p_no':1-p_yes,'threshold':.8,'semantic_pass':p_yes>=.8,
+                    'target_category':'chair','prompt_version':'P1','protocol_sha256':PROTOCOL_SHA256}
+            model={'model':'internlm/Intern-Decision-4B','revision':'test'}
+            images=[{'sha256':'a'},{'sha256':'b'},{'sha256':'c'}]
+            entry={'candidate_id':candidate['candidate_id'],'image_sha256':['a','b','c'],
+                   'observation':quality}
+            return {'version':'binary','provider':'intern-decision-binary-local','status':'observed',
+                    'request_sent':True,'request_sha256':'d'*64,'observation':quality,
+                    'binary_review':binary,'binary_review_sha256':content_sha256(binary),
+                    'observation_sha256':content_sha256(quality),'model_identity_sha256':content_sha256(model),
+                    'request_identity':{'model':model,'target_category':'chair','prompt_version':'P1',
+                                        'protocol_sha256':PROTOCOL_SHA256,'images':images,
+                                        'quality_manifest_sha256':'f'*64},
+                    'frozen_quality':{'manifest_sha256':'f'*64,'entry_sha256':content_sha256(entry),'entry':entry}}
+    monkeypatch.setattr(local,'make_review_client',lambda config:Binary())
+    objects,stats,_=qb.bind_question_objects(**harness.args,semantic_review_config={'provider':'intern-decision',
+        'mode':'binary','prompt_version':'P1','yes_threshold':.8,'quality_manifest':'fixture','quality_manifest_sha256':'f'*64})
+    assert bool(objects)==expected
+    assert list(harness.args['vlm_client'].phase_calls)==['m5_object_parse']
+    assert stats['semantic_review']['n_relation_requests']==0
+    if expected:
+        obj=objects[0]
+        assert obj.binding_validation.checks['intern_binary_integrity']
+        assert 'observed_object' not in obj.binding_provenance[0]['semantic_observation']
+        changed=copy.deepcopy(obj.binding_provenance)
+        changed[0]['semantic_binary_review']['threshold']=.9
+        altered=obj.model_copy(update={'binding_provenance':changed})
+        assert validate_binding(altered).status=='unavailable'
