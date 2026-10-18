@@ -5,15 +5,22 @@
 `object_rel_distance`（S03），`--question-types` 接受逗号分隔的规范题型。
 
 两臂均通过真实 `run_episode` 生成、执行程序，默认共同使用
-`program_synth_v11_5_en`、`solver-v11.5-core-engineering-repair` 和
-`tool-docs-v11.5-core-engineering-repair`，
+`program_synth_v11_7_en`、`solver-v11.7-initial-state-skills` 和
+`tool-docs-v11.6-two-capabilities`，
 质量门始终开启。`ReturnAnswer` 先暂存提交；M11 通过后才进入评分，拒绝时在同一
 求解预算内撤销受影响结果并把结构化失败反馈给同一模型。声明了 `derivation` 时，
 M11 只使用登记操作确定性重放并核对答案；计算声明错误不会撤销本身有效的工具结果。
 B01 的交付集合为空；
-B11 默认校验并加载 `S0-v11-english` 的 snapshot、manifest 和完整英文正文，
-经正常题型查找与交付路径选择 Skill。入口不读取或修改 active pointer，
+B11 默认校验并加载 `S0-v11-initial-state-skills` 的 24 槽位 snapshot、manifest 和完整英文正文，
+经题型与初始证据状态精确查找并固定整题 Skill。入口不读取或修改 active pointer，
 也不使用 v10 的 `evaluation_binding`。
+
+公共证据只包含 `geometry_3d`、`metric_scale` 两项二值状态；候选技术检查与
+世界坐标约定按工具实际需要验证。M5/M11 不证明对象符合题目指代，在线模型需看图
+消歧。EpisodeTrace 9.4 记录初始选择、候选与后续变化，经验包 v11/5.0 按初始槽位
+归属整题。运行期证据失效仍收回工具和结果，不重检索 Skill。父／候选在首次求解前
+按共同准备的初始状态筛选同槽位题目，最终状态或得分不参与筛选。无目标槽位样本
+报告未完成且不晋升。本次结构迁移建立新的初始正文，保留历史源，未运行新实验。
 
 当前代码默认每次Qwen请求的最大输出为8192 token，输入token另计；M5显式小预算
 保持不变。2026-10-11完成的256次正式实验属于`c020345`与4096输出上限，不能与
@@ -214,8 +221,8 @@ YAML 加载。两臂配置由同一份配置复制，
 都不再重试。`induction`、输入错误、原 solver 服务不可用及已通过验收的答案均不触发；
 因此也不会根据评分正确性决定是否补答。成功答案登记为 `visual_estimate` 和
 `direct_vlm_routed`，原失败快照、程序轮次及工具审计保留在 `eval_visual_fallback`。
-新增字段使用 `EpisodeTrace.schema_version=9.2`；旧 `9.0/9.1` trace 只能经 legacy reader
-只读审计，不能把缺失字段默认解释为“当时未触发补答”。
+当前字段使用 `EpisodeTrace.schema_version=9.4`；旧 trace 缺少完整的初始槽位选择，
+不能直接用作当前修订经验，也不能把缺失字段默认解释为“当时未触发补答”。
 旧质量确认与旧运行结果不能证明本工程版本有效；需重新确认当前合同并另建 GPU 运行，
 结果变化不得与 Skill 演化收益混报。
 

@@ -256,6 +256,15 @@ class SceneHandle:
         return None if v is None else str(v)
 
     @property
+    def world_frame_usable(self) -> bool:
+        """局部坐标约定检查，不是公共证据维度。"""
+        return self.world_up is not None and self.handedness in ("right", "left")
+
+    @property
+    def local_facts(self) -> dict[str, bool]:
+        return {"world_frame": self.world_frame_usable}
+
+    @property
     def quality_overall(self) -> Optional[float]:
         return self._quality_overall
 
@@ -282,9 +291,7 @@ class SceneHandle:
             declared -= {ARTIFACT_POSES}
         if self._k is None:
             declared -= {ARTIFACT_INTRINSICS, ARTIFACT_POSES}
-        if not self._objects_materialized or (
-                self.require_question_binding
-                and not any(self.binding_usable(o.obj_id) for o in self._objects.values())):
+        if not self._objects_materialized:
             declared -= {ARTIFACT_OBJECTS}
         if not self._state.metric_task_authorized(self.question_type):
             declared -= {ARTIFACT_SCALE}
@@ -300,6 +307,28 @@ class SceneHandle:
         obj = self._objects.get(object_id)
         return bool(obj and binding_is_usable(obj, strict=self.require_question_binding))
 
+    def object_mask_frames(self, object_id: str) -> list[int]:
+        """按实际 mask 检查可见帧，独立于对象点云与几何门。"""
+        from .contract import ConfidenceGateError
+        from skill3d.schemas.tool import FailureCause
+
+        obj = self.get_object(object_id)
+        if not self.require_question_binding and not obj.mask_per_frame:
+            return sorted(set(int(i) for i in obj.visible_frames))
+        try:
+            mask = np.load(obj.mask_per_frame, allow_pickle=False, mmap_mode="r")
+            if mask.ndim != 3 or not np.isin(mask, [0, 1]).all():
+                raise ValueError("invalid mask shape or values")
+            visible = np.flatnonzero(mask.any(axis=(1, 2))).tolist()
+            if visible != list(obj.visible_frames):
+                raise ValueError("mask and visible_frames disagree")
+            return visible
+        except (OSError, ValueError, TypeError) as exc:
+            raise ConfidenceGateError(
+                "object_visible_frames", f"Object {obj.obj_id} mask is unavailable: {exc}",
+                failure_cause=FailureCause(code="object_mask_unavailable",
+                    scope="local_call")) from exc
+
     def category_binding_complete(self, name: str) -> bool:
         """A full scan with usable instances is required; failure is not absence."""
         if not self.require_question_binding:
@@ -310,7 +339,7 @@ class SceneHandle:
         rows = [row for row in self.grounding_coverage.get("requirements", [])
                 if matches(row["name"], name)]
         return bool(rows) and all(
-            row.get("scan_complete") and row.get("status") == "resolved"
+            row.get("scan_complete") and row.get("status") == "candidates_available"
             and not row.get("binding_failures")
             and bool(row.get("usable_object_ids"))
             and all(self.binding_usable(oid) for oid in row["usable_object_ids"])

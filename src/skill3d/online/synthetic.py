@@ -1008,22 +1008,13 @@ def build_scene_state(
 
 
 def synthetic_m5_summary(geometry: SyntheticGeometry) -> M5EvidenceSummary:
-    """合成场景的 M5 证据输入（对象清单是**构造真值**，不是检测器产出）。
-
-    如实标注：基础清单直接来自合成对象的构造（4 个对象、各自一条 track、覆盖全部
-    可见帧），故 `object_detection` / `track_consensus` 在合成通道按 available 计入；
-    它只影响 mock 管道的 Tool 可见性，**不构成任何检测/跟踪能力的证据**。
-    """
+    """合成候选诊断；清单来自构造，仅验证管道，不认证题目指代。"""
     return M5EvidenceSummary(
         m5_ran=True,          # §6.1：合成路径同样"运行过 M5"（真值是构造的，不是检测）
         detection_fault=False,
         n_objects=len(geometry.objects),
         n_tracks=len(geometry.objects),
         track_stable_ratio=1.0,
-        grounding_pointed_hit=None,
-        grounding_conf=None,
-        grounding_miss=False,
-        grounding_filled=False,
         notes=["mock_light：对象清单为合成构造真值（非检测器产出），仅管道验证"],
     )
 

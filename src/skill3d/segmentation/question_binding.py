@@ -340,7 +340,7 @@ def _merge_instances(objects, masks, depth, frame_slots=None):
 
 
 def refresh_coverage(grounding, objects):
-    """Failure or no usable candidate means unresolved, never certified absence."""
+    """Report category scan/candidate facts without certifying question referents."""
     body = dict(grounding)
     requirements = []
     for prior in body.get("requirements", []):
@@ -352,15 +352,17 @@ def refresh_coverage(grounding, objects):
         row["matched_object_ids"] = [o.obj_id for o in matched]
         row["usable_object_ids"] = [o.obj_id for o in usable]
         row["blocking_failures"] = blocking
-        row["status"] = ("resolved" if usable and row.get("scan_complete")
+        row["status"] = ("candidates_available" if usable and row.get("scan_complete")
                          and not blocking else "unavailable")
         requirements.append(row)
-    unresolved = [r["name"] for r in requirements if r["status"] != "resolved"]
+    unresolved = [r["name"] for r in requirements if r["status"] != "candidates_available"]
     body.update(
         requirements=requirements, unresolved_names=unresolved,
-        all_present=bool(requirements) and not unresolved,
-        miss=bool(unresolved), status="available" if requirements and not unresolved
+        candidate_scan_complete=bool(requirements) and not unresolved,
+        status="candidates_available" if requirements and not unresolved
         else "unavailable", n_new=sum(binding_is_usable(o) for o in objects))
+    body.pop("all_present", None)
+    body.pop("miss", None)
     return body
 
 

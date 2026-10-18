@@ -6,12 +6,12 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
 
-当前在线合同使用 `program_synth_v11_5_en`、
-`solver-v11.5-core-engineering-repair` 和 `tool-docs-v11.5-core-engineering-repair`。类别匹配、对象覆盖、
+当前在线合同使用 `program_synth_v11_7_en`、
+`solver-v11.7-initial-state-skills` 和 `tool-docs-v11.6-two-capabilities`。类别匹配、对象覆盖、
 完整排名验收及检测器重试由两臂共用；评测时原 solver 失败后可预算外追加一次
 `eval-visual-v1` 请求，只携带冻结的 32 张原帧、问题、选项和答案格式。该路径不在
 `induction` 使用，正常提交但答错也不会触发。当前 active snapshot 为
-`S0-v11-english`；质量确认哈希包含相关源码和合同版本，旧确认会被拒绝。详见
+`S0-v11-initial-state-skills`；质量确认哈希包含相关源码和合同版本，旧确认会被拒绝。详见
 [配对运行合同](docs/skill_ablation_v11.md)。
 
 对象清单中的 `det_conf` 是检测器原始置信度，`mask_support_ratio` 是非空传播 mask
@@ -23,7 +23,7 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 冻结帧，逐帧 SAM2 后执行目标盲审与纯文本类别关系判断；只有语义和 mask 质量同时
 通过的候选才生成局部点云。保留解析、检测、分割与语义收据，失败不记为对象不存在。
 高 IoU 仅在明确不相容关系时触发绑定硬门；局部对象失败只撤销相关结果，不撤全局尺度。
-答案解析、提交与评分分别记录，空 GT 保留预测与 null 得分；EpisodeTrace 版本为 9.2。
+答案解析、提交与评分分别记录，空 GT 保留预测与 null 得分；EpisodeTrace 版本为 9.4。
 完整扩容入口 `scripts/run_full_experiment_v11.py` 固定八类各24题，192道唯一题、
 两个seed同题单、B01/B11共768次。全部公共准备按场景审计封存后才逐对求解，
 首批32臂核查后自动继续，答案全冻结后独立评分。详见[扩大面板合同](docs/skill_ablation_v11.md)。
@@ -47,6 +47,20 @@ MoGe-2 显式启用后使用与 VGGT 相同的裁剪网格；米制工具需要�
 源数组及收据哈希校验。尺度融合仍属待验证分支，默认不开启。配置、缓存迁移和
 证据字段见[度量尺度链路说明](docs/metric_fusion_v11.md)。
 
+公共证据画像仅保留 `geometry_3d`、`metric_scale`，均为 `available/unavailable`。
+几何取现有 M4 主门；尺度取现有尺度门前五项，题型授权另算。几何失效连带撤销尺度，
+尺度失效保留非米制几何；软告警仅作诊断。固定图片与采样帧不再作为公共证据维度。
+世界坐标约定在相关工具局部检查，展示与执行共用授权判定。
+M5 提供候选和技术校验，不证明候选是题目所指实例；模型通过帧／裁剪消歧并传入
+明确 `obj_id`，唯一候选也不代表指代正确。单对象工具仅校验所选对象，计数／完整
+排名另查所需集合覆盖；三维不可用时仍可查看二维候选。M11 不认证指代真伪。
+每个题型按初始两项状态建立 `g0m0/g1m0/g1m1` 三个槽位，完整基线共 24 条
+方法，快照使用 `runtime-skill-snapshot/3.0` 与 `active_by_slot`。M7.5 后精确选择
+一条 Skill，整题保持版本和正文 hash；运行期证据撤销只收回工具和结果，不重检索。
+经验包 v11/5.0 记录初始槽位、能力／候选变化、实际对象 ID 和图像／工具观察；
+整题归属于初始交付版本，答错不自动归因为绑定错误。修订、评测和发布均限定同槽位。
+新源从英文历史源整理形成结构迁移基线，未运行演进实验。CPU 验证不代表模型收益。
+
 > **历史核查结论（2026-10-09）**：当时的正式 run `v11-s03-seed137` 在模型许可证门处退出，未启动 GPU 阶段。下文第 3–10 节保留该次服务器审计记录，不代表当前运行状态。
 
 ## 1. 当前基线与证据口径
@@ -63,9 +77,9 @@ MoGe-2 显式启用后使用与 VGGT 相同的裁剪网格；米制工具需要�
 | v11 默认配置 | `configs/gpu_experiment_v11.yaml` |
 | v11 运行器 | `scripts/run_gpu_experiment_v11.py` |
 | v11 配对协议 | `docs/skill_ablation_v11.md` |
-| 当前 active snapshot | `S0-v11-english` |
+| 当前 active snapshot | `S0-v11-initial-state-skills` |
 | active snapshot 文件 | `skill_library/snapshots/active_snapshot.json` |
-| active snapshot SHA-256 | `ac8accb533bee48a182ddcf2f3103dca2e66e0d1ec2fbc4d903d14834873bf1b` |
+| active snapshot SHA-256 | 由 `skill_library/snapshots/active_snapshot.json` 当前内容复算 |
 
 本 README 中的“已核查”只表示有命令输出、代码收据或文件哈希支撑；“已缓存”只表示本机有文件；“机制可跑”只表示合同测试或确定性夹具覆盖。只有包含完整输入身份、权重身份、质量确认、运行清单和结果文件的正式 run，才可以被称为正式实验结果。
 
@@ -374,7 +388,7 @@ PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
 - 默认题型：`object_rel_distance`，S03。
 - 两臂都通过真实 runner、同一题单、同一输入和同一质量门。
 - B01 的交付 Skill 集合为空。
-- B11 默认加载 `S0-v11-english` 的 snapshot、manifest 和正文。
+- B11 默认加载 `S0-v11-initial-state-skills`，按题型与初始证据状态选择完整正文。
 - 当前入口不读取或修改 active pointer，不使用 v10 的 `evaluation_binding`。
 - 两臂按顺序运行，当前不是延迟公平性实验。
 - `seed` 进入准备阶段和模型请求，但不同 GPU 调度不承诺逐位一致。

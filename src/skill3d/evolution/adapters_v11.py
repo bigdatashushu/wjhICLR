@@ -18,6 +18,7 @@ from skill3d.evaluation.skill_ablation_v11 import (
     _hash,
     input_identity,
     input_error_identity,
+    initial_state_for_item,
     pair_results,
     quality_contract,
     run_skill_pair_evaluation_v11,
@@ -49,7 +50,7 @@ from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
 
-REVISION_PROMPT_VERSION = "skill-revision-v11.3-en"
+REVISION_PROMPT_VERSION = "skill-revision-v11.4-initial-slot"
 _SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -168,10 +169,17 @@ class V11OfflineReviser:
             "question, an option list, or a reference answer into the method. "
             "Do not invent tools or alter framework/model/evaluation settings. "
             "Use the cases to improve decision rules, checks, and error handling. "
+            "Revise only the parent's question-type/initial-evidence slot. The method stays "
+            "fixed throughout an episode and must handle withdrawn tools without switching "
+            "to another Skill. Public evidence has only geometry_3d and metric_scale, each "
+            "available/unavailable; warnings and candidate diagnostics are not extra states. "
+            "Use initial states, capability changes, candidate records, selected object IDs, "
+            "and actual observations as context. A wrong answer alone does not prove a "
+            "referent-selection or binding error; never invent that attribution. "
             "The cases expose only question-level induction answers; no GT 3D "
             "annotation is authorized.\n\n"
             f"Parent identity: {parent.skill_id}@{parent.version} "
-            f"({parent.question_type}, sha256={parent.content_sha256})\n"
+            f"({parent.slot_key}, sha256={parent.content_sha256})\n"
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
             f"Keep the stable frontmatter name exactly {parent.name!r}.\n"
             "Current online execution contract:\n"
@@ -357,6 +365,8 @@ class V11PairedEvaluator:
             raise V11AdapterError("candidate and experience parent snapshots differ")
         if str(kwargs["question_type"]) != parent.question_type:
             raise V11AdapterError("evaluation question type differs from parent")
+        if candidate.full_skill_spec.evidence_state != parent.evidence_state:
+            raise V11AdapterError("evaluation evidence state differs from parent")
         qa_ids = [item.episode.qa_id for item in self.items]
         expected_ids = list(self.expected_qa_ids) if self.expected_qa_ids is not None else qa_ids
         if (not qa_ids or len(set(qa_ids)) != len(qa_ids)
@@ -426,14 +436,22 @@ class V11PairedEvaluator:
                 encoding="utf-8").splitlines()
             if line.strip()
         ]
-        if not rows or int(summary.get("n_pairs", -1)) != len(rows):
+        if not rows:
+            raise V11AdapterError("E11 has no samples in the target initial evidence slot")
+        if int(summary.get("n_pairs", -1)) != len(rows):
             raise V11AdapterError("E11 summary and pair rows have different denominators")
         # Re-derive both the frozen inputs and every aggregate before trusting a
         # previous directory (including one left by another candidate/config).
+        selected_ids = [
+            q for q in expected_ids
+            if next(it for it in self.items if it.episode.qa_id == q).input_error is None
+            and initial_state_for_item(
+                next(it for it in self.items if it.episode.qa_id == q),
+                self.artifact_paths[q]) == parent.evidence_state]
         expected_inputs = {
             item.episode.qa_id: input_error_identity(item) if item.input_error else
             input_identity(item, self.artifact_paths[item.episode.qa_id])
-            for item in self.items
+            for item in self.items if item.episode.qa_id in selected_ids
         }
         specs = {"B01": parent, "B11": candidate.full_skill_spec}
         expected_arms = {
@@ -448,7 +466,7 @@ class V11PairedEvaluator:
         }
         code_root = Path(runner.__file__).parents[1]
         expected_fields = {
-            "qa_ids": expected_ids,
+            "qa_ids": selected_ids,
             "question_types": [parent.question_type],
             "seed": seed,
             "evaluation_mode": "fixed_parent_candidate",
@@ -458,7 +476,9 @@ class V11PairedEvaluator:
             "quality_contract": quality_identity,
             "quality_confirmation": self.quality_confirmation,
             "client_mode": "injected" if self.client_factory else "bailian",
-            "reconstruction_costs_s": dict(self.reconstruction_costs or {}),
+            "reconstruction_costs_s": {
+                q: value for q, value in (self.reconstruction_costs or {}).items()
+                if q in selected_ids},
             "source_sha256": {str(p.relative_to(code_root)): _file_hash(p)
                               for p in sorted(code_root.rglob("*.py"))},
         }
@@ -470,7 +490,7 @@ class V11PairedEvaluator:
             raise V11AdapterError("E11 parent/candidate identities changed")
         recomputed_pairs = pair_results(
             [pair["arms"]["B01"] for pair in rows],
-            [pair["arms"]["B11"] for pair in rows], expected_ids)
+            [pair["arms"]["B11"] for pair in rows], selected_ids)
         if recomputed_pairs != rows:
             raise V11AdapterError("E11 pair rows do not replay")
         recomputed = summarize_pairs(recomputed_pairs)
@@ -546,6 +566,7 @@ class V11PairedEvaluator:
             panel_id=f"panel-{panel_sha[:20]}",
             panel_sha256=panel_sha,
             question_type=parent.question_type,
+            evidence_state=parent.evidence_state,
             seed=seed,
             request_seed_observed=request_seed_observed,
             model_id=self.base_cfg.online_model,
@@ -622,7 +643,7 @@ class V11PostPublishVerifier:
         expected_key = candidate.candidate_skill_version
         loaded = [
             spec for spec in skills
-            if spec.question_type == candidate.full_skill_spec.question_type
+            if spec.slot_key == candidate.full_skill_spec.slot_key
         ]
         if len(loaded) != 1 or (
             f"{loaded[0].skill_id}@{loaded[0].version}" != expected_key
@@ -710,6 +731,7 @@ class V11PostPublishVerifier:
             raise V11AdapterError("post-publish run produced no learning cases")
         return V11PostPublishObservation(
             question_type=question_type,
+            evidence_state=candidate.full_skill_spec.evidence_state,
             snapshot_id=snapshot_id,
             retrieved_skill_version=expected_key,
             delivered_skill_version=expected_key,

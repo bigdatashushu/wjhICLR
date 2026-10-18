@@ -25,7 +25,7 @@ paths:
     - /nas/wangjh/Skill-3D/dataset/VSI_videos
   reconstructions: data/reconstructions
   trace_store: data/traces
-  # 每题型唯一 active Skill。
+  # 每个题型＋初始证据状态槽位唯一 active Skill。
   skill_library: skill_library
   active_snapshot: skill_library/snapshots/active_snapshot.json
 
@@ -36,9 +36,9 @@ frame_sampling:
 # 只在独立诊断实验中开启。默认 1.0 权重不影响主流程（scene_route 不再被 M2 权重左右）。
 input_diagnostics: false
 
-# v11 固定按题型查找唯一方法；只配置完整正文的服务长度上限。
+# v11 固定按题型＋初始证据状态查找唯一方法。
 retrieval:
-  config_version: ret-v11-deterministic-1  # 人类标签；内容摘要由代码复算并落盘
+  config_version: ret-v11-initial-slot-1  # 人类标签；内容摘要由代码复算并落盘
   # §13.5"上下文放不下时先减少完整条目"的上限，同时是"超过服务限制的候选在静态
   # 检查中拒绝"的判据（单条正文超过它的候选永远无法完整交付）。
   # 依据：32 帧 @max_pixels=131072 ≈ 9.7k prompt tokens，max_model_len=32768，

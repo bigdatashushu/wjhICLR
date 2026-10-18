@@ -87,9 +87,7 @@ def test_unknown_source_is_never_rewritten_to_online_model_ok(value):
 # ------------------------------------------------------- 执行前拒绝的失败归因 ----
 
 def _profile(**over) -> EvidenceProfile:
-    base = dict(geometry_3d="available", world_frame="available",
-                metric_scale="available", object_detection="available",
-                track_consensus="available", object_grounding="available")
+    base = dict(geometry_3d="available", metric_scale="available")
     base.update(over)
     return EvidenceProfile(**base)
 

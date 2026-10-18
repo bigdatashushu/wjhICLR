@@ -119,10 +119,8 @@ def test_annotate_frames_rejects_frame_count_mismatch():
 # ------------------------------------------------------- M6 Tool 契约 fail-closed ----
 
 def _profile(**over) -> EvidenceProfile:
-    """v6 证据画像：默认全 available（`temporal`/`image_2d` 恒 available，§5.4）。"""
-    base = dict(geometry_3d="available", world_frame="available",
-                metric_scale="available", object_detection="available",
-                track_consensus="available", object_grounding="available")
+    """两项公共能力默认可用。"""
+    base = dict(geometry_3d="available", metric_scale="available")
     base.update(over)
     return EvidenceProfile(**base)
 
@@ -188,7 +186,8 @@ def test_tool_docs_scope_filter_matches_contract_map():
     才是"逐题工具集"的维度，`scene_route` 只决定产物集合。
     """
     for scope in QUESTION_TOOL_SCOPES:
-        exposed = set(REGISTRY.names_for_scope(scope))
+        exposed = set(REGISTRY.names_for_scope(
+            scope, evidence_profile=_profile(), local_facts={"world_frame": True}))
         expected = {n for n in REGISTRY.names()
                     if scope_allows(REGISTRY.spec(n), scope)}
         assert exposed == expected, scope
@@ -199,7 +198,8 @@ def test_tool_docs_scope_filter_matches_contract_map():
     # （只依赖 frames 产物）与 `detect_objects`（服务健康是执行前置条件，不要求已有
     # 检测成功）都在此 scope 暴露；重建失败只收回 3D 工具，不收回"看原图"的能力。
     # 本断言**取代**原先的 `== {"euclidean_distance"}`（那时这两个工具还不存在）。
-    assert fallback == {"euclidean_distance", "inspect_frames", "detect_objects"}
+    assert fallback == {"euclidean_distance", "inspect_frames", "detect_objects",
+                        "list_objects", "exists_in_scene", "object_visible_frames"}
     for name in fallback:
         assert set(REGISTRY.requires_artifacts(name)) <= set(
             ROUTE_ARTIFACTS["fallback_2d_only"])
@@ -212,9 +212,10 @@ def test_tool_docs_monotonic_over_scopes():
     v5 的三段 route 单调（full_3d ⊇ fallback_2d_only ⊇ unanswerable）不再适用：
     `unanswerable` 是 scene_route 的取值而非 scope，逐题维度只剩上述两条包含关系。
     """
-    full = set(REGISTRY.names_for_scope(SCOPE_FULL_3D))
-    metric = set(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED))
-    fallback = set(REGISTRY.names_for_scope(SCOPE_FALLBACK_2D_ONLY))
+    context = {"evidence_profile": _profile(), "local_facts": {"world_frame": True}}
+    full = set(REGISTRY.names_for_scope(SCOPE_FULL_3D, **context))
+    metric = set(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, **context))
+    fallback = set(REGISTRY.names_for_scope(SCOPE_FALLBACK_2D_ONLY, **context))
     metric_tools = {n for n in REGISTRY.names() if REGISTRY.is_metric_tool(n)}
 
     assert full <= metric                      # 逐题只新增米制 Tool，不新增别的
@@ -260,24 +261,24 @@ def test_registry_rejects_unknown_artifact_name():
                               requires_artifacts=["not_a_real_artifact"]))(fn)
 
 
-def test_fallback_scope_tool_call_is_fail_closed_not_false():
-    """硬约束 23：`fallback_2d_only` 下调 exists_in_scene 必须抛错而非返回 False。
+def test_fallback_scope_missing_candidates_is_fail_closed_not_false():
+    """硬约束 23：候选产物缺失时调 exists_in_scene 必须抛错而非返回 False。
 
     归因必须写明"缺哪些产物"（§9.12）：scope 收窄与产物缺失同源，异常里带
     `missing=["objects"]` 与 `route="fallback_2d_only"`，供 M10 回灌与审计。
     """
-    scene = _scene("fallback_2d_only")
+    scene = _scene("fallback_2d_only", objects=())
     handle = _handle(scene)
     with pytest.raises(ToolContractError) as ei:
         REGISTRY.call_tool("exists_in_scene", {"name": "table"}, handle, mode="real")
     assert ei.value.error_code == "tool_contract"
-    assert ei.value.missing == ["objects"]           # objects 不在 2D-only 的可用产物里
+    assert ei.value.missing == ["objects"]
     assert ei.value.route == "fallback_2d_only"
 
 
 def test_kernel_maps_contract_violation_to_tool_contract_and_untrusts_answer():
     """M10：契约违规 → error_code=tool_contract，且 ReturnAnswer 的答案不得采纳。"""
-    scene = _scene("fallback_2d_only")
+    scene = _scene("fallback_2d_only", objects=())
     handle = _handle(scene)
     kernel = RestrictedNamespaceKernel(REGISTRY, handle, frames=[], mode="real")
     cell = kernel.run_cell(

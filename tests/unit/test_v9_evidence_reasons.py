@@ -1,15 +1,4 @@
-"""v9 P3b：证据不可用原因码的生产者接线（§6.1/§6.4）。
-
-规范原文：
-
-- §6.1："每项取 `available`／`degraded`／`unavailable`…附生产者、原因、原始数值、
-  阈值版本和证据版本。"；"`unavailable` 必须通过原因码区分**未运行**／**生成失败**。"
-- §6.4："`unavailable` 的原因**至少**区分 `not_run / producer_failed / invalidated /
-  unsupported`；成功执行但无匹配目标使用明确的**空检出**状态。"
-
-接线前" M5 从未运行"会被报成 `zero_detection_after_retry` —— 那暗示"重试后仍零检出"，
-而实际根本没跑过。本文件守住三类原因彼此可区分。
-"""
+"""两维证据原因码与 M5 诊断隔离；未运行、生产失败、空检出保留原始事实。"""
 
 from __future__ import annotations
 
@@ -19,8 +8,6 @@ import pytest
 from skill3d.reconstruction_gate.evidence_profile import (
     M5EvidenceSummary,
     build_evidence_profile,
-    detection_capability,
-    track_capability,
 )
 from skill3d.schemas import ConfidenceMap, QualityMetrics, ReconstructionArtifact
 from skill3d.schemas.evidence import UNAVAILABLE_REASON_CODES
@@ -55,36 +42,20 @@ def _artifact(*, quality_status="computed", main_passed=True, fusion="success",
 # --------------------------------------------- 未运行 vs 运行失败 vs 空检出 ----
 
 def test_never_run_is_distinguishable_from_zero_detection():
-    """§6.1/§6.4：三种原因必须彼此可区分，不得混为一谈。"""
-    never = detection_capability(M5EvidenceSummary())
-    faulted = detection_capability(M5EvidenceSummary(m5_ran=True, detection_fault=True))
-    empty = detection_capability(M5EvidenceSummary(m5_ran=True, n_objects=0))
-    assert never == ("unavailable", ["m5_not_run"])
-    assert faulted == ("unavailable", ["detector_fault"])
-    assert empty == ("unavailable", ["zero_detection_after_retry"])
-    codes = {never[1][0], faulted[1][0], empty[1][0]}
-    assert len(codes) == 3, "三类原因不得塌成同一个"
-
-def test_track_never_run_is_distinguishable_from_no_statistics():
-    assert track_capability(M5EvidenceSummary()) == ("unavailable", ["m5_not_run"])
-    assert track_capability(M5EvidenceSummary(m5_ran=True))[1] == ["no_track_statistics"]
-
-
-# --------------------------------------------- state_reasons 落进画像 ----
-
-def test_never_run_detection_registers_not_run_reason():
-    profile = build_evidence_profile(
-        artifact=_artifact(), scene_route="full_3d", question_type="object_counting",
-        gate=None, m5=M5EvidenceSummary())
-    assert profile.object_detection == "unavailable"
-    assert profile.state_reasons.get("object_detection") == "not_run"
-
-
-def test_failed_detection_registers_producer_failed_reason():
-    profile = build_evidence_profile(
-        artifact=_artifact(), scene_route="full_3d", question_type="object_counting",
-        gate=None, m5=M5EvidenceSummary(m5_ran=True, detection_fault=True))
-    assert profile.state_reasons.get("object_detection") == "producer_failed"
+    signatures = []
+    facts = []
+    for summary in (M5EvidenceSummary(),
+                    M5EvidenceSummary(m5_ran=True, detection_fault=True),
+                    M5EvidenceSummary(m5_ran=True, n_objects=0)):
+        profile = build_evidence_profile(
+            artifact=_artifact(), scene_route="full_3d", question_type="object_counting",
+            gate=None, m5=summary)
+        signatures.append(profile.as_signature())
+        d = profile.producer_subvalues["candidate_diagnostics"]
+        facts.append((d["m5_ran"], d["detection_fault"], d["n_objects"]))
+        assert "object_detection" not in profile.state_reasons
+    assert signatures[0] == signatures[1] == signatures[2]
+    assert len(set(facts)) == 3
 
 
 def test_metric_scale_not_run_and_failed_are_distinguished():
@@ -137,45 +108,38 @@ def test_fusion_success_but_gate_not_passed_registers_the_fifth_code():
         sub_results={name: name != "scale_self_consistency_ok"
                      for name in GATE_SUBCONDITIONS},
         values={"valid_frame_ratio": 1.0}, missing_subconditions=["scale_self_consistency_ok"])
-    # 自洽值本身确实超阈值（与 gate 的判定一致：融合成功但自洽松 → degraded）
+    # 自洽值本身确实超阈值。
     art = _artifact(fusion="success").model_copy(
         update={"scale_self_consistency": 0.9})
     profile = build_evidence_profile(
         artifact=art, scene_route="full_3d",
         question_type="object_abs_distance", gate=gate)
-    assert profile.metric_scale == "degraded"
+    assert profile.metric_scale == "unavailable"
     assert profile.state_reasons.get("metric_scale") == "quality_gate_not_passed"
 
 
-def test_degraded_world_frame_registers_quality_gate_not_passed():
-    """world frame 估计出来了但置信低（degraded）→ 质量门未过。"""
+def test_world_frame_failure_only_changes_local_diagnostics():
     art = _artifact()
     art = art.model_copy(update={"world_frame_status": "degraded", "world_up": None})
     profile = build_evidence_profile(artifact=art, scene_route="full_3d",
                                      question_type="object_counting", gate=None)
-    assert profile.world_frame == "degraded"
-    assert profile.state_reasons.get("world_frame") == "quality_gate_not_passed"
+    assert profile.geometry_3d == "available"
+    assert "world_frame" not in profile.state_reasons
+    assert profile.producer_subvalues["world_frame_diagnostics"]["world_up"] is None
 
 
-def test_sparse_detection_and_track_stats_register_quality_gate_not_passed():
-    """检出稀疏 / track 统计超阈值 → 质量门未过；零检出仍记 unsupported（空状态）。"""
-    sparse = build_evidence_profile(
+@pytest.mark.parametrize("summary", [
+    M5EvidenceSummary(m5_ran=True, n_objects=2),
+    M5EvidenceSummary(m5_ran=True, n_tracks=5, track_fragmentation_ratio=.99),
+    M5EvidenceSummary(m5_ran=True, n_objects=0),
+])
+def test_sparse_detection_and_track_stats_do_not_change_public_reasons(summary):
+    profile = build_evidence_profile(
         artifact=_artifact(), scene_route="full_3d", question_type="object_counting",
-        gate=None, m5=M5EvidenceSummary(m5_ran=True, n_objects=2))
-    assert sparse.object_detection == "degraded"
-    assert sparse.state_reasons.get("object_detection") == "quality_gate_not_passed"
-
-    ragged = build_evidence_profile(
-        artifact=_artifact(), scene_route="full_3d", question_type="object_counting",
-        gate=None, m5=M5EvidenceSummary(m5_ran=True, n_tracks=5,
-                                        track_fragmentation_ratio=0.99))
-    assert ragged.track_consensus == "unavailable"
-    assert ragged.state_reasons.get("track_consensus") == "quality_gate_not_passed"
-
-    empty = build_evidence_profile(
-        artifact=_artifact(), scene_route="full_3d", question_type="object_counting",
-        gate=None, m5=M5EvidenceSummary(m5_ran=True, n_objects=0))
-    assert empty.state_reasons.get("object_detection") == "unsupported"
+        gate=None, m5=summary)
+    assert profile.geometry_3d == "available"
+    assert set(profile.state_reasons) <= {"geometry_3d", "metric_scale"}
+    assert profile.producer_subvalues["candidate_diagnostics"]["n_objects"] == summary.n_objects
 
 
 def test_unknown_world_frame_status_stays_unregistered():
@@ -185,7 +149,7 @@ def test_unknown_world_frame_status_stays_unregistered():
                                  "handedness": None})
     profile = build_evidence_profile(artifact=art, scene_route="full_3d",
                                      question_type="object_counting", gate=None)
-    assert profile.world_frame == "unavailable"
+    assert profile.geometry_3d == "available"
     assert "world_frame" not in profile.state_reasons
 
 
@@ -206,9 +170,7 @@ def test_every_registered_reason_is_in_the_documented_vocabulary():
 def test_bogus_reason_is_rejected_by_the_profile():
     from skill3d.schemas.evidence import EvidenceProfile
 
-    base = dict(geometry_3d="unavailable", world_frame="unavailable",
-                metric_scale="unavailable", object_detection="unavailable",
-                track_consensus="unavailable")
+    base = dict(geometry_3d="unavailable", metric_scale="unavailable")
     with pytest.raises(Exception):
         EvidenceProfile(**base, state_reasons={"geometry_3d": "because_i_said_so"})
 
@@ -220,9 +182,7 @@ def test_cascade_revocation_marks_invalidated():
     from skill3d.online.recovery import downgrade_profile
     from skill3d.schemas.evidence import EvidenceProfile
 
-    profile = EvidenceProfile(
-        geometry_3d="available", world_frame="available", metric_scale="available",
-        object_detection="available", track_consensus="available")
+    profile = EvidenceProfile(geometry_3d="available", metric_scale="available")
     downgraded, changed = downgrade_profile(profile, "geometry_3d")
     assert changed, "撤销应产生能力变化"
     assert all(downgraded.state_reasons[c] == "invalidated" for c in changed), \

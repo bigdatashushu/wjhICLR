@@ -53,8 +53,7 @@ class ToolSpec(Spec):
     - `requires_evidence`：本 Tool 依赖哪些证据能力（词汇表见
       `schemas.evidence.CAPABILITIES`）。任一项 `unavailable` → 该 Tool 从
       `docs(question_tool_scope)` 隐藏、执行期抛 `ArtifactUnavailableError`；
-    - `tolerates_degraded`：`requires_evidence` 的子集 —— 这些能力即使为
-      `degraded` 也允许暴露，但答案强制带 `evidence_degraded` 标记（§7.2）。
+    - `requires_local_facts`：工具局部事实（如世界坐标约定），不进入公共画像。
 
     §7.2 的关键语义是**逐 Tool 收窄**：某能力失败只隐藏依赖它的 Tool，
     不连带隐藏其他 Tool。因此本声明是"单项失败只收回依赖该证据的工具"的
@@ -73,8 +72,7 @@ class ToolSpec(Spec):
     requires_artifacts: list[str]  # 显式声明，禁止默认（硬约束 23）
     # v6 D6：证据依赖（显式声明，禁止默认 —— 缺声明直接构造报错）
     requires_evidence: list[str]
-    # v6 D6：可容忍为 degraded 的能力子集（必须 ⊆ requires_evidence）
-    tolerates_degraded: list[str] = []
+    requires_local_facts: list[Literal["world_frame"]] = []
     # v4 HC33：米制 Tool 显式列出支持题型；非米制 Tool 保持空（默认）
     supported_metric_tasks: list[str] = []
 
@@ -112,6 +110,8 @@ class ToolResult(Spec):
     failure_cause: Optional[FailureCause] = None
     # 名称解析后的实际几何输入；观察工具不声明对象几何依赖。
     object_dependencies: list[str] = []
+    # 实参实际解析到的 ID（包括局部校验失败），不声称语义选择正确。
+    resolved_object_ids: list[str] = []
     # 显式派生关系，用于对结果的传递撤销。
     result_dependencies: list[str] = []
 

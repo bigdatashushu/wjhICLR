@@ -2,9 +2,9 @@
 
 规范原文（§9.2 最小工具面）：
 
-    | `inspect_frames(frame_ids, boxes=None)` | image_2d；允许 degraded |
+    | `inspect_frames(frame_ids, boxes=None)` | 冻结帧 |
       从冻结帧集中查看/裁剪真实图片；返回图像引用和变换，**不能新采样视频帧** |
-    | `detect_objects(frame_ids, categories)` | image_2d 及健康检测服务 |
+    | `detect_objects(frame_ids, categories)` | 冻结帧及健康检测服务 |
       返回候选、置信度和执行状态；**服务健康属于执行前置条件**，不要求已有检测成功 |
 
 规范原文（§9.4）：
@@ -28,15 +28,11 @@ from typing import Optional, Sequence
 import numpy as np
 
 from skill3d.schemas import ObjectRecord
-from skill3d.schemas.evidence import CAPABILITIES  # noqa: F401 - 词汇表可达性（证据声明校验）
 from skill3d.schemas.tool import ToolSpec
 
 from .contract import ArtifactUnavailableError, DomainValueError
 from .registry import REGISTRY
 from .scene_handle import SceneHandle
-
-# 证据能力名（与 schemas.evidence.CAPABILITIES 同源）
-EV_IMAGE_2D = "image_2d"
 
 # 单次调用允许的最大裁剪数与单图最小边长（防止模型用 1×1 图刷轮次）
 MAX_BOXES_PER_CALL = 8
@@ -97,9 +93,7 @@ def _resize_for_model(img: np.ndarray, max_side: int = MAX_DERIVED_SIDE
         cost_estimate_ms=5.0,
         source_default="real",
         requires_artifacts=["frames"],
-        requires_evidence=[EV_IMAGE_2D],
-        # §9.2：允许 degraded —— 有图必答的前提就是 image_2d 可用（v6 §5.4 恒 available）
-        tolerates_degraded=[EV_IMAGE_2D],
+        requires_evidence=[],
     )
 )
 def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
@@ -210,10 +204,8 @@ def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
         cost_estimate_ms=800.0,
         source_default="real",
         requires_artifacts=["frames"],
-        # §9.2：证据上只要 image_2d（**不要求已有检测成功** —— 补检的意义正是补上它）；
         # "服务健康"是执行前置条件，由工具在调用时判定并**如实返回 fault**。
-        requires_evidence=[EV_IMAGE_2D],
-        tolerates_degraded=[EV_IMAGE_2D],
+        requires_evidence=[],
     )
 )
 def detect_objects(handle: SceneHandle, frame_ids: Sequence[int],

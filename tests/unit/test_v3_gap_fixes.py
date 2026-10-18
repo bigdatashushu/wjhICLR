@@ -107,9 +107,7 @@ def _fallback_scene() -> SceneState:
         question_tool_scope="fallback_2d_only",
         available_artifacts=set(available_artifacts_for("fallback_2d_only")),
         evidence_profile=EvidenceProfile(
-            geometry_3d="unavailable", world_frame="unavailable",
-            metric_scale="unavailable", object_detection="unavailable",
-            track_consensus="unavailable", object_grounding="unavailable"),
+            geometry_3d="unavailable", metric_scale="unavailable"),
         objects=[], summary="s", question_type="object_counting")
 
 
@@ -174,13 +172,8 @@ def test_m8_real_mode_requires_full_frame_set():
 
 # ------------------------------------------- §9.1：objects 产物语义 ----
 
-def test_exists_in_scene_semantics_and_zero_detection_fail_closed(tmp_path):
-    """§9.1：False 当且仅当 objects 产物可用且真无此实例；产物未产出 → fail-closed 抛错。
-
-    v6 比 v5 更严的一处：**零检出**（基础清单为空）在证据层与"检测器故障"不可区分
-    → `object_detection=unavailable`（§7.1）→ Tool 被收回，**不得**返回 False
-    假装"场景里没有"。这也是把 `exists_in_scene` 当布尔计数器用的最后一层刹车。
-    """
+def test_exists_in_scene_distinguishes_empty_candidates_from_missing_artifact(tmp_path):
+    """False 表示当前候选中无匹配项；产物未产出则必须抛错。"""
     healthy = _scene_state(tmp_path, objects=("obj_0", "obj_1", "obj_2"))
     inventory = [_obj("obj_0", "table"), _obj("obj_1", "chair"), _obj("obj_2", "door")]
     c2w = np.tile(np.eye(4), (2, 1, 1))
@@ -206,16 +199,12 @@ def test_exists_in_scene_semantics_and_zero_detection_fail_closed(tmp_path):
     legacy = SceneHandle(healthy, objects=[])
     assert "objects" not in legacy.available_artifacts
 
-    # ④ 零检出（M5 跑过但清单为空）→ 证据层 fail-closed，而不是"False"
+    # ④ 已产出空候选清单 → False，仅表达候选不存在，不证明场景物体不存在。
     empty = _scene_state(tmp_path, objects=())
-    assert empty.evidence_state("object_detection") == "unavailable"
     empty_handle = SceneHandle(empty, objects=[], c2w_list=c2w, intrinsics=k,
                                objects_materialized=True)
-    with pytest.raises(ArtifactUnavailableError) as ei:
-        REGISTRY.call_tool("exists_in_scene", {"name": "table"}, empty_handle, mode="real")
-    # v6：missing 逐项带原因后缀（`object_detection(unavailable)`）
-    assert len(ei.value.missing) == 1
-    assert ei.value.missing[0].startswith("object_detection")
+    assert REGISTRY.call_tool(
+        "exists_in_scene", {"name": "table"}, empty_handle, mode="real").value == "false"
 
 
 # ------------------------------------------------- Appendix A：G1 / G3 ----

@@ -33,6 +33,7 @@ def _parent() -> SkillSpecV11:
         skill_id="S03",
         version="1.2.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
         skill_md=SOURCE,
     )
 
@@ -42,6 +43,7 @@ def _candidate() -> SkillCandidateV11:
         skill_id="S03",
         version="1.3.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
         skill_md=SOURCE.replace(
             "Focus on incorrect bindings",
             "Prioritize checking incorrect bindings",

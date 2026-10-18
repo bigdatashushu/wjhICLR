@@ -71,6 +71,7 @@ def test_v11_complete_source_is_the_only_planned_model_text():
         skill_id="S03",
         version="1.2.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
     )
     plan = plan_delivery([source.spec], max_chars=8000)
     plan.mark_delivered()
@@ -99,6 +100,7 @@ def test_v11_complete_source_reaches_runner_model_request_once():
         skill_id="S03",
         version="1.2.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
     )
     client = _FakeClient(['ReturnAnswer("A")\n'])
     cfg = OnlineRunConfig(
@@ -132,20 +134,20 @@ def test_v11_complete_source_reaches_runner_model_request_once():
 
 def _v11_specs():
     snapshot = json.loads(
-        (LIBRARY / "snapshots/snapshot_S0-v11-english.json").read_text())
+        (LIBRARY / "snapshots/snapshot_S0-v11-initial-state-skills.json").read_text())
     return validate_v11_snapshot(snapshot, library_root=LIBRARY)
 
 
 @pytest.mark.parametrize("spec", _v11_specs(), ids=lambda spec: spec.skill_id)
-@pytest.mark.parametrize("evidence_available", [True, False])
-def test_skill_on_off_requests_only_differ_by_complete_method(spec, evidence_available):
+def test_skill_on_off_requests_only_differ_by_complete_method(spec):
+    evidence_available = spec.evidence_state != "g0m0"
     item = load_synthetic_items(
         "inner_validation", question_types=[spec.question_type],
         frame_size=FRAME_SIZE, limit=1, seed=0)[0]
     reply = 'ReturnAnswer("A")\n' if item.episode.options else 'ReturnAnswer(1)\n'
     profile = EvidenceProfile(**{
-        key: "available" if evidence_available or key in ("image_2d", "temporal")
-        else "unavailable"
+        key: ("available" if evidence_available and (
+            key == "geometry_3d" or spec.evidence_state == "g1m1") else "unavailable")
         for key in CAPABILITIES})
     scene = SceneState(
         artifact_ref="test", question_type=spec.question_type, evidence_profile=profile,
@@ -181,8 +183,10 @@ def test_skill_on_off_requests_only_differ_by_complete_method(spec, evidence_ava
     assert "优先 `count_objects`" not in off_text
     assert "theta_deg" not in off_text
     assert "AnswerPayload" in off_text
-    assert ("- relative_direction_of(" in off_text) == evidence_available
-    assert ("- object_visible_frames(" in off_text) == evidence_available
+    assert ("- object_centroid(" in off_text) == evidence_available
+    # 未提供 SceneHandle 的局部坐标约定；方向工具不可凭公共状态放行。
+    assert "- relative_direction_of(" not in off_text
+    assert "- object_visible_frames(" in off_text
     assert "- inspect_frames(" in off_text
 
 
@@ -191,7 +195,7 @@ def room_source_and_artifact(tmp_path_factory):
     item = load_synthetic_items(
         "inner_validation", question_types=["room_size_estimation"],
         frame_size=FRAME_SIZE, limit=1, seed=0)[0]
-    spec = next(s for s in _v11_specs() if s.skill_id == "S05")
+    spec = next(s for s in _v11_specs() if s.skill_id == "S05-g1m1")
     artifact = _write_v6_artifact(
         tmp_path_factory.mktemp("v11-room"), with_poses=True)
     return item, spec, artifact

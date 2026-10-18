@@ -10,9 +10,8 @@ v6 迁移（§5.2/§5.3/§13/§20）：
    （= 题型是米制 ∧ `MetricEvidenceGateResult.gate_passed` ∧
    `question_tool_scope=metric_enabled`，§13.2）。任何"用别的代理量推断尺度已知"的写法
    都是实现错误（§10.4：G5 类代理值严禁冒充）。
-2. **世界系检查 fail-closed**：方向 / 连通性类 Tool 与"世界系 3D 点的 reproject"都依赖
-   `world_up` + `handedness` 契约（M3 落盘、M4 校验，§5.2）。契约缺失时这些检查
-   **判失败**（`world_frame=False`），绝不"缺就跳过"——跳过等于把错误坐标当对答案放行。
+2. **局部世界系检查**：方向 / 连通性 / 房间面积依赖 `world_up` + `handedness`。
+   重投影只依赖位姿与内参，不依赖重力方向。
 3. **G5 重投影残差永久 `not_available`**（§10.4/§20）：本模块的 `reprojection` 项是对
    **自算值**的确定性复核（同一 c2w/K 重算并比较），它**不是** BA 重投影残差，也**不得**
    被当作 G5 上报。M4 主门另有其人（warp 内点率 + 点云重叠率，D11）。
@@ -37,9 +36,10 @@ TH_REPROJ_PX = 2.0  # TODO_CALIBRATE 重投影误差阈值（像素）
 BBOX_MARGIN = 0.05  # TODO_CALIBRATE 包围盒外扩比例
 
 # 依赖**世界系契约**（`world_up` + `handedness`）的 Tool（§9.8/§9.10）。
-# 口径与 `ToolSpec.requires_evidence` 含 `world_frame` 一致：契约缺失时这些调用
+# 口径与 `ToolSpec.requires_local_facts` 含 `world_frame` 一致：契约缺失时这些调用
 # 产出的方向/可达结论不可信 → 对应的几何检查必须 fail-closed。
-WORLD_FRAME_TOOLS: tuple[str, ...] = ("relative_direction_of", "connectivity_graph")
+WORLD_FRAME_TOOLS: tuple[str, ...] = (
+    "relative_direction_of", "connectivity_graph", "plane_fit_room_size")
 
 # 米制量键：Tool 输出里若出现这些**非空**键，说明该次调用产出了绝对单位数值
 # （米）。它们只在米制证据被授权时才允许出现（§13.2 fail-closed）。
@@ -63,8 +63,6 @@ _OBJECT_GEOMETRY_ARGS: dict[str, tuple[str, ...]] = {
     "object_distance_m": ("obj_a", "obj_b"),
     "relative_direction_of": ("observer_id", "facing_at_id", "target_id"),
     "count_objects": ("category_name",),
-    "exists_in_scene": ("name",),
-    "object_visible_frames": ("obj_id",),
 }
 
 # 合法手性取值（与 `reconstruction_gate/world_frame.py` 同一词汇表）
@@ -143,10 +141,7 @@ def _valid_json_result(value: str) -> bool:
 
 def _world_frame_available(handle: SceneHandle) -> bool:
     """世界系契约是否可用（`world_up` 合法非零单位向量 ∧ `handedness` 已知取值）。"""
-    if handle.world_up is None:
-        return False
-    hand = handle.handedness
-    return hand is not None and str(hand).lower() in KNOWN_HANDEDNESS
+    return handle.world_frame_usable
 
 
 def metric_evidence_authorized(handle: SceneHandle) -> bool:
@@ -221,13 +216,11 @@ def _has_binding_conflict(obj) -> bool:
 
 
 def _binding_unavailable(handle, obj) -> bool:
-    return (_has_binding_conflict(obj) or not handle.binding_usable(obj.obj_id)
-            or (handle.require_question_binding
-                and not handle.category_binding_complete(obj.category_name)))
+    return _has_binding_conflict(obj) or not handle.binding_usable(obj.obj_id)
 
 
 def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -> bool:
-    """成功的对象几何结果不得引用已被 M5 审计判定冲突的对象。"""
+    """复核实际使用对象的技术有效性；不判断其是否为题目所指实例。"""
     if not hasattr(handle, "object_records"):
         return True
     conflict_ids = {
@@ -266,10 +259,14 @@ def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -
         if (result.status != "ok" or result.error is not None
                 or result.tool not in _OBJECT_GEOMETRY_ARGS):
             continue
-        if (result.tool in ("count_objects", "exists_in_scene")
+        if (result.tool == "count_objects"
                 and handle.require_question_binding
-                and not handle.category_binding_complete(str(result.args.get(
-                    "category_name" if result.tool == "count_objects" else "name", "")))):
+                and not handle.category_binding_complete(
+                    str(result.args.get("category_name", "")))):
+            return False
+        if (result.tool == "relative_distance_rank" and handle.require_question_binding
+                and any(not handle.category_binding_complete(str(category))
+                        for category in result.args.get("candidate_categories", []))):
             return False
         if result.object_dependencies:
             if conflict_ids.intersection(result.object_dependencies):
@@ -292,13 +289,9 @@ def check_inside_bbox(
 ) -> bool:
     """reproject 调用的 3D 输入点必须落在场景包围盒内（外扩 margin）。
 
-    世界系依赖：`p3d` 与世界系包围盒必须处在同一（且已确认的）世界系里。故
-    ① 存在 reproject 调用但世界系契约缺失 → fail-closed（判失败）；
-    ② 无对象（`scene_bbox()` 抛 ValueError）→ 无从判定，不否决。
+    点和包围盒使用同一重建坐标系，无需知道重力方向。
+    无对象（`scene_bbox()` 抛 ValueError）→ 无从判定，不否决。
     """
-    has_reproj = any(r.tool == "reproject" and "p3d" in r.args for r in trace.results)
-    if has_reproj and not _world_frame_available(handle):
-        return False
     try:
         bmin, bmax = handle.scene_bbox()
     except ValueError:
@@ -365,7 +358,7 @@ def geometry_verify(
         "world_frame": "The world up direction or handedness contract is missing",
         "binding_integrity": (
             "The result references an unavailable or inconsistent object binding"),
-        "inside_bbox": "The reprojection input point is outside the scene bounding box, or the world frame contract is missing",
+        "inside_bbox": "The reprojection input point is outside the scene bounding box",
         "reprojection": "The reprojection result cannot be reproduced using the same pose/intrinsics",
     }
     # 逐结果检查：既能精确撤销，也避免单个错误被多条正确重投影的均值掩盖。
@@ -407,7 +400,7 @@ def geometry_verify(
             reason = ""
             if check == "binding_integrity" and not hasattr(handle, "object_records"):
                 reason = "object_records_unavailable"
-            if check == "inside_bbox" and wf_ok:
+            if check == "inside_bbox":
                 try:
                     handle.scene_bbox()
                 except ValueError:
@@ -431,9 +424,7 @@ def geometry_verify(
                 continue
             checks[check] = False
             # 未获本题米制授权不等于全局尺度失效；域值/复算错误也不猜根因。
-            premise = ("world_frame" if not wf_ok and (
-                check == "world_frame" or
-                (check == "inside_bbox" and result.tool == "reproject")) else None)
+            premise = "world_frame" if not wf_ok and check == "world_frame" else None
             conflicted = [
                 obj for obj in handle.object_records()
                 if _binding_unavailable(handle, obj)

@@ -9,8 +9,8 @@
    `status="failed"` 的结果**不进** validated observations；
 3. **保留范围**：仅当前 episode、当前 EvidenceProfile 版本下已成功、且**未被失败
    根因污染**的结果；
-4. **共享前提失效时按依赖级联撤销**：若失败揭示共享前提无效（坐标/尺度/重建证据
-   失效 → EvidenceProfile 对应能力降为 `unavailable`/`degraded`），级联撤销所有
+4. **共享前提失效时按依赖级联撤销**：若失败揭示共享前提无效，公共几何／尺度
+   置为 unavailable，局部坐标约定或候选产物按对应依赖收回；级联撤销所有
    依赖该前提的旧结果，从 validated observations 移除并标 `invalidated_by`；
 5. **重置命名空间后注入**：恢复时重置用户命名空间（避免引用已失效旧变量），
    重新注入 validated observations 摘要 + 失败信息（失败 Tool、根因、已撤销的
@@ -32,7 +32,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Optional
 
-from skill3d.schemas.evidence import EvidenceProfile
+from skill3d.schemas.evidence import CAPABILITIES, EvidenceProfile
 from skill3d.schemas.reconstruction import SceneState
 from skill3d.schemas.tool import FailureCause
 from skill3d.tools.contract import EVIDENCE_METRIC_SCALE
@@ -53,15 +53,15 @@ _PREMISE_BY_ARTIFACT: dict[str, str] = {
 
 # 哪些能力失效会连带撤销依赖它的结果（撤销是**传递**的：几何没了，米制也没了）
 _DEPENDENTS: dict[str, tuple[str, ...]] = {
-    "geometry_3d": ("geometry_3d", "world_frame", EVIDENCE_METRIC_SCALE),
+    "geometry_3d": ("geometry_3d", EVIDENCE_METRIC_SCALE),
     "world_frame": ("world_frame",),
-    "object_detection": ("object_detection", "object_grounding", "track_consensus"),
+    "object_detection": ("objects",),
     EVIDENCE_METRIC_SCALE: (EVIDENCE_METRIC_SCALE,),
 }
 
 # 状态和可判定性先于测量，测量先于审计；不是题型解法。
 _COMMON_FIELDS = (
-    "status", "error", "service_healthy", "degradation_flags", "evidence_degraded",
+    "status", "error", "service_healthy", "degradation_flags", "diagnostic_warnings",
     "duplicate_suspect", "grounding_status", "unit", "units",
     "obj_id", "category", "category_name", "track_id",
 )
@@ -76,7 +76,7 @@ _SUMMARY_FIELDS = {
         "status", "service_healthy", "error", "n_detections", "n_new_objects",
         "new_object_ids", "categories", "frame_ids", "detections",
     ),
-    "count_objects": ("count", "duplicate_suspect", "evidence_degraded",
+    "count_objects": ("count", "duplicate_suspect", "diagnostic_warnings",
                       "n_records", "n_distinct_tracks", "n_geometric_merges"),
     "object_centroid": ("centroid_normalized", "centroid_metric",
                         "category_name", "track_id", "world_up_used", "handedness_used"),
@@ -398,7 +398,7 @@ def premise_of_failure(*, error_code: str, tool: str,
     """从失败事实推断失效的共享前提；`None` = 局部失败，不做级联（§14.1）。
 
     `unmet_evidence`：授权检查给出的**逐项未达标能力**（可能带
-    `"(degraded 且不容忍)"` 之类的后缀）。**必须优先于产物判据**：
+    `"(unavailable)"` 之类的后缀）。**必须优先于产物判据**：
     实测踩过的坑是"证据缺口"被当成"缺产物"从而一律退成 `geometry_3d`，
     级联撤销就把 geometry/world_frame/metric_scale 全部无差别降级了。
     """
@@ -454,7 +454,9 @@ def cascade_invalidate(kernel, premise: str, *,
             continue
         name = str(getattr(r, "source_tool", "") or getattr(r, "tool", ""))
         try:
-            req = set(registry.requires_evidence(name))
+            spec = registry.spec(name)
+            req = (set(spec.requires_evidence) | set(spec.requires_local_facts)
+                   | set(spec.requires_artifacts))
         except Exception:  # noqa: BLE001 - 未注册名（回放/历史 trace）→ 不撤销
             continue
         if req & affected:
@@ -507,32 +509,27 @@ def downgrade_profile(profile: Optional[EvidenceProfile],
                       premise: str, *, confirmed_invalid: bool = False,
                       excluded_capabilities=()
                       ) -> tuple[Optional[EvidenceProfile], dict[str, str]]:
-    """降级失效前提；M11 确证无效时直接收回对应能力。"""
+    """失效即 unavailable；对象与坐标约定不写回公共画像。"""
     if profile is None:
         return None, {}
     changed: dict[str, str] = {}
     update: dict = {}
     reasons = dict(getattr(profile, "state_reasons", None) or {})
     for cap in _DEPENDENTS.get(str(premise), (str(premise),)):
-        if cap in excluded_capabilities:
+        if cap not in CAPABILITIES or cap in excluded_capabilities:
             continue
         cur = profile.state(cap)
-        if confirmed_invalid and cur != "unavailable":
+        if cur != "unavailable":
             update[cap] = "unavailable"
             changed[cap] = f"{cur}→unavailable"
-        elif cur == "available":
-            update[cap] = "degraded"
-            changed[cap] = "available→degraded"
-        elif cur == "degraded":
-            update[cap] = "unavailable"
-            changed[cap] = "degraded→unavailable"
         else:
             continue
         # v9 §6.1：被级联撤销的能力记 `invalidated` —— 与"没跑"和"跑失败"区分开
         reasons[cap] = "invalidated"
     if update:
         update["state_reasons"] = reasons
-    return (profile.model_copy(update=update) if update else profile), changed
+    return (EvidenceProfile.model_validate({**profile.model_dump(), **update})
+            if update else profile), changed
 
 
 def build_feedback(plan: RecoveryPlan, *, question_type: str,

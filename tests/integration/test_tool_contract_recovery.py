@@ -194,13 +194,17 @@ def test_shared_premise_failure_cascades_and_downgrades(tmp_path, episode_item):
     # 级联撤销与能力降级写入结构化轮次记录。
     failed_round = next(r for r in out.rounds if r.get("error_code"))
     assert failed_round["downgraded_capabilities"]["geometry_3d"] == (
-        "available→degraded")
+        "available→unavailable")
     assert failed_round["invalidated_result_ids"]
     assert len(out.invalidated_result_ids) >= 1
-    # EvidenceProfile 能力降级（available → degraded），几何/世界系/米制一起降
+    # 几何失效连带尺度失效，两项均直接 unavailable。
     assert out.evidence_profile is not None
-    assert out.evidence_profile.state("geometry_3d") == "degraded"
-    assert out.evidence_profile.state("metric_scale") == "degraded"
+    assert out.evidence_profile.state("geometry_3d") == "unavailable"
+    assert out.evidence_profile.state("metric_scale") == "unavailable"
+    history = out.episode_trace.evidence_history
+    assert history[0]["evidence_states"]["geometry_3d"] == "available"
+    assert history[-1]["evidence_states"]["geometry_3d"] == "unavailable"
+    assert history[-1]["evidence_states"] == out.episode_trace.evidence_states
     # 降级后的证据画像必须真的把米制 Tool 收回去（§7.2 单项失败只收回依赖它的工具）
     from skill3d.tools import REGISTRY
 
@@ -213,6 +217,30 @@ def test_shared_premise_failure_cascades_and_downgrades(tmp_path, episode_item):
     # 恢复后仍能作答（用未被污染的工具），但答案绝不复用被撤销的房间面积
     assert out.final_state == "answer" and out.answer_source == "tool_program"
     assert out.answer not in ("17.11",)                   # 被撤销的旧数值不得复用
+
+
+def test_shared_failure_keeps_initial_skill_and_does_not_retrieve_again(tmp_path, episode_item):
+    from pathlib import Path
+    from skill3d.skills.registry import load_active_skills
+
+    library = Path(__file__).resolve().parents[2] / "skill_library"
+    skills, _, snapshot = load_active_skills(library / "snapshots")
+    client = _FakeClient(PREMISE_FAIL_THEN_OK)
+    cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=False), max_recovery=2)
+    cfg.skills = skills
+    cfg.active_snapshot_ref = snapshot
+    out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
+    assert out.initial_skill_selection["evidence_state"] == "g1m1"
+    expected = "S05-g1m1@1.0.0"
+    assert out.initial_skill_selection["skill_version"] == expected
+    assert out.evidence_profile.geometry_3d == "unavailable"
+    assert len(out.retrieval_records) == 1
+    assert out.delivered_skill_versions == [expected]
+    selected = next(s for s in skills if s.skill_id == "S05-g1m1")
+    for messages in client.calls:
+        assert _blob(messages).count(json.dumps(selected.skill_md)[1:-1]) == 1
+    assert out.episode_trace.initial_evidence_states["geometry_3d"] == "available"
+    assert out.episode_trace.evidence_states["geometry_3d"] == "unavailable"
 
 
 # ------------------------------------------------------- (c) 恢复次数有限 ----
@@ -380,7 +408,7 @@ def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
     monkeypatch.setattr(runner, "_bind_objects_best_effort", lambda *a, **k: (
         objs, {"grounding": {"attempted": True, "status": "partial",
                             "requirements": [{"name": "chair", "scan_complete": True,
-                                              "status": "resolved", "binding_failures": [],
+                                              "status": "candidates_available", "binding_failures": [],
                                               "usable_object_ids": ["good"]}]},
                "track_stable_ratio": 1}, [], True))
     client = _FakeClient([

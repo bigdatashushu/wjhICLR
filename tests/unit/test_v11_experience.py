@@ -44,6 +44,7 @@ def _parent() -> SkillSpecV11:
         skill_id="S03",
         version="1.1.0",
         question_type="object_rel_distance",
+        evidence_state="g1m1",
         skill_md=SOURCE.read_text(encoding="utf-8"),
     )
 
@@ -86,6 +87,13 @@ def _write_case(
         frame_set_hash=f"frames-{qa_id}",
     ))
     digest = delivered_hash or parent.content_sha256
+    initial = {
+        "geometry_3d": "unavailable" if parent.evidence_state == "g0m0" else "available",
+        "metric_scale": "available" if parent.evidence_state == "g1m1" else "unavailable"}
+    final = {"geometry_3d": "available", "metric_scale": "unavailable"}
+    candidates = [{"obj_id": "chair_1", "category_name": "chair"},
+                  {"obj_id": "chair_2", "category_name": "chair"},
+                  {"obj_id": "table_1", "category_name": "table"}]
     store.append("episode_trace", EpisodeTrace(
         episode_id=qa_id,
         qa_id=qa_id,
@@ -97,6 +105,15 @@ def _write_case(
         active_snapshot_ref="S0-v11-learning",
         frame_set_hash=f"frames-{qa_id}",
         episode_status="answered",
+        evidence_states=final,
+        initial_evidence_states=initial,
+        initial_skill_selection={
+            "question_type": parent.question_type, "evidence_state": parent.evidence_state,
+            "skill_version": key, "content_sha256": parent.content_sha256},
+        evidence_history=[
+            {"trigger": "initial", "evidence_states": initial, "candidates": candidates},
+            {"trigger": "final", "evidence_states": final, "candidates": candidates}],
+        image_ledger={"observed_image_ids": ["frame-0"]},
         retrieval_records=[{
             "candidates": [{
                 "skill_version": key,
@@ -133,6 +150,7 @@ def _write_case(
         payload={"closest_category": "table"},
         value='{"closest_category":"table"}',
         source="real",
+        resolved_object_ids=["chair_2", "table_1"],
     )
     store.append("program_trace", ProgramExecutionTrace(
         program_id=program_id,
@@ -196,6 +214,12 @@ def test_builds_complete_learning_bundle_from_structured_trace(tmp_path):
     assert by_qa["success"].model_answer == "B"
     assert by_qa["success"].reference_answer == "B"
     assert by_qa["success"].score == 1.0
+    assert by_qa["success"].initial_evidence_states["metric_scale"] == "available"
+    assert by_qa["success"].evidence_states["metric_scale"] == "unavailable"
+    assert len(by_qa["success"].evidence_history) == 2
+    assert len(by_qa["success"].candidate_objects) == 3
+    assert by_qa["success"].selected_object_ids == ["chair_2", "table_1"]
+    assert by_qa["success"].image_observations["observed_image_ids"] == ["frame-0"]
     assert by_qa["success"].tool_observations[0]["tool"] == (
         "relative_distance_rank"
     )
@@ -203,6 +227,7 @@ def test_builds_complete_learning_bundle_from_structured_trace(tmp_path):
     assert by_qa["success"].response_text != by_qa["success"].program_source
     assert by_qa["failure"].model_answer == "A"
     assert by_qa["failure"].score == 0.0
+    assert by_qa["failure"].failure_categories == ["answer_incorrect"]
     assert by_qa["failure"].error_direction == "wrong_option"
     assert by_qa["failure"].failure_categories == ["answer_incorrect"]
     assert all(case.delivered_skill_md == parent.skill_md for case in bundle.cases)
@@ -300,7 +325,10 @@ def test_rejects_mock_run_for_formal_revision(tmp_path):
         )
 
 
-@pytest.mark.parametrize("field", ["source_split", "split", "label_access"])
+@pytest.mark.parametrize("field", [
+    "source_split", "split", "label_access",
+    "initial_evidence_states", "evidence_states", "evidence_history",
+])
 def test_case_schema_requires_explicit_learning_identity(tmp_path, field):
     parent = _parent()
     store = TraceStore(tmp_path)
@@ -317,6 +345,40 @@ def test_case_schema_requires_explicit_learning_identity(tmp_path, field):
 
     with pytest.raises(ValidationError):
         V11ExperienceCase.model_validate(payload)
+
+
+@pytest.mark.parametrize("damage", ["empty_history", "mismatched_final", "old_dimension"])
+def test_experience_rejects_inconsistent_evidence_history(tmp_path, damage):
+    parent = _complete_trace(tmp_path)
+    bundle = build_v11_experience_bundle_from_trace_store(
+        tmp_path, campaign_id="history-check", parent_snapshot_id="S0-v11-learning",
+        parent=parent)
+    payload = bundle.cases[0].model_dump(mode="json")
+    if damage == "empty_history":
+        payload["evidence_history"] = []
+    elif damage == "mismatched_final":
+        payload["evidence_states"] = payload["initial_evidence_states"]
+    else:
+        payload["evidence_history"][0]["evidence_states"]["object_grounding"] = "available"
+    with pytest.raises(ValidationError):
+        V11ExperienceCase.model_validate(payload)
+
+
+def test_collector_partitions_by_initial_state_instead_of_final_state(tmp_path):
+    parent = _parent()
+    lower = parent.model_copy(update={"skill_id": "S03-other", "evidence_state": "g1m0"})
+    store = TraceStore(tmp_path)
+    _write_run(store)
+    _write_case(store, parent, qa_id="initial-metric", correct=False)
+    _write_case(store, lower, qa_id="initial-nonmetric", correct=True)
+    upper_bundle = build_v11_experience_bundle_from_trace_store(
+        tmp_path, campaign_id="upper", parent_snapshot_id="S0-v11-learning", parent=parent)
+    lower_bundle = build_v11_experience_bundle_from_trace_store(
+        tmp_path, campaign_id="lower", parent_snapshot_id="S0-v11-learning", parent=lower)
+    assert [case.qa_id for case in upper_bundle.cases] == ["initial-metric"]
+    assert [case.qa_id for case in lower_bundle.cases] == ["initial-nonmetric"]
+    assert upper_bundle.cases[0].evidence_states == lower_bundle.cases[0].evidence_states
+    assert upper_bundle.cases[0].evidence_state == "g1m1"
 
 
 def test_selects_one_of_repeated_runs_and_joins_shared_program_by_qa(tmp_path):

@@ -182,8 +182,8 @@ def test_real_runner_seed_skill_geometry_and_recomputed_summary(panel, tmp_path)
     assert pair["comparable"] is True
     off, on = (pair["arms"][arm] for arm in ab.ARMS)
     assert off["delivered_content_sha256"] == {}
-    assert on["delivered_skill_versions"] == ["S03@1.2.0"]
-    body = (root / "skills/S03/1.2.0/SKILL.md").read_text()
+    assert on["delivered_skill_versions"] == ["S03-g1m0@1.0.0"]
+    body = (root / "skills/S03-g1m0/1.0.0/SKILL.md").read_text()
     assert body in clients[("B11", item.episode.qa_id)].calls[0][0][0]["content"][0]["text"]
     assert off["initial_tree_sha256"] == on["initial_tree_sha256"]
     assert off["first_common_request_sha256"] == on["first_common_request_sha256"]
@@ -420,9 +420,11 @@ def test_campaign_adapter_revalidates_cached_panel_and_summary(panel, tmp_path, 
     source = (ROOT / "skill_library/versions/S03/1.1.0/"
               "rank-object-distances/SKILL.md").read_text()
     parent = SkillSpecV11(skill_id="S03", version="1.1.0",
-                         question_type="object_rel_distance", skill_md=source)
+                         question_type="object_rel_distance", evidence_state="g1m0",
+                         skill_md=source)
     spec = SkillSpecV11(skill_id="S03", version="1.2.0",
                        question_type=parent.question_type,
+                       evidence_state=parent.evidence_state,
                        skill_md=source + "\n复核对象绑定后再提交。\n")
     candidate = SkillCandidateV11(
         candidate_id="candidate-test", parent_snapshot_id="parent-test",
@@ -473,12 +475,14 @@ def test_e11_fixed_parent_candidate_injection_is_auditable(panel, tmp_path):
         skill_id="S03",
         version="1.1.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
         skill_md=source,
     )
     candidate = SkillSpecV11(
         skill_id="S03",
         version="1.2.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
         skill_md=source.replace(
             "重点核查会改变前两名的错误绑定",
             "优先核查会改变前两名的错误绑定",
@@ -536,6 +540,28 @@ def test_e11_fixed_parent_candidate_injection_is_auditable(panel, tmp_path):
         assert retrieval["candidates"][0]["reason_code"] == "fixed_injection_selected"
     assert bindings["B01"]["arm"] == "parent"
     assert bindings["B11"]["arm"] == "candidate"
+
+
+def test_e11_without_target_state_exits_before_model_requests(panel, tmp_path):
+    item, artifact, binding_calls = panel
+    source = (ROOT / "skill_library/versions/S03/1.1.0/rank-object-distances/SKILL.md").read_text()
+    parent = SkillSpecV11(skill_id="S03", version="1.1.0",
+                          question_type="object_rel_distance", evidence_state="g0m0",
+                          skill_md=source)
+    candidate = parent.model_copy(update={"version": "1.2.0",
+                                          "skill_md": source + "\nCheck the full layout.\n"})
+    calls = []
+    output = tmp_path / "no-target"
+    result = ab.run_skill_pair_evaluation_v11(
+        [item], artifact_paths={item.episode.qa_id: artifact}, output_dir=output,
+        base_cfg=OnlineRunConfig(mode="real"), seed=0,
+        parent=parent, candidate=candidate, parent_snapshot_ref="parent",
+        parent_manifest_sha256="a" * 64, candidate_snapshot_ref="candidate",
+        candidate_manifest_sha256="b" * 64,
+        client_factory=lambda *args: calls.append(args))
+    assert result["reason"] == "no_target_slot_samples"
+    assert result["n_pairs"] == result["n_solver_runs"] == 0
+    assert calls == binding_calls == []
 
 
 def test_state_observation_namespace_and_disk_are_isolated(panel, tmp_path, monkeypatch):
@@ -783,12 +809,12 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_5_en"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_7_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.5-core-engineering-repair")
+        "solver-v11.7-initial-state-skills")
     assert manifest["common_config"]["tool_docs_version"] == (
-        "tool-docs-v11.5-core-engineering-repair")
-    assert manifest["snapshot"]["snapshot_id"] == "S0-v11-english"
+        "tool-docs-v11.6-two-capabilities")
+    assert manifest["snapshot"]["snapshot_id"] == "S0-v11-initial-state-skills"
 
 
 @pytest.mark.parametrize("damage", ["missing_qa", "duplicate_qa", "frame_hash", "source",

@@ -172,6 +172,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="one canonical question type",
     )
     parser.add_argument("--parent-trace-dir", required=True)
+    parser.add_argument("--evidence-state", choices=["g0m0", "g1m0", "g1m1"],
+                        required=True, help="target initial evidence slot")
     parser.add_argument("--source", choices=["jsonl", "vsi_bench"],
                         default="vsi_bench")
     parser.add_argument("--episodes-jsonl")
@@ -340,6 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         campaign_cfg = V11CampaignConfig(
             campaign_id=args.campaign_id,
             question_type=args.question_type,
+            evidence_state=args.evidence_state,
             library_root=library_root,
             run_root=args.run_root,
             max_revision_attempts=args.max_revision_attempts,

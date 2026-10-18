@@ -35,6 +35,7 @@ from skill3d.schemas import (
     SkillSpecV11,
 )
 from skill3d.schemas.trace import EVALUATION_CONTRACT_VERSION
+from skill3d.schemas.evidence import skill_evidence_state
 from skill3d.segmentation.open_vocab_detector import capture_detector_failures
 from skill3d.skills.v11_library import (
     _manifest_for,
@@ -56,7 +57,7 @@ from skill3d.tools.scene_handle import (
 from skill3d.trace.store import TraceStore
 from skill3d.infra.experiment_startup import MODE_ENV, current_code_identity
 
-SNAPSHOT_ID = "S0-v11-english"
+SNAPSHOT_ID = "S0-v11-initial-state-skills"
 DEFAULT_LIBRARY = Path(__file__).resolve().parents[3] / "skill_library"
 ARMS = ("B01", "B11")
 ARTIFACT_REFS = (
@@ -303,6 +304,19 @@ def input_identity(item: EpisodeItem, artifact_path: str | Path) -> dict:
                   for key, p in sorted(files.items())},
     }
     return {**value, "sha256": _hash(value)}
+
+
+def initial_state_for_item(item: EpisodeItem, artifact_path: str | Path) -> str:
+    """Determine the slot from shared geometry before any model request or score."""
+    path = Path(artifact_path).resolve()
+    art = ReconstructionArtifact.model_validate_json(path.read_bytes())
+    art = art.model_copy(update={
+        key: str(value) for key, value in _artifact_files(art, path).items()
+        if key in ARTIFACT_REFS})
+    art = runner._prepare_m4_quality(art, item.pixels, persist_quality=False)
+    scene = runner.build_scene_state(
+        art, question_type=canonical_task(item.episode.question_type))
+    return skill_evidence_state(scene.evidence_profile)
 
 
 def input_error_identity(item: EpisodeItem) -> dict:
@@ -660,6 +674,8 @@ def _arm_result(
         "geometry_verify": out.verify.model_dump(mode="json") if out.verify is not None else None,
         "delivered_skill_versions": out.delivered_skill_versions,
         "delivered_content_sha256": delivered, "delivery_ok": delivery_ok,
+        "initial_evidence_states": dict(out.initial_evidence_states),
+        "initial_skill_selection": dict(out.initial_skill_selection),
         "requests": client.requests,
         "first_common_request_sha256": (
             program_requests[0]["common_request_sha256"] if program_requests else None),
@@ -960,9 +976,33 @@ def run_skill_ablation_v11(
         _same_ids(expected, chosen, "question panel")
         if not chosen:
             raise PairingError("empty question panel")
+        initial_states = {
+            q: initial_state_for_item(item, artifact_paths[q])
+            for q, item in chosen.items() if item.input_error is None
+            and q in artifact_paths}
+        excluded = []
+        if fixed_pair:
+            target_states = {s.evidence_state for s in fixed_arms.values()}
+            if len(target_states) != 1:
+                raise PairingError("parent/candidate initial evidence slots must match")
+            target_state = next(iter(target_states))
+            excluded = [q for q in expected if initial_states.get(q) != target_state]
+            expected = [q for q in expected if q not in excluded]
+            chosen = {q: chosen[q] for q in expected}
+            manifest.update(target_evidence_state=target_state,
+                            excluded_qa_ids=excluded, initial_evidence_states=initial_states)
+            if not expected:
+                manifest.update(status="incomplete", qa_ids=[], reason="no_target_slot_samples")
+                _write(root / "manifest.json", manifest)
+                summary = {"status": "incomplete", "reason": "no_target_slot_samples",
+                           "n_pairs": 0, "n_solver_runs": 0,
+                           "formal_result_eligible": False, "excluded_qa_ids": excluded}
+                _write(root / "summary.json", summary)
+                (root / "paired_results.jsonl").write_text("")
+                return summary
         costs = {
             str(key): float(value)
-            for key, value in (reconstruction_costs or {}).items()
+            for key, value in (reconstruction_costs or {}).items() if key not in excluded
         }
         if set(costs) - set(expected):
             raise PairingError(
@@ -1006,7 +1046,7 @@ def run_skill_ablation_v11(
                 "manifest_sha256": fixed_identity_sha,
                 "arms": identities_by_arm,
             }
-            by_task = {}
+            by_slot = {}
         else:
             snapshot = json.loads(
                 (library / f"snapshots/snapshot_{snapshot_id}.json").read_text())
@@ -1023,10 +1063,11 @@ def run_skill_ablation_v11(
                     snapshot.get("manifest_hash") or skill_manifest.get(
                         "manifest_sha256") != snapshot.get("manifest_hash"):
                 raise PairingError("frozen Skill manifest mismatch")
-            by_task = {s.question_type: s for s in specs}
-            if wanted - set(by_task):
+            by_slot = {(s.question_type, s.evidence_state): s for s in specs}
+            if any((task, state) not in by_slot for task in wanted
+                   for state in ("g0m0", "g1m0", "g1m1")):
                 raise PairingError(
-                    f"missing frozen Skills: {sorted(wanted - set(by_task))}")
+                    "missing frozen task/evidence Skills")
         quality = quality_contract()
         if quality_confirmations is not None:
             unknown = set(quality_confirmations) - set(expected)
@@ -1253,6 +1294,18 @@ def run_skill_ablation_v11(
                     objects_materialized=binding.materialized, persist_quality=False)
                 preparation_work[q]["artifact"] = updated_art
 
+        for q in expected:
+            if chosen[q].input_error is not None:
+                continue
+            art = (preparation_work[q]["artifact"] if q in preparation_work else
+                   ReconstructionArtifact.model_validate_json(
+                       (Path(prepared[q]["directory"]) / "artifact.json").read_bytes()))
+            state = skill_evidence_state(runner.build_scene_state(
+                art, question_type=canonical_task(chosen[q].episode.question_type)).evidence_profile)
+            if state != initial_states[q]:
+                raise PairingError(f"{q}: shared preparation changed the initial evidence slot")
+        manifest["initial_skill_states"] = dict(initial_states)
+
         # Room measurements are scene-level deterministic infrastructure. Compute once per
         # request identity before either arm and freeze success/failure identically.
         room_receipts: dict[str, dict] = (
@@ -1337,7 +1390,7 @@ def run_skill_ablation_v11(
                 input_hash = identities[q]["sha256"]
                 for arm in ARMS:
                     spec = fixed_arms[arm] if fixed_pair else (
-                        by_task[task] if arm == "B11" else None)
+                        None)
                     binding = (
                         SkillEvaluationBinding(
                             mode="fixed_skill_evaluation",
@@ -1412,7 +1465,7 @@ def run_skill_ablation_v11(
                                 "prepared": prepared[q]["sha256"]})
             for arm in ARMS:
                 spec = fixed_arms[arm] if fixed_pair else (
-                    by_task[task] if arm == "B11" else None)
+                    by_slot[(task, initial_states[q])] if arm == "B11" else None)
                 binding = (
                     SkillEvaluationBinding(
                         mode="fixed_skill_evaluation",
@@ -1470,6 +1523,8 @@ def run_skill_ablation_v11(
                             } if spec is not None else {}),
                             options=item.episode.options,
                             reconstruction_cost_s=costs.get(q))
+                        if out.initial_skill_selection.get("evidence_state") != initial_states[q]:
+                            raise PairingError(f"{q}/{arm}: runtime initial slot differs from shared preparation")
                     except Exception as exc:
                         row = _incomplete_row(
                             identity, task=task, is_mca=classify(item.episode).is_mca,
@@ -1550,8 +1605,8 @@ def run_skill_pair_evaluation_v11(
     reconstruction_costs: Mapping[str, float] | None = None,
 ) -> dict:
     """Run E11 with explicit parent/candidate fixed injection on frozen inputs."""
-    if parent.question_type != candidate.question_type:
-        raise PairingError("parent and candidate question_type must match")
+    if parent.slot_key != candidate.slot_key:
+        raise PairingError("parent and candidate task/evidence slot must match")
     return run_skill_ablation_v11(
         items,
         artifact_paths=artifact_paths,

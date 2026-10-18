@@ -10,6 +10,7 @@ import pytest
 
 from skill3d.routing.skill_retriever import retrieve_ex
 from skill3d.schemas import (
+    EvidenceProfile,
     SceneState,
     SkillCandidateV11,
     SkillSpecV11,
@@ -69,6 +70,7 @@ def _install_s03(library_root: Path):
         skill_id="S03",
         version="1.1.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
     )
 
 
@@ -100,6 +102,7 @@ def test_all_v11_sources_are_compact_lossless_methods(
         skill_id=skill_id,
         version="1.1.0",
         question_type=question_type,
+        evidence_state="g1m0",
     )
     front, body = parse_skill_markdown(source.spec.skill_md)
     assert set(front) == {"name", "description"}
@@ -123,17 +126,19 @@ def test_all_v11_sources_are_compact_lossless_methods(
 
 def test_complete_v11_snapshot_has_one_active_skill_for_all_eight_tasks():
     snapshot_path = (
-        LIBRARY / "snapshots" / "snapshot_S0-v11-format-migration.json")
+        LIBRARY / "snapshots" / "snapshot_S0-v11-initial-state-skills.json")
     snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
     skills = validate_v11_snapshot(snapshot, library_root=LIBRARY)
 
     assert {skill.skill_id for skill in skills} == {
-        skill_id for skill_id, _question_type, _name, _tools in V11_SKILLS}
-    assert snapshot["active_by_question_type"] == {
-        question_type: f"{skill_id}@1.1.0"
+        f"{skill_id}-{state}" for skill_id, _question_type, _name, _tools in V11_SKILLS
+        for state in ("g0m0", "g1m0", "g1m1")}
+    assert snapshot["active_by_slot"] == {
+        question_type: {state: f"{skill_id}-{state}@1.0.0"
+                        for state in ("g0m0", "g1m0", "g1m1")}
         for skill_id, question_type, _name, _tools in V11_SKILLS
     }
-    assert len(snapshot["entries"]) == len(V11_SKILLS) == 8
+    assert len(snapshot["entries"]) == 24
 
     manifest = json.loads(
         (LIBRARY / snapshot["manifest_ref"]).read_text(encoding="utf-8"))
@@ -166,6 +171,7 @@ def test_v11_spec_rejects_noncanonical_line_endings(mutator):
             skill_id="S03",
             version="1.1.0",
             question_type="object_rel_distance",
+            evidence_state="g1m0",
             skill_md=text,
         )
 
@@ -200,6 +206,7 @@ def test_v11_source_ref_cannot_escape_library(tmp_path):
             skill_id="S03",
             version="1.1.0",
             question_type="object_rel_distance",
+            evidence_state="g1m0",
         )
 
 
@@ -207,7 +214,7 @@ def test_v11_loader_rejects_manifest_tampering(tmp_path):
     _source, snapshot = _activate_s03_baseline(tmp_path)
     manifest_path = tmp_path / snapshot["manifest_ref"]
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["active_by_question_type"] = {}
+    manifest["active_by_slot"] = {}
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     with pytest.raises(ValueError, match="manifest 校验失败"):
@@ -228,6 +235,7 @@ def test_v11_snapshot_rejects_multiple_active_skills_for_one_question_type(tmp_p
         skill_id="S09",
         version="1.0.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
     )
     with pytest.raises(V11LibraryError, match="多个 active"):
         build_v11_snapshot([first, second], snapshot_id="duplicate")
@@ -238,7 +246,7 @@ def test_v11_retrieval_is_deterministic_question_type_lookup(tmp_path):
     scene = SceneState(
         artifact_ref="artifact",
         scene_route="fallback_2d_only",
-        evidence_profile=None,
+        evidence_profile=EvidenceProfile(geometry_3d="available", metric_scale="unavailable"),
     )
     hits, record = retrieve_ex(
         "Which object is closest to the chair?",
@@ -250,11 +258,11 @@ def test_v11_retrieval_is_deterministic_question_type_lookup(tmp_path):
 
     assert [hit.skill_version for hit in hits] == ["S03@1.1.0"]
     assert record.retrieved_skill_versions == ["S03@1.1.0"]
-    assert record.partition_policy == "v11_unique_active_by_question_type"
-    assert record.config_version == "ret-v11-deterministic-1"
+    assert record.partition_policy == "v11_unique_active_by_initial_slot"
+    assert record.config_version == "ret-v11-initial-slot-1"
     assert record.lineage_selections == []
     assert record.candidates[0].score == 1.0
-    assert record.candidates[0].matched_evidence_signature == {}
+    assert record.candidates[0].matched_evidence_signature == scene.evidence_profile.as_signature()
 
 
 def test_v11_retrieval_rejects_mixed_runtime_formats(tmp_path):
@@ -291,6 +299,7 @@ def test_v11_publish_replaces_active_and_preserves_parent_for_rollback(tmp_path)
             skill_id="S03",
             version="1.2.0",
             question_type="object_rel_distance",
+            evidence_state="g1m0",
             skill_md=candidate_md,
         ),
         modification_reason="测试完整 Markdown 发布",
@@ -300,8 +309,8 @@ def test_v11_publish_replaces_active_and_preserves_parent_for_rollback(tmp_path)
     promoted, receipt = publish_v11_candidate(tmp_path, candidate)
     assert promoted["entries"]["S03@1.1.0"]["state"] == "historical"
     assert promoted["entries"]["S03@1.2.0"]["state"] == "active"
-    assert promoted["active_by_question_type"] == {
-        "object_rel_distance": "S03@1.2.0"}
+    assert promoted["active_by_slot"] == {
+        "object_rel_distance": {"g1m0": "S03@1.2.0"}}
     assert receipt["snapshot_before"] == parent_snapshot["snapshot_id"]
     assert receipt["snapshot_after"] == promoted["snapshot_id"]
     assert receipt["source_diff"].startswith("--- S03@1.1.0")
@@ -365,7 +374,7 @@ def test_current_online_loader_rejects_legacy_snapshot_schema(tmp_path):
         json.dumps({"snapshot_id": "legacy", "schema_version": "runtime-skill-snapshot/1.0"}),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="只接受 runtime-skill-snapshot/2.0"):
+    with pytest.raises(ValueError, match="只接受 runtime-skill-snapshot/3.0"):
         load_active_skills(store)
 
 
@@ -373,7 +382,9 @@ def test_empty_and_populated_arms_record_the_same_lookup_contract(tmp_path):
     from skill3d.online.config import load_config, retrieval_policy_from
 
     skill = _install_s03(tmp_path).spec
-    scene = SceneState(artifact_ref="artifact", scene_route="fallback_2d_only")
+    scene = SceneState(artifact_ref="artifact", scene_route="fallback_2d_only",
+                       evidence_profile=EvidenceProfile(
+                           geometry_3d="available", metric_scale="unavailable"))
     policy = retrieval_policy_from(load_config())
     _, empty = retrieve_ex("q", scene, [], question_type=skill.question_type, policy=policy)
     _, populated = retrieve_ex(
@@ -404,6 +415,6 @@ def test_rollback_rejects_old_schema_and_preserves_active_pointer(tmp_path):
     (store / "snapshot_old.json").write_text(json.dumps({
         "schema_version": "runtime-skill-snapshot/1.0", "snapshot_id": "old",
     }))
-    with pytest.raises(ValueError, match="runtime-skill-snapshot/2.0"):
+    with pytest.raises(ValueError, match="runtime-skill-snapshot/3.0"):
         rollback(store, "old")
     assert load_active_skills(store)[2] == parent["snapshot_id"]

@@ -22,8 +22,8 @@ def test_current_protocol_identity_is_fixed_and_not_cli_selectable():
     }
     assert PromptBuilder().template_version == PROMPT_TEMPLATE_VERSION
     versions = current_version_fields()
-    assert versions["template_version"] == "program_synth_v11_5_en"
-    assert versions["execution_protocol_version"] == "solver-v11.5-core-engineering-repair"
+    assert versions["template_version"] == "program_synth_v11_7_en"
+    assert versions["execution_protocol_version"] == "solver-v11.7-initial-state-skills"
     assert versions["tool_docs_version"] == TOOL_DOCS_VERSION
 
 

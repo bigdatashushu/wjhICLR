@@ -41,18 +41,17 @@ def test_track_groups_are_never_split_by_geometry(tracks, centers, expected, mer
     assert data["n_records"] == len(tracks)
 
 
-@pytest.mark.parametrize(("evidence", "up", "hand", "valid"), [
-    ("available", [0, 2, 0], "right", True),
-    ("degraded", [1, 0, 0], "left", True),
-    ("unavailable", [0, 1, 0], "right", False),
-    ("available", None, "right", False),
-    ("available", [0, 0, 0], "right", False),
-    ("available", [0, 1, 0], "invalid", False),
+@pytest.mark.parametrize(("up", "hand", "valid"), [
+    ([0, 2, 0], "right", True),
+    ([1, 0, 0], "left", True),
+    ([0, 1, 0], "right", True),
+    (None, "right", False),
+    ([0, 0, 0], "right", False),
+    ([0, 1, 0], "invalid", False),
 ])
-def test_centroid_direction_metadata_requires_evidence_and_real_values(evidence, up, hand, valid):
+def test_centroid_direction_metadata_requires_valid_local_values(up, hand, valid):
     obj = _obj("route-point", "chair", (1, 2, 3))
     scene = _scene(objs=[obj])
-    scene.evidence_profile.world_frame = evidence
     scene.artifact = scene.artifact.model_copy(update={"world_up": up, "handedness": hand})
     handle = _handle(scene, objs=[obj], metric_scale=2.0)
     result = call_tool("object_centroid", {"obj_id": obj.obj_id}, handle)
@@ -147,7 +146,7 @@ def test_neutral_docs_cover_current_tools_without_old_recipes():
         assert stale not in text
     assert "candidate_categories" in text
     assert "centroid_normalized" in text and "world_up_used" in text
-    assert "Sorting and deduplication are not guaranteed" in text.replace("\n", " ")
+    assert "Return mask-verified visible frames" in text
     assert not re.search(r"[\u4e00-\u9fff]", text)
     text = PromptBuilder().render(
         question="test", scene_summary="", scene_frame="world", tool_docs=text,
@@ -157,11 +156,20 @@ def test_neutral_docs_cover_current_tools_without_old_recipes():
 
 
 def test_repair_snapshot_preserves_original_sources_and_records_ancestry():
-    from skill3d.skills.v11_library import validate_v11_snapshot, canonical_json_sha256
+    import hashlib
+    from types import SimpleNamespace
+    from skill3d.skills.v11_library import canonical_json_sha256
     original = json.loads((LIBRARY / "snapshots/snapshot_S0-v11-format-migration.json").read_text())
     revised = json.loads((LIBRARY / "snapshots/snapshot_S0-v11-contract-repair.json").read_text())
-    old = {s.skill_id: s for s in validate_v11_snapshot(original, library_root=LIBRARY)}
-    new = {s.skill_id: s for s in validate_v11_snapshot(revised, library_root=LIBRARY)}
+    def archived(snapshot):
+        values = {}
+        for entry in snapshot["entries"].values():
+            text = (LIBRARY / entry["source_ref"]).read_text()
+            assert hashlib.sha256(text.encode()).hexdigest() == entry["content_sha256"]
+            values[entry["skill_id"]] = SimpleNamespace(**entry, skill_md=text)
+        return values
+    old = archived(original)
+    new = archived(revised)
     assert set(old) == set(new) and len(new) == 8
     assert original["manifest_hash"] == "992c7624e2af429df8efc63b22a2b5eaf82ba3a53772d0f5cde19bf839a54a8b"
     assert revised["parent_snapshot_id"] == original["snapshot_id"]

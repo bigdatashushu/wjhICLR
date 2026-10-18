@@ -107,7 +107,7 @@ def _artifact(*, world_up=UP, handedness="right", metric_scale=None, **over):
 
 
 def _scene(*, metric: bool = False, question_type: str = "",
-           world_up=UP, handedness="right", track_consensus: str = "available",
+           world_up=UP, handedness="right",
            objs=(), artifact=None) -> SceneState:
     """v6 SceneState：`question_tool_scope` 逐题派生；米制由 gate ∧ 题型共同决定。"""
     art = artifact or _artifact(world_up=world_up, handedness=handedness,
@@ -118,10 +118,7 @@ def _scene(*, metric: bool = False, question_type: str = "",
                                     sub_results={n: metric for n in GATE_SUBCONDITIONS})
     profile = EvidenceProfile(
         geometry_3d="available",
-        world_frame="available" if world_up is not None else "unavailable",
-        metric_scale="available" if metric else "unavailable",
-        object_detection="available", track_consensus=track_consensus,
-        object_grounding="available")
+        metric_scale="available" if metric else "unavailable")
     return SceneState(
         artifact_ref="artifact://demo", artifact=art, scene_route="full_3d",
         question_tool_scope=question_tool_scope_of(
@@ -219,7 +216,8 @@ def test_every_tool_declares_evidence_and_metric_flag_is_derived_from_it():
         declared = REGISTRY.requires_evidence(name)
         assert isinstance(declared, list)
         spec = REGISTRY.spec(name)
-        assert set(spec.tolerates_degraded) <= set(declared)
+        assert set(declared) <= {"geometry_3d", "metric_scale"}
+        assert not hasattr(spec, "tolerates_degraded")
         assert REGISTRY.is_metric_tool(name) == (EVIDENCE_METRIC_SCALE in declared)
     metric_tools = {n for n in REGISTRY.names() if REGISTRY.is_metric_tool(n)}
     assert metric_tools == {"object_3d_extent", "plane_fit_room_size",
@@ -229,10 +227,13 @@ def test_every_tool_declares_evidence_and_metric_flag_is_derived_from_it():
 def test_metric_tools_only_visible_under_metric_scope():
     """米制 Tool 只在 `metric_enabled` 出现（§5.3/D4：逐题只收窄，唯一例外是米制追加）。"""
     metric_tools = {n for n in REGISTRY.names() if REGISTRY.is_metric_tool(n)}
+    context = {"evidence_profile": EvidenceProfile(
+        geometry_3d="available", metric_scale="available"),
+        "local_facts": {"world_frame": True}}
     for scope in (SCOPE_FALLBACK_2D_ONLY, SCOPE_FULL_3D):
-        assert metric_tools.isdisjoint(REGISTRY.names_for_scope(scope)), scope
-    assert metric_tools <= set(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED))
-    docs = REGISTRY.docs(SCOPE_METRIC_ENABLED)
+        assert metric_tools.isdisjoint(REGISTRY.names_for_scope(scope, **context)), scope
+    assert metric_tools <= set(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, **context))
+    docs = REGISTRY.docs(SCOPE_METRIC_ENABLED, **context)
     for name in metric_tools:
         assert f"- {name}(" in docs
     assert "- camera_object_distance(" not in REGISTRY.docs(SCOPE_FULL_3D)
@@ -368,23 +369,22 @@ def test_count_objects_counts_distinct_tracks():
     h = _handle(_scene(objs=objs), objs=objs)
     out = json.loads(call_tool("count_objects", {"category_name": "chair"}, h).value)
     assert set(out) >= {"count", "n_distinct_tracks", "duplicate_suspect",
-                        "evidence_degraded"}
+                        "diagnostic_warnings"}
     assert out["count"] == 3                 # t0 去重后 1 + t1 + 无 track 的 1
     assert out["n_distinct_tracks"] == 3
     assert out["n_records"] == 4             # 清单长度是 4（直接数就会系统性错）
     assert out["duplicate_suspect"] is True
-    assert out["evidence_degraded"] is False
+    assert "duplicate_suspect" in out["diagnostic_warnings"]
     # 类别过滤同样生效（"chai" 子串命中 4 条；"table" 不命中）
     assert json.loads(call_tool("count_objects", {"category_name": "table"}, h).value)["count"] == 0
 
 
-def test_count_objects_marks_degraded_evidence():
-    """track_consensus=degraded → 暴露但答案带 `evidence_degraded` 标记（§7.2/§9.2）。"""
+def test_count_objects_has_no_public_degraded_state():
     o = _obj("obj_0", "chair", (0.0, 0.0, 1.0), track="t0")
-    h = _handle(_scene(objs=[o], track_consensus="degraded"), objs=[o])
+    h = _handle(_scene(objs=[o]), objs=[o])
     r = call_tool("count_objects", {"category_name": "chair"}, h)
-    assert json.loads(r.value)["evidence_degraded"] is True
-    assert r.degraded_evidence == ["evidence_degraded:track_consensus"]
+    assert json.loads(r.value)["diagnostic_warnings"] == []
+    assert r.degraded_evidence == []
 
 
 def test_exists_in_scene():
@@ -650,7 +650,7 @@ def test_surface_distance_between_objects_uses_both_pointsets():
 
     # 非米制工具不受尺度失败连累（§7.2：单项失败只收回依赖它的工具）
     assert {"list_objects", "robust_distance", "surface_distance_between_objects"} <= set(
-        REGISTRY.names_for_scope(_scene(objs=[a, b]).question_tool_scope))
+        REGISTRY.names_for_scope(h.question_tool_scope, evidence_profile=h.evidence_profile))
 
 
 # ------------------------------------------------- 方向：世界系契约（§9.8/D5）----
@@ -797,12 +797,13 @@ def test_relative_direction_of_fails_closed_without_world_up():
     o2 = _obj("obj_2", "laptop", (5.0, 0.0, 0.1), track="t2")
     objs = [o0, o1, o2]
 
-    # ① 证据层：world_frame=unavailable → Tool 被收回（执行期二次校验也拦）
+    # 局部坐标约定缺失 → 展示与执行都拦住，公共几何仍然可用。
     scene = _scene(world_up=None, handedness=None, objs=objs)
-    assert scene.evidence_state("world_frame") == "unavailable"
-    assert "relative_direction_of" not in REGISTRY.names_for_scope(
-        scene.question_tool_scope, evidence_profile=scene.evidence_profile)
+    assert scene.evidence_state("geometry_3d") == "available"
     handle = _handle(scene, objs=objs)
+    assert "relative_direction_of" not in REGISTRY.names_for_scope(
+        scene.question_tool_scope, evidence_profile=scene.evidence_profile,
+        local_facts=handle.local_facts)
     with pytest.raises(ArtifactUnavailableError) as ei:
         call_tool("relative_direction_of",
                   {"observer_id": "obj_0", "facing_at_id": "obj_1", "target_id": "obj_2"},
@@ -812,15 +813,11 @@ def test_relative_direction_of_fails_closed_without_world_up():
     assert len(ei.value.missing) == 1
     assert ei.value.missing[0].startswith("world_frame")
 
-    # ② 第三道保险：证据说可用、但产物里真的没有约定 → domain_value（不猜方向）
-    scene2 = scene.model_copy(update={
-        "evidence_profile": scene.evidence_profile.model_copy(
-            update={"world_frame": "available"})})
-    out = call_tool("relative_direction_of",
-                    {"observer_id": "obj_0", "facing_at_id": "obj_1", "target_id": "obj_2"},
-                    _handle(scene2, objs=objs))
-    assert out.error_code == "domain_value" and out.value == "null"
-    assert "world_up" in (out.error or "")
+    # 即使绕过注册表直接调实现，局部检查仍拒绝猜方向。
+    from skill3d.tools.geometry_tools import relative_direction_of
+    from skill3d.tools.contract import DomainValueError
+    with pytest.raises(DomainValueError, match="world_up"):
+        relative_direction_of(handle, "obj_0", "obj_1", "obj_2")
 
 
 def test_horizontal_degenerate_direction_is_domain_error():

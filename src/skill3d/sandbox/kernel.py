@@ -254,6 +254,8 @@ def _denial_receipt(kernel: Any, name: str, call_args: dict,
             gate=getattr(scene, "metric_evidence_gate_result", None),
             supported_metric_tasks=spec.supported_metric_tasks,
             allowed_metric_tasks=getattr(scene, "allowed_metric_tasks", ()) or (),
+            local_facts=getattr(scene, "local_facts", {}),
+            gate_passed=getattr(scene, "metric_gate_passed", None),
             question_type=str(getattr(scene, "question_type", "") or ""),
             args=call_args, tools_enabled=kernel._tools_enabled)  # noqa: SLF001
         reason_codes = list(decision.reason_codes)

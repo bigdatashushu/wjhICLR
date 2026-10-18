@@ -11,9 +11,9 @@
 4. 度量融合：`scale_fusion_status="success"` 必须有有限正 `metric_scale`；
    非 success 时 `metric_scale` 必须为 `None`（PoC 通过前不得冒充）；
 5. `SceneState`：`docs(question_tool_scope) ⊆ docs(scene_route)`，逐题只收窄；
-6. `EvidenceProfile`：三值有序、`temporal`/`image_2d` 恒 available、
+6. `EvidenceProfile`：两维二值、已移除维度拒绝写入、
    未知能力名不得静默放行；
-7. 工具证据门：`requires_evidence` 声明缺失/未知能力/容忍列表越界 → 注册失败；
+7. 工具证据门：`requires_evidence` 声明缺失/未知能力/旧容忍列表 → 注册失败；
    `MetricEvidenceGate` 6 项子条件全真才通过，且 gate 只影响 `metric_scale` 分项；
 8. 单项失败只收回依赖该项的 Tool（§7.2 的核心不变量）。
 """
@@ -27,7 +27,6 @@ from skill3d.reconstruction_gate.evidence_profile import (
     build_evidence_profile,
     evaluate_metric_gate,
     metric_scale_capability,
-    world_frame_capability,
 )
 from skill3d.schemas import (
     LEGACY_ONLY_FIELDS,
@@ -178,19 +177,12 @@ def test_world_up_must_be_unit_and_finite():
             _art(world_frame_status="available", world_up=bad, handedness="right")
 
 
-def test_world_frame_capability_three_values():
-    assert world_frame_capability(world_frame_status="available", world_up=UP,
-                                  handedness="right") == "available"
-    assert world_frame_capability(world_frame_status="degraded", world_up=None,
-                                  handedness="right") == "degraded"
-    assert world_frame_capability(world_frame_status="unavailable", world_up=None,
-                                  handedness=None) == "unavailable"
-    # 声称 available 但没给 up → 一律 unavailable（自相矛盾的产物不得留半条证据）
-    assert world_frame_capability(world_frame_status="available", world_up=None,
-                                  handedness="right") == "unavailable"
-    # 声称 degraded 但没有 handedness（连手性都不知道）→ 同样 unavailable
-    assert world_frame_capability(world_frame_status="degraded", world_up=None,
-                                  handedness=None) == "unavailable"
+def test_world_frame_is_a_local_fact():
+    from skill3d.tools.scene_handle import SceneHandle
+
+    good = _art(world_frame_status="available", world_up=UP, handedness="right")
+    assert SceneHandle(_scene(artifact=good)).local_facts["world_frame"]
+    assert not SceneHandle(_scene(artifact=_art())).local_facts["world_frame"]
 
 
 # ------------------------------------------------- 4. 度量融合字段（D1/D2）----
@@ -259,6 +251,8 @@ def test_metric_task_authorized_requires_scope_and_gate():
                                        GATE_SUB_SCALE_SELF_CONSISTENCY,
                                        GATE_SUB_FINITE_INPUTS, GATE_SUB_METRIC_QUESTION)})
     s = _scene(scene_route="full_3d", question_tool_scope="metric_enabled",
+               evidence_profile=EvidenceProfile(geometry_3d="available",
+                                                metric_scale="available"),
                metric_evidence_gate_result=gate_ok)
     assert s.metric_gate_passed and s.metric_task_authorized("object_abs_distance")
     # 非米制题型不得被授权米制 Tool
@@ -269,46 +263,38 @@ def test_metric_task_authorized_requires_scope_and_gate():
     assert s2.metric_gate_passed and not s2.metric_task_authorized("object_abs_distance")
 
 
-# --------------------------------------------- 6. EvidenceProfile 三值纪律 ----
+# --------------------------------------------- 6. EvidenceProfile 二值纪律 ----
 
 def test_evidence_profile_order_and_unknown_capability():
-    assert CAPABILITY_ORDER["available"] > CAPABILITY_ORDER["degraded"] \
-        > CAPABILITY_ORDER["unavailable"]
-    assert capability_at_least("available", "degraded")
-    assert capability_at_least("degraded", "degraded")
-    assert not capability_at_least("unavailable", "degraded")
+    assert CAPABILITY_ORDER == {"available": 1, "unavailable": 0}
+    assert capability_at_least("available", "available")
+    assert not capability_at_least("unavailable", "available")
+    assert not capability_at_least("degraded", "unavailable")
     # 未知取值一律当 unavailable（fail-closed）
     assert not capability_at_least("bogus", "available")
     assert not capability_at_least("bogus", "unavailable")
 
 
-def test_evidence_profile_temporal_and_image_2d_never_degrade():
-    """§5.4：统一 FrameSet 存在时二者恒 available，是 direct_vlm_routed 的兜底基础。"""
-    p = EvidenceProfile(geometry_3d="unavailable", world_frame="unavailable",
-                        metric_scale="unavailable", object_detection="unavailable",
-                        track_consensus="unavailable")
-    assert p.temporal == "available" and p.image_2d == "available"
-    for bad in ("degraded", "unavailable"):
+def test_evidence_profile_rejects_removed_capabilities():
+    for removed in ("temporal", "image_2d", "world_frame", "object_detection",
+                    "track_consensus", "object_grounding"):
         with pytest.raises(Exception):
-            EvidenceProfile(geometry_3d="available", world_frame="available",
-                            metric_scale="available", object_detection="available",
-                            track_consensus="available", temporal=bad)
+            EvidenceProfile(geometry_3d="available", metric_scale="available",
+                            **{removed: "available"})
 
 
 def test_evidence_profile_signature_matching_fail_closed():
-    p = EvidenceProfile(geometry_3d="available", world_frame="degraded",
-                        metric_scale="unavailable", object_detection="available",
-                        track_consensus="degraded")
+    p = EvidenceProfile(geometry_3d="available", metric_scale="unavailable")
     assert p.satisfies({"geometry_3d": "available"})
     assert not p.satisfies({"metric_scale": "degraded"})
-    assert p.satisfies({"world_frame": "degraded"})
+    assert not p.satisfies({"world_frame": "available"})
     # 未知能力名 → 不匹配（归纳器写错不得静默放行）
     assert not p.satisfies({"not_a_capability": "available"})
     with pytest.raises(KeyError):
         p.state("nope")
 
 
-def test_metric_scale_capability_three_values():
+def test_metric_scale_capability_is_binary():
     gate_ok = MetricEvidenceGateResult(
         gate_passed=True, gate_version="g",
         sub_results={k: True for k in (GATE_SUB_SCENE_ROUTE, GATE_SUB_M4_MAIN_GATE,
@@ -318,7 +304,7 @@ def test_metric_scale_capability_three_values():
     assert metric_scale_capability(gate=gate_ok, fusion_status="success",
                                    scale_self_consistency=0.05, valid_frame_ratio=1.0,
                                    metric_scale=1.5) == "available"
-    # 融合成功但自洽松 → degraded（不是 unavailable，也不是 available）
+    # 融合成功但自洽门失败 → unavailable。
     gate_loose = MetricEvidenceGateResult(
         gate_passed=False, gate_version="g",
         sub_results={**{k: True for k in (GATE_SUB_SCENE_ROUTE, GATE_SUB_M4_MAIN_GATE,
@@ -329,7 +315,7 @@ def test_metric_scale_capability_three_values():
         missing_subconditions=[GATE_SUB_SCALE_SELF_CONSISTENCY, GATE_SUB_METRIC_QUESTION])
     assert metric_scale_capability(gate=gate_loose, fusion_status="success",
                                    scale_self_consistency=0.9, valid_frame_ratio=1.0,
-                                   metric_scale=1.5) == "degraded"
+                                   metric_scale=1.5) == "unavailable"
     assert metric_scale_capability(gate=None, fusion_status="failed",
                                    scale_self_consistency=None, valid_frame_ratio=0.0,
                                    metric_scale=None) == "unavailable"
@@ -379,9 +365,7 @@ def test_gate_is_metric_only_and_does_not_touch_other_capabilities():
     p = build_evidence_profile(artifact=art, scene_route="full_3d",
                                question_type="object_abs_distance", gate=gate_fail)
     assert p.metric_scale == "unavailable"
-    # world_frame 仍然 available —— 米制失败不波及其他能力（§7.3 示例 B）
-    assert p.world_frame == "available"
-    assert p.image_2d == "available" and p.temporal == "available"
+    assert p.geometry_3d == "available"
 
 
 # -------------------------------------------- 8. 工具证据门 / 单项失败收窄 ----
@@ -417,11 +401,9 @@ def test_registry_rejects_bad_evidence_declarations():
 
 def test_evidence_visible_per_tool_single_failure_isolation():
     """§7.2 核心不变量：某能力失败**只**隐藏依赖它的 Tool。"""
-    p = EvidenceProfile(geometry_3d="unavailable", world_frame="available",
-                        metric_scale="unavailable", object_detection="available",
-                        track_consensus="available", object_grounding="available")
+    p = EvidenceProfile(geometry_3d="unavailable", metric_scale="unavailable")
     geo_tool = _spec(requires_evidence=["geometry_3d"])
-    det_tool = _spec(requires_evidence=["object_detection"])
+    det_tool = _spec(requires_evidence=[])
     metric_tool = _spec(requires_evidence=["geometry_3d", EVIDENCE_METRIC_SCALE])
     assert not evidence_visible(geo_tool, p)
     assert evidence_visible(det_tool, p)          # 不连带隐藏
@@ -430,20 +412,14 @@ def test_evidence_visible_per_tool_single_failure_isolation():
     pure = _spec(requires_evidence=[])
     assert evidence_visible(pure, p)
     # profile 缺失 → 只放行无证据依赖的 Tool（fail-closed）
-    assert not evidence_visible(det_tool, None)
+    assert not evidence_visible(geo_tool, None)
     assert evidence_visible(pure, None)
 
 
-def test_degraded_tool_visible_only_when_tolerated_and_flagged():
-    p = EvidenceProfile(geometry_3d="available", world_frame="available",
-                        metric_scale="available", object_detection="available",
-                        track_consensus="degraded")
-    strict = _spec(requires_evidence=["object_detection", "track_consensus"])
-    tolerant = _spec(requires_evidence=["object_detection", "track_consensus"],
-                     tolerates_degraded=["track_consensus"])
-    assert not evidence_visible(strict, p)         # degraded 且不在容忍列表 → 隐藏
-    assert evidence_visible(tolerant, p)           # 容忍 → 暴露但带标记
-    assert degraded_evidence_flags(tolerant, p) == ["evidence_degraded:track_consensus"]
+def test_binary_profile_never_produces_degraded_flags():
+    p = EvidenceProfile(geometry_3d="available", metric_scale="unavailable")
+    strict = _spec(requires_evidence=["geometry_3d"])
+    assert evidence_visible(strict, p)
     assert degraded_evidence_flags(strict, p) == []
 
 
@@ -468,15 +444,13 @@ def test_registry_docs_tracks_evidence_and_scope():
 
     from skill3d.tools.registry import REGISTRY
 
-    full = EvidenceProfile(geometry_3d="available", world_frame="available",
-                           metric_scale="available", object_detection="available",
-                           track_consensus="available", object_grounding="available")
-    broken_geo = full.model_copy(update={"geometry_3d": "unavailable"})
+    full = EvidenceProfile(geometry_3d="available", metric_scale="available")
+    broken_geo = EvidenceProfile(geometry_3d="unavailable", metric_scale="unavailable")
     n_full = len(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=full))
     n_geo = len(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=broken_geo))
     # geometry_3d 失败收回了部分 Tool，但**不是**全部（单项失败只收回依赖它的）
     assert 0 < n_geo < n_full
-    # list_objects 只依赖 object_detection → 几何失败不影响它
+    # list_objects 只依赖候选产物 → 几何失败不影响它
     names_geo = REGISTRY.names_for_scope(SCOPE_FULL_3D, evidence_profile=broken_geo)
     assert "list_objects" in names_geo
     assert "object_centroid" not in names_geo
@@ -485,46 +459,33 @@ def test_registry_docs_tracks_evidence_and_scope():
     names_metric = REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=full)
     assert "camera_object_distance" not in names_nometric
     assert "camera_object_distance" in names_metric
-    # 2D-only：只留不依赖深度/位姿/点云/对象的 Tool
+    # 2D-only：候选清单仍可查看
     names_2d = REGISTRY.names_for_scope(SCOPE_FALLBACK_2D_ONLY, evidence_profile=full)
-    assert "list_objects" not in names_2d
+    assert "list_objects" in names_2d
     assert "euclidean_distance" in names_2d
 
 
 # ------------------------------- 9. degraded 容忍口径（真实 GPU 实测修正）----
 
-def test_geometry_degraded_keeps_3d_tools_but_metric_degraded_does_not():
-    """真实 corpus 实测口径：`degraded` 是"能用但有告警"，不是"不能用"。
-
-    背景（本机真实 VGGT 数据，scene 41069043）：`warp_inlier=0.668` /
-    `cloud_overlap=0.551` → M4 主门**通过**，但因"相邻帧旋转跳变 43.3°"这条
-    **诊断告警**，`geometry_3d` 被判 `degraded`。若不容忍 degraded，
-    `relative_direction_of`（方向题唯一可用原语）会被一起隐藏，与 §6.2
-    "主门告警未崩 → 仍走 full_3d" 冲突。
-
-    但 `metric_scale` 例外：D3 硬契约要求米制 Tool 只在 gate 通过
-    （= `metric_scale == "available"`）时可用，`degraded` 也不放行。
-    """
+def test_geometry_warnings_keep_tools_but_metric_failure_blocks_metric_tools():
+    """软诊断不改变几何可用性；尺度失败只收回米制工具。"""
     import skill3d.tools  # noqa: F401 - 触发注册
 
     from skill3d.tools.registry import REGISTRY
 
-    degraded_geo = EvidenceProfile(
-        geometry_3d="degraded", world_frame="degraded", metric_scale="available",
-        object_detection="available", track_consensus="available",
-        object_grounding="available")
-    names = REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=degraded_geo)
+    profile = build_evidence_profile(
+        artifact=_art(quality=_quality(diagnostic_warnings=["rotation_jump"])),
+        scene_route="full_3d", question_type="object_abs_distance", gate=_gate())
+    names = REGISTRY.names_for_scope(
+        SCOPE_METRIC_ENABLED, evidence_profile=profile, local_facts={"world_frame": True})
     assert "relative_direction_of" in names     # 方向题必须仍然可用
     assert "object_centroid" in names
     assert "connectivity_graph" in names
 
-    # metric_scale 降级 → 米制 Tool 一律收回（D3）
-    degraded_metric = EvidenceProfile(
-        geometry_3d="available", world_frame="available", metric_scale="degraded",
-        object_detection="available", track_consensus="available",
-        object_grounding="available")
+    failed_metric = EvidenceProfile(geometry_3d="available", metric_scale="unavailable")
     names2 = REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED,
-                                      evidence_profile=degraded_metric)
+                                      evidence_profile=failed_metric,
+                                      local_facts={"world_frame": True})
     for metric_tool in ("camera_object_distance", "object_3d_extent",
                         "plane_fit_room_size"):
         assert metric_tool not in names2, metric_tool
@@ -532,8 +493,8 @@ def test_geometry_degraded_keeps_3d_tools_but_metric_degraded_does_not():
     assert "object_centroid" in names2 and "relative_direction_of" in names2
 
 
-def test_metric_tools_never_tolerate_degraded_metric_scale():
-    """D3 硬契约：任何 requires `metric_scale` 的 Tool 都不得声明容忍它。"""
+def test_metric_tools_require_scale_artifact():
+    """米制证据与尺度产物必须同时声明。"""
     import skill3d.tools  # noqa: F401
 
     from skill3d.tools.registry import REGISTRY
@@ -541,65 +502,36 @@ def test_metric_tools_never_tolerate_degraded_metric_scale():
     for name in REGISTRY.names():
         spec = REGISTRY.spec(name)
         if EVIDENCE_METRIC_SCALE in (spec.requires_evidence or []):
-            assert EVIDENCE_METRIC_SCALE not in (spec.tolerates_degraded or []), name
+            assert "scale" in spec.requires_artifacts, name
+        assert not hasattr(spec, "tolerates_degraded"), name
 
 
 # ------------------- 10. track_consensus 判据（真实数据口径修正）----
 
-def test_track_consensus_uses_fragmentation_not_visibility():
-    """`track_consensus` 判据 = 碎片化率 ∧ 重复嫌疑占比，**不是**可见帧率。
-
-    真实数据依据（scene 41069043 / arkitscenes）：可见帧率实测只有 0.14–0.19
-    （手持扫描里单个物体本来只在少数帧出现），若拿它当门，`count_objects`
-    会结构性不可用 —— counting 题的程序路径直接消失。而 v5 [已实测] 的计数
-    失败根因是**重复实例**（清单 12 个重复）与**碎片化**。故改口径。
-    """
-    from skill3d.reconstruction_gate.evidence_profile import (
-        TH_TRACK_FRAGMENTATION_DEGRADED,
-        track_capability,
-    )
-
-
-    # 可见帧率很低但 track 干净 → 判 available（旧口径会误判 unavailable）
-    clean = M5EvidenceSummary(m5_ran=True, n_objects=24, n_tracks=24, track_stable_ratio=0.15,
-                              track_fragmentation_ratio=0.0,
-                              duplicate_suspect_ratio=0.0)
-    assert track_capability(clean)[0] == "available"
-
-    # 碎片化/重复偏高 → degraded（计数可用但需带标记）
-    messy = M5EvidenceSummary(m5_ran=True, n_objects=24, n_tracks=24, track_stable_ratio=0.19,
-                              track_fragmentation_ratio=0.31,
-                              duplicate_suspect_ratio=0.33)
-    state, notes = track_capability(messy)
-    assert state == "degraded" and notes
-
-    # 碎片化极高 → unavailable（计数不可信）
-    broken = M5EvidenceSummary(m5_ran=True, n_objects=24, n_tracks=24,
-                               track_fragmentation_ratio=0.8,
-                               duplicate_suspect_ratio=0.6)
-    assert track_capability(broken)[0] == "unavailable"
-
-    # 无统计 → unavailable（不伪造）
-    assert track_capability(M5EvidenceSummary())[0] == "unavailable"
-    assert TH_TRACK_FRAGMENTATION_DEGRADED > 0
+def test_track_statistics_are_retained_as_diagnostics():
+    summary = M5EvidenceSummary(m5_ran=True, n_objects=24, n_tracks=24,
+                               track_stable_ratio=.15, track_fragmentation_ratio=.8,
+                               duplicate_suspect_ratio=.6)
+    profile = build_evidence_profile(artifact=_art(), scene_route="full_3d",
+                                     question_type="object_counting", gate=None, m5=summary)
+    assert profile.geometry_3d == "available"
+    diagnostics = profile.producer_subvalues["candidate_diagnostics"]
+    assert diagnostics["track_stable_ratio"] == .15
+    assert diagnostics["track_fragmentation_ratio"] == .8
+    assert diagnostics["duplicate_suspect_ratio"] == .6
 
 
-def test_count_objects_visible_when_track_consensus_degraded():
-    """§9.2：`count_objects` 容忍 track_consensus 降级（带 evidence_degraded 标记）。
-
-    这条是 counting 题程序路径能否存在的前提；degraded 下必须**暴露**而不是隐藏。
-    """
+def test_count_objects_visibility_uses_geometry():
+    """实例集合的技术完整性留给执行期检查。"""
     import skill3d.tools  # noqa: F401
 
     from skill3d.tools.registry import REGISTRY
 
-    p = EvidenceProfile(geometry_3d="available", world_frame="available",
-                        metric_scale="available", object_detection="available",
-                        track_consensus="degraded", object_grounding="available")
+    p = EvidenceProfile(geometry_3d="available", metric_scale="unavailable")
     names = REGISTRY.names_for_scope(SCOPE_FULL_3D, evidence_profile=p)
     assert "count_objects" in names
     flags = degraded_evidence_flags(REGISTRY.spec("count_objects"), p)
-    assert "evidence_degraded:track_consensus" in flags
+    assert flags == []
 
 
 # ------------- 11. prompt 头部：非米制题不得误导模型 abstain（实测修正）----
@@ -617,9 +549,7 @@ def test_docs_header_does_not_scare_non_metric_tasks():
 
     from skill3d.tools.registry import REGISTRY
 
-    p = EvidenceProfile(geometry_3d="degraded", world_frame="degraded",
-                        metric_scale="unavailable", object_detection="available",
-                        track_consensus="degraded", object_grounding="available")
+    p = EvidenceProfile(geometry_3d="available", metric_scale="unavailable")
     for task in ("object_rel_direction", "object_rel_distance", "route_planning",
                  "obj_appearance_order", "object_counting"):
         h = REGISTRY.docs_header("full_3d", ["depth", "objects"], question_type=task,

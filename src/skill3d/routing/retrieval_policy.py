@@ -12,7 +12,7 @@ from skill3d.skills.delivery import DEFAULT_METHOD_CONTEXT_MAX_CHARS
 @dataclass(frozen=True)
 class RetrievalPolicy:
     method_context_max_chars: int = DEFAULT_METHOD_CONTEXT_MAX_CHARS
-    label: str = "ret-v11-deterministic-1"
+    label: str = "ret-v11-initial-slot-1"
     source: str = "default"
 
     def __post_init__(self) -> None:
@@ -21,7 +21,7 @@ class RetrievalPolicy:
 
     def canonical(self) -> dict:
         return {
-            "mode": "v11_unique_active_by_question_type",
+            "mode": "v11_unique_active_by_initial_slot",
             "ranking": False,
             "version_selection": False,
             "method_context_max_chars": self.method_context_max_chars,
@@ -51,6 +51,6 @@ def retrieval_policy_from_config(cfg: Mapping | None) -> RetrievalPolicy:
     return RetrievalPolicy(
         method_context_max_chars=int(section.get(
             "method_context_max_chars", DEFAULT_METHOD_CONTEXT_MAX_CHARS)),
-        label=str(section.get("config_version", "ret-v11-deterministic-1")),
+        label=str(section.get("config_version", "ret-v11-initial-slot-1")),
         source="config",
     )

@@ -25,6 +25,8 @@ from skill3d.schemas import (
 )
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
+from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION
+from skill3d.schemas.evidence import skill_evidence_state
 
 
 class V11ExperienceBuildError(ValueError):
@@ -329,15 +331,25 @@ def build_v11_experience_bundle_from_trace_store(
         )
 
     parent_key = f"{parent.skill_id}@{parent.version}"
-    selected_ids = sorted(
+    task_ids = sorted(
         qa_id
         for qa_id, row in inputs.items()
         if canonical_task(str(row.get("question_type") or ""))
         == parent.question_type
     )
+    selected_ids = []
+    for qa_id in task_ids:
+        row = traces[qa_id]
+        try:
+            initial = row.get("initial_evidence_states", {})
+            state = skill_evidence_state(initial)
+        except (ValueError, TypeError) as exc:
+            raise V11ExperienceBuildError(f"{qa_id}: 缺少合法初始证据状态") from exc
+        if state == parent.evidence_state:
+            selected_ids.append(qa_id)
     if not selected_ids:
         raise V11ExperienceBuildError(
-            f"trace 中没有题型 {parent.question_type!r} 的 induction case"
+            f"trace 中没有槽位 {parent.slot_key!r} 的 induction case"
         )
 
     cases: list[V11ExperienceCase] = []
@@ -363,6 +375,20 @@ def build_v11_experience_bundle_from_trace_store(
             raise V11ExperienceBuildError(f"{qa_id}: 评分题型与父 Skill 不一致")
         if trace.qa_id != qa_id or trace.episode_id != qa_id:
             raise V11ExperienceBuildError(f"{qa_id}: EpisodeTrace 身份不一致")
+        if trace.schema_version != EPISODE_TRACE_SCHEMA_VERSION or not trace.evidence_history:
+            raise V11ExperienceBuildError(f"{qa_id}: 缺少当前两项证据状态与候选历史")
+        selection = trace.initial_skill_selection
+        if (selection.get("question_type") != parent.question_type
+                or selection.get("evidence_state") != parent.evidence_state
+                or selection.get("skill_version") != parent_key
+                or selection.get("content_sha256") != parent.content_sha256):
+            raise V11ExperienceBuildError(f"{qa_id}: 初始 Skill 选择与父槽位身份不一致")
+        if (set(trace.delivered_skill_versions) != {parent_key}
+                or any(set(record.get("delivered_skill_versions") or []) - {parent_key}
+                       for record in trace.retrieval_records)
+                or any(set(row.get("delivered_skill_versions") or []) - {parent_key}
+                       for row in trace.rounds)):
+            raise V11ExperienceBuildError(f"{qa_id}: 整题实际交付的 Skill 发生变化")
         if not _same_snapshot(trace.active_snapshot_ref, parent_snapshot_id):
             raise V11ExperienceBuildError(
                 f"{qa_id}: 运行快照不是父快照 {parent_snapshot_id}"
@@ -388,7 +414,7 @@ def build_v11_experience_bundle_from_trace_store(
         response_texts: list[str] = []
         program_trace: ProgramExecutionTrace | None = None
         if program_row is not None:
-            if parent_key not in set(program_row.get("delivered_skill_versions") or []):
+            if set(program_row.get("delivered_skill_versions") or []) != {parent_key}:
                 raise V11ExperienceBuildError(
                     f"{qa_id}: episode_program 未记录父 Skill 交付"
                 )
@@ -442,11 +468,13 @@ def build_v11_experience_bundle_from_trace_store(
         outcome = "success" if score == 1.0 else "failure"
         categories = _failure_categories(trace, program_trace, score=score)
         direction = _error_direction(result, score)
+        observations = _all_tool_observations(trace, program_trace)
         cases.append(V11ExperienceCase(
             case_id=_case_id(campaign_id, run_ref, qa_id, parent_key),
             qa_id=qa_id,
             scene_id=episode_input.scene_id,
             question_type=parent.question_type,
+            evidence_state=parent.evidence_state,
             question_text=episode_input.question_text,
             options=list(episode_input.options),
             source_split="induction",
@@ -460,7 +488,16 @@ def build_v11_experience_bundle_from_trace_store(
             response_text=response_text,
             response_texts=response_texts,
             program_source=program_source,
-            tool_observations=_all_tool_observations(trace, program_trace),
+            tool_observations=observations,
+            initial_evidence_states=trace.initial_evidence_states,
+            evidence_states=trace.evidence_states,
+            evidence_history=list(trace.evidence_history),
+            candidate_objects=list(trace.evidence_history[-1].get("candidates") or []),
+            selected_object_ids=sorted({
+                str(oid) for row in observations
+                for oid in row.get("resolved_object_ids", row.get("object_dependencies", []))
+            }),
+            image_observations=dict(trace.image_ledger),
             model_answer=_answer_text(result.answer_text),
             reference_answer=episode_input.reference_answer,
             score=score,
@@ -510,6 +547,7 @@ def build_v11_experience_bundle_from_trace_store(
         parent_skill_version=parent_key,
         parent_content_sha256=parent.content_sha256,
         question_type=parent.question_type,
+        evidence_state=parent.evidence_state,
         source_split="induction",
         split="learning",
         label_access=True,

@@ -1,6 +1,6 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.5-core-engineering-repair"
+TOOL_DOCS_VERSION = "tool-docs-v11.6-two-capabilities"
 
 
 DESCRIPTIONS = {
@@ -21,20 +21,24 @@ DESCRIPTIONS = {
         "from that object but leaves frozen-image inspection available. "
         "The conflict requires high mask overlap and explicitly incompatible complete labels, "
         "with at least one question-targeted binding. Compatible and unknown overlap relations "
-        "remain audit diagnostics; they do not establish semantic correctness or merge instances."),
+        "remain audit diagnostics; they do not establish semantic correctness or merge instances. "
+        "Category agreement and even a unique candidate do not prove that it is the question's referent. "
+        "Use frames/crops to select an explicit obj_id. Candidate inspection remains available without 3D."),
     "count_objects": (
         "Count instances using the same category rules as list_objects. Group records sharing a "
         "nonempty track_id; each untracked record forms its own group. Merge each group's point clouds, "
         "then consolidate duplicate groups using bidirectional nearest-neighbor overlap. Retain groups "
         "without point clouds once. Return dict: count (final group count), n_records, n_distinct_tracks "
         "(groups before geometric merging, including untracked records), n_geometric_merges, "
-        "n_without_track, duplicate_suspect, evidence_degraded, and instance_consolidation "
-        "(method, min_overlap, error)."),
+        "n_without_track, duplicate_suspect, diagnostic_warnings, and instance_consolidation "
+        "(method, min_overlap, error). Question-driven M5 instances are already consolidated. "
+        "Requires complete technical scan coverage and usable bindings for the requested category; "
+        "this does not prove that visual detection found every real instance."),
     "object_centroid": (
         "Return dict: centroid_normalized (3D centroid in world coordinates, normalized units), "
         "centroid_metric (3D coordinates in meters, or None without metric authorization), "
         "category_name, track_id, world_up_used (world-space unit up vector), and handedness_used "
-        "(right/left). The last two fields are None when world-frame evidence is unavailable or "
+        "(right/left). The last two fields are None when the local world convention is missing or "
         "orientation metadata is invalid; the centroid remains usable."),
     "object_3d_extent": (
         "Return dict: extent_normalized (per-axis lengths [dx,dy,dz] in normalized units), "
@@ -99,9 +103,9 @@ DESCRIPTIONS = {
         "difficulty, world_up_used, handedness_used. Raise an error for missing/invalid world conventions "
         "or degenerate horizontal vectors."),
     "object_visible_frames": (
-        "Return the object record's visible_frames as list[int]. Values are frame slots (0..N-1) "
-        "in the frozen FrameSet, not physical video frame indices. Sorting and deduplication are not "
-        "guaranteed. An empty list means this record has no registered visible frames; it does not "
+        "Return mask-verified visible frames as list[int], independently of 3D validity. "
+        "Values are frame slots (0..N-1) in the frozen FrameSet, not physical video frame indices. "
+        "An empty list means this record has no registered visible frames; it does not "
         "prove the object is absent from the entire video."),
     "connectivity_graph": (
         "Project the point cloud onto the ground plane defined by world_up and derive reachability "

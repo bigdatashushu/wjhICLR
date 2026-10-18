@@ -11,10 +11,11 @@ from pydantic import Field, field_validator, model_validator
 from . import Spec
 from .data_access import DataAccessRecord
 from .skill import SkillCandidateV11
+from .evidence import SkillEvidenceState, skill_evidence_state
 
-V11_CAMPAIGN_SCHEMA_VERSION = "skill-evolution-campaign-v11/1.0"
-V11_EXPERIENCE_SCHEMA_VERSION = "skill-experience-bundle-v11/3.0"
-V11_EVALUATION_SCHEMA_VERSION = "skill-paired-evaluation-v11/2.0"
+V11_CAMPAIGN_SCHEMA_VERSION = "skill-evolution-campaign-v11/2.0"
+V11_EXPERIENCE_SCHEMA_VERSION = "skill-experience-bundle-v11/5.0"
+V11_EVALUATION_SCHEMA_VERSION = "skill-paired-evaluation-v11/3.0"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -33,6 +34,7 @@ class V11ExperienceCase(Spec):
     qa_id: str
     scene_id: str
     question_type: str
+    evidence_state: SkillEvidenceState
     question_text: str
     options: list[str] = Field(default_factory=list)
     source_split: Literal["induction"]
@@ -47,6 +49,12 @@ class V11ExperienceCase(Spec):
     response_texts: list[str]
     program_source: str
     tool_observations: list[dict] = Field(default_factory=list)
+    initial_evidence_states: dict[str, str]
+    evidence_states: dict[str, str]
+    evidence_history: list[dict]
+    candidate_objects: list[dict] = Field(default_factory=list)
+    selected_object_ids: list[str] = Field(default_factory=list)
+    image_observations: dict = Field(default_factory=dict)
     model_answer: Optional[str] = None
     reference_answer: str
     score: float = Field(ge=0.0, le=1.0)
@@ -79,6 +87,19 @@ class V11ExperienceCase(Spec):
 
     @model_validator(mode="after")
     def _delivery_body_matches_hash(self):
+        from .evidence import EvidenceProfile
+
+        for states in (self.initial_evidence_states, self.evidence_states):
+            EvidenceProfile.model_validate(states)
+        if skill_evidence_state(self.initial_evidence_states) != self.evidence_state:
+            raise ValueError("经验初始证据状态与所属槽位不一致")
+        if not self.evidence_history:
+            raise ValueError("经验必须记录首次证据状态及后续变化")
+        for row in self.evidence_history:
+            EvidenceProfile.model_validate(row.get("evidence_states", {}))
+        if (self.initial_evidence_states != self.evidence_history[0]["evidence_states"]
+                or self.evidence_states != self.evidence_history[-1]["evidence_states"]):
+            raise ValueError("经验首末证据状态与历史快照不一致")
         if not self.delivered_skill_md:
             raise ValueError("经验必须记录实际交付的完整 SKILL.md")
         actual = hashlib.sha256(self.delivered_skill_md.encode("utf-8")).hexdigest()
@@ -100,7 +121,7 @@ class V11ExperienceCase(Spec):
 class V11ExperienceBundle(Spec):
     """Parent-version learning evidence consumed by one offline revision."""
 
-    schema_version: Literal["skill-experience-bundle-v11/3.0"] = (
+    schema_version: Literal["skill-experience-bundle-v11/5.0"] = (
         V11_EXPERIENCE_SCHEMA_VERSION
     )
     campaign_id: str
@@ -108,6 +129,7 @@ class V11ExperienceBundle(Spec):
     parent_skill_version: str
     parent_content_sha256: str
     question_type: str
+    evidence_state: SkillEvidenceState
     source_split: Literal["induction"]
     split: Literal["learning"]
     label_access: Literal[True]
@@ -155,6 +177,8 @@ class V11ExperienceBundle(Spec):
         for case in self.cases:
             if case.question_type != self.question_type:
                 raise ValueError("经验 case 与经验包 question_type 不一致")
+            if case.evidence_state != self.evidence_state:
+                raise ValueError("经验 case 与经验包 evidence_state 不一致")
             if (
                 case.source_split != self.source_split
                 or case.split != self.split
@@ -252,7 +276,7 @@ class V11EvaluationArm(Spec):
 class V11PairedEvaluationReceipt(Spec):
     """Frozen same-question-type parent/candidate evaluation result."""
 
-    schema_version: Literal["skill-paired-evaluation-v11/2.0"] = (
+    schema_version: Literal["skill-paired-evaluation-v11/3.0"] = (
         V11_EVALUATION_SCHEMA_VERSION
     )
     campaign_id: str
@@ -260,6 +284,7 @@ class V11PairedEvaluationReceipt(Spec):
     panel_id: str
     panel_sha256: str
     question_type: str
+    evidence_state: SkillEvidenceState
     seed: int
     request_seed_observed: bool
     model_id: str
@@ -327,6 +352,8 @@ class V11PairedEvaluationReceipt(Spec):
 
 class V11CampaignDecision(Spec):
     campaign_id: str
+    question_type: str
+    evidence_state: SkillEvidenceState
     stage: Literal["static_validation", "paired_evaluation"]
     outcome: Literal["promote", "reject"]
     parent_snapshot_id: str
@@ -349,6 +376,8 @@ class V11CampaignDecision(Spec):
 
 class V11PublicationReceipt(Spec):
     campaign_id: str
+    question_type: str
+    evidence_state: SkillEvidenceState
     candidate_id: str
     skill_version: str
     parent_skill_version: str
@@ -383,6 +412,7 @@ class V11PostPublishObservation(Spec):
     """Result returned by a new-learning probe after publication."""
 
     question_type: str
+    evidence_state: SkillEvidenceState
     snapshot_id: str
     retrieved_skill_version: str
     delivered_skill_version: str
@@ -440,12 +470,13 @@ V11CampaignStatus = Literal[
 
 
 class V11CampaignCheckpoint(Spec):
-    schema_version: Literal["skill-evolution-campaign-v11/1.0"] = (
+    schema_version: Literal["skill-evolution-campaign-v11/2.0"] = (
         V11_CAMPAIGN_SCHEMA_VERSION
     )
     campaign_id: str
     status: V11CampaignStatus
     question_type: str
+    evidence_state: SkillEvidenceState
     library_root: str
     parent_snapshot_id: str
     parent_skill_version: str

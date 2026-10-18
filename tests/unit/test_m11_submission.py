@@ -26,6 +26,7 @@ class _MetricState:
 class _VerifierHandle:
     world_up = np.asarray([0.0, 0.0, 1.0])
     handedness = "right"
+    world_frame_usable = True
     metric_gate_passed = False
     question_type = "object_abs_distance"
     _state = _MetricState()
@@ -239,7 +240,7 @@ def test_shared_missing_facts_and_multiple_downgrades_have_precise_union():
     profile = _scene(metric=True, question_type="object_size_estimation").evidence_profile
     first, changed = downgrade_profile(profile, "geometry_3d")
     second, other = downgrade_profile(first, "metric_scale", excluded_capabilities=changed)
-    assert second.metric_scale == "degraded" and not other
+    assert second.metric_scale == "unavailable" and not other
 
 
 def test_repeated_tool_requests_have_unique_replayable_occurrence_ids():

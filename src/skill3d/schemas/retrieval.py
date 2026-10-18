@@ -37,8 +37,9 @@ from typing import Optional
 from pydantic import field_validator
 
 from . import Spec
+from .evidence import SkillEvidenceState
 
-RETRIEVAL_RECORD_SCHEMA_VERSION = "1.0"
+RETRIEVAL_RECORD_SCHEMA_VERSION = "2.0"
 
 # 检索触发原因（§13.5：初次检索 / 证据更新后在同一快照内重检索）
 RETRIEVAL_TRIGGERS: tuple[str, ...] = ("initial", "evidence_update")
@@ -49,6 +50,8 @@ CANDIDATE_REASON_CODES: frozenset[str] = frozenset({
     "question_type_unknown",       # 题型不可知 → 不检索任何 Skill（fail-closed）
     "question_type_mismatch",      # §13.5 精确过滤题型分区
     "evidence_signature_unmet",    # EvidenceProfile 不满足 Skill 的证据签名
+    "evidence_state_unknown",
+    "evidence_state_mismatch",
     "metric_gate_not_passed",      # 米制 Skill：当前米制证据门未过
     "metric_gate_version_mismatch",  # 米制 Skill：gate 版本与新声明不一致
     "gate_result_missing",         # 米制 Skill：连 gate 结果都没有（无法证明可用）
@@ -91,6 +94,7 @@ class SkillCandidateRecord(Spec):
     skill_version: str = ""
     # 该 Skill 声明的适用题型（规范化后）；题型分区过滤的依据
     canonical_question_type: str = ""
+    evidence_state: Optional[SkillEvidenceState] = None
     hard_filter_passed: bool = False
     reason_code: str = "hit"
     reason: str = ""                     # 人类可读判定文本（原 RetrievalDecision.reason）
@@ -152,12 +156,13 @@ class SkillRetrievalRecord(Spec):
     canonical_question_type: str = ""
     question_type_raw: str = ""
     question_type_known: bool = True
+    initial_evidence_state: Optional[SkillEvidenceState] = None
     # §13.5 的过滤顺序是固定的（先题型分区，再硬条件），记录策略名以便核对顺序未被改
     partition_policy: str = "question_type_partition_then_hard_requirements"
     evidence_version: str = ""
-    # 证据三值快照（§13.6 只要求 `evidence_version`，但 `profile_version` 是**合同
+    # 两项二值快照（§13.6 只要求 `evidence_version`，但 `profile_version` 是**合同
     # 版本**：同一版本号下不同 episode 的证据状态可以不同，甚至同一 episode 里
-    # 级联降级后版本号也不变。因此把能力三值一起落盘 —— 重检索记录之间可直接比对
+    # 级联失效后版本号也不变。因此把能力状态一起落盘 —— 重检索记录之间可直接比对
     # "证据是否真的变了"，不必靠版本号猜。
     evidence_states: dict[str, str] = {}
     evidence_state_reasons: dict[str, str] = {}

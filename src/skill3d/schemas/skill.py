@@ -6,6 +6,7 @@ from typing import Optional
 import yaml
 from pydantic import field_validator
 from . import Spec
+from .evidence import SkillEvidenceState
 
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _V11_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -72,6 +73,7 @@ class SkillSpecV11(Spec):
     skill_id: str
     version: str
     question_type: str
+    evidence_state: SkillEvidenceState
     skill_md: str
 
     @field_validator("skill_id")
@@ -114,6 +116,10 @@ class SkillSpecV11(Spec):
     @property
     def task_type(self) -> str:
         return self.question_type
+
+    @property
+    def slot_key(self) -> str:
+        return f"{self.question_type}/{self.evidence_state}"
 
     @property
     def applicable_question_types(self) -> list[str]:

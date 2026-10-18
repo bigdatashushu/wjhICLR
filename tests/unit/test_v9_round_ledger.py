@@ -61,9 +61,7 @@ class _ScriptedClient:
 def _kernel() -> RestrictedNamespaceKernel:
     gate = MetricEvidenceGateResult(gate_passed=True, gate_version=GATE_VERSION,
                                     sub_results={n: True for n in GATE_SUBCONDITIONS})
-    profile = EvidenceProfile(geometry_3d="available", world_frame="available",
-                              metric_scale="available", object_detection="available",
-                              track_consensus="available", object_grounding="available")
+    profile = EvidenceProfile(geometry_3d="available", metric_scale="available")
     qtype = "room_size_estimation"
     scene = SceneState(
         artifact_ref="test", scene_route="full_3d",

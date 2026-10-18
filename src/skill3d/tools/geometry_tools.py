@@ -3,28 +3,8 @@
 全部注册进全局 REGISTRY 并带 ToolSpec；统一签名 (handle: SceneHandle, **args)。
 所有函数为确定性纯计算，不调任何 VLM / 外部服务。
 
-v6 三条纪律：
-
-1. **每个 Tool 显式声明 `requires_evidence`**（§17.4 硬约束 7）：无声明不得进注册表；
-   可选 `tolerates_degraded` 声明"降级也能用但答案要带标记"的能力子集；
-2. **执行期 fail-closed**：`REGISTRY.call_tool` 在调用实现前校验产物 + 证据，
-   缺失抛 `ArtifactUnavailableError` / `ConfidenceGateError`（绝不静默返回假值）；
-3. **单项失败只收回依赖该证据的工具**（§7.2）：例如 `metric_scale` 不可用时
-   只隐藏米制 Tool，`list_objects` / `object_centroid` / `relative_direction_of`
-   照常可用。
-
-**`tolerates_degraded` 的口径（2026-09-21 真实 GPU 实测修正）**：
-
-除了 `metric_scale`（D3 硬契约：米制 Tool 只在 gate 通过 =
-`metric_scale==available` 时可用），其余能力的 `degraded` 一律**容忍**，
-工具照常暴露但答案带 `evidence_degraded:<能力>` 标记。理由是真实数据给的教训：
-本机真实 VGGT corpus（scene 41069043）实测 `warp_inlier=0.668` / `cloud_overlap=0.551`
-→ 主门**通过**，但因为"相邻帧旋转跳变 43.3°"这条**诊断告警**，`geometry_3d`
-被判 `degraded`；若不容忍，整个 3D Tool 面（含方向题唯一可用的
-`relative_direction_of`）会被一起隐藏 —— 这与 §6.2"主门告警未崩 → 仍走 full_3d"
-和 §2.3"4 个 MCA 题型不受度量路线影响"直接冲突。
-
-`degraded` 的语义是"能用但有告警"，不是"不能用"；`unavailable` 才是收回工具的信号。
+公共能力仅 geometry_3d / metric_scale，均为二值。对象技术校验按调用实参执行，
+计数和完整排名另查集合覆盖。候选是否对应题目指代由模型查看帧后判断。
 
 域值错误（负距离 / 点在相机后方 / 对象不存在 / 单位错）统一抛
 `DomainValueError`，进 `ProgramExecutionTrace.error_code="domain_value"`。
@@ -71,18 +51,13 @@ INSTANCE_OVERLAP_THRESHOLD = 0.30
 
 # 证据能力名（§7.1 词汇表；写成常量避免字符串散落）
 EV_GEOMETRY = "geometry_3d"
-EV_WORLD = "world_frame"
 EV_METRIC = EVIDENCE_METRIC_SCALE
-EV_DETECTION = "object_detection"
-EV_GROUNDING = "object_grounding"
-EV_TRACK = "track_consensus"
-EV_TEMPORAL = "temporal"
 
 BINDING_INTEGRITY_TOOLS = frozenset({
     "object_centroid", "object_3d_extent", "robust_distance",
     "camera_object_distance", "surface_distance_between_objects",
     "relative_distance_rank", "object_distance_m", "relative_direction_of",
-    "count_objects", "object_visible_frames",
+    "count_objects",
 })
 
 
@@ -151,9 +126,11 @@ def _get_object(handle: SceneHandle, object_id: str, tool: str, *, consume=True)
         obj = handle.get_object(object_id)
     except KeyError as exc:
         raise DomainValueError(
-            tool, f"Object does not exist: {object_id} (the objects artifact is available and all instances have been listed)",
+            tool, f"Object {object_id} is not in the currently loaded candidate inventory",
             args={"object_id": object_id}, failure_cause=FailureCause(
                 code="object_not_found", scope="local_call")) from exc
+    handle._resolved_object_ids = list(dict.fromkeys(
+        [*getattr(handle, "_resolved_object_ids", []), obj.obj_id]))
     if tool in BINDING_INTEGRITY_TOOLS:
         conflicts = [
             flag for flag in (obj.binding_flags or [])
@@ -178,12 +155,6 @@ def _get_object(handle: SceneHandle, object_id: str, tool: str, *, consume=True)
                 tool, f"Object {obj.obj_id} has no usable verified M5 binding; "
                 "use the frozen images.",
                 args={"object_id": obj.obj_id},
-                failure_cause=FailureCause(code="object_binding_unavailable",
-                    scope="local_object", object_ids=[obj.obj_id]))
-        if (handle.require_question_binding
-                and not handle.category_binding_complete(obj.category_name)):
-            raise ConfidenceGateError(
-                tool, f"M5 category {obj.category_name} has unresolved scan or binding failures.",
                 failure_cause=FailureCause(code="object_binding_unavailable",
                     scope="local_object", object_ids=[obj.obj_id]))
         if consume:
@@ -249,17 +220,11 @@ def _degraded_property(distance_result, *, metric_ok: bool) -> list[str]:
         cost_estimate_ms=1.0,
         source_default="real",
         requires_artifacts=["objects"],
-        requires_evidence=[EV_DETECTION],
-        tolerates_degraded=[EV_DETECTION],
+        requires_evidence=[],
     )
 )
 def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
-    """返回 scene 级基础清单（**自描述**，§8/§9.1）。
-
-    `exists_in_scene(name)==False` 当且仅当 objects 产物可用且真无此实例；
-    检测器故障时 `object_detection=unavailable` → 本 Tool 被隐藏且执行期抛错，
-    **不**静默返回 `[]`。
-    """
+    """列出全部候选与技术诊断；不证明清单完整或候选符合题目指代。"""
     out = []
     for oid in handle.list_objects_by_name(category_filter):
         o = handle.get_object(oid)
@@ -303,9 +268,7 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
         cost_estimate_ms=40.0,
         source_default="real",
         requires_artifacts=["objects"],
-        requires_evidence=[EV_DETECTION, EV_TRACK],
-        # §9.2：track_consensus 降级仍可计数，但答案必须带 evidence_degraded 标记
-        tolerates_degraded=[EV_DETECTION, EV_TRACK],
+        requires_evidence=[EV_GEOMETRY],
     )
 )
 def count_objects(handle: SceneHandle, category_name: str) -> dict:
@@ -372,9 +335,6 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
             merge_error = f"{type(exc).__name__}: {exc}"
             n_final = n_track_distinct
 
-    profile = handle.evidence_profile
-    evidence_degraded = bool(
-        profile is not None and profile.state(EV_TRACK) == "degraded")
     return {
         "count": int(n_final),
         "n_distinct_tracks": int(n_track_distinct),
@@ -382,7 +342,8 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
         "n_geometric_merges": int(n_geometric_merges),
         "n_without_track": int(n_no_track),
         "duplicate_suspect": bool(dup),
-        "evidence_degraded": evidence_degraded,
+        "diagnostic_warnings": (["duplicate_suspect"] if dup else [])
+                               + (["instance_merge_failed"] if merge_error else []),
         "instance_consolidation": {
             "method": ("verified_m5_instances" if handle.require_question_binding
                        else "track_then_bidirectional_nn_pointcloud_overlap_v11"),
@@ -406,8 +367,7 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
         source_default="real",
         requires_artifacts=["objects"],
         # §7.3 示例 B：metric_scale 失败时 object_centroid（相对坐标）仍必须可用
-        requires_evidence=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
-        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[EV_GEOMETRY],
     )
 )
 def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
@@ -427,10 +387,9 @@ def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
     scale = _metric_scale_if_authorized(handle)
     metric = (None if scale is None
               else [float(x) * float(scale) for x in c])
-    # 质心本身不依赖 world_frame；只在证据与实际元数据都有效时附带方向约定。
+    # 质心不依赖世界轴约定；实际元数据有效时才附带它。
     up, handedness = None, None
-    profile = handle.evidence_profile
-    if profile is not None and profile.state(EV_WORLD) in ("available", "degraded"):
+    if handle.world_frame_usable:
         raw_up, raw_hand = handle.world_up, handle.handedness
         if raw_up is not None:
             arr = np.asarray(raw_up, dtype=np.float64)
@@ -464,9 +423,7 @@ def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
         cost_estimate_ms=5.0,
         source_default="real",
         requires_artifacts=["objects", "scale"],
-        requires_evidence=[EV_GEOMETRY, EV_METRIC, EV_DETECTION, EV_GROUNDING],
-        # metric_scale 是唯一不容忍 degraded 的能力（D3 硬契约）；其余容忍
-        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[EV_GEOMETRY, EV_METRIC],
     )
 )
 def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
@@ -531,7 +488,7 @@ def object_3d_extent(handle: SceneHandle, obj_id: str) -> dict:
         source_default="real",
         requires_artifacts=["point_cloud", "scale"],
         requires_evidence=[EV_GEOMETRY, EV_METRIC],
-        tolerates_degraded=[EV_GEOMETRY],
+        requires_local_facts=["world_frame"],
     )
 )
 def plane_fit_room_size(handle: SceneHandle) -> dict:
@@ -639,8 +596,7 @@ def plane_fit_room_size(handle: SceneHandle) -> dict:
         cost_estimate_ms=20.0,
         source_default="real",
         requires_artifacts=["point_cloud", "objects"],
-        requires_evidence=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
-        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[EV_GEOMETRY],
     )
 )
 def robust_distance(handle: SceneHandle, reference: str, target: str) -> dict:
@@ -683,8 +639,7 @@ def robust_distance(handle: SceneHandle, reference: str, target: str) -> dict:
         cost_estimate_ms=20.0,
         source_default="real",
         requires_artifacts=["point_cloud", "objects", "scale"],
-        requires_evidence=[EV_GEOMETRY, EV_METRIC, EV_DETECTION, EV_GROUNDING],
-        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[EV_GEOMETRY, EV_METRIC],
     )
 )
 def camera_object_distance(handle: SceneHandle, obj_id: str) -> dict:
@@ -727,8 +682,7 @@ def camera_object_distance(handle: SceneHandle, obj_id: str) -> dict:
         cost_estimate_ms=30.0,
         source_default="real",
         requires_artifacts=["point_cloud", "objects"],
-        requires_evidence=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
-        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[EV_GEOMETRY],
     )
 )
 def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
@@ -784,8 +738,7 @@ def surface_distance_between_objects(handle: SceneHandle, obj_a: str, obj_b: str
         cost_estimate_ms=60.0,
         source_default="real",
         requires_artifacts=["point_cloud", "objects"],
-        requires_evidence=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
-        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[EV_GEOMETRY],
     )
 )
 def relative_distance_rank(handle: SceneHandle, reference: str,
@@ -826,6 +779,11 @@ def relative_distance_rank(handle: SceneHandle, reference: str,
         detail = {"category": cat, "n_instances": len(oids), "instances": [],
                   "status": "missing" if not oids else "ok"}
         candidates.append(detail)
+        if not handle.category_binding_complete(cat):
+            detail["status"] = "incomplete_candidates"
+            missing.append(cat)
+            flags.add("category_coverage_incomplete:" + cat)
+            continue
         if not oids:
             missing.append(cat)
             flags.add("category_missing:" + cat)
@@ -920,8 +878,7 @@ def relative_distance_rank(handle: SceneHandle, reference: str,
         cost_estimate_ms=30.0,
         source_default="real",
         requires_artifacts=["point_cloud", "objects", "scale"],
-        requires_evidence=[EV_GEOMETRY, EV_METRIC, EV_DETECTION, EV_GROUNDING],
-        tolerates_degraded=[EV_GEOMETRY, EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[EV_GEOMETRY, EV_METRIC],
     )
 )
 def object_distance_m(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
@@ -976,10 +933,8 @@ def object_distance_m(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
         cost_estimate_ms=2.0,
         source_default="real",
         requires_artifacts=["objects"],
-        requires_evidence=[EV_GEOMETRY, EV_WORLD, EV_DETECTION, EV_GROUNDING],
-        # §9.8：world_up 为 degraded 时仍给出方向（带 evidence_degraded 标记）——
-        # 真实数据上 pose-only 的 up 一致性很难稳定 ≥0.9，不容忍会让方向题直接不可答
-        tolerates_degraded=[EV_GEOMETRY, EV_WORLD, EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[EV_GEOMETRY],
+        requires_local_facts=["world_frame"],
     )
 )
 def relative_direction_of(handle: SceneHandle, observer_id: str,
@@ -1037,13 +992,12 @@ def relative_direction_of(handle: SceneHandle, observer_id: str,
         cost_estimate_ms=1.0,
         source_default="real",
         requires_artifacts=["objects"],
-        requires_evidence=[EV_TEMPORAL, EV_DETECTION, EV_GROUNDING],
-        tolerates_degraded=[EV_DETECTION, EV_GROUNDING],
+        requires_evidence=[],
     )
 )
 def object_visible_frames(handle: SceneHandle, obj_id: str) -> list[int]:
     obj = _get_object(handle, obj_id, "object_visible_frames")
-    return [int(i) for i in (obj.visible_frames or [])]
+    return handle.object_mask_frames(obj.obj_id)
 
 
 @REGISTRY.register(
@@ -1057,8 +1011,8 @@ def object_visible_frames(handle: SceneHandle, obj_id: str) -> list[int]:
         cost_estimate_ms=100.0,
         source_default="real",
         requires_artifacts=["point_cloud", "objects"],
-        requires_evidence=[EV_GEOMETRY, EV_WORLD, EV_DETECTION],
-        tolerates_degraded=[EV_GEOMETRY, EV_WORLD, EV_DETECTION],
+        requires_evidence=[EV_GEOMETRY],
+        requires_local_facts=["world_frame"],
     )
 )
 def connectivity_graph(handle: SceneHandle) -> dict:
@@ -1089,8 +1043,7 @@ def connectivity_graph(handle: SceneHandle) -> dict:
         # objects 不可用时抛 ArtifactUnavailableError；
         # 返回 False 当且仅当 objects 可用且真无此实例
         requires_artifacts=["objects"],
-        requires_evidence=[EV_DETECTION],
-        tolerates_degraded=[EV_DETECTION],
+        requires_evidence=[],
     )
 )
 def exists_in_scene(handle: SceneHandle, name: str) -> bool:
@@ -1119,7 +1072,6 @@ def exists_in_scene(handle: SceneHandle, name: str) -> bool:
         source_default="real",
         requires_artifacts=["poses", "intrinsics"],
         requires_evidence=[EV_GEOMETRY],
-        tolerates_degraded=[EV_GEOMETRY],
     )
 )
 def reproject(handle: SceneHandle, p3d: list[float], frame_idx: int) -> list[float]:

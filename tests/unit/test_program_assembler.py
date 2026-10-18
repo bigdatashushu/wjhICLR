@@ -129,7 +129,7 @@ def test_prompt_states_control_interfaces_terminate_and_ban_abstain():
     assert "host automatically calls" in text
     # 头部与摘要同源（§5.3）：scope 由调用方传入并透传
     assert f"question_tool_scope={SCOPE_FULL_3D}" in text
-    assert PROMPT_TEMPLATE_VERSION == "program_synth_v11_5_en"
+    assert PROMPT_TEMPLATE_VERSION == "program_synth_v11_7_en"
 
 
 def test_prompt_header_carries_scope_evidence_and_metric_gate():
@@ -150,10 +150,7 @@ def test_prompt_header_carries_scope_evidence_and_metric_gate():
             "gate_missing"} <= params
     assert "scale_known" not in params and "route" not in params
 
-    profile = EvidenceProfile(
-        geometry_3d="available", world_frame="degraded", metric_scale="unavailable",
-        object_detection="available", track_consensus="degraded", temporal="available",
-        image_2d="available", object_grounding="available")
+    profile = EvidenceProfile(geometry_3d="available", metric_scale="unavailable")
     text = PromptBuilder().render(
         question="Q", scene_summary="s", scene_frame="world",
         tool_docs=REGISTRY.docs(SCOPE_FULL_3D, evidence_profile=profile),

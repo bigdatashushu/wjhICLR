@@ -6,7 +6,7 @@ v6（D4/D6/D7）三条纪律同时落地：
    只由 M4 质量决定，**不含 `scale`** —— `scale` 是 `question_tool_scope` 派生的
    条件集（米制题 ∧ gate_passed）；
 2. **逐 Tool 证据收窄**（§7.2）：`docs()` 按每个 Tool 的
-   `requires_evidence` / `tolerates_degraded` 与当前 `EvidenceProfile` 逐项匹配，
+   `requires_evidence` 与当前 `EvidenceProfile` 逐项匹配，
    **单项失败只收回依赖该项的 Tool**，不做全局降级；
 3. **执行期 fail-closed**（硬约束 23）：`call_tool` 在 `fn` 之前校验产物与证据，
    缺失抛 `ArtifactUnavailableError` / `ConfidenceGateError`，
@@ -53,7 +53,8 @@ ROUTE_ARTIFACTS: dict[str, frozenset[str]] = {
         ARTIFACT_FRAMES, ARTIFACT_INTRINSICS, ARTIFACT_DEPTH, ARTIFACT_POSES,
         ARTIFACT_POINT_CLOUD, ARTIFACT_OBJECTS,
     }),
-    "fallback_2d_only": frozenset({ARTIFACT_FRAMES, ARTIFACT_INTRINSICS}),
+    "fallback_2d_only": frozenset({
+        ARTIFACT_FRAMES, ARTIFACT_INTRINSICS, ARTIFACT_OBJECTS}),
     "unanswerable": frozenset(),
 }
 
@@ -134,11 +135,7 @@ def question_tool_scope_of(scene_route: str, *,
 # ------------------------------------------------- 证据驱动的 Tool 可见性 ----
 
 def evidence_visible(spec, profile: Optional[EvidenceProfile]) -> bool:
-    """§7.2 逐 Tool 判定：`requires_evidence` × `tolerates_degraded`。
-
-    - 任一 required = `unavailable` → 不可见；
-    - 任一 required = `degraded` 且不在 `tolerates_degraded` → 不可见；
-    - 其余情况可见（`degraded` 且在容忍列表 → 可见但答案带 `evidence_degraded`）。
+    """逐 Tool 判定：所有公共依赖必须 available。
 
     `profile=None`（无证据画像，例如 mock_light 早期路径）→ 按"全部 available"
     处理**不成立**：此时只允许**无证据依赖**的 Tool 通过（fail-closed）。
@@ -148,31 +145,18 @@ def evidence_visible(spec, profile: Optional[EvidenceProfile]) -> bool:
         return True
     if profile is None:
         return False
-    tolerates = set(getattr(spec, "tolerates_degraded", None) or [])
     for cap in required:
         if cap not in CAPABILITIES:
             return False   # 未知能力名 = 声明错误 → 不暴露（fail-closed）
         state = profile.state(cap)
-        if state == "unavailable":
-            return False
-        if state == "degraded" and cap not in tolerates:
+        if state != "available":
             return False
     return True
 
 
 def degraded_evidence_flags(spec, profile: Optional[EvidenceProfile]) -> list[str]:
-    """该 Tool 在当前画像下会带上的降级标记（空 = 全 available）。"""
-    if profile is None:
-        return ["evidence_unavailable"]
-    required = list(getattr(spec, "requires_evidence", None) or [])
-    tolerates = set(getattr(spec, "tolerates_degraded", None) or [])
-    out = []
-    for cap in required:
-        if cap not in CAPABILITIES:
-            continue
-        if profile.state(cap) == "degraded" and cap in tolerates:
-            out.append(f"evidence_degraded:{cap}")
-    return out
+    """历史结果字段保留可读；当前二值画像不产生降级状态标记。"""
+    return []
 
 
 def scope_allows(spec, scope: str) -> bool:
@@ -181,7 +165,7 @@ def scope_allows(spec, scope: str) -> bool:
     - `metric_enabled`：允许全部（`docs(metric_enabled) ⊇ docs(full_3d)` 仅限
       米制 Tool 的追加，不含"新增工具"）；
     - `full_3d`：米制 Tool 一律不可见（gate 未过）；
-    - `fallback_2d_only`：只允许不依赖 `depth/poses/point_cloud/objects/scale` 的 Tool。
+    - `fallback_2d_only`：只允许不依赖 `depth/poses/point_cloud/scale` 的 Tool。
     """
     required = set(getattr(spec, "requires_evidence", None) or [])
     if scope == SCOPE_METRIC_ENABLED:
@@ -198,7 +182,7 @@ def route_aware_available(saved: Optional[Iterable[str]], route: str) -> set[str
     """可用产物集合：以 route 映射为准，SceneState 显式声明仅作上界补充。
 
     取交集语义：`SceneState.available_artifacts` 若已按 route 填好则与映射一致；
-    若调用方手工缩小（例如对象绑定失败后 objects 不可用），以更小者为准（fail-closed）。
+    若调用方手工缩小（例如候选产物未生成），以更小者为准（fail-closed）。
     """
     base = set(available_artifacts_for(route, metric_question=True, gate_passed=True))
     if saved is None:
@@ -298,11 +282,8 @@ def check_evidence_contract(
                 missing.append(f"{cap}(no evidence profile)")
                 continue
             state = profile.state(cap)
-            tolerates = set(getattr(spec, "tolerates_degraded", None) or [])
             if state == "unavailable":
                 missing.append(f"{cap}(unavailable)")
-            elif state == "degraded" and cap not in tolerates:
-                missing.append(f"{cap}(degraded and not tolerated)")
         raise ArtifactUnavailableError(
             tool, missing or ["(insufficient evidence)"], route=route,
             available=[], args=args)
@@ -412,6 +393,8 @@ def authorize_tool_call(
     question_type: str = "",
     args: Optional[dict] = None,
     tools_enabled: bool = True,
+    local_facts: Optional[dict[str, bool]] = None,
+    gate_passed: Optional[bool] = None,
 ) -> "AuthorizationDecision":
     """§6.4：**唯一**的授权判定函数，产出结构化决策（允许与否 + 原因码）。
 
@@ -428,9 +411,10 @@ def authorize_tool_call(
     gate_payload, gate_applicable = gate_result_payload(gate)
     metric_required = ARTIFACT_SCALE in set(
         getattr(spec, "requires_artifacts", None) or []) or (
-        ARTIFACT_SCALE in (getattr(spec, "requires_evidence", None) or []))
+        EVIDENCE_METRIC_SCALE in (getattr(spec, "requires_evidence", None) or []))
     deps = sorted(set(getattr(spec, "requires_artifacts", None) or []) |
-                  set(getattr(spec, "requires_evidence", None) or []))
+                  set(getattr(spec, "requires_evidence", None) or []) |
+                  set(getattr(spec, "requires_local_facts", None) or []))
     reasons: list[str] = []
     missing: list[str] = []
 
@@ -449,9 +433,11 @@ def authorize_tool_call(
                 missing.append(f"{cap}(no evidence profile)")
             elif profile.state(cap) == "unavailable":
                 missing.append(f"{cap}(unavailable)")
-            elif profile.state(cap) == "degraded" and cap not in set(
-                    getattr(spec, "tolerates_degraded", None) or []):
-                missing.append(f"{cap}(degraded and not tolerated)")
+
+    for fact in (getattr(spec, "requires_local_facts", None) or []):
+        if not (local_facts or {}).get(fact, False):
+            reasons.append("tool_contract")
+            missing.append(f"{fact}(local fact unavailable)")
 
     need = set(getattr(spec, "requires_artifacts", None) or [])
     absent = sorted(need - set(available_artifacts))
@@ -459,9 +445,16 @@ def authorize_tool_call(
         reasons.append("tool_contract")
         missing.extend(f"{a}(artifact missing)" for a in absent)
 
-    if metric_required and supported_metric_tasks and allowed_metric_tasks:
-        allowed = set(allowed_metric_tasks)
-        if not (set(supported_metric_tasks) & allowed):
+    if metric_required:
+        effective_gate = gate_passed if gate_passed is not None else getattr(
+            gate, "gate_passed", None)
+        if effective_gate is False:
+            reasons.append("confidence_gate")
+            missing.append("metric_scale(gate failed)")
+        try:
+            check_metric_task_contract(tool, supported_metric_tasks,
+                                       allowed_metric_tasks, question_type, args=args)
+        except ConfidenceGateError:
             reasons.append("confidence_gate")
 
     allowed = not reasons

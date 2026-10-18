@@ -31,9 +31,7 @@ QUESTION = "How many chairs are in this room?"
 
 
 def _profile(states=None) -> EvidenceProfile:
-    base = {"geometry_3d": "available", "world_frame": "available",
-            "metric_scale": "available", "object_detection": "available",
-            "track_consensus": "available", "object_grounding": "available"}
+    base = {"geometry_3d": "available", "metric_scale": "available"}
     base.update(states or {})
     return EvidenceProfile(**base)
 
@@ -71,7 +69,7 @@ def test_retrieval_record_carries_every_required_field():
     assert rec.policy["method_context_max_chars"] == DEFAULT_METHOD_CONTEXT_MAX_CHARS
     assert rec.active_snapshot_ref == "S0-seed-20260925-v1"
     assert rec.active_snapshot_manifest_sha256 == "61259a"
-    assert rec.partition_policy == "v11_unique_active_by_question_type"
+    assert rec.partition_policy == "v11_unique_active_by_initial_slot"
     assert rec.n_skills_offered == 1
     row = rec.candidates[0]
     assert row.reason_code == "hit" and row.hard_filter_passed
@@ -212,4 +210,5 @@ def test_plan_to_dict_does_not_leak_full_bodies():
 
 def _skill(skill_id="sk-1", version="1.0.0", task="object_counting", desc="计数方法", template="", **kwargs):
     return SkillSpecV11(skill_id=skill_id, version=version, question_type=task,
+                        evidence_state=kwargs.get("evidence_state", "g1m1"),
                         skill_md=f"---\nname: count-objects\ndescription: {desc}\n---\n\n{template or desc}\n")

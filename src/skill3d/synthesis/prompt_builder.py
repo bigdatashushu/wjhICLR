@@ -15,7 +15,7 @@ from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_5_en"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_7_en"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -46,6 +46,8 @@ with `return ReturnAnswer(AnswerPayload(...))`.
 - Missing tools, failed calls, and invalid results do not mean zero. Do not invent geometry, scale, observations, or result_id values.
 - ToolResult.status=ok only means the call succeeded. Also check payload status, missing items, ambiguity, and degradation flags.
   Explicitly omitted summary fields are not empty values; no detection does not prove absence.
+- M5 supplies candidates and technical checks, not verified question referents. Category agreement or a unique candidate does not prove that it is the instance described by the question. Inspect candidate frames/crops, compare the question's roles and spatial qualifiers, and pass explicit obj_id values to geometry calls.
+  M11 checks technical validity and derivations; it does not certify that your selected instance is the intended referent.
 - Old variables are cleared during recovery. Reuse valid results using their actual IDs and values in the feedback without recomputing them.
   Do not repeat a deterministically invalid call while its arguments and evidence premises remain unchanged. Editing comments is not a repair.
 - A ranking must cover all question options. Missing candidates, ambiguous instances, unmeasurable distances, or tied minima make a partial ranking or argmin insufficient for a definitive answer.
@@ -95,6 +97,10 @@ Without valid scale, do not present normalized geometry as metric measurements. 
 {{ route_header }}
 Scene summary: {{ scene_summary }}
 Coordinate and scale availability follows the current evidence state and tool contracts.
+The public evidence profile contains only geometry_3d and metric_scale, each available/unavailable.
+Warnings and candidate diagnostics do not create additional evidence states. Frozen images remain the input premise.
+The reference method is selected once from the question type and initial evidence state and stays fixed for this episode.
+Runtime failures may withdraw capabilities and invalidate results. Follow the current authorized tools and failure feedback even when the fixed method describes capabilities that are no longer usable.
 
 ## Authorized tools and interface documentation
 {{ tool_docs }}

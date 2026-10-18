@@ -6,7 +6,7 @@ Coding Agent（百炼 Qwen3.8-Flash）只生成编排这些 Tool 的 episode-spe
 v6 三条纪律：
 
 - **注册准入**（§17.4 硬约束 7）：`ToolSpec` 的 `requires_evidence` **无默认值**，
-  不声明就构造不出来；`tolerates_degraded ⊆ requires_evidence`，声明的能力名必须在
+  不声明就构造不出来；声明的能力名必须在
   `schemas.evidence.CAPABILITIES` 词汇表内；
 - **静态裁剪** `docs(question_tool_scope, evidence_profile)`（§7.2/§5.3）：
   逐 Tool 按证据匹配 + 按 scope 收窄，只暴露当前真正可执行的 Tool 文档；
@@ -33,6 +33,7 @@ from skill3d.tools.contract import (
     SCOPE_FALLBACK_2D_ONLY,
     SCOPE_FULL_3D,
     SCOPE_METRIC_ENABLED,
+    ArtifactUnavailableError,
     DomainValueError,
     ToolContractError,
     check_artifact_contract,
@@ -51,7 +52,7 @@ from skill3d.tools.docs_v11 import DESCRIPTIONS, TOOL_DOCS_VERSION
 # v9 §9.2/§9.4：工具面新增 `inspect_frames` / `detect_objects`（主动图像与补检）。
 # 工具面变了就升版本 —— prompt 里列出的 Tool 集合与 trace 的 tool_face_version
 # 必须对得上，否则"这次跑的是哪套工具面"无法回答。
-TOOL_FACE_VERSION: str = "tool-face-v11.1"
+TOOL_FACE_VERSION: str = "tool-face-v11.6-two-capabilities"
 
 
 class ToolNotFoundError(KeyError):
@@ -107,11 +108,6 @@ class ToolRegistry:
                 raise ValueError(
                     f"Tool {spec.name} 声明了未知证据能力 {sorted(unknown_ev)}；"
                     f"词汇表见 schemas.evidence.CAPABILITIES")
-            bad_tol = set(spec.tolerates_degraded or []) - set(spec.requires_evidence)
-            if bad_tol:
-                raise ValueError(
-                    f"Tool {spec.name} 的 tolerates_degraded 含未在 requires_evidence "
-                    f"中声明的能力 {sorted(bad_tol)}（§7.2：容忍列表必须是依赖的子集）")
             unknown_tasks = set(spec.supported_metric_tasks) - set(METRIC_TASK_TYPES)
             if unknown_tasks:
                 raise ValueError(
@@ -167,29 +163,34 @@ class ToolRegistry:
                         evidence_profile: Optional[EvidenceProfile] = None,
                         gate_passed: Optional[bool] = None,
                         allowed_metric_tasks: Optional[Iterable[str]] = None,
-                        question_type: str = "") -> list[str]:
+                        question_type: str = "",
+                        local_facts: Optional[dict[str, bool]] = None) -> list[str]:
         """当前 scope/证据下**可暴露**的 Tool 名（`docs()` 的过滤依据）。
 
         过滤顺序（任一不满足即隐藏）：
 
         1. `scope_allows`（§5.3）：`metric_enabled` 才允许米制 Tool；
-           `fallback_2d_only` 只允许不依赖深度/位姿/点云/对象的 Tool；
-        2. 证据匹配（§7.2）：逐 Tool 按 `requires_evidence` / `tolerates_degraded`；
+           `fallback_2d_only` 只允许不依赖深度/位姿/点云/尺度的 Tool；
+        2. 证据匹配与局部坐标约定检查；
         3. 实际装载产物（硬约束 23）：`available` 给定时按事实收窄 ——
            scope 是**声明**，句柄的 available_artifacts 是**事实**；不一致时以事实为准，
            避免 prompt 里列出必然抛 `ArtifactUnavailableError` 的 Tool。
         """
-        names = self.names()
-        if scope is not None:
-            names = [n for n in names if scope_allows(self._tools[n].spec, scope)]
-        if evidence_profile is not None:
-            names = [n for n in names
-                     if evidence_visible(self._tools[n].spec, evidence_profile)]
-        if available is not None:
-            avail = set(available)
-            names = [n for n in names
-                     if set(self._tools[n].spec.requires_artifacts).issubset(avail)]
-        return names
+        if (scope is None and available is None and evidence_profile is None
+                and local_facts is None and gate_passed is None):
+            return self.names()  # 离线接口目录，不表示某一 episode 的执行授权
+        return [
+            name for name in self.names()
+            if authorize_tool_call(
+                name, self._tools[name].spec, scope=scope or "",
+                profile=evidence_profile,
+                available_artifacts=KNOWN_ARTIFACTS if available is None else available,
+                gate_passed=gate_passed, local_facts=local_facts,
+                supported_metric_tasks=self._tools[name].spec.supported_metric_tasks,
+                allowed_metric_tasks=allowed_metric_tasks or (),
+                question_type=question_type,
+            ).allowed
+        ]
 
     def docs(self, scope: Optional[str] = None,
              available: Optional[Iterable[str]] = None,
@@ -197,7 +198,8 @@ class ToolRegistry:
              evidence_profile: Optional[EvidenceProfile] = None,
              gate_passed: Optional[bool] = None,
              allowed_metric_tasks: Optional[Iterable[str]] = None,
-             question_type: str = "") -> str:
+             question_type: str = "",
+             local_facts: Optional[dict[str, bool]] = None) -> str:
         """只暴露 Tool 文档（名称/描述/参数签名 + 所需产物 + 所需证据）。
 
         `scope` = `SceneState.question_tool_scope`（§5.3）。关于 scope 单调：
@@ -208,14 +210,16 @@ class ToolRegistry:
         for name in self.names_for_scope(
                 scope, available, evidence_profile=evidence_profile,
                 gate_passed=gate_passed,
-                allowed_metric_tasks=allowed_metric_tasks, question_type=question_type):
+                allowed_metric_tasks=allowed_metric_tasks, question_type=question_type,
+                local_facts=local_facts):
             t = self._tools[name]
             sig = inspect.signature(t.fn)
             params = [str(p) for p in list(sig.parameters.values())[1:]]
             needs = ", ".join(t.spec.requires_artifacts) or "none"
             ev = ", ".join(t.spec.requires_evidence or []) or "none"
-            lines.append(f"- {name}({', '.join(params)}): {DESCRIPTIONS[name]}"
-                         f" [requires_artifacts: {needs}; requires_evidence: {ev}]")
+            facts = ", ".join(t.spec.requires_local_facts) or "none"
+            lines.append(f"- {name}({', '.join(params)}): {DESCRIPTIONS.get(name, t.spec.description)}"
+                         f" [requires_artifacts: {needs}; requires_evidence: {ev}; local_facts: {facts}]")
         return "\n".join(lines)
 
     def docs_header(self, scope: str, available: Iterable[str],
@@ -309,7 +313,8 @@ class ToolRegistry:
             gate=scene.metric_evidence_gate_result,
             supported_metric_tasks=entry.spec.supported_metric_tasks,
             allowed_metric_tasks=scene.allowed_metric_tasks,
-            question_type=scene.question_type, args=args)
+            question_type=scene.question_type, args=args,
+            local_facts=scene.local_facts, gate_passed=scene.metric_gate_passed)
         receipt = ToolAuthorizationReceipt(
             episode_id=episode_id, tool_id=name, argument_digest=digest,
             evidence_version=str(getattr(profile, "profile_version", "") or ""),
@@ -347,6 +352,10 @@ class ToolRegistry:
         # ④ 产物契约：缺产物直接抛 ArtifactUnavailableError（不静默返回假值）
         check_artifact_contract(name, entry.spec.requires_artifacts, available,
                                route=scene.scene_route, args=args)
+        if not decision.allowed:
+            raise ArtifactUnavailableError(
+                name, decision.missing_refs, route=scene.scene_route,
+                available=available, args=args)
 
         switch = mock_switch or MockSwitch()
         fn, source = switch.resolve(
@@ -361,6 +370,7 @@ class ToolRegistry:
         failure_cause = None
         missing: list[str] = []
         scene._consumed_object_ids = []
+        scene._resolved_object_ids = []
         try:
             value = fn(scene, **args)
         except ToolContractError as exc:  # 确定性契约异常 → 进失败归因（§4 M6 字段 9）
@@ -395,6 +405,7 @@ class ToolRegistry:
             error_code=error_code,  # type: ignore[arg-type]
             failure_cause=failure_cause,
             object_dependencies=(list(scene._consumed_object_ids) if error is None else []),
+            resolved_object_ids=list(scene._resolved_object_ids),
             missing_artifacts=missing,
             available_artifacts=sorted(set(available)),
         )

@@ -1,9 +1,10 @@
-"""v11: canonical question type selects its unique active method."""
+"""Exact task/initial-evidence lookup; the selected method stays fixed for an episode."""
 from __future__ import annotations
 
 import logging
 from typing import NamedTuple, Optional, Sequence
 from skill3d.schemas import RetrievedSkill, SceneState, SkillSpecV11
+from skill3d.schemas.evidence import skill_evidence_state
 from skill3d.schemas.retrieval import SkillCandidateRecord, SkillRetrievalRecord
 from skill3d.skills.delivery import skill_body_length, skill_content_sha256, skill_version_key
 from .retrieval_policy import RetrievalPolicy
@@ -50,7 +51,7 @@ def canonical_question_type(value: Optional[str]) -> Optional[str]:
 def retrieval_decision(
     skill: SkillSpecV11, scene: SceneState, task_type: str,
 ) -> RetrievalDecision:
-    """Method selection depends on question type; tools enforce evidence requirements."""
+    """Exact task/state matching; current tool authorization remains independent."""
     if not isinstance(skill, SkillSpecV11):
         raise ValueError("当前检索只接受 SkillSpecV11")
     expected = canonical_question_type(skill.question_type)
@@ -59,7 +60,17 @@ def retrieval_decision(
             False, {}, None,
             f"题型不匹配（题目={task_type}，Skill={skill.question_type}）",
             "question_type_mismatch")
-    return RetrievalDecision(True, {}, None, "v11 题型唯一 active Skill", "hit")
+    try:
+        state = skill_evidence_state(scene.evidence_profile)
+    except (ValueError, TypeError, AttributeError):
+        return RetrievalDecision(False, {}, None, "初始证据状态不可知",
+                                 "evidence_state_unknown")
+    if state != skill.evidence_state:
+        return RetrievalDecision(False, {}, None,
+                                 f"初始证据状态不匹配: {state} != {skill.evidence_state}",
+                                 "evidence_state_mismatch")
+    return RetrievalDecision(True, scene.evidence_profile.as_signature(), None,
+                             "题型与初始证据状态精确匹配", "hit")
 
 
 def retrieve_ex(
@@ -99,15 +110,20 @@ def _retrieve_v11_ex(
     snapshot_manifest_sha256: str,
     policy: RetrievalPolicy,
 ) -> tuple[list[RetrievedSkill], SkillRetrievalRecord]:
-    """v11 deterministic lookup: canonical question type -> one active method."""
+    """Deterministic lookup before solving: task/state -> one active method."""
     task_type = canonical_question_type(question_type)
+    try:
+        initial_state = skill_evidence_state(scene.evidence_profile)
+    except (ValueError, TypeError, AttributeError):
+        initial_state = None
     record = SkillRetrievalRecord(
         retrieval_index=int(retrieval_index),
         trigger=str(trigger),
         canonical_question_type=str(task_type or ""),
         question_type_raw=str(question_type or ""),
         question_type_known=bool(task_type),
-        partition_policy="v11_unique_active_by_question_type",
+        partition_policy="v11_unique_active_by_initial_slot",
+        initial_evidence_state=initial_state,
         evidence_version=str(evidence_version or ""),
         config_version=policy.version(),
         config_sha256=policy.sha256(),
@@ -127,6 +143,7 @@ def _retrieve_v11_ex(
             version=skill.version,
             skill_version=skill_version_key(skill),
             canonical_question_type=skill.question_type,
+            evidence_state=skill.evidence_state,
             hard_filter_passed=bool(decision.ok),
             reason_code=(
                 "question_type_unknown" if not task_type else decision.reason_code
@@ -139,7 +156,7 @@ def _retrieve_v11_ex(
             selected=is_selected,
             content_sha256=skill_content_sha256(skill),
             content_chars=skill_body_length(skill),
-            matched_evidence_signature={},
+            matched_evidence_signature=dict(decision.matched_signature),
             gate_version_matched=None,
             delivered=False,
             delivery_reason=("no_model_request" if is_selected else "not_selected"),
@@ -149,7 +166,7 @@ def _retrieve_v11_ex(
             selected.append(skill)
     if len(selected) > 1:
         raise ValueError(
-            f"v11 题型 {task_type} 存在多个 active Skill: "
+            f"v11 槽位 {task_type}/{initial_state} 存在多个 active Skill: "
             f"{[skill_version_key(skill) for skill in selected]}")
     record.candidates = rows
     record.eligible_skill_versions = [
@@ -160,9 +177,9 @@ def _retrieve_v11_ex(
     ]
     record.delivery_channel = "not_sent"
     record.delivery_note = (
-        "v11 题型唯一 Skill 已确定，尚未发出模型请求"
+        "初始槽位唯一 Skill 已确定，尚未发出模型请求"
         if selected else
-        "v11 当前题型没有 active Skill，未发出 Skill 请求"
+        "初始槽位不可知或没有 active Skill，未发出 Skill 请求"
     )
     hits = [
         RetrievedSkill(
@@ -170,7 +187,7 @@ def _retrieve_v11_ex(
             skill_version=skill_version_key(skill),
             score=1.0,
             hard_filter_passed=True,
-            matched_evidence_signature={},
+            matched_evidence_signature=scene.evidence_profile.as_signature(),
             gate_version_matched=None,
         )
         for skill in selected

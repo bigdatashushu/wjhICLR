@@ -92,6 +92,7 @@ class V11RevisionFormatError(RuntimeError):
 class V11CampaignConfig:
     """Stable orchestration inputs; model/evaluator details live in callbacks."""
 
+    evidence_state: str
     campaign_id: str = ""
     question_type: str = "object_counting"
     library_root: str = "data/evolution/library_v11"
@@ -104,6 +105,12 @@ class V11CampaignConfig:
     quality_contract_sha256: str = ""
     solver_config_sha256: str = ""
     resume: bool = True
+
+    def __post_init__(self):
+        from skill3d.schemas.evidence import SKILL_EVIDENCE_STATES
+
+        if self.evidence_state not in SKILL_EVIDENCE_STATES:
+            raise ValueError("campaign 必须明确指定 g0m0/g1m0/g1m1 槽位")
 
     def resolved_id(self) -> str:
         campaign_id = self.campaign_id or f"camp-v11-{uuid.uuid4().hex[:12]}"
@@ -348,7 +355,8 @@ class V11CampaignRunner:
             cp = self.checkpoint
             if cp.campaign_id != self.campaign_id:
                 raise V11CampaignBlocked("checkpoint campaign_id 不一致")
-            if cp.question_type != self.cfg.question_type:
+            if (cp.question_type != self.cfg.question_type
+                    or cp.evidence_state != self.cfg.evidence_state):
                 raise V11CampaignBlocked("checkpoint question_type 与配置不一致")
             if Path(cp.library_root).resolve() != self.library_root:
                 raise V11CampaignBlocked("checkpoint library_root 与配置不一致")
@@ -370,12 +378,13 @@ class V11CampaignRunner:
             raise V11CampaignBlocked("存在收据但缺少 campaign checkpoint，拒绝猜测恢复")
         snapshot = read_active_snapshot(self.store_dir)
         if snapshot.get("schema_version") != V11_SNAPSHOT_SCHEMA:
-            raise V11CampaignBlocked("v11 campaign 只接受 runtime-skill-snapshot/2.0")
+            raise V11CampaignBlocked("v11 campaign 只接受 runtime-skill-snapshot/3.0")
         skills, warnings, snapshot_id = load_active_skills(self.store_dir)
         if warnings:
             raise V11CampaignBlocked(f"父快照加载警告: {warnings}")
         matching = [
             skill for skill in skills if skill.question_type == self.cfg.question_type
+            and skill.evidence_state == self.cfg.evidence_state
         ]
         if len(matching) != 1:
             raise V11CampaignBlocked(
@@ -387,6 +396,7 @@ class V11CampaignRunner:
             campaign_id=self.campaign_id,
             status="initialized",
             question_type=self.cfg.question_type,
+            evidence_state=self.cfg.evidence_state,
             library_root=str(self.library_root),
             parent_snapshot_id=snapshot_id,
             parent_skill_version=f"{parent.skill_id}@{parent.version}",
@@ -411,6 +421,7 @@ class V11CampaignRunner:
             ) from exc
         matching = [
             spec for spec in specs if spec.question_type == self.cfg.question_type
+            and spec.evidence_state == self.cfg.evidence_state
         ]
         if len(matching) != 1:
             raise V11CampaignBlocked("父快照题型槽位不唯一")
@@ -428,6 +439,7 @@ class V11CampaignRunner:
             parent=parent.model_copy(deep=True),
             parent_snapshot_id=self.checkpoint.parent_snapshot_id,
             question_type=self.cfg.question_type,
+            evidence_state=self.cfg.evidence_state,
             idempotency_key=f"{self.campaign_id}:collect",
         )
         bundle = _coerce(V11ExperienceBundle, value)
@@ -447,6 +459,7 @@ class V11CampaignRunner:
             "parent_skill_version": self.checkpoint.parent_skill_version,
             "parent_content_sha256": parent.content_sha256,
             "question_type": self.cfg.question_type,
+            "evidence_state": self.cfg.evidence_state,
         }
         actual = {
             "campaign_id": bundle.campaign_id,
@@ -454,6 +467,7 @@ class V11CampaignRunner:
             "parent_skill_version": bundle.parent_skill_version,
             "parent_content_sha256": bundle.parent_content_sha256,
             "question_type": bundle.question_type,
+            "evidence_state": bundle.evidence_state,
         }
         if actual != expected:
             raise V11CampaignBlocked(
@@ -552,6 +566,7 @@ class V11CampaignRunner:
                 skill_id=parent.skill_id,
                 version=version,
                 question_type=parent.question_type,
+                evidence_state=parent.evidence_state,
                 skill_md=raw,
             )
             checks["complete_source_valid"] = True
@@ -562,6 +577,7 @@ class V11CampaignRunner:
         checks["same_lineage"] = candidate_spec is not None and (
             candidate_spec.skill_id == parent.skill_id
             and candidate_spec.question_type == parent.question_type
+            and candidate_spec.evidence_state == parent.evidence_state
         )
         if not checks["same_lineage"]:
             problems.append("The candidate must preserve the parent's skill_id and question_type")
@@ -691,6 +707,7 @@ class V11CampaignRunner:
             candidate=candidate.model_copy(deep=True),
             experience=bundle.model_copy(deep=True),
             question_type=self.cfg.question_type,
+            evidence_state=self.cfg.evidence_state,
             seed=int(self.cfg.seed),
             model_id=self.cfg.model_id,
             model_config_sha256=self.cfg.model_config_sha256,
@@ -708,6 +725,8 @@ class V11CampaignRunner:
     ) -> V11CampaignDecision:
         return V11CampaignDecision(
             campaign_id=self.campaign_id,
+            question_type=self.cfg.question_type,
+            evidence_state=self.cfg.evidence_state,
             stage="static_validation",
             outcome="reject",
             parent_snapshot_id=self.checkpoint.parent_snapshot_id,
@@ -746,6 +765,7 @@ class V11CampaignRunner:
             "question_type_matches": (
                 evaluation.question_type == self.cfg.question_type
             ),
+            "evidence_state_matches": evaluation.evidence_state == self.cfg.evidence_state,
             "seed_matches": (
                 evaluation.seed == int(self.cfg.seed)
                 and evaluation.request_seed_observed
@@ -819,6 +839,8 @@ class V11CampaignRunner:
         reasons = [name for name, passed in conditions.items() if not passed]
         return V11CampaignDecision(
             campaign_id=self.campaign_id,
+            question_type=self.cfg.question_type,
+            evidence_state=self.cfg.evidence_state,
             stage="paired_evaluation",
             outcome="promote" if not reasons else "reject",
             parent_snapshot_id=self.checkpoint.parent_snapshot_id,
@@ -896,9 +918,9 @@ class V11CampaignRunner:
                 or entry.get("candidate_id") != candidate.candidate_id
                 or entry.get("content_sha256")
                 != candidate.full_skill_spec.content_sha256
-                or (snapshot.get("active_by_question_type") or {}).get(
-                    candidate.full_skill_spec.question_type
-                )
+                or (snapshot.get("active_by_slot") or {}).get(
+                    candidate.full_skill_spec.question_type, {}
+                ).get(candidate.full_skill_spec.evidence_state)
                 != candidate.candidate_skill_version
             ):
                 raise V11CampaignBlocked("已物化候选快照与 campaign 候选身份不一致")
@@ -933,6 +955,8 @@ class V11CampaignRunner:
             )
         return V11PublicationReceipt(
             campaign_id=self.campaign_id,
+            question_type=candidate.full_skill_spec.question_type,
+            evidence_state=candidate.full_skill_spec.evidence_state,
             candidate_id=candidate.candidate_id,
             skill_version=candidate.candidate_skill_version,
             parent_skill_version=candidate.parent_skill_version,
@@ -956,6 +980,7 @@ class V11CampaignRunner:
             skill
             for skill in skills
             if skill.question_type == candidate.full_skill_spec.question_type
+            and skill.evidence_state == candidate.full_skill_spec.evidence_state
         ]
         if (
             warnings
@@ -1015,6 +1040,7 @@ class V11CampaignRunner:
             skill
             for skill in skills
             if skill.question_type == candidate.full_skill_spec.question_type
+            and skill.evidence_state == candidate.full_skill_spec.evidence_state
         ]
         loader_ok = (
             not warnings
@@ -1032,6 +1058,8 @@ class V11CampaignRunner:
             "question_type_matches": (
                 observation.question_type == candidate.full_skill_spec.question_type
             ),
+            "evidence_state_matches": (
+                observation.evidence_state == candidate.full_skill_spec.evidence_state),
             "candidate_retrieved": (
                 observation.retrieved_skill_version == expected_version
             ),
@@ -1073,6 +1101,7 @@ class V11CampaignRunner:
             candidate=candidate.model_copy(deep=True),
             snapshot_id=publication.snapshot_after,
             question_type=self.cfg.question_type,
+            evidence_state=self.cfg.evidence_state,
             idempotency_key=f"{self.campaign_id}:post-publish",
         )
         observation = _coerce(V11PostPublishObservation, value)

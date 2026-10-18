@@ -93,7 +93,7 @@ _FALLBACK: dict[str, Any] = {
     # 缺键时用默认值跑，但检索记录里的 `config_source` 会记 "default" ——
     # 缺省值不会被冒充成"已冻结配置"。
     "retrieval": {
-        "config_version": "ret-v11-deterministic-1",
+        "config_version": "ret-v11-initial-slot-1",
         "method_context_max_chars": 8000,
     },
     "online_model": {

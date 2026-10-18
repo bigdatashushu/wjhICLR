@@ -59,6 +59,7 @@ def _activate_parent(library: Path):
         skill_id="S03",
         version="1.1.0",
         question_type="object_rel_distance",
+        evidence_state="g1m0",
     )
     snapshot, manifest = build_v11_snapshot(
         [loaded],
@@ -100,12 +101,14 @@ class _Callbacks:
         self.calls["collect"] += 1
         parent = kwargs["parent"]
         key = f"{parent.skill_id}@{parent.version}"
+        evidence = {"geometry_3d": "available", "metric_scale": "unavailable"}
         return V11ExperienceBundle(
             campaign_id=kwargs["campaign_id"],
             parent_snapshot_id=kwargs["parent_snapshot_id"],
             parent_skill_version=key,
             parent_content_sha256=parent.content_sha256,
             question_type=parent.question_type,
+            evidence_state=parent.evidence_state,
             source_split="induction",
             split="learning",
             label_access=True,
@@ -128,6 +131,7 @@ class _Callbacks:
                     qa_id="qa-alpha",
                     scene_id="scene-alpha",
                     question_type=parent.question_type,
+                    evidence_state=parent.evidence_state,
                     question_text="Which object is closest to the chair?",
                     options=["lamp", "table", "sofa", "door"],
                     source_split="induction",
@@ -141,6 +145,9 @@ class _Callbacks:
                     response_text="candidate response",
                     response_texts=["candidate response"],
                     program_source="ReturnAnswer('A')",
+                    initial_evidence_states=evidence,
+                    evidence_states=evidence,
+                    evidence_history=[{"trigger": "initial", "evidence_states": evidence}],
                     tool_observations=[{"tool": "relative_distance_rank", "ok": False}],
                     model_answer="A",
                     reference_answer="B",
@@ -154,6 +161,7 @@ class _Callbacks:
                     qa_id="qa-beta",
                     scene_id="scene-beta",
                     question_type=parent.question_type,
+                    evidence_state=parent.evidence_state,
                     question_text="Which object is nearest to the desk?",
                     options=["cabinet", "chair", "plant", "window"],
                     source_split="induction",
@@ -167,6 +175,9 @@ class _Callbacks:
                     response_text="candidate response",
                     response_texts=["candidate response"],
                     program_source="ReturnAnswer('B')",
+                    initial_evidence_states=evidence,
+                    evidence_states=evidence,
+                    evidence_history=[{"trigger": "initial", "evidence_states": evidence}],
                     tool_observations=[{"tool": "relative_distance_rank", "ok": True}],
                     model_answer="B",
                     reference_answer="B",
@@ -208,6 +219,7 @@ class _Callbacks:
             panel_id="panel-object-rel-distance",
             panel_sha256="a" * 64,
             question_type=parent.question_type,
+            evidence_state=parent.evidence_state,
             seed=kwargs["seed"],
             request_seed_observed=True,
             model_id=kwargs["model_id"],
@@ -262,6 +274,7 @@ class _Callbacks:
         )
         return V11PostPublishObservation(
             question_type=kwargs["question_type"],
+            evidence_state=kwargs["evidence_state"],
             snapshot_id=kwargs["snapshot_id"],
             retrieved_skill_version=candidate.candidate_skill_version,
             delivered_skill_version=candidate.candidate_skill_version,
@@ -277,6 +290,7 @@ def _runner(tmp_path: Path, callbacks: _Callbacks, *, campaign_id="campaign-one"
     cfg = V11CampaignConfig(
         campaign_id=campaign_id,
         question_type="object_rel_distance",
+        evidence_state="g1m0",
         library_root=str(library),
         run_root=str(runs),
         max_revision_attempts=3,

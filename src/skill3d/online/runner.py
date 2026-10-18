@@ -82,7 +82,7 @@ from skill3d.skills.delivery import (
     skill_content_sha256,
     skill_version_key,
 )
-from skill3d.schemas.evidence import CAPABILITIES
+from skill3d.schemas.evidence import CAPABILITIES, skill_evidence_state
 from skill3d.synthesis.program_assembler import (
     SynthesisError,
     assemble_program,
@@ -401,6 +401,9 @@ class EpisodeOutcome:
     metric_fusion_version: str = ""
     per_frame_scale_ref: Optional[str] = None
     evidence_profile: Optional[object] = None
+    evidence_history: list[dict] = field(default_factory=list)
+    initial_evidence_states: dict[str, str] = field(default_factory=dict)
+    initial_skill_selection: dict = field(default_factory=dict)
     metric_evidence_gate_result: Optional[object] = None
     m5_summary: Optional[object] = None
     authorized_metric_tasks: list[str] = field(default_factory=list)  # 本题授权后
@@ -498,7 +501,7 @@ def _trace_record_of(outcome: EpisodeOutcome, episode: VSIBenchEpisode,
                      cfg: OnlineRunConfig) -> TraceRecord:
     """§5.9 TraceRecord：版本字段 + 证据/路由全状态（D10）。
 
-    目的：**不依赖重跑即可归因失败** —— 每个失败码、每个证据三值、
+    目的：**不依赖重跑即可归因失败** —— 每个失败码、两项证据状态、
     每条 used_result_id 都在这里，评审只需读 trace。
     """
     from skill3d.reconstruction.metric_fusion import METRIC_FUSION_VERSION
@@ -681,10 +684,10 @@ def _evidence_version_of_scene(scene) -> str:
 
 
 def _evidence_state_snapshot(scene) -> tuple[dict, dict]:
-    """证据三值快照 + 原因码（§13.6 检索记录的可比对证据事实）。
+    """两项二值快照 + 原因码（§13.6 检索记录的可比对证据事实）。
 
     `profile_version` 是**合同版本**：级联降级前后它不变，所以"证据是否真的变了"
-    不能靠版本号判断，必须另记三值快照。
+    不能靠版本号判断，必须另记状态快照。
     """
     profile = getattr(scene, "evidence_profile", None) if scene is not None else None
     if profile is None:
@@ -722,6 +725,7 @@ def _fixed_injection_retrieval(episode, scene, cfg: OnlineRunConfig,
         version=str(skill.version),
         skill_version=skill_version_key(skill),
         canonical_question_type=str(task_type or ""),
+        evidence_state=skill.evidence_state,
         hard_filter_passed=bool(decision.ok),
         reason_code=("fixed_injection_selected" if decision.ok
                      else "fixed_injection_not_applicable"),
@@ -740,6 +744,7 @@ def _fixed_injection_retrieval(episode, scene, cfg: OnlineRunConfig,
         canonical_question_type=str(task_type or ""),
         question_type_raw=str(getattr(episode, "question_type", "") or ""),
         question_type_known=bool(task_type),
+        initial_evidence_state=outcome.initial_skill_selection.get("evidence_state"),
         evidence_version=str(
             getattr(getattr(scene, "evidence_profile", None), "profile_version", "") or ""),
         config_version=cfg.retrieval_policy.version(),
@@ -788,20 +793,31 @@ def _hit_from_decision(skill: SkillSpecV11, decision) -> RetrievedSkill:
 def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: EpisodeOutcome,
                           *, trigger: str = "initial",
                           llm=None) -> list[RuntimeSkillSpec]:
-    """§13.5/§13.6：检索一次并把**完整记录**落进 outcome；返回可用 SkillSpec 列表。
-
-    `trigger="evidence_update"` 是 §13.5 的"证据更新后可在**同一快照**中重检索，
-    更新实际交付记录"——重检索只换输入证据，**不**发布新库（`cfg.skills` 不变），
-    因此本函数没有重新加载快照的路径。
-
-    `cfg.evaluation_binding` 非空时走固定注入分支；普通运行按规范题型确定唯一
-    `SkillSpecV11`。空列表是合法的 B01 baseline。
-    """
+    """冻结一次初始槽位选择；恢复时仅复用已选方法。"""
+    if outcome.retrieval_records:
+        by_key = {skill_version_key(s): s for s in cfg.skills}
+        return [by_key[key] for key in outcome.retrieved_skill_versions]
+    states, reasons = _evidence_state_snapshot(scene)
+    outcome.initial_evidence_states = dict(states)
+    try:
+        state = skill_evidence_state(states)
+    except (ValueError, TypeError):
+        state = None
+    outcome.initial_skill_selection = {
+        "question_type": canonical_question_type(episode.question_type) or "",
+        "evidence_state": state,
+        "active_snapshot_ref": cfg.active_snapshot_ref,
+        "active_snapshot_manifest_sha256": cfg.active_snapshot_manifest_sha256,
+        "skill_version": "", "content_sha256": "",
+    }
     index = len(outcome.retrieval_records) + 1
     if cfg.evaluation_binding is not None:
-        return _fixed_injection_retrieval(episode, scene, cfg, outcome,
-                                          trigger=trigger, retrieval_index=index)
-    states, reasons = _evidence_state_snapshot(scene)
+        selected = _fixed_injection_retrieval(episode, scene, cfg, outcome,
+                                              trigger=trigger, retrieval_index=index)
+        outcome.initial_skill_selection.update(
+            skill_version=skill_version_key(selected[0]),
+            content_sha256=selected[0].content_sha256)
+        return selected
     retrieved, record = retrieve_ex(
         episode.question, scene, cfg.skills,  # type: ignore[arg-type]
         question_type=episode.question_type,
@@ -816,6 +832,10 @@ def _retrieve_for_episode(episode, scene, cfg: OnlineRunConfig, outcome: Episode
     by_key = {f"{s.skill_id}@{s.semver}": s for s in cfg.skills}
     selected = [by_key[key] for key in record.retrieved_skill_versions
                 if key in by_key]
+    if selected:
+        outcome.initial_skill_selection.update(
+            skill_version=skill_version_key(selected[0]),
+            content_sha256=selected[0].content_sha256)
     outcome.retrieval_records.append(record)
     outcome.retrieved_skills = [r.model_dump() for r in retrieved]
     outcome.selected_skill_semvers = [f"{s.skill_id}@{s.semver}" for s in selected]
@@ -881,6 +901,15 @@ def _record_skill_delivery(outcome: EpisodeOutcome, delivery: Optional[SkillDeli
     skills_by_key = {f"{s.skill_id}@{s.version}": s for s in skills or []}
     program_source = str(getattr(program, "program_source", "") or "")
     delivered = list(delivery.delivered_skill_versions)
+    binding = outcome.initial_skill_selection
+    if binding:
+        expected = binding.get("skill_version") or ""
+        if any(key != expected for key in delivered):
+            raise ValueError("运行中不得切换初始槽位的 Skill")
+        if expected in delivery.delivered_content_sha256 and (
+            delivery.delivered_content_sha256[expected] != binding["content_sha256"]
+        ):
+            raise ValueError("初始 Skill 的交付正文 hash 不得变化")
     clues = _skill_usage_clues(program_source, list(skills or []), delivered) \
         if program_source else []
     record.add_delivery(delivery, round_index=round_index,
@@ -1014,6 +1043,26 @@ def _sync_scene_snapshot(outcome: EpisodeOutcome, scene: Optional[SceneState],
         else [])
 
 
+def _record_evidence_context(outcome, scene, handle, *, trigger: str) -> None:
+    """记录实际求解输入与变化；候选技术状态不构成指代认证。"""
+    profile = getattr(scene, "evidence_profile", None)
+    if profile is None:
+        return
+    snapshot = {
+        "evidence_version": profile.profile_version,
+        "evidence_states": profile.as_signature(),
+        "state_reasons": dict(profile.state_reasons),
+        "question_tool_scope": scene.question_tool_scope,
+        "available_artifacts": sorted(handle.available_artifacts) if handle else [],
+        "local_facts": dict(handle.local_facts) if handle else {},
+        "candidates": [obj.model_dump(mode="json") for obj in handle.object_records()]
+        if handle else [],
+    }
+    previous = outcome.evidence_history[-1] if outcome.evidence_history else {}
+    if snapshot != {k: v for k, v in previous.items() if k != "trigger"}:
+        outcome.evidence_history.append({"trigger": trigger, **snapshot})
+
+
 def _invalidate_metric_gate(gate, premise: str):
     """Return a fail-closed metric gate after a shared premise is invalidated.
 
@@ -1049,6 +1098,7 @@ def _invalidate_metric_gate(gate, premise: str):
     updated = gate.model_dump()
     updated.update({
         "gate_passed": False,
+        "status": "fail",
         "sub_results": sub_results,
         "missing_subconditions": missing,
         "invalidated_by": invalidated,
@@ -1379,10 +1429,8 @@ def run_episode(
                 persist_quality=not bool(cfg.reuse_artifact))
             # v9 §9.4：把声明的布局/上限装进图像账本（在 M5/M4 之后、M7 之前）
             _configure_image_ledger(handle, cfg, episode)
-            # M5 证据摘要在**此处**落档：M7.5 的逐题 scope 派生与 M10 的级联撤销
-            # 都要重算 EvidenceProfile（`scope_scene_to_question(..., m5=...)`），
-            # 传 None 会把 object_detection/track_consensus 重算成 unavailable →
-            # 对象类 Tool 被整批隐藏（真实链路上等于每题都撞 tool_contract 后 abstain）。
+            # 保留 M5 候选诊断，供逐题 scope 派生与恢复后的画像审计使用；
+            # 这些统计不参与公共两项能力的判定。
             outcome.m5_summary = _m5_evidence_summary(
                 m5_stats, m5_objects, episode, m5_materialized=m5_materialized)
             notes.append(f"M4 质量门禁（唯一事实源）scene_route={scene.scene_route} "
@@ -1624,7 +1672,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         states.append(fsm.state.value)
 
     def revoke_premise(premise, *, confirmed=False):
-        nonlocal scene, handle, skills
+        nonlocal scene, handle
         ids, _ = cascade_invalidate(kernel, premise, registry=REGISTRY)
         profile, changed = downgrade_profile(
             getattr(scene, "evidence_profile", None), premise,
@@ -1637,19 +1685,24 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 metric_gate_override=_invalidate_metric_gate(
                     getattr(scene, "metric_evidence_gate_result", None), premise),
                 evidence_profile_override=profile)
+            if premise == "world_frame" and scene.artifact is not None:
+                scene = scene.model_copy(update={"artifact": scene.artifact.model_copy(
+                    update={"world_up": None, "handedness": None,
+                            "world_frame_status": "unavailable"})})
+            if premise == "object_detection":
+                scene = scene.model_copy(update={
+                    "available_artifacts": set(scene.available_artifacts) - {"objects"}})
             _sync_scene_snapshot(outcome, scene, outcome.task)
             handle = _retarget_handle(handle, scene)
-            if changed:
-                skills = _retrieve_for_episode(
-                    episode, scene, cfg, outcome, trigger="evidence_update", llm=llm)
-                outcome.retrieved_skill_versions = list(
-                    outcome.retrieval_records[-1].retrieved_skill_versions)
+            if premise == "object_detection" and handle is not None:
+                handle._objects_materialized = False
         return ids, changed
 
     def observations():
         return [o for o in collect_validated(kernel) if o.result_id not in unresolved_ids]
 
     for index in range(1, int(cfg.max_solver_rounds) + 1):
+        _record_evidence_context(outcome, scene, handle, trigger=f"round:{index}")
         round_downgraded.clear()
         finalizing = force_next or (
             index > 1 and index > int(cfg.max_solver_rounds) - int(cfg.finalization_rounds))
@@ -2122,10 +2175,7 @@ def _scene_from_artifact(art, pixels, m5_stats: Optional[dict] = None,
 def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
                          *, m5_materialized: Optional[bool] = None,
                          grounding=None) -> M5EvidenceSummary:
-    """把 M5 统计压成证据输入（§7.1 的 object_detection / track_consensus / grounding）。
-
-    不确定的一律留 `None`/False（fail-closed：证据不足落 unavailable，不做乐观默认）。
-    """
+    """M5 候选生成诊断；不推导题目指代是否命中。"""
     objs = list(objects or [])
     fault = bool((stats or {}).get("detector_fault", False))
     if m5_materialized is False:
@@ -2145,20 +2195,7 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
     def _opt(v):
         return None if v is None else float(v)
 
-    # §7.1 `object_grounding`：M5 逐题补漏的**实际结果**（不是"没查"）
-    g = (stats or {}).get("grounding") or grounding or {}
-    if g.get("attempted"):
-        if g.get("miss") or g.get("status") in ("missing", "fault"):
-            hit, miss = False, True
-        elif g.get("status") in ("partial", "ambiguous"):
-            hit, miss = None, False
-        elif g.get("all_present"):
-            hit, miss = True, False
-        else:
-            # 框数/新增数不能证明全部需求已覆盖；旧统计缺覆盖记录时保守降级。
-            hit, miss = None, False
-    else:
-        hit, miss = None, False      # 未做校验 → 上层按 degraded（不是 available）
+    question["candidate_coverage"] = (stats or {}).get("grounding") or grounding or {}
     return M5EvidenceSummary(
         # v9 §6.1：这里是把 M5 汇总成证据摘要的地方 —— 它被调用即说明 M5 运行过
         m5_ran=True,
@@ -2171,10 +2208,6 @@ def _m5_evidence_summary(stats: dict, objects: Optional[list], episode,
         detection_scope="question_binding",
         track_scope="question_binding",
         question_binding=question,
-        grounding_pointed_hit=hit,
-        grounding_conf=_opt(g.get("conf")),
-        grounding_miss=miss,
-        grounding_filled=bool(int(g.get("n_new", 0)) > 0),
         notes=[str(x) for x in ((stats or {}).get("evidence_notes") or [])],
     )
 
@@ -2673,7 +2706,7 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
         public["requirements"] = [{
             k: v for k, v in row.items() if k not in {"detector_errors", "vlm_errors"}
         } for row in coverage.get("requirements", [])]
-        scene_summary += "\nM5 initial object coverage (consult the tool inventory for subsequently added objects): " + json.dumps(
+        scene_summary += "\nM5 candidate coverage (technical scan facts only; the model must resolve question referents using images): " + json.dumps(
             public, ensure_ascii=False, sort_keys=True)
     text = PromptBuilder().render(
         question=episode.question,
@@ -2686,6 +2719,7 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
                                            if handle is not None else None),
                                 evidence_profile=profile,
                                 gate_passed=(None if gate is None else gate.gate_passed),
+                                local_facts=(handle.local_facts if handle is not None else {}),
                                 question_type=qtype),
         options=episode.options,
         skills=skills,
@@ -2756,7 +2790,7 @@ def _premise_from_cell(cell: CellResult, kernel) -> Optional[str]:
         req = tuple(REGISTRY.requires_evidence(name))
     except Exception:  # noqa: BLE001 - 未注册名 → 无法判前提，保守不撤销
         req = ()
-    # `missing_artifacts` 里带括号的是**证据项**（如 "metric_scale(degraded 且不容忍)"），
+    # `missing_artifacts` 里带括号的是**证据项**（如 "metric_scale(unavailable)"），
     # 不带括号且命中产物表的才是**产物项**。两者判据不同，不能混在一起。
     raw_missing = [str(x) for x in (v.get("missing_artifacts") or ())]
     unmet = tuple(x for x in raw_missing if "(" in x)
@@ -3064,6 +3098,7 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
     outcome.frame_set_hash = (episode.frame_set.frame_set_hash
                               if episode.frame_set is not None else "")
     profile = outcome.evidence_profile
+    _record_evidence_context(outcome, scene, handle, trigger="final")
     evidence_states = (profile.as_signature() if profile is not None else {})
     gate = outcome.metric_evidence_gate_result
     q = outcome.overall_quality
@@ -3104,6 +3139,9 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
         metric_model=str(outcome.metric_model or "none"),
         authorized_metric_tasks=sorted(outcome.authorized_metric_tasks),
         evidence_states=evidence_states,
+        evidence_history=list(outcome.evidence_history),
+        initial_evidence_states=dict(outcome.initial_evidence_states),
+        initial_skill_selection=dict(outcome.initial_skill_selection),
         overall_quality=(None if outcome.overall_quality is None
                          else float(outcome.overall_quality)),
         main_gate_passed=main_gate_passed,

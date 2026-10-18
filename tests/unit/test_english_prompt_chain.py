@@ -1,6 +1,7 @@
 """English framework instructions, with immutable Skill ancestry and real M5 requests."""
 
 import ast
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -20,8 +21,18 @@ def test_english_snapshot_preserves_parent_identity_and_executable_examples():
         (LIBRARY / "snapshots/snapshot_S0-v11-contract-repair.json").read_text())
     current = json.loads(
         (LIBRARY / "snapshots/snapshot_S0-v11-english.json").read_text())
-    old = {s.skill_id: s for s in validate_v11_snapshot(parent, library_root=LIBRARY)}
-    new = {s.skill_id: s for s in validate_v11_snapshot(current, library_root=LIBRARY)}
+    from types import SimpleNamespace
+    from skill3d.schemas.skill import parse_skill_markdown
+    def archived(snapshot):
+        values = {}
+        for entry in snapshot["entries"].values():
+            text = (LIBRARY / entry["source_ref"]).read_text()
+            assert hashlib.sha256(text.encode()).hexdigest() == entry["content_sha256"]
+            values[entry["skill_id"]] = SimpleNamespace(
+                **entry, skill_md=text, name=parse_skill_markdown(text)[0]["name"])
+        return values
+    old = archived(parent)
+    new = archived(current)
     assert len(new) == 8 and new.keys() == old.keys()
     assert current["parent_snapshot_id"] == parent["snapshot_id"]
     assert all(entry["created_by"] == "english_translation"

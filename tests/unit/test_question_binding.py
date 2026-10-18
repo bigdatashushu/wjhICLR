@@ -122,7 +122,7 @@ def test_late_detection_still_scans_every_frame(harness, monkeypatch):
     monkeypatch.setattr(qb.ovd, "detect", detect)
     objects, stats, _ = qb.bind_question_objects(**harness.args)
     assert len(objects) == 1 and len(harness.calls) == 32
-    assert stats["grounding"]["all_present"]
+    assert stats["grounding"]["candidate_scan_complete"]
     assert objects[0].binding_provenance[0]["frame_slot"] == 27
 
 
@@ -198,7 +198,7 @@ def test_failed_detector_frame_does_not_stop_the_scan(harness, monkeypatch):
     monkeypatch.setattr(qb.ovd, "detect", detect)
     _, stats, _ = qb.bind_question_objects(**harness.args)
     assert len(harness.calls) == 32 and stats["detector_fault"]
-    assert not stats["grounding"]["all_present"]
+    assert not stats["grounding"]["candidate_scan_complete"]
     assert stats["grounding"]["requirements"][0]["scan_errors"][0]["frame_slot"] == 3
 
 

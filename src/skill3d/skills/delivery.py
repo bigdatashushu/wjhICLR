@@ -158,6 +158,8 @@ def plan_delivery(skills: Optional[Sequence[Any]], *,
       静默当成无上限会让上限形同虚设）。
     """
     limit = int(DEFAULT_METHOD_CONTEXT_MAX_CHARS if max_chars is None else max_chars)
+    if len(skills or []) > 1:
+        raise ValueError("每次请求最多交付初始槽位的一条完整 Skill")
     if limit <= 0:
         raise ValueError(f"method_context_max_chars must be a positive integer; got {limit!r}")
     plan = SkillDeliveryPlan(max_chars=limit)

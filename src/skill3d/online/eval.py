@@ -191,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     legacy = [type(skill).__name__ for skill in skills
               if not isinstance(skill, SkillSpecV11)]
     if legacy:
-        print("[错误] 当前在线协议只接受 runtime-skill-snapshot/2.0 与 "
+        print("[错误] 当前在线协议只接受 runtime-skill-snapshot/3.0 与 "
               f"SkillSpecV11；收到旧格式 {legacy}", file=sys.stderr)
         return 2
     for w in warnings:

@@ -294,9 +294,7 @@ def _scene_summary(art, *, scene_route: str, scope: str,
                 f"quality_status={getattr(art, 'quality_status', 'not_computed')} "
                 "(quality not computed; no geometric evidence)")
 
-    ev = ("; ".join(f"{c}={profile.state(c)}" for c in
-                    ("geometry_3d", "world_frame", "metric_scale",
-                     "object_detection", "track_consensus", "object_grounding"))
+    ev = ("; ".join(f"{c}={s}" for c, s in profile.as_signature().items())
           if profile is not None else "no evidence profile")
     wf = getattr(art, "world_frame_status", "unavailable")
     return (
@@ -308,7 +306,7 @@ def _scene_summary(art, *, scene_route: str, scope: str,
         f"head_relative_p95={q.point_depth_relative_p95:.3f} "
         f"cloud_neighbor_tail={q.cloud_neighbor_tail_ratio:.3f} "
         f"overall_quality={float(q.overall_quality):.3f} "
-        f"world_frame={wf} metric_scale_status={getattr(art, 'scale_fusion_status', 'not_run')} "
+        f"world_frame_diagnostic={wf} metric_scale_status={getattr(art, 'scale_fusion_status', 'not_run')} "
         f"metric_gate={'passed' if (gate and gate.gate_passed) else 'not_passed'} "
         f"n_objects={n_objects} evidence=[{ev}] "
         f"frame_set_hash={str(art.frame_set_hash)[:12]}"

@@ -20,11 +20,12 @@ from typing import Iterable, Mapping
 
 from skill3d.routing.task_classifier import TASK_TYPES
 from skill3d.schemas import SkillCandidateV11, SkillSpecV11
+from skill3d.schemas.evidence import SKILL_EVIDENCE_STATES, SkillEvidenceState
 from skill3d.schemas.skill import normalize_skill_markdown, parse_skill_markdown
 from skill3d.skills.delivery import DEFAULT_METHOD_CONTEXT_MAX_CHARS
 
-V11_SNAPSHOT_SCHEMA = "runtime-skill-snapshot/2.0"
-V11_LIBRARY_FORMAT = "harness3d-skill-library/2.0"
+V11_SNAPSHOT_SCHEMA = "runtime-skill-snapshot/3.0"
+V11_LIBRARY_FORMAT = "harness3d-skill-library/3.0"
 V11_ENTRY_ACTIVE = "active"
 V11_ENTRY_HISTORICAL = "historical"
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -84,6 +85,7 @@ def load_skill_source_v11(
     skill_id: str,
     version: str,
     question_type: str,
+    evidence_state: SkillEvidenceState,
 ) -> LoadedSkillV11:
     """Load one canonical complete source and bind framework identity to it."""
     path = resolve_source_ref(library_root, source_ref)
@@ -103,6 +105,7 @@ def load_skill_source_v11(
         skill_id=skill_id,
         version=version,
         question_type=question_type,
+        evidence_state=evidence_state,
         skill_md=text,
     )
     canonical_ref = source_ref_for(spec)
@@ -146,6 +149,7 @@ def _entry_of(
         "skill_id": spec.skill_id,
         "version": spec.version,
         "question_type": spec.question_type,
+        "evidence_state": spec.evidence_state,
         "source_ref": source.source_ref,
         "content_sha256": source.content_sha256,
         "parent_version": parent_version,
@@ -172,17 +176,20 @@ def _manifest_for(snapshot: dict) -> dict:
             "skill_id": entry["skill_id"],
             "version": entry["version"],
             "question_type": entry["question_type"],
+            "evidence_state": entry["evidence_state"],
             "source_ref": entry["source_ref"],
             "content_sha256": entry["content_sha256"],
             "parent_version": entry.get("parent_version"),
             "state": entry["state"],
+            **{k: entry[k] for k in (
+                "origin_skill_version", "origin_content_sha256") if k in entry},
         })
     return {
         "library_format": V11_LIBRARY_FORMAT,
         "snapshot_id": snapshot["snapshot_id"],
         "parent_snapshot_id": snapshot.get("parent_snapshot_id"),
         "generation": int(snapshot.get("generation", 0)),
-        "active_by_question_type": dict(snapshot["active_by_question_type"]),
+        "active_by_slot": snapshot["active_by_slot"],
         "entries": rows,
     }
 
@@ -195,27 +202,43 @@ def build_v11_snapshot(
     generation: int = 0,
     created_by: str = "format_migration",
     parent_versions: Mapping[str, str] | None = None,
+    origins: Mapping[str, dict] | None = None,
+    require_complete: bool = False,
 ) -> tuple[dict, dict]:
-    """Build a deterministic v11 snapshot with one active method per question type."""
+    """Build a deterministic snapshot with one active method per task/state slot."""
     if not _SAFE_ID_RE.fullmatch(str(snapshot_id or "")):
         raise V11LibraryError(f"snapshot_id 不是安全标识符: {snapshot_id!r}")
     entries: dict[str, dict] = {}
-    active_by_question_type: dict[str, str] = {}
+    active_by_slot: dict[str, dict[str, str]] = {}
+    slot_by_lineage: dict[str, str] = {}
     for source in sources:
         spec = source.spec
         key = f"{spec.skill_id}@{spec.version}"
         if key in entries:
             raise V11LibraryError(f"Skill 版本重复: {key}")
-        if spec.question_type in active_by_question_type:
+        states = active_by_slot.setdefault(spec.question_type, {})
+        if spec.evidence_state in states:
             raise V11LibraryError(
-                f"题型 {spec.question_type} 存在多个 active Skill: "
-                f"{active_by_question_type[spec.question_type]}, {key}")
+                f"槽位 {spec.slot_key} 存在多个 active Skill: "
+                f"{states[spec.evidence_state]}, {key}")
+        if spec.skill_id in slot_by_lineage:
+            raise V11LibraryError(f"lineage {spec.skill_id} 不能占据多个槽位")
+        slot_by_lineage[spec.skill_id] = spec.slot_key
         entries[key] = _entry_of(
             source, parent_version=(parent_versions or {}).get(spec.skill_id),
             state=V11_ENTRY_ACTIVE, created_by=created_by)
-        active_by_question_type[spec.question_type] = key
+        origin = (origins or {}).get(spec.skill_id)
+        if origin:
+            entries[key].update(origin)
+        states[spec.evidence_state] = key
     if not entries:
         raise V11LibraryError("v11 snapshot 至少需要一条 Skill")
+    if require_complete and (
+        set(active_by_slot) != set(TASK_TYPES)
+        or any(set(states) != set(SKILL_EVIDENCE_STATES)
+               for states in active_by_slot.values())
+    ):
+        raise V11LibraryError("完整基线要求八个题型各有三个证据状态槽位")
 
     snapshot = {
         "schema_version": V11_SNAPSHOT_SCHEMA,
@@ -223,7 +246,9 @@ def build_v11_snapshot(
         "parent_snapshot_id": parent_snapshot_id,
         "generation": int(generation),
         "skill_versions": sorted(entries),
-        "active_by_question_type": dict(sorted(active_by_question_type.items())),
+        "active_by_slot": {
+            task: dict(sorted(states.items()))
+            for task, states in sorted(active_by_slot.items())},
         "manifest_ref": (
             PurePosixPath("manifests") / f"manifest_{snapshot_id}.json"
         ).as_posix(),
@@ -248,18 +273,28 @@ def validate_v11_snapshot(
         raise V11LibraryError(
             f"不支持的 v11 snapshot schema: {snapshot.get('schema_version')!r}")
     entries = snapshot.get("entries")
-    active = snapshot.get("active_by_question_type")
+    active = snapshot.get("active_by_slot")
     if not isinstance(entries, dict) or not isinstance(active, dict):
-        raise V11LibraryError("v11 snapshot 缺少 entries/active_by_question_type mapping")
+        raise V11LibraryError("v11 snapshot 缺少 entries/active_by_slot mapping")
+    slots: list[tuple[str, str, str]] = []
+    for task, states in active.items():
+        if task not in TASK_TYPES or not isinstance(states, dict) or not states:
+            raise V11LibraryError(f"非法题型槽位: {task!r}")
+        for evidence_state, key in states.items():
+            if evidence_state not in SKILL_EVIDENCE_STATES or not isinstance(key, str):
+                raise V11LibraryError(f"非法证据状态槽位: {task}/{evidence_state}")
+            slots.append((task, evidence_state, key))
     if set(snapshot.get("skill_versions") or []) != set(entries):
         raise V11LibraryError("skill_versions 与 entries 不一致")
-    if len(set(active.values())) != len(active):
-        raise V11LibraryError("一个 active Skill 不能占据多个题型槽位")
+    active_keys = [key for _, _, key in slots]
+    if len(set(active_keys)) != len(active_keys):
+        raise V11LibraryError("一个 active Skill 不能占据多个槽位")
 
     limit = int(method_context_max_chars)
     if limit <= 0:
         raise V11LibraryError("method_context_max_chars 必须为正整数")
     loaded_by_key: dict[str, SkillSpecV11] = {}
+    lineage_slots: dict[str, str] = {}
     for key, entry in sorted(entries.items()):
         if not isinstance(entry, dict):
             raise V11LibraryError(f"v11 条目不是 mapping: {key}")
@@ -274,6 +309,7 @@ def validate_v11_snapshot(
             skill_id=str(entry.get("skill_id") or ""),
             version=str(entry.get("version") or ""),
             question_type=str(entry.get("question_type") or ""),
+            evidence_state=entry.get("evidence_state"),
         )
         if source.content_sha256 != entry.get("content_sha256"):
             raise V11LibraryError(
@@ -284,23 +320,26 @@ def validate_v11_snapshot(
                 f"{key} 完整 SKILL.md 为 {len(source.spec.skill_md)} 字符，"
                 f"超过服务限制 {limit}")
         loaded_by_key[key] = source.spec
+        prior_slot = lineage_slots.setdefault(source.spec.skill_id, source.spec.slot_key)
+        if prior_slot != source.spec.slot_key:
+            raise V11LibraryError(f"lineage {source.spec.skill_id} 的槽位不一致")
 
     active_entry_keys = {
         key for key, entry in entries.items()
         if entry.get("state") == V11_ENTRY_ACTIVE
     }
-    if set(active.values()) != active_entry_keys:
+    if set(active_keys) != active_entry_keys:
         raise V11LibraryError(
-            "active_by_question_type 必须完整且只引用 state=active 的条目")
+            "active_by_slot 必须完整且只引用 state=active 的条目")
     loaded: list[SkillSpecV11] = []
-    for question_type, key in sorted(active.items()):
+    for question_type, evidence_state, key in sorted(slots):
         entry = entries.get(key)
         if not isinstance(entry, dict):
             raise V11LibraryError(f"active 条目不存在: {question_type} -> {key}")
-        if entry.get("question_type") != question_type:
+        if (entry.get("question_type") != question_type
+                or entry.get("evidence_state") != evidence_state):
             raise V11LibraryError(
-                f"active 题型与条目不一致: {question_type} != "
-                f"{entry.get('question_type')}")
+                f"active 槽位与条目不一致: {question_type}/{evidence_state}")
         loaded.append(loaded_by_key[key])
     return loaded
 
@@ -414,7 +453,7 @@ def publish_v11_candidate(
                 f"active 快照不是候选父快照: expected={expected}, "
                 f"actual={before.get('snapshot_id')}")
         entries = json.loads(json.dumps(before["entries"]))
-        active = dict(before["active_by_question_type"])
+        active = json.loads(json.dumps(before["active_by_slot"]))
         parent_key = candidate.parent_skill_version
         parent = entries.get(parent_key)
         if not isinstance(parent, dict):
@@ -422,8 +461,10 @@ def publish_v11_candidate(
         spec = candidate.full_skill_spec
         if parent.get("question_type") != spec.question_type:
             raise V11LibraryError("首期修订不得改变规范题型")
-        if active.get(spec.question_type) != parent_key:
-            raise V11LibraryError(f"父版本不是题型 {spec.question_type} 的 active Skill")
+        if parent.get("evidence_state") != spec.evidence_state:
+            raise V11LibraryError("修订不得改变初始证据状态槽位")
+        if active.get(spec.question_type, {}).get(spec.evidence_state) != parent_key:
+            raise V11LibraryError(f"父版本不是槽位 {spec.slot_key} 的 active Skill")
         parent_spec = parent_specs.get(parent_key)
         if parent_spec is None:
             raise V11LibraryError(f"父版本不是当前 active Skill: {parent_key}")
@@ -448,6 +489,7 @@ def publish_v11_candidate(
             skill_id=spec.skill_id,
             version=spec.version,
             question_type=spec.question_type,
+            evidence_state=spec.evidence_state,
         )
         source_diff = "".join(difflib.unified_diff(
             parent_spec.skill_md.splitlines(keepends=True),
@@ -467,7 +509,7 @@ def publish_v11_candidate(
             modification_reason=candidate.modification_reason,
             diff_sha256=diff_sha256,
         )
-        active[spec.question_type] = candidate_key
+        active[spec.question_type][spec.evidence_state] = candidate_key
         generation = int(before.get("generation", 0)) + 1
         snapshot_id = (
             f"S{generation}-{spec.skill_id}-{spec.version}-{candidate.candidate_id}")
@@ -477,7 +519,9 @@ def publish_v11_candidate(
             "parent_snapshot_id": before["snapshot_id"],
             "generation": generation,
             "skill_versions": sorted(entries),
-            "active_by_question_type": dict(sorted(active.items())),
+            "active_by_slot": {
+                task: dict(sorted(states.items()))
+                for task, states in sorted(active.items())},
             "manifest_ref": (
                 PurePosixPath("manifests") / f"manifest_{snapshot_id}.json"
             ).as_posix(),
@@ -504,6 +548,8 @@ def publish_v11_candidate(
             "candidate_id": candidate.candidate_id,
             "skill_version": candidate_key,
             "parent_skill_version": parent_key,
+            "question_type": spec.question_type,
+            "evidence_state": spec.evidence_state,
             "snapshot_before": before["snapshot_id"],
             "snapshot_after": snapshot_id,
             "manifest_hash": manifest_hash,

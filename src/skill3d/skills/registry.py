@@ -54,7 +54,7 @@ def active_snapshot_provenance(path: str | Path) -> tuple[str, str]:
         return "genesis", ""
     snapshot_id = str(snap.get("snapshot_id", "genesis"))
     registered = str(snap.get("manifest_hash", "") or "")
-    if not registered or snap.get("schema_version") != "runtime-skill-snapshot/2.0":
+    if not registered or snap.get("schema_version") != "runtime-skill-snapshot/3.0":
         return snapshot_id, ""
     # When the library manifest is present, independently recompute its
     # canonical payload digest. A stale registration is not provenance.
@@ -101,9 +101,9 @@ def load_active_skills(
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"active snapshot 读取失败: {type(exc).__name__}: {exc}") from exc
     schema = str(snapshot.get("schema_version") or "")
-    if schema != "runtime-skill-snapshot/2.0":
+    if schema != "runtime-skill-snapshot/3.0":
         raise ValueError(
-            "当前在线协议只接受 runtime-skill-snapshot/2.0；"
+            "当前在线协议只接受 runtime-skill-snapshot/3.0；"
             f"收到 {schema or 'missing'}，历史快照请在对应 Git 提交运行")
     from .v11_library import validate_v11_snapshot
 

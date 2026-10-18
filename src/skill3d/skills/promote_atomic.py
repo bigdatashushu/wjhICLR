@@ -72,8 +72,8 @@ def rollback(store_dir: str | Path, snapshot_before: str,
     store_dir = Path(store_dir)
     with publish_lock(store_dir):
         snap = read_snapshot(store_dir, snapshot_before)
-        if snap.get("schema_version") != "runtime-skill-snapshot/2.0":
-            raise ValueError("回滚目标必须是 runtime-skill-snapshot/2.0")
+        if snap.get("schema_version") != "runtime-skill-snapshot/3.0":
+            raise ValueError("回滚目标必须是 runtime-skill-snapshot/3.0")
         manifest_path = resolve_source_like_ref(store_dir.parent, snap["manifest_ref"])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         write_v11_snapshot(store_dir.parent, snap, manifest, activate=True)

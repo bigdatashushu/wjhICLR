@@ -367,6 +367,8 @@ class SceneState(Spec):
         qt = str(question_type or "")
         return (qt in METRIC_TASK_TYPES
                 and self.metric_gate_passed
+                and self.evidence_profile is not None
+                and self.evidence_profile.metric_scale == "available"
                 and self.question_tool_scope == "metric_enabled")
 
     def evidence_state(self, capability: str) -> str:

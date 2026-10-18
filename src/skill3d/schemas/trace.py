@@ -51,9 +51,9 @@ RoundTriggerValue = Literal["initial", "observation", "error_recovery", "finaliz
 # 6.0 与 9.0 语料由 `skill3d.legacy.readers.read_legacy_episode_trace` 只读解释；
 # **不得**直接 `model_validate` 成当前对象。9.1 新增评测视觉补答及原失败快照，
 # 旧记录缺该字段表示“当时未记录”，不能被默认空对象解释成“当时未触发”。
-EPISODE_TRACE_SCHEMA_VERSION = "9.2"
+EPISODE_TRACE_SCHEMA_VERSION = "9.4"
 EVALUATION_CONTRACT_VERSION = "evaluation-v11.5-parse-submit-score"
-LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS: tuple[str, ...] = ("6.0", "9.0", "9.1")
+LEGACY_EPISODE_TRACE_SCHEMA_VERSIONS: tuple[str, ...] = ("6.0", "9.0", "9.1", "9.2", "9.3")
 AnswerParseStatus = Literal["parsed", "unparsed", "no_answer"]
 SubmissionStatus = Literal["accepted", "rejected", "not_submitted"]
 ScoringStatus = Literal["scored", "reference_unavailable", "invalid_reference", "incomplete"]
@@ -266,8 +266,11 @@ class EpisodeTrace(Spec):
     metric_model: str = "none"
     # 逐题授权后的米制题型（空 = 未授权）
     authorized_metric_tasks: list[str] = []
-    # EvidenceProfile 三值快照（便于按证据状态分组统计，§16.5/§18.5）
+    # 两项二值终态，以及首次求解和每次能力/候选变化时的快照。
     evidence_states: dict[str, str] = {}
+    evidence_history: list[dict] = []
+    initial_evidence_states: dict[str, str] = {}
+    initial_skill_selection: dict = {}
     input_degradation_flags: list[str] = []
     answer_source: str = ""
     evaluation_contract_version: str = EVALUATION_CONTRACT_VERSION

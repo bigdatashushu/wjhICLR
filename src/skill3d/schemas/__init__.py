@@ -56,15 +56,12 @@ from .data_access import (
     utcnow_iso,
 )
 from .evidence import (
-    ALWAYS_AVAILABLE_CAPABILITIES,
     CAPABILITIES,
     CAPABILITY_ORDER,
     GATE_SUBCONDITIONS,
     GATE_VERSION,
     UNAVAILABLE_REASON_CODES,
     PROFILE_VERSION,
-    QUESTION_CAPABILITIES,
-    SCENE_CAPABILITIES,
     CapabilityState,
     EvidenceProfile,
     MetricGateStatus,

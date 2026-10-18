@@ -39,9 +39,7 @@ def _handle(n_frames: int = 4, *, max_images: int = 32, max_derived: int = 8):
     from skill3d.schemas.evidence import EvidenceProfile
     from skill3d.tools.scene_handle import SceneHandle
 
-    profile = EvidenceProfile(geometry_3d="unavailable", world_frame="unavailable",
-                              metric_scale="unavailable", object_detection="unavailable",
-                              track_consensus="unavailable", object_grounding="unavailable")
+    profile = EvidenceProfile(geometry_3d="unavailable", metric_scale="unavailable")
     state = SceneState(artifact_ref="a", scene_route="fallback_2d_only",
                        evidence_profile=profile, objects=[], summary="s")
     handle = SceneHandle(state)
@@ -60,7 +58,7 @@ def test_both_active_vision_tools_are_registered():
     for name in ("inspect_frames", "detect_objects"):
         spec = REGISTRY.spec(name)
         assert spec.requires_artifacts == ["frames"]
-        assert "image_2d" in spec.requires_evidence
+        assert spec.requires_evidence == []
     # §9.2：重建失败（2D-only）时这两个工具必须**仍然**可用（视觉路径不能被收回）
     fallback = set(REGISTRY.names_for_scope("fallback_2d_only"))
     assert {"inspect_frames", "detect_objects"} <= fallback

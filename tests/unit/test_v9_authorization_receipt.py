@@ -47,9 +47,7 @@ RECEIPT_FIELDS = ("episode_id", "tool_id", "argument_digest", "evidence_version"
 # --------------------------------------------------- §6.4 收据字段与同源 ----
 
 def _profile(**over) -> EvidenceProfile:
-    base = dict(geometry_3d="available", world_frame="available",
-                metric_scale="available", object_detection="available",
-                track_consensus="available", object_grounding="available")
+    base = dict(geometry_3d="available", metric_scale="available")
     base.update(over)
     return EvidenceProfile(**base)
 
@@ -155,7 +153,7 @@ def test_evidence_gap_denial_names_the_missing_capability():
     """证据不足的拒绝要能说出缺哪个能力（收据与错误文案同源）。"""
     scene = _scene()
     scene = scene.model_copy(update={"evidence_profile": _profile(
-        geometry_3d="unavailable", object_detection="unavailable",
+        geometry_3d="unavailable",
         metric_scale="unavailable")})
     spec = REGISTRY.get("count_objects").spec
     decision = authorize_tool_call(
@@ -254,11 +252,9 @@ def test_unavailable_reason_vocabulary_covers_four_classes_plus_quality_gate():
 
 
 def test_state_reasons_accepts_documented_codes_and_rejects_others():
-    base = dict(geometry_3d="unavailable", world_frame="unavailable",
-                metric_scale="unavailable", object_detection="unavailable",
-                track_consensus="unavailable")
+    base = dict(geometry_3d="unavailable", metric_scale="unavailable")
     ok = EvidenceProfile(**base, state_reasons={"metric_scale": "not_run",
-                                                "object_detection": "producer_failed"})
+                                                "geometry_3d": "producer_failed"})
     assert ok.state_reasons["metric_scale"] == "not_run"
     with pytest.raises(Exception):
         EvidenceProfile(**base, state_reasons={"metric_scale": "guess"})
