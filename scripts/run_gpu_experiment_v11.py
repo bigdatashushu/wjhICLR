@@ -499,19 +499,50 @@ def _pipeline(
              commands=commands, stage="metric_b01_b11")
         return commands
     recon_dir = run_root / "reconstructions"
-    question_type = str(experiment["question_type"])
-    evidence_state = str(experiment.get("evidence_state") or "")
-    if experiment.get("run_evolution") and evidence_state not in {
-        "g0m0", "g1m0", "g1m1"
-    }:
+    question_type = str(
+        experiment.get("question_types")
+        or experiment.get("question_type")
+        or ""
+    )
+    if not question_type:
+        raise GPUExperimentError("experiment.question_types is empty")
+    slot_manifest_value = str(experiment.get("slot_manifest") or "")
+    slot_manifest = (
+        (root / slot_manifest_value).resolve()
+        if slot_manifest_value
+        and not Path(slot_manifest_value).is_absolute()
+        else Path(slot_manifest_value).resolve()
+        if slot_manifest_value
+        else None
+    )
+    all_reachable_slots = bool(
+        experiment.get("all_reachable_slots", False)
+    )
+    if all_reachable_slots and slot_manifest is not None:
         raise GPUExperimentError(
-            "run_evolution=true requires experiment.evidence_state")
+            "all_reachable_slots and slot_manifest are mutually exclusive")
+    evidence_state = str(experiment.get("evidence_state") or "")
+    if (
+        experiment.get("run_evolution")
+        and not all_reachable_slots
+        and slot_manifest is None
+        and evidence_state not in {
+        "g0m0", "g1m0", "g1m1"
+        }
+    ):
+        raise GPUExperimentError(
+            "run_evolution=true requires slot_manifest or evidence_state")
+    if slot_manifest is not None and not slot_manifest.is_file():
+        raise GPUExperimentError(
+            f"slot manifest does not exist: {slot_manifest}")
     datasets = str(experiment.get("datasets") or "")
     seed = int(experiment["seed"])
     sampling = int(experiment["reconstruction_sampling_per_task"])
     if sampling < max(int(experiment["inner_limit"]),
+                      int(experiment.get("outer_limit", 8)),
                       int(experiment["induction_limit"]) + int(experiment["post_publish_limit"])):
-        raise GPUExperimentError("reconstruction panel cannot cover learning/inner/post limits")
+        raise GPUExperimentError(
+            "reconstruction panel cannot cover learning/inner/outer/post limits")
 
     reconstruction = [
         python,
@@ -522,7 +553,7 @@ def _pipeline(
         "--source",
         "vsi_bench",
         "--split",
-        "induction,inner_validation",
+        "induction,inner_validation,outer_holdout",
         "--video-root",
         video_root,
         "--recon-dir",
@@ -532,7 +563,7 @@ def _pipeline(
         "--sampling-per-task",
         str(sampling),
         "--episodes-per-scene",
-        "1",
+        "8",
         "--n-frames",
         str(runtime["n_images"]),
         "--seed",
@@ -565,10 +596,6 @@ def _pipeline(
             config_path,
             "--stream-id",
             str(experiment["campaign_id"]),
-            "--question-types",
-            question_type,
-            "--evidence-states",
-            evidence_state,
             "--source",
             "vsi_bench",
             "--video-root",
@@ -581,10 +608,14 @@ def _pipeline(
             str(sampling),
             "--inner-candidates-per-task",
             str(sampling),
+            "--outer-candidates-per-task",
+            str(sampling),
             "--post-limit",
             str(experiment["post_publish_limit"]),
             "--min-evaluation-pairs",
             str(experiment.get("min_evaluation_pairs", 8)),
+            "--outer-limit-per-slot",
+            str(experiment.get("outer_limit", 8)),
             "--batch-size",
             str(experiment.get("evolution_batch_size", 12)),
             "--seed",
@@ -595,7 +626,21 @@ def _pipeline(
             str(library),
             "--run-root",
             str(run_root / "evolution"),
+            "--binding-store",
+            str(run_root / "prepared_binding_store"),
+            "--prepare-bindings",
+            "--require-prepared-bindings",
+            "--run-outer",
         ]
+        if slot_manifest is not None:
+            stream.extend(["--slot-manifest", str(slot_manifest)])
+        elif not all_reachable_slots:
+            stream.extend([
+                "--question-types",
+                question_type,
+                "--evidence-states",
+                evidence_state,
+            ])
         if datasets:
             stream.extend(["--datasets", datasets])
         _run(

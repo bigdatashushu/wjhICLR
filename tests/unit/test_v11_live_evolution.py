@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,9 +13,15 @@ from skill3d.evolution.live_v11 import (
     V11LiveEvolutionError,
     V11LiveEvolutionScheduler,
     V11LiveSchedulerConfig,
+    V11ProductionAttempt,
     prepare_validation_panels,
+    select_scene_round_robin,
+    validation_panel_manifest,
 )
-from skill3d.evolution.streaming_v11 import StreamingAttemptResult
+from skill3d.evolution.streaming_v11 import (
+    StreamingAttemptRequest,
+    StreamingAttemptResult,
+)
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.schemas import SkillSpecV11, V11ExperienceCase
 
@@ -120,6 +127,76 @@ def test_validation_panels_freeze_eight_exact_slot_pairs(tmp_path):
         item.episode.scene_name != "learning-scene"
         for item in panel.items
     )
+    manifest = validation_panel_manifest(panels)
+    slot = manifest["slots"]["object_rel_distance/g1m0"]
+    assert slot["unique_scene_count"] == 8
+    assert slot["selection_contract"] == {
+        "algorithm": "stable-scene-round-robin",
+        "max_per_scene": 1,
+        "min_unique_scenes": 8,
+    }
+
+
+def test_validation_panel_round_robin_takes_one_row_per_scene(tmp_path):
+    items = [
+        _item(index, split="inner_validation", scene=f"scene-{index % 8}")
+        for index in range(16)
+    ]
+    artifacts = {
+        item.episode.qa_id: tmp_path / f"{item.episode.qa_id}.json"
+        for item in items
+    }
+    panels = prepare_validation_panels(
+        items,
+        artifacts,
+        required_slots=[("object_rel_distance", "g1m0")],
+        min_pairs=8,
+        state_resolver=lambda _item, _path: "g1m0",
+    )
+    panel = panels["object_rel_distance/g1m0"]
+    assert panel.qa_ids == tuple(
+        f"qa-inner_validation-{index:02d}" for index in range(8)
+    )
+    assert panel.unique_scene_count == 8
+
+
+def test_validation_panel_rejects_many_rows_from_too_few_scenes(tmp_path):
+    items = [
+        _item(index, split="inner_validation", scene=f"scene-{index % 2}")
+        for index in range(16)
+    ]
+    artifacts = {
+        item.episode.qa_id: tmp_path / f"{item.episode.qa_id}.json"
+        for item in items
+    }
+    with pytest.raises(V11LiveEvolutionError, match="8 unique scenes"):
+        prepare_validation_panels(
+            items,
+            artifacts,
+            required_slots=[("object_rel_distance", "g1m0")],
+            min_pairs=8,
+            state_resolver=lambda _item, _path: "g1m0",
+        )
+
+
+def test_scene_round_robin_supports_bounded_second_round():
+    items = [
+        _item(1, split="induction", scene="scene-a"),
+        _item(2, split="induction", scene="scene-a"),
+        _item(3, split="induction", scene="scene-b"),
+        _item(4, split="induction", scene="scene-b"),
+    ]
+    selected = select_scene_round_robin(
+        items,
+        limit=4,
+        max_per_scene=2,
+    )
+    assert [item.episode.qa_id for item in selected] == [
+        "qa-induction-01",
+        "qa-induction-03",
+        "qa-induction-02",
+        "qa-induction-04",
+    ]
 
 
 def test_validation_panel_shortage_fails_before_model_calls(tmp_path):
@@ -136,6 +213,84 @@ def test_validation_panel_shortage_fails_before_model_calls(tmp_path):
             min_pairs=8,
             state_resolver=lambda _item, _path: "g1m0",
         )
+
+
+def test_post_panel_excludes_request_and_previously_used_scenes(tmp_path):
+    parent = _parent()
+    request_items = [
+        _item(90, split="induction", scene="request-scene-a"),
+        _item(91, split="induction", scene="request-scene-b"),
+    ]
+    request = StreamingAttemptRequest(
+        stream_id="live-test",
+        question_type=parent.question_type,
+        evidence_state=parent.evidence_state,
+        parent_snapshot_id="snapshot-parent",
+        parent_skill_version=f"{parent.skill_id}@{parent.version}",
+        parent_content_sha256=parent.content_sha256,
+        attempt_index=1,
+        trigger="batch",
+        cases=tuple(
+            _case(parent, item, index)
+            for index, item in enumerate(request_items, start=1)
+        ),
+        new_case_count=2,
+    )
+    post_items = [
+        _item(1, split="induction", scene="request-scene-a"),
+        _item(2, split="induction", scene="used-scene"),
+        _item(3, split="induction", scene="used-by-other-slot"),
+        _item(4, split="induction", scene="fresh-scene-a"),
+        _item(5, split="induction", scene="fresh-scene-a"),
+        _item(6, split="induction", scene="fresh-scene-b"),
+        _item(7, split="induction", scene="fresh-scene-c"),
+        _item(8, split="induction", scene="fresh-scene-d"),
+    ]
+    campaign_root = tmp_path / "campaigns"
+    campaign_root.mkdir()
+    (campaign_root / "post_publish_usage.json").write_text(
+        json.dumps({
+            "schema_version": "v11-post-publish-usage/1.2",
+            "used_qa_ids": [],
+            "used_scene_ids_by_slot": {
+                request.slot_key: ["used-scene"],
+                "object_counting/g1m0": ["used-by-other-slot"],
+            },
+        }),
+        encoding="utf-8",
+    )
+    attempt = V11ProductionAttempt(
+        library_root=tmp_path / "library",
+        campaign_root=campaign_root,
+        base_cfg=OnlineRunConfig(),
+        validation_panels={},
+        post_items_by_slot={request.slot_key: post_items},
+        post_artifact_paths={
+            item.episode.qa_id: tmp_path / f"{item.episode.qa_id}.json"
+            for item in post_items
+        },
+        reviser=lambda *_args, **_kwargs: None,
+        quality_confirmation={},
+        post_limit=4,
+    )
+    selected, _ = attempt._post_panel(request, "campaign-001")
+    assert [item.episode.scene_name for item in selected] == [
+        "used-by-other-slot",
+        "fresh-scene-a",
+        "fresh-scene-b",
+        "fresh-scene-c",
+    ]
+    manifest = json.loads(
+        (campaign_root / "campaign-001" / "live_inputs.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["post_scene_ids"] == [
+        "used-by-other-slot",
+        "fresh-scene-a",
+        "fresh-scene-b",
+        "fresh-scene-c",
+    ]
 
 
 def test_live_scheduler_runs_isolated_episodes_and_triggers_at_twelve(tmp_path):

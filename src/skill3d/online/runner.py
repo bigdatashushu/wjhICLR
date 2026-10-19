@@ -27,7 +27,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 from skill3d.online.config import default_mask_review
@@ -2305,8 +2305,16 @@ def _retarget_handle(handle: Optional[SceneHandle], scene: SceneState) -> Option
 
 
 @capture_detector_attempts()
-def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
-                              llm=None, point_conf=None) -> tuple[list, dict, list[str], bool]:
+def _bind_objects_best_effort(
+    art,
+    pixels,
+    _scene,
+    episode,
+    cfg=None,
+    llm=None,
+    point_conf=None,
+    m5_out_dir=None,
+) -> tuple[list, dict, list[str], bool]:
     """M5 对象绑定：SAM2 未配置等失败 → 记降级、不阻断（§4 M5 字段 9）。
 
     返回 `(objects, stats, notes, materialized)`：
@@ -2334,7 +2342,9 @@ def _bind_objects_best_effort(art, pixels, _scene, episode, cfg=None,
             pixels, None, episode.question, depth_maps=depth, c2w_list=c2w,
             question_type=canonical_task(episode.question_type),
             options=episode.options,
-            intrinsics=intr, out_dir=_m5_out_dir(art), scene_name=art.scene_name,
+            intrinsics=intr,
+            out_dir=m5_out_dir if m5_out_dir is not None else _m5_out_dir(art),
+            scene_name=art.scene_name,
             # v6：BA 已废止 → 深度网格恒为纯缩放（mask_to_grid 走 resize_mask_nearest），
             # 不再需要 grid_transform 仿射映射（§20 废止表）
             grid_transform=None,
@@ -3320,8 +3330,14 @@ def _run_id(cfg: OnlineRunConfig, split: str, n: int) -> str:
     return f"eval-{uuid.uuid4().hex[:12]}"
 
 
-def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[TraceStore] = None,
-              llm=None) -> tuple[list[EpisodeOutcome], EvaluationRun]:
+def run_split(
+    items: Sequence,
+    cfg: OnlineRunConfig,
+    *,
+    trace_store: Optional[TraceStore] = None,
+    llm=None,
+    prepared_bindings: Optional[Mapping[str, PreparedObjectBinding]] = None,
+) -> tuple[list[EpisodeOutcome], EvaluationRun]:
     """跑一批 episode 并聚合为 `EvaluationRun`（§5.7）。items 为 EpisodeItem 序列。"""
     from datetime import datetime, timezone
 
@@ -3336,15 +3352,31 @@ def run_split(items: Sequence, cfg: OnlineRunConfig, *, trace_store: Optional[Tr
     if store is not None and items:
         store.claim_run(run_id)
         store = store.bind(run_id=run_id)
-    outcomes = [run_episode(
-        it.episode,
-        it.pixels,
-        cfg,
-        geometry=it.geometry,
-        trace_store=store.bind(qa_id=it.episode.qa_id) if store is not None else None,
-        llm=llm,
-        input_error=getattr(it, "input_error", None),
-    ) for it in items]
+    prepared = dict(prepared_bindings or {})
+    unknown_prepared = set(prepared) - {
+        it.episode.qa_id for it in items
+    }
+    if unknown_prepared:
+        raise ValueError(
+            f"prepared bindings contain unknown qa_ids: {sorted(unknown_prepared)}"
+        )
+    outcomes = [
+        run_episode(
+            it.episode,
+            it.pixels,
+            cfg,
+            geometry=it.geometry,
+            trace_store=(
+                store.bind(qa_id=it.episode.qa_id)
+                if store is not None
+                else None
+            ),
+            llm=llm,
+            prepared_binding=prepared.get(it.episode.qa_id),
+            input_error=getattr(it, "input_error", None),
+        )
+        for it in items
+    ]
 
     mca = [o for o in outcomes if o.is_mca]
     na = [o for o in outcomes if not o.is_mca]

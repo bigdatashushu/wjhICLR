@@ -13,6 +13,7 @@ from typing import Callable, Mapping, Sequence
 
 from skill3d.adapters.episode_source import EpisodeItem
 from skill3d.evaluation.skill_ablation_v11 import (
+    input_identity,
     initial_state_for_item,
     quality_contract,
 )
@@ -42,8 +43,11 @@ from skill3d.evolution.streaming_v11 import (
 )
 from skill3d.online import runner
 from skill3d.online.runner import OnlineRunConfig
-from skill3d.routing.task_classifier import canonical_task
-from skill3d.schemas import SkillSpecV11
+from skill3d.routing.task_classifier import TASK_TYPES, canonical_task
+from skill3d.schemas import METRIC_TASK_TYPES, SkillSpecV11
+from skill3d.segmentation.prepared_binding_store import (
+    load_prepared_binding_reference,
+)
 from skill3d.skills.promote_atomic import read_snapshot
 from skill3d.skills.registry import (
     active_snapshot_provenance,
@@ -52,6 +56,11 @@ from skill3d.skills.registry import (
 from skill3d.skills.v11_library import validate_v11_snapshot
 
 SlotKey = tuple[str, str]
+REACHABLE_V11_SLOTS: tuple[SlotKey, ...] = (
+    *((question_type, "g0m0") for question_type in TASK_TYPES),
+    *((question_type, "g1m0") for question_type in TASK_TYPES),
+    *((question_type, "g1m1") for question_type in METRIC_TASK_TYPES),
+)
 StateResolver = Callable[[EpisodeItem, str | Path], str]
 ActiveProvider = Callable[[], tuple[list[SkillSpecV11], str, str]]
 SnapshotProvider = Callable[[str], tuple[list[SkillSpecV11], str]]
@@ -123,12 +132,16 @@ def slot_key(question_type: str, evidence_state: str) -> str:
 
 @dataclass(frozen=True)
 class V11ValidationPanel:
-    """One frozen exact-slot E11 panel."""
+    """One frozen exact-slot evaluation panel."""
 
     question_type: str
     evidence_state: str
     items: tuple[EpisodeItem, ...]
     artifact_paths: Mapping[str, str]
+    source_split: str = "inner_validation"
+    selection_algorithm: str = "stable-scene-round-robin"
+    max_per_scene: int = 1
+    min_unique_scenes: int = 8
 
     @property
     def key(self) -> str:
@@ -137,6 +150,43 @@ class V11ValidationPanel:
     @property
     def qa_ids(self) -> tuple[str, ...]:
         return tuple(item.episode.qa_id for item in self.items)
+
+    @property
+    def scene_ids(self) -> tuple[str, ...]:
+        return tuple(str(item.episode.scene_name) for item in self.items)
+
+    @property
+    def unique_scene_count(self) -> int:
+        return len(set(self.scene_ids))
+
+
+def select_scene_round_robin(
+    items: Sequence[EpisodeItem],
+    *,
+    limit: int,
+    max_per_scene: int = 1,
+) -> list[EpisodeItem]:
+    """Select deterministically in scene rounds while preserving input order."""
+    if int(limit) <= 0:
+        raise ValueError("limit must be positive")
+    if int(max_per_scene) <= 0:
+        raise ValueError("max_per_scene must be positive")
+    by_scene: dict[str, list[EpisodeItem]] = {}
+    for item in items:
+        scene_id = str(item.episode.scene_name or "")
+        if not scene_id:
+            raise V11LiveEvolutionError(
+                f"{item.episode.qa_id}: missing scene identity"
+            )
+        by_scene.setdefault(scene_id, []).append(item)
+    selected: list[EpisodeItem] = []
+    for round_index in range(int(max_per_scene)):
+        for scene_items in by_scene.values():
+            if round_index < len(scene_items):
+                selected.append(scene_items[round_index])
+                if len(selected) == int(limit):
+                    return selected
+    return selected
 
 
 def partition_items_by_slot(
@@ -180,27 +230,39 @@ def partition_items_by_slot(
     return grouped
 
 
-def prepare_validation_panels(
+def prepare_slot_panels(
     items: Sequence[EpisodeItem],
     artifact_paths: Mapping[str, str | Path],
     *,
     required_slots: Sequence[SlotKey],
+    source_split: str,
     min_pairs: int = 8,
+    max_per_scene: int = 1,
+    min_unique_scenes: int | None = None,
     excluded_scene_ids: Sequence[str] = (),
     state_resolver: StateResolver = initial_state_for_item,
 ) -> dict[str, V11ValidationPanel]:
-    """Freeze at least ``min_pairs`` independent inner-validation rows per slot."""
+    """Freeze at least ``min_pairs`` scene-independent rows per exact slot."""
     if int(min_pairs) <= 0:
         raise ValueError("min_pairs must be positive")
+    if int(max_per_scene) <= 0:
+        raise ValueError("max_per_scene must be positive")
+    required_unique_scenes = (
+        int(min_pairs)
+        if min_unique_scenes is None
+        else int(min_unique_scenes)
+    )
+    if required_unique_scenes <= 0 or required_unique_scenes > int(min_pairs):
+        raise ValueError("min_unique_scenes must be in [1, min_pairs]")
     required = [
         (canonical_task(question_type), evidence_state)
         for question_type, evidence_state in required_slots
     ]
     if len(set(required)) != len(required):
         raise V11LiveEvolutionError("required validation slots contain duplicates")
-    if any(item.episode.split != "inner_validation" for item in items):
+    if any(item.episode.split != source_split for item in items):
         raise V11LiveEvolutionError(
-            "validation panel candidates must all use inner_validation"
+            f"panel candidates must all use {source_split}"
         )
     grouped = partition_items_by_slot(
         items,
@@ -210,14 +272,31 @@ def prepare_validation_panels(
         state_resolver=state_resolver,
     )
     panels: dict[str, V11ValidationPanel] = {}
-    shortages: dict[str, int] = {}
+    shortages: dict[str, dict[str, int]] = {}
     for question_type, evidence_state in required:
         key = slot_key(question_type, evidence_state)
         candidates = grouped.get(key, [])
-        if len(candidates) < int(min_pairs):
-            shortages[key] = len(candidates)
+        unique_scene_count = len({
+            str(item.episode.scene_name) for item in candidates
+        })
+        selected = tuple(select_scene_round_robin(
+            candidates,
+            limit=int(min_pairs),
+            max_per_scene=int(max_per_scene),
+        ))
+        selected_unique_scene_count = len({
+            str(item.episode.scene_name) for item in selected
+        })
+        if (
+            len(selected) < int(min_pairs)
+            or selected_unique_scene_count < required_unique_scenes
+        ):
+            shortages[key] = {
+                "candidate_rows": len(candidates),
+                "unique_scenes": unique_scene_count,
+                "selected_rows": len(selected),
+            }
             continue
-        selected = tuple(candidates[: int(min_pairs)])
         selected_artifacts = {
             item.episode.qa_id: str(
                 Path(artifact_paths[item.episode.qa_id]).resolve()
@@ -229,29 +308,63 @@ def prepare_validation_panels(
             evidence_state=evidence_state,
             items=selected,
             artifact_paths=selected_artifacts,
+            source_split=source_split,
+            max_per_scene=int(max_per_scene),
+            min_unique_scenes=required_unique_scenes,
         )
     if shortages:
         raise V11LiveEvolutionError(
-            "inner_validation exact-slot panels require at least "
-            f"{int(min_pairs)} pairs: {shortages}"
+            f"{source_split} exact-slot panels require at least "
+            f"{int(min_pairs)} pairs and {required_unique_scenes} unique "
+            f"scenes: {shortages}"
         )
     return panels
+
+
+def prepare_validation_panels(
+    items: Sequence[EpisodeItem],
+    artifact_paths: Mapping[str, str | Path],
+    *,
+    required_slots: Sequence[SlotKey],
+    min_pairs: int = 8,
+    max_per_scene: int = 1,
+    min_unique_scenes: int | None = None,
+    excluded_scene_ids: Sequence[str] = (),
+    state_resolver: StateResolver = initial_state_for_item,
+) -> dict[str, V11ValidationPanel]:
+    """Freeze the inner-validation admission panel."""
+    return prepare_slot_panels(
+        items,
+        artifact_paths,
+        required_slots=required_slots,
+        source_split="inner_validation",
+        min_pairs=min_pairs,
+        max_per_scene=max_per_scene,
+        min_unique_scenes=min_unique_scenes,
+        excluded_scene_ids=excluded_scene_ids,
+        state_resolver=state_resolver,
+    )
 
 
 def validation_panel_manifest(
     panels: Mapping[str, V11ValidationPanel],
 ) -> dict:
     return {
-        "schema_version": "v11-validation-panels/1.0",
+        "schema_version": "v11-validation-panels/1.1",
         "slots": {
             key: {
                 "question_type": panel.question_type,
                 "evidence_state": panel.evidence_state,
+                "source_split": panel.source_split,
                 "n_pairs": len(panel.items),
+                "unique_scene_count": panel.unique_scene_count,
+                "selection_contract": {
+                    "algorithm": panel.selection_algorithm,
+                    "max_per_scene": panel.max_per_scene,
+                    "min_unique_scenes": panel.min_unique_scenes,
+                },
                 "qa_ids": list(panel.qa_ids),
-                "scene_ids": [
-                    item.episode.scene_name for item in panel.items
-                ],
+                "scene_ids": list(panel.scene_ids),
                 "artifact_paths": dict(panel.artifact_paths),
             }
             for key, panel in sorted(panels.items())
@@ -267,6 +380,7 @@ class V11LiveSchedulerConfig:
     batch_size: int = 12
     flush_tail: bool = True
     retry_deferred: bool = False
+    require_prepared_bindings: bool = False
 
 
 class V11LiveEvolutionScheduler:
@@ -286,6 +400,7 @@ class V11LiveEvolutionScheduler:
         episode_executor: EpisodeExecutor | None = None,
         case_collector: CaseCollector = collect_v11_streaming_case,
         client_factory: Callable[[str], object] | None = None,
+        prepared_binding_refs: Mapping[str, Mapping] | None = None,
     ) -> None:
         self.cfg = cfg
         self.root = Path(cfg.root).resolve()
@@ -303,6 +418,10 @@ class V11LiveEvolutionScheduler:
         self.episode_executor = episode_executor or self._execute_episode
         self.case_collector = case_collector
         self.client_factory = client_factory
+        self.prepared_binding_refs = {
+            str(qa_id): copy.deepcopy(dict(reference))
+            for qa_id, reference in (prepared_binding_refs or {}).items()
+        }
         self.stream = StreamingEvolutionRunner(
             self.root / "buffer",
             stream_id=cfg.stream_id,
@@ -376,7 +495,38 @@ class V11LiveEvolutionScheduler:
             if self.client_factory is not None
             else None
         )
-        _, run = runner.run_split([item], cfg, llm=llm)
+        prepared = {}
+        reference = self.prepared_binding_refs.get(item.episode.qa_id)
+        if reference is not None:
+            if (
+                Path(reference["scene_artifact_ref"]).resolve()
+                != Path(artifact_path).resolve()
+            ):
+                raise V11LiveEvolutionError(
+                    f"{item.episode.qa_id}: prepared binding scene path changed"
+                )
+            current_input = input_identity(item, artifact_path)
+            if (
+                reference.get("scene_input_identity_sha256")
+                != current_input["sha256"]
+            ):
+                raise V11LiveEvolutionError(
+                    f"{item.episode.qa_id}: prepared binding input changed"
+                )
+            prepared[item.episode.qa_id] = load_prepared_binding_reference(
+                reference,
+                scene_input_identity=current_input,
+            )
+        elif self.cfg.require_prepared_bindings:
+            raise V11LiveEvolutionError(
+                f"{item.episode.qa_id}: required prepared binding is missing"
+            )
+        _, run = runner.run_split(
+            [item],
+            cfg,
+            llm=llm,
+            prepared_bindings=prepared,
+        )
         return f"online_run:{run.run_id}"
 
     @staticmethod
@@ -430,6 +580,13 @@ class V11LiveEvolutionScheduler:
             raise V11LiveEvolutionError(
                 f"{qa_id}: missing induction artifact"
             )
+        if (
+            self.cfg.require_prepared_bindings
+            and qa_id not in self.prepared_binding_refs
+        ):
+            raise V11LiveEvolutionError(
+                f"{qa_id}: required prepared binding is missing"
+            )
         question_type = canonical_task(item.episode.question_type)
         evidence_state = self.state_resolver(item, artifact_path)
         key = slot_key(question_type, evidence_state)
@@ -443,12 +600,18 @@ class V11LiveEvolutionScheduler:
         active_skills, active_snapshot, active_manifest = self.active_provider()
         if plan_path.is_file():
             plan = json.loads(plan_path.read_bytes())
+            prepared_reference = self.prepared_binding_refs.get(qa_id)
             expected = {
                 "qa_id": qa_id,
                 "question_type": question_type,
                 "evidence_state": evidence_state,
                 "slot_key": key,
                 "artifact_path": str(Path(artifact_path).resolve()),
+                "prepared_binding_key": (
+                    str(prepared_reference.get("key") or "")
+                    if prepared_reference is not None
+                    else ""
+                ),
             }
             if any(plan.get(name) != value for name, value in expected.items()):
                 raise V11LiveEvolutionError(
@@ -487,6 +650,7 @@ class V11LiveEvolutionScheduler:
             planned_skills = active_skills
             planned_manifest = active_manifest
             source_run_ref = ""
+            prepared_reference = self.prepared_binding_refs.get(qa_id)
             plan = {
                 "schema_version": "v11-live-episode-plan/1.0",
                 "stream_id": self.cfg.stream_id,
@@ -496,6 +660,11 @@ class V11LiveEvolutionScheduler:
                 "evidence_state": evidence_state,
                 "slot_key": key,
                 "artifact_path": str(Path(artifact_path).resolve()),
+                "prepared_binding_key": (
+                    str(prepared_reference.get("key") or "")
+                    if prepared_reference is not None
+                    else ""
+                ),
                 "parent_snapshot_id": planned_snapshot,
                 "parent_manifest_sha256": planned_manifest,
                 "parent_skill_version": f"{parent.skill_id}@{parent.version}",
@@ -629,7 +798,14 @@ class V11ProductionAttempt:
     max_revision_attempts: int = 3
     paired_client_factory: Callable[[str, str], object] | None = None
     post_client_factory: Callable[[str], object] | None = None
+    prepared_binding_store: str | Path | None = None
+    prepared_binding_refs: Mapping[str, Mapping] | None = None
     _used_post_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _used_post_scene_ids_by_slot: dict[str, set[str]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self.library_root = Path(self.library_root).resolve()
@@ -646,13 +822,29 @@ class V11ProductionAttempt:
         if self._usage_path.is_file():
             payload = json.loads(self._usage_path.read_bytes())
             self._used_post_ids = set(payload.get("used_qa_ids") or [])
+            rows = payload.get("used_scene_ids_by_slot")
+            if isinstance(rows, dict):
+                self._used_post_scene_ids_by_slot = {
+                    str(key): set(values or [])
+                    for key, values in rows.items()
+                }
+            elif payload.get("used_scene_ids"):
+                self._used_post_scene_ids_by_slot = {
+                    "*": set(payload["used_scene_ids"])
+                }
 
     def _save_post_usage(self) -> None:
         _write_atomic(
             self._usage_path,
             _json_bytes({
-                "schema_version": "v11-post-publish-usage/1.0",
+                "schema_version": "v11-post-publish-usage/1.2",
                 "used_qa_ids": sorted(self._used_post_ids),
+                "used_scene_ids_by_slot": {
+                    key: sorted(values)
+                    for key, values in sorted(
+                        self._used_post_scene_ids_by_slot.items()
+                    )
+                },
             }),
         )
 
@@ -698,6 +890,12 @@ class V11ProductionAttempt:
         manifest_path = campaign_dir / "live_inputs.json"
         pool = list(self.post_items_by_slot.get(request.slot_key) or [])
         by_id = {item.episode.qa_id: item for item in pool}
+        request_qa_ids = {case.qa_id for case in request.cases}
+        request_scene_ids = {case.scene_id for case in request.cases}
+        used_scene_ids = (
+            self._used_post_scene_ids_by_slot.get(request.slot_key, set())
+            | self._used_post_scene_ids_by_slot.get("*", set())
+        )
         if manifest_path.is_file():
             manifest = json.loads(manifest_path.read_bytes())
             expected_parent = {
@@ -718,30 +916,48 @@ class V11ProductionAttempt:
                 item
                 for item in pool
                 if item.episode.qa_id not in self._used_post_ids
-                and item.episode.qa_id
-                not in {case.qa_id for case in request.cases}
+                and item.episode.qa_id not in request_qa_ids
+                and str(item.episode.scene_name)
+                not in used_scene_ids
+                and str(item.episode.scene_name) not in request_scene_ids
             ]
-            if len(available) < int(self.post_limit):
+            selected = select_scene_round_robin(
+                available,
+                limit=int(self.post_limit),
+                max_per_scene=1,
+            )
+            if len(selected) < int(self.post_limit):
                 raise V11LiveEvolutionError(
                     f"{request.slot_key}: requires {self.post_limit} fresh "
-                    f"post-publish episodes, found {len(available)}"
+                    "post-publish episodes from distinct unused scenes, "
+                    f"found {len(selected)}"
                 )
             qa_ids = [
                 item.episode.qa_id
-                for item in available[: int(self.post_limit)]
+                for item in selected
             ]
+            manifest = {
+                "schema_version": "v11-live-campaign-inputs/1.1",
+                "campaign_id": campaign_id,
+                "slot_key": request.slot_key,
+                "parent_snapshot_id": request.parent_snapshot_id,
+                "parent_skill_version": request.parent_skill_version,
+                "parent_content_sha256": request.parent_content_sha256,
+                "case_ids": [case.case_id for case in request.cases],
+                "post_qa_ids": qa_ids,
+                "post_scene_ids": [
+                    str(item.episode.scene_name) for item in selected
+                ],
+                "selection_contract": {
+                    "algorithm": "stable-scene-round-robin",
+                    "max_per_scene": 1,
+                    "exclude_request_scenes": True,
+                    "exclude_previously_used_scenes": True,
+                },
+            }
             _write_create_once(
                 manifest_path,
-                _json_bytes({
-                    "schema_version": "v11-live-campaign-inputs/1.0",
-                    "campaign_id": campaign_id,
-                    "slot_key": request.slot_key,
-                    "parent_snapshot_id": request.parent_snapshot_id,
-                    "parent_skill_version": request.parent_skill_version,
-                    "parent_content_sha256": request.parent_content_sha256,
-                    "case_ids": [case.case_id for case in request.cases],
-                    "post_qa_ids": qa_ids,
-                }),
+                _json_bytes(manifest),
             )
         try:
             items = [by_id[qa_id] for qa_id in qa_ids]
@@ -755,6 +971,25 @@ class V11ProductionAttempt:
             raise V11LiveEvolutionError(
                 f"{campaign_id}: frozen post-publish input is unavailable: {exc}"
             ) from exc
+        scene_ids = [str(item.episode.scene_name) for item in items]
+        if (
+            len(items) != int(self.post_limit)
+            or len(set(qa_ids)) != len(qa_ids)
+            or len(set(scene_ids)) != len(scene_ids)
+            or set(qa_ids) & request_qa_ids
+            or set(scene_ids) & request_scene_ids
+            or set(qa_ids) & self._used_post_ids
+            or set(scene_ids) & used_scene_ids
+        ):
+            raise V11LiveEvolutionError(
+                f"{campaign_id}: frozen post-publish inputs violate "
+                "fresh QA/scene isolation"
+            )
+        frozen_scene_ids = manifest.get("post_scene_ids")
+        if frozen_scene_ids is not None and list(frozen_scene_ids) != scene_ids:
+            raise V11LiveEvolutionError(
+                f"{campaign_id}: frozen post-publish scene identities changed"
+            )
         return items, artifacts
 
     def __call__(
@@ -783,6 +1018,11 @@ class V11ProductionAttempt:
             raise V11LiveEvolutionError(
                 f"{request.slot_key}: validation panel is below "
                 f"{self.min_evaluation_pairs} pairs"
+            )
+        if panel.unique_scene_count < int(self.min_evaluation_pairs):
+            raise V11LiveEvolutionError(
+                f"{request.slot_key}: validation panel is below "
+                f"{self.min_evaluation_pairs} unique scenes"
             )
         campaign_id = self._campaign_id(request)
         post_items, post_artifacts = self._post_panel(
@@ -830,6 +1070,15 @@ class V11ProductionAttempt:
             expected_qa_ids=panel.qa_ids,
             quality_confirmation=self.quality_confirmation,
             client_factory=self.paired_client_factory,
+            prepared_binding_store=self.prepared_binding_store,
+            prepared_binding_refs=(
+                {
+                    qa_id: self.prepared_binding_refs[qa_id]
+                    for qa_id in panel.qa_ids
+                }
+                if self.prepared_binding_refs is not None
+                else None
+            ),
         )
         verifier = V11PostPublishVerifier(
             items=post_items,
@@ -838,6 +1087,17 @@ class V11ProductionAttempt:
             output_root=self.campaign_root,
             library_root=self.library_root,
             client_factory=self.post_client_factory,
+            prepared_binding_store=self.prepared_binding_store,
+            prepared_binding_refs=(
+                {
+                    item.episode.qa_id: self.prepared_binding_refs[
+                        item.episode.qa_id
+                    ]
+                    for item in post_items
+                }
+                if self.prepared_binding_refs is not None
+                else None
+            ),
         )
         try:
             checkpoint = V11CampaignRunner(
@@ -883,6 +1143,10 @@ class V11ProductionAttempt:
         self._used_post_ids.update(
             item.episode.qa_id for item in post_items
         )
+        self._used_post_scene_ids_by_slot.setdefault(
+            request.slot_key,
+            set(),
+        ).update(str(item.episode.scene_name) for item in post_items)
         self._save_post_usage()
         return StreamingAttemptResult(
             outcome="promoted",
@@ -895,6 +1159,7 @@ class V11ProductionAttempt:
 
 
 __all__ = [
+    "REACHABLE_V11_SLOTS",
     "V11LiveEvolutionDeferred",
     "V11LiveEvolutionError",
     "V11LiveEvolutionScheduler",
@@ -902,7 +1167,9 @@ __all__ = [
     "V11ProductionAttempt",
     "V11ValidationPanel",
     "partition_items_by_slot",
+    "prepare_slot_panels",
     "prepare_validation_panels",
+    "select_scene_round_robin",
     "slot_key",
     "validation_panel_manifest",
 ]

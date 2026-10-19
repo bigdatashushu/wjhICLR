@@ -19,15 +19,22 @@ from skill3d.evolution.adapters_v11 import (
     REVISION_PROMPT_VERSION,
     V11OfflineReviser,
 )
+from skill3d.evolution.prepared_bindings_v11 import (
+    prepare_shared_bindings_v11,
+)
 from skill3d.evolution.live_v11 import (
+    REACHABLE_V11_SLOTS,
     V11LiveEvolutionScheduler,
     V11LiveSchedulerConfig,
     V11ProductionAttempt,
     partition_items_by_slot,
+    prepare_slot_panels,
     prepare_validation_panels,
+    select_scene_round_robin,
     slot_key,
     validation_panel_manifest,
 )
+from skill3d.evolution.outer_v11 import V11OuterHoldoutEvaluator
 from skill3d.governance.deepseek_client import (
     BASE_URL,
     MODEL_ID,
@@ -45,7 +52,8 @@ from skill3d.online.config import (
 )
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.reconstruction.run import resolve_artifact_path
-from skill3d.routing.task_classifier import TASK_TYPES, canonical_task
+from skill3d.routing.task_classifier import canonical_task
+from skill3d.skills.registry import active_snapshot_provenance
 
 
 class V11StreamingCliError(ValueError):
@@ -81,6 +89,57 @@ def _write_json(path: Path, value: object) -> None:
 
 def _csv(value: str) -> list[str]:
     return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
+def _target_slots(args) -> list[tuple[str, str]]:
+    if args.slot_manifest:
+        value = _read_json(args.slot_manifest)
+        rows = value.get("slots") if isinstance(value, dict) else value
+        if not isinstance(rows, list):
+            raise V11StreamingCliError(
+                "slot manifest must be a list or an object with slots"
+            )
+        targets = []
+        for row in rows:
+            if isinstance(row, str) and "/" in row:
+                question_type, evidence_state = row.split("/", 1)
+            elif isinstance(row, dict):
+                question_type = row.get("question_type")
+                evidence_state = row.get("evidence_state")
+            else:
+                raise V11StreamingCliError(
+                    f"invalid slot manifest row: {row!r}"
+                )
+            targets.append((
+                canonical_task(str(question_type)),
+                str(evidence_state),
+            ))
+    else:
+        question_types = tuple(
+            canonical_task(value)
+            for value in _csv(args.question_types)
+        )
+        evidence_states = tuple(_csv(args.evidence_states))
+        if not question_types and not evidence_states:
+            targets = list(REACHABLE_V11_SLOTS)
+        elif not question_types or not evidence_states:
+            raise V11StreamingCliError(
+                "question-types and evidence-states must be supplied together"
+            )
+        else:
+            targets = [
+                (question_type, evidence_state)
+                for question_type in question_types
+                for evidence_state in evidence_states
+            ]
+    if len(set(targets)) != len(targets):
+        raise V11StreamingCliError("target slots contain duplicates")
+    invalid = sorted(set(targets) - set(REACHABLE_V11_SLOTS))
+    if invalid:
+        raise V11StreamingCliError(
+            f"target slots are unreachable under current evidence policy: {invalid}"
+        )
+    return targets
 
 
 def _load_items(
@@ -239,13 +298,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream-id", required=True)
     parser.add_argument(
         "--question-types",
-        default="object_rel_distance",
-        help="comma-separated canonical tasks",
+        default="",
+        help="comma-separated canonical tasks; empty with states selects 19 slots",
     )
     parser.add_argument(
         "--evidence-states",
-        default="g1m0",
-        help="comma-separated g0m0,g1m0,g1m1 targets",
+        default="",
+        help="comma-separated states; must be paired with --question-types",
+    )
+    parser.add_argument(
+        "--slot-manifest",
+        default="",
+        help="explicit JSON slot list; overrides question/state arguments",
     )
     parser.add_argument(
         "--source",
@@ -257,12 +321,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--datasets", default="")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--induction-limit-per-slot", type=int, default=12)
-    parser.add_argument("--induction-candidates-per-task", type=int, default=24)
-    parser.add_argument("--inner-candidates-per-task", type=int, default=24)
+    parser.add_argument("--induction-candidates-per-task", type=int, default=64)
+    parser.add_argument("--inner-candidates-per-task", type=int, default=32)
+    parser.add_argument("--outer-candidates-per-task", type=int, default=32)
     parser.add_argument("--post-limit", type=int, default=4)
     parser.add_argument("--min-evaluation-pairs", type=int, default=8)
+    parser.add_argument("--outer-limit-per-slot", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=12)
     parser.add_argument("--inner-artifacts-json", default="")
+    parser.add_argument("--outer-artifacts-json", default="")
     parser.add_argument("--induction-artifacts-json", default="")
     parser.add_argument("--recon-dir", default="")
     parser.add_argument(
@@ -273,6 +340,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--library-root", default="")
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--max-revision-attempts", type=int, default=3)
+    parser.add_argument("--binding-store", default="")
+    parser.add_argument("--prepared-bindings-json", default="")
+    parser.add_argument(
+        "--prepare-bindings",
+        action="store_true",
+        help="precompute audited bindings for all frozen inputs",
+    )
+    parser.add_argument(
+        "--require-prepared-bindings",
+        action="store_true",
+        help="fail execution if any selected question lacks a binding",
+    )
+    parser.add_argument(
+        "--run-outer",
+        action="store_true",
+        help="after streaming freezes, compare S0 with final active on outer",
+    )
     parser.add_argument(
         "--prepare-only",
         action="store_true",
@@ -302,34 +386,26 @@ def main(argv: list[str] | None = None) -> int:
     try:
         raw = resolve_runtime(load_config(args.config), seed=args.seed)
         args.seed = int(raw["seed"])
-        args.question_types = tuple(
-            canonical_task(value) for value in _csv(args.question_types)
-        )
-        args.evidence_states = tuple(_csv(args.evidence_states))
-        if not args.question_types or any(
-            value not in TASK_TYPES for value in args.question_types
-        ):
-            raise V11StreamingCliError("question-types are empty or invalid")
-        if not args.evidence_states or any(
-            value not in {"g0m0", "g1m0", "g1m1"}
-            for value in args.evidence_states
-        ):
-            raise V11StreamingCliError("evidence-states are empty or invalid")
+        targets = _target_slots(args)
+        args.question_types = tuple(dict.fromkeys(
+            question_type for question_type, _ in targets
+        ))
         for name in (
             "induction_limit_per_slot",
             "induction_candidates_per_task",
             "inner_candidates_per_task",
+            "outer_candidates_per_task",
             "post_limit",
             "min_evaluation_pairs",
+            "outer_limit_per_slot",
             "batch_size",
         ):
             if int(getattr(args, name)) <= 0:
                 raise V11StreamingCliError(f"{name} must be positive")
-        targets = [
-            (question_type, evidence_state)
-            for question_type in args.question_types
-            for evidence_state in args.evidence_states
-        ]
+        if args.run_outer and set(targets) != set(REACHABLE_V11_SLOTS):
+            raise V11StreamingCliError(
+                "--run-outer requires the complete 19-slot manifest"
+            )
         paths = raw.get("paths", {})
         library_root = Path(
             args.library_root
@@ -354,6 +430,12 @@ def main(argv: list[str] | None = None) -> int:
             split="inner_validation",
             per_task_limit=args.inner_candidates_per_task,
         )
+        outer_candidates = _load_items(
+            args,
+            raw,
+            split="outer_holdout",
+            per_task_limit=args.outer_candidates_per_task,
+        )
         induction_artifacts = _artifact_mapping(
             induction_candidates,
             explicit_json=args.induction_artifacts_json,
@@ -364,41 +446,73 @@ def main(argv: list[str] | None = None) -> int:
             explicit_json=args.inner_artifacts_json,
             recon_dir=recon_dir,
         )
+        outer_artifacts = _artifact_mapping(
+            outer_candidates,
+            explicit_json=args.outer_artifacts_json,
+            recon_dir=recon_dir,
+        )
         grouped_induction = partition_items_by_slot(
             induction_candidates,
             induction_artifacts,
             target_slots=targets,
         )
-        stream_ids: set[str] = set()
-        post_ids: set[str] = set()
-        shortages: dict[str, int] = {}
+        selected_stream_items: list[EpisodeItem] = []
+        selected_post_items: list[EpisodeItem] = []
+        shortages: dict[str, dict[str, int]] = {}
         for question_type, evidence_state in targets:
             key = slot_key(question_type, evidence_state)
             candidates = grouped_induction.get(key, [])
-            required = (
-                int(args.induction_limit_per_slot)
-                + int(args.post_limit)
+            selected_stream = select_scene_round_robin(
+                candidates,
+                limit=int(args.induction_limit_per_slot),
+                max_per_scene=1,
             )
-            if len(candidates) < required:
-                shortages[key] = len(candidates)
+            stream_scenes = {
+                str(item.episode.scene_name)
+                for item in selected_stream
+            }
+            post_candidates = [
+                item
+                for item in candidates
+                if item.episode.qa_id
+                not in {
+                    selected.episode.qa_id
+                    for selected in selected_stream
+                }
+                and str(item.episode.scene_name) not in stream_scenes
+            ]
+            selected_post = select_scene_round_robin(
+                post_candidates,
+                limit=int(args.post_limit),
+                max_per_scene=1,
+            )
+            if (
+                len(selected_stream) < int(args.induction_limit_per_slot)
+                or len(selected_post) < int(args.post_limit)
+            ):
+                shortages[key] = {
+                    "candidate_rows": len(candidates),
+                    "candidate_scenes": len({
+                        str(item.episode.scene_name)
+                        for item in candidates
+                    }),
+                    "stream_rows": len(selected_stream),
+                    "post_rows": len(selected_post),
+                }
                 continue
-            stream_ids.update(
-                item.episode.qa_id
-                for item in candidates[
-                    : int(args.induction_limit_per_slot)
-                ]
-            )
-            post_ids.update(
-                item.episode.qa_id
-                for item in candidates[
-                    int(args.induction_limit_per_slot) :
-                ]
-            )
+            selected_stream_items.extend(selected_stream)
+            selected_post_items.extend(selected_post)
         if shortages:
             raise V11StreamingCliError(
-                "induction exact-slot pools cannot cover stream and fresh "
-                f"post-publish panels: {shortages}"
+                "induction exact-slot pools cannot cover scene-isolated "
+                f"stream/post quotas: {shortages}"
             )
+        stream_ids = {
+            item.episode.qa_id for item in selected_stream_items
+        }
+        post_ids = {
+            item.episode.qa_id for item in selected_post_items
+        }
         stream_items = [
             item
             for item in induction_candidates
@@ -420,6 +534,21 @@ def main(argv: list[str] | None = None) -> int:
             min_pairs=args.min_evaluation_pairs,
             excluded_scene_ids=sorted(induction_scenes),
         )
+        inner_scenes = {
+            scene_id
+            for panel in panels.values()
+            for scene_id in panel.scene_ids
+        }
+        outer_panels = prepare_slot_panels(
+            outer_candidates,
+            outer_artifacts,
+            required_slots=targets,
+            source_split="outer_holdout",
+            min_pairs=args.outer_limit_per_slot,
+            excluded_scene_ids=sorted(
+                induction_scenes | inner_scenes
+            ),
+        )
         grouped_post = partition_items_by_slot(
             post_items,
             induction_artifacts,
@@ -436,18 +565,55 @@ def main(argv: list[str] | None = None) -> int:
             validation_panel_manifest(panels),
         )
         _write_json(
+            run_root / "outer_panels.json",
+            validation_panel_manifest(outer_panels),
+        )
+        _write_json(
+            run_root / "slot_manifest.json",
+            {
+                "schema_version": "v11-reachable-slots/1.0",
+                "n_slots": len(targets),
+                "slots": [
+                    {
+                        "question_type": question_type,
+                        "evidence_state": evidence_state,
+                        "slot_key": slot_key(
+                            question_type,
+                            evidence_state,
+                        ),
+                    }
+                    for question_type, evidence_state in targets
+                ],
+            },
+        )
+        _write_json(
             run_root / "stream_inputs.json",
             {
-                "schema_version": "v11-live-stream-inputs/1.0",
+                "schema_version": "v11-live-stream-inputs/1.1",
                 "stream_id": args.stream_id,
                 "target_slots": [
                     slot_key(*target) for target in targets
                 ],
+                "selection_contract": {
+                    "algorithm": "stable-scene-round-robin",
+                    "stream_per_slot": args.induction_limit_per_slot,
+                    "post_per_slot": args.post_limit,
+                    "inner_per_slot": args.min_evaluation_pairs,
+                    "outer_per_slot": args.outer_limit_per_slot,
+                    "max_same_slot_questions_per_scene": 1,
+                    "post_excludes_stream_scenes": True,
+                },
                 "stream_qa_ids": [
                     item.episode.qa_id for item in stream_items
                 ],
+                "stream_scene_ids": [
+                    item.episode.scene_name for item in stream_items
+                ],
                 "post_qa_ids": [
                     item.episode.qa_id for item in post_items
+                ],
+                "post_scene_ids": [
+                    item.episode.scene_name for item in post_items
                 ],
             },
         )
@@ -455,6 +621,128 @@ def main(argv: list[str] | None = None) -> int:
             run_root / "runtime_configuration.json",
             config_receipt(raw),
         )
+        detector = raw.get("detection", {}).get("endpoint")
+        if detector:
+            os.environ.setdefault(
+                "SKILL3D_DETECTOR_ENDPOINT",
+                str(detector),
+            )
+        base_cfg = _base_config(args, raw)
+        selected_items = [
+            *stream_items,
+            *post_items,
+            *(
+                item
+                for panel in panels.values()
+                for item in panel.items
+            ),
+            *(
+                item
+                for panel in outer_panels.values()
+                for item in panel.items
+            ),
+        ]
+        selected_by_id = {
+            item.episode.qa_id: item for item in selected_items
+        }
+        if len(selected_by_id) != len(selected_items):
+            raise V11StreamingCliError(
+                "frozen stream/post/inner/outer inputs reuse a qa_id"
+            )
+        selected_scene_counts: dict[tuple[str, str], int] = {}
+        for item in selected_items:
+            scene_key = (
+                item.episode.split,
+                item.episode.scene_name,
+            )
+            selected_scene_counts[scene_key] = (
+                selected_scene_counts.get(scene_key, 0) + 1
+            )
+        oversized_scenes = {
+            f"{split}/{scene_id}": count
+            for (split, scene_id), count in selected_scene_counts.items()
+            if count > 8
+        }
+        if oversized_scenes:
+            raise V11StreamingCliError(
+                "selected inputs exceed eight questions per scene: "
+                f"{oversized_scenes}"
+            )
+        selected_artifacts = {
+            **{
+                qa_id: induction_artifacts[qa_id]
+                for qa_id in stream_ids | post_ids
+            },
+            **{
+                qa_id: path
+                for panel in panels.values()
+                for qa_id, path in panel.artifact_paths.items()
+            },
+            **{
+                qa_id: path
+                for panel in outer_panels.values()
+                for qa_id, path in panel.artifact_paths.items()
+            },
+        }
+        prepared_manifest = None
+        if args.prepared_bindings_json:
+            value = _read_json(args.prepared_bindings_json)
+            if not isinstance(value, dict):
+                raise V11StreamingCliError(
+                    "prepared bindings manifest must be an object"
+                )
+            prepared_manifest = value
+        if args.prepare_bindings:
+            if prepared_manifest is not None:
+                raise V11StreamingCliError(
+                    "--prepare-bindings cannot be combined with "
+                    "--prepared-bindings-json"
+                )
+            model = online_model_from(raw)
+            if model.enabled and not os.environ.get(
+                model.api_key_env,
+                "",
+            ).strip():
+                raise V11StreamingCliError(
+                    f"{model.api_key_env} is not configured"
+                )
+            binding_store = Path(
+                args.binding_store
+                or run_root / "prepared_binding_store"
+            ).resolve()
+            prepared_manifest = prepare_shared_bindings_v11(
+                list(selected_by_id.values()),
+                artifact_paths=selected_artifacts,
+                base_cfg=base_cfg,
+                store_root=binding_store,
+                max_questions_per_scene=8,
+            )
+            _write_json(
+                run_root / "prepared_bindings.json",
+                prepared_manifest,
+            )
+        prepared_refs = (
+            prepared_manifest.get("bindings")
+            if prepared_manifest is not None
+            else None
+        )
+        prepared_store = (
+            prepared_manifest.get("store_root")
+            if prepared_manifest is not None
+            else None
+        )
+        if prepared_manifest is not None and (
+            not isinstance(prepared_refs, dict)
+            or set(prepared_refs) != set(selected_by_id)
+            or not prepared_store
+        ):
+            raise V11StreamingCliError(
+                "prepared bindings must exactly cover all frozen inputs"
+            )
+        if args.require_prepared_bindings and prepared_manifest is None:
+            raise V11StreamingCliError(
+                "--require-prepared-bindings needs a prepared manifest"
+            )
         if args.prepare_only:
             print(json.dumps({
                 "status": "prepared",
@@ -468,6 +756,13 @@ def main(argv: list[str] | None = None) -> int:
                     key: len(panel.items)
                     for key, panel in sorted(panels.items())
                 },
+                "outer_pairs": {
+                    key: len(panel.items)
+                    for key, panel in sorted(outer_panels.items())
+                },
+                "prepared_bindings": (
+                    len(prepared_refs) if prepared_refs is not None else 0
+                ),
                 "run_root": str(run_root),
             }, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
@@ -489,13 +784,6 @@ def main(argv: list[str] | None = None) -> int:
             raise V11StreamingCliError(
                 "DEEPSEEK_API_KEY is not configured"
             )
-        detector = raw.get("detection", {}).get("endpoint")
-        if detector:
-            os.environ.setdefault(
-                "SKILL3D_DETECTOR_ENDPOINT",
-                str(detector),
-            )
-        base_cfg = _base_config(args, raw)
         offline_client = DeepSeekClient(
             base_url=args.deepseek_base_url,
             model=args.deepseek_model,
@@ -524,6 +812,8 @@ def main(argv: list[str] | None = None) -> int:
             post_limit=args.post_limit,
             min_evaluation_pairs=args.min_evaluation_pairs,
             max_revision_attempts=args.max_revision_attempts,
+            prepared_binding_store=prepared_store,
+            prepared_binding_refs=prepared_refs,
         )
         summary = V11LiveEvolutionScheduler(
             V11LiveSchedulerConfig(
@@ -533,12 +823,35 @@ def main(argv: list[str] | None = None) -> int:
                 batch_size=args.batch_size,
                 flush_tail=args.flush_tail,
                 retry_deferred=args.retry_deferred,
+                require_prepared_bindings=args.require_prepared_bindings,
             ),
             items=stream_items,
             artifact_paths=induction_artifacts,
             base_cfg=base_cfg,
             attempt=production_attempt,
+            prepared_binding_refs=prepared_refs,
         ).run()
+        if args.run_outer:
+            final_snapshot_id, _ = active_snapshot_provenance(
+                library_root / "snapshots"
+            )
+            outer_report = V11OuterHoldoutEvaluator(
+                panels=outer_panels,
+                base_cfg=base_cfg,
+                output_root=run_root / "outer",
+                library_root=library_root,
+                final_snapshot_id=final_snapshot_id,
+                quality_confirmation=quality_confirmation,
+                prepared_binding_store=prepared_store,
+                prepared_binding_refs=prepared_refs,
+            ).run()
+            summary["outer_report"] = str(
+                run_root / "outer" / "outer_report.json"
+            )
+            summary["outer_status_by_slot"] = {
+                key: row["status"]
+                for key, row in outer_report["slots"].items()
+            }
         print(
             json.dumps(
                 summary,

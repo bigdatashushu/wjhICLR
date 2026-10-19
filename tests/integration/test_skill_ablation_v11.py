@@ -12,6 +12,9 @@ import pytest
 
 from skill3d.adapters.episode_source import EpisodeItem, load_synthetic_items
 from skill3d.evaluation import skill_ablation_v11 as ab
+from skill3d.evolution.prepared_bindings_v11 import (
+    prepare_shared_bindings_v11,
+)
 from skill3d.online.runner import OnlineRunConfig, PreparedObjectBinding
 from skill3d.reconstruction_gate.quality_metrics import compute_quality
 from skill3d.schemas import (
@@ -198,6 +201,89 @@ def test_real_runner_seed_skill_geometry_and_recomputed_summary(panel, tmp_path)
         rec = json.loads(path.read_text().splitlines()[0])
         assert rec["arm"] in ab.ARMS and rec["qa_id"] == item.episode.qa_id
     assert (artifact.parent / "stale_m5_cache.json").exists()
+
+
+def test_prepared_binding_store_reuses_m5_and_hardlinks_scene_arrays(
+        panel, tmp_path):
+    item, artifact, binding_calls = panel
+    store_root = tmp_path / "binding-store"
+    companion = copy.deepcopy(item)
+    companion_id = f"{item.episode.qa_id}-companion"
+    companion.episode = companion.episode.model_copy(update={
+        "qa_id": companion_id,
+        "frame_set": companion.episode.frame_set.model_copy(
+            update={"episode_id": companion_id}
+        ),
+    })
+    prep_cfg = OnlineRunConfig(
+        semantic_review_config=None,
+        mode="real",
+        seed=137,
+        max_solver_rounds=3,
+        max_retries_per_operation=0,
+    )
+    prepared = prepare_shared_bindings_v11(
+        [item, companion],
+        artifact_paths={
+            item.episode.qa_id: artifact,
+            companion.episode.qa_id: artifact,
+        },
+        base_cfg=prep_cfg,
+        store_root=store_root,
+        client_factory=lambda _qa_id: FakeClient(
+            ['ReturnAnswer("A")\n']
+        ),
+        min_free_gib=0,
+    )
+    assert len(binding_calls) == 2
+    assert prepared["scene_groups"][item.episode.scene_name] == sorted([
+        item.episode.qa_id,
+        companion.episode.qa_id,
+    ])
+    assert not any((store_root / ".work").iterdir())
+
+    result, _, _, root = run(
+        panel,
+        tmp_path,
+        prepared_binding_store=store_root,
+        prepared_binding_refs={
+            item.episode.qa_id: prepared["bindings"][
+                item.episode.qa_id
+            ],
+        },
+    )
+    assert result["status"] == "completed"
+    assert len(binding_calls) == 2
+
+    manifest = json.loads((root / "manifest.json").read_text())
+    frozen = Path(
+        manifest["prepared"][item.episode.qa_id]["directory"]
+    )
+    original_artifact = ReconstructionArtifact.model_validate_json(
+        artifact.read_bytes()
+    )
+    frozen_artifact = ReconstructionArtifact.model_validate_json(
+        (frozen / "artifact.json").read_bytes()
+    )
+    paths = [
+        Path(original_artifact.depth_maps),
+        Path(frozen_artifact.depth_maps),
+    ]
+    for arm in ab.ARMS:
+        arm_artifact = ReconstructionArtifact.model_validate_json(
+            (
+                root
+                / "arms"
+                / arm
+                / frozen.name
+                / "artifacts"
+                / "artifact.json"
+            ).read_bytes()
+        )
+        paths.append(Path(arm_artifact.depth_maps))
+    assert len({path.stat().st_ino for path in paths}) == 1
+    assert (frozen / "binding_store_ref.json").is_file()
+    assert not (frozen / "binding.json").exists()
 
 
 def test_unlabelled_completed_pair_keeps_parse_submission_and_null_scores(panel, tmp_path):

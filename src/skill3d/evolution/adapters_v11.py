@@ -45,6 +45,9 @@ from skill3d.skills.registry import (
     active_snapshot_provenance,
     load_active_skills,
 )
+from skill3d.segmentation.prepared_binding_store import (
+    PreparedBindingStore,
+)
 from skill3d.routing.task_classifier import canonical_task
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION, _PROGRAM_SYNTH
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
@@ -312,9 +315,18 @@ class V11PairedEvaluator:
     quality_confirmation: dict | None = None
     reconstruction_costs: Mapping[str, float] | None = None
     client_factory: Callable[[str, str], object] | None = None
+    prepared_binding_store: str | Path | None = None
+    prepared_binding_refs: Mapping[str, Mapping] | None = None
+    purpose: str = "promotion"
+    source_split: str = "inner_validation"
 
     def _output_dir(self, campaign_id: str) -> Path:
-        return Path(self.output_root).resolve() / _safe_component(campaign_id) / "e11"
+        directory = "e11" if self.purpose == "promotion" else "paired_report"
+        return (
+            Path(self.output_root).resolve()
+            / _safe_component(campaign_id)
+            / directory
+        )
 
     def _parent_manifest_hash(self, snapshot_id: str) -> str:
         snapshot = read_snapshot(
@@ -387,6 +399,21 @@ class V11PairedEvaluator:
             raise V11AdapterError("evaluation question type differs from parent")
         if candidate.full_skill_spec.evidence_state != parent.evidence_state:
             raise V11AdapterError("evaluation evidence state differs from parent")
+        if self.purpose not in {"promotion", "report_only"}:
+            raise V11AdapterError(
+                f"unsupported paired evaluation purpose: {self.purpose}"
+            )
+        if (
+            self.purpose == "promotion"
+            and self.source_split != "inner_validation"
+        ):
+            raise V11AdapterError(
+                "promotion evaluation must use inner_validation"
+            )
+        if self.purpose == "report_only" and self.source_split != "outer_holdout":
+            raise V11AdapterError(
+                "report-only evaluation must use outer_holdout"
+            )
         qa_ids = [item.episode.qa_id for item in self.items]
         expected_ids = list(self.expected_qa_ids) if self.expected_qa_ids is not None else qa_ids
         if (not qa_ids or len(set(qa_ids)) != len(qa_ids)
@@ -395,10 +422,13 @@ class V11PairedEvaluator:
             raise V11AdapterError("empty, duplicate, or mismatched E11 panel")
         learning_scenes = {case.scene_id for case in kwargs["experience"].cases}
         for item in self.items:
-            if (item.episode.split != "inner_validation"
+            if (item.episode.split != self.source_split
                     or canonical_task(item.episode.question_type)
                     != parent.question_type):
-                raise V11AdapterError("E11 requires the target inner_validation panel")
+                raise V11AdapterError(
+                    f"paired evaluation requires the target "
+                    f"{self.source_split} panel"
+                )
             if not item.episode.scene_name or item.episode.scene_name in learning_scenes:
                 raise V11AdapterError("learning/inner scene overlap or missing scene identity")
 
@@ -447,6 +477,8 @@ class V11PairedEvaluator:
                 client_factory=self.client_factory,
                 quality_confirmation=self.quality_confirmation,
                 reconstruction_costs=self.reconstruction_costs,
+                prepared_binding_store=self.prepared_binding_store,
+                prepared_binding_refs=self.prepared_binding_refs,
             )
 
         manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
@@ -623,6 +655,8 @@ class V11PostPublishVerifier:
     output_root: str | Path
     library_root: str | Path
     client_factory: Callable[[str], object] | None = None
+    prepared_binding_store: str | Path | None = None
+    prepared_binding_refs: Mapping[str, Mapping] | None = None
     last_bundle: object | None = field(default=None, init=False, repr=False)
 
     def _trace_dir(self, campaign_id: str) -> Path:
@@ -688,9 +722,9 @@ class V11PostPublishVerifier:
             str(kwargs["idempotency_key"]).encode("utf-8")
         ).hexdigest()[:16]
         if not trace_dir.exists():
-            store = TraceStore(trace_dir)
-            store.claim_run(run_id)
-            store = store.bind(run_id=run_id)
+            trace_store = TraceStore(trace_dir)
+            trace_store.claim_run(run_id)
+            trace_store = trace_store.bind(run_id=run_id)
             outcomes = []
             for item in self.items:
                 cfg = replace(
@@ -708,19 +742,48 @@ class V11PostPublishVerifier:
                     self.client_factory(item.episode.qa_id)
                     if self.client_factory is not None else None
                 )
+                prepared_binding = None
+                if self.prepared_binding_store is not None:
+                    references = self.prepared_binding_refs or {}
+                    reference = references.get(item.episode.qa_id)
+                    if reference is None:
+                        raise V11AdapterError(
+                            f"missing prepared post-publish binding: "
+                            f"{item.episode.qa_id}"
+                        )
+                    current_input = input_identity(
+                        item,
+                        self.artifact_paths[item.episode.qa_id],
+                    )
+                    binding_store = PreparedBindingStore(
+                        self.prepared_binding_store
+                    )
+                    prepared_binding = binding_store.load(
+                        reference["key"],
+                        expected_request_identity=reference[
+                            "request_identity"
+                        ],
+                        scene_artifact=self.artifact_paths[
+                            item.episode.qa_id
+                        ],
+                        scene_input_identity=current_input,
+                    )
                 outcomes.append(runner.run_episode(
                     item.episode.model_copy(deep=True),
                     [pixels.copy() for pixels in item.pixels],
                     cfg,
-                    trace_store=store.bind(qa_id=item.episode.qa_id),
+                    trace_store=trace_store.bind(
+                        qa_id=item.episode.qa_id
+                    ),
                     llm=llm,
+                    prepared_binding=prepared_binding,
                     input_error=None,
                 ))
             n_unavailable = sum(
                 out.final_state == "unavailable" or any(
                     row.get("service_errors") for row in out.rounds)
                 for out in outcomes)
-            store.append("online_run", {
+            trace_store.append("online_run", {
                 "run_id": run_id,
                 "status": "incomplete" if n_unavailable else "completed",
                 "n_unavailable": n_unavailable,

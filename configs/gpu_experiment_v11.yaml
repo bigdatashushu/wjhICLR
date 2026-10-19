@@ -45,18 +45,19 @@ experiment:
   video_root: ""
   quality_confirmation: ""
   detector_endpoint: ""
-  question_type: object_rel_distance
-  evidence_state: g1m0
+  question_types: object_counting,object_abs_distance,object_size_estimation,room_size_estimation,object_rel_distance,object_rel_direction,route_planning,obj_appearance_order
+  all_reachable_slots: true
   datasets: scannet,scannetpp
   seed: 137
   induction_limit: 12
   inner_limit: 8
+  outer_limit: 8
   post_publish_limit: 4
   min_evaluation_pairs: 8
   evolution_batch_size: 12
-  reconstruction_sampling_per_task: 24
+  reconstruction_sampling_per_task: 64
   run_evolution: false
   # When evolution is enabled this identifies the resumable episode stream.
-  campaign_id: v11-s03-gpu
+  campaign_id: v11-19-slot-gpu
   # Deliberately no final_test option. This launcher only touches induction and
-  # inner_validation; independent final evaluation remains a separate action.
+  # inner_validation/outer_holdout; final evaluation remains a separate action.

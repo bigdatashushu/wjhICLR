@@ -62,11 +62,22 @@ def test_runtime_plan_freezes_budget_seed_and_private_library(tmp_path):
         command = row["command"]
         assert command[command.index("--seed") + 1] == "137"
         assert command[command.index("--config") + 1] == str(tmp_path / "runtime_config.yaml")
+        if row["stage"] == "reconstruction":
+            assert command[command.index("--split") + 1] == (
+                "induction,inner_validation,outer_holdout"
+            )
+            assert command[command.index("--episodes-per-scene") + 1] == "8"
         if row["stage"] == "streaming_evolution":
             assert command[command.index("--library-root") + 1] == str(tmp_path / "skill_library")
-            assert command[command.index("--evidence-states") + 1] == "g1m0"
+            assert "--slot-manifest" not in command
+            assert "--question-types" not in command
+            assert "--evidence-states" not in command
             assert command[command.index("--min-evaluation-pairs") + 1] == "8"
+            assert command[command.index("--outer-limit-per-slot") + 1] == "8"
             assert command[command.index("--batch-size") + 1] == "12"
+            assert "--prepare-bindings" in command
+            assert "--require-prepared-bindings" in command
+            assert "--run-outer" in command
     stages = [row["stage"] for row in commands]
     assert stages == ["reconstruction", "streaming_evolution"]
 

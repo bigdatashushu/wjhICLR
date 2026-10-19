@@ -37,6 +37,10 @@ from skill3d.schemas import (
 from skill3d.schemas.trace import EVALUATION_CONTRACT_VERSION
 from skill3d.schemas.evidence import skill_evidence_state
 from skill3d.segmentation.open_vocab_detector import capture_detector_failures
+from skill3d.segmentation.prepared_binding_store import (
+    PreparedBindingStore,
+    prepared_binding_request_identity,
+)
 from skill3d.skills.v11_library import (
     _manifest_for,
     canonical_json_sha256,
@@ -331,14 +335,27 @@ def input_error_identity(item: EpisodeItem) -> dict:
     return {**value, "sha256": _hash(value)}
 
 
-def _copy_base(source: Path, dest: Path) -> ReconstructionArtifact:
+def _copy_base(
+    source: Path,
+    dest: Path,
+    *,
+    link_files: bool = False,
+) -> ReconstructionArtifact:
     """Copy declared arrays only: old M5 caches must not enter the experiment."""
     art = ReconstructionArtifact.model_validate_json(source.read_bytes())
     data = art.model_dump()
     dest.mkdir(parents=True)
     for key, src in _artifact_files(art, source).items():
         target = dest / (key.replace(".", "_") + src.suffix)
-        shutil.copyfile(src, target)
+        if link_files:
+            try:
+                os.link(src, target)
+            except OSError as exc:
+                raise PairingError(
+                    f"immutable scene payload cannot be hard-linked: {src}"
+                ) from exc
+        else:
+            shutil.copyfile(src, target)
         if key.startswith("confidence."):
             data["confidence"][key.split(".")[1]] = str(target)
         else:
@@ -384,6 +401,26 @@ def _save_binding(binding: PreparedObjectBinding, root: Path) -> None:
 
 
 def _load_binding(root: Path) -> PreparedObjectBinding:
+    store_reference = root / "binding_store_ref.json"
+    if store_reference.is_file():
+        reference = json.loads(store_reference.read_text(encoding="utf-8"))
+        scene_input_identity = reference.pop("scene_input_identity")
+        store = PreparedBindingStore(reference["store_root"])
+        binding = store.load(
+            reference["key"],
+            expected_request_identity=reference["request_identity"],
+            scene_artifact=reference["scene_artifact_ref"],
+            scene_input_identity=scene_input_identity,
+        )
+        overlay_path = root / "binding_overlay.json"
+        if overlay_path.is_file():
+            overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
+            binding.prepared_measurements = overlay.get(
+                "prepared_measurements") or {}
+            binding.notes = list(overlay.get("notes") or binding.notes)
+            binding.stats.update(overlay.get("stats_updates") or {})
+        return binding
+
     def unpack(value):
         if isinstance(value, dict):
             if set(value) == {"__array_ref__"}:
@@ -412,9 +449,26 @@ def tree_identity(root: Path) -> dict:
     return {"files": result, "sha256": _hash(result)}
 
 
-def _clone_tree(source: Path, dest: Path) -> None:
+def _clone_tree(
+    source: Path,
+    dest: Path,
+    *,
+    link_binary: bool = False,
+) -> None:
     tree_identity(source)  # reject links before copying
-    shutil.copytree(source, dest, copy_function=shutil.copyfile)
+
+    def clone_file(src, dst):
+        if link_binary and Path(src).suffix != ".json":
+            try:
+                os.link(src, dst)
+            except OSError as exc:
+                raise PairingError(
+                    f"immutable prepared payload cannot be hard-linked: {src}"
+                ) from exc
+            return dst
+        return shutil.copyfile(src, dst)
+
+    shutil.copytree(source, dest, copy_function=clone_file)
     for path in dest.rglob("*.json"):
         # Runtime geometry schema uses NaN for unavailable diagnostic values.
         # Keep that existing serialization contract; report JSON uses null.
@@ -910,6 +964,8 @@ def run_skill_ablation_v11(
     reconstruction_costs: Mapping[str, float] | None = None,
     prepare_only: bool = False,
     prepared_manifest: str | Path | None = None,
+    prepared_binding_store: str | Path | None = None,
+    prepared_binding_refs: Mapping[str, Mapping] | None = None,
     prepared_room_cache: dict[str, dict] | None = None,
     _fixed_skill_arms: Mapping[str, SkillSpecV11] | None = None,
     _fixed_arm_snapshot_refs: Mapping[str, str] | None = None,
@@ -938,6 +994,15 @@ def run_skill_ablation_v11(
             raise PairingError("v11 requires real C1_tools_program (fake clients may be injected)")
         if base_cfg.evaluation_binding or base_cfg.metric_depth_model:
             raise PairingError("v11 requires normal retrieval, program solving and frozen geometry")
+        binding_store_enabled = prepared_binding_store is not None
+        if binding_store_enabled != (prepared_binding_refs is not None):
+            raise PairingError(
+                "prepared binding store and references must be supplied together"
+            )
+        if binding_store_enabled and prepared_manifest is not None:
+            raise PairingError(
+                "prepared binding store cannot be combined with a legacy prepared manifest"
+            )
         wanted = {canonical_task(t) for t in question_types}
         if not wanted:
             raise PairingError("question_types must not be empty")
@@ -1148,6 +1213,30 @@ def run_skill_ablation_v11(
             if key in seen and seen[key] != value:
                 raise PairingError(f"{q}: reused artifact identity has different content/frames")
             seen[key] = value
+        binding_store = (
+            PreparedBindingStore(prepared_binding_store)
+            if binding_store_enabled
+            else None
+        )
+        binding_references = {
+            str(qa_id): copy.deepcopy(dict(reference))
+            for qa_id, reference in (prepared_binding_refs or {}).items()
+        }
+        runnable_ids = {
+            q for q in expected if chosen[q].input_error is None
+        }
+        if binding_store_enabled and set(binding_references) != runnable_ids:
+            raise PairingError(
+                "prepared binding references must exactly cover runnable panel: "
+                f"expected={sorted(runnable_ids)}, "
+                f"actual={sorted(binding_references)}"
+            )
+        scene_audit_groups: dict[str, list[str]] = {}
+        for q in sorted(runnable_ids):
+            scene_audit_groups.setdefault(
+                chosen[q].episode.scene_name,
+                [],
+            ).append(q)
         code_root = Path(runner.__file__).parents[1]
         manifest.update({
             "qa_ids": expected, "question_types": sorted(wanted),
@@ -1165,6 +1254,18 @@ def run_skill_ablation_v11(
                 ) else "unconfirmed"),
             "reconstruction_costs_s": dict(sorted(costs.items())),
             "client_mode": "injected" if client_factory else "bailian",
+            "prepared_binding_store": (
+                {
+                    "root": str(binding_store.root),
+                    "keys": {
+                        q: binding_references[q]["key"]
+                        for q in sorted(binding_references)
+                    },
+                    "scene_audit_groups": scene_audit_groups,
+                }
+                if binding_store is not None
+                else None
+            ),
             "run_mode": os.environ.get(MODE_ENV, "formal"),
             "code_identity": current_code_identity(),
             "source_sha256": {str(p.relative_to(code_root)): _file_hash(p)
@@ -1226,27 +1327,89 @@ def run_skill_ablation_v11(
                 preparation_detector_attempts[q] = prior.get(
                     "preparation_detector_attempts", {}).get(q, [])
                 continue
-            art = _copy_base(Path(artifact_paths[q]).resolve(), frozen)
+            art = _copy_base(
+                Path(artifact_paths[q]).resolve(),
+                frozen,
+                link_files=binding_store is not None,
+            )
             art = runner._prepare_m4_quality(art, item.pixels, persist_quality=False)
             _write(frozen / "episode.json", item.episode)
             for i, pixels in enumerate(item.pixels):
                 np.save(frozen / f"frame_{i:04d}.npy", pixels)
-            trace = _BoundTrace(root / "preparation" / key, {
-                "experiment_id": experiment_id, "arm": "prepare",
-                "run_id": f"{experiment_id}:prepare:{q}", "qa_id": q})
-            llm = client("prepare", q, trace)
             local_pixels = [p.copy() for p in item.pixels]
-            with capture_detector_failures() as detection_errors:
-                binding = PreparedObjectBinding(*runner._bind_objects_best_effort(
-                    art, local_pixels, None, item.episode.model_copy(deep=True), cfg, llm))
-            preparation_detector_attempts[q] = list(binding.stats.get("detector_attempts") or [])
-            if llm.contract_errors:
-                raise PairingError("; ".join(llm.contract_errors))
-            llm.failures.extend(detection_errors)
-            if binding.stats.get("binding_error"):
-                llm.failures.append(binding.stats["binding_error"])
-            if llm.failures:
-                prepare_errors[q] = list(llm.failures)
+            if binding_store is not None:
+                reference = binding_references[q]
+                audit_qa_ids = list(
+                    (
+                        reference.get("request_identity") or {}
+                    ).get("scene_audit_qa_ids") or []
+                )
+                if (
+                    q not in audit_qa_ids
+                    or len(audit_qa_ids) > 8
+                    or len(set(audit_qa_ids)) != len(audit_qa_ids)
+                ):
+                    raise PairingError(
+                        f"{q}: invalid sealed scene audit group"
+                    )
+                expected_request = prepared_binding_request_identity(
+                    input_identity=identities[q],
+                    cfg=cfg,
+                    scene_audit_qa_ids=audit_qa_ids,
+                )
+                expected_reference = binding_store.reference(
+                    binding_store.key_for(expected_request)
+                )
+                for name in (
+                    "store_root",
+                    "key",
+                    "request_identity",
+                    "scene_artifact_ref",
+                    "scene_input_identity_sha256",
+                    "manifest_sha256",
+                ):
+                    if reference.get(name) != expected_reference.get(name):
+                        raise PairingError(
+                            f"{q}: prepared binding reference {name} changed"
+                        )
+                binding = binding_store.load(
+                    reference["key"],
+                    expected_request_identity=expected_request,
+                    scene_artifact=artifact_paths[q],
+                    scene_input_identity=identities[q],
+                )
+                preparation_detector_attempts[q] = list(
+                    binding.stats.get("detector_attempts") or []
+                )
+            else:
+                trace = _BoundTrace(root / "preparation" / key, {
+                    "experiment_id": experiment_id,
+                    "arm": "prepare",
+                    "run_id": f"{experiment_id}:prepare:{q}",
+                    "qa_id": q,
+                })
+                llm = client("prepare", q, trace)
+                with capture_detector_failures() as detection_errors:
+                    binding = PreparedObjectBinding(
+                        *runner._bind_objects_best_effort(
+                            art,
+                            local_pixels,
+                            None,
+                            item.episode.model_copy(deep=True),
+                            cfg,
+                            llm,
+                        )
+                    )
+                preparation_detector_attempts[q] = list(
+                    binding.stats.get("detector_attempts") or []
+                )
+                if llm.contract_errors:
+                    raise PairingError("; ".join(llm.contract_errors))
+                llm.failures.extend(detection_errors)
+                if binding.stats.get("binding_error"):
+                    llm.failures.append(binding.stats["binding_error"])
+                if llm.failures:
+                    prepare_errors[q] = list(llm.failures)
             _, _, art = runner._scene_from_artifact(
                 art, local_pixels, binding.stats, binding.objects, item.episode,
                 objects_materialized=binding.materialized, persist_quality=False)
@@ -1254,6 +1417,11 @@ def run_skill_ablation_v11(
                 raise PairingError(f"{q}: preparation modified frozen pixels")
             preparation_work[q] = {
                 "artifact": art, "binding": binding, "frozen": frozen,
+                "binding_reference": (
+                    copy.deepcopy(binding_references[q])
+                    if binding_store is not None
+                    else None
+                ),
             }
 
         # Cross-question M5 integrity audit runs before any frozen tree identity is computed.
@@ -1272,7 +1440,8 @@ def run_skill_ablation_v11(
                     "frame_set_hash": art.frame_set_hash,
                 }))
             work["scene_identity"] = scene_identity
-            scene_groups.setdefault(scene_identity, []).append(q)
+            if work["binding_reference"] is None:
+                scene_groups.setdefault(scene_identity, []).append(q)
         for scene_identity, qa_ids in sorted(scene_groups.items()):
             audited, audits = audit_semantic_mask_conflicts(
                 [(q, preparation_work[q]["binding"].objects) for q in sorted(qa_ids)],
@@ -1357,7 +1526,34 @@ def run_skill_ablation_v11(
             work = preparation_work[q]
             art, binding, frozen = (
                 work["artifact"], work["binding"], work["frozen"])
-            _save_binding(binding, frozen)
+            if work["binding_reference"] is None:
+                _save_binding(binding, frozen)
+            else:
+                _write(
+                    frozen / "binding_store_ref.json",
+                    {
+                        **work["binding_reference"],
+                        "scene_input_identity": identities[q],
+                    },
+                )
+                if binding.prepared_measurements:
+                    _write(
+                        frozen / "binding_overlay.json",
+                        {
+                            "prepared_measurements": (
+                                binding.prepared_measurements
+                            ),
+                            "notes": binding.notes,
+                            "stats_updates": {
+                                "prepared_measurement_receipts": (
+                                    binding.stats.get(
+                                        "prepared_measurement_receipts"
+                                    )
+                                    or {}
+                                ),
+                            },
+                        },
+                    )
             (frozen / "artifact.json").write_text(art.model_dump_json(), encoding="utf-8")
             prepared[q] = {"directory": str(frozen), **tree_identity(frozen),
                            "gate_thresholds": art.quality.gate_thresholds if art.quality else None}
@@ -1484,7 +1680,11 @@ def run_skill_ablation_v11(
                 )
                 arm_root = root / "arms" / arm / frozen.name
                 local = arm_root / "artifacts"
-                _clone_tree(frozen, local)
+                _clone_tree(
+                    frozen,
+                    local,
+                    link_binary=binding_store is not None,
+                )
                 actual = tree_identity(local)["sha256"]
                 if actual != prepared[q]["sha256"]:
                     raise PairingError(f"{q}/{arm}: copied initial inputs differ")
@@ -1608,6 +1808,8 @@ def run_skill_pair_evaluation_v11(
     client_factory: Callable[[str, str], object] | None = None,
     quality_confirmation: dict | None = None,
     reconstruction_costs: Mapping[str, float] | None = None,
+    prepared_binding_store: str | Path | None = None,
+    prepared_binding_refs: Mapping[str, Mapping] | None = None,
 ) -> dict:
     """Run E11 with explicit parent/candidate fixed injection on frozen inputs."""
     if parent.slot_key != candidate.slot_key:
@@ -1623,6 +1825,8 @@ def run_skill_pair_evaluation_v11(
         client_factory=client_factory,
         quality_confirmation=quality_confirmation,
         reconstruction_costs=reconstruction_costs,
+        prepared_binding_store=prepared_binding_store,
+        prepared_binding_refs=prepared_binding_refs,
         _fixed_skill_arms={"B01": parent, "B11": candidate},
         _fixed_arm_snapshot_refs={
             "B01": parent_snapshot_ref,

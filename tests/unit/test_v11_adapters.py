@@ -246,6 +246,30 @@ def test_paired_evaluator_rejects_cache_without_actual_panel(tmp_path):
         )
 
 
+def test_promotion_evaluator_rejects_outer_holdout_source(tmp_path):
+    evaluator = adapters.V11PairedEvaluator(
+        items=[],
+        artifact_paths={},
+        base_cfg=OnlineRunConfig(mode="real", seed=17),
+        output_root=tmp_path,
+        library_root=tmp_path / "library",
+        purpose="promotion",
+        source_split="outer_holdout",
+    )
+    with pytest.raises(
+        adapters.V11AdapterError,
+        match="promotion evaluation must use inner_validation",
+    ):
+        evaluator(
+            campaign_id="campaign-test",
+            parent=_parent(),
+            candidate=_candidate(),
+            experience=_Experience(),
+            question_type="object_rel_distance",
+            seed=17,
+        )
+
+
 def test_post_publish_verifier_uses_normal_active_loading(
     tmp_path,
     monkeypatch,
