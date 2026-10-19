@@ -11,6 +11,7 @@ from skill3d.evolution.experience_v11 import (
     V11ExperienceBuildError,
     V11TraceCollector,
     build_v11_experience_bundle_from_trace_store,
+    collect_v11_streaming_case,
 )
 from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
 from skill3d.schemas import (
@@ -50,11 +51,14 @@ def _parent() -> SkillSpecV11:
 
 
 def _write_run(store: TraceStore, *, split="induction", mode="real",
-               run_id="learning-run-1") -> None:
+               run_id="learning-run-1", status="completed",
+               n_unavailable=0) -> None:
     store.append("online_run", {
         "run_id": run_id,
         "mode": mode,
         "split": split,
+        "status": status,
+        "n_unavailable": n_unavailable,
         "template_version": PROMPT_TEMPLATE_VERSION,
         "execution_protocol_version": EXECUTION_PROTOCOL_VERSION,
         "tool_docs_version": TOOL_DOCS_VERSION,
@@ -246,6 +250,41 @@ def test_injectable_collector_passes_full_bundle(tmp_path):
 
     assert bundle.cases[0].question_text
     assert bundle.cases[0].reference_answer == "B"
+
+
+def test_streaming_case_admission_is_per_episode(tmp_path):
+    parent = _parent()
+    store = TraceStore(tmp_path)
+    _write_run(store)
+    _write_case(store, parent, qa_id="one", correct=False)
+
+    result = collect_v11_streaming_case(
+        tmp_path,
+        stream_id="stream-one",
+        parent_snapshot_id="S0-v11-learning",
+        parent=parent,
+    )
+
+    assert result.eligible is True
+    assert result.case is not None and result.case.qa_id == "one"
+
+
+def test_streaming_case_quarantines_unavailable_run(tmp_path):
+    parent = _parent()
+    store = TraceStore(tmp_path)
+    _write_run(store, status="incomplete", n_unavailable=1)
+    _write_case(store, parent, qa_id="unavailable", correct=False)
+
+    result = collect_v11_streaming_case(
+        tmp_path,
+        stream_id="stream-unavailable",
+        parent_snapshot_id="S0-v11-learning",
+        parent=parent,
+    )
+
+    assert result.eligible is False
+    assert result.reason_code == "trace_contract_invalid"
+    assert "未完成" in result.detail
 
 
 @pytest.mark.parametrize("split", [

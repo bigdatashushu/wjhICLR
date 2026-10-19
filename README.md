@@ -128,7 +128,15 @@ M5 提供候选和技术校验，不证明候选是题目所指实例；模型�
 
 ### 离线演化链
 
-离线演化只能在 parent trace、质量确认、API 密钥和配对结果等前置条件均满足时运行。候选必须经过固定面板、泄漏检查、质量门、准入门和原子 promote；失败时留下结构化收据，不切换成 mock 候选。当前服务器没有 `DEEPSEEK_API_KEY`，本次 v11 配置保持 `run_evolution=false`。
+离线演化只能在 parent trace、质量确认、API 密钥和配对结果等前置条件均满足时运行。
+经验按“题型＋初始证据状态＋实际父版本”积累：每新增 12 条合格 induction 轨迹触发
+一次候选；拒绝保留累计经验并等待下一批 12 条，晋升则原子换版并由发布后 learning
+开启新 buffer。未满 12 条且从未尝试的槽位在轮末执行一次尾批次。候选至少需要 8 个
+独立完整配对才可晋升；服务／输入／trace 故障单独记录，不计入 buffer。失败时留下
+结构化收据，不切换成 mock 候选。生产入口
+`scripts/run_streaming_evolution_v11.py` 逐题冻结父快照和独立 trace，并在晋升后为
+下一题重新加载 active。当前服务器没有 `DEEPSEEK_API_KEY`，真实模型配置保持
+`run_evolution=false`。
 
 ## 3. 冻结环境与硬件
 
@@ -317,10 +325,13 @@ runtime:
 experiment:
   formal: true
   question_type: object_rel_distance
+  evidence_state: g1m0
   datasets: scannet,scannetpp
   seed: 137
   induction_limit: 12
   inner_limit: 8
+  min_evaluation_pairs: 8
+  evolution_batch_size: 12
   reconstruction_sampling_per_task: 24
   run_evolution: false
 ```
@@ -387,6 +398,18 @@ PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
 - `run_evolution=true` 写在外部配置副本中。
 
 否则必须保持 `run_evolution=false`，先完成或报告正式 B01/B11。
+
+不依赖 GPU 或模型密钥的流程合同实验使用真实 campaign、静态检查、配对准入、
+不可变快照发布和 active pointer 切换，只注入确定性的模型结果：
+
+```bash
+PYTHONPATH=src python scripts/run_streaming_evolution_contract_v11.py \
+  --output /tmp/streaming-evolution-contract-v11
+```
+
+预期尝试序列为 `rejected → promoted → rejected`：前 12 条拒绝后不丢经验，
+再新增 12 条以累计 24 条重试并晋升；发布后新版本 case 进入新 buffer；另一槽位
+以 5 条尾批次完成拒绝验证。该实验只证明流程合同，不证明 Skill 效果。
 
 ## 8. v11 B01/B11 协议
 

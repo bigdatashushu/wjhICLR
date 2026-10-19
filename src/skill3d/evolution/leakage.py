@@ -6,9 +6,12 @@ import re
 
 # 泄漏扫描模式：答案字样 + 官方 qa_id/sample 样式（真实实现：正则/字段扫描）
 _ANSWER_PATTERNS = [
-    re.compile(r"ground[_ ]?truth", re.IGNORECASE),
+    re.compile(
+        r"\b(?:ground[_ ]?truth|reference[_ ]?answer)\s*[:=]\s*\S+",
+        re.IGNORECASE,
+    ),
     re.compile(r"\banswer\s*[:=]\s*\S+", re.IGNORECASE),
-    re.compile(r"correct\s+option", re.IGNORECASE),
+    re.compile(r"\bcorrect\s+option\s*[:=]\s*\S+", re.IGNORECASE),
 ]
 # qa/sample id 样式：`qa123`、`qa_123`、`qa-1a2b3c`、`sample_0042`、`question-7`
 _QA_ID_PATTERN = re.compile(

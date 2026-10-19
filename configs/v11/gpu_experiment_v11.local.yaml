@@ -47,13 +47,17 @@ experiment:
   quality_confirmation: data/quality_confirmation_v11/scenes/index.json
   detector_endpoint: ""
   question_type: object_rel_distance
+  evidence_state: g1m0
   datasets: scannet,scannetpp
   seed: 137
   induction_limit: 12
   inner_limit: 8
   post_publish_limit: 4
+  min_evaluation_pairs: 8
+  evolution_batch_size: 12
   reconstruction_sampling_per_task: 24
   run_evolution: false
+  # When evolution is enabled this identifies the resumable episode stream.
   campaign_id: v11-s03-gpu
   # Deliberately no final_test option. This launcher only touches induction and
   # inner_validation; independent final evaluation remains a separate action.

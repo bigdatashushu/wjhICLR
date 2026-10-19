@@ -62,8 +62,13 @@ def test_runtime_plan_freezes_budget_seed_and_private_library(tmp_path):
         command = row["command"]
         assert command[command.index("--seed") + 1] == "137"
         assert command[command.index("--config") + 1] == str(tmp_path / "runtime_config.yaml")
-        if row["stage"] == "evolution":
+        if row["stage"] == "streaming_evolution":
             assert command[command.index("--library-root") + 1] == str(tmp_path / "skill_library")
+            assert command[command.index("--evidence-states") + 1] == "g1m0"
+            assert command[command.index("--min-evaluation-pairs") + 1] == "8"
+            assert command[command.index("--batch-size") + 1] == "12"
+    stages = [row["stage"] for row in commands]
+    assert stages == ["reconstruction", "streaming_evolution"]
 
 
 def test_real_pipeline_records_sam2_extension_before_execution(monkeypatch, tmp_path):

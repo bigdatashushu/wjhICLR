@@ -192,9 +192,21 @@ PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
   --run-id dry-run --dry-run
 ```
 
-配置 `experiment.run_evolution=true` 后，一键流程会在 B01/B11 之后调用
-`scripts/run_evolution_campaign_v11.py`。此时还必须通过环境变量提供
-`DEEPSEEK_API_KEY`；缺失或健康检查失败会阻断演化，不会以 mock 候选替代。
+配置 `experiment.run_evolution=true` 后，一键流程在重建后直接调用
+`scripts/run_streaming_evolution_v11.py`，不再先生成整批 parent trace，也不再只跑
+一个手工配置的 campaign。调度器逐题加载当前 active 快照、写独立 trace，并按
+`question_type + initial evidence_state + delivered parent version` 入 buffer；晋升后
+下一题会重新加载 active。此时还必须通过环境变量提供 `DEEPSEEK_API_KEY`，并明确冻结
+`experiment.evidence_state`、`experiment.evolution_batch_size` 与
+`experiment.min_evaluation_pairs`；缺失、健康检查失败或目标槽位的冻结
+`inner_validation` 面板少于 8 个完整配对都会在模型调用前阻断，不会以 mock 候选替代。
+
+持续积累合同由 `evolution/live_v11.py` 与 `evolution/streaming_v11.py` 管理。
+前者负责精确槽位验证面板、逐题父快照冻结、单题 trace、真实 campaign 和恢复；后者
+持久化版本化 buffer。默认每新增 12 条合格 induction case 触发，拒绝后累计 case
+保留但需再新增 12 条，晋升后切换到新版本并从发布后 learning 重新计数。轮末只为
+从未尝试且有经验的槽位执行尾批次。`scripts/run_streaming_evolution_contract_v11.py`
+是 CPU 流程实验，不产生可解释为模型收益的分数。
 
 模型名需与服务实际的 served model name 一致。配对宜使用单个 endpoint；
 请求 seed 会进入准备阶段和两臂的模型请求，但不承诺不同 GPU 批处理调度下逐位复现。

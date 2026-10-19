@@ -87,6 +87,7 @@ class _Callbacks:
         post_body=None,
         revision_values=None,
         evaluator_error: Exception | None = None,
+        n_pairs: int = 8,
     ):
         self.candidate_score = candidate_score
         self.candidate_runtime_errors = candidate_runtime_errors
@@ -94,6 +95,7 @@ class _Callbacks:
         self.post_body = post_body
         self.revision_values = list(revision_values or [])
         self.evaluator_error = evaluator_error
+        self.n_pairs = int(n_pairs)
         self.calls = {"collect": 0, "revise": 0, "evaluate": 0, "post": 0}
         self.revision_experiences = []
 
@@ -234,15 +236,15 @@ class _Callbacks:
             formal_result_eligible=True,
             frozen_panel=True,
             independent_arms=True,
-            n_pairs=4,
-            result_refs=[f"pair:{index}" for index in range(4)],
+            n_pairs=self.n_pairs,
+            result_refs=[f"pair:{index}" for index in range(self.n_pairs)],
             parent=V11EvaluationArm(
                 skill_version=parent_key,
                 content_sha256=parent.content_sha256,
                 delivered_skill_version=parent_key,
                 delivered_content_sha256=parent.content_sha256,
                 delivery_observed=True,
-                n_scored=4,
+                n_scored=self.n_pairs,
                 mean_score=0.5,
                 runtime_error_count=1,
                 program_error_count=1,
@@ -255,7 +257,7 @@ class _Callbacks:
                 delivered_skill_version=candidate_key,
                 delivered_content_sha256=candidate.full_skill_spec.content_sha256,
                 delivery_observed=True,
-                n_scored=4,
+                n_scored=self.n_pairs,
                 mean_score=self.candidate_score,
                 runtime_error_count=self.candidate_runtime_errors,
                 program_error_count=self.candidate_runtime_errors,
@@ -378,6 +380,27 @@ def test_v11_campaign_rejects_runtime_or_legal_answer_regression(
         ).read_text(encoding="utf-8")
     )
     assert decision["conditions"][failed_condition] is False
+
+
+def test_v11_campaign_rejects_too_small_paired_panel(tmp_path):
+    _parent, original = _activate_parent(tmp_path / "library")
+    callbacks = _Callbacks(candidate_score=0.75, n_pairs=4)
+
+    result = _runner(tmp_path, callbacks).run()
+
+    assert result.status == "rejected"
+    assert _pointer(tmp_path / "library")["snapshot_id"] == original["snapshot_id"]
+    decision = json.loads(
+        (
+            tmp_path
+            / "runs"
+            / "campaign-one"
+            / "receipts"
+            / "decision.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert decision["conditions"]["minimum_evaluation_pairs"] is False
+    assert "minimum_evaluation_pairs" in decision["reasons"]
 
 
 def test_v11_campaign_promotes_strict_improvement_and_verifies_new_learning(tmp_path):

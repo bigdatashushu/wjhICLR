@@ -98,6 +98,7 @@ class V11CampaignConfig:
     library_root: str = "data/evolution/library_v11"
     run_root: str = "data/evolution/runs_v11"
     max_revision_attempts: int = 3
+    min_evaluation_pairs: int = 8
     method_context_max_chars: int = DEFAULT_METHOD_CONTEXT_MAX_CHARS
     seed: int = 0
     model_id: str = ""
@@ -111,6 +112,8 @@ class V11CampaignConfig:
 
         if self.evidence_state not in SKILL_EVIDENCE_STATES:
             raise ValueError("campaign 必须明确指定 g0m0/g1m0/g1m1 槽位")
+        if int(self.min_evaluation_pairs) <= 0:
+            raise ValueError("min_evaluation_pairs 必须为正整数")
 
     def resolved_id(self) -> str:
         campaign_id = self.campaign_id or f"camp-v11-{uuid.uuid4().hex[:12]}"
@@ -798,6 +801,9 @@ class V11CampaignRunner:
             "frozen_panel": evaluation.frozen_panel,
             "independent_arms": evaluation.independent_arms,
             "nonempty_pairs": evaluation.n_pairs > 0,
+            "minimum_evaluation_pairs": (
+                evaluation.n_pairs >= int(self.cfg.min_evaluation_pairs)
+            ),
             "complete_denominators": (
                 evaluation.n_pairs > 0
                 and pa.n_scored == evaluation.n_pairs

@@ -190,6 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--library-root", default="")
     parser.add_argument("--run-root", default="data/evolution/runs_v11")
     parser.add_argument("--max-revision-attempts", type=int, default=3)
+    parser.add_argument("--min-evaluation-pairs", type=int, default=8)
     parser.add_argument("--max-solver-rounds", type=int)
     parser.add_argument("--max-retries-per-operation", type=int)
     parser.add_argument("--finalization-rounds", type=int)
@@ -346,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
             library_root=library_root,
             run_root=args.run_root,
             max_revision_attempts=args.max_revision_attempts,
+            min_evaluation_pairs=args.min_evaluation_pairs,
             method_context_max_chars=(
                 base_cfg.retrieval_policy.method_context_max_chars),
             seed=args.seed,

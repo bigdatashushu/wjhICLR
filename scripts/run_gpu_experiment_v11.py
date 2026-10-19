@@ -500,6 +500,12 @@ def _pipeline(
         return commands
     recon_dir = run_root / "reconstructions"
     question_type = str(experiment["question_type"])
+    evidence_state = str(experiment.get("evidence_state") or "")
+    if experiment.get("run_evolution") and evidence_state not in {
+        "g0m0", "g1m0", "g1m1"
+    }:
+        raise GPUExperimentError(
+            "run_evolution=true requires experiment.evidence_state")
     datasets = str(experiment.get("datasets") or "")
     seed = int(experiment["seed"])
     sampling = int(experiment["reconstruction_sampling_per_task"])
@@ -523,7 +529,7 @@ def _pipeline(
         str(recon_dir),
         "--question-types",
         question_type,
-        "--limit",
+        "--sampling-per-task",
         str(sampling),
         "--episodes-per-scene",
         "1",
@@ -546,6 +552,61 @@ def _pipeline(
         commands=commands,
         stage="reconstruction",
     )
+
+    confirmation = str(experiment.get("quality_confirmation") or "")
+    if experiment.get("run_evolution"):
+        if not os.environ.get("DEEPSEEK_API_KEY") and not dry_run:
+            raise GPUExperimentError(
+                "run_evolution=true requires DEEPSEEK_API_KEY")
+        stream = [
+            python,
+            str(root / "scripts" / "run_streaming_evolution_v11.py"),
+            "--config",
+            config_path,
+            "--stream-id",
+            str(experiment["campaign_id"]),
+            "--question-types",
+            question_type,
+            "--evidence-states",
+            evidence_state,
+            "--source",
+            "vsi_bench",
+            "--video-root",
+            video_root,
+            "--recon-dir",
+            str(recon_dir),
+            "--induction-limit-per-slot",
+            str(experiment["induction_limit"]),
+            "--induction-candidates-per-task",
+            str(sampling),
+            "--inner-candidates-per-task",
+            str(sampling),
+            "--post-limit",
+            str(experiment["post_publish_limit"]),
+            "--min-evaluation-pairs",
+            str(experiment.get("min_evaluation_pairs", 8)),
+            "--batch-size",
+            str(experiment.get("evolution_batch_size", 12)),
+            "--seed",
+            str(seed),
+            "--quality-confirmation",
+            confirmation,
+            "--library-root",
+            str(library),
+            "--run-root",
+            str(run_root / "evolution"),
+        ]
+        if datasets:
+            stream.extend(["--datasets", datasets])
+        _run(
+            stream,
+            cwd=root,
+            env=geometry_env,
+            dry_run=dry_run,
+            commands=commands,
+            stage="streaming_evolution",
+        )
+        return commands
 
     parent_trace = run_root / "parent_learning_trace"
     parent_manifest = run_root / "parent_learning_manifest.json"
@@ -614,7 +675,6 @@ def _pipeline(
     ]
     if datasets:
         ablation.extend(["--datasets", datasets])
-    confirmation = str(experiment.get("quality_confirmation") or "")
     if confirmation:
         ablation.extend(["--quality-confirmation", confirmation])
     _run(
@@ -630,50 +690,6 @@ def _pipeline(
         if summary.get("formal_result_eligible") is not True:
             raise GPUExperimentError("B01/B11 completed without formal eligibility")
 
-    if experiment.get("run_evolution"):
-        if not os.environ.get("DEEPSEEK_API_KEY") and not dry_run:
-            raise GPUExperimentError(
-                "run_evolution=true requires DEEPSEEK_API_KEY")
-        campaign = [
-            python,
-            str(root / "scripts" / "run_evolution_campaign_v11.py"),
-            "--config",
-            config_path,
-            "--campaign-id",
-            str(experiment["campaign_id"]),
-            "--question-type",
-            question_type,
-            "--parent-trace-dir",
-            str(parent_trace),
-            "--source",
-            "vsi_bench",
-            "--video-root",
-            video_root,
-            "--recon-dir",
-            str(recon_dir),
-            "--inner-limit",
-            str(experiment["inner_limit"]),
-            "--post-limit",
-            str(experiment["post_publish_limit"]),
-            "--seed",
-            str(seed),
-            "--quality-confirmation",
-            confirmation,
-            "--library-root",
-            str(library),
-            "--run-root",
-            str(run_root / "evolution"),
-        ]
-        if datasets:
-            campaign.extend(["--datasets", datasets])
-        _run(
-            campaign,
-            cwd=root,
-            env=geometry_env,
-            dry_run=dry_run,
-            commands=commands,
-            stage="evolution",
-        )
     return commands
 
 

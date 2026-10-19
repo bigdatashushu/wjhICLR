@@ -6,7 +6,7 @@ import copy
 import hashlib
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -45,6 +45,7 @@ from skill3d.skills.registry import (
     active_snapshot_provenance,
     load_active_skills,
 )
+from skill3d.routing.task_classifier import canonical_task
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION, _PROGRAM_SYNTH
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
@@ -395,7 +396,8 @@ class V11PairedEvaluator:
         learning_scenes = {case.scene_id for case in kwargs["experience"].cases}
         for item in self.items:
             if (item.episode.split != "inner_validation"
-                    or item.episode.question_type != parent.question_type):
+                    or canonical_task(item.episode.question_type)
+                    != parent.question_type):
                 raise V11AdapterError("E11 requires the target inner_validation panel")
             if not item.episode.scene_name or item.episode.scene_name in learning_scenes:
                 raise V11AdapterError("learning/inner scene overlap or missing scene identity")
@@ -621,6 +623,7 @@ class V11PostPublishVerifier:
     output_root: str | Path
     library_root: str | Path
     client_factory: Callable[[str], object] | None = None
+    last_bundle: object | None = field(default=None, init=False, repr=False)
 
     def _trace_dir(self, campaign_id: str) -> Path:
         return (
@@ -645,7 +648,7 @@ class V11PostPublishVerifier:
                     f"post-publish item {item.episode.qa_id} has input_error")
             if item.episode.split != "induction":
                 raise V11AdapterError("post-publish items must use induction split")
-            if item.episode.question_type != question_type:
+            if canonical_task(item.episode.question_type) != question_type:
                 raise V11AdapterError(
                     "post-publish panel contains another question type")
             if item.episode.qa_id not in self.artifact_paths:
@@ -745,6 +748,11 @@ class V11PostPublishVerifier:
             parent=candidate.full_skill_spec,
             source_run_ref=f"online_run:{run_id}",
             require_real=True,
+        )
+        self.last_bundle = (
+            bundle.model_copy(deep=True)
+            if hasattr(bundle, "model_copy")
+            else copy.deepcopy(bundle)
         )
         if not bundle.cases:
             raise V11AdapterError("post-publish run produced no learning cases")

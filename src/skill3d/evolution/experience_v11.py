@@ -579,8 +579,149 @@ class V11TraceCollector:
         )
 
 
+@dataclass(frozen=True)
+class V11CaseEligibility:
+    """Per-episode admission result for a streaming Skill buffer."""
+
+    eligible: bool
+    case: V11ExperienceCase | None = None
+    reason_code: str = ""
+    detail: str = ""
+
+
+def collect_v11_streaming_case(
+    trace_dir: str | Path,
+    *,
+    stream_id: str,
+    parent_snapshot_id: str,
+    parent: SkillSpecV11,
+    source_run_ref: str = "",
+) -> V11CaseEligibility:
+    """Convert one isolated induction run without poisoning sibling episodes."""
+    try:
+        bundle = build_v11_experience_bundle_from_trace_store(
+            trace_dir,
+            campaign_id=stream_id,
+            parent_snapshot_id=parent_snapshot_id,
+            parent=parent,
+            source_run_ref=source_run_ref,
+            require_real=True,
+        )
+    except V11ExperienceBuildError as exc:
+        return V11CaseEligibility(
+            eligible=False,
+            reason_code="trace_contract_invalid",
+            detail=str(exc),
+        )
+    if len(bundle.cases) != 1:
+        return V11CaseEligibility(
+            eligible=False,
+            reason_code="not_single_episode",
+            detail=(
+                f"streaming admission requires one isolated episode, "
+                f"received {len(bundle.cases)} eligible cases"
+            ),
+        )
+    return V11CaseEligibility(eligible=True, case=bundle.cases[0])
+
+
+def build_v11_experience_bundle_from_cases(
+    cases: list[V11ExperienceCase],
+    *,
+    campaign_id: str,
+    parent_snapshot_id: str,
+    parent: SkillSpecV11,
+    source_run_ref: str,
+    source_refs: list[str] | None = None,
+) -> V11ExperienceBundle:
+    """Bind immutable eligible cases to the currently active parent campaign."""
+    if not cases:
+        raise V11ExperienceBuildError("流式经验包至少需要一条合格 case")
+    parent_key = f"{parent.skill_id}@{parent.version}"
+    case_ids = [case.case_id for case in cases]
+    if len(set(case_ids)) != len(case_ids):
+        raise V11ExperienceBuildError("流式经验 case_id 重复")
+    for case in cases:
+        if (
+            case.question_type != parent.question_type
+            or case.evidence_state != parent.evidence_state
+            or case.delivered_skill_version != parent_key
+            or case.delivered_content_sha256 != parent.content_sha256
+            or case.delivered_skill_md != parent.skill_md
+        ):
+            raise V11ExperienceBuildError(
+                f"{case.case_id}: 流式经验未绑定当前父 Skill/槽位")
+    manifest = [
+        {
+            "case_id": case.case_id,
+            "qa_id": case.qa_id,
+            "trace_ref": case.trace_ref,
+            "case_sha256": _json_sha256(case.model_dump(mode="json")),
+        }
+        for case in cases
+    ]
+    refs = list(source_refs or sorted({case.trace_ref for case in cases}))
+    access = DataAccessRecord(
+        record_id="label-access-" + _json_sha256({
+            "campaign_id": campaign_id,
+            "parent": parent_key,
+            "cases": manifest,
+        })[:20],
+        at=utcnow_iso(),
+        split="induction",
+        purpose="skill_induction",
+        component_role="inducer",
+        run_id=source_run_ref,
+        input_manifest_sha256=_json_sha256(manifest),
+        n_items=len(cases),
+        label_access=True,
+        source_refs=refs,
+        notes=[
+            "Buffered eligible induction cases; only question-level answers and scores are authorized"
+        ],
+    )
+    return V11ExperienceBundle(
+        campaign_id=campaign_id,
+        parent_snapshot_id=parent_snapshot_id,
+        parent_skill_version=parent_key,
+        parent_content_sha256=parent.content_sha256,
+        question_type=parent.question_type,
+        evidence_state=parent.evidence_state,
+        source_split="induction",
+        split="learning",
+        label_access=True,
+        source_run_ref=source_run_ref,
+        label_access_record=access,
+        cases=[case.model_copy(deep=True) for case in cases],
+    )
+
+
+@dataclass(frozen=True)
+class V11BufferedCollector:
+    """Campaign collector over an immutable cumulative parent-version buffer."""
+
+    cases: tuple[V11ExperienceCase, ...]
+    source_run_ref: str
+    source_refs: tuple[str, ...] = ()
+
+    def __call__(self, **kwargs) -> V11ExperienceBundle:
+        parent = kwargs["parent"]
+        return build_v11_experience_bundle_from_cases(
+            list(self.cases),
+            campaign_id=str(kwargs["campaign_id"]),
+            parent_snapshot_id=str(kwargs["parent_snapshot_id"]),
+            parent=parent,
+            source_run_ref=self.source_run_ref,
+            source_refs=list(self.source_refs),
+        )
+
+
 __all__ = [
+    "V11BufferedCollector",
+    "V11CaseEligibility",
     "V11ExperienceBuildError",
     "V11TraceCollector",
+    "build_v11_experience_bundle_from_cases",
     "build_v11_experience_bundle_from_trace_store",
+    "collect_v11_streaming_case",
 ]
