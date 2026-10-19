@@ -1,9 +1,18 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.6-two-capabilities"
+TOOL_DOCS_VERSION = "tool-docs-v11.8-task-tools"
 
 
 DESCRIPTIONS = {
+    "object_surface_distance": (
+        "Low quantile of bidirectional nearest-neighbor distances between two distinct "
+        "objects' point sets, used as a nearest-surface-distance proxy. unit selects the "
+        "coordinate unit; use only a unit listed in allowed units. Return dict: distance, "
+        "unit, definition, distance_normalized, distance_metric (None for normalized mode), "
+        "a/b (resolved obj_id/category_name), n_nn_samples, n_valid_points, quantile_q, "
+        "voxel_size, point_contamination_suspect, and degradation_flags. Raise an error "
+        "without a finite distance in the requested unit; never silently change units. "
+        "This is an object-surface measurement, not a centroid or camera distance."),
     "list_objects": (
         "Return object records as list[dict] with obj_id, category_name, visible_frames, track_id, "
         "source_label, binding_provenance, det_conf, det_conf_source, mask_support_ratio, "

@@ -6,13 +6,20 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
 
-当前在线合同使用 `program_synth_v11_7_en`、
-`solver-v11.7-initial-state-skills` 和 `tool-docs-v11.6-two-capabilities`。类别匹配、对象覆盖、
+当前在线合同使用 `program_synth_v11_8_en`、
+`solver-v11.8-task-tools` 和 `tool-docs-v11.8-task-tools`。类别匹配、对象覆盖、
 完整排名验收及检测器重试由两臂共用；评测时原 solver 失败后可预算外追加一次
 `eval-visual-v1` 请求，只携带冻结的 32 张原帧、问题、选项和答案格式。该路径不在
 `induction` 使用，正常提交但答错也不会触发。当前 active snapshot 为
-`S0-v11-initial-state-skills`；质量确认哈希包含相关源码和合同版本，旧确认会被拒绝。详见
+`S0-v11-task-tools`；质量确认哈希包含相关源码和合同版本，旧确认会被拒绝。详见
 [配对运行合同](docs/skill_ablation_v11.md)。
+
+正常模型工具目录为 13 个，按八题型与当前证据／产物／局部条件，每题最多暴露
+4–8 个。两个表面距离入口统一为 `object_surface_distance(obj_a, obj_b, unit)`，
+`normalized` 只表示重建单位，`m` 额外需要题级尺度授权。旧距离、相机距离、
+存在性与简单欧氏距离入口保留内部兼容，正常模型调用会被拒绝。
+新快照只迁移两条绝对距离正文至 1.0.1，其余 22 条及历史源 hash 保持；
+该接口迁移不构成模型效果或 Skill 演进实验。
 
 对象清单中的 `det_conf` 是检测器原始置信度，`mask_support_ratio` 是非空传播 mask
 覆盖率。paired 运行会在全部题完成 M5 后审计跨题异类 mask 冲突；冲突对象仅禁用
@@ -77,7 +84,7 @@ M5 提供候选和技术校验，不证明候选是题目所指实例；模型�
 | v11 默认配置 | `configs/gpu_experiment_v11.yaml` |
 | v11 运行器 | `scripts/run_gpu_experiment_v11.py` |
 | v11 配对协议 | `docs/skill_ablation_v11.md` |
-| 当前 active snapshot | `S0-v11-initial-state-skills` |
+| 当前 active snapshot | `S0-v11-task-tools` |
 | active snapshot 文件 | `skill_library/snapshots/active_snapshot.json` |
 | active snapshot SHA-256 | 由 `skill_library/snapshots/active_snapshot.json` 当前内容复算 |
 
@@ -388,7 +395,7 @@ PYTHONPATH=src python scripts/run_gpu_experiment_v11.py \
 - 默认题型：`object_rel_distance`，S03。
 - 两臂都通过真实 runner、同一题单、同一输入和同一质量门。
 - B01 的交付 Skill 集合为空。
-- B11 默认加载 `S0-v11-initial-state-skills`，按题型与初始证据状态选择完整正文。
+- B11 默认加载 `S0-v11-task-tools`，按题型与初始证据状态选择完整正文。
 - 当前入口不读取或修改 active pointer，不使用 v10 的 `evaluation_binding`。
 - 两臂按顺序运行，当前不是延迟公平性实验。
 - `seed` 进入准备阶段和模型请求，但不同 GPU 调度不承诺逐位一致。

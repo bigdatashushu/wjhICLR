@@ -75,7 +75,7 @@ def test_unlabelled_visual_fallback_preserves_numeric_parse_and_unscored_origina
 def test_failure_gets_exactly_one_clean_visual_answer(source, tmp_path, split):
     out, client = run_case(
         source, tmp_path,
-        ["r = euclidean_distance([0,0,0], [1,0,0])\nReturnAnswer(-1)",
+        ["r = list_objects()\nReturnAnswer(-1)",
          "ReturnAnswer(-1)", "12.5"], split=split)
     assert out.final_state == "answer" and out.answer == "12.5" and out.mra_value == 1.0
     assert out.agent_rounds == 2 and len(out.rounds) == 2

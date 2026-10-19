@@ -158,9 +158,12 @@ def _number(value: Any, label: str) -> float:
     return number
 
 
-def _unit_for_field(tool: str, raw_field: Any) -> str:
+def _unit_for_field(tool: str, raw_field: Any, value: Any = None) -> str:
     tokens = _field_tokens(raw_field)
     leaf = str(tokens[-1]) if tokens else ""
+    if tool == "object_surface_distance" and leaf == "distance":
+        unit = value.get("unit") if isinstance(value, dict) else None
+        return unit if unit in ("m", "normalized") else ""
     if leaf == "count" or leaf.startswith("n_"):
         return "count"
     if leaf.endswith("_m2"):
@@ -227,7 +230,7 @@ def _execute(
     if op == "field":
         if len(decoded) != 1:
             raise DerivationReplayError("invalid_arity", "field must reference exactly one result")
-        return _lookup(decoded[0], field), _unit_for_field(tools[0], field)
+        return _lookup(decoded[0], field), _unit_for_field(tools[0], field, decoded[0])
 
     if op == "convert":
         if len(decoded) != 1:
@@ -239,7 +242,7 @@ def _execute(
             raise DerivationReplayError(
                 "invalid_parameters",
                 f"Unsupported unit conversion {source_unit!r} -> {target_unit!r}")
-        inferred = _unit_for_field(tools[0], field)
+        inferred = _unit_for_field(tools[0], field, decoded[0])
         if not inferred:
             raise DerivationReplayError(
                 "unit_unverified", "Cannot determine the source unit for convert from tool result fields")

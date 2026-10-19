@@ -184,16 +184,17 @@ def test_exists_in_scene_distinguishes_empty_candidates_from_missing_artifact(tm
                                objects_materialized=True)
     assert "objects" in materialized.available_artifacts
     assert REGISTRY.call_tool("exists_in_scene", {"name": "table"}, materialized,
-                              mode="real").value == "true"
+                              mode="real", model_call=False).value == "true"
     assert REGISTRY.call_tool("exists_in_scene", {"name": "spaceship"}, materialized,
-                              mode="real").value == "false"
+                              mode="real", model_call=False).value == "false"
 
     # ② M5 未跑（objects 产物未产出）→ 必须 fail-closed 抛错（不得假装"场景里没有"）
     absent = SceneHandle(healthy, objects=[], c2w_list=c2w, intrinsics=k,
                          objects_materialized=False)
     assert "objects" not in absent.available_artifacts
     with pytest.raises(ArtifactUnavailableError):
-        REGISTRY.call_tool("exists_in_scene", {"name": "table"}, absent, mode="real")
+        REGISTRY.call_tool("exists_in_scene", {"name": "table"}, absent, mode="real",
+                           model_call=False)
 
     # ③ 未显式声明时保持老语义（空列表 = 未产出）
     legacy = SceneHandle(healthy, objects=[])
@@ -204,7 +205,8 @@ def test_exists_in_scene_distinguishes_empty_candidates_from_missing_artifact(tm
     empty_handle = SceneHandle(empty, objects=[], c2w_list=c2w, intrinsics=k,
                                objects_materialized=True)
     assert REGISTRY.call_tool(
-        "exists_in_scene", {"name": "table"}, empty_handle, mode="real").value == "false"
+        "exists_in_scene", {"name": "table"}, empty_handle, mode="real",
+        model_call=False).value == "false"
 
 
 # ------------------------------------------------- Appendix A：G1 / G3 ----
@@ -364,9 +366,11 @@ def test_docs_trim_respects_actually_available_artifacts(tmp_path):
     facts = REGISTRY.docs(scene.question_tool_scope, available=handle.available_artifacts)
     assert "exists_in_scene" not in facts          # 需要 objects → 不该出现
     assert "reproject" not in facts                # 需要 poses/intrinsics → 不该出现
-    assert "euclidean_distance" in facts           # 纯算术 → 保留
+    assert "inspect_frames" in facts
+    assert "euclidean_distance" not in facts
     # 不传 available 时保持 scope 口径（属性测试的单调性不受影响）
-    assert "exists_in_scene" in REGISTRY.docs(scene.question_tool_scope)
+    assert "list_objects" in REGISTRY.docs(scene.question_tool_scope)
+    assert "exists_in_scene" not in REGISTRY.docs(scene.question_tool_scope)
 
 
 # ------------------------------------------------------------------ 归档 ----

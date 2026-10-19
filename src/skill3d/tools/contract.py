@@ -25,6 +25,7 @@ from skill3d.schemas.evidence import (
     EvidenceProfile,
 )
 from skill3d.schemas.tool import FailureCause
+from skill3d.tools.task_policy import task_allows
 
 if TYPE_CHECKING:
     from skill3d.schemas.authorization import AuthorizationDecision
@@ -157,6 +158,17 @@ def evidence_visible(spec, profile: Optional[EvidenceProfile]) -> bool:
 def degraded_evidence_flags(spec, profile: Optional[EvidenceProfile]) -> list[str]:
     """历史结果字段保留可读；当前二值画像不产生降级状态标记。"""
     return []
+
+
+def effective_tool_spec(spec, args: Optional[dict] = None):
+    """Resolve parameter-dependent requirements before visibility or execution."""
+    if spec.name != "object_surface_distance" or (args or {}).get(
+            "unit", "normalized") != "m":
+        return spec
+    return spec.model_copy(update={
+        "requires_artifacts": sorted(set(spec.requires_artifacts) | {"scale"}),
+        "requires_evidence": sorted(set(spec.requires_evidence) | {"metric_scale"}),
+    })
 
 
 def scope_allows(spec, scope: str) -> bool:
@@ -395,6 +407,7 @@ def authorize_tool_call(
     tools_enabled: bool = True,
     local_facts: Optional[dict[str, bool]] = None,
     gate_passed: Optional[bool] = None,
+    model_call: bool = True,
 ) -> "AuthorizationDecision":
     """§6.4：**唯一**的授权判定函数，产出结构化决策（允许与否 + 原因码）。
 
@@ -408,6 +421,7 @@ def authorize_tool_call(
     """
     from skill3d.schemas.authorization import AuthorizationDecision, gate_result_payload
 
+    spec = effective_tool_spec(spec, args)
     gate_payload, gate_applicable = gate_result_payload(gate)
     metric_required = ARTIFACT_SCALE in set(
         getattr(spec, "requires_artifacts", None) or []) or (
@@ -420,6 +434,13 @@ def authorize_tool_call(
 
     if not tools_enabled:
         reasons.append("tools_disabled")
+
+    if model_call and not task_allows(tool, question_type):
+        reasons.append("task_denied")
+    if tool == "object_surface_distance" and (args or {}).get(
+            "unit", "normalized") not in ("normalized", "m"):
+        reasons.append("domain_value")
+        missing.append("unit(must be normalized or m)")
 
     if scope and not scope_allows(spec, scope):
         reasons.append("scope_denied")
@@ -451,6 +472,13 @@ def authorize_tool_call(
         if effective_gate is False:
             reasons.append("confidence_gate")
             missing.append("metric_scale(gate failed)")
+        if tool == "object_surface_distance" and (
+            effective_gate is not True or scope != SCOPE_METRIC_ENABLED
+            or question_type not in (
+                "object_abs_distance", "object_size_estimation", "room_size_estimation")
+        ):
+            reasons.append("confidence_gate")
+            missing.append("metric_scale(question authorization missing)")
         try:
             check_metric_task_contract(tool, supported_metric_tasks,
                                        allowed_metric_tasks, question_type, args=args)

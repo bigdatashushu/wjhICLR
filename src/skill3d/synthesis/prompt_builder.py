@@ -15,7 +15,7 @@ from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_7_en"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_8_en"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -44,6 +44,7 @@ with `return ReturnAnswer(AnswerPayload(...))`.
 - Reason only from images actually received and valid tool observations. Invalidated results must not support the answer.
 - Answer whenever readable images are available. Insufficient evidence permits a visual estimate with an honest basis declaration; `ReturnAnswer("abstain")` is not a valid answer.
 - Missing tools, failed calls, and invalid results do not mean zero. Do not invent geometry, scale, observations, or result_id values.
+- Call only the currently listed tools and allowed unit modes. Task-specific interface restrictions apply at execution too; a name in historical examples is not permission to call it.
 - ToolResult.status=ok only means the call succeeded. Also check payload status, missing items, ambiguity, and degradation flags.
   Explicitly omitted summary fields are not empty values; no detection does not prove absence.
 - M5 supplies candidates and technical checks, not verified question referents. Category agreement or a unique candidate does not prove that it is the instance described by the question. Inspect candidate frames/crops, compare the question's roles and spatial qualifiers, and pass explicit obj_id values to geometry calls.
@@ -62,7 +63,7 @@ with `return ReturnAnswer(AnswerPayload(...))`.
 - tool_derived additionally requires nonempty used_result_ids and a derivation:
   `{"op": operation_name, "input_result_ids": [actual_result_id], "parameters": transformation_parameters}`.
   Supported operations are field/convert/count/sort/argmin/option_map. The framework deterministically replays the operation against actual ToolResults and checks the answer. Parameter formats:
-  field=`{"field":"a.b.0"}`; convert=`{"field":"distance_m","from_unit":"m","to_unit":"cm"}`;
+  field=`{"field":"a.b.0"}`; convert=`{"field":"distance","from_unit":"m","to_unit":"cm"}`;
   count=`{"field":"items"}`; argmin accepts one dictionary or multiple results, with `labels` required for multiple results.
   sort is similar to argmin and also accepts `descending`; option_map=
   `{"field":"direction","mapping":{"left":"A","right":"B"}}`.

@@ -594,7 +594,8 @@ def test_state_observation_namespace_and_disk_are_isolated(panel, tmp_path, monk
     monkeypatch.setattr(SceneHandle, "object_points", get_points)
     item = panel[0]
     obj = item.geometry.objects[0].obj_id
-    first = (f'x = robust_distance("camera", "{obj}")\n'
+    reference = item.geometry.objects[1].obj_id
+    first = (f'x = object_surface_distance("{obj}", "{reference}")\n'
              'secret = 123\n'
              'im = inspect_frames([0])\n'
              'return YieldObservations([im], "look")\n')
@@ -809,12 +810,12 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_7_en"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_8_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.7-initial-state-skills")
+        "solver-v11.8-task-tools")
     assert manifest["common_config"]["tool_docs_version"] == (
-        "tool-docs-v11.6-two-capabilities")
-    assert manifest["snapshot"]["snapshot_id"] == "S0-v11-initial-state-skills"
+        "tool-docs-v11.8-task-tools")
+    assert manifest["snapshot"]["snapshot_id"] == "S0-v11-task-tools"
 
 
 @pytest.mark.parametrize("damage", ["missing_qa", "duplicate_qa", "frame_hash", "source",

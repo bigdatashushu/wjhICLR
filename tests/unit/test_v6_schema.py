@@ -446,8 +446,9 @@ def test_registry_docs_tracks_evidence_and_scope():
 
     full = EvidenceProfile(geometry_3d="available", metric_scale="available")
     broken_geo = EvidenceProfile(geometry_3d="unavailable", metric_scale="unavailable")
-    n_full = len(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=full))
-    n_geo = len(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=broken_geo))
+    ctx = {"question_type": "object_size_estimation", "gate_passed": True}
+    n_full = len(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=full, **ctx))
+    n_geo = len(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=broken_geo, **ctx))
     # geometry_3d 失败收回了部分 Tool，但**不是**全部（单项失败只收回依赖它的）
     assert 0 < n_geo < n_full
     # list_objects 只依赖候选产物 → 几何失败不影响它
@@ -455,14 +456,14 @@ def test_registry_docs_tracks_evidence_and_scope():
     assert "list_objects" in names_geo
     assert "object_centroid" not in names_geo
     # scope 收窄：full_3d 下米制 Tool 不可见，metric_enabled 下可见
-    names_nometric = REGISTRY.names_for_scope(SCOPE_FULL_3D, evidence_profile=full)
-    names_metric = REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=full)
-    assert "camera_object_distance" not in names_nometric
-    assert "camera_object_distance" in names_metric
+    names_nometric = REGISTRY.names_for_scope(SCOPE_FULL_3D, evidence_profile=full, **ctx)
+    names_metric = REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, evidence_profile=full, **ctx)
+    assert "object_3d_extent" not in names_nometric
+    assert "object_3d_extent" in names_metric
     # 2D-only：候选清单仍可查看
     names_2d = REGISTRY.names_for_scope(SCOPE_FALLBACK_2D_ONLY, evidence_profile=full)
     assert "list_objects" in names_2d
-    assert "euclidean_distance" in names_2d
+    assert "euclidean_distance" not in names_2d
 
 
 # ------------------------------- 9. degraded 容忍口径（真实 GPU 实测修正）----
@@ -477,7 +478,8 @@ def test_geometry_warnings_keep_tools_but_metric_failure_blocks_metric_tools():
         artifact=_art(quality=_quality(diagnostic_warnings=["rotation_jump"])),
         scene_route="full_3d", question_type="object_abs_distance", gate=_gate())
     names = REGISTRY.names_for_scope(
-        SCOPE_METRIC_ENABLED, evidence_profile=profile, local_facts={"world_frame": True})
+        SCOPE_METRIC_ENABLED, evidence_profile=profile, local_facts={"world_frame": True},
+        question_type="route_planning")
     assert "relative_direction_of" in names     # 方向题必须仍然可用
     assert "object_centroid" in names
     assert "connectivity_graph" in names
@@ -485,7 +487,8 @@ def test_geometry_warnings_keep_tools_but_metric_failure_blocks_metric_tools():
     failed_metric = EvidenceProfile(geometry_3d="available", metric_scale="unavailable")
     names2 = REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED,
                                       evidence_profile=failed_metric,
-                                      local_facts={"world_frame": True})
+                                      local_facts={"world_frame": True},
+                                      question_type="route_planning")
     for metric_tool in ("camera_object_distance", "object_3d_extent",
                         "plane_fit_room_size"):
         assert metric_tool not in names2, metric_tool
@@ -528,7 +531,8 @@ def test_count_objects_visibility_uses_geometry():
     from skill3d.tools.registry import REGISTRY
 
     p = EvidenceProfile(geometry_3d="available", metric_scale="unavailable")
-    names = REGISTRY.names_for_scope(SCOPE_FULL_3D, evidence_profile=p)
+    names = REGISTRY.names_for_scope(SCOPE_FULL_3D, evidence_profile=p,
+                                     question_type="object_counting")
     assert "count_objects" in names
     flags = degraded_evidence_flags(REGISTRY.spec("count_objects"), p)
     assert flags == []

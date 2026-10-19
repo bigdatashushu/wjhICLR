@@ -134,7 +134,7 @@ def test_v11_complete_source_reaches_runner_model_request_once():
 
 def _v11_specs():
     snapshot = json.loads(
-        (LIBRARY / "snapshots/snapshot_S0-v11-initial-state-skills.json").read_text())
+        (LIBRARY / "snapshots/snapshot_S0-v11-task-tools.json").read_text())
     return validate_v11_snapshot(snapshot, library_root=LIBRARY)
 
 
@@ -183,7 +183,8 @@ def test_skill_on_off_requests_only_differ_by_complete_method(spec):
     assert "优先 `count_objects`" not in off_text
     assert "theta_deg" not in off_text
     assert "AnswerPayload" in off_text
-    assert ("- object_centroid(" in off_text) == evidence_available
+    assert ("- object_centroid(" in off_text) == (
+        evidence_available and spec.question_type != "obj_appearance_order")
     # 未提供 SceneHandle 的局部坐标约定；方向工具不可凭公共状态放行。
     assert "- relative_direction_of(" not in off_text
     assert "- object_visible_frames(" in off_text
@@ -306,7 +307,7 @@ def test_m11_rejects_first_answer_revokes_local_result_and_scores_correction(
 
     out, client = _run_m11_case(
         room_source_and_artifact, tmp_path, monkeypatch,
-        ["d = euclidean_distance([0, 0, 0], [1, 0, 0])\nReturnAnswer(1)\n",
+        ["d = plane_fit_room_size()\nReturnAnswer(1)\n",
          "ReturnAnswer(2)\n"],
         verifier)
 
@@ -370,7 +371,7 @@ def test_m11_checks_valid_cross_round_results_after_yield(
 
     out, client = _run_m11_case(
         room_source_and_artifact, tmp_path, monkeypatch,
-        ["d = euclidean_distance([0, 0, 0], [1, 0, 0])\n"
+        ["d = plane_fit_room_size()\n"
          "return YieldObservations([], 'observe')\n",
          "ReturnAnswer(1)\n"],
         verifier)
@@ -473,7 +474,7 @@ def test_m11_budget_exhaustion_clears_rejected_answer_and_keeps_denominator(
 
 @pytest.mark.parametrize(("program", "code", "stage"), [
     ("import os\nReturnAnswer(1)", "ast_violation", "M9"),
-    ("euclidean_distance([0, 0], [0, 0, 1])", "domain_value", "M10"),
+    ("reproject([0, 0], 0)", "domain_value", "M10"),
     ("x = 1", "no_answer", "M10"),
 ])
 def test_solver_budget_retains_terminal_error_and_stage(

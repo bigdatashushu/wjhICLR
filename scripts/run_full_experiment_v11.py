@@ -186,7 +186,7 @@ def make_manifest(rows, original, run_id, seeds=(137, 138), **identity):
         "questions": rows, "runs": runs, "pair_order": [list(k) for k in order],
         "first_batch_pairs": [list(k) for k in first],
         "planned_solver_count": len(runs), "unique_question_count": len(rows),
-        "frozen_skill": "S0-v11-initial-state-skills", "language": "en",
+        "frozen_skill": "S0-v11-task-tools", "language": "en",
         "allow_evolution": False, "allow_final_test": False,
         "budgets": {"n_frames": 32, "max_pixels": 131072, "max_model_len": 32768,
                     "max_tokens": 8192, "temperature": 0, "max_solver_rounds": 6,

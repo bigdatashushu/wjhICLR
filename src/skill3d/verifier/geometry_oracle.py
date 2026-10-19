@@ -51,6 +51,7 @@ _METRIC_VALUE_KEYS: dict[str, str] = {
     "object_3d_extent": "extent_metric",
     "object_centroid": "centroid_metric",
     "object_distance_m": "distance_m",
+    "object_surface_distance": "distance_metric",
 }
 
 _OBJECT_GEOMETRY_ARGS: dict[str, tuple[str, ...]] = {
@@ -61,6 +62,7 @@ _OBJECT_GEOMETRY_ARGS: dict[str, tuple[str, ...]] = {
     "surface_distance_between_objects": ("obj_a", "obj_b"),
     "relative_distance_rank": ("reference", "candidate_categories"),
     "object_distance_m": ("obj_a", "obj_b"),
+    "object_surface_distance": ("obj_a", "obj_b"),
     "relative_direction_of": ("observer_id", "facing_at_id", "target_id"),
     "count_objects": ("category_name",),
 }
@@ -161,12 +163,12 @@ def check_no_negative_distance(trace: ProgramExecutionTrace) -> bool:
     """距离 / 尺寸 / 面积类结果必须非负（确定性，与证据状态无关）。"""
     for name in ("euclidean_distance", "robust_distance", "camera_object_distance",
                  "surface_distance_between_objects", "object_3d_extent",
-                 "plane_fit_room_size", "object_distance_m"):
+                 "plane_fit_room_size", "object_distance_m", "object_surface_distance"):
         for v in _iter_tool_values(trace, name):
             if isinstance(v, dict):
                 for key in ("distance_metric", "distance_normalized",
                             "surface_distance_metric", "surface_distance_normalized",
-                            "distance_m", "room_area_m2", "room_diagonal_normalized",
+                            "distance_m", "distance", "room_area_m2", "room_diagonal_normalized",
                             "extent_metric", "extent_normalized", "extent_longest_metric"):
                     val = v.get(key)
                     values = val if isinstance(val, list) else [val]
@@ -186,12 +188,33 @@ def check_unit_consistent(trace: ProgramExecutionTrace, handle: SceneHandle) -> 
     `metric_evidence_authorized(handle)`。**不**再读任何"尺度已知/置信度"中间量
     （v5 `scale_known` 已随校准路线废止，§20）。
     """
-    if metric_evidence_authorized(handle):
-        return True
-    for tool, key in _METRIC_VALUE_KEYS.items():
-        for v in _iter_tool_values(trace, tool):
-            if isinstance(v, dict) and v.get(key) is not None:
-                return False   # 无米制授权却给出米制量 → 单位/证据不一致
+    authorized = metric_evidence_authorized(handle)
+    if not authorized:
+        for tool, key in _METRIC_VALUE_KEYS.items():
+            for v in _iter_tool_values(trace, tool):
+                if isinstance(v, dict) and v.get(key) is not None:
+                    return False
+    for result in trace.results:
+        if result.tool != "object_surface_distance" or result.error is not None:
+            continue
+        try:
+            payload = json.loads(result.value)
+        except (ValueError, TypeError):
+            return False
+        unit = result.args.get("unit", "normalized")
+        if (not isinstance(payload, dict) or unit not in ("normalized", "m")
+                or payload.get("unit") != unit
+                or not _finite_number(payload.get("distance"))
+                or float(payload["distance"]) < 0
+                or payload.get("definition") != "pointcloud_surface_nearest_quantile"):
+            return False
+        expected = payload.get("distance_metric" if unit == "m" else "distance_normalized")
+        if not _finite_number(expected) or not np.isclose(
+                float(payload["distance"]), float(expected)):
+            return False
+        if (unit == "m" and not authorized
+                or unit == "normalized" and payload.get("distance_metric") is not None):
+            return False
     return True
 
 
@@ -372,7 +395,7 @@ def geometry_verify(
             "no_negative_distance": result.tool in (
                 "euclidean_distance", "robust_distance", "camera_object_distance",
                 "surface_distance_between_objects", "object_3d_extent",
-                "plane_fit_room_size", "object_distance_m"),
+                "plane_fit_room_size", "object_distance_m", "object_surface_distance"),
             "unit_consistent": result.tool in _METRIC_VALUE_KEYS,
             "world_frame": result.tool in WORLD_FRAME_TOOLS,
             "binding_integrity": result.tool in _OBJECT_GEOMETRY_ARGS,

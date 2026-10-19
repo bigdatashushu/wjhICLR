@@ -57,7 +57,7 @@ from skill3d.tools.scene_handle import (
 from skill3d.trace.store import TraceStore
 from skill3d.infra.experiment_startup import MODE_ENV, current_code_identity
 
-SNAPSHOT_ID = "S0-v11-initial-state-skills"
+SNAPSHOT_ID = "S0-v11-task-tools"
 DEFAULT_LIBRARY = Path(__file__).resolve().parents[3] / "skill_library"
 ARMS = ("B01", "B11")
 ARTIFACT_REFS = (
@@ -449,7 +449,8 @@ def quality_contract() -> dict:
         "sandbox/kernel.py", "sandbox/receipt.py",
         "infra/m5_identity.py", "infra/version_lock.py", "coords.py",
         "segmentation/groundingdino_startup.py", "schemas/reconstruction.py",
-        "schemas/tool.py", "schemas/trace.py",
+        "schemas/tool.py", "schemas/trace.py", "schemas/authorization.py",
+        "tools/task_policy.py", "tools/registry.py", "tools/contract.py",
     )
     from skill3d.reconstruction.metric_fusion import threshold_snapshot, METRIC_FUSION_VERSION
 
@@ -482,6 +483,10 @@ def _common_config(cfg: OnlineRunConfig) -> dict:
     value["execution_protocol_version"] = EXECUTION_PROTOCOL_VERSION
     value["tool_face_version"] = TOOL_FACE_VERSION
     value["tool_docs_version"] = TOOL_DOCS_VERSION
+    from skill3d.tools.task_policy import TOOL_TASK_POLICY_VERSION
+    from skill3d.schemas.authorization import DECISION_VERSION
+    value["tool_task_policy_version"] = TOOL_TASK_POLICY_VERSION
+    value["tool_authorization_version"] = DECISION_VERSION
     value["eval_visual_prompt_version"] = EVAL_VISUAL_PROMPT_VERSION
     return _clean(value)
 

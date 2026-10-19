@@ -13,7 +13,7 @@ from skill3d.schemas.evidence import skill_evidence_state
 from skill3d.skills.delivery import plan_delivery
 from skill3d.skills.registry import load_active_skills
 from skill3d.skills.v11_library import publish_v11_candidate, validate_v11_snapshot
-from skill3d.skills.state_baseline import STATE_SNAPSHOT_ID
+from skill3d.skills.tool_baseline import TOOL_SNAPSHOT_ID as STATE_SNAPSHOT_ID
 
 LIBRARY = Path(__file__).resolve().parents[2] / "skill_library"
 
@@ -107,5 +107,6 @@ def test_nonmetric_question_with_scale_selects_g1m1_without_metric_tools():
     assert [h.skill_version for h in hits] == ["S01-g1m1@1.0.0"]
     assert not scene.metric_gate_passed
     assert not scene.metric_task_authorized("object_counting")
-    names = REGISTRY.names_for_scope("full_3d", evidence_profile=scene.evidence_profile)
+    names = REGISTRY.names_for_scope("full_3d", evidence_profile=scene.evidence_profile,
+                                     question_type=scene.question_type)
     assert not any(REGISTRY.is_metric_tool(name) for name in names)

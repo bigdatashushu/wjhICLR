@@ -204,7 +204,8 @@ def test_tool_face_is_exactly_the_v7_plus_v9_set():
     本断言**取代**原先的 `== V7_TOOLS`（v9 明确要求 `inspect_frames`/`detect_objects`
     必须在册，见 `V9_TOOLS` 的注释与 §9.4）：v5 的 4 个已删除 Tool 仍不得回归。
     """
-    assert set(REGISTRY.names()) == V9_TOOLS
+    assert set(REGISTRY.names()) == V9_TOOLS | {"object_surface_distance"}
+    assert len(REGISTRY.model_names()) == 13
     for gone in ("relative_direction", "object_size_longest_dim",
                  "object_distance_meters", "room_size_m2"):
         assert gone not in REGISTRY
@@ -226,10 +227,11 @@ def test_every_tool_declares_evidence_and_metric_flag_is_derived_from_it():
 
 def test_metric_tools_only_visible_under_metric_scope():
     """米制 Tool 只在 `metric_enabled` 出现（§5.3/D4：逐题只收窄，唯一例外是米制追加）。"""
-    metric_tools = {n for n in REGISTRY.names() if REGISTRY.is_metric_tool(n)}
+    metric_tools = {"object_3d_extent"}
     context = {"evidence_profile": EvidenceProfile(
         geometry_3d="available", metric_scale="available"),
-        "local_facts": {"world_frame": True}}
+        "local_facts": {"world_frame": True}, "question_type": "object_size_estimation",
+        "gate_passed": True}
     for scope in (SCOPE_FALLBACK_2D_ONLY, SCOPE_FULL_3D):
         assert metric_tools.isdisjoint(REGISTRY.names_for_scope(scope, **context)), scope
     assert metric_tools <= set(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, **context))
@@ -649,8 +651,9 @@ def test_surface_distance_between_objects_uses_both_pointsets():
     assert r.error_code == "domain_value"
 
     # 非米制工具不受尺度失败连累（§7.2：单项失败只收回依赖它的工具）
-    assert {"list_objects", "robust_distance", "surface_distance_between_objects"} <= set(
-        REGISTRY.names_for_scope(h.question_tool_scope, evidence_profile=h.evidence_profile))
+    assert {"list_objects", "object_surface_distance"} <= set(
+        REGISTRY.names_for_scope(h.question_tool_scope, evidence_profile=h.evidence_profile,
+                                question_type="object_abs_distance"))
 
 
 # ------------------------------------------------- 方向：世界系契约（§9.8/D5）----

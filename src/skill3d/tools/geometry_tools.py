@@ -56,7 +56,8 @@ EV_METRIC = EVIDENCE_METRIC_SCALE
 BINDING_INTEGRITY_TOOLS = frozenset({
     "object_centroid", "object_3d_extent", "robust_distance",
     "camera_object_distance", "surface_distance_between_objects",
-    "relative_distance_rank", "object_distance_m", "relative_direction_of",
+    "relative_distance_rank", "object_distance_m", "object_surface_distance",
+    "relative_direction_of",
     "count_objects",
 })
 
@@ -909,6 +910,60 @@ def object_distance_m(handle: SceneHandle, obj_a: str, obj_b: str) -> dict:
         "n_valid_points": int(res.n_valid_points),
         "degradation_flags": _degraded_property(
             res, metric_ok=res.distance_metric is not None),
+    }
+
+
+@REGISTRY.register(
+    ToolSpec(
+        name="object_surface_distance",
+        description="Nearest-surface distance proxy between two explicit objects.",
+        args_schema_ref="obj_a:str, obj_b:str, unit:str='normalized'",
+        returns_schema_ref="dict",
+        cost_estimate_ms=30.0,
+        source_default="real",
+        requires_artifacts=["point_cloud", "objects"],
+        requires_evidence=[EV_GEOMETRY],
+    )
+)
+def object_surface_distance(handle: SceneHandle, obj_a: str, obj_b: str,
+                            unit: str = "normalized") -> dict:
+    """One surface primitive with explicit units and no silent metric fallback."""
+    if unit not in ("normalized", "m"):
+        raise DomainValueError(
+            "object_surface_distance", "unit must be normalized or m",
+            failure_cause=FailureCause(code="invalid_tool_arguments", scope="local_call"))
+    if unit == "m" and not handle._state.metric_task_authorized(handle.question_type):
+        raise ConfidenceGateError(
+            "object_surface_distance", "This question has no metric authorization",
+            failure_cause=FailureCause(code="metric_question_unauthorized", scope="local_call"))
+    a = _get_object(handle, obj_a, "object_surface_distance")
+    b = _get_object(handle, obj_b, "object_surface_distance")
+    if a.obj_id == b.obj_id:
+        raise DomainValueError(
+            "object_surface_distance", "obj_a and obj_b resolve to the same object",
+            failure_cause=FailureCause(code="object_identity_reused", scope="local_call"))
+    scale = _metric_scale_or_fail(handle, "object_surface_distance") if unit == "m" else None
+    res = robust_distance_between_pointsets(
+        handle.object_points(a.obj_id), handle.object_points(b.obj_id),
+        metric_scale=scale, params=DistancePrimitiveParams(),
+        duplicate_suspect=bool(a.duplicate_suspect or b.duplicate_suspect))
+    distance = _require_metric(
+        res.distance_metric if unit == "m" else res.distance_normalized,
+        "object_surface_distance", f"Object surface distance ({unit})",
+        object_ids=[a.obj_id, b.obj_id])
+    return {
+        "distance": distance, "unit": unit,
+        "definition": "pointcloud_surface_nearest_quantile",
+        "distance_normalized": res.distance_normalized,
+        "distance_metric": res.distance_metric if unit == "m" else None,
+        "a": {"obj_id": a.obj_id, "category_name": a.category_name},
+        "b": {"obj_id": b.obj_id, "category_name": b.category_name},
+        "quantile_q": res.quantile_q, "voxel_size": res.voxel_size,
+        "n_nn_samples": int(getattr(res, "n_nn_samples", 0) or 0),
+        "n_valid_points": int(res.n_valid_points),
+        "point_contamination_suspect": (
+            "point_contamination_suspect" in (res.degradation_flags or [])),
+        "degradation_flags": list(res.degradation_flags or []),
     }
 
 

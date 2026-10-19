@@ -5,7 +5,7 @@ from __future__ import annotations
 from skill3d.verifier.geometry_oracle import GeometryIssue
 from skill3d.schemas.tool import FailureCause
 
-EXECUTION_PROTOCOL_VERSION = "solver-v11.7-initial-state-skills"
+EXECUTION_PROTOCOL_VERSION = "solver-v11.8-task-tools"
 
 
 def submission_scope(kernel, trace):

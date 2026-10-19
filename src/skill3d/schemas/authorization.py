@@ -21,12 +21,12 @@ from typing import Optional
 from . import Spec
 from .evidence import UNAVAILABLE_REASON_CODES  # re-exported compatibility vocabulary
 
-DECISION_VERSION = "tool-authorization-v11.6-two-capabilities"
+DECISION_VERSION = "tool-authorization-v11.8-task-tools"
 
 # 拒绝原因码 = 既有四类契约错误码 + 作用域/对象级拒绝
 DENIAL_REASON_CODES = frozenset({
     "tool_contract", "confidence_gate", "domain_value", "answer_already_given",
-    "tools_disabled", "scope_denied", "object_unbound",
+    "tools_disabled", "scope_denied", "object_unbound", "task_denied",
 })
 
 

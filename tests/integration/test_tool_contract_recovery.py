@@ -179,7 +179,7 @@ PREMISE_FAIL_THEN_OK = [
      'uv = reproject([0.0, 0.0, 1.0], 0)\n'
      'ReturnAnswer(str(round(area["room_area_m2"], 2)))\n'),
     # 第二次：只用一个不依赖被撤销证据的 Tool 作答（不碰已失效的数值）
-    ('ReturnAnswer(str(round(euclidean_distance([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]), 2)))\n'),
+    ('ReturnAnswer("1.0")\n'),
 ]
 
 
@@ -330,7 +330,7 @@ def test_validated_observation_is_not_replayed_after_invalidation(tmp_path,
 
 
 def test_same_failed_ast_skips_tools_and_keeps_original_request_budget(tmp_path, episode_item):
-    bad = "euclidean_distance([0, 0, 0], [1, 0, 0])\nx = {}['obj_id']\n"
+    bad = "list_objects()\nx = {}['obj_id']\n"
     client = _FakeClient([bad, "# changed comment\n" + bad,
                           '"""different docs"""\n' + bad, 'ReturnAnswer("3.0")\n'])
     cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=3)
@@ -351,7 +351,7 @@ def test_same_failed_ast_skips_tools_and_keeps_original_request_budget(tmp_path,
     "def broken():\n    x = x + 1\nbroken()\n",
 ])
 def test_name_failure_with_unchanged_evidence_skips_repeat(tmp_path, episode_item, failure):
-    bad = "euclidean_distance([0, 0, 0], [1, 0, 0])\n" + failure
+    bad = "list_objects()\n" + failure
     client = _FakeClient([bad, "# new comment\n" + bad, bad, 'ReturnAnswer("3.0")\n'])
     cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=3)
     cfg.max_solver_rounds = 4
@@ -364,8 +364,8 @@ def test_name_failure_with_unchanged_evidence_skips_repeat(tmp_path, episode_ite
 
 
 def test_changed_observation_does_not_trip_failed_ast_guard(tmp_path, episode_item):
-    bad = "euclidean_distance([0, 0, 0], [1, 0, 0])\nx = {}['obj_id']\n"
-    observe = ("value = euclidean_distance([0, 0, 0], [2, 0, 0])\n"
+    bad = "list_objects()\nx = {}['obj_id']\n"
+    observe = ("value = list_objects(category_filter='chair')\n"
                "YieldObservations([], 'New measurement is available')\n")
     client = _FakeClient([bad, observe, "# comment\n" + bad, bad, 'ReturnAnswer("3.0")\n'])
     cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=3)
@@ -412,7 +412,7 @@ def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
                                               "usable_object_ids": ["good"]}]},
                "track_stable_ratio": 1}, [], True))
     client = _FakeClient([
-        "object_centroid('good')\nobject_3d_extent('bad')",
+        "object_centroid('good')\nobject_centroid('bad')",
         "ReturnAnswer('1.0')",
     ])
     cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=True), max_recovery=2)

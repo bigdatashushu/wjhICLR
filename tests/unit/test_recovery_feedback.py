@@ -153,7 +153,7 @@ def test_collect_parses_list_values_and_excludes_failed_or_revoked_results():
 
 
 def test_failed_call_reports_actual_runtime_arguments():
-    kernel = RestrictedNamespaceKernel(REGISTRY, _handle(_scene()))
+    kernel = RestrictedNamespaceKernel(REGISTRY, _handle(_scene(question_type="object_counting")))
     kernel.run_cell("object_centroid(None)")
     text = failed_call_feedback(kernel.cell_results)
     assert 'object_centroid({"obj_id": null})' in text

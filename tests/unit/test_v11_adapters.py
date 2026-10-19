@@ -137,6 +137,13 @@ def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_pa
     assert "reference_answer" not in audit
     assert str(audit_path) in proposal.source_run_ref
     assert "Current Tool interfaces" in client.calls[0][0][1]["content"]
+    tool_text = client.calls[0][0][1]["content"].split("Current Tool interfaces", 1)[1].split(
+        "Induction experience JSON", 1)[0]
+    assert "- relative_distance_rank(" in tool_text
+    assert "- object_surface_distance(" in tool_text
+    assert "allowed units: normalized]" in tool_text
+    assert "- plane_fit_room_size(" not in tool_text
+    assert "- camera_object_distance(" not in tool_text
     assert not re.search(r"[\u4e00-\u9fff]", json.dumps(client.calls[0][0], ensure_ascii=False))
     assert all(problem in client.calls[0][0][1]["content"] for problem in feedback)
     repeated = reviser(

@@ -40,6 +40,7 @@ from skill3d.tools.contract import (
     check_evidence_contract,
     check_metric_task_contract,
     degraded_evidence_flags,
+    effective_tool_spec,
     evidence_visible,
     scope_allows,
 )
@@ -48,11 +49,12 @@ from skill3d.tools.contract import authorize_tool_call
 from skill3d.tools.mock_switch import MockSwitch, request_key
 from skill3d.tools.scene_handle import SceneHandle
 from skill3d.tools.docs_v11 import DESCRIPTIONS, TOOL_DOCS_VERSION
+from skill3d.tools.task_policy import MODEL_TOOLS, TOOL_TASK_POLICY_VERSION
 
 # v9 §9.2/§9.4：工具面新增 `inspect_frames` / `detect_objects`（主动图像与补检）。
 # 工具面变了就升版本 —— prompt 里列出的 Tool 集合与 trace 的 tool_face_version
 # 必须对得上，否则"这次跑的是哪套工具面"无法回答。
-TOOL_FACE_VERSION: str = "tool-face-v11.6-two-capabilities"
+TOOL_FACE_VERSION: str = "tool-face-v11.8-task-tools"
 
 
 class ToolNotFoundError(KeyError):
@@ -134,6 +136,9 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._tools.keys())
 
+    def model_names(self) -> list[str]:
+        return sorted(set(self._tools) & MODEL_TOOLS)
+
     def get(self, name: str) -> _RegisteredTool:
         if name not in self._tools:
             raise ToolNotFoundError(f"Unregistered tool: {name}")
@@ -177,8 +182,8 @@ class ToolRegistry:
            避免 prompt 里列出必然抛 `ArtifactUnavailableError` 的 Tool。
         """
         if (scope is None and available is None and evidence_profile is None
-                and local_facts is None and gate_passed is None):
-            return self.names()  # 离线接口目录，不表示某一 episode 的执行授权
+                and local_facts is None and gate_passed is None and not question_type):
+            return self.model_names()  # Public catalog, not episode authorization.
         return [
             name for name in self.names()
             if authorize_tool_call(
@@ -218,8 +223,20 @@ class ToolRegistry:
             needs = ", ".join(t.spec.requires_artifacts) or "none"
             ev = ", ".join(t.spec.requires_evidence or []) or "none"
             facts = ", ".join(t.spec.requires_local_facts) or "none"
+            modes = ""
+            if name == "object_surface_distance":
+                metric = authorize_tool_call(
+                    name, t.spec, scope=scope or "", profile=evidence_profile,
+                    available_artifacts=KNOWN_ARTIFACTS if available is None else available,
+                    gate_passed=gate_passed, local_facts=local_facts,
+                    question_type=question_type, args={"unit": "m"},
+                ).allowed
+                modes = (" [allowed units: normalized, m; m additionally requires "
+                         "metric_scale, scale, and question authorization]" if metric
+                         else " [allowed units: normalized]")
             lines.append(f"- {name}({', '.join(params)}): {DESCRIPTIONS.get(name, t.spec.description)}"
-                         f" [requires_artifacts: {needs}; requires_evidence: {ev}; local_facts: {facts}]")
+                         f" [requires_artifacts: {needs}; requires_evidence: {ev}; local_facts: {facts}]"
+                         f"{modes}")
         return "\n".join(lines)
 
     def docs_header(self, scope: str, available: Iterable[str],
@@ -257,7 +274,8 @@ class ToolRegistry:
             if evidence_profile is not None else "")
         return (f"Current question_tool_scope={scope}; available reconstruction artifacts={avail}.\n"
                 f"{evidence}{metric_line}\nTool documentation version={TOOL_DOCS_VERSION}. "
-                "The tools below are filtered by scope, evidence, and loaded artifacts. "
+                f"Tool task policy={TOOL_TASK_POLICY_VERSION}. "
+                "The tools below are filtered by question type, scope, evidence, and loaded artifacts. "
                 "Object bindings, arguments, and actual numerical validity are checked at call time.")
 
     # ---- 参数校验 ----
@@ -287,6 +305,7 @@ class ToolRegistry:
         mode: ToolSource = "real",
         mock_switch: Optional[MockSwitch] = None,
         episode_id: str = "",
+        model_call: bool = True,
     ) -> ToolResult:
         """validate(args) → **契约校验（fail-closed）** → mock 解析 → 执行 → ToolResult。
 
@@ -314,7 +333,8 @@ class ToolRegistry:
             supported_metric_tasks=entry.spec.supported_metric_tasks,
             allowed_metric_tasks=scene.allowed_metric_tasks,
             question_type=scene.question_type, args=args,
-            local_facts=scene.local_facts, gate_passed=scene.metric_gate_passed)
+            local_facts=scene.local_facts, gate_passed=scene.metric_gate_passed,
+            model_call=model_call)
         receipt = ToolAuthorizationReceipt(
             episode_id=episode_id, tool_id=name, argument_digest=digest,
             evidence_version=str(getattr(profile, "profile_version", "") or ""),
@@ -325,11 +345,22 @@ class ToolRegistry:
             args=dict(args), scene_route=str(scene.scene_route),
             question_tool_scope=str(scope))
 
+        effective = effective_tool_spec(entry.spec, args)
+        if "task_denied" in decision.reason_codes:
+            raise ToolContractError(
+                name, f"Tool {name} is not exposed for question type {scene.question_type}; "
+                "use the currently listed tools.", args=args,
+                failure_cause=FailureCause(code="task_denied", scope="local_call"))
+        if name == "object_surface_distance" and "domain_value" in decision.reason_codes:
+            raise DomainValueError(
+                name, "unit must be normalized or m", args=args,
+                failure_cause=FailureCause(code="invalid_tool_arguments", scope="local_call"))
+
         # ① scope 收窄（§5.3）：scope 之外的工具即便被模型写出也不得执行
-        if not scope_allows(entry.spec, scope):
+        if not scope_allows(effective, scope):
             # 归因（§9.12）：scope 违规时把"缺哪些产物"一并写进异常，
             # 让 M10 的 `tool_contract` 桶能给出可回放的缺失清单（而非一句"越权"）。
-            missing = sorted(set(entry.spec.requires_artifacts) - set(available))
+            missing = sorted(set(effective.requires_artifacts) - set(available))
             raise ToolContractError(
                 name,
                 f"Tool {name} is not allowed in the current question_tool_scope={scope}"
@@ -345,12 +376,12 @@ class ToolRegistry:
 
         # ③ 证据契约（§7.2/§13.2 执行期二次校验）
         check_evidence_contract(
-            name, entry.spec, profile,
+            name, effective, profile,
             gate_passed=scene.metric_gate_passed,
             route=scene.scene_route, args=args)
 
         # ④ 产物契约：缺产物直接抛 ArtifactUnavailableError（不静默返回假值）
-        check_artifact_contract(name, entry.spec.requires_artifacts, available,
+        check_artifact_contract(name, effective.requires_artifacts, available,
                                route=scene.scene_route, args=args)
         if not decision.allowed:
             raise ArtifactUnavailableError(
@@ -423,7 +454,10 @@ def call_tool(
     mock_switch: Optional[MockSwitch] = None,
 ) -> ToolResult:
     """§4 M6 伪代码的模块级入口，委托全局 REGISTRY。"""
-    return REGISTRY.call_tool(name, args, scene, mode=mode, mock_switch=mock_switch)
+    # Framework/legacy callers retain the technical contract. Model programs use
+    # ToolRegistry.call_tool directly and cannot set this internal access flag.
+    return REGISTRY.call_tool(name, args, scene, mode=mode, mock_switch=mock_switch,
+                              model_call=False)
 
 
 __all__ = [

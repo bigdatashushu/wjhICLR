@@ -50,7 +50,7 @@ from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
 
-REVISION_PROMPT_VERSION = "skill-revision-v11.4-initial-slot"
+REVISION_PROMPT_VERSION = "skill-revision-v11.5-task-tools"
 _SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -158,6 +158,22 @@ class V11OfflineReviser:
         experience = kwargs["experience"]
         feedback = list(kwargs.get("static_feedback") or [])
         evidence = experience.model_dump(mode="json")
+        from skill3d.schemas import EvidenceProfile
+        from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
+        from skill3d.tools.contract import KNOWN_ARTIFACTS
+
+        geometry = parent.evidence_state != "g0m0"
+        scale = parent.evidence_state == "g1m1"
+        metric = scale and parent.question_type in METRIC_TASK_TYPES
+        tool_docs = REGISTRY.docs(
+            scope=("fallback_2d_only" if not geometry
+                   else "metric_enabled" if metric else "full_3d"),
+            available=KNOWN_ARTIFACTS,
+            evidence_profile=EvidenceProfile(
+                geometry_3d="available" if geometry else "unavailable",
+                metric_scale="available" if scale else "unavailable"),
+            gate_passed=metric, question_type=parent.question_type,
+            local_facts={"world_frame": True})
         return (
             "You revise one reusable 3D reasoning method for a coding agent.\n"
             f"Protocol: {REVISION_PROMPT_VERSION}.\n"
@@ -184,7 +200,10 @@ class V11OfflineReviser:
             f"Keep the stable frontmatter name exactly {parent.name!r}.\n"
             "Current online execution contract:\n"
             f"{_PROGRAM_SYNTH.split('## Current question and answer requirements')[0]}\n"
-            f"Current Tool interfaces ({TOOL_DOCS_VERSION}):\n{REGISTRY.docs()}\n"
+            f"Current Tool interfaces ({TOOL_DOCS_VERSION}) for this initial slot:\n{tool_docs}\n"
+            "This is the slot's maximum interface set. Actual objects, artifacts and local "
+            "conditions can restrict it further; use only currently authorized interfaces "
+            "and unit modes. The method may retain visual fallback checks.\n"
             "Induction experience JSON:\n"
             f"{json.dumps(evidence, ensure_ascii=False, sort_keys=True)}\n"
             "Static-validation feedback from earlier attempts:\n"

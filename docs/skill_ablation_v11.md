@@ -5,13 +5,13 @@
 `object_rel_distance`（S03），`--question-types` 接受逗号分隔的规范题型。
 
 两臂均通过真实 `run_episode` 生成、执行程序，默认共同使用
-`program_synth_v11_7_en`、`solver-v11.7-initial-state-skills` 和
-`tool-docs-v11.6-two-capabilities`，
+`program_synth_v11_8_en`、`solver-v11.8-task-tools` 和
+`tool-docs-v11.8-task-tools`，
 质量门始终开启。`ReturnAnswer` 先暂存提交；M11 通过后才进入评分，拒绝时在同一
 求解预算内撤销受影响结果并把结构化失败反馈给同一模型。声明了 `derivation` 时，
 M11 只使用登记操作确定性重放并核对答案；计算声明错误不会撤销本身有效的工具结果。
 B01 的交付集合为空；
-B11 默认校验并加载 `S0-v11-initial-state-skills` 的 24 槽位 snapshot、manifest 和完整英文正文，
+B11 默认校验并加载 `S0-v11-task-tools` 的 24 槽位 snapshot、manifest 和完整英文正文，
 经题型与初始证据状态精确查找并固定整题 Skill。入口不读取或修改 active pointer，
 也不使用 v10 的 `evaluation_binding`。
 
@@ -21,6 +21,12 @@ B11 默认校验并加载 `S0-v11-initial-state-skills` 的 24 槽位 snapshot�
 归属整题。运行期证据失效仍收回工具和结果，不重检索 Skill。父／候选在首次求解前
 按共同准备的初始状态筛选同槽位题目，最终状态或得分不参与筛选。无目标槽位样本
 报告未完成且不晋升。本次结构迁移建立新的初始正文，保留历史源，未运行新实验。
+
+两臂使用同一 `tool-task-policy-v11.8`，模型目录有 13 个接口，按题型和当前授权
+每题最多展示 4–8 个。`object_surface_distance` 统一表面距离计算，米制模式的授权
+依赖由实际 `unit` 参数决定，收据、尺度撤销和 M11 使用同一单位事实。
+`S0-v11-task-tools` 只将两条绝对距离正文升为 1.0.1，保留父快照与旧版本，
+其余 22 条正文未变。题型规则与授权源码进入质量确认身份，新旧工具协议结果不可混用。
 
 当前代码默认每次Qwen请求的最大输出为8192 token，输入token另计；M5显式小预算
 保持不变。2026-10-11完成的256次正式实验属于`c020345`与4096输出上限，不能与

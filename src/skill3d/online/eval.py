@@ -461,11 +461,15 @@ def current_version_fields() -> dict:
     from skill3d.schemas.evidence import GATE_VERSION, PROFILE_VERSION
     from skill3d.tools.distance_primitives import DistancePrimitiveParams
     from skill3d.tools.registry import TOOL_FACE_VERSION
+    from skill3d.tools.task_policy import TOOL_TASK_POLICY_VERSION
+    from skill3d.schemas.authorization import DECISION_VERSION
     return {
         "template_version": PROMPT_TEMPLATE_VERSION,
         "execution_protocol_version": EXECUTION_PROTOCOL_VERSION,
         "tool_face_version": TOOL_FACE_VERSION,
         "tool_docs_version": TOOL_DOCS_VERSION,
+        "tool_task_policy_version": TOOL_TASK_POLICY_VERSION,
+        "tool_authorization_version": DECISION_VERSION,
         "evidence_profile_version": PROFILE_VERSION,
         "gate_version": GATE_VERSION,
         "metric_model": METRIC_MODEL_NONE,          # 未跑融合时如实标 none

@@ -589,9 +589,8 @@ def _question_and_gt(question_type: str, geometry: SyntheticGeometry,
 
     GT 与工具口径对齐（否则"mock 答错"无法区分是管道坏了还是口径不同）：
 
-    - `object_abs_distance`：§12.3 的官方口径是**相机→对象**（不是对象↔对象），
-      GT 用相机中心到对象表面点集的低分位距离；
-    - `object_rel_distance`：观察点（相机）到各候选对象的稳健距离比较；
+    - `object_abs_distance`：两个命名对象之间的表面距离；
+    - `object_rel_distance`：命名参照对象到所有候选对象的表面距离比较；
     - `object_rel_direction`：观察者 = cabinet、面向 chair、指向 sofa（三对象口径，
       与 `relative_direction_of(observer, facing_at, target)` 同构）；
     - `obj_appearance_order`：按对象**最早可见帧**排序（来自真实投影可见性）。
@@ -646,22 +645,16 @@ def _question_and_gt(question_type: str, geometry: SyntheticGeometry,
         return (f"What is the longest dimension of the {names[0]} in meters?",
                 None, f"{gt:.2f}")
     if question_type == "object_abs_distance":
-        pts = _load_object_points(geometry, geometry.objects[0])
-        cam = np.asarray(geometry.c2w[0][:3, 3], dtype=np.float64)
-        gt = float(np.quantile(np.linalg.norm(pts - cam, axis=1), 0.01))
-        return (f"In the first frame, how far is the camera from the {names[0]}? "
-                f"Answer in meters.", None, f"{gt:.2f}")
+        gt = _synthetic_surface_distance(geometry, geometry.objects[0], geometry.objects[2])
+        return (f"What is the nearest distance between the {names[0]} and the {names[2]}? "
+                "Answer in meters.", None, f"{gt:.2f}")
     if question_type == "object_rel_distance":
-        # MCA：观察点（相机）比较 objects[0] / objects[2] 谁更近（选项 = 对象名）
-        cam = np.asarray(geometry.c2w[0][:3, 3], dtype=np.float64)
-        d0 = float(np.quantile(np.linalg.norm(
-            _load_object_points(geometry, geometry.objects[0]) - cam, axis=1), 0.01))
-        d2 = float(np.quantile(np.linalg.norm(
-            _load_object_points(geometry, geometry.objects[2]) - cam, axis=1), 0.01))
+        d0 = _synthetic_surface_distance(geometry, geometry.objects[1], geometry.objects[0])
+        d2 = _synthetic_surface_distance(geometry, geometry.objects[1], geometry.objects[2])
         options = [names[0], names[2]]
         gt = "A" if d0 <= d2 else "B"
         return (f"Between the {names[0]} and the {names[2]}, which is closer to the "
-                f"camera (the observer) in the first frame?", options, gt)
+                f"{names[1]}?", options, gt)
     raise ValueError(f"未支持的合成题型: {question_type}")
 
 
@@ -675,6 +668,14 @@ def _load_object_points(geometry: SyntheticGeometry, obj: ObjectInstance) -> np.
                      [bbox[0, 0], bbox[1, 1], bbox[0, 2]],
                      [bbox[1, 0], bbox[0, 1], bbox[1, 2]],
                      np.asarray(obj.centroid_world, dtype=np.float64)])
+
+
+def _synthetic_surface_distance(geometry, a, b) -> float:
+    """Independent fixture answer; synthetic scores are not model evidence."""
+    from scipy.spatial import cKDTree
+    pa, pb = _load_object_points(geometry, a), _load_object_points(geometry, b)
+    return float(np.quantile(np.concatenate((
+        cKDTree(pb).query(pa)[0], cKDTree(pa).query(pb)[0])), .01))
 
 
 def make_synthetic_episode(
@@ -1066,15 +1067,13 @@ def stub_program(question_type: str, episode: VSIBenchEpisode,
             f"ReturnAnswer(answer)\n"
         )
     if question_type == "object_rel_distance":
-        # MCA：按 §12.3 官方口径比较"观察点（相机）→ 各候选对象"的稳健距离
+        # Pipeline stub follows the public object-reference ranking interface.
         pairs = ", ".join(f'("{o}", "{"ABCD"[i]}")' for i, o in enumerate(opts))
         return (
             f"{_STUB_BANNER}\n"
             f"pairs = [{pairs}]\n"
-            f"dists = {{}}\n"
-            f"for text, letter in pairs:\n"
-            f'    dists[text] = robust_distance("camera", text)["distance_normalized"]\n'
-            f'nearest = min(dists, key=dists.get)\n'
+            f'rank = relative_distance_rank("{names[1]}", [text for text, _ in pairs])\n'
+            f'nearest = rank["closest_category"]\n'
             f'answer = pairs[0][1]\n'
             f"for text, letter in pairs:\n"
             f"    if text == nearest:\n"
@@ -1113,11 +1112,11 @@ def stub_program(question_type: str, episode: VSIBenchEpisode,
             f'ReturnAnswer(str(round(max(ext["extent_metric"]), 2)))\n'
         )
     if question_type == "object_abs_distance":
-        # §12.3 官方口径：相机（观察点）→ 对象表面的稳健低分位距离
+        # Same object-surface unit contract as the current public tool.
         return (
             f"{_STUB_BANNER}\n"
-            f'd = camera_object_distance("{anchor_a}")\n'
-            f'ReturnAnswer(str(round(d["distance_metric"], 2)))\n'
+            f'd = object_surface_distance("{anchor_a}", "{anchor_b}", unit="m")\n'
+            f'ReturnAnswer(str(round(d["distance"], 2)))\n'
         )
     raise ValueError(f"未支持的合成题型: {question_type}")
 

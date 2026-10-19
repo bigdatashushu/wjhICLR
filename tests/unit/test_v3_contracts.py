@@ -125,7 +125,7 @@ def _profile(**over) -> EvidenceProfile:
     return EvidenceProfile(**base)
 
 
-def _scene(scene_route: str = "full_3d", *, question_type: str = "",
+def _scene(scene_route: str = "full_3d", *, question_type: str = "object_counting",
            objects: tuple[str, ...] = ("obj_0",), profile=None,
            gate_passed: bool | None = None) -> SceneState:
     """v6 SceneState：`scene_route`（M4 质量）× `question_tool_scope`（逐题派生）正交。
@@ -187,8 +187,10 @@ def test_tool_docs_scope_filter_matches_contract_map():
     """
     for scope in QUESTION_TOOL_SCOPES:
         exposed = set(REGISTRY.names_for_scope(
-            scope, evidence_profile=_profile(), local_facts={"world_frame": True}))
-        expected = {n for n in REGISTRY.names()
+            scope, evidence_profile=_profile(), local_facts={"world_frame": True},
+            question_type="object_counting"))
+        from skill3d.tools.task_policy import TASK_TOOLS
+        expected = {n for n in TASK_TOOLS["object_counting"]
                     if scope_allows(REGISTRY.spec(n), scope)}
         assert exposed == expected, scope
 
@@ -198,8 +200,8 @@ def test_tool_docs_scope_filter_matches_contract_map():
     # （只依赖 frames 产物）与 `detect_objects`（服务健康是执行前置条件，不要求已有
     # 检测成功）都在此 scope 暴露；重建失败只收回 3D 工具，不收回"看原图"的能力。
     # 本断言**取代**原先的 `== {"euclidean_distance"}`（那时这两个工具还不存在）。
-    assert fallback == {"euclidean_distance", "inspect_frames", "detect_objects",
-                        "list_objects", "exists_in_scene", "object_visible_frames"}
+    assert fallback == {"inspect_frames", "detect_objects",
+                        "list_objects", "object_visible_frames"}
     for name in fallback:
         assert set(REGISTRY.requires_artifacts(name)) <= set(
             ROUTE_ARTIFACTS["fallback_2d_only"])
@@ -212,11 +214,12 @@ def test_tool_docs_monotonic_over_scopes():
     v5 的三段 route 单调（full_3d ⊇ fallback_2d_only ⊇ unanswerable）不再适用：
     `unanswerable` 是 scene_route 的取值而非 scope，逐题维度只剩上述两条包含关系。
     """
-    context = {"evidence_profile": _profile(), "local_facts": {"world_frame": True}}
+    context = {"evidence_profile": _profile(), "local_facts": {"world_frame": True},
+               "question_type": "object_size_estimation", "gate_passed": True}
     full = set(REGISTRY.names_for_scope(SCOPE_FULL_3D, **context))
     metric = set(REGISTRY.names_for_scope(SCOPE_METRIC_ENABLED, **context))
     fallback = set(REGISTRY.names_for_scope(SCOPE_FALLBACK_2D_ONLY, **context))
-    metric_tools = {n for n in REGISTRY.names() if REGISTRY.is_metric_tool(n)}
+    metric_tools = {"object_3d_extent"}
 
     assert full <= metric                      # 逐题只新增米制 Tool，不新增别的
     assert fallback <= full                    # 2D-only 是 full_3d 的子集
@@ -270,7 +273,8 @@ def test_fallback_scope_missing_candidates_is_fail_closed_not_false():
     scene = _scene("fallback_2d_only", objects=())
     handle = _handle(scene)
     with pytest.raises(ToolContractError) as ei:
-        REGISTRY.call_tool("exists_in_scene", {"name": "table"}, handle, mode="real")
+        REGISTRY.call_tool("exists_in_scene", {"name": "table"}, handle, mode="real",
+                           model_call=False)
     assert ei.value.error_code == "tool_contract"
     assert ei.value.missing == ["objects"]
     assert ei.value.route == "fallback_2d_only"
@@ -282,13 +286,13 @@ def test_kernel_maps_contract_violation_to_tool_contract_and_untrusts_answer():
     handle = _handle(scene)
     kernel = RestrictedNamespaceKernel(REGISTRY, handle, frames=[], mode="real")
     cell = kernel.run_cell(
-        'if exists_in_scene("table"):\n    n = 1\nelse:\n    n = 0\nReturnAnswer(n)\n')
+        'n = list_objects("table")\nReturnAnswer(len(n))\n')
     assert cell.error_code == "tool_contract"
     assert cell.answer is None
     assert cell.answer_untrusted is True
     assert cell.contract_violations[0]["missing_artifacts"] == ["objects"]
     # 调用本身仍进 ProgramExecutionTrace（审计可回放）
-    assert [r.tool for r in kernel.tool_results] == ["exists_in_scene"]
+    assert [r.tool for r in kernel.tool_results] == ["list_objects"]
     assert kernel.tool_results[0].error_code == "tool_contract"
 
 
@@ -297,9 +301,9 @@ def test_exists_in_scene_false_iff_objects_available_and_truly_absent():
     scene = _scene("full_3d")
     handle = _handle(scene)
     assert REGISTRY.call_tool("exists_in_scene", {"name": "table"}, handle,
-                              mode="real").value == "true"
+                              mode="real", model_call=False).value == "true"
     assert REGISTRY.call_tool("exists_in_scene", {"name": "spaceship"}, handle,
-                              mode="real").value == "false"
+                              mode="real", model_call=False).value == "false"
 
 
 def test_domain_errors_are_attributed_not_swallowed():

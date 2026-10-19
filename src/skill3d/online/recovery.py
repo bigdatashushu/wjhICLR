@@ -35,7 +35,7 @@ from typing import Optional
 from skill3d.schemas.evidence import CAPABILITIES, EvidenceProfile
 from skill3d.schemas.reconstruction import SceneState
 from skill3d.schemas.tool import FailureCause
-from skill3d.tools.contract import EVIDENCE_METRIC_SCALE
+from skill3d.tools.contract import EVIDENCE_METRIC_SCALE, effective_tool_spec
 
 # 恢复重试上限（TODO_CALIBRATE：起始参考值，必须先标定再当结论）
 MAX_RECOVERY_ATTEMPTS: int = 2   # TODO_CALIBRATE
@@ -85,6 +85,9 @@ _SUMMARY_FIELDS = {
     "plane_fit_room_size": ("degradation_flags", "room_area_m2", "fit_quality",
                             "plane_inlier_ratio", "room_diagonal_normalized"),
     "object_distance_m": ("degradation_flags", "distance_m", "distance_normalized", "a", "b"),
+    "object_surface_distance": (
+        "distance", "unit", "definition", "a", "b", "distance_normalized",
+        "distance_metric", "n_valid_points", "degradation_flags"),
     "relative_direction_of": ("direction", "difficulty", "world_up_used", "handedness_used"),
     "inspect_frames": ("n_images", "frame_ids", "images", "note"),
 }
@@ -454,9 +457,10 @@ def cascade_invalidate(kernel, premise: str, *,
             continue
         name = str(getattr(r, "source_tool", "") or getattr(r, "tool", ""))
         try:
-            spec = registry.spec(name)
+            spec = effective_tool_spec(registry.spec(name), r.args)
             req = (set(spec.requires_evidence) | set(spec.requires_local_facts)
                    | set(spec.requires_artifacts))
+            req.update((r.authorization or {}).get("dependency_refs", []))
         except Exception:  # noqa: BLE001 - 未注册名（回放/历史 trace）→ 不撤销
             continue
         if req & affected:

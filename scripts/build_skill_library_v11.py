@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 
-from skill3d.skills.state_baseline import STATE_SNAPSHOT_ID, build_initial_state_baseline
+from skill3d.skills.tool_baseline import TOOL_SNAPSHOT_ID, build_tool_baseline
 from skill3d.skills.v11_library import V11LibraryError, write_v11_snapshot
 
 
@@ -16,10 +16,10 @@ def main() -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
     root = Path(args.library_root)
-    snapshot, manifest = build_initial_state_baseline(root, write_sources=not args.check)
+    snapshot, manifest = build_tool_baseline(root, write_sources=not args.check)
     if args.check:
         for path, value in (
-            (root / "snapshots" / f"snapshot_{STATE_SNAPSHOT_ID}.json", snapshot),
+            (root / "snapshots" / f"snapshot_{TOOL_SNAPSHOT_ID}.json", snapshot),
             (root / snapshot["manifest_ref"], manifest),
         ):
             expected = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)

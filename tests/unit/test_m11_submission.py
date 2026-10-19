@@ -246,8 +246,8 @@ def test_shared_missing_facts_and_multiple_downgrades_have_precise_union():
 def test_repeated_tool_requests_have_unique_replayable_occurrence_ids():
     kernel = RestrictedNamespaceKernel(REGISTRY, _handle(_scene()))
     result = kernel.run_cell(
-        "euclidean_distance([0,0,0], [1,0,0])\n"
-        "euclidean_distance([0,0,0], [1,0,0])")
+        "list_objects()\n"
+        "list_objects()")
     assert result.error_code is None
     a, b = kernel.tool_results
     assert a.request_digest == b.request_digest
@@ -256,8 +256,8 @@ def test_repeated_tool_requests_have_unique_replayable_occurrence_ids():
     assert b.authorization["result_id"] == b.result_id
     replay = RestrictedNamespaceKernel(REGISTRY, _handle(_scene()))
     replay.run_cell(
-        "euclidean_distance([0,0,0], [1,0,0])\n"
-        "euclidean_distance([0,0,0], [1,0,0])")
+        "list_objects()\n"
+        "list_objects()")
     assert [r.result_id for r in replay.tool_results] == [a.result_id, b.result_id]
 
 

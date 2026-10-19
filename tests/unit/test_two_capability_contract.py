@@ -110,10 +110,11 @@ def test_local_world_failure_hides_and_blocks_only_dependent_tools():
     visible = _visible(handle)
     assert "relative_direction_of" not in visible
     assert "plane_fit_room_size" not in visible
-    assert {"object_centroid", "object_distance_m", "list_objects"} <= set(visible)
+    assert {"object_centroid", "object_surface_distance", "list_objects"} <= set(visible)
     with pytest.raises(ArtifactUnavailableError, match="world_frame"):
         REGISTRY.call_tool("relative_direction_of", {
-            "observer_id": "a", "facing_at_id": "b", "target_id": "c"}, handle)
+            "observer_id": "a", "facing_at_id": "b", "target_id": "c"}, handle,
+            model_call=False)
 
 
 def test_2d_candidates_survive_geometry_and_object_point_failures(tmp_path):
@@ -141,10 +142,12 @@ def test_single_object_does_not_require_whole_category(monkeypatch):
     assert selected.status == "ok"
     assert selected.object_dependencies == ["chair_1"]
     assert selected.resolved_object_ids == ["chair_1"]
-    count = REGISTRY.call_tool("count_objects", {"category_name": "chair"}, handle)
+    count = REGISTRY.call_tool("count_objects", {"category_name": "chair"}, handle,
+                               model_call=False)
     assert count.status == "failed"
     rank = REGISTRY.call_tool("relative_distance_rank", {
-        "reference": "chair_1", "candidate_categories": ["table", "sofa"]}, handle)
+        "reference": "chair_1", "candidate_categories": ["table", "sofa"]}, handle,
+        model_call=False)
     assert rank.payload["status"] == "incomplete_candidates"
     assert rank.payload["closest_category"] is None
 
