@@ -96,12 +96,16 @@ def test_exhaustive_scan_deduplicates_observations_and_recomputes_saved_facts(ha
     objects, stats, _ = qb.bind_question_objects(**harness.args)
     assert harness.calls == [(i, "chair.") for i in range(32)]
     assert harness.segment_calls == [(i, 1) for i in range(32)]
-    assert len(objects) == 1 and len(objects[0].candidate_ids) == 32
+    assert len(objects) == 1 and len(objects[0].candidate_ids) == 2
     obj = objects[0]
     assert obj.grounding_status == "question_driven" and not obj.duplicate_suspect
     assert obj.binding_validation.status == "validated"
     assert stats["track_consensus"]["track_fragmentation_ratio"] == 0
-    assert stats["track_consensus"]["n_dedup_absorbed"] == 31
+    assert stats["track_consensus"]["n_dedup_absorbed"] == 1
+    assert stats["review_selection"]["n_observations"] == 32
+    assert stats["review_selection"]["n_selected"] == 2
+    assert len(harness.args["vlm_client"].phase_calls["m5_mask_visual"]) == 2
+    assert objects[0].visible_frames == [0, 31]
     masks = np.load(obj.mask_per_frame)
     pts, conf = np.load(obj.pointcloud_world), np.load(obj.pointconf_world)
     assert obj.visible_frames == np.flatnonzero(masks.any(axis=(1, 2))).tolist()
@@ -133,7 +137,8 @@ def test_all_instances_and_nms_suppression_have_candidate_receipts(harness, monk
             qb.ovd.Detection("chair", (6, 1, 8, 3), .9)]
     monkeypatch.setattr(qb.ovd, "detect", detect)
     objects, stats, _ = qb.bind_question_objects(**harness.args)
-    assert len(objects) == 2 and all(len(o.candidate_ids) == 32 for o in objects)
+    assert len(objects) == 2 and all(len(o.candidate_ids) == 2 for o in objects)
+    assert stats["review_selection"]["n_groups"] == 2
     assert harness.segment_calls == [(i, 2) for i in range(32)]
     for scan in stats["detection_receipts"]:
         assert len(scan["candidates"]) == 3
@@ -222,12 +227,71 @@ def test_semantic_mismatch_is_audited_rejection_not_transport_failure(
     monkeypatch.setattr(qb.msr, "compare_categories", reject)
     objects, stats, _ = qb.bind_question_objects(**harness.args)
     assert objects == []
-    assert all(row["status"] == "semantic_rejected"
-               for row in stats["candidate_receipts"])
+    assert sum(row["status"] == "semantic_rejected"
+               for row in stats["candidate_receipts"]) == 2
     requirement = stats["grounding"]["requirements"][0]
-    assert len(requirement["semantic_rejections"]) == 32
+    assert len(requirement["semantic_rejections"]) == 2
     assert requirement["binding_failures"] == []
-    assert stats["track_consensus"]["n_semantic_rejected"] == 32
+    assert stats["track_consensus"]["n_semantic_rejected"] == 2
+
+
+def test_multiple_categories_use_one_request_per_frame(harness, monkeypatch):
+    roles = [{"category": "chair", "role": "target_a", "source_text": "chair"},
+             {"category": "table", "role": "target_b", "source_text": "table"}]
+    harness.args.update(question="Distance from chair to table?",
+                        question_type="object_abs_distance", vlm_client=TextModel(roles))
+
+    def detect(frame, prompt):
+        harness.calls.append((int(frame[0, 0, 0]), prompt))
+        return [qb.ovd.Detection("chair", (1, 1, 3, 3), .8),
+                qb.ovd.Detection("table", (6, 1, 8, 3), .9)]
+
+    monkeypatch.setattr(qb.ovd, "detect", detect)
+    _, stats, _ = qb.bind_question_objects(**harness.args)
+    assert harness.calls == [(index, "chair. table.") for index in range(32)]
+    assert stats["actual_detector_requests"] == 32
+    assert all(row["scan_complete"] for row in stats["grounding"]["requirements"])
+
+
+def test_appearance_order_preserves_every_reviewed_frame(harness):
+    harness.args["question_type"] = "obj_appearance_order"
+    objects, stats, _ = qb.bind_question_objects(**harness.args)
+    assert stats["review_selection"]["n_selected"] == 32
+    assert objects[0].visible_frames == list(range(32))
+    assert len(harness.args["vlm_client"].phase_calls["m5_mask_visual"]) == 32
+
+
+def test_ambiguous_joint_labels_rescan_single_categories(harness, monkeypatch):
+    rows = [{"category": "chair", "role": "target_a", "source_text": "chair"},
+            {"category": "table", "role": "target_b", "source_text": "table"}]
+    harness.args.update(question="Distance from chair to table?",
+                        question_type="object_abs_distance", vlm_client=TextModel(rows))
+
+    def detect(frame, prompt):
+        harness.calls.append((int(frame[0, 0, 0]), prompt))
+        if prompt == "chair. table.":
+            return [qb.ovd.Detection("chair table", (1, 1, 3, 3), .8)]
+        box = (1, 1, 3, 3) if prompt == "chair." else (6, 1, 8, 3)
+        return [qb.ovd.Detection(prompt[:-1], box, .8)]
+
+    monkeypatch.setattr(qb.ovd, "detect", detect)
+    _, stats, _ = qb.bind_question_objects(**harness.args)
+    assert stats["actual_detector_requests"] == 96
+    assert all(row["scan_complete"] for row in stats["grounding"]["requirements"])
+    assert all(row["unassigned_labels"] == ["chair table"]
+               for row in stats["detection_receipts"])
+
+
+def test_review_selection_does_not_admit_unreviewed_masks(harness):
+    objects, stats, _ = qb.bind_question_objects(**harness.args)
+    selected = set(stats["review_selection"]["selected_candidate_ids"])
+    assert objects
+    for obj in objects:
+        assert set(obj.candidate_ids) <= selected
+        assert {row["candidate_id"] for row in obj.binding_provenance} <= selected
+        assert set(obj.visible_frames) == {
+            row["frame_slot"] for row in obj.binding_provenance
+        }
 
 
 def test_cached_binding_is_same_question_only_and_corruption_rebuilds(harness):

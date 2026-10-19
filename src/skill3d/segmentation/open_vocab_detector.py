@@ -204,3 +204,22 @@ def prompt_from_nouns(nouns: Sequence[str]) -> str:
     """问题名词 → 检测器文本提示（GroundingDINO 用句点分隔的类目串）。"""
     parts = [str(n).strip() for n in nouns if str(n).strip()]
     return ". ".join(parts) + ("." if parts else "")
+
+
+def assign_categories(detections: Sequence[Detection], categories: Sequence[str]):
+    """Route only unique full-label matches; ambiguous phrases remain unassigned."""
+    import re
+
+    def label(value):
+        return re.sub(r"[\s_-]+", " ", str(value).lower().strip().strip("."))
+
+    assigned = {category: [] for category in categories}
+    unassigned = []
+    for detection in detections:
+        matches = [category for category in categories
+                   if label(category) == label(detection.label)]
+        if len(matches) == 1:
+            assigned[matches[0]].append(detection)
+        else:
+            unassigned.append(detection.label)
+    return assigned, unassigned

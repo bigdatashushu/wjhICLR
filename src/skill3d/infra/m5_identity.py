@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 from importlib import metadata, util
 import json
 import os
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -13,6 +15,7 @@ import numpy as np
 
 M5_IDENTITY_VERSION = "m5-generation-identity-v2-question-driven"
 HASH_BLOCK_BYTES = 8 * 1024 * 1024
+FILE_HASH_SETTLE_NS = 2_000_000_000
 SOURCE_REFS = (
     "infra/m5_identity.py", "infra/version_lock.py",
     "segmentation/sam2_tracker.py", "segmentation/open_vocab_detector.py",
@@ -20,6 +23,7 @@ SOURCE_REFS = (
     "segmentation/mask_semantic_review.py",
     "segmentation/intern_decision_client.py", "segmentation/intern_decision_protocol.py",
     "segmentation/intern_binary_review.py",
+    "segmentation/intern_review_pool.py",
     "segmentation/groundingdino_startup.py", "coords.py",
     "reconstruction/image_grid.py", "tools/category_match.py",
     "reconstruction_gate/confidence_map.py",
@@ -37,14 +41,35 @@ def content_sha256(value) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-def file_identity(path: str | Path) -> dict:
-    """Paths are provenance only; the returned identity survives relocation."""
-    path = Path(path)
+def _file_stamp(path: Path) -> tuple:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size,
+            stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+@lru_cache(maxsize=8192)
+def _file_digest(path: str, stamp: tuple) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(HASH_BLOCK_BYTES), b""):
             digest.update(block)
-    return {"size": path.stat().st_size, "sha256": digest.hexdigest()}
+    if _file_stamp(Path(path)) != stamp:
+        raise ValueError(f"identity file changed during hashing: {path}")
+    return digest.hexdigest()
+
+
+def file_identity(path: str | Path) -> dict:
+    """Reuse hashes in this process only while inode, size and timestamps match."""
+    path = Path(path).resolve()
+    stamp = _file_stamp(path)
+    settled = time.time_ns() - max(stamp[3:]) > FILE_HASH_SETTLE_NS
+    digest = (_file_digest(str(path), stamp)
+              if stamp[2] >= HASH_BLOCK_BYTES and settled
+              else _file_digest.__wrapped__(str(path), stamp))
+    result = {"size": stamp[2], "sha256": digest}
+    if _file_stamp(path) != stamp:
+        raise ValueError(f"identity file changed during lookup: {path}")
+    return result
 
 
 def array_identity(value, *, block_bytes: int = HASH_BLOCK_BYTES):

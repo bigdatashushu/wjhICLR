@@ -75,6 +75,44 @@ def test_relocation_does_not_change_file_or_generation_identity(tmp_path):
     assert identity.generation_identity(**inputs) == before
 
 
+def test_file_hash_cache_reuses_reads_and_detects_same_size_edit(tmp_path, monkeypatch):
+    path = tmp_path / "weights.bin"
+    path.write_bytes(b"original")
+    monkeypatch.setattr(identity, "HASH_BLOCK_BYTES", 8)
+    future = identity.time.time_ns() + 3_000_000_000
+    monkeypatch.setattr(identity.time, "time_ns", lambda: future)
+    identity._file_digest.cache_clear()
+    first = identity.file_identity(path)
+    assert identity.file_identity(path) == first
+    assert identity._file_digest.cache_info().hits == 1
+    previous_mtime = path.stat().st_mtime_ns
+    path.write_bytes(b"modified")
+    identity.os.utime(path, ns=(previous_mtime, previous_mtime))
+    future = path.stat().st_ctime_ns
+    changed = identity.file_identity(path)
+    assert changed != first
+    assert changed["sha256"] == hashlib.sha256(b"modified").hexdigest()
+
+
+def test_small_or_recent_files_never_reuse_hash_cache(tmp_path):
+    path = tmp_path / "small"
+    path.write_bytes(b"original")
+    identity._file_digest.cache_clear()
+    identity.file_identity(path)
+    identity.file_identity(path)
+    assert identity._file_digest.cache_info().hits == 0
+
+
+def test_replaced_inode_invalidates_file_hash_cache(tmp_path):
+    path = tmp_path / "asset"
+    path.write_bytes(b"before")
+    first = identity.file_identity(path)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"after!")
+    replacement.replace(path)
+    assert identity.file_identity(path) != first
+
+
 @pytest.mark.parametrize("name", ["model", "sam2", "detector"])
 def test_incomplete_model_identity_is_diagnostic_only(name):
     inputs = _inputs()

@@ -148,6 +148,10 @@ def load_config(path: Optional[str | Path] = None) -> dict:
         raise ValueError(f"Unknown runtime configuration fields: {sorted(unknown)}")
     cfg = RuntimeConfig(_deep_merge(deepcopy(_FALLBACK), loaded),
                         path=cfg_path, sources={})
+    # A reviewer mapping is a complete operating point. Merging an endpoint pool
+    # with the singular default would retain the wrong endpoint and model pin.
+    if isinstance(loaded.get("online_model"), dict) and "mask_review" in loaded["online_model"]:
+        cfg["online_model"]["mask_review"] = deepcopy(loaded["online_model"]["mask_review"])
     for section in ("paths", "frame_sampling", "online_model",
                     "sandbox", "active_vision", "retrieval"):
         if not isinstance(cfg[section], dict):
@@ -258,7 +262,7 @@ class OnlineModelSettings:
             if not isinstance(self.mask_review, dict):
                 raise ValueError("online_model.mask_review must be a mapping")
             review = self.mask_review
-            if set(review) - {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation",
+            if set(review) - {"provider", "endpoint", "endpoints", "timeout_s", "expected_identity_sha256", "relation",
                               "mode", "prompt_version", "yes_threshold", "quality_manifest", "quality_manifest_sha256",
                               "admission_policy"}:
                 raise ValueError("unknown mask_review fields")
@@ -285,6 +289,9 @@ class OnlineModelSettings:
                 raise ValueError("admission_policy requires binary mode")
             if review.get("relation", "qwen") not in {"qwen", "frozen-rules"}:
                 raise ValueError("unsupported mask_review relation")
+            if "endpoints" in review:
+                from skill3d.segmentation.intern_decision_client import review_config
+                review_config(review)
         if not isinstance(self.enabled, bool):
             raise ValueError("online_model.enabled must be boolean")
         if self.provider != "bailian":

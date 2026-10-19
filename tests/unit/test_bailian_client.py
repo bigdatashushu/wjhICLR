@@ -7,6 +7,7 @@ import urllib.error
 import pytest
 
 from skill3d.synthesis.bailian_client import BailianClient
+from skill3d.synthesis import bailian_client as bailian
 from skill3d.synthesis.client_errors import ServiceUnavailable
 from skill3d.synthesis.program_assembler import assemble_program_ex
 from skill3d.online.runner import OnlineRunConfig, _make_online_client
@@ -24,6 +25,41 @@ class Response:
 
     def read(self):
         return self.body.read()
+
+
+def test_connect_prefers_ipv4_and_falls_back_without_global_socket_changes(monkeypatch):
+    addresses = [
+        (bailian.socket.AF_INET6, bailian.socket.SOCK_STREAM, 0, "", ("::1", 443)),
+        (bailian.socket.AF_INET, bailian.socket.SOCK_STREAM, 0, "", ("127.0.0.1", 443)),
+    ]
+    monkeypatch.setattr(bailian.socket, "getaddrinfo", lambda *args: addresses)
+    attempts = []
+
+    class Connection:
+        def __init__(self, family, *_):
+            self.family = family
+            self.closed = False
+            self.timeouts = []
+            attempts.append(self)
+
+        def settimeout(self, timeout):
+            self.timeouts.append(timeout)
+
+        def connect(self, address):
+            if self.family == bailian.socket.AF_INET:
+                raise OSError("test IPv4 unavailable")
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(bailian.socket, "socket", Connection)
+    connected = bailian._connect_addresses(("example", 443), 180)
+    assert [row.family for row in attempts] == [
+        bailian.socket.AF_INET, bailian.socket.AF_INET6,
+    ]
+    assert attempts[0].closed
+    assert connected is attempts[1]
+    assert connected.timeouts == [5, 180]
 
 
 def test_bailian_reads_key_at_request_time_and_records_public_identity(monkeypatch):

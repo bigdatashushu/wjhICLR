@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
+import socket
+import time
 from typing import Optional
 import urllib.error
 import urllib.request
@@ -14,6 +17,46 @@ from .client_errors import ServiceUnavailable
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen3.8-flash"
 DEFAULT_API_KEY_ENV = "DASHSCOPE_API_KEY"
+
+
+def _connect_addresses(address, timeout, source_address=None):
+    """Prefer IPv4 and bound each connect attempt without altering TLS checks."""
+    host, port = address
+    deadline = time.monotonic() + float(timeout)
+    addresses = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    addresses.sort(key=lambda row: row[0] != socket.AF_INET)
+    last_error = None
+    for family, socktype, protocol, _, sockaddr in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        connection = socket.socket(family, socktype, protocol)
+        try:
+            connection.settimeout(min(5.0, remaining))
+            if source_address is not None:
+                connection.bind(source_address)
+            connection.connect(sockaddr)
+            connection.settimeout(float(timeout))
+            return connection
+        except OSError as exc:
+            last_error = exc
+            connection.close()
+    if last_error is not None:
+        raise last_error
+    raise TimeoutError("Bailian connection address budget exhausted")
+
+
+class _HTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = _connect_addresses
+
+
+class _HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(
+            _HTTPSConnection, request, context=self._context,
+            check_hostname=self._check_hostname)
 
 
 def _base_url(value: str) -> str:
@@ -68,7 +111,7 @@ class BailianClient:
         self.max_output_tokens = int(max_output_tokens)
         self.model_revision = str(model_revision or "")
         self.endpoint_hash = hashlib.sha256(self.base_url.encode()).hexdigest()
-        self._opener = opener or urllib.request.urlopen
+        self._opener = opener or urllib.request.build_opener(_HTTPSHandler()).open
         self.last_usage: dict = {}
         self.last_generation: dict = {}
         self.last_response_identity: dict = {}

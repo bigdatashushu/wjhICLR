@@ -149,7 +149,7 @@ def review_config(config=None):
         raise ValueError("unsupported M5 visual provider")
     if config.get("relation", "qwen") not in {"qwen", "frozen-rules"}:
         raise ValueError("unsupported M5 relation provider")
-    allowed = {"provider", "endpoint", "timeout_s", "expected_identity_sha256", "relation",
+    allowed = {"provider", "endpoint", "endpoints", "timeout_s", "expected_identity_sha256", "relation",
                "mode", "prompt_version", "yes_threshold", "quality_manifest", "quality_manifest_sha256",
                "admission_policy"}
     if config.get("mode", "observation") not in {"observation", "binary"}:
@@ -163,6 +163,23 @@ def review_config(config=None):
         raise ValueError("category-only requires binary mode without frozen quality")
     if set(config) - allowed:
         raise ValueError("unknown M5 review configuration")
+    if "endpoints" in config:
+        endpoints = config["endpoints"]
+        if config.get("provider") != "intern-decision" or "endpoint" in config or "expected_identity_sha256" in config:
+            raise ValueError("review endpoints require Intern provider without singular endpoint/identity")
+        if not isinstance(endpoints, list) or not 1 <= len(endpoints) <= 8:
+            raise ValueError("review endpoints must contain 1 to 8 pinned replicas")
+        addresses = []
+        for row in endpoints:
+            if not isinstance(row, dict) or set(row) != {"endpoint", "expected_identity_sha256"}:
+                raise ValueError("each review replica requires endpoint and expected identity")
+            if not row["expected_identity_sha256"]:
+                raise ValueError("review replicas must pin full model identities")
+            client = InternDecisionClient(**row, timeout_s=config.get("timeout_s", 60))
+            parsed = urlsplit(client.endpoint)
+            addresses.append((parsed.port or 80, parsed.path.rstrip("/")))
+        if len(set(addresses)) != len(addresses):
+            raise ValueError("duplicate review replica endpoint")
     return config
 
 
@@ -170,6 +187,11 @@ def make_review_client(config=None):
     config = review_config(config)
     if config.get("provider", "qwen") == "qwen":
         return None
+    if "endpoints" in config:
+        from .intern_review_pool import InternReviewPool
+        return InternReviewPool([
+            make_review_client({**{k: v for k, v in config.items() if k != "endpoints"}, **row})
+            for row in config["endpoints"]])
     if config.get("mode") == "binary":
         from .intern_binary_review import InternBinaryClient, validate_threshold
         validate_threshold(config.get("yes_threshold"))

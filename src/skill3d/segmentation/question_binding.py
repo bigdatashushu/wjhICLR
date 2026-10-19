@@ -20,9 +20,9 @@ from .binding_validation import binding_is_usable, validate_binding
 from . import mask_semantic_review as msr
 from . import open_vocab_detector as ovd
 
-M5_BINDING_VERSION = "m5-question-binding-v2-qwen38-image-mask"
+M5_BINDING_VERSION = "m5-question-binding-v3-grouped-review"
 PARSER_VERSION = "m5-question-objects-v3-qwen38-json-mode"
-CACHE_VERSION = "m5-question-cache-v2-qwen38-image-mask"
+CACHE_VERSION = "m5-question-cache-v3-grouped-review"
 MAX_OBJECTS = 16
 PARAMETERS = {
     "parser_version": PARSER_VERSION, "max_objects": MAX_OBJECTS,
@@ -38,6 +38,10 @@ PARAMETERS = {
     "semantic_min_pixels": 65536, "semantic_max_pixels": 1048576,
     "semantic_relation_batch_size": 32,
     "frame_scan": "all_readable_in_order",
+    "detector_scan": "multi_category_per_frame_v1",
+    "semantic_selection": "complete_link_geometry_two_views_v1",
+    "semantic_views_per_group": 2,
+    "semantic_all_views_tasks": ["obj_appearance_order"],
 }
 ROLES = {
     "object_counting": {"target"},
@@ -339,6 +343,73 @@ def _merge_instances(objects, masks, depth, frame_slots=None):
     return groups, merged, suspect
 
 
+def _review_groups(observations, depth, c2w, intrinsics):
+    """Group provisional geometry for review scheduling, without admitting it."""
+    geometry, masks, slots = [], [], []
+    intrinsics = np.asarray(intrinsics)
+    for observation in observations:
+        candidate = observation["candidate"]
+        slot = int(candidate["frame_slot"])
+        mask = observation["mapped"][slot]
+        ys, xs = np.nonzero(mask & np.isfinite(depth[slot]) & (depth[slot] > 0))
+        # Bounded deterministic sampling is used only for provisional grouping.
+        stride = max(1, int(np.ceil(len(xs) / 4096)))
+        ys, xs = ys[::stride], xs[::stride]
+        z = depth[slot, ys, xs]
+        k = intrinsics[slot] if intrinsics.ndim == 3 else intrinsics
+        camera = np.stack(((xs - k[0, 2]) * z / k[0, 0],
+                           (ys - k[1, 2]) * z / k[1, 1], z), axis=1)
+        points = camera @ c2w[slot, :3, :3].T + c2w[slot, :3, 3]
+        if not len(points) or not np.isfinite(points).all():
+            raise ValueError("provisional review geometry is not finite")
+        geometry.append(ObjectRecord(
+            obj_id=candidate["candidate_id"], category_name=candidate["category"],
+            centroid_world=points.mean(axis=0).tolist(),
+            bbox=np.concatenate(np.quantile(points, [0.05, 0.95], axis=0)).tolist(),
+            det_conf=candidate["score"],
+        ))
+        masks.append(observation["mapped"])
+        slots.append(slot)
+    groups, _, _ = _merge_instances(geometry, masks, depth, frame_slots=slots)
+    return groups
+
+
+def _select_review_observations(observations, *, depth, c2w, intrinsics, task):
+    """Keep at most two deterministic views per group; temporal tasks keep all."""
+    if task in PARAMETERS["semantic_all_views_tasks"]:
+        groups = [[index] for index in range(len(observations))]
+    else:
+        try:
+            groups = _review_groups(observations, depth, c2w, intrinsics)
+        except (ValueError, IndexError, TypeError, FloatingPointError):
+            # Uncertain geometry cannot safely collapse review candidates.
+            groups = [[index] for index in range(len(observations))]
+    selected_indices = []
+    for group_index, members in enumerate(groups):
+        ranked = sorted(members, key=lambda index: (
+            -float(observations[index]["candidate"]["score"]),
+            -int(observations[index]["raw_mask"].sum()),
+            int(observations[index]["candidate"]["frame_slot"]),
+            observations[index]["candidate"]["candidate_id"],
+        ))
+        views = ranked[:1]
+        if len(ranked) > 1:
+            first_slot = observations[ranked[0]]["candidate"]["frame_slot"]
+            views.append(min(ranked[1:], key=lambda index: (
+                -abs(observations[index]["candidate"]["frame_slot"] - first_slot),
+                ranked.index(index),
+            )))
+        views = views[: int(PARAMETERS["semantic_views_per_group"])]
+        for index in members:
+            row = observations[index]["row"]
+            row["provisional_review_group"] = group_index
+            row["review_selected"] = index in views
+            if index not in views:
+                row["status"] = "unreviewed_repeated_observation"
+        selected_indices.extend(views)
+    return [observations[index] for index in sorted(selected_indices)], groups
+
+
 def refresh_coverage(grounding, objects):
     """Report category scan/candidate facts without certifying question referents."""
     body = dict(grounding)
@@ -416,6 +487,17 @@ def bind_question_objects(
     from . import sam2_tracker as st
 
     started = time.perf_counter()
+    stage_timings = {}
+
+    def progress(stage, **detail):
+        if out_dir is not None:
+            _write(Path(out_dir) / "binding_progress.json", {
+                "qa_id": str(qa_id), "stage": stage,
+                "elapsed_s": time.perf_counter() - started,
+                "stage_timings": dict(stage_timings), **detail,
+            })
+
+    progress("identity")
     inputs = question_input(question, question_type, options)
     parameters = binding_parameters(
         semantic_min_pixels=semantic_min_pixels,
@@ -430,6 +512,7 @@ def bind_question_objects(
         seed=seed, parameters=parameters, model_weights_sha256=model_weights_sha256,
         question=question, question_type=question_type, options=options,
         reconstruction_identity=scene_identity, point_map=point_map)
+    stage_timings["identity_s"] = time.perf_counter() - started
     from .intern_decision_client import make_review_client, compare_fixed_categories
     from .intern_decision_protocol import RELATION_VERSION
     visual_client = make_review_client(semantic_review_config) or vlm_client
@@ -473,15 +556,20 @@ def bind_question_objects(
     stats = {"version": M5_BINDING_VERSION, "generation": generation,
              "cache_hit": False, "detector_attempts": [], "detection_receipts": [],
              "candidate_receipts": [], "n_propagations": 0,
-             "input_degraded": len(frames) != 32, "materialized": False}
+             "input_degraded": len(frames) != 32, "materialized": False,
+             "stage_timings": stage_timings}
     if not geometry_usable:
         stats.update(status="m4_unavailable", elapsed_s=time.perf_counter() - started)
         return [], stats, ["M4 整场质量门未通过 → 冻结图像二维求解"]
     if question_type == "room_size_estimation":
         stats.update(materialized=True, status="objects_not_required")
+        progress("completed", status=stats["status"])
         return [], stats, ["M5 房间面积题无需对象解析"]
+    progress("object_parse")
+    stage_started = time.perf_counter()
     parsed, receipt = parse_question_objects(inputs, vlm_client, seed=seed,
                                             identity=generation, out_dir=out_dir)
+    stage_timings["object_parse_s"] = time.perf_counter() - stage_started
     stats["object_parse"] = receipt
     stats["actual_model_requests"] = (0 if receipt["cache_hit"] else len(receipt["requests"]))
     if receipt["status"] != "parsed":
@@ -489,6 +577,7 @@ def bind_question_objects(
                      elapsed_s=time.perf_counter() - started)
         return [], stats, ["M5 对象解析不可用 → 使用冻结图像二维求解"]
     categories = list(dict.fromkeys(row["category"] for row in parsed))
+    progress("detector", categories=categories)
     readable = [i for i, frame in enumerate(frames)
                 if frame is not None and np.asarray(frame).ndim == 3
                 and np.asarray(frame).size]
@@ -498,40 +587,74 @@ def bind_question_objects(
             or len(depth_maps) != len(frames) or len(c2w_list) != len(frames)):
         stats["binding_error"] = "frozen image/geometry alignment unavailable"
         # Do not compact or renumber the frozen frame sequence.
-    requirements, selected = [], []
-    for category in categories:
-        scans, errors = [], []
-        for slot in readable:
-            before = time.perf_counter()
-            with ovd.capture_detector_attempts() as attempts:
-                try:
-                    ovd.detect.last_error = ""
-                    detections = ovd.detect(frames[slot], ovd.prompt_from_nouns([category]))
-                    error = getattr(ovd.detect, "last_error", "")
-                except Exception as exc:
-                    detections, error = [], f"{type(exc).__name__}: {exc}"
-            request_sha = (attempts[0]["request_sha256"] if attempts else
-                           content_sha256({"frame": array_identity(frames[slot]),
-                                           "category": category}))
-            rows, kept = _nms(detections, category, slot, request_sha)
-            stats["detector_attempts"].extend(attempts)
-            scan = {"category": category, "frame_slot": slot, "candidates": rows,
-                    "transport_attempts": attempts, "error": error,
-                    "elapsed_s": time.perf_counter() - before,
-                    "request_sha256": request_sha}
-            stats["detection_receipts"].append(scan)
-            selected.extend(kept)
-            scans.append(slot)
-            if error:
-                errors.append({"frame_slot": slot, "error": error})
-        requirements.append({
+    requirements = [{
             "name": category, "roles": [r for r in parsed if r["category"] == category],
-            "scanned_slots": scans, "scan_errors": errors,
-            "scan_complete": bool(readable) and len(scans) == len(readable) and not errors,
+            "scanned_slots": [], "scan_errors": [], "scan_complete": False,
             "binding_failures": [],
-        })
+        } for category in categories]
+    selected = []
+    detector_requests = 0
+    stage_started = time.perf_counter()
+    for slot in readable:
+        before = time.perf_counter()
+        with ovd.capture_detector_attempts() as attempts:
+            try:
+                ovd.detect.last_error = ""
+                detections = ovd.detect(frames[slot], ovd.prompt_from_nouns(categories))
+                error = getattr(ovd.detect, "last_error", "")
+            except Exception as exc:
+                detections, error = [], f"{type(exc).__name__}: {exc}"
+        request_sha = (attempts[0]["request_sha256"] if attempts else
+                       content_sha256({"frame": array_identity(frames[slot]),
+                                       "categories": categories}))
+        category_request_shas = {category: request_sha for category in categories}
+        assigned, unassigned = ovd.assign_categories(detections, categories)
+        detector_requests += 1
+        if unassigned:
+            # Some services emit composite phrases. Rescan that frame with single
+            # categories rather than guessing which category a box belongs to.
+            assigned = {}
+            for category in categories:
+                with ovd.capture_detector_attempts() as fallback_attempts:
+                    try:
+                        ovd.detect.last_error = ""
+                        assigned[category] = ovd.detect(
+                            frames[slot], ovd.prompt_from_nouns([category]))
+                        fallback_error = getattr(ovd.detect, "last_error", "")
+                    except Exception as exc:
+                        assigned[category] = []
+                        fallback_error = f"{type(exc).__name__}: {exc}"
+                detector_requests += 1
+                attempts.extend(fallback_attempts)
+                category_request_shas[category] = (
+                    fallback_attempts[0]["request_sha256"] if fallback_attempts else
+                    content_sha256({"frame": array_identity(frames[slot]),
+                                    "categories": [category]}))
+                error = error or fallback_error
+        stats["detector_attempts"].extend(attempts)
+        for requirement in requirements:
+            category = requirement["name"]
+            rows, kept = _nms(
+                assigned[category], category, slot, category_request_shas[category])
+            stats["detection_receipts"].append({
+                "category": category, "frame_slot": slot, "candidates": rows,
+                "transport_attempts": [], "error": error,
+                "elapsed_s": time.perf_counter() - before,
+                "request_sha256": category_request_shas[category],
+                "unassigned_labels": unassigned,
+            })
+            selected.extend(kept)
+            requirement["scanned_slots"].append(slot)
+            if error:
+                requirement["scan_errors"].append({"frame_slot": slot, "error": error})
+        if (slot + 1) % 8 == 0:
+            progress("detector", n_scanned_frames=slot + 1,
+                     n_detector_requests=detector_requests, n_candidates=len(selected))
+    for requirement in requirements:
+        requirement["scan_complete"] = bool(readable) and not requirement["scan_errors"]
+    stage_timings["detector_s"] = time.perf_counter() - stage_started
     stats["detector_fault"] = any(row["scan_errors"] for row in requirements)
-    stats["actual_detector_requests"] = len(stats["detection_receipts"])
+    stats["actual_detector_requests"] = detector_requests
     work = root / uuid4().hex if root else None
     req_by_name = {row["name"]: row for row in requirements}
     rows_by_id = {
@@ -540,6 +663,8 @@ def bind_question_objects(
             "track_id": candidate["candidate_id"],
         } for candidate in selected}
     observations = []
+    progress("sam2", n_candidates=len(selected))
+    stage_started = time.perf_counter()
     stats.update(n_propagations=0, n_sam2_image_frames=0, n_sam2_masks=0)
     if selected and not stats.get("binding_error"):
         try:
@@ -610,16 +735,43 @@ def bind_question_objects(
             rows_by_id[candidate["candidate_id"]]["sam2_frame_elapsed_s"] = elapsed
 
     relation_input = []
+    stage_timings["sam2_s"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
+    all_observations = observations
+    observations, review_groups = _select_review_observations(
+        all_observations, depth=np.asarray(depth_maps),
+        c2w=np.asarray(c2w_list), intrinsics=intrinsics, task=question_type)
+    stats["review_selection"] = {
+        "n_observations": len(all_observations), "n_groups": len(review_groups),
+        "n_selected": len(observations),
+        "selected_candidate_ids": [o["candidate"]["candidate_id"] for o in observations],
+        "unreviewed_masks_admitted": False,
+    }
+    stage_timings["review_grouping_s"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
+    progress("semantic_review", n_observations=len(all_observations),
+             n_groups=len(review_groups), n_selected=len(observations), n_reviewed=0)
     binary_mode = bool(getattr(visual_client, "target_binary", False))
-    for observation in observations:
+    review_kwargs = dict(
+        seed=seed, min_pixels=parameters["semantic_min_pixels"],
+        max_pixels=parameters["semantic_max_pixels"],
+        out_dir=(work / "semantic_reviews") if work else None)
+    if hasattr(visual_client, "observe_candidates"):
+        visual_results = visual_client.observe_candidates(observations, frames, **review_kwargs)
+    else:
+        visual_results = (
+            msr.observe_candidate(
+                observation["candidate"],
+                frames[observation["candidate"]["frame_slot"]],
+                observation["raw_mask"], visual_client, **review_kwargs)
+            for observation in observations)
+    for review_index, (observation, visual) in enumerate(
+            zip(observations, visual_results, strict=True), start=1):
         candidate, row = observation["candidate"], observation["row"]
-        visual = msr.observe_candidate(
-            candidate, frames[candidate["frame_slot"]], observation["raw_mask"],
-            visual_client, seed=seed,
-            min_pixels=parameters["semantic_min_pixels"],
-            max_pixels=parameters["semantic_max_pixels"],
-            out_dir=(work / "semantic_reviews") if work else None)
         row["semantic_visual"] = visual
+        progress("semantic_review", n_observations=len(all_observations),
+                 n_groups=len(review_groups), n_selected=len(observations),
+                 n_reviewed=review_index)
         if visual["status"] == "observed" and not binary_mode:
             relation_input.append({
                 "candidate_id": candidate["candidate_id"],
@@ -662,6 +814,8 @@ def bind_question_objects(
     stats["actual_model_requests"] += (
         stats["semantic_review"]["n_visual_requests"]
         + stats["semantic_review"]["n_relation_requests"])
+    stage_timings["semantic_review_s"] = time.perf_counter() - stage_started
+    stage_started = time.perf_counter()
 
     candidates, masks, accepted, accepted_slots = [], [], [], []
     for observation in observations:
@@ -816,7 +970,11 @@ def bind_question_objects(
     stats["actual_sam2_tracks"] = 0
     stats["actual_sam2_image_frames"] = stats["n_sam2_image_frames"]
     stats["actual_sam2_masks"] = stats["n_sam2_masks"]
+    stage_timings["binding_finalize_s"] = time.perf_counter() - stage_started
     stats["elapsed_s"] = time.perf_counter() - started
+    progress("completed", status=stats["status"], n_objects=len(objects),
+             n_detector_requests=stats["actual_detector_requests"],
+             n_visual_requests=stats["semantic_review"]["n_visual_requests"])
     if cache and work:
         rows = [obj.model_dump(mode="json") for obj in objects]
         for row in rows:

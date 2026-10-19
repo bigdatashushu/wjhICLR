@@ -104,3 +104,16 @@ def test_slow_timeout_leaves_bounded_budget_for_recovery(monkeypatch):
     assert not failures
     assert timeouts[0] == 120
     assert 59 < timeouts[1] < 60
+
+
+def test_multicategory_labels_must_match_exactly_one_requested_category():
+    rows = [
+        ovd.Detection("trash_bin", (1, 1, 4, 4), .8),
+        ovd.Detection("chair.", (1, 1, 4, 4), .8),
+        ovd.Detection("chair table", (1, 1, 4, 4), .8),
+        ovd.Detection("unknown", (1, 1, 4, 4), .8),
+    ]
+    assigned, rejected = ovd.assign_categories(rows, ["trash bin", "chair", "table"])
+    assert len(assigned["trash bin"]) == len(assigned["chair"]) == 1
+    assert assigned["table"] == []
+    assert rejected == ["chair table", "unknown"]
