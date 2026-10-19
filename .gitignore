@@ -16,6 +16,7 @@ __pycache__/
 configs/*.local.env
 *.local.env
 deepseekapi.md
+qwenkey.md
 
 # ---- 新系统（§2 目录树）----
 # 数据集与重建产物不入库（§2：data/ 不入库；DVC/软链）
