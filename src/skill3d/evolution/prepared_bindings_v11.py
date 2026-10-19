@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import shutil
 import uuid
 from pathlib import Path
@@ -58,7 +59,7 @@ def prepare_shared_bindings_v11(
     """Prepare, cross-audit and publish one immutable binding per question."""
     if int(max_questions_per_scene) <= 0:
         raise ValueError("max_questions_per_scene must be positive")
-    if float(min_free_gib) < 0:
+    if not math.isfinite(float(min_free_gib)) or float(min_free_gib) < 0:
         raise ValueError("min_free_gib must be non-negative")
     if base_cfg.mode != "real":
         raise V11BindingPreparationError(
@@ -121,12 +122,15 @@ def prepare_shared_bindings_v11(
         scene_cache_hits: set[str] = set()
         try:
             for qa_id in qa_ids:
+                if shutil.disk_usage(store.root).free / 1024 ** 3 < float(min_free_gib):
+                    raise V11BindingPreparationError("free disk is below runtime reserve before next question")
                 item = indexed[qa_id]
                 artifact_path = Path(
                     artifact_paths[qa_id]
                 ).expanduser().resolve()
                 request = requests[qa_id]
                 key = store.key_for(request)
+                draft_store = PreparedBindingStore(store.root / ".drafts")
                 if store.entry_path(key).is_dir():
                     bindings[qa_id] = store.load(
                         key,
@@ -139,6 +143,13 @@ def prepare_shared_bindings_v11(
                     artifacts[qa_id] = load_artifact_v5(
                         artifact_path
                     )
+                    continue
+                if draft_store.entry_path(key).is_dir():
+                    bindings[qa_id] = draft_store.load(
+                        key, expected_request_identity=request, scene_artifact=artifact_path,
+                        scene_input_identity=identities[qa_id])
+                    artifacts[qa_id] = runner._prepare_m4_quality(
+                        load_artifact_v5(artifact_path), item.pixels, persist_quality=False)
                     continue
                 art = load_artifact_v5(artifact_path)
                 art = runner._prepare_m4_quality(
@@ -168,10 +179,23 @@ def prepare_shared_bindings_v11(
                 )
                 binding = PreparedObjectBinding(*values)
                 if binding.stats.get("binding_error"):
-                    raise V11BindingPreparationError(
-                        f"{qa_id}: {binding.stats['binding_error']}"
-                    )
-                bindings[qa_id] = binding
+                    # Runtime perception failure is an honest reusable outcome.
+                    # Identity/storage/alignment faults still abort preparation.
+                    if (binding.objects or binding.materialized
+                            or binding.stats["binding_error"] == "frozen image/geometry alignment unavailable"):
+                        raise V11BindingPreparationError(
+                            f"{qa_id}: {binding.stats['binding_error']}")
+                    binding.stats.setdefault("status", "binding_unavailable")
+                reference = draft_store.publish(
+                    request_identity=request, scene_artifact=artifact_path,
+                    scene_input_identity=identities[qa_id], binding=binding)
+                # Remove transient request images/files only after their full
+                # response and image identities have entered the draft payload.
+                bindings[qa_id] = draft_store.load(
+                    reference["key"], expected_request_identity=request,
+                    scene_artifact=artifact_path, scene_input_identity=identities[qa_id])
+                shutil.rmtree(work)
+                work_dirs.pop(qa_id)
                 artifacts[qa_id] = art
 
             reconstruction_ids = {
@@ -247,6 +271,11 @@ def prepare_shared_bindings_v11(
                         scene_input_identity=identities[qa_id],
                         binding=binding,
                     )
+            for qa_id in qa_ids:
+                key = store.key_for(requests[qa_id])
+                shutil.rmtree(
+                    PreparedBindingStore(store.root / ".drafts").entry_path(key),
+                    ignore_errors=True)
         finally:
             for work in work_dirs.values():
                 shutil.rmtree(work, ignore_errors=True)

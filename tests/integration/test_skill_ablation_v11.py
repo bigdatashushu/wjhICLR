@@ -29,6 +29,57 @@ from skill3d.segmentation import sam2_tracker
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def test_failed_perception_is_stored_and_replayed_without_repeating_model_work(panel, tmp_path, monkeypatch):
+    item, artifact, binding_calls = panel
+    from skill3d.online import runner
+    calls = []
+    def unavailable(*args, **kwargs):
+        calls.append(1)
+        return [], {"binding_error": "ValueError: missing required question roles",
+                    "object_parse": {"status": "unavailable", "requests": []}}, [
+                        "fallback to frozen images"], False
+    monkeypatch.setattr(runner, "_bind_objects_best_effort", unavailable)
+    cfg = OnlineRunConfig(mode="real", skills=[])
+    arguments = dict(artifact_paths={item.episode.qa_id: artifact}, base_cfg=cfg,
+                     store_root=tmp_path / "failed-store", min_free_gib=0)
+    first = prepare_shared_bindings_v11([item], **arguments)
+    second = prepare_shared_bindings_v11([item], **arguments)
+    assert calls == [1] and second["cache_hit_qa_ids"] == [item.episode.qa_id]
+    from skill3d.segmentation.prepared_binding_store import PreparedBindingStore
+    ref = first["bindings"][item.episode.qa_id]
+    binding = PreparedBindingStore(first["store_root"]).load(
+        ref["key"], expected_request_identity=ref["request_identity"],
+        scene_artifact=artifact, scene_input_identity=ab.input_identity(item, artifact))
+    assert binding.stats["status"] == "binding_unavailable" and not binding.materialized
+    assert binding.objects == [] and "missing required" in binding.stats["binding_error"]
+
+
+def test_scene_audit_failure_resumes_completed_question_draft(panel, tmp_path, monkeypatch):
+    item, artifact, binding_calls = panel
+    from skill3d.evolution import prepared_bindings_v11 as preparation
+    from skill3d.online import runner
+    calls = []
+    def completed(*args, **kwargs):
+        calls.append(1)
+        return [], {"status": "objects_not_required"}, [], True
+    monkeypatch.setattr(runner, "_bind_objects_best_effort", completed)
+    real_audit = preparation.audit_semantic_mask_conflicts
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("interrupted before scene audit")
+    monkeypatch.setattr(preparation, "audit_semantic_mask_conflicts", interrupted)
+    arguments = dict(artifact_paths={item.episode.qa_id: artifact},
+                     base_cfg=OnlineRunConfig(mode="real", skills=[]),
+                     store_root=tmp_path / "draft-store", min_free_gib=0)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        prepare_shared_bindings_v11([item], **arguments)
+    assert not list((tmp_path / "draft-store/entries").glob("*/*/manifest.json"))
+    assert len(list((tmp_path / "draft-store/.drafts/entries").glob("*/*/manifest.json"))) == 1
+    monkeypatch.setattr(preparation, "audit_semantic_mask_conflicts", real_audit)
+    result = prepare_shared_bindings_v11([item], **arguments)
+    assert calls == [1] and result["n_questions"] == 1
+    assert not list((tmp_path / "draft-store/.drafts/entries").glob("*/*/manifest.json"))
+
+
 @pytest.fixture
 def panel(tmp_path, monkeypatch, request):
     item = load_synthetic_items(

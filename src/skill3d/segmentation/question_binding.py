@@ -573,8 +573,9 @@ def bind_question_objects(
     stats["object_parse"] = receipt
     stats["actual_model_requests"] = (0 if receipt["cache_hit"] else len(receipt["requests"]))
     if receipt["status"] != "parsed":
-        stats.update(status="parse_unavailable", binding_error=receipt.get("error", ""),
+        stats.update(status="parse_unavailable", parse_error=receipt.get("error", ""),
                      elapsed_s=time.perf_counter() - started)
+        progress("completed", status="parse_unavailable", error=stats["parse_error"])
         return [], stats, ["M5 对象解析不可用 → 使用冻结图像二维求解"]
     categories = list(dict.fromkeys(row["category"] for row in parsed))
     progress("detector", categories=categories)
