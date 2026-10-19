@@ -86,6 +86,7 @@ def main(argv=None):
     parser.add_argument("--scene-working-gib", type=float, default=8)
     parser.add_argument("--seed", type=int, default=137)
     parser.add_argument("--freeze-only", action="store_true")
+    parser.add_argument("--reconstruction-only", action="store_true")
     args = parser.parse_args(argv)
     splits = [s.strip() for s in args.splits.split(",") if s.strip()]
     if not splits or any(s not in {"induction", "inner_validation", "outer_holdout"} for s in splits):
@@ -127,6 +128,7 @@ def main(argv=None):
         "min_free_gib": args.min_free_gib, "scene_working_gib": args.scene_working_gib,
         "reuse_recon_dir": str(Path(args.reuse_recon_dir).resolve()) if args.reuse_recon_dir else "",
         "pool_role": "precomputed-input-pool; exact-slot panels selected separately",
+        "reconstruction_only": args.reconstruction_only,
         "reference_answers_sent_to_models": False,
     }
     selection["sha256"] = content_sha256(selection)
@@ -140,7 +142,7 @@ def main(argv=None):
         print(json.dumps({"status": "frozen", "n_scenes": len(grouped),
                           "n_questions": sum(len(group["rows"]) for group in grouped)}))
         return 0
-    if not os.environ.get(cfg.online_api_key_env, "").strip():
+    if not args.reconstruction_only and not os.environ.get(cfg.online_api_key_env, "").strip():
         raise ValueError("online parser credential is not configured")
     store_root = root / "binding_store"
     recon_root = root / "reconstructions"
@@ -215,6 +217,18 @@ def main(argv=None):
             artifact = jobs[0].artifact_ref
             artifacts = {item.episode.qa_id: artifact for item in items}
             states = {item.episode.qa_id: initial_state_for_item(item, artifact) for item in items}
+            if args.reconstruction_only:
+                report["scenes"].append({
+                    "scene_id": scene, "split": group["split"], "artifact": artifact,
+                    "elapsed_s": time.perf_counter() - started, "evidence_states": states,
+                    "qa_ids": list(artifacts), "binding_prepared": False})
+                completed.add(scene)
+                report.update(status="running", completed_scenes=len(completed),
+                              completed_questions=0, free_gib=shutil.disk_usage(root).free / 1024 ** 3)
+                write(report_path, report)
+                print(json.dumps({"scene_id": scene, "completed_scenes": len(completed),
+                                  "evidence_states": states, "free_gib": report["free_gib"]}), flush=True)
+                continue
             write(root / "progress.json", {"status": "binding", "scene_id": scene,
                   "qa_ids": list(artifacts), "completed_scenes": len(completed),
                   "completed_questions": combined["n_questions"]})
