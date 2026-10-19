@@ -147,6 +147,14 @@ def _artifact_mapping(
             str(key): str(Path(path).expanduser().resolve())
             for key, path in value.items()
         }
+        missing_files = sorted(
+            qa_id for qa_id, path in mapping.items()
+            if not Path(path).is_file()
+        )
+        if missing_files:
+            raise V11StreamingCliError(
+                f"explicit artifact mappings do not exist: {missing_files[:10]}"
+            )
     else:
         mapping = {
             item.episode.qa_id: str(
@@ -160,16 +168,11 @@ def _artifact_mapping(
             for item in items
             if item.input_error is None
         }
-    missing = sorted(
-        item.episode.qa_id
-        for item in items
-        if item.input_error is None
-        and item.episode.qa_id not in mapping
-    )
-    if missing:
-        raise V11StreamingCliError(
-            f"missing artifact mappings: {missing[:10]}"
-        )
+        mapping = {
+            qa_id: path
+            for qa_id, path in mapping.items()
+            if Path(path).is_file()
+        }
     return mapping
 
 
