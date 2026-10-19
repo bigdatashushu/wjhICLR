@@ -262,7 +262,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inner-artifacts-json", default="")
     parser.add_argument("--induction-artifacts-json", default="")
     parser.add_argument("--recon-dir", default="")
-    parser.add_argument("--quality-confirmation", required=True)
+    parser.add_argument(
+        "--quality-confirmation",
+        default="",
+        help="required for campaign execution; not read by --prepare-only",
+    )
     parser.add_argument("--library-root", default="")
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--max-revision-attempts", type=int, default=3)
@@ -335,9 +339,6 @@ def main(argv: list[str] | None = None) -> int:
         from skill3d.env_preflight import assert_runtime_dependencies
 
         assert_runtime_dependencies(context="streaming_evolution_v11")
-        quality_confirmation = _quality_confirmation(
-            args.quality_confirmation
-        )
         induction_candidates = _load_items(
             args,
             raw,
@@ -467,6 +468,13 @@ def main(argv: list[str] | None = None) -> int:
                 "run_root": str(run_root),
             }, ensure_ascii=False, indent=2, sort_keys=True))
             return 0
+        if not args.quality_confirmation:
+            raise V11StreamingCliError(
+                "--quality-confirmation is required unless --prepare-only is used"
+            )
+        quality_confirmation = _quality_confirmation(
+            args.quality_confirmation
+        )
         model = online_model_from(raw)
         if model.enabled and not os.environ.get(
             model.api_key_env, ""
