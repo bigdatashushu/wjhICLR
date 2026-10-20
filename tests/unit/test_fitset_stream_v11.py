@@ -121,7 +121,7 @@ class ProbeRunner(SystemVariantRunner):
         return row
 
 
-def make_runner(tmp_path, *, workers=1, n=13, reference="2"):
+def make_runner(tmp_path, *, workers=1, n=13, reference="2", episode_concurrency=None):
     skills, _, snapshot = load_active_skills(LIBRARY / "snapshots")
     variants = [{
         "variant_id": f"fit-{i:03d}@g0m0", "qa_id": f"fit-{i:03d}",
@@ -141,6 +141,7 @@ def make_runner(tmp_path, *, workers=1, n=13, reference="2"):
         skills_for_variant=FrozenSkillProvider(skills, {
             "snapshot_ref": snapshot, "manifest_sha256": "a" * 64,
         }), workers=workers, min_free_gib=0,
+        episode_concurrency=episode_concurrency,
         evolution_config=FitSetEvolutionConfig(),
         label_metadata=labels, revision_client_factory=revision_factory,
         gate_client_factory=gate_factory,
@@ -171,6 +172,32 @@ def test_twelve_case_boundary_promotes_then_next_uses_new_version(tmp_path, work
     bundle = freeze_fitset_stream(runner.root, tmp_path / "bundle")
     assert bundle["revised_slot_count"] == 1
     assert bundle["preserved_unreachable_slot_count"] == 5
+    assert load_active_parent_slots(LIBRARY)[0] == seed
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_parallel_gate_matches_serial_admission(tmp_path, workers):
+    """A global episode-concurrency cap must not change the A/B decision.
+
+    The gate episodes run in spawned children bounded by one global permit, so
+    this proves the parallel path reaches the same promotion and the same
+    per-seed conditions as the serial gate.
+    """
+    seed = load_active_parent_slots(LIBRARY)[0]
+    runner = make_runner(tmp_path, workers=workers, episode_concurrency=4)
+    result = runner.run(resume=False)
+    assert result["completed_variants"] == 13
+    rows = runner.completed()
+    assert rows["fit-011@g0m0"]["initial_skill_selection"][
+        "skill_version"] == "S01-g0m0@1.0.0"
+    assert rows["fit-012@g0m0"]["initial_skill_selection"][
+        "skill_version"] == "S01-g0m0@1.1.0"
+    decision = json.loads(next(
+        (runner.root / "workers").glob("*/campaigns/*/decision.json")).read_text())
+    assert decision["conditions"] == {"137": True, "138": True}
+    assert decision["passed"] is True
+    bundle = freeze_fitset_stream(runner.root, tmp_path / "bundle")
+    assert bundle["revised_slot_count"] == 1
     assert load_active_parent_slots(LIBRARY)[0] == seed
 
 

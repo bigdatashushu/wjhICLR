@@ -383,10 +383,12 @@ class FitSetWorkerEvolution:
         if len(panel_ids) < self.config.gate_size:
             return {"passed": False, "conditions": {"gate_size": False},
                     "reason": "槽位题量不足冻结 gate_size", "arms": []}
-        conditions = {}
-        arms = []
+        # Phase 1 — set up each (seed, arm) runner deterministically and collect
+        # every panel episode as an independent work item. Setup writes the
+        # run-local library and frozen identity; it performs no model request.
+        arm_runners: dict[tuple[int, str], object] = {}
+        episodes: list[tuple[object, Mapping]] = []
         for seed in self.config.gate_seeds:
-            pair = {}
             for name, spec in (("parent", parent), ("candidate", candidate)):
                 output = attempt_root / "gate" / str(seed) / name
                 evaluation_skills = [
@@ -422,12 +424,30 @@ class FitSetWorkerEvolution:
                         [self.rows[value] for value in panel_ids]),
                 }
                 _write_create_once(output / "gate_identity.json", frozen)
+                arm_runners[(seed, name)] = gate_runner
+                episodes.extend(
+                    (gate_runner, self.rows[variant_id])
+                    for variant_id in panel_ids
+                )
+        # Phase 2 — run every episode under the global permit. Each result lands
+        # in its own arm directory; completed results from a prior attempt are
+        # reused, so a resumed gate relaunches only the missing episodes.
+        self.runner._run_gate_episodes(episodes)
+        # Phase 3 — score the persisted results. This logic is identical to the
+        # previous serial gate; only the order episodes ran in has changed.
+        conditions = {}
+        arms = []
+        for seed in self.config.gate_seeds:
+            pair = {}
+            for name, spec in (("parent", parent), ("candidate", candidate)):
+                gate_runner = arm_runners[(seed, name)]
+                output = gate_runner.root
                 rows = []
                 for variant_id in panel_ids:
                     variant = self.rows[variant_id]
                     path = gate_runner._result_path(variant_id)
-                    row = (json.loads(path.read_text()) if path.exists()
-                           else gate_runner._run_one(variant))
+                    _require(path.exists(), "gate 执行后缺少 result")
+                    row = json.loads(path.read_text())
                     _require(row["question_type"] == request.question_type
                              and row["evidence_state"] == request.evidence_state,
                              "gate result 槽位错配")

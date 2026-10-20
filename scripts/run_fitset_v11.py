@@ -440,6 +440,8 @@ def _run_system(args) -> int:
         skills_for_variant=skill_provider,
         min_free_gib=args.min_free_gib,
         workers=args.workers,
+        episode_concurrency=(
+            args.episode_concurrency if args.episode_concurrency else None),
         evolution_config=(
             FitSetEvolutionConfig(
                 gate_size=args.gate_size,
@@ -597,6 +599,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--scene-cache-size", type=int, default=2)
     run.add_argument("--min-free-gib", type=float, default=80.0)
     run.add_argument("--workers", type=int, default=1)
+    run.add_argument("--episode-concurrency", type=int, default=0,
+                     help="global cap on concurrently executing episodes "
+                          "across every worker and gate; 0 keeps serial runs")
     run.add_argument("--gate-size", type=int, default=8)
     run.add_argument("--max-revision-attempts", type=int, default=3)
     run.add_argument("--revision-max-tokens", type=int, default=8192)

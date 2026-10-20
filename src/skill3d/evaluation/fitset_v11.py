@@ -10,6 +10,7 @@ for physical slots that are not revised by the selected panel.
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 import copy
 import hashlib
@@ -215,9 +216,11 @@ def _process_shard_worker(
     variants: Sequence[Mapping],
     stop_event,
     messages,
+    episode_semaphore=None,
 ) -> None:
     """Run one slot shard on the child process main thread."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    runner._episode_semaphore = episode_semaphore
     if threading.current_thread() is not threading.main_thread():
         messages.put({
             "kind": "error",
@@ -243,6 +246,32 @@ def _process_shard_worker(
         stop_event.set()
     finally:
         messages.put({"kind": "done", "shard_index": shard_index})
+
+
+def _gate_episode_worker(gate_runner, variant, messages) -> None:
+    """Run one gate episode on a spawned child's main thread.
+
+    The global permit is held by the parent gate process on this child's
+    behalf, so the child never touches the semaphore. The episode result is
+    written to the arm's own result directory; the parent reads it back during
+    the unchanged scoring phase.
+    """
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    variant_id = str(variant["variant_id"])
+    try:
+        if threading.current_thread() is not threading.main_thread():
+            raise FitSetError("gate episode did not start on its main thread")
+        gate_runner._episode_semaphore = None
+        gate_runner._run_one(variant)
+    except BaseException as exc:  # noqa: BLE001 - parent records child failure
+        messages.put({
+            "kind": "error",
+            "variant_id": variant_id,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        })
+    else:
+        messages.put({"kind": "done", "variant_id": variant_id})
 
 
 def _source_code_identity() -> dict:
@@ -1207,6 +1236,7 @@ class SystemVariantRunner:
         label_metadata: Mapping[str, Mapping] | None = None,
         revision_client_factory=None,
         gate_client_factory=None,
+        episode_concurrency: int | None = None,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -1232,6 +1262,12 @@ class SystemVariantRunner:
         self.label_metadata = copy.deepcopy(dict(label_metadata or {}))
         self.revision_client_factory = revision_client_factory
         self.gate_client_factory = gate_client_factory
+        self.episode_concurrency = (
+            None if episode_concurrency is None else int(episode_concurrency))
+        # The cross-process permit is a runtime-only resource. It is created by
+        # the parent ``run`` and handed to workers as an explicit spawn argument;
+        # it is never pickled into result files or snapshot identities.
+        self._episode_semaphore = None
         self.seed_skills = []
         self.gate_panels = {}
         self.run_identity = ""
@@ -1242,6 +1278,11 @@ class SystemVariantRunner:
         )
         _require(1 <= self.workers <= 16,
                  "workers must be between 1 and 16")
+        _require(
+            self.episode_concurrency is None
+            or 1 <= self.episode_concurrency <= 128,
+            "episode_concurrency must be between 1 and 128 when set",
+        )
         self.execution_variants = [
             row
             for _, row in sorted(
@@ -1281,6 +1322,18 @@ class SystemVariantRunner:
                     if len(selected) == self.evolution_config.gate_size:
                         break
                 self.gate_panels[key] = selected
+
+    def __getstate__(self) -> dict:
+        # Spawned workers receive the live permit as an explicit process
+        # argument, never through the pickled runner, so drop it here to keep
+        # the runner picklable and to avoid duplicating the global permit.
+        state = dict(self.__dict__)
+        state["_episode_semaphore"] = None
+        return state
+
+    def __setstate__(self, state: Mapping) -> None:
+        self.__dict__.update(state)
+        self.__dict__.setdefault("_episode_semaphore", None)
 
     @property
     def execution_scheduler(self) -> str:
@@ -1558,7 +1611,30 @@ class SystemVariantRunner:
             "plan": plan,
         }
 
+    @contextmanager
+    def _episode_permit(self):
+        """Hold one global episode permit for the body, if one is configured.
+
+        A streaming episode blocks until a permit is free. Because it owns no
+        other permit while waiting, concurrent episodes cannot deadlock; the
+        permit simply caps how many episodes execute at once across every
+        worker and every gate child process.
+        """
+        semaphore = self._episode_semaphore
+        if semaphore is None:
+            yield
+            return
+        semaphore.acquire()
+        try:
+            yield
+        finally:
+            semaphore.release()
+
     def _run_one(self, variant: Mapping) -> dict:
+        with self._episode_permit():
+            return self._run_one_locked(variant)
+
+    def _run_one_locked(self, variant: Mapping) -> dict:
         from skill3d.online import runner
         from skill3d.sandbox.kernel import _Timeout
 
@@ -1688,6 +1764,13 @@ class SystemVariantRunner:
         pending: Sequence[Mapping],
         accept: Callable[[dict], None],
     ) -> None:
+        context = multiprocessing.get_context("spawn")
+        # One global permit pool, created from the spawn context so it can be
+        # inherited by shard workers and their gate children. It bounds the
+        # total number of episodes executing at once across the whole run.
+        if self.episode_concurrency is not None and self._episode_semaphore is None:
+            self._episode_semaphore = context.BoundedSemaphore(
+                self.episode_concurrency)
         if self.workers == 1:
             owned = self._planned_slot_shards()[0]
             pending_ids = {row["variant_id"] for row in pending}
@@ -1705,7 +1788,6 @@ class SystemVariantRunner:
         }
         if not shards:
             return
-        context = multiprocessing.get_context("spawn")
         messages = context.Queue()
         stop_event = context.Event()
         processes: dict[int, multiprocessing.Process] = {}
@@ -1714,7 +1796,7 @@ class SystemVariantRunner:
             process = context.Process(
                 target=_process_shard_worker,
                 args=(self, shard_index, owned_shards[shard_index],
-                      shard, stop_event, messages),
+                      shard, stop_event, messages, self._episode_semaphore),
                 name=f"fitset-{self.phase}-{shard_index:02d}",
                 daemon=False,
             )
@@ -1797,6 +1879,98 @@ class SystemVariantRunner:
         if errors:
             raise FitSetError(
                 "fit-set process worker failed: " + "; ".join(errors))
+
+    def _run_gate_episodes(
+        self,
+        items: Sequence[tuple[object, Mapping]],
+    ) -> None:
+        """Execute gate episodes under the global permit, writing each result.
+
+        Each ``(gate_runner, variant)`` already has a persisted result when a
+        prior attempt completed it, so only the missing ones are launched. The
+        parent acquires one global permit before spawning a single-episode
+        child and releases it when that child exits. Permits are taken with a
+        non-blocking try so that several concurrent gates (one per slot worker)
+        can never hold-and-wait on each other; a full pool simply means the
+        parent reaps a finished child before starting the next.
+        """
+        pending = [
+            (gate_runner, variant)
+            for gate_runner, variant in items
+            if not gate_runner._result_path(str(variant["variant_id"])).exists()
+        ]
+        if not pending:
+            return
+        semaphore = self._episode_semaphore
+        if semaphore is None:
+            for gate_runner, variant in pending:
+                gate_runner._run_one(variant)
+            return
+        context = multiprocessing.get_context("spawn")
+        messages = context.Queue()
+        running: dict[int, tuple[multiprocessing.Process, bool]] = {}
+        errors: list[str] = []
+        index = 0
+        try:
+            while (index < len(pending) and not errors) or running:
+                started = False
+                if index < len(pending) and not errors:
+                    acquired = semaphore.acquire(block=False)
+                    if acquired:
+                        gate_runner, variant = pending[index]
+                        process = context.Process(
+                            target=_gate_episode_worker,
+                            args=(gate_runner, dict(variant), messages),
+                            name=f"fitset-gate-{index:03d}",
+                            daemon=False,
+                        )
+                        try:
+                            process.start()
+                        except BaseException as exc:  # noqa: BLE001
+                            semaphore.release()
+                            errors.append(
+                                f"{variant['variant_id']}: "
+                                f"{type(exc).__name__}: {exc}")
+                        else:
+                            running[process.pid] = (process, False)
+                            index += 1
+                            started = True
+                self._drain_gate_messages(
+                    messages, running, errors, semaphore, block=not started)
+        finally:
+            self._join_gate_children(running, semaphore)
+            messages.close()
+            messages.join_thread()
+        if errors:
+            raise FitSetError("fit-set gate episode failed: " + "; ".join(errors))
+
+    @staticmethod
+    def _drain_gate_messages(messages, running, errors, semaphore, *, block):
+        """Reap finished gate children, releasing each permit exactly once."""
+        try:
+            message = messages.get(timeout=0.5 if block else 0.05)
+        except queue.Empty:
+            message = None
+        if message is not None and str(message.get("kind") or "") == "error":
+            errors.append(
+                f"{message.get('variant_id')}: {message.get('error')}")
+        for pid, (process, released) in list(running.items()):
+            if process.exitcode is None:
+                continue
+            if not released:
+                semaphore.release()
+            process.join()
+            running.pop(pid, None)
+            if process.exitcode != 0:
+                errors.append(f"gate child {pid} exited with {process.exitcode}")
+
+    @staticmethod
+    def _join_gate_children(running, semaphore):
+        for pid, (process, released) in list(running.items()):
+            process.join()
+            if not released:
+                semaphore.release()
+                running[pid] = (process, True)
 
     def _preflight_one(self, variant: Mapping) -> dict:
         values = self._prepare_one(variant, preflight=True)
