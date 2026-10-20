@@ -21,6 +21,8 @@ import re
 import time
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
+import numpy as np
+
 from skill3d.adapters.episode_source import EpisodeItem
 from skill3d.evaluation.accuracy import extract_option_letter
 from skill3d.evaluation.direct_qwen_v11 import (
@@ -78,6 +80,10 @@ def content_sha256(value: object) -> str:
 def _json_value(value):
     if hasattr(value, "model_dump"):
         return _json_value(value.model_dump(mode="json"))
+    if isinstance(value, np.ndarray):
+        return _json_value(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_value(value.item())
     if isinstance(value, dict):
         return {str(key): _json_value(child)
                 for key, child in value.items()}
@@ -85,6 +91,8 @@ def _json_value(value):
         return [_json_value(child) for child in value]
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     return value
 
 

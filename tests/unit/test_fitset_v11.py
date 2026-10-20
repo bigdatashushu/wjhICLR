@@ -518,6 +518,7 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
             legal_answer=True,
             task="object_counting",
             episode_status="answered",
+                overall_quality=float("nan"),
             initial_evidence_states={
                 "geometry_3d": "unavailable",
                 "metric_scale": "unavailable",
@@ -586,6 +587,10 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
     ).read_text(encoding="utf-8"))
     assert result["variant_id"] == variant["variant_id"]
     assert result["scoring_status"] == "reference_unavailable"
+    outcome = json.loads(next(
+        (tmp_path / "system" / "variants").glob("*/outcome.json")
+    ).read_text(encoding="utf-8"))
+    assert outcome["overall_quality"] is None
 
 
 def test_shared_reconstruction_file_hash_is_cached_by_stable_file_stamp(
