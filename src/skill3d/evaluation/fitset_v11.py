@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import random
 import re
+import shutil
 import subprocess
 import time
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
@@ -557,6 +558,7 @@ class SystemVariantRunner:
         phase: str,
         skills_for_variant: Callable[[Mapping], tuple[Sequence[SkillSpecV11], dict]],
         client_factory: Callable[[str], object] | None = None,
+        min_free_gib: float = 80.0,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -576,6 +578,11 @@ class SystemVariantRunner:
         self.phase = phase
         self.skills_for_variant = skills_for_variant
         self.client_factory = client_factory
+        self.min_free_gib = float(min_free_gib)
+        _require(
+            math.isfinite(self.min_free_gib) and self.min_free_gib >= 0,
+            "min_free_gib must be finite and non-negative",
+        )
 
     def _manifest(self) -> dict:
         identities = []
@@ -604,6 +611,7 @@ class SystemVariantRunner:
             "variant_rows_sha256": content_sha256(self.variants),
             "skill_identities_sha256": content_sha256(identities),
             "input_contract_identity": self.input_contract_identity,
+            "min_free_gib": self.min_free_gib,
             "seed": int(self.base_cfg.seed),
             "online_model": self.base_cfg.online_model,
             "online_model_revision": self.base_cfg.online_model_revision,
@@ -632,6 +640,14 @@ class SystemVariantRunner:
 
     def _result_path(self, variant_id: str) -> Path:
         return self.root / "results" / f"{_variant_key(variant_id)}.json"
+
+    def _require_storage_reserve(self, variant_id: str) -> None:
+        free_gib = shutil.disk_usage(self.root).free / (1024 ** 3)
+        _require(
+            free_gib >= self.min_free_gib,
+            f"{variant_id}: free disk {free_gib:.2f} GiB is below "
+            f"the {self.min_free_gib:.2f} GiB reserve",
+        )
 
     def completed(self) -> dict[str, dict]:
         rows = {}
@@ -665,6 +681,7 @@ class SystemVariantRunner:
         )
 
         variant_id = str(variant["variant_id"])
+        self._require_storage_reserve(variant_id)
         item = self.item_provider(variant)
         _require(isinstance(item, EpisodeItem),
                  f"{variant_id}: episode provider returned an invalid item")

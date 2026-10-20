@@ -562,6 +562,7 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
                 semantic_review_config=None,
             ),
             phase="accumulation",
+            min_free_gib=0,
             skills_for_variant=lambda _variant: (
                 [skill],
                 {

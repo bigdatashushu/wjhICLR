@@ -349,6 +349,7 @@ def _run_system(args) -> int:
         base_cfg=_base_config(raw),
         phase=args.phase,
         skills_for_variant=skill_provider,
+        min_free_gib=args.min_free_gib,
     )
     action = runner.preflight if args.preflight_only else runner.run
     summary = action(
@@ -468,6 +469,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--video-root")
     run.add_argument("--video-fallback-root", action="append", default=[])
     run.add_argument("--scene-cache-size", type=int, default=2)
+    run.add_argument("--min-free-gib", type=float, default=80.0)
     run.add_argument("--library-root", default="")
     run.add_argument(
         "--phase", choices=("accumulation", "final_system"), required=True)
