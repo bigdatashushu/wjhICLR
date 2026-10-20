@@ -248,6 +248,9 @@ def test_four_workers_issue_four_requests_concurrently(tmp_path):
     assert all(row["accepted"] for row in results)
     assert batch["workers"] == 4
     assert batch["status_counts"] == {"accepted": 4}
+    assert batch["api_wall_elapsed_s"] > 0
+    assert batch["api_throughput_requests_per_s"] > 0
+    assert batch["receipt_overhead_s"] >= 0
     assert len(list((tmp_path / "responses").glob("*.json"))) == 4
 
 

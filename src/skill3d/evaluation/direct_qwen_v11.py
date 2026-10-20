@@ -62,7 +62,12 @@ def file_identity(path: str | Path) -> dict:
     }
 
 
-def write_json_atomic(path: str | Path, value) -> None:
+def write_json_atomic(
+    path: str | Path,
+    value,
+    *,
+    sync_directory: bool = True,
+) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".tmp")
@@ -71,6 +76,13 @@ def write_json_atomic(path: str | Path, value) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, destination)
+    if not sync_directory:
+        return
+    sync_parent_directory(destination)
+
+
+def sync_parent_directory(path: str | Path) -> None:
+    destination = Path(path)
     directory_fd = os.open(destination.parent, os.O_RDONLY)
     try:
         os.fsync(directory_fd)
@@ -360,7 +372,8 @@ def execute_batch(
 
     def run_one(item: PreparedDirectRequest) -> dict:
         result = execute_direct_request(item, client_factory=client_factory)
-        write_json_atomic(root / f"{item.qa_id}.json", result)
+        write_json_atomic(
+            root / f"{item.qa_id}.json", result, sync_directory=False)
         return result
 
     results = []
@@ -369,9 +382,13 @@ def execute_batch(
         futures = {executor.submit(run_one, item): item.qa_id for item in prepared}
         for future in as_completed(futures):
             results.append(future.result())
+    sync_parent_directory(root / "responses.json")
     results.sort(key=lambda row: row["qa_id"])
     elapsed = time.perf_counter() - started
     latencies = sorted(float(row["elapsed_s"]) for row in results)
+    api_started_at = min(float(row["started_at"]) for row in results)
+    api_completed_at = max(float(row["completed_at"]) for row in results)
+    api_wall_elapsed = api_completed_at - api_started_at
 
     def percentile(fraction: float) -> float:
         index = max(0, min(len(latencies) - 1,
@@ -390,6 +407,10 @@ def execute_batch(
         "completed_at": time.time(),
         "wall_elapsed_s": elapsed,
         "throughput_requests_per_s": len(results) / elapsed if elapsed else 0.0,
+        "api_wall_elapsed_s": api_wall_elapsed,
+        "api_throughput_requests_per_s": (
+            len(results) / api_wall_elapsed if api_wall_elapsed else 0.0),
+        "receipt_overhead_s": max(0.0, elapsed - api_wall_elapsed),
         "latency_p50_s": percentile(0.50),
         "latency_p95_s": percentile(0.95),
         "status_counts": counts,
