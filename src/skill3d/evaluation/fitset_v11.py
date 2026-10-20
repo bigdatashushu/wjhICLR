@@ -603,12 +603,11 @@ class SystemVariantRunner:
                  "system results contain variants outside the frozen panel")
         return rows
 
-    def _run_one(self, variant: Mapping) -> dict:
+    def _prepare_one(self, variant: Mapping) -> dict:
         from skill3d.evaluation.skill_ablation_v11 import (
             input_identity,
             initial_state_for_item,
         )
-        from skill3d.online import runner
         from skill3d.segmentation.prepared_binding_store import (
             load_prepared_binding_reference,
         )
@@ -654,6 +653,13 @@ class SystemVariantRunner:
         )
         skills, skill_identity = self.skills_for_variant(variant)
         _require(bool(skills), f"{variant_id}: no runtime Skill was supplied")
+        matching = [
+            skill for skill in skills
+            if skill.question_type == variant["question_type"]
+            and skill.evidence_state == state
+        ]
+        _require(len(matching) == 1,
+                 f"{variant_id}: runtime Skill match is not unique")
         variant_root = self.root / "variants" / _variant_key(variant_id)
         plan = {
             "schema_version": "v11-fit-set-system-plan/1.0",
@@ -666,6 +672,32 @@ class SystemVariantRunner:
             "skill_identity": dict(skill_identity),
         }
         _write_create_once(variant_root / "plan.json", plan)
+        return {
+            "variant_id": variant_id,
+            "item": item,
+            "artifact_path": artifact_path,
+            "state": state,
+            "identity": identity,
+            "reference": reference,
+            "prepared": prepared,
+            "skills": skills,
+            "skill_identity": skill_identity,
+            "variant_root": variant_root,
+            "plan": plan,
+        }
+
+    def _run_one(self, variant: Mapping) -> dict:
+        from skill3d.online import runner
+
+        prepared_run = self._prepare_one(variant)
+        variant_id = prepared_run["variant_id"]
+        item = prepared_run["item"]
+        artifact_path = prepared_run["artifact_path"]
+        state = prepared_run["state"]
+        prepared = prepared_run["prepared"]
+        skills = prepared_run["skills"]
+        skill_identity = prepared_run["skill_identity"]
+        variant_root = prepared_run["variant_root"]
         trace_dir = variant_root / "trace"
         _require(not trace_dir.exists(),
                  f"{variant_id}: incomplete trace exists without a result")
@@ -716,6 +748,78 @@ class SystemVariantRunner:
         )
         _write_create_once(self._result_path(variant_id), row)
         return row
+
+    def preflight(
+        self,
+        *,
+        resume: bool,
+        max_variants: int = 0,
+        variant_ids: Sequence[str] = (),
+    ) -> dict:
+        manifest = self.initialize(resume=resume)
+        wanted = set(variant_ids)
+        known = {row["variant_id"] for row in self.variants}
+        _require(not (wanted - known),
+                 f"requested variants are outside the panel: {sorted(wanted - known)}")
+        completed = {}
+        for path in sorted((self.root / "preflight").glob("*.json")):
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            variant_id = str(receipt.get("variant_id") or "")
+            _require(
+                variant_id in known
+                and path.stem == _variant_key(variant_id)
+                and variant_id not in completed,
+                f"invalid system preflight receipt: {path}",
+            )
+            completed[variant_id] = receipt
+        pending = [
+            row for row in self.variants
+            if row["variant_id"] not in completed
+            and (not wanted or row["variant_id"] in wanted)
+        ]
+        if max_variants:
+            _require(max_variants > 0, "max_variants must be non-negative")
+            pending = pending[:max_variants]
+        for variant in pending:
+            values = self._prepare_one(variant)
+            binding = values["prepared"]
+            receipt = {
+                "schema_version": "v11-fit-set-system-preflight/1.0",
+                "variant_id": values["variant_id"],
+                "input_identity_sha256": values["identity"]["sha256"],
+                "binding_key": values["reference"]["key"],
+                "binding_manifest_sha256": values["reference"][
+                    "manifest_sha256"],
+                "binding_object_count": len(binding.objects),
+                "binding_materialized": bool(binding.materialized),
+                "binding_status": str(
+                    binding.stats.get("status") or "available"),
+                "runtime_evidence_state": values["state"],
+                "skill_identity": dict(values["skill_identity"]),
+                "model_requests": 0,
+            }
+            _write_create_once(
+                self.root / "preflight"
+                / f"{_variant_key(values['variant_id'])}.json",
+                receipt,
+            )
+            completed[values["variant_id"]] = receipt
+        summary = {
+            "schema_version": "v11-fit-set-system-preflight/1.0",
+            "status": (
+                "complete"
+                if len(completed) == len(self.variants)
+                else "partial"
+            ),
+            "manifest_identity_sha256": manifest["identity_sha256"],
+            "selected_variants": len(self.variants),
+            "completed_preflights": len(completed),
+            "pending_preflights": len(self.variants) - len(completed),
+            "model_requests": 0,
+            "updated_at": time.time(),
+        }
+        _write_json_atomic(self.root / "preflight_summary.json", summary)
+        return summary
 
     def run(
         self,

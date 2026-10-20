@@ -303,7 +303,10 @@ def _run_system(args) -> int:
     ):
         raise FitSetError(
             "fit-set system execution requires enabled bailian/qwen3.8-flash")
-    if not os.environ.get(model.api_key_env, "").strip():
+    if (
+        not args.preflight_only
+        and not os.environ.get(model.api_key_env, "").strip()
+    ):
         raise FitSetError(f"{model.api_key_env} is not configured")
     detector = raw.get("detection", {}).get("endpoint")
     if detector:
@@ -347,7 +350,8 @@ def _run_system(args) -> int:
         phase=args.phase,
         skills_for_variant=skill_provider,
     )
-    summary = runner.run(
+    action = runner.preflight if args.preflight_only else runner.run
+    summary = action(
         resume=args.resume,
         max_variants=args.max_variants,
         variant_ids=selected_ids,
@@ -471,6 +475,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--output-dir", required=True)
     run.add_argument("--max-variants", type=int, default=0)
     run.add_argument("--variant-ids", default="")
+    run.add_argument("--preflight-only", action="store_true")
     run.add_argument("--resume", action="store_true")
     run.set_defaults(handler=_run_system)
 

@@ -425,7 +425,11 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
     from skill3d.adapters.episode_source import load_synthetic_items
     from skill3d.evaluation import skill_ablation_v11 as ablation
     from skill3d.online import runner as online_runner
-    from skill3d.online.runner import EpisodeOutcome, OnlineRunConfig
+    from skill3d.online.runner import (
+        EpisodeOutcome,
+        OnlineRunConfig,
+        PreparedObjectBinding,
+    )
     from skill3d.segmentation import prepared_binding_store
 
     item = load_synthetic_items(
@@ -461,7 +465,7 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
     monkeypatch.setattr(
         prepared_binding_store,
         "load_prepared_binding_reference",
-        lambda *_args, **_kwargs: object(),
+        lambda *_args, **_kwargs: PreparedObjectBinding(),
     )
     calls = []
 
@@ -535,7 +539,14 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
             ),
         )
 
-    first = build_runner().run(resume=False)
+    preflight = build_runner().preflight(
+        resume=False,
+        variant_ids=[variant["variant_id"]],
+    )
+    assert preflight["model_requests"] == 0
+    assert preflight["completed_preflights"] == 1
+    assert calls == []
+    first = build_runner().run(resume=True)
     second = build_runner().run(resume=True)
     assert first["status"] == second["status"] == "complete"
     assert len(calls) == 1
