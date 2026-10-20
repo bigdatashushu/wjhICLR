@@ -42,6 +42,23 @@ def build_visual_prompt(question: str, options: Sequence[str], question_type: st
     return text + " Do not include an explanation, units, or code."
 
 
+def build_visual_request(
+    *,
+    question: str,
+    options: Sequence[str],
+    question_type: str,
+    frames,
+    max_images: int,
+) -> tuple[str, list[dict], str]:
+    """Build the frozen eval-visual request without sending it."""
+    prompt = build_visual_prompt(question, options, question_type)
+    messages = build_image_messages(prompt, frames, max_images=max_images)
+    messages_sha256 = hashlib.sha256(json.dumps(
+        messages, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
+    return prompt, messages, messages_sha256
+
+
 def parse_visual_answer(text: str, *, question_type: str,
                         options: Sequence[str]) -> tuple[AnswerPayload, dict]:
     """Accept a single answer, never extract a guess from prose or executable code."""
@@ -75,9 +92,9 @@ def request_visual_answer(*, question: str, options: Sequence[str], question_typ
     if client is None:
         return None, {**audit, "skipped_reason": "client_unavailable"}
     try:
-        prompt = build_visual_prompt(question, options, question_type)
-        messages = build_image_messages(
-            prompt, [ledger.frame_pixels(fid) for fid in ledger.frame_ids],
+        prompt, messages, messages_sha256 = build_visual_request(
+            question=question, options=options, question_type=question_type,
+            frames=[ledger.frame_pixels(fid) for fid in ledger.frame_ids],
             max_images=max_images)
     except (KeyError, ValueError) as exc:
         return None, {**audit, "skipped_reason": "invalid_visual_input", "error": str(exc)}
@@ -87,9 +104,7 @@ def request_visual_answer(*, question: str, options: Sequence[str], question_typ
         derived_image_ids=[], original_frame_ids=ledger.frame_ids)
     audit.update(
         prompt=prompt, n_images=N_FRAMES, seed=seed, max_tokens=max_tokens,
-        request_sha256=hashlib.sha256(json.dumps(
-            messages, ensure_ascii=False, sort_keys=True,
-            separators=(",", ":")).encode()).hexdigest())
+        request_sha256=messages_sha256)
     ledger.mark_round_sent(round_index)
     ledger.mark_delivered(round_index, plan.image_ids)
     audit["request_count"] = 1
