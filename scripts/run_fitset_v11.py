@@ -34,6 +34,7 @@ from skill3d.evaluation.fitset_v11 import (
     load_fitset_panel,
     load_label_metadata,
     load_variant_bindings,
+    migrate_empty_m4_bindings,
     select_panel_variants,
 )
 from skill3d.online.config import (
@@ -347,7 +348,10 @@ def _run_system(args) -> int:
         variants=variants,
         item_provider=item_provider,
         input_receipt_provider=item_provider.receipt,
-        input_contract_identity=item_provider.input_contract_identity,
+        input_contract_identity={
+            **item_provider.input_contract_identity,
+            "prepared_bindings_manifest": file_identity(args.bindings),
+        },
         binding_refs=bindings,
         base_cfg=_base_config(raw),
         phase=args.phase,
@@ -382,6 +386,30 @@ def _validate(args) -> int:
         },
     }
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def _migrate_bindings(args) -> int:
+    panel = load_fitset_panel(args.panel)
+    variants = select_panel_variants(panel, args.panel_name)
+    manifest = migrate_empty_m4_bindings(
+        panel=panel,
+        variants=variants,
+        source_manifest_path=args.bindings,
+        output_dir=args.output_dir,
+        min_free_gib=args.min_free_gib,
+    )
+    print(json.dumps({
+        "status": "completed",
+        "schema_version": manifest["schema_version"],
+        "n_variants": manifest["n_variants"],
+        "n_migrated": manifest["n_migrated"],
+        "n_reused": manifest["n_reused"],
+        "n_migrated_scenes": manifest["n_migrated_scenes"],
+        "identity_sha256": manifest["identity_sha256"],
+        "prepared_bindings": str(
+            Path(args.output_dir).resolve() / "prepared_bindings.json"),
+    }, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -458,6 +486,19 @@ def build_parser() -> argparse.ArgumentParser:
         required=True)
     validate.add_argument("--bindings", required=True)
     validate.set_defaults(handler=_validate)
+
+    migrate = subparsers.add_parser(
+        "migrate-bindings",
+        help="republish reviewed empty M4 bindings under current source identity",
+    )
+    migrate.add_argument("--panel", required=True)
+    migrate.add_argument("--panel-name", choices=(
+        "ready_579", "recommended_core_897", "maximum_1166"),
+        required=True)
+    migrate.add_argument("--bindings", required=True)
+    migrate.add_argument("--output-dir", required=True)
+    migrate.add_argument("--min-free-gib", type=float, default=80.0)
+    migrate.set_defaults(handler=_migrate_bindings)
 
     run = subparsers.add_parser(
         "run-system", help="run accumulation or final Skill-3D variants")

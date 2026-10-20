@@ -52,6 +52,7 @@ FIT_SKILL_BUNDLE_SCHEMA = "v11-fit-set-task-method-bundle/1.0"
 SYSTEM_RUN_SCHEMA = "v11-fit-set-system-run/1.0"
 SYSTEM_RESULT_SCHEMA = "v11-fit-set-system-result/1.0"
 COMPARISON_SCHEMA = "v11-fit-set-system-vs-direct-qwen/1.0"
+FIT_BINDING_MIGRATION_SCHEMA = "v11-fit-set-binding-migrations/1.0"
 PANEL_NAMES = ("ready_579", "recommended_core_897", "maximum_1166")
 CORE_G1M1_TASKS = frozenset({
     "object_abs_distance",
@@ -59,6 +60,12 @@ CORE_G1M1_TASKS = frozenset({
     "room_size_estimation",
 })
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.@-]+$")
+_EMPTY_M4_PARENT_QUESTION_BINDING_SHA256 = (
+    "945301bce9b0f5167bd5c8feb3878ec0873ac384288930bccb0e7b702a2cd72f"
+)
+_EMPTY_M4_CURRENT_QUESTION_BINDING_SHA256 = (
+    "894baaf8cd3447fa19160f597c781db08c1a72197f5b32b072b68de6c458c57b"
+)
 
 
 class FitSetError(RuntimeError):
@@ -321,8 +328,21 @@ def load_variant_bindings(
     579-row manifest while allowing g1m0/g1m1 variants of one QA to coexist.
     """
     manifest = json.loads(Path(path).read_text(encoding="utf-8"))
+    if manifest.get("schema_version") == FIT_BINDING_MIGRATION_SCHEMA:
+        claimed = str(manifest.get("identity_sha256") or "")
+        body = {
+            key: value for key, value in manifest.items()
+            if key != "identity_sha256"
+        }
+        _require(
+            claimed == content_sha256(body),
+            "fit-set binding migration manifest hash changed",
+        )
     rows = manifest.get("bindings")
     _require(isinstance(rows, dict), "prepared binding manifest lacks bindings")
+    migrations = manifest.get("migrations") or {}
+    _require(isinstance(migrations, dict),
+             "prepared binding migrations must be a mapping")
     resolved: dict[str, dict] = {}
     for variant in variants:
         variant_id = str(variant["variant_id"])
@@ -332,13 +352,24 @@ def load_variant_bindings(
             reference = rows.get(qa_id)
         _require(isinstance(reference, dict),
                  f"{variant_id}: prepared binding is missing")
-        _require(reference.get("key") == variant["binding_key"],
-                 f"{variant_id}: binding key changed")
-        _require(
-            reference.get("manifest_sha256")
-            == variant["binding_manifest_sha256"],
-            f"{variant_id}: binding manifest hash changed",
+        parent_matches = (
+            reference.get("key") == variant["binding_key"]
+            and reference.get("manifest_sha256")
+            == variant["binding_manifest_sha256"]
         )
+        if not parent_matches:
+            migration = migrations.get(variant_id)
+            _require(
+                isinstance(migration, dict)
+                and migration.get("parent_key") == variant["binding_key"]
+                and migration.get("parent_manifest_sha256")
+                == variant["binding_manifest_sha256"]
+                and migration.get("new_key") == reference.get("key")
+                and migration.get("new_manifest_sha256")
+                == reference.get("manifest_sha256")
+                and migration.get("proof", {}).get("passed") is True,
+                f"{variant_id}: binding identity changed without a valid migration",
+            )
         _require(
             _lexical_absolute(reference.get("scene_artifact_ref") or "")
             == _lexical_absolute(variant["artifact_ref"]),
@@ -346,6 +377,195 @@ def load_variant_bindings(
         )
         resolved[variant_id] = copy.deepcopy(reference)
     return resolved
+
+
+def migrate_empty_m4_bindings(
+    *,
+    panel: Mapping,
+    variants: Sequence[Mapping],
+    source_manifest_path: str | Path,
+    output_dir: str | Path,
+    min_free_gib: float = 80.0,
+) -> dict:
+    """Republish only empty M4-unavailable bindings across one reviewed source diff."""
+    from skill3d.infra.m5_identity import (
+        content_sha256 as m5_content_sha256,
+        file_identity as m5_file_identity,
+        source_identity,
+    )
+    from skill3d.segmentation import (
+        prepared_binding_store as prepared_store_module,
+        question_binding,
+    )
+    from skill3d.segmentation.prepared_binding_store import (
+        PreparedBindingStore,
+        load_prepared_binding_reference,
+    )
+
+    reserve = float(min_free_gib)
+    _require(math.isfinite(reserve) and reserve >= 0,
+             "min_free_gib must be finite and non-negative")
+    root = Path(output_dir).resolve()
+    _require(not root.exists(), f"binding migration output exists: {root}")
+    source_path = Path(source_manifest_path).resolve()
+    source_manifest = json.loads(source_path.read_text(encoding="utf-8"))
+    source_rows = source_manifest.get("bindings")
+    _require(isinstance(source_rows, dict),
+             "source prepared binding manifest lacks bindings")
+    root.mkdir(parents=True)
+    target_store = PreparedBindingStore(root / "store")
+    code_root = Path(question_binding.__file__).resolve().parents[1]
+    current_sources = source_identity(code_root)
+    current_question_binding = current_sources.get(
+        "segmentation/question_binding.py") or {}
+    _require(
+        current_question_binding.get("sha256")
+        == _EMPTY_M4_CURRENT_QUESTION_BINDING_SHA256,
+        "current question_binding.py is outside the reviewed migration diff",
+    )
+    current_store_source = m5_file_identity(
+        Path(prepared_store_module.__file__))
+    bindings: dict[str, dict] = {}
+    migrations: dict[str, dict] = {}
+    migrated_scenes: set[str] = set()
+    for variant in variants:
+        variant_id = str(variant["variant_id"])
+        qa_id = str(variant["qa_id"])
+        parent = source_rows.get(variant_id) or source_rows.get(qa_id)
+        _require(isinstance(parent, dict),
+                 f"{variant_id}: source binding is missing")
+        binding = load_prepared_binding_reference(
+            parent,
+            scene_input_identity={
+                "sha256": parent["scene_input_identity_sha256"],
+            },
+        )
+        generation = copy.deepcopy(binding.stats.get("generation") or {})
+        identity = copy.deepcopy(generation.get("identity") or {})
+        frozen_sources = identity.get("sources") or {}
+        diff_keys = sorted(
+            key for key in set(frozen_sources) | set(current_sources)
+            if frozen_sources.get(key) != current_sources.get(key)
+        )
+        if not diff_keys:
+            bindings[variant_id] = copy.deepcopy(parent)
+            continue
+        parent_question_binding = frozen_sources.get(
+            "segmentation/question_binding.py") or {}
+        proof = {
+            "passed": False,
+            "source_diff_keys": diff_keys,
+            "parent_question_binding_sha256": (
+                parent_question_binding.get("sha256")),
+            "current_question_binding_sha256": (
+                current_question_binding.get("sha256")),
+            "binding_status": binding.stats.get("status"),
+            "object_count": len(binding.objects),
+            "materialized": bool(binding.materialized),
+            "object_parse_present": bool(
+                binding.stats.get("object_parse")),
+            "binding_error_present": bool(
+                binding.stats.get("binding_error")),
+            "parse_error_present": bool(
+                binding.stats.get("parse_error")),
+        }
+        _require(
+            diff_keys == ["segmentation/question_binding.py"]
+            and proof["parent_question_binding_sha256"]
+            == _EMPTY_M4_PARENT_QUESTION_BINDING_SHA256
+            and proof["current_question_binding_sha256"]
+            == _EMPTY_M4_CURRENT_QUESTION_BINDING_SHA256
+            and proof["binding_status"] == "m4_unavailable"
+            and proof["object_count"] == 0
+            and proof["materialized"] is False
+            and proof["object_parse_present"] is False
+            and proof["binding_error_present"] is False
+            and proof["parse_error_present"] is False
+            and not binding.prepared_measurements,
+            f"{variant_id}: binding is not eligible for empty-M4 migration",
+        )
+        _require(
+            generation.get("sha256") == m5_content_sha256(identity),
+            f"{variant_id}: parent generation identity does not replay",
+        )
+        generation_sha256_before = generation["sha256"]
+        identity["sources"] = current_sources
+        generation["identity"] = identity
+        generation["sha256"] = m5_content_sha256(identity)
+        binding.stats["generation"] = generation
+        request = copy.deepcopy(parent["request_identity"])
+        request.pop("sha256", None)
+        request["implementation_sources"] = current_sources
+        request["store_source"] = current_store_source
+        request["sha256"] = m5_content_sha256(request)
+        free_gib = shutil.disk_usage(root).free / (1024 ** 3)
+        _require(
+            free_gib >= reserve,
+            f"{variant_id}: free disk {free_gib:.2f} GiB is below "
+            f"the {reserve:.2f} GiB reserve",
+        )
+        migrated = target_store.publish(
+            request_identity=request,
+            scene_artifact=parent["scene_artifact_ref"],
+            scene_input_identity={
+                "sha256": parent["scene_input_identity_sha256"],
+            },
+            binding=binding,
+        )
+        proof["passed"] = True
+        bindings[variant_id] = migrated
+        migrations[variant_id] = {
+            "parent_key": parent["key"],
+            "parent_manifest_sha256": parent["manifest_sha256"],
+            "new_key": migrated["key"],
+            "new_manifest_sha256": migrated["manifest_sha256"],
+            "reason": (
+                "empty m4_unavailable binding; reviewed source diff is "
+                "unreachable before object parsing"
+            ),
+            "generation_sha256_before": generation_sha256_before,
+            "generation_sha256_after": generation["sha256"],
+            "proof": proof,
+        }
+        migrated_scenes.add(str(variant["scene_id"]))
+    body = {
+        "schema_version": FIT_BINDING_MIGRATION_SCHEMA,
+        "role": "fit-set current-source binding compatibility overlay",
+        "panel_proposal_sha256": panel["proposal_sha256"],
+        "panel_file_sha256": panel["panel_file_sha256"],
+        "source_manifest": file_identity(source_path),
+        "source_code_identity": _source_code_identity(),
+        "migration_contract": {
+            "parent_question_binding_sha256": (
+                _EMPTY_M4_PARENT_QUESTION_BINDING_SHA256),
+            "current_question_binding_sha256": (
+                _EMPTY_M4_CURRENT_QUESTION_BINDING_SHA256),
+            "allowed_source_diff_keys": [
+                "segmentation/question_binding.py"],
+            "required_binding_status": "m4_unavailable",
+            "required_object_count": 0,
+            "required_materialized": False,
+        },
+        "store_root": str(target_store.root),
+        "n_variants": len(variants),
+        "n_migrated": len(migrations),
+        "n_reused": len(variants) - len(migrations),
+        "n_migrated_scenes": len(migrated_scenes),
+        "min_free_gib": reserve,
+        "bindings": {
+            key: bindings[key] for key in sorted(bindings)
+        },
+        "migrations": {
+            key: migrations[key] for key in sorted(migrations)
+        },
+    }
+    manifest = {**body, "identity_sha256": content_sha256(body)}
+    _write_create_once(root / "prepared_bindings.json", manifest)
+    load_variant_bindings(
+        root / "prepared_bindings.json",
+        variants,
+    )
+    return manifest
 
 
 @dataclass(frozen=True)
@@ -1356,6 +1576,7 @@ def build_fitset_comparison(
 
 __all__ = [
     "COMPARISON_SCHEMA",
+    "FIT_BINDING_MIGRATION_SCHEMA",
     "FIT_SKILL_BUNDLE_SCHEMA",
     "FitSetError",
     "FitSkillBundle",
@@ -1368,6 +1589,7 @@ __all__ = [
     "load_fitset_panel",
     "load_label_metadata",
     "load_variant_bindings",
+    "migrate_empty_m4_bindings",
     "score_answer",
     "select_panel_variants",
 ]

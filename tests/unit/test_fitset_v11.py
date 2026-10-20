@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -21,6 +22,7 @@ from skill3d.evaluation.fitset_v11 import (
     load_fit_skill_bundle,
     load_fitset_panel,
     load_variant_bindings,
+    migrate_empty_m4_bindings,
     select_panel_variants,
 )
 from skill3d.evolution.fitset_revision_v11 import (
@@ -163,6 +165,93 @@ def test_variant_binding_index_supports_qa_fallback_and_variant_override(
         "/g1m0/artifact.json")
     assert loaded["10@g1m1"]["scene_artifact_ref"].endswith(
         "/g1m1/artifact.json")
+
+
+def test_empty_m4_binding_migration_is_explicit_and_replayable(tmp_path):
+    from skill3d.infra.m5_identity import (
+        content_sha256 as m5_content_sha256,
+        file_identity as m5_file_identity,
+        source_identity,
+    )
+    from skill3d.online.runner import PreparedObjectBinding
+    from skill3d.segmentation import prepared_binding_store, question_binding
+    from skill3d.segmentation.prepared_binding_store import PreparedBindingStore
+
+    code_root = Path(question_binding.__file__).resolve().parents[1]
+    current_sources = source_identity(code_root)
+    parent_sources = copy.deepcopy(current_sources)
+    parent_sources["segmentation/question_binding.py"] = {
+        "sha256": (
+            "945301bce9b0f5167bd5c8feb3878ec0873ac384288930bccb0e7b702a2cd72f"
+        ),
+        "size": 52507,
+    }
+    generation_identity = {"sources": parent_sources}
+    generation = {
+        "identity": generation_identity,
+        "sha256": m5_content_sha256(generation_identity),
+    }
+    binding = PreparedObjectBinding(
+        objects=[],
+        stats={
+            "status": "m4_unavailable",
+            "generation": generation,
+        },
+        materialized=False,
+    )
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text("{}", encoding="utf-8")
+    input_sha = "i" * 64
+    request = {
+        "input_sha256": input_sha,
+        "implementation_sources": parent_sources,
+        "store_source": m5_file_identity(
+            Path(prepared_binding_store.__file__)),
+    }
+    request["sha256"] = m5_content_sha256(request)
+    source_store = PreparedBindingStore(tmp_path / "source-store")
+    parent = source_store.publish(
+        request_identity=request,
+        scene_artifact=artifact,
+        scene_input_identity={"sha256": input_sha},
+        binding=binding,
+    )
+    source_manifest = tmp_path / "source-bindings.json"
+    _write(source_manifest, {"bindings": {"qa-1": parent}})
+    variant = {
+        "variant_id": "qa-1@g0m0",
+        "qa_id": "qa-1",
+        "scene_id": "scene-1",
+        "question_type": "object_counting",
+        "evidence_state": "g0m0",
+        "split": "induction",
+        "artifact_ref": str(artifact.resolve()),
+        "binding_key": parent["key"],
+        "binding_manifest_sha256": parent["manifest_sha256"],
+    }
+    output = tmp_path / "migration"
+    manifest = migrate_empty_m4_bindings(
+        panel={
+            "proposal_sha256": "p" * 64,
+            "panel_file_sha256": "f" * 64,
+        },
+        variants=[variant],
+        source_manifest_path=source_manifest,
+        output_dir=output,
+        min_free_gib=0,
+    )
+    assert manifest["n_migrated"] == 1
+    resolved = load_variant_bindings(
+        output / "prepared_bindings.json", [variant])
+    migrated = resolved[variant["variant_id"]]
+    assert migrated["key"] != parent["key"]
+    loaded = PreparedBindingStore(migrated["store_root"]).load(
+        migrated["key"],
+        expected_request_identity=migrated["request_identity"],
+        scene_artifact=artifact,
+        scene_input_identity={"sha256": input_sha},
+    )
+    assert loaded.stats["generation"]["identity"]["sources"] == current_sources
 
 
 def _method(task: str, index: int) -> SkillSpecV11:
