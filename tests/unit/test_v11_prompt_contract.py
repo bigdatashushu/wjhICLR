@@ -11,7 +11,7 @@ from skill3d.online.eval import build_parser, current_version_fields
 from skill3d.online.runner import OnlineRunConfig
 from skill3d.synthesis import prompt_builder
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION, PromptBuilder
-from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
+from skill3d.tools.docs_v11 import DESCRIPTIONS, TOOL_DOCS_VERSION
 
 
 def test_current_protocol_identity_is_fixed_and_not_cli_selectable():
@@ -25,6 +25,22 @@ def test_current_protocol_identity_is_fixed_and_not_cli_selectable():
     assert versions["template_version"] == "program_synth_v11_8_en"
     assert versions["execution_protocol_version"] == "solver-v11.8-task-tools"
     assert versions["tool_docs_version"] == TOOL_DOCS_VERSION
+
+
+def test_list_objects_documents_plain_list_and_counting_contract():
+    text = DESCRIPTIONS["list_objects"]
+    assert "plain list with no attached result_id" in text
+    assert "do not index it as result['result_id']" in text
+    assert "do not" in text and "pass obj_id values to YieldObservations" in text
+    assert "call inspect_frames" in text
+    assert "prefer count_objects" in text
+
+
+def test_detect_objects_documents_no_repeat_transition():
+    text = DESCRIPTIONS["detect_objects"]
+    assert "do not repeat detect_objects with unchanged" in text
+    assert "Analyze the registered candidates with list_objects" in text
+    assert "selected views or crops with inspect_frames" in text
 
 
 def test_historical_prompt_selectors_are_absent():

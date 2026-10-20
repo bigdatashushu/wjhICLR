@@ -951,7 +951,7 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
     assert manifest["common_config"]["execution_protocol_version"] == (
         "solver-v11.8-task-tools")
     assert manifest["common_config"]["tool_docs_version"] == (
-        "tool-docs-v11.8-task-tools")
+        "tool-docs-v11.9-list-result-contract")
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-task-tools"
 
 

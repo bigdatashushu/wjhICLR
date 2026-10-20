@@ -6,7 +6,7 @@
 
 两臂均通过真实 `run_episode` 生成、执行程序，默认共同使用
 `program_synth_v11_8_en`、`solver-v11.8-task-tools` 和
-`tool-docs-v11.8-task-tools`，
+`tool-docs-v11.9-list-result-contract`，
 质量门始终开启。`ReturnAnswer` 先暂存提交；M11 通过后才进入评分，拒绝时在同一
 求解预算内撤销受影响结果并把结构化失败反馈给同一模型。声明了 `derivation` 时，
 M11 只使用登记操作确定性重放并核对答案；计算声明错误不会撤销本身有效的工具结果。

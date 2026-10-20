@@ -1,6 +1,6 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.8-task-tools"
+TOOL_DOCS_VERSION = "tool-docs-v11.9-list-result-contract"
 
 
 DESCRIPTIONS = {
@@ -32,7 +32,11 @@ DESCRIPTIONS = {
         "with at least one question-targeted binding. Compatible and unknown overlap relations "
         "remain audit diagnostics; they do not establish semantic correctness or merge instances. "
         "Category agreement and even a unique candidate do not prove that it is the question's referent. "
-        "Use frames/crops to select an explicit obj_id. Candidate inspection remains available without 3D."),
+        "Use frames/crops to select an explicit obj_id. Candidate inspection remains available without 3D. "
+        "The return is a plain list with no attached result_id, unlike detect_objects, which returns a dict; "
+        "do not index it as result['result_id'] or pass obj_id values to YieldObservations. Read fields from "
+        "each list element in the same program. To request image feedback, call inspect_frames and yield that "
+        "dict result's result_id. For instance counts, prefer count_objects over summing list length."),
     "count_objects": (
         "Count instances using the same category rules as list_objects. Group records sharing a "
         "nonempty track_id; each untracked record forms its own group. Merge each group's point clouds, "
@@ -150,5 +154,8 @@ DESCRIPTIONS = {
         "Detection dictionaries have no obj_id. new_object_ids contains only newly added IDs; "
         "it can be empty on repeated detection while earlier objects remain registered. Verify "
         "real identities with list_objects; do not infer a one-to-one mapping from list order. "
-        "A partial result or empty list does not establish complete frame/category coverage."),
+        "A partial result or empty list does not establish complete frame/category coverage. "
+        "After a successful all-requested-frame scan, do not repeat detect_objects with unchanged "
+        "categories and frame_ids. Analyze the registered candidates with list_objects, request "
+        "selected views or crops with inspect_frames, then answer or request materially new evidence."),
 }
