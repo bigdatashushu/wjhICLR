@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import threading
+import time
 
 from skill3d.evaluation.direct_qwen_v11 import (
     DIRECT_RESPONSE_SCHEMA,
@@ -622,3 +624,83 @@ def test_shared_reconstruction_file_hash_is_cached_by_stable_file_stamp(
     assert first == second
     assert info.misses == 1
     assert info.hits == 1
+
+
+def test_system_runner_uses_four_workers_and_stable_scene_schedule(
+    tmp_path,
+):
+    from skill3d.online.runner import OnlineRunConfig
+
+    variants = [
+        {
+            "variant_id": f"qa-{index}@g0m0",
+            "qa_id": f"qa-{index}",
+            "scene_id": scene,
+            "question_type": "object_counting",
+            "evidence_state": "g0m0",
+            "split": "induction",
+        }
+        for index, scene in enumerate(("scene-b", "scene-a", "scene-b", "scene-a"))
+    ]
+    skill = _method("object_counting", 1)
+    runner = SystemVariantRunner(
+        output_root=tmp_path / "parallel",
+        panel={
+            "proposal_sha256": "p" * 64,
+            "panel_file_sha256": "f" * 64,
+        },
+        panel_name="ready_579",
+        variants=variants,
+        item_provider=lambda _variant: None,
+        input_receipt_provider=lambda _variant, _item: {},
+        input_contract_identity={"sha256": "d" * 64},
+        binding_refs={},
+        base_cfg=OnlineRunConfig(mode="real", semantic_review_config=None),
+        phase="accumulation",
+        min_free_gib=0,
+        workers=4,
+        skills_for_variant=lambda _variant: (
+            [skill],
+            {
+                "snapshot_ref": "parallel-test",
+                "manifest_sha256": "a" * 64,
+            },
+        ),
+    )
+    state = {"active": 0, "max_active": 0}
+    lock = threading.Lock()
+    barrier = threading.Barrier(4)
+
+    def fake_run_one(variant):
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+        try:
+            barrier.wait(timeout=2)
+            time.sleep(0.02)
+            return {
+                "variant_id": variant["variant_id"],
+                "status": "completed",
+            }
+        finally:
+            with lock:
+                state["active"] -= 1
+
+    runner._run_one = fake_run_one
+    summary = runner.run(resume=False)
+    manifest = json.loads(
+        (tmp_path / "parallel" / "manifest.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "complete"
+    assert summary["workers"] == 4
+    assert state["max_active"] == 4
+    assert manifest["execution"] == {
+        "workers": 4,
+        "scheduler": "stable_scene_grouped_v1",
+        "variant_ids": [
+            "qa-1@g0m0",
+            "qa-3@g0m0",
+            "qa-0@g0m0",
+            "qa-2@g0m0",
+        ],
+        "variant_ids_sha256": manifest["execution"]["variant_ids_sha256"],
+    }

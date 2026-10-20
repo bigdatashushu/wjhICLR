@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -155,33 +156,35 @@ class _FitSetItemProvider:
         self.fallback_roots = list(fallback_roots)
         self.max_scenes = int(max_scenes)
         self.cache: OrderedDict[tuple[str, str], dict] = OrderedDict()
+        self.cache_lock = threading.RLock()
 
     def _scene(self, row: dict) -> dict:
         key = (row["dataset"], row["scene_name"])
-        if key in self.cache:
-            value = self.cache.pop(key)
-            self.cache[key] = value
-            return value
-        loaded, attempts = _load_from_sources(
-            row,
-            self.video_root,
-            self.fallback_roots,
-            32,
-        )
-        if loaded is None:
-            raise FitSetError(
-                f"{row['qa_id']}: frozen video input unavailable: {attempts}")
-        if (
-            len(loaded["planned"]) != 32
-            or len(loaded["pixels"]) != 32
-            or loaded["missing"]
-        ):
-            raise FitSetError(
-                f"{row['qa_id']}: fit-set requires exactly 32 readable frames")
-        self.cache[key] = loaded
-        while len(self.cache) > self.max_scenes:
-            self.cache.popitem(last=False)
-        return loaded
+        with self.cache_lock:
+            if key in self.cache:
+                value = self.cache.pop(key)
+                self.cache[key] = value
+                return value
+            loaded, attempts = _load_from_sources(
+                row,
+                self.video_root,
+                self.fallback_roots,
+                32,
+            )
+            if loaded is None:
+                raise FitSetError(
+                    f"{row['qa_id']}: frozen video input unavailable: {attempts}")
+            if (
+                len(loaded["planned"]) != 32
+                or len(loaded["pixels"]) != 32
+                or loaded["missing"]
+            ):
+                raise FitSetError(
+                    f"{row['qa_id']}: fit-set requires exactly 32 readable frames")
+            self.cache[key] = loaded
+            while len(self.cache) > self.max_scenes:
+                self.cache.popitem(last=False)
+            return loaded
 
     def __call__(self, variant: dict) -> EpisodeItem:
         qa_id = str(variant["qa_id"])
@@ -350,6 +353,7 @@ def _run_system(args) -> int:
         phase=args.phase,
         skills_for_variant=skill_provider,
         min_free_gib=args.min_free_gib,
+        workers=args.workers,
     )
     action = runner.preflight if args.preflight_only else runner.run
     summary = action(
@@ -470,6 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--video-fallback-root", action="append", default=[])
     run.add_argument("--scene-cache-size", type=int, default=2)
     run.add_argument("--min-free-gib", type=float, default=80.0)
+    run.add_argument("--workers", type=int, default=1)
     run.add_argument("--library-root", default="")
     run.add_argument(
         "--phase", choices=("accumulation", "final_system"), required=True)

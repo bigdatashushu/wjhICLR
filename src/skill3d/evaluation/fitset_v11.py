@@ -9,6 +9,7 @@ can execute them without creating additional method bodies.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, replace
 import copy
 import hashlib
@@ -559,6 +560,7 @@ class SystemVariantRunner:
         skills_for_variant: Callable[[Mapping], tuple[Sequence[SkillSpecV11], dict]],
         client_factory: Callable[[str], object] | None = None,
         min_free_gib: float = 80.0,
+        workers: int = 1,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -579,10 +581,23 @@ class SystemVariantRunner:
         self.skills_for_variant = skills_for_variant
         self.client_factory = client_factory
         self.min_free_gib = float(min_free_gib)
+        self.workers = int(workers)
         _require(
             math.isfinite(self.min_free_gib) and self.min_free_gib >= 0,
             "min_free_gib must be finite and non-negative",
         )
+        _require(1 <= self.workers <= 16,
+                 "workers must be between 1 and 16")
+        self.execution_variants = [
+            row
+            for _, row in sorted(
+                enumerate(self.variants),
+                key=lambda pair: (
+                    str(pair[1]["scene_id"]),
+                    pair[0],
+                ),
+            )
+        ]
 
     def _manifest(self) -> dict:
         identities = []
@@ -612,6 +627,18 @@ class SystemVariantRunner:
             "skill_identities_sha256": content_sha256(identities),
             "input_contract_identity": self.input_contract_identity,
             "min_free_gib": self.min_free_gib,
+            "execution": {
+                "workers": self.workers,
+                "scheduler": "stable_scene_grouped_v1",
+                "variant_ids": [
+                    row["variant_id"]
+                    for row in self.execution_variants
+                ],
+                "variant_ids_sha256": content_sha256([
+                    row["variant_id"]
+                    for row in self.execution_variants
+                ]),
+            },
             "seed": int(self.base_cfg.seed),
             "online_model": self.base_cfg.online_model,
             "online_model_revision": self.base_cfg.online_model_revision,
@@ -862,6 +889,62 @@ class SystemVariantRunner:
         _write_create_once(self._result_path(variant_id), row)
         return row
 
+    def _execute_pending(
+        self,
+        pending: Sequence[Mapping],
+        operation: Callable[[Mapping], dict],
+        accept: Callable[[dict], None],
+    ) -> None:
+        if self.workers == 1:
+            for variant in pending:
+                accept(operation(variant))
+            return
+        executor = ThreadPoolExecutor(
+            max_workers=self.workers,
+            thread_name_prefix=f"fitset-{self.phase}",
+        )
+        futures: dict[Future, str] = {
+            executor.submit(operation, variant): str(variant["variant_id"])
+            for variant in pending
+        }
+        try:
+            for future in as_completed(futures):
+                accept(future.result())
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+
+    def _preflight_one(self, variant: Mapping) -> dict:
+        values = self._prepare_one(variant)
+        binding = values["prepared"]
+        receipt = {
+            "schema_version": "v11-fit-set-system-preflight/1.0",
+            "variant_id": values["variant_id"],
+            "input_identity_sha256": values["identity"]["sha256"],
+            "binding_key": values["reference"]["key"],
+            "binding_manifest_sha256": values["reference"][
+                "manifest_sha256"],
+            "m5_parameters_sha256": values["plan"][
+                "m5_parameters_sha256"],
+            "binding_object_count": len(binding.objects),
+            "binding_materialized": bool(binding.materialized),
+            "binding_status": str(
+                binding.stats.get("status") or "available"),
+            "runtime_evidence_state": values["state"],
+            "skill_identity": dict(values["skill_identity"]),
+            "model_requests": 0,
+        }
+        _write_create_once(
+            self.root / "preflight"
+            / f"{_variant_key(values['variant_id'])}.json",
+            receipt,
+        )
+        return receipt
+
     def preflight(
         self,
         *,
@@ -886,39 +969,17 @@ class SystemVariantRunner:
             )
             completed[variant_id] = receipt
         pending = [
-            row for row in self.variants
+            row for row in self.execution_variants
             if row["variant_id"] not in completed
             and (not wanted or row["variant_id"] in wanted)
         ]
         if max_variants:
             _require(max_variants > 0, "max_variants must be non-negative")
             pending = pending[:max_variants]
-        for variant in pending:
-            values = self._prepare_one(variant)
-            binding = values["prepared"]
-            receipt = {
-                "schema_version": "v11-fit-set-system-preflight/1.0",
-                "variant_id": values["variant_id"],
-                "input_identity_sha256": values["identity"]["sha256"],
-                "binding_key": values["reference"]["key"],
-                "binding_manifest_sha256": values["reference"][
-                    "manifest_sha256"],
-                "m5_parameters_sha256": values["plan"][
-                    "m5_parameters_sha256"],
-                "binding_object_count": len(binding.objects),
-                "binding_materialized": bool(binding.materialized),
-                "binding_status": str(
-                    binding.stats.get("status") or "available"),
-                "runtime_evidence_state": values["state"],
-                "skill_identity": dict(values["skill_identity"]),
-                "model_requests": 0,
-            }
-            _write_create_once(
-                self.root / "preflight"
-                / f"{_variant_key(values['variant_id'])}.json",
-                receipt,
-            )
-            completed[values["variant_id"]] = receipt
+        def accept(receipt: dict) -> None:
+            completed[receipt["variant_id"]] = receipt
+
+        self._execute_pending(pending, self._preflight_one, accept)
         summary = {
             "schema_version": "v11-fit-set-system-preflight/1.0",
             "status": (
@@ -931,6 +992,8 @@ class SystemVariantRunner:
             "completed_preflights": len(completed),
             "pending_preflights": len(self.variants) - len(completed),
             "model_requests": 0,
+            "workers": self.workers,
+            "scheduler": "stable_scene_grouped_v1",
             "updated_at": time.time(),
         }
         _write_json_atomic(self.root / "preflight_summary.json", summary)
@@ -950,17 +1013,18 @@ class SystemVariantRunner:
         _require(not (wanted - known),
                  f"requested variants are outside the panel: {sorted(wanted - known)}")
         pending = [
-            row for row in self.variants
+            row for row in self.execution_variants
             if row["variant_id"] not in completed
             and (not wanted or row["variant_id"] in wanted)
         ]
         if max_variants:
             _require(max_variants > 0, "max_variants must be non-negative")
             pending = pending[:max_variants]
-        for row in pending:
-            result = self._run_one(row)
+        def accept(result: dict) -> None:
             completed[result["variant_id"]] = result
             self._write_summary(manifest, completed)
+
+        self._execute_pending(pending, self._run_one, accept)
         return self._write_summary(manifest, completed)
 
     def _write_summary(self, manifest: Mapping, completed: Mapping[str, dict]) -> dict:
@@ -981,6 +1045,8 @@ class SystemVariantRunner:
             "completed_variants": len(completed),
             "pending_variants": len(self.variants) - len(completed),
             "status_counts": counts,
+            "workers": self.workers,
+            "scheduler": "stable_scene_grouped_v1",
             "updated_at": time.time(),
         }
         _write_json_atomic(self.root / "summary.json", summary)
