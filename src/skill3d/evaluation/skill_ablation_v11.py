@@ -188,11 +188,12 @@ def _hash(value) -> str:
 
 
 def _file_hash(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
+    # Reconstruction arrays are shared by every question in one scene. Reuse a
+    # digest only while inode, size, mtime and ctime are unchanged; this keeps
+    # the exact SHA256 identity while avoiding full array rereads per question.
+    from skill3d.infra.m5_identity import file_identity
+
+    return str(file_identity(path)["sha256"])
 
 
 def _write(path: Path, value) -> None:
