@@ -578,6 +578,11 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
     assert preflight["model_requests"] == 0
     assert preflight["completed_preflights"] == 1
     assert calls == []
+    manifest = json.loads(
+        (tmp_path / "system" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["code_identity"]["base_commit"]
+    assert manifest["code_identity"]["source"] in {
+        "git_worktree", "startup_receipt"}
     first = build_runner().run(resume=True)
     second = build_runner().run(resume=True)
     assert first["status"] == second["status"] == "complete"

@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import random
 import re
+import subprocess
 import time
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
@@ -131,6 +132,42 @@ def _require(condition: bool, message: str) -> None:
 
 def _variant_key(variant_id: str) -> str:
     return hashlib.sha256(variant_id.encode("utf-8")).hexdigest()[:20]
+
+
+def _source_code_identity() -> dict:
+    root = Path(__file__).resolve().parents[3]
+    receipt = current_code_identity(root)
+    if receipt:
+        return {"source": "startup_receipt", **receipt}
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise FitSetError(
+            f"cannot establish fit-set source identity: {exc}") from exc
+    dirty = bool(status.strip())
+    if os.environ.get("SKILL3D_RUN_MODE") == "formal" and dirty:
+        raise FitSetError("formal fit-set execution requires a clean source worktree")
+    return {
+        "source": "git_worktree",
+        "source_root": str(root),
+        "base_commit": commit,
+        "git_dirty": dirty,
+        "status_sha256": hashlib.sha256(
+            status.encode("utf-8")).hexdigest(),
+    }
 
 
 def _lexical_absolute(path: str | Path) -> str:
@@ -572,7 +609,7 @@ class SystemVariantRunner:
             "online_model_revision": self.base_cfg.online_model_revision,
             "prompt_version": PROMPT_TEMPLATE_VERSION,
             "tool_docs_version": TOOL_DOCS_VERSION,
-            "code_identity": current_code_identity(),
+            "code_identity": _source_code_identity(),
             "reference_answer_retained_for_input_identity_and_m12": True,
             "reference_answer_visible_to_online_model": False,
         }
