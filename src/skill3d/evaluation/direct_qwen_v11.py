@@ -136,7 +136,10 @@ def load_safe_metadata(path: str | Path) -> dict[str, dict]:
         if not line.strip():
             continue
         raw = json.loads(line)
-        qa_id = str(raw.get("qa_id") or raw.get("id") or "")
+        raw_id = raw.get("qa_id")
+        if raw_id is None or raw_id == "":
+            raw_id = raw.get("id")
+        qa_id = "" if raw_id is None else str(raw_id)
         _require(qa_id and qa_id not in rows,
                  f"duplicate or empty metadata qa_id: {qa_id!r}")
         options = raw.get("options")

@@ -14,6 +14,7 @@ from skill3d.evaluation.direct_qwen_v11 import (
     execute_batch,
     execute_direct_request,
     load_request_index,
+    load_safe_metadata,
     prepare_direct_request,
 )
 from skill3d.synthesis.client_errors import ServiceUnavailable
@@ -118,6 +119,22 @@ def test_request_index_hard_locks_qwen38_flash(tmp_path):
         load_request_index(path)
 
 
+def test_safe_metadata_preserves_numeric_zero_id(tmp_path):
+    path = tmp_path / "metadata.jsonl"
+    path.write_text(json.dumps({
+        "id": 0,
+        "dataset": "scannet",
+        "scene_name": "scene-0",
+        "question_type": "object_counting",
+        "question": "How many chairs?",
+        "options": None,
+        "ground_truth": "3",
+    }) + "\n")
+    rows = load_safe_metadata(path)
+    assert rows["0"]["qa_id"] == "0"
+    assert "ground_truth" not in rows["0"]
+
+
 def test_preflight_binds_exact_32_frame_bytes_and_model_contract():
     prepared = _prepared()
     receipt = prepared.preflight
@@ -181,6 +198,7 @@ class _Client:
         self.last_response_identity = {}
 
     def chat(self, messages, **kwargs):
+        assert len(messages[0]["content"]) == 33
         assert kwargs == {
             "max_tokens": 8192,
             "seed": 137,
