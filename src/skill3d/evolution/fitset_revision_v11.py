@@ -92,6 +92,8 @@ def _parse_response(text: str) -> dict:
         raise FitSetError("offline reviser response lacks full_skill_md")
     if not isinstance(value.get("modification_reason"), str):
         raise FitSetError("offline reviser response lacks modification_reason")
+    skill_md = value["full_skill_md"].replace("\r\n", "\n").replace("\r", "\n")
+    value["full_skill_md"] = skill_md.rstrip("\n") + "\n"
     return value
 
 

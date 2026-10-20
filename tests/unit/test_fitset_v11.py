@@ -37,6 +37,7 @@ from skill3d.evaluation.fitset_v11 import (
 from skill3d.evolution.fitset_revision_v11 import (
     FIT_FEEDBACK_SCHEMA,
     FitSetSlotReviser,
+    _parse_response,
     build_method_feedback,
     load_active_parent_slots,
 )
@@ -555,6 +556,23 @@ class _RevisionClient:
             "full_skill_md": candidate,
             "modification_reason": "Add an exact-slot fail-closed check.",
         })
+
+
+@pytest.mark.parametrize(
+    "skill_md",
+    [
+        "---\nname: count\ndescription: Count objects.\n---\n\nMethod",
+        "---\r\nname: count\r\ndescription: Count objects.\r\n---\r\n\r\nMethod\r\n\r\n",
+    ],
+)
+def test_fitset_revision_normalizes_canonical_skill_newlines(skill_md):
+    value = _parse_response(json.dumps({
+        "full_skill_md": skill_md,
+        "modification_reason": "Keep the complete method.",
+    }))
+    assert "\r" not in value["full_skill_md"]
+    assert value["full_skill_md"].endswith("\n")
+    assert not value["full_skill_md"].endswith("\n\n")
 
 
 def test_feedback_is_sanitized_and_ungated_freeze_is_refused(tmp_path):
