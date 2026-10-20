@@ -15,6 +15,7 @@ from skill3d.synthesis.program_assembler import (
     SynthesisError,
     assemble_program,
     extract_program_source,
+    extract_program_source_ex,
 )
 
 
@@ -74,6 +75,14 @@ def test_unclosed_fence_without_parseable_prefix_raises():
     text = "```python\ndef broken(:\n    ???\n"
     with pytest.raises(SynthesisError):
         extract_program_source(text)
+
+
+@pytest.mark.parametrize("extractor", [extract_program_source, extract_program_source_ex])
+@pytest.mark.parametrize("text", ["```python\n", "```py\n   \n", "```\n"])
+def test_unclosed_empty_fence_raises_synthesis_error(extractor, text):
+    """空的未闭合围栏是模型解析失败，不能泄漏内部断言。"""
+    with pytest.raises(SynthesisError, match="unclosed and empty"):
+        extractor(text)
 
 
 def test_closed_block_with_syntax_error_raises_when_unrecoverable():

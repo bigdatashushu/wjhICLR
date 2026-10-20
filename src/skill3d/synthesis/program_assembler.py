@@ -181,6 +181,10 @@ def extract_program_source_ex(text: str) -> tuple[str, bool]:
 
     remainder = _open_fence_remainder(raw)
     if remainder is not None:
+        if not remainder.strip():
+            raise SynthesisError(
+                "Program code fence is unclosed and empty; cannot extract a program"
+            )
         recovered = _recover_truncated(remainder)
         if recovered is not None:
             return recovered, True
@@ -228,6 +232,10 @@ def extract_program_source(text: str) -> str:
 
     remainder = _open_fence_remainder(raw)
     if remainder is not None:
+        if not remainder.strip():
+            raise SynthesisError(
+                "Program code fence is unclosed and empty; cannot extract a program"
+            )
         recovered = _recover_truncated(remainder)
         if recovered is not None:
             return recovered
