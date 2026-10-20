@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import time
 from typing import Callable, Iterable, Sequence
 
@@ -88,6 +89,153 @@ def sync_parent_directory(path: str | Path) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def import_reused_responses(
+    *,
+    output_root: str | Path,
+    selected_qa_ids: Sequence[str],
+    reuse_roots: Sequence[str | Path],
+    target_manifest: dict,
+) -> dict:
+    """Create-only import of exact prior requests into a larger frozen run."""
+    root = Path(output_root)
+    selected = {str(item) for item in selected_qa_ids}
+    candidates: dict[str, tuple[Path, Path, dict, dict]] = {}
+    sources = []
+    for raw_root in reuse_roots:
+        source_root = Path(raw_root).resolve()
+        _require(source_root != root.resolve(),
+                 "reuse run root must differ from output root")
+        manifest_path = source_root / "manifest.json"
+        _require(manifest_path.is_file(),
+                 f"reuse run has no manifest: {source_root}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        _require(manifest.get("schema_version") == DIRECT_RUN_SCHEMA,
+                 f"reuse run schema changed: {source_root}")
+        _validate_reuse_manifest(
+            source=manifest, target=target_manifest, source_root=source_root)
+        sources.append(file_identity(manifest_path))
+        for response_path in sorted((source_root / "responses").glob("*.json")):
+            qa_id = response_path.stem
+            if qa_id not in selected:
+                continue
+            preflight_path = source_root / "preflight" / f"{qa_id}.json"
+            _require(preflight_path.is_file(),
+                     f"{qa_id}: reused response has no preflight receipt")
+            response = json.loads(response_path.read_text(encoding="utf-8"))
+            preflight = json.loads(preflight_path.read_text(encoding="utf-8"))
+            _require(response.get("schema_version") == DIRECT_RESPONSE_SCHEMA,
+                     f"{qa_id}: reused response schema changed")
+            _require(preflight.get("schema_version") == DIRECT_REQUEST_SCHEMA,
+                     f"{qa_id}: reused preflight schema changed")
+            _require(response.get("qa_id") == qa_id
+                     and preflight.get("qa_id") == qa_id,
+                     f"{qa_id}: reused identity changed")
+            _require(response.get("request_sha256")
+                     == preflight.get("request_sha256"),
+                     f"{qa_id}: reused request hash mismatch")
+            identity = preflight.get("request_identity") or {}
+            expected_identity = {
+                "provider": EXPECTED_PROVIDER,
+                "model": target_manifest["request_model"],
+                "model_revision": target_manifest["request_model_revision"],
+                "endpoint_sha256": target_manifest["endpoint_sha256"],
+                "prompt_version": target_manifest["contract"]["prompt_version"],
+                "seed": target_manifest["seed"],
+                "temperature": target_manifest["temperature"],
+                "max_tokens": target_manifest["max_tokens"],
+                "enable_thinking": target_manifest["enable_thinking"],
+            }
+            _require(all(identity.get(key) == value
+                         for key, value in expected_identity.items()),
+                     f"{qa_id}: reused request contract changed")
+            prior = candidates.get(qa_id)
+            if prior is not None:
+                _require(
+                    file_identity(prior[0])["sha256"]
+                    == file_identity(response_path)["sha256"]
+                    and file_identity(prior[1])["sha256"]
+                    == file_identity(preflight_path)["sha256"],
+                    f"{qa_id}: conflicting reusable responses")
+                continue
+            candidates[qa_id] = (
+                response_path, preflight_path, response, preflight)
+
+    imported = []
+    (root / "responses").mkdir(parents=True, exist_ok=True)
+    (root / "preflight").mkdir(parents=True, exist_ok=True)
+    for qa_id, (response_source, preflight_source, response, preflight) in sorted(
+            candidates.items()):
+        response_target = root / "responses" / response_source.name
+        preflight_target = root / "preflight" / preflight_source.name
+        methods = {
+            "response": _link_or_copy_create_only(
+                response_source, response_target),
+            "preflight": _link_or_copy_create_only(
+                preflight_source, preflight_target),
+        }
+        imported.append({
+            "qa_id": qa_id,
+            "request_sha256": response["request_sha256"],
+            "response_sha256": file_identity(response_target)["sha256"],
+            "preflight_sha256": file_identity(preflight_target)["sha256"],
+            "source_root": str(response_source.parents[1]),
+            "methods": methods,
+            "accepted": bool(response.get("accepted")),
+        })
+    sync_parent_directory(root / "responses.json")
+    sync_parent_directory(root / "preflight.json")
+    receipt = {
+        "schema_version": "v11-direct-qwen-reuse/1.0",
+        "selected_requests": len(selected),
+        "reuse_roots": [str(Path(item).resolve()) for item in reuse_roots],
+        "source_manifests": sources,
+        "imported_count": len(imported),
+        "imported": imported,
+    }
+    receipt["identity_sha256"] = content_sha256(receipt)
+    write_json_atomic(root / "reuse_receipt.json", receipt)
+    return receipt
+
+
+def _validate_reuse_manifest(*, source: dict, target: dict,
+                             source_root: Path) -> None:
+    for key in ("request_index", "metadata", "config"):
+        _require(
+            (source.get(key) or {}).get("sha256")
+            == (target.get(key) or {}).get("sha256"),
+            f"reuse run {key} changed: {source_root}")
+    for key in (
+        "contract", "request_model", "request_model_revision",
+        "endpoint_sha256", "seed", "temperature", "max_tokens",
+        "enable_thinking", "reference_answer_visible",
+    ):
+        _require(source.get(key) == target.get(key),
+                 f"reuse run {key} changed: {source_root}")
+
+
+def _link_or_copy_create_only(source: Path, destination: Path) -> str:
+    if destination.exists():
+        _require(file_identity(source)["sha256"]
+                 == file_identity(destination)["sha256"],
+                 f"reuse target changed: {destination}")
+        return "existing"
+    try:
+        os.link(source, destination)
+        return "hardlink"
+    except OSError as exc:
+        if exc.errno != getattr(os, "EXDEV", 18):
+            raise
+    temporary = destination.with_name(destination.name + ".tmp")
+    shutil.copyfile(source, temporary)
+    with temporary.open("rb") as stream:
+        os.fsync(stream.fileno())
+    os.replace(temporary, destination)
+    _require(file_identity(source)["sha256"]
+             == file_identity(destination)["sha256"],
+             f"reuse copy changed: {destination}")
+    return "copy"
 
 
 def _require(condition: bool, message: str) -> None:
@@ -219,6 +367,7 @@ def prepare_direct_request(
     contract: dict,
     endpoint_sha256: str,
     max_tokens: int,
+    encoded_frames: Sequence[dict] | None = None,
 ) -> PreparedDirectRequest:
     validate_metadata_row(index_row, metadata_row)
     qa_id = index_row["qa_id"]
@@ -246,7 +395,9 @@ def prepare_direct_request(
     options = tuple(metadata_row["options"])
     prompt, messages, messages_sha256 = build_visual_request(
         question=metadata_row["question"], options=options,
-        question_type=index_row["question_type"], frames=pixels,
+        question_type=index_row["question_type"],
+        frames=(pixels if encoded_frames is None else None),
+        encoded_frames=encoded_frames,
         max_images=N_FRAMES,
     )
     request_identity = {

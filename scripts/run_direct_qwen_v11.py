@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import OrderedDict
 import json
 from pathlib import Path
 import sys
@@ -19,6 +20,7 @@ from skill3d.evaluation.direct_qwen_v11 import (
     DirectQwenError,
     execute_batch,
     file_identity,
+    import_reused_responses,
     load_input_receipt,
     load_request_index,
     load_safe_metadata,
@@ -28,6 +30,7 @@ from skill3d.evaluation.direct_qwen_v11 import (
 )
 from skill3d.online.config import load_config, online_model_from, paths_from
 from skill3d.synthesis.bailian_client import BailianClient
+from skill3d.synthesis.eval_visual_fallback import encode_visual_frames
 
 
 def _parse_positive_csv(value: str) -> list[int]:
@@ -77,6 +80,8 @@ def _manifest(
             str(Path(path).resolve()) for path in fallback_roots],
         "input_receipt_roots": [
             str(Path(path).resolve()) for path in args.input_receipt_root],
+        "reuse_run_roots": [
+            str(Path(path).resolve()) for path in args.reuse_run_root],
         "request_model": model.model,
         "request_model_revision": model.model_revision,
         "endpoint_sha256": BailianClient(
@@ -120,14 +125,51 @@ def _load_existing_responses(root: Path, manifest: dict) -> dict[str, dict]:
     return responses
 
 
+class _SceneInputCache:
+    def __init__(
+        self,
+        *,
+        max_scenes: int,
+        input_receipt_roots: list[str],
+        video_root: str,
+        fallback_roots: list[str],
+    ) -> None:
+        self.max_scenes = max_scenes
+        self.input_receipt_roots = input_receipt_roots
+        self.video_root = video_root
+        self.fallback_roots = fallback_roots
+        self._values: OrderedDict[tuple[str, str], dict] = OrderedDict()
+
+    def get(self, index_row: dict, metadata_row: dict) -> dict:
+        key = (metadata_row["dataset"], index_row["scene_id"])
+        if key in self._values:
+            value = self._values.pop(key)
+            self._values[key] = value
+            return value
+        loaded, attempts = _load_from_sources(
+            metadata_row, self.video_root, self.fallback_roots, 32)
+        if loaded is None:
+            raise DirectQwenError(
+                f"{index_row['qa_id']}: frozen video input unavailable: {attempts}")
+        value = {
+            "loaded": loaded,
+            "input_receipt": load_input_receipt(
+                index_row["scene_id"], self.input_receipt_roots),
+            "encoded_frames": encode_visual_frames(
+                loaded["pixels"], max_images=32),
+        }
+        self._values[key] = value
+        while len(self._values) > self.max_scenes:
+            self._values.popitem(last=False)
+        return value
+
+
 def _prepare(
     *,
     index_row: dict,
     metadata_by_id: dict[str, dict],
     request_index: dict,
-    input_receipt_roots: list[str],
-    video_root: str,
-    fallback_roots: list[str],
+    scene_cache: _SceneInputCache,
     endpoint_sha256: str,
     max_tokens: int,
     output_root: Path,
@@ -136,21 +178,16 @@ def _prepare(
     metadata_row = metadata_by_id.get(qa_id)
     if metadata_row is None:
         raise DirectQwenError(f"{qa_id}: metadata row is missing")
-    loaded, attempts = _load_from_sources(
-        metadata_row, video_root, fallback_roots, 32)
-    if loaded is None:
-        raise DirectQwenError(
-            f"{qa_id}: frozen video input unavailable: {attempts}")
-    input_receipt = load_input_receipt(
-        index_row["scene_id"], input_receipt_roots)
+    scene = scene_cache.get(index_row, metadata_row)
     prepared = prepare_direct_request(
         index_row=index_row,
         metadata_row=metadata_row,
-        loaded=loaded,
-        input_receipt=input_receipt,
+        loaded=scene["loaded"],
+        input_receipt=scene["input_receipt"],
         contract=request_index["contract"],
         endpoint_sha256=endpoint_sha256,
         max_tokens=max_tokens,
+        encoded_frames=scene["encoded_frames"],
     )
     path = output_root / "preflight" / f"{qa_id}.json"
     if path.is_file():
@@ -165,6 +202,10 @@ def _prepare(
 def _summary(root: Path, manifest: dict, *, status: str) -> dict:
     responses = _load_existing_responses(root, manifest)
     preflight_count = len(list((root / "preflight").glob("*.json")))
+    reuse_path = root / "reuse_receipt.json"
+    reused_count = (
+        int(_read_json(reuse_path).get("imported_count", 0))
+        if reuse_path.is_file() else 0)
     counts: dict[str, int] = {}
     for value in responses.values():
         key = str(value.get("status") or "unknown")
@@ -177,6 +218,7 @@ def _summary(root: Path, manifest: dict, *, status: str) -> dict:
         "manifest_identity_sha256": manifest["identity_sha256"],
         "selected_requests": len(manifest["selected_qa_ids"]),
         "preflight_requests": preflight_count,
+        "reused_requests": reused_count,
         "completed_requests": len(responses),
         "pending_requests": len(manifest["selected_qa_ids"]) - len(responses),
         "status_counts": counts,
@@ -197,8 +239,10 @@ def main(argv=None) -> int:
     parser.add_argument("--video-root")
     parser.add_argument("--video-fallback-root", action="append", default=[])
     parser.add_argument("--input-receipt-root", action="append", required=True)
+    parser.add_argument("--reuse-run-root", action="append", default=[])
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--scene-cache-size", type=int, default=2)
     parser.add_argument(
         "--concurrency-levels", default="",
         help="comma-separated one-wave pilot, for example 1,2,4,8",
@@ -213,8 +257,10 @@ def main(argv=None) -> int:
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
 
-    if args.workers <= 0 or args.max_requests < 0:
-        parser.error("--workers must be positive and --max-requests non-negative")
+    if args.workers <= 0 or args.scene_cache_size <= 0 or args.max_requests < 0:
+        parser.error(
+            "--workers/--scene-cache-size must be positive and "
+            "--max-requests non-negative")
     try:
         levels = _parse_positive_csv(args.concurrency_levels)
         raw_config = load_config(args.config)
@@ -264,6 +310,14 @@ def main(argv=None) -> int:
         else:
             root.mkdir(parents=True)
             write_json_atomic(manifest_path, manifest)
+        reuse_receipt_path = root / "reuse_receipt.json"
+        if args.reuse_run_root and not reuse_receipt_path.is_file():
+            import_reused_responses(
+                output_root=root,
+                selected_qa_ids=[row["qa_id"] for row in selected_rows],
+                reuse_roots=args.reuse_run_root,
+                target_manifest=manifest,
+            )
         existing = _load_existing_responses(root, manifest)
         pending = [
             row for row in selected_rows if row["qa_id"] not in existing]
@@ -282,6 +336,7 @@ def main(argv=None) -> int:
                 grouped.append((level, pending[offset:offset + level]))
                 offset += level
         else:
+            pending.sort(key=lambda row: (row["scene_id"], row["qa_id"]))
             grouped = [
                 (args.workers, pending[offset:offset + args.workers])
                 for offset in range(0, len(pending), args.workers)
@@ -310,6 +365,12 @@ def main(argv=None) -> int:
                 max_output_tokens=model.max_tokens,
             )
 
+        scene_cache = _SceneInputCache(
+            max_scenes=args.scene_cache_size,
+            input_receipt_roots=args.input_receipt_root,
+            video_root=video_root,
+            fallback_roots=fallback_roots,
+        )
         stopped_status = ""
         for workers, rows in grouped:
             prepared = [
@@ -317,9 +378,7 @@ def main(argv=None) -> int:
                     index_row=row,
                     metadata_by_id=metadata_by_id,
                     request_index=request_index,
-                    input_receipt_roots=args.input_receipt_root,
-                    video_root=video_root,
-                    fallback_roots=fallback_roots,
+                    scene_cache=scene_cache,
                     endpoint_sha256=client_template.endpoint_hash,
                     max_tokens=model.max_tokens,
                     output_root=root,

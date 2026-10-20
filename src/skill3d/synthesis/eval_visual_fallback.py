@@ -47,16 +47,34 @@ def build_visual_request(
     question: str,
     options: Sequence[str],
     question_type: str,
-    frames,
+    frames=None,
+    encoded_frames: Sequence[dict] | None = None,
     max_images: int,
 ) -> tuple[str, list[dict], str]:
     """Build the frozen eval-visual request without sending it."""
     prompt = build_visual_prompt(question, options, question_type)
-    messages = build_image_messages(prompt, frames, max_images=max_images)
+    if (frames is None) == (encoded_frames is None):
+        raise ValueError("provide exactly one of frames or encoded_frames")
+    if encoded_frames is None:
+        encoded_frames = encode_visual_frames(frames, max_images=max_images)
+    images = list(encoded_frames)
+    if not images or len(images) > max_images:
+        raise ValueError("encoded visual frame count is outside max_images")
+    if any(not isinstance(item, dict) or item.get("type") != "image_url"
+           for item in images):
+        raise ValueError("encoded visual frames must be image_url content items")
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": prompt}, *images]}]
     messages_sha256 = hashlib.sha256(json.dumps(
         messages, ensure_ascii=False, sort_keys=True,
         separators=(",", ":")).encode()).hexdigest()
     return prompt, messages, messages_sha256
+
+
+def encode_visual_frames(frames, *, max_images: int) -> tuple[dict, ...]:
+    """Encode one frozen scene once so same-scene questions reuse JPEG bytes."""
+    messages = build_image_messages("", frames, max_images=max_images)
+    return tuple(messages[0]["content"][1:])
 
 
 def parse_visual_answer(text: str, *, question_type: str,

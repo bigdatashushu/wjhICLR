@@ -10,12 +10,16 @@ from skill3d.adapters import vsibench_loader as vl
 from skill3d.adapters.frame_set import with_pixel_identity
 from skill3d.evaluation.direct_qwen_v11 import (
     DIRECT_INDEX_SCHEMA,
+    DIRECT_RESPONSE_SCHEMA,
+    DIRECT_RUN_SCHEMA,
     DirectQwenError,
     execute_batch,
     execute_direct_request,
+    import_reused_responses,
     load_request_index,
     load_safe_metadata,
     prepare_direct_request,
+    write_json_atomic,
 )
 from skill3d.synthesis.client_errors import ServiceUnavailable
 
@@ -264,3 +268,49 @@ def test_http_429_is_terminal_and_audited():
     assert result["service_error"]
     assert not result["api_response_received"]
     assert "HTTP 429" in result["error"]
+
+
+def test_prior_exact_request_is_imported_create_only(tmp_path):
+    prepared = _prepared()
+    source = tmp_path / "source"
+    manifest = {
+        "schema_version": DIRECT_RUN_SCHEMA,
+        "request_index": {"sha256": "i" * 64},
+        "metadata": {"sha256": "m" * 64},
+        "config": {"sha256": "c" * 64},
+        "contract": _contract(),
+        "selected_qa_ids": ["10"],
+        "request_model": "qwen3.8-flash",
+        "request_model_revision": "",
+        "endpoint_sha256": "e" * 64,
+        "seed": 137,
+        "temperature": 0.0,
+        "max_tokens": 8192,
+        "enable_thinking": False,
+        "reference_answer_visible": False,
+    }
+    write_json_atomic(source / "manifest.json", manifest)
+    write_json_atomic(
+        source / "preflight" / "10.json", prepared.preflight)
+    response = {
+        "schema_version": DIRECT_RESPONSE_SCHEMA,
+        "qa_id": "10",
+        "request_sha256": prepared.preflight["request_sha256"],
+        "status": "accepted",
+        "accepted": True,
+    }
+    write_json_atomic(source / "responses" / "10.json", response)
+
+    target = tmp_path / "target"
+    receipt = import_reused_responses(
+        output_root=target,
+        selected_qa_ids=["10", "11"],
+        reuse_roots=[source],
+        target_manifest=manifest,
+    )
+    assert receipt["imported_count"] == 1
+    assert receipt["imported"][0]["qa_id"] == "10"
+    assert (target / "preflight" / "10.json").is_file()
+    assert (target / "responses" / "10.json").is_file()
+    assert (target / "responses" / "10.json").stat().st_ino == (
+        source / "responses" / "10.json").stat().st_ino

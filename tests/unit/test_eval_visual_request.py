@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 
 from skill3d.synthesis.eval_visual_fallback import (
-    build_visual_prompt, parse_visual_answer, request_visual_answer,
+    build_visual_prompt, build_visual_request, encode_visual_frames,
+    parse_visual_answer, request_visual_answer,
 )
 from skill3d.synthesis.request_context import current_request_phase, request_phase
 from skill3d.tools.image_ledger import ImageLedger
@@ -72,6 +73,18 @@ def test_output_templates_use_only_question_options_and_units():
     prompt = build_visual_prompt("query", ["A. chair", "B. table"], "object_rel_distance")
     assert "A. chair\nB. table" in prompt
     assert "AnswerPayload" not in prompt and "Skill" not in prompt
+
+
+def test_preencoded_scene_frames_preserve_exact_request_bytes():
+    frames = [np.full((4, 4, 3), i, np.uint8) for i in range(32)]
+    direct = build_visual_request(
+        question="How many?", options=[], question_type="object_counting",
+        frames=frames, max_images=32)
+    reused = build_visual_request(
+        question="How many?", options=[], question_type="object_counting",
+        encoded_frames=encode_visual_frames(frames, max_images=32),
+        max_images=32)
+    assert reused == direct
 
 
 def test_request_phase_restores_nested_phase():
