@@ -608,8 +608,15 @@ class SystemVariantRunner:
             input_identity,
             initial_state_for_item,
         )
+        from skill3d.legacy.readers import load_artifact_v5
+        from skill3d.online import runner
         from skill3d.segmentation.prepared_binding_store import (
             load_prepared_binding_reference,
+        )
+        from skill3d.segmentation.question_binding import (
+            binding_parameters,
+            question_input,
+            validate_prepared_binding,
         )
 
         variant_id = str(variant["variant_id"])
@@ -651,6 +658,47 @@ class SystemVariantRunner:
             reference,
             scene_input_identity=identity,
         )
+        frozen_parameters = dict(
+            (reference.get("request_identity") or {}).get("parameters") or {})
+        frozen_review = copy.deepcopy(
+            frozen_parameters.get("experimental_semantic_review"))
+        runtime_base_cfg = replace(
+            copy.deepcopy(self.base_cfg),
+            semantic_review_config=frozen_review,
+        )
+        runtime_parameters = binding_parameters(
+            semantic_min_pixels=runtime_base_cfg.semantic_min_pixels,
+            semantic_max_pixels=runtime_base_cfg.semantic_max_pixels,
+            semantic_relation_batch_size=(
+                runtime_base_cfg.semantic_relation_batch_size),
+            semantic_review_config=runtime_base_cfg.semantic_review_config,
+        )
+        _require(runtime_parameters == frozen_parameters,
+                 f"{variant_id}: sealed M5 parameters no longer replay")
+        artifact = load_artifact_v5(artifact_path)
+        validate_prepared_binding(
+            prepared,
+            frames=item.pixels,
+            depth=runner._load_npy(artifact.depth_maps),
+            c2w=runner._load_npy(artifact.c2w_list),
+            intrinsics=runner._load_npy(artifact.intrinsics),
+            point_conf=runner._load_npy(artifact.depth_conf),
+            depth_conf=runner._load_npy(artifact.depth_conf),
+            point_map=runner._load_npy(artifact.point_map),
+            inputs=question_input(
+                item.episode.question,
+                canonical_task(item.episode.question_type),
+                item.episode.options,
+            ),
+            scene_identity=str(
+                artifact.reconstruction_input_identity
+                or artifact.frame_set_hash
+                or artifact.artifact_id
+            ),
+            seed=int(runtime_base_cfg.seed),
+            model_weights_sha256="",
+            parameters=runtime_parameters,
+        )
         skills, skill_identity = self.skills_for_variant(variant)
         _require(bool(skills), f"{variant_id}: no runtime Skill was supplied")
         matching = [
@@ -669,6 +717,7 @@ class SystemVariantRunner:
             "direct_input_receipt": input_receipt,
             "binding_key": reference["key"],
             "binding_manifest_sha256": reference["manifest_sha256"],
+            "m5_parameters_sha256": content_sha256(frozen_parameters),
             "skill_identity": dict(skill_identity),
         }
         _write_create_once(variant_root / "plan.json", plan)
@@ -680,6 +729,7 @@ class SystemVariantRunner:
             "identity": identity,
             "reference": reference,
             "prepared": prepared,
+            "runtime_base_cfg": runtime_base_cfg,
             "skills": skills,
             "skill_identity": skill_identity,
             "variant_root": variant_root,
@@ -695,6 +745,7 @@ class SystemVariantRunner:
         artifact_path = prepared_run["artifact_path"]
         state = prepared_run["state"]
         prepared = prepared_run["prepared"]
+        runtime_base_cfg = prepared_run["runtime_base_cfg"]
         skills = prepared_run["skills"]
         skill_identity = prepared_run["skill_identity"]
         variant_root = prepared_run["variant_root"]
@@ -702,7 +753,7 @@ class SystemVariantRunner:
         _require(not trace_dir.exists(),
                  f"{variant_id}: incomplete trace exists without a result")
         cfg = replace(
-            copy.deepcopy(self.base_cfg),
+            copy.deepcopy(runtime_base_cfg),
             skills=[skill.model_copy(deep=True) for skill in skills],
             active_snapshot_ref=str(skill_identity["snapshot_ref"]),
             active_snapshot_manifest_sha256=str(
@@ -790,6 +841,8 @@ class SystemVariantRunner:
                 "binding_key": values["reference"]["key"],
                 "binding_manifest_sha256": values["reference"][
                     "manifest_sha256"],
+                "m5_parameters_sha256": values["plan"][
+                    "m5_parameters_sha256"],
                 "binding_object_count": len(binding.objects),
                 "binding_materialized": bool(binding.materialized),
                 "binding_status": str(

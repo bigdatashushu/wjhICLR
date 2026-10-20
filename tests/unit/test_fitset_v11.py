@@ -424,6 +424,7 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
 
     from skill3d.adapters.episode_source import load_synthetic_items
     from skill3d.evaluation import skill_ablation_v11 as ablation
+    from skill3d.legacy import readers as legacy_readers
     from skill3d.online import runner as online_runner
     from skill3d.online.runner import (
         EpisodeOutcome,
@@ -431,6 +432,7 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
         PreparedObjectBinding,
     )
     from skill3d.segmentation import prepared_binding_store
+    from skill3d.segmentation import question_binding
 
     item = load_synthetic_items(
         "induction",
@@ -466,6 +468,35 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
         prepared_binding_store,
         "load_prepared_binding_reference",
         lambda *_args, **_kwargs: PreparedObjectBinding(),
+    )
+    monkeypatch.setattr(
+        legacy_readers,
+        "load_artifact_v5",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            depth_maps="depth",
+            c2w_list="c2w",
+            intrinsics="intrinsics",
+            depth_conf="confidence",
+            point_map="points",
+            reconstruction_input_identity="scene-input",
+            frame_set_hash="",
+            artifact_id="artifact",
+        ),
+    )
+    monkeypatch.setattr(
+        online_runner,
+        "_load_npy",
+        lambda _value: [],
+    )
+    monkeypatch.setattr(
+        question_binding,
+        "binding_parameters",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        question_binding,
+        "validate_prepared_binding",
+        lambda *_args, **_kwargs: None,
     )
     calls = []
 
