@@ -485,6 +485,14 @@ def test_v11_campaign_retries_static_failure_with_feedback(tmp_path):
     assert _pointer(tmp_path / "library")["snapshot_id"] == original["snapshot_id"]
 
 
+def test_unknown_tool_scan_ignores_prose_parentheticals():
+    prose = "Use this evidence state (g0m0) and inspect structural elements (walls, doors)."
+    assert campaign_module._unknown_tool_calls(prose) == []
+    assert campaign_module._unknown_tool_calls(
+        "Never call `invented_tool()`."
+    ) == ["invented_tool"]
+
+
 def test_v11_campaign_retries_candidate_that_copies_a_question(tmp_path):
     parent, _original = _activate_parent(tmp_path / "library")
     copied = (

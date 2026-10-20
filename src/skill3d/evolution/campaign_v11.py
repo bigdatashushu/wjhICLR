@@ -62,7 +62,7 @@ from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-_CALL_RE = re.compile(r"(?<![.\w])([a-z][a-z0-9_]{2,})\s*\(")
+_CALL_RE = re.compile(r"(?<![.\w])([a-z][a-z0-9_]{2,})\(")
 _TOOLS_CALL_RE = re.compile(r"\btools\.([a-z][a-z0-9_]*)\s*\(")
 _LOCAL_DEF_RE = re.compile(r"\bdef\s+([a-z][a-z0-9_]*)\s*\(")
 _NON_TOOL_CALLS = frozenset({
