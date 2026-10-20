@@ -330,21 +330,38 @@ def validate_metadata_row(index_row: dict, metadata_row: dict) -> None:
 
 
 def load_input_receipt(scene_id: str, roots: Sequence[str | Path]) -> dict:
-    matches = []
+    complete = []
+    partial = []
+    fields = ("scene_id", "frame_set_hash", "pixel_hashes", "source_frame_indices")
     for root in roots:
         path = Path(root) / f"{scene_id}.json"
         if path.is_file():
             value = json.loads(path.read_text(encoding="utf-8"))
-            matches.append((path, value))
-    _require(bool(matches), f"{scene_id}: frozen input receipt not found")
-    fields = ("scene_id", "frame_set_hash", "pixel_hashes", "source_frame_indices")
-    baseline = {key: matches[0][1].get(key) for key in fields}
-    for path, value in matches[1:]:
-        _require({key: value.get(key) for key in fields} == baseline,
+            normalized = {key: value.get(key) for key in fields}
+            target = complete if (
+                normalized["scene_id"] == scene_id
+                and isinstance(normalized["frame_set_hash"], str)
+                and isinstance(normalized["pixel_hashes"], list)
+                and len(normalized["pixel_hashes"]) == N_FRAMES
+                and isinstance(normalized["source_frame_indices"], list)
+                and len(normalized["source_frame_indices"]) == N_FRAMES
+            ) else partial
+            target.append((path, normalized))
+    _require(bool(complete), f"{scene_id}: complete frozen input receipt not found")
+    baseline = complete[0][1]
+    for path, value in complete[1:]:
+        _require(value == baseline,
                  f"{scene_id}: conflicting frozen input receipt at {path}")
+    for path, value in partial:
+        for key in ("scene_id", "frame_set_hash"):
+            if value.get(key) is not None:
+                _require(value[key] == baseline[key],
+                         f"{scene_id}: conflicting partial input receipt at {path}")
     return {
         **baseline,
-        "receipt_paths": [str(path.resolve()) for path, _ in matches],
+        "receipt_paths": [str(path.resolve()) for path, _ in complete],
+        "partial_receipt_paths": [
+            str(path.resolve()) for path, _ in partial],
     }
 
 
@@ -426,6 +443,8 @@ def prepare_direct_request(
         "source_frame_indices": list(frame_set.source_frame_indices),
         "pixel_sha256": list(frame_set.pixel_sha256),
         "input_receipt_paths": list(input_receipt["receipt_paths"]),
+        "partial_input_receipt_paths": list(
+            input_receipt.get("partial_receipt_paths") or ()),
         "video_source": str(source.path),
         "messages_sha256": messages_sha256,
         "request_identity": request_identity,

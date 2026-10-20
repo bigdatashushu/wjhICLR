@@ -16,6 +16,7 @@ from skill3d.evaluation.direct_qwen_v11 import (
     execute_batch,
     execute_direct_request,
     import_reused_responses,
+    load_input_receipt,
     load_request_index,
     load_safe_metadata,
     prepare_direct_request,
@@ -137,6 +138,29 @@ def test_safe_metadata_preserves_numeric_zero_id(tmp_path):
     rows = load_safe_metadata(path)
     assert rows["0"]["qa_id"] == "0"
     assert "ground_truth" not in rows["0"]
+
+
+def test_complete_input_receipt_wins_over_matching_partial(tmp_path):
+    complete_root = tmp_path / "complete"
+    partial_root = tmp_path / "partial"
+    full = {
+        "scene_id": "scene-1",
+        "frame_set_hash": "f" * 64,
+        "pixel_hashes": [f"{index:064x}" for index in range(32)],
+        "source_frame_indices": list(range(32)),
+    }
+    write_json_atomic(complete_root / "scene-1.json", full)
+    write_json_atomic(partial_root / "scene-1.json", {
+        "scene_id": "scene-1",
+        "frame_set_hash": "f" * 64,
+    })
+    receipt = load_input_receipt(
+        "scene-1", [partial_root, complete_root])
+    assert receipt["pixel_hashes"] == full["pixel_hashes"]
+    assert receipt["receipt_paths"] == [
+        str((complete_root / "scene-1.json").resolve())]
+    assert receipt["partial_receipt_paths"] == [
+        str((partial_root / "scene-1.json").resolve())]
 
 
 def test_preflight_binds_exact_32_frame_bytes_and_model_contract():
