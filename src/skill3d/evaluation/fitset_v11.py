@@ -1,10 +1,10 @@
-"""Fit-set system execution and direct-Qwen comparison for v11.
+"""Fit-set Harness3D execution and direct-Qwen comparison for v11.
 
-This exploratory path intentionally reuses the same questions for method
+This exploratory path intentionally reuses the same questions for Skill
 induction and final comparison. It does not modify the production active Skill
-pointer. Eight canonical task methods are adapted to the frozen initial
-evidence state only at runtime so the existing task/state retrieval contract
-can execute them without creating additional method bodies.
+pointer. Every reachable ``(question_type, evidence_state)`` slot receives an
+independent candidate body; the frozen bundle also preserves the active parent
+for physical slots that are not revised by the selected panel.
 """
 
 from __future__ import annotations
@@ -15,13 +15,18 @@ import copy
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
+import queue
 import random
 import re
+import signal
 import shutil
 import subprocess
+import threading
 import time
+import traceback
 from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 import numpy as np
@@ -39,6 +44,7 @@ from skill3d.routing.task_classifier import TASK_TYPES, canonical_task
 from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.schemas.evidence import SKILL_EVIDENCE_STATES
+from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
 from skill3d.schemas.skill import parse_skill_markdown
 from skill3d.skills.delivery import DEFAULT_METHOD_CONTEXT_MAX_CHARS
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
@@ -47,18 +53,33 @@ from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 if TYPE_CHECKING:
     from skill3d.online.runner import OnlineRunConfig
 
-PANEL_SCHEMA = "v11-same-question-system-vs-direct-qwen-proposal/1.0"
-FIT_SKILL_BUNDLE_SCHEMA = "v11-fit-set-task-method-bundle/1.0"
+PANEL_SCHEMA = "v11-same-question-system-vs-direct-qwen-proposal/2.0"
+FIT_SKILL_BUNDLE_SCHEMA = "v11-fit-set-slot-skill-bundle/2.0"
 SYSTEM_RUN_SCHEMA = "v11-fit-set-system-run/1.0"
 SYSTEM_RESULT_SCHEMA = "v11-fit-set-system-result/1.0"
 COMPARISON_SCHEMA = "v11-fit-set-system-vs-direct-qwen/1.0"
 FIT_BINDING_MIGRATION_SCHEMA = "v11-fit-set-binding-migrations/1.0"
-PANEL_NAMES = ("ready_579", "recommended_core_897", "maximum_1166")
+PANEL_NAMES = ("ready_579", "recommended_core_897")
 CORE_G1M1_TASKS = frozenset({
     "object_abs_distance",
     "object_size_estimation",
     "room_size_estimation",
 })
+ALL_FIT_SLOTS = tuple(
+    (question_type, evidence_state)
+    for question_type in TASK_TYPES
+    for evidence_state in SKILL_EVIDENCE_STATES
+)
+REACHABLE_FIT_SLOTS = (
+    *((question_type, "g0m0") for question_type in TASK_TYPES),
+    *((question_type, "g1m0") for question_type in TASK_TYPES),
+    *((question_type, "g1m1") for question_type in TASK_TYPES
+      if question_type in METRIC_TASK_TYPES),
+)
+UNREACHABLE_FIT_SLOTS = tuple(
+    slot for slot in ALL_FIT_SLOTS if slot not in set(REACHABLE_FIT_SLOTS)
+)
+FIT_SLOT_GROUPING_FIELDS = ("question_type", "evidence_state")
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.@-]+$")
 _EMPTY_M4_PARENT_QUESTION_BINDING_SHA256 = (
     "945301bce9b0f5167bd5c8feb3878ec0873ac384288930bccb0e7b702a2cd72f"
@@ -66,6 +87,9 @@ _EMPTY_M4_PARENT_QUESTION_BINDING_SHA256 = (
 _EMPTY_M4_CURRENT_QUESTION_BINDING_SHA256 = (
     "894baaf8cd3447fa19160f597c781db08c1a72197f5b32b072b68de6c458c57b"
 )
+PROCESS_SCHEDULER = "stable_slot_spawn_process_v1"
+SINGLE_PROCESS_SCHEDULER = "single_main_process_v1"
+PREFLIGHT_SCHEDULER = "stable_scene_threaded_preflight_v1"
 
 
 class FitSetError(RuntimeError):
@@ -85,6 +109,10 @@ def canonical_json_bytes(value: object) -> bytes:
 
 def content_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def fit_slot_key(question_type: str, evidence_state: str) -> str:
+    return f"{canonical_task(question_type)}/{evidence_state}"
 
 
 def _json_value(value):
@@ -141,6 +169,80 @@ def _require(condition: bool, message: str) -> None:
 
 def _variant_key(variant_id: str) -> str:
     return hashlib.sha256(variant_id.encode("utf-8")).hexdigest()[:20]
+
+
+def _stable_slot_shards(
+    variants: Sequence[Mapping],
+    workers: int,
+) -> list[list[dict]]:
+    """Assign every ``(question_type, evidence_state)`` slot to one worker.
+
+    One Skill lineage belongs to exactly one slot, so exclusive slot ownership is
+    what lets every worker publish into its own run-local library without a
+    cross-process read-modify-write race on the shared active snapshot.
+
+    Inside a worker the episodes are ordered by scene, so all questions of one
+    scene run back to back and that scene is decoded once. A scene-grouped order
+    is still a deterministic total order over each slot's own episodes, so every
+    slot keeps its relative stream order and its own batch boundaries.
+    """
+    _require(workers > 0, "process worker count must be positive")
+    by_slot: dict[str, list[dict]] = {}
+    for raw in variants:
+        row = dict(raw)
+        scene_id = str(row.get("scene_id") or "")
+        _require(bool(scene_id), "slot scheduling requires scene_id")
+        slot_key = f"{row['question_type']}/{row['evidence_state']}"
+        row["slot_key"] = slot_key
+        by_slot.setdefault(slot_key, []).append(row)
+    shards: list[list[dict]] = [[] for _ in range(workers)]
+    for slot_key in sorted(by_slot, key=lambda key: (-len(by_slot[key]), key)):
+        index = min(range(workers), key=lambda value: (len(shards[value]), value))
+        shards[index].extend(by_slot[slot_key])
+    for shard in shards:
+        shard.sort(key=lambda row: (
+            str(row["scene_id"]),
+            str(row["slot_key"]),
+            str(row["variant_id"]),
+        ))
+    return shards
+
+
+def _process_shard_worker(
+    runner,
+    shard_index: int,
+    owned_variants: Sequence[Mapping],
+    variants: Sequence[Mapping],
+    stop_event,
+    messages,
+) -> None:
+    """Run one slot shard on the child process main thread."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if threading.current_thread() is not threading.main_thread():
+        messages.put({
+            "kind": "error",
+            "shard_index": shard_index,
+            "error": "fit-set process shard did not start on its main thread",
+        })
+        return
+    try:
+        def accept(result):
+            messages.put({
+                "kind": "result",
+                "shard_index": shard_index,
+                "result": result,
+            })
+        runner._run_shard(shard_index, owned_variants, variants, stop_event, accept)
+    except BaseException as exc:  # noqa: BLE001 - parent freezes worker failure
+        messages.put({
+            "kind": "error",
+            "shard_index": shard_index,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        })
+        stop_event.set()
+    finally:
+        messages.put({"kind": "done", "shard_index": shard_index})
 
 
 def _source_code_identity() -> dict:
@@ -217,6 +319,52 @@ def load_fitset_panel(path: str | Path) -> dict:
     value = json.loads(Path(path).read_text(encoding="utf-8"))
     _require(value.get("schema_version") == PANEL_SCHEMA,
              "unsupported fit-set panel schema")
+    claimed = str(value.get("proposal_sha256") or "")
+    proposal_body = {
+        key: child for key, child in value.items()
+        if key != "proposal_sha256"
+    }
+    _require(claimed == content_sha256(proposal_body),
+             "fit-set panel proposal hash changed")
+    accumulation = value.get("skill_accumulation")
+    _require(isinstance(accumulation, dict),
+             "fit-set panel lacks a Skill accumulation contract")
+    _require(
+        accumulation.get("grouping_key") == list(FIT_SLOT_GROUPING_FIELDS),
+        "fit-set feedback must group by question_type and evidence_state",
+    )
+    _require(
+        accumulation.get("active_snapshot_physical_slot_count")
+        == len(ALL_FIT_SLOTS),
+        "fit-set active snapshot must declare 24 physical slots",
+    )
+    _require(
+        accumulation.get("reachable_slot_count") == len(REACHABLE_FIT_SLOTS),
+        "fit-set panel must declare 19 reachable slots",
+    )
+    _require(
+        accumulation.get("unreachable_slots")
+        == [fit_slot_key(*slot) for slot in UNREACHABLE_FIT_SLOTS],
+        "fit-set panel unreachable slot declaration changed",
+    )
+    panels = value.get("panels")
+    _require(isinstance(panels, dict),
+             "fit-set panel lacks panel definitions")
+    for panel_name in PANEL_NAMES:
+        panel_row = panels.get(panel_name)
+        _require(isinstance(panel_row, dict),
+                 f"fit-set panel definition is missing: {panel_name}")
+        declared_slots = list(panel_row.get("skill_slots") or [])
+        _require(
+            panel_row.get("skill_slot_count") == len(declared_slots)
+            and len(declared_slots) == len(set(declared_slots)),
+            f"{panel_name}: invalid Skill slot count",
+        )
+        _require(
+            set(declared_slots)
+            <= {fit_slot_key(*slot) for slot in REACHABLE_FIT_SLOTS},
+            f"{panel_name}: panel declares an unreachable Skill slot",
+        )
     raw_variants = value.get("system_variants")
     direct_rows = value.get("direct_qwen_rows")
     _require(isinstance(raw_variants, list) and raw_variants,
@@ -227,6 +375,12 @@ def load_fitset_panel(path: str | Path) -> dict:
     by_variant: dict[str, dict] = {}
     for row in variants:
         variant_id = row["variant_id"]
+        _require(
+            (row["question_type"], row["evidence_state"])
+            in set(REACHABLE_FIT_SLOTS),
+            f"{variant_id}: non-metric g1m1 is unreachable and cannot "
+            "participate in the fit-set experiment",
+        )
         _require(variant_id not in by_variant,
                  f"duplicate system variant: {variant_id}")
         by_variant[variant_id] = row
@@ -287,11 +441,22 @@ def select_panel_variants(panel: Mapping, panel_name: str) -> list[dict]:
             )
         ]
     else:
-        selected = variants
+        raise AssertionError(f"unhandled fit-set panel: {panel_name}")
     expected = int((panel.get("panels") or {}).get(
         panel_name, {}).get("system_input_variants") or 0)
     _require(expected > 0 and len(selected) == expected,
              f"{panel_name}: selected {len(selected)} variants, expected {expected}")
+    actual_slots = {
+        fit_slot_key(row["question_type"], row["evidence_state"])
+        for row in selected
+    }
+    panel_row = (panel.get("panels") or {}).get(panel_name) or {}
+    declared_slots = set(panel_row.get("skill_slots") or [])
+    _require(
+        actual_slots == declared_slots
+        and panel_row.get("skill_slot_count") == len(actual_slots),
+        f"{panel_name}: selected Skill slots differ from the panel contract",
+    )
     return selected
 
 
@@ -569,22 +734,27 @@ def migrate_empty_m4_bindings(
 
 
 @dataclass(frozen=True)
-class FitTaskMethod:
+class FitSlotSkill:
     question_type: str
+    evidence_state: str
     skill_id: str
     version: str
     source_ref: str
     content_sha256: str
     skill_md: str
+    role: str
+    parent_skill_version: str
 
-    def adapt(self, evidence_state: str) -> SkillSpecV11:
-        _require(evidence_state in SKILL_EVIDENCE_STATES,
-                 f"invalid runtime evidence state: {evidence_state}")
+    @property
+    def slot_key(self) -> str:
+        return fit_slot_key(self.question_type, self.evidence_state)
+
+    def as_spec(self) -> SkillSpecV11:
         return SkillSpecV11(
-            skill_id=f"FIT-{self.skill_id}-{evidence_state}",
+            skill_id=self.skill_id,
             version=self.version,
             question_type=self.question_type,
-            evidence_state=evidence_state,
+            evidence_state=self.evidence_state,
             skill_md=self.skill_md,
         )
 
@@ -593,8 +763,17 @@ class FitTaskMethod:
 class FitSkillBundle:
     bundle_id: str
     manifest_sha256: str
-    methods: Mapping[str, FitTaskMethod]
+    slots: Mapping[tuple[str, str], FitSlotSkill]
     manifest: Mapping
+
+    def skill_for(
+        self,
+        question_type: str,
+        evidence_state: str,
+    ) -> FitSlotSkill:
+        slot = (canonical_task(question_type), evidence_state)
+        _require(slot in self.slots, f"fit Skill bundle lacks slot {slot}")
+        return self.slots[slot]
 
 
 def load_fit_skill_bundle(path: str | Path) -> FitSkillBundle:
@@ -607,41 +786,105 @@ def load_fit_skill_bundle(path: str | Path) -> FitSkillBundle:
             if key != "manifest_sha256"}
     _require(claimed == content_sha256(body),
              "fit Skill bundle manifest hash changed")
-    tasks = value.get("tasks")
-    _require(isinstance(tasks, dict) and set(tasks) == set(TASK_TYPES),
-             "fit Skill bundle must contain exactly eight canonical tasks")
-    methods: dict[str, FitTaskMethod] = {}
-    for question_type, row in tasks.items():
+    rows = value.get("slots")
+    expected_keys = {fit_slot_key(*slot) for slot in ALL_FIT_SLOTS}
+    _require(isinstance(rows, dict) and set(rows) == expected_keys,
+             "fit Skill bundle must contain all 24 physical slots")
+    slots: dict[tuple[str, str], FitSlotSkill] = {}
+    role_counts: dict[str, int] = {}
+    for question_type, evidence_state in ALL_FIT_SLOTS:
+        key = fit_slot_key(question_type, evidence_state)
+        row = rows[key]
         _require(isinstance(row, dict),
-                 f"{question_type}: task method entry must be a mapping")
+                 f"{key}: slot Skill entry must be a mapping")
+        _require(
+            row.get("question_type") == question_type
+            and row.get("evidence_state") == evidence_state,
+            f"{key}: slot identity changed",
+        )
+        role = str(row.get("role") or "")
+        _require(
+            role in {
+                "revised_candidate",
+                "active_parent_pending",
+                "active_parent_unreachable",
+            },
+            f"{key}: invalid frozen slot role",
+        )
+        if (question_type, evidence_state) in set(UNREACHABLE_FIT_SLOTS):
+            _require(role == "active_parent_unreachable",
+                     f"{key}: unreachable slot must preserve its active parent")
+        else:
+            _require(role != "active_parent_unreachable",
+                     f"{key}: reachable slot has an unreachable role")
         source_ref = str(row.get("source_ref") or "")
         source_path = (manifest_path.parent / source_ref).resolve()
         _require(source_path.is_relative_to(manifest_path.parent),
-                 f"{question_type}: source_ref escapes the bundle")
+                 f"{key}: source_ref escapes the bundle")
         text = source_path.read_text(encoding="utf-8")
         _require(hashlib.sha256(text.encode("utf-8")).hexdigest()
                  == row.get("content_sha256"),
-                 f"{question_type}: canonical SKILL.md changed")
+                 f"{key}: canonical SKILL.md changed")
         _require(len(text) <= DEFAULT_METHOD_CONTEXT_MAX_CHARS,
-                 f"{question_type}: canonical SKILL.md exceeds service limit")
+                 f"{key}: canonical SKILL.md exceeds service limit")
         front, _ = parse_skill_markdown(text)
         _require(front["name"] == row.get("name"),
-                 f"{question_type}: stable method name changed")
-        method = FitTaskMethod(
+                 f"{key}: stable method name changed")
+        skill = FitSlotSkill(
             question_type=question_type,
+            evidence_state=evidence_state,
             skill_id=str(row.get("skill_id") or ""),
             version=str(row.get("version") or ""),
             source_ref=source_ref,
             content_sha256=str(row["content_sha256"]),
             skill_md=text,
+            role=role,
+            parent_skill_version=str(row.get("parent_skill_version") or ""),
         )
-        for state in SKILL_EVIDENCE_STATES:
-            method.adapt(state)
-        methods[question_type] = method
+        spec = skill.as_spec()
+        _require(
+            spec.name == row.get("name")
+            and spec.content_sha256 == skill.content_sha256,
+            f"{key}: frozen Skill identity changed",
+        )
+        parent_id, separator, parent_version = (
+            skill.parent_skill_version.partition("@"))
+        _require(
+            bool(separator)
+            and parent_id == skill.skill_id
+            and len(parent_version.split(".")) == 3,
+            f"{key}: invalid parent Skill identity",
+        )
+        if role == "revised_candidate":
+            _require(
+                tuple(map(int, skill.version.split(".")))
+                > tuple(map(int, parent_version.split("."))),
+                f"{key}: candidate version did not advance",
+            )
+        else:
+            _require(
+                skill.version == parent_version,
+                f"{key}: preserved parent version changed",
+            )
+        role_counts[role] = role_counts.get(role, 0) + 1
+        slots[(question_type, evidence_state)] = skill
+    revised = role_counts.get("revised_candidate", 0)
+    _require(
+        value.get("physical_slot_count") == len(ALL_FIT_SLOTS)
+        and value.get("reachable_slot_count") == len(REACHABLE_FIT_SLOTS)
+        and value.get("revised_slot_count") == revised
+        and value.get("preserved_parent_slot_count")
+        == len(ALL_FIT_SLOTS) - revised
+        and value.get("preserved_unreachable_slot_count")
+        == len(UNREACHABLE_FIT_SLOTS)
+        and value.get("unreachable_slots")
+        == [fit_slot_key(*slot) for slot in UNREACHABLE_FIT_SLOTS],
+        "fit Skill bundle slot counts changed",
+    )
     return FitSkillBundle(
         bundle_id=str(value.get("bundle_id") or ""),
         manifest_sha256=claimed,
-        methods=methods,
+        slots=slots,
         manifest=value,
     )
 
@@ -650,43 +893,91 @@ def build_fit_skill_bundle(
     *,
     output_dir: str | Path,
     bundle_id: str,
-    methods: Mapping[str, SkillSpecV11],
+    candidates: Mapping[tuple[str, str], SkillSpecV11],
+    active_parents: Mapping[tuple[str, str], SkillSpecV11],
     source_run_identity: Mapping,
 ) -> dict:
-    """Freeze eight validated method bodies without changing active_snapshot."""
+    """Freeze exact-slot candidates and unchanged active parents."""
     root = Path(output_dir).resolve()
     _require(not root.exists(), f"fit Skill bundle already exists: {root}")
-    _require(set(methods) == set(TASK_TYPES),
-             "exactly one candidate method is required for each canonical task")
+    _require(set(active_parents) == set(ALL_FIT_SLOTS),
+             "fit Skill bundle requires all 24 active parent slots")
+    _require(
+        set(candidates) <= set(REACHABLE_FIT_SLOTS),
+        "candidate Skills must cover only reachable slots",
+    )
+    _require(
+        len({spec.content_sha256 for spec in candidates.values()})
+        == len(candidates),
+        "each revised slot must have an independent SKILL.md body",
+    )
     root.mkdir(parents=True)
-    task_rows = {}
-    for task in TASK_TYPES:
-        spec = methods[task]
-        _require(spec.question_type == task,
-                 f"{task}: candidate question_type changed")
+    slot_rows = {}
+    for question_type, evidence_state in ALL_FIT_SLOTS:
+        slot = (question_type, evidence_state)
+        key = fit_slot_key(*slot)
+        parent = active_parents[slot]
+        _require(
+            parent.question_type == question_type
+            and parent.evidence_state == evidence_state,
+            f"{key}: active parent occupies another slot",
+        )
+        spec = candidates.get(slot, parent)
+        _require(
+            spec.question_type == question_type
+            and spec.evidence_state == evidence_state,
+            f"{key}: frozen Skill occupies another slot",
+        )
+        if slot in candidates:
+            _require(
+                spec.skill_id == parent.skill_id
+                and tuple(map(int, spec.version.split(".")))
+                > tuple(map(int, parent.version.split("."))),
+                f"{key}: candidate left its active lineage",
+            )
         _require(len(spec.skill_md) <= DEFAULT_METHOD_CONTEXT_MAX_CHARS,
-                 f"{task}: candidate exceeds service limit")
-        relative = Path("skills") / task / "SKILL.md"
+                 f"{key}: frozen Skill exceeds service limit")
+        relative = Path("skills") / question_type / evidence_state / "SKILL.md"
         destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(spec.skill_md, encoding="utf-8")
-        task_rows[task] = {
+        if slot in candidates:
+            role = "revised_candidate"
+        elif slot in set(UNREACHABLE_FIT_SLOTS):
+            role = "active_parent_unreachable"
+        else:
+            role = "active_parent_pending"
+        slot_rows[key] = {
+            "question_type": question_type,
+            "evidence_state": evidence_state,
             "skill_id": spec.skill_id,
             "version": spec.version,
             "name": spec.name,
             "source_ref": relative.as_posix(),
             "content_sha256": spec.content_sha256,
+            "role": role,
+            "parent_skill_version": f"{parent.skill_id}@{parent.version}",
         }
     body = {
         "schema_version": FIT_SKILL_BUNDLE_SCHEMA,
         "bundle_id": bundle_id,
-        "method_count": len(task_rows),
-        "runtime_adapter_contract": (
-            "one canonical task SKILL.md; evidence_state is attached as an "
-            "experiment-local read-only identity for existing retrieval"
+        "physical_slot_count": len(ALL_FIT_SLOTS),
+        "reachable_slot_count": len(REACHABLE_FIT_SLOTS),
+        "revised_slot_count": len(candidates),
+        "preserved_parent_slot_count": len(ALL_FIT_SLOTS) - len(candidates),
+        "preserved_reachable_pending_slot_count": (
+            len(REACHABLE_FIT_SLOTS) - len(candidates)
+        ),
+        "preserved_unreachable_slot_count": len(UNREACHABLE_FIT_SLOTS),
+        "unreachable_slots": [
+            fit_slot_key(*slot) for slot in UNREACHABLE_FIT_SLOTS
+        ],
+        "runtime_contract": (
+            "load exactly one immutable Skill by question_type/evidence_state; "
+            "no cross-state body reuse or runtime identity adaptation"
         ),
         "source_run_identity": dict(source_run_identity),
-        "tasks": task_rows,
+        "slots": slot_rows,
     }
     manifest = {**body, "manifest_sha256": content_sha256(body)}
     _write_create_once(root / "manifest.json", manifest)
@@ -760,6 +1051,137 @@ def _system_result_row(
     }
 
 
+def audit_fitset_pilot(
+    *,
+    output_root: str | Path,
+    expected_variants: int,
+) -> dict:
+    """Fail closed before a pilot may expand to a full Harness3D run."""
+    root = Path(output_root).resolve()
+    _require(expected_variants > 0, "pilot size must be positive")
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    result_paths = sorted((root / "results").glob("*.json"))
+    results = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in result_paths
+    ]
+    outcomes = []
+    missing_outcomes = []
+    for row in results:
+        variant_id = str(row.get("variant_id") or "")
+        path = root / "variants" / _variant_key(variant_id) / "outcome.json"
+        if not path.is_file():
+            missing_outcomes.append(variant_id)
+        else:
+            outcomes.append(json.loads(path.read_text(encoding="utf-8")))
+    all_rounds = [
+        round_row
+        for outcome in outcomes
+        for round_row in (outcome.get("rounds") or [])
+    ]
+    execution_errors = [
+        {
+            "variant_id": str(outcome.get("qa_id") or ""),
+            "error_code": str(round_row.get("error_code") or ""),
+            "error_type": str(
+                (round_row.get("execution_diagnostics") or {}).get(
+                    "error_type") or ""),
+            "error_message": str(
+                (round_row.get("execution_diagnostics") or {}).get(
+                    "error_message") or ""),
+        }
+        for outcome in outcomes
+        for round_row in (outcome.get("rounds") or [])
+        if round_row.get("error_code") in {
+            "violation_runtime",
+            "violation_syntax",
+        }
+    ]
+    service_errors = [
+        str(error)
+        for row in results
+        for error in (row.get("service_errors") or [])
+    ]
+    executed_rounds = sum(bool(row.get("executed")) for row in all_rounds)
+    no_execution_variants = sum(
+        not any(row.get("executed") for row in (outcome.get("rounds") or []))
+        for outcome in outcomes
+    )
+    tool_program_answers = sum(
+        row.get("answer_source") == "tool_program" for row in results)
+    visual_fallback_answers = sum(
+        row.get("answer_source") == "direct_vlm_routed" for row in results)
+    evidence_mismatches = sum(
+        row.get("evidence_state")
+        != (row.get("initial_skill_selection") or {}).get("evidence_state")
+        for row in results
+    )
+    infrastructure_error_counts: dict[str, int] = {}
+    for error in execution_errors:
+        key = (
+            f"{error['error_code']}:{error['error_type']}:"
+            f"{error['error_message']}"
+        )
+        infrastructure_error_counts[key] = (
+            infrastructure_error_counts.get(key, 0) + 1)
+    problems = []
+    manifest_body = {key: value for key, value in manifest.items()
+                     if key != "identity_sha256"}
+    if (manifest.get("identity_sha256") != content_sha256(manifest_body)
+            or summary.get("manifest_identity_sha256") != manifest.get("identity_sha256")):
+        problems.append("pilot manifest identity/hash differs from its summary")
+    ids = [row.get("variant_id") for row in results]
+    if len(set(ids)) != len(ids) or not set(ids) <= set(manifest.get("variant_ids") or []):
+        problems.append("pilot result IDs are duplicated or outside the panel")
+    if len(results) != expected_variants:
+        problems.append("pilot result count differs from the declared size")
+    if (
+        summary.get("completed_variants") != len(results)
+        or summary.get("pending_variants")
+        != len(manifest.get("variant_ids") or []) - len(results)
+    ):
+        problems.append("pilot summary and result files disagree")
+    if missing_outcomes:
+        problems.append("pilot result lacks a matching outcome")
+    if execution_errors:
+        problems.append("pilot contains sandbox infrastructure errors")
+    if no_execution_variants or executed_rounds < expected_variants:
+        problems.append("pilot did not execute at least one program per variant")
+    if tool_program_answers <= 0:
+        problems.append("pilot has no accepted Harness3D program answer")
+    if visual_fallback_answers:
+        problems.append("pilot success depends on direct visual fallback")
+    if service_errors:
+        problems.append("pilot contains online-model service errors")
+    if evidence_mismatches:
+        problems.append("pilot runtime evidence state changed")
+    body = {
+        "schema_version": "v11-fit-set-pilot-audit/2.0",
+        "status": "passed" if not problems else "failed",
+        "expand_to_full": not problems,
+        "expected_variants": expected_variants,
+        "result_files": len(results),
+        "outcomes": len(outcomes),
+        "missing_outcomes": len(missing_outcomes),
+        "executed_rounds": executed_rounds,
+        "no_execution_variants": no_execution_variants,
+        "tool_program_answers": tool_program_answers,
+        "visual_fallback_answers": visual_fallback_answers,
+        "service_error_rows": sum(
+            bool(row.get("service_errors")) for row in results),
+        "http_429_mentions": sum("429" in error for error in service_errors),
+        "http_5xx_mentions": sum(
+            any(str(code) in error for code in range(500, 600))
+            for error in service_errors
+        ),
+        "evidence_mismatches": evidence_mismatches,
+        "infrastructure_error_counts": infrastructure_error_counts,
+        "problems": problems,
+    }
+    return {**body, "identity_sha256": content_sha256(body)}
+
+
 class SystemVariantRunner:
     """Run one frozen system input per isolated, resumable variant directory."""
 
@@ -781,6 +1203,10 @@ class SystemVariantRunner:
         client_factory: Callable[[str], object] | None = None,
         min_free_gib: float = 80.0,
         workers: int = 1,
+        evolution_config=None,
+        label_metadata: Mapping[str, Mapping] | None = None,
+        revision_client_factory=None,
+        gate_client_factory=None,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -802,6 +1228,14 @@ class SystemVariantRunner:
         self.client_factory = client_factory
         self.min_free_gib = float(min_free_gib)
         self.workers = int(workers)
+        self.evolution_config = evolution_config
+        self.label_metadata = copy.deepcopy(dict(label_metadata or {}))
+        self.revision_client_factory = revision_client_factory
+        self.gate_client_factory = gate_client_factory
+        self.seed_skills = []
+        self.gate_panels = {}
+        self.run_identity = ""
+        self.evolution_finished = False
         _require(
             math.isfinite(self.min_free_gib) and self.min_free_gib >= 0,
             "min_free_gib must be finite and non-negative",
@@ -818,6 +1252,52 @@ class SystemVariantRunner:
                 ),
             )
         ]
+        if self.evolution_config is not None:
+            _require(phase == "accumulation", "只有 accumulation 可启动演化")
+            _require(self.revision_client_factory is not None
+                     and self.gate_client_factory is not None,
+                     "演化必须配置真实 reviser 和 paired client factory")
+            skills, _ = self.skills_for_variant(self.variants[0])
+            self.seed_skills = [skill.model_copy(deep=True) for skill in skills]
+            _require(
+                {(s.question_type, s.evidence_state) for s in self.seed_skills}
+                == set(ALL_FIT_SLOTS),
+                "演化初始 provider 必须提供完整 24 槽位 seed",
+            )
+            by_slot: dict[str, list[dict]] = {}
+            for row in self.execution_variants:
+                _require(row["qa_id"] in self.label_metadata, "演化缺少 label metadata")
+                key = fit_slot_key(row["question_type"], row["evidence_state"])
+                _require((row["question_type"], row["evidence_state"])
+                         in set(REACHABLE_FIT_SLOTS), "演化包含不可达槽位")
+                by_slot.setdefault(key, []).append(row)
+            for key, rows in by_slot.items():
+                selected = []
+                scenes = set()
+                for row in rows:
+                    if row["scene_id"] not in scenes:
+                        selected.append(row["variant_id"])
+                        scenes.add(row["scene_id"])
+                    if len(selected) == self.evolution_config.gate_size:
+                        break
+                self.gate_panels[key] = selected
+
+    @property
+    def execution_scheduler(self) -> str:
+        return (
+            SINGLE_PROCESS_SCHEDULER
+            if self.workers == 1
+            else PROCESS_SCHEDULER
+        )
+
+    def _planned_slot_shards(
+        self,
+        variants: Sequence[Mapping] | None = None,
+    ) -> list[list[dict]]:
+        return _stable_slot_shards(
+            self.execution_variants if variants is None else variants,
+            self.workers,
+        )
 
     def _manifest(self) -> dict:
         identities = []
@@ -849,7 +1329,11 @@ class SystemVariantRunner:
             "min_free_gib": self.min_free_gib,
             "execution": {
                 "workers": self.workers,
-                "scheduler": "stable_scene_grouped_v1",
+                "scheduler": self.execution_scheduler,
+                "process_start_method": (
+                    "none" if self.workers == 1 else "spawn"
+                ),
+                "sandbox_timeout_runtime": "main_thread_sigalrm",
                 "variant_ids": [
                     row["variant_id"]
                     for row in self.execution_variants
@@ -858,6 +1342,19 @@ class SystemVariantRunner:
                     row["variant_id"]
                     for row in self.execution_variants
                 ]),
+                "slot_shards": [
+                    {
+                        "slot_keys": sorted(
+                            {row["slot_key"] for row in shard}),
+                        "variant_ids": [row["variant_id"] for row in shard],
+                    }
+                    for shard in self._planned_slot_shards()
+                ],
+                "slot_ownership": {
+                    row["slot_key"]: index
+                    for index, shard in enumerate(self._planned_slot_shards())
+                    for row in shard
+                },
             },
             "seed": int(self.base_cfg.seed),
             "online_model": self.base_cfg.online_model,
@@ -865,8 +1362,21 @@ class SystemVariantRunner:
             "prompt_version": PROMPT_TEMPLATE_VERSION,
             "tool_docs_version": TOOL_DOCS_VERSION,
             "code_identity": _source_code_identity(),
+            "evolution": (
+                {
+                    "config": _json_value(asdict(self.evolution_config)),
+                    "seed_skills": [
+                        skill.model_dump(mode="json") for skill in self.seed_skills],
+                    "gate_panels": self.gate_panels,
+                    "label_metadata_sha256": content_sha256(self.label_metadata),
+                    "source_split_preserved": True,
+                    "final_version_policy": "last_successfully_published_per_slot",
+                }
+                if self.evolution_config is not None else None
+            ),
             "reference_answer_retained_for_input_identity_and_m12": True,
             "reference_answer_visible_to_online_model": False,
+            "solver_config_sha256": content_sha256(_json_value(asdict(self.base_cfg))),
         }
         return {**body, "identity_sha256": content_sha256(body)}
 
@@ -883,6 +1393,7 @@ class SystemVariantRunner:
         else:
             self.root.mkdir(parents=True)
             _write_create_once(path, manifest)
+        self.run_identity = manifest["identity_sha256"]
         return manifest
 
     def _result_path(self, variant_id: str) -> Path:
@@ -911,7 +1422,7 @@ class SystemVariantRunner:
                  "system results contain variants outside the frozen panel")
         return rows
 
-    def _prepare_one(self, variant: Mapping) -> dict:
+    def _prepare_one(self, variant: Mapping, *, preflight: bool = False) -> dict:
         from skill3d.evaluation.skill_ablation_v11 import (
             input_identity,
             initial_state_for_item,
@@ -932,6 +1443,7 @@ class SystemVariantRunner:
         item = self.item_provider(variant)
         _require(isinstance(item, EpisodeItem),
                  f"{variant_id}: episode provider returned an invalid item")
+        item = copy.deepcopy(item)
         input_receipt = dict(self.input_receipt_provider(variant, item))
         _require(item.input_error is None,
                  f"{variant_id}: input-error variants require explicit rows")
@@ -1029,7 +1541,8 @@ class SystemVariantRunner:
             "m5_parameters_sha256": content_sha256(frozen_parameters),
             "skill_identity": dict(skill_identity),
         }
-        _write_create_once(variant_root / "plan.json", plan)
+        if not preflight:
+            _write_create_once(variant_root / "plan.json", plan)
         return {
             "variant_id": variant_id,
             "item": item,
@@ -1047,6 +1560,12 @@ class SystemVariantRunner:
 
     def _run_one(self, variant: Mapping) -> dict:
         from skill3d.online import runner
+        from skill3d.sandbox.kernel import _Timeout
+
+        _require(threading.current_thread() is threading.main_thread(),
+                 "fit-set sandbox 必须在进程主线程执行，模型请求尚未发出")
+        with _Timeout(1):
+            pass
 
         prepared_run = self._prepare_one(variant)
         variant_id = prepared_run["variant_id"]
@@ -1107,9 +1626,35 @@ class SystemVariantRunner:
             skill_identity=skill_identity,
         )
         _write_create_once(self._result_path(variant_id), row)
+        if any(
+            (record.get("execution_diagnostics") or {}).get("error_message")
+            == "cell timeout requires a main-thread SIGALRM runtime"
+            for record in outcome.rounds
+        ):
+            raise FitSetError("SIGALRM 基础设施故障，停止调度")
         return row
 
-    def _execute_pending(
+    def _run_shard(self, index, owned, pending, stop_event, accept):
+        evolution = None
+        if self.evolution_config is not None:
+            from skill3d.evolution.fitset_stream_v11 import FitSetWorkerEvolution
+
+            evolution = FitSetWorkerEvolution(self, index, owned)
+            self.skills_for_variant = evolution.provider
+            evolution.recover()
+            existing = self.completed()
+            for row in owned:
+                if row["variant_id"] in existing:
+                    evolution.ingest_result(row, existing[row["variant_id"]])
+        for variant in pending:
+            if stop_event is not None and stop_event.is_set():
+                break
+            result = self._run_one(variant)
+            accept(result)
+            if evolution is not None:
+                evolution.ingest_result(variant, result)
+
+    def _execute_preflight_pending(
         self,
         pending: Sequence[Mapping],
         operation: Callable[[Mapping], dict],
@@ -1138,8 +1683,123 @@ class SystemVariantRunner:
         else:
             executor.shutdown(wait=True)
 
+    def _execute_process_pending(
+        self,
+        pending: Sequence[Mapping],
+        accept: Callable[[dict], None],
+    ) -> None:
+        if self.workers == 1:
+            owned = self._planned_slot_shards()[0]
+            pending_ids = {row["variant_id"] for row in pending}
+            worker = copy.copy(self)
+            worker._run_shard(
+                0, owned, [row for row in owned
+                           if row["variant_id"] in pending_ids], None, accept)
+            return
+        owned_shards = self._planned_slot_shards()
+        pending_ids = {row["variant_id"] for row in pending}
+        shards = {
+            index: [row for row in shard if row["variant_id"] in pending_ids]
+            for index, shard in enumerate(owned_shards)
+            if shard and (pending_ids or self.evolution_config is not None)
+        }
+        if not shards:
+            return
+        context = multiprocessing.get_context("spawn")
+        messages = context.Queue()
+        stop_event = context.Event()
+        processes: dict[int, multiprocessing.Process] = {}
+        start_errors: list[str] = []
+        for shard_index, shard in shards.items():
+            process = context.Process(
+                target=_process_shard_worker,
+                args=(self, shard_index, owned_shards[shard_index],
+                      shard, stop_event, messages),
+                name=f"fitset-{self.phase}-{shard_index:02d}",
+                daemon=False,
+            )
+            try:
+                process.start()
+            except BaseException as exc:  # noqa: BLE001
+                start_errors.append(
+                    f"shard {shard_index}: {type(exc).__name__}: {exc}")
+                stop_event.set()
+                break
+            processes[shard_index] = process
+        if start_errors:
+            for process in processes.values():
+                process.join()
+            messages.close()
+            messages.join_thread()
+            raise FitSetError(
+                "fit-set process worker startup failed: "
+                + "; ".join(start_errors)
+            )
+
+        done: set[int] = set()
+        errors: list[str] = []
+        abort = None
+        prior_handler = signal.getsignal(signal.SIGINT)
+
+        def stop_after_current(_signum, _frame):
+            nonlocal abort
+            abort = KeyboardInterrupt()
+            stop_event.set()
+
+        signal.signal(signal.SIGINT, stop_after_current)
+        try:
+            while len(done) < len(processes):
+                try:
+                    message = messages.get(timeout=0.5)
+                except queue.Empty:
+                    for shard_index, process in processes.items():
+                        if shard_index not in done and process.exitcode is not None:
+                            done.add(shard_index)
+                            if process.exitcode != 0:
+                                errors.append(
+                                    f"shard {shard_index} exited with code "
+                                    f"{process.exitcode}")
+                                stop_event.set()
+                    continue
+                except KeyboardInterrupt as exc:
+                    abort = exc
+                    stop_event.set()
+                    continue
+                kind = str(message.get("kind") or "")
+                shard_index = int(message.get("shard_index", -1))
+                if kind == "result":
+                    if abort is None:
+                        try:
+                            accept(dict(message["result"]))
+                        except BaseException as exc:
+                            abort = exc
+                            stop_event.set()
+                elif kind == "error":
+                    errors.append(f"shard {shard_index}: {message.get('error')}")
+                    stop_event.set()
+                elif kind == "done":
+                    done.add(shard_index)
+                else:
+                    errors.append(f"shard {shard_index}: invalid message {kind!r}")
+                    stop_event.set()
+            for shard_index, process in processes.items():
+                process.join()
+                if process.exitcode != 0:
+                    errors.append(
+                        f"shard {shard_index} exited with code {process.exitcode}")
+        finally:
+            stop_event.set()
+            signal.signal(signal.SIGINT, prior_handler)
+            messages.close()
+            messages.join_thread()
+        if abort is not None:
+            raise abort
+        if errors:
+            raise FitSetError(
+                "fit-set process worker failed: " + "; ".join(errors))
+
     def _preflight_one(self, variant: Mapping) -> dict:
-        values = self._prepare_one(variant)
+        values = self._prepare_one(variant, preflight=True)
         binding = values["prepared"]
         receipt = {
             "schema_version": "v11-fit-set-system-preflight/1.0",
@@ -1199,7 +1859,8 @@ class SystemVariantRunner:
         def accept(receipt: dict) -> None:
             completed[receipt["variant_id"]] = receipt
 
-        self._execute_pending(pending, self._preflight_one, accept)
+        self._execute_preflight_pending(
+            pending, self._preflight_one, accept)
         summary = {
             "schema_version": "v11-fit-set-system-preflight/1.0",
             "status": (
@@ -1213,7 +1874,7 @@ class SystemVariantRunner:
             "pending_preflights": len(self.variants) - len(completed),
             "model_requests": 0,
             "workers": self.workers,
-            "scheduler": "stable_scene_grouped_v1",
+            "scheduler": PREFLIGHT_SCHEDULER,
             "updated_at": time.time(),
         }
         _write_json_atomic(self.root / "preflight_summary.json", summary)
@@ -1244,8 +1905,14 @@ class SystemVariantRunner:
             completed[result["variant_id"]] = result
             self._write_summary(manifest, completed)
 
-        self._execute_pending(pending, self._run_one, accept)
-        return self._write_summary(manifest, completed)
+        try:
+            self._execute_process_pending(pending, accept)
+        except BaseException:
+            completed = self.completed()
+            self._write_summary(manifest, completed)
+            raise
+        self.evolution_finished = True
+        return self._write_summary(manifest, self.completed())
 
     def _write_summary(self, manifest: Mapping, completed: Mapping[str, dict]) -> dict:
         counts: dict[str, int] = {}
@@ -1258,6 +1925,7 @@ class SystemVariantRunner:
             "status": (
                 "complete"
                 if len(completed) == len(self.variants)
+                and (self.evolution_config is None or self.evolution_finished)
                 else "partial"
             ),
             "manifest_identity_sha256": manifest["identity_sha256"],
@@ -1266,7 +1934,9 @@ class SystemVariantRunner:
             "pending_variants": len(self.variants) - len(completed),
             "status_counts": counts,
             "workers": self.workers,
-            "scheduler": "stable_scene_grouped_v1",
+            "scheduler": self.execution_scheduler,
+            "evolution_finished": (
+                self.evolution_finished if self.evolution_config is not None else None),
             "updated_at": time.time(),
         }
         _write_json_atomic(self.root / "summary.json", summary)
@@ -1438,6 +2108,8 @@ def _summarize_group(rows: Sequence[Mapping]) -> dict:
         "direct_legal_answer_rate": _mean(rows, "direct_legal_answer"),
         "system_available_rate": _mean(rows, "system_available"),
         "direct_available_rate": _mean(rows, "direct_available"),
+        "system_run_error_rate": _mean(rows, "system_run_error"),
+        "system_service_error_rate": _mean(rows, "system_service_error"),
         "system_mean_model_requests": _mean(
             rows, "system_model_request_count"),
         "system_mean_tool_calls": _mean(rows, "system_tool_call_count"),
@@ -1473,6 +2145,11 @@ def build_fitset_comparison(
                  and label["question_type"] == variant["question_type"],
                  f"{variant_id}: label metadata identity changed")
         system_row = system[variant_id]
+        _require(
+            system_row.get("question_type") == variant["question_type"]
+            and system_row.get("evidence_state") == variant["evidence_state"],
+            f"{variant_id}: final system slot identity changed",
+        )
         direct_row = direct[qa_id]
         preflight = preflights[qa_id]
         _require(variant_id in preflight.get("system_variant_ids", []),
@@ -1513,6 +2190,8 @@ def build_fitset_comparison(
             "scene_id": variant["scene_id"],
             "question_type": variant["question_type"],
             "evidence_state": variant["evidence_state"],
+            "slot_key": fit_slot_key(variant["question_type"], variant["evidence_state"]),
+            "system_skill_identity": system_row.get("skill_identity"),
             "split": variant["split"],
             "metric": system_score["metric"],
             "system_score": system_score["score"],
@@ -1523,6 +2202,8 @@ def build_fitset_comparison(
             "system_legal_answer": float(system_score["legal_answer"]),
             "direct_legal_answer": float(direct_score["legal_answer"]),
             "system_available": float(system_score["available"]),
+            "system_run_error": float(system_row.get("final_state") == "run_error"),
+            "system_service_error": float(bool(system_row.get("service_errors"))),
             "direct_available": float(direct_score["available"]),
             "system_status": system_row.get("status"),
             "direct_status": direct_row.get("status"),
@@ -1535,7 +2216,7 @@ def build_fitset_comparison(
         }
         pairs.append(pair)
     groups = {"all": _summarize_group(pairs)}
-    for field in ("question_type", "evidence_state", "split"):
+    for field in ("question_type", "evidence_state", "slot_key", "split"):
         values = sorted({str(row[field]) for row in pairs})
         for value in values:
             groups[f"{field}:{value}"] = _summarize_group([
@@ -1549,7 +2230,7 @@ def build_fitset_comparison(
         "n_variants": len(pairs),
         "n_unique_qa": len(expected_qa_ids),
         "interpretation": (
-            "fit-set comparison of the final complete Skill-3D system versus "
+            "fit-set comparison of the final complete Harness3D system versus "
             "qwen3.8-flash direct 32-frame visual answering; not a "
             "generalization, final-test, or isolated Skill-effect estimate"
         ),
@@ -1580,7 +2261,13 @@ __all__ = [
     "FIT_SKILL_BUNDLE_SCHEMA",
     "FitSetError",
     "FitSkillBundle",
-    "FitTaskMethod",
+    "FitSlotSkill",
+    "PANEL_NAMES",
+    "REACHABLE_FIT_SLOTS",
+    "ALL_FIT_SLOTS",
+    "UNREACHABLE_FIT_SLOTS",
+    "audit_fitset_pilot",
+    "fit_slot_key",
     "SystemVariantRunner",
     "build_fit_skill_bundle",
     "build_fitset_comparison",

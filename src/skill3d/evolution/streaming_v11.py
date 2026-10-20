@@ -197,7 +197,7 @@ class StreamingEvolutionRunner:
                 path = self.root / ref
                 if not path.is_file():
                     raise StreamingEvolutionError(f"checkpoint case is missing: {ref}")
-                case = V11ExperienceCase.model_validate_json(path.read_bytes())
+                case = self._decode_case(path.read_bytes())
                 if case.case_id in active_case_ids:
                     raise StreamingEvolutionError(
                         f"duplicate active checkpoint case_id: {case.case_id}")
@@ -230,9 +230,12 @@ class StreamingEvolutionRunner:
         _write_create_once(path, data)
         return path.relative_to(self.root).as_posix()
 
+    def _decode_case(self, data: bytes) -> V11ExperienceCase:
+        return V11ExperienceCase.model_validate_json(data)
+
     def _load_cases(self, slot: _SlotBuffer) -> tuple[V11ExperienceCase, ...]:
         return tuple(
-            V11ExperienceCase.model_validate_json((self.root / ref).read_bytes())
+            self._decode_case((self.root / ref).read_bytes())
             for ref in slot.case_refs
         )
 

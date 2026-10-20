@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -26,8 +27,10 @@ from skill3d.evaluation.direct_qwen_v11 import (
     load_safe_metadata,
 )
 from skill3d.evaluation.fitset_v11 import (
+    PANEL_NAMES,
     FitSetError,
     SystemVariantRunner,
+    audit_fitset_pilot,
     build_fitset_comparison,
     direct_rows_for_variants,
     load_fit_skill_bundle,
@@ -159,6 +162,17 @@ class _FitSetItemProvider:
         self.cache: OrderedDict[tuple[str, str], dict] = OrderedDict()
         self.cache_lock = threading.RLock()
 
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        state["cache"] = OrderedDict()
+        state.pop("cache_lock", None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self.cache = OrderedDict()
+        self.cache_lock = threading.RLock()
+
     def _scene(self, row: dict) -> dict:
         key = (row["dataset"], row["scene_name"])
         with self.cache_lock:
@@ -256,45 +270,113 @@ class _FitSetItemProvider:
         }
 
 
+class _ActiveSkillProvider:
+    def __init__(
+        self,
+        *,
+        skills,
+        snapshot_id: str,
+        manifest_hash: str,
+    ) -> None:
+        self.skills = list(skills)
+        self.snapshot_id = snapshot_id
+        self.manifest_hash = manifest_hash
+
+    def __call__(self, _variant):
+        return self.skills, {
+            "mode": "active_accumulation",
+            "snapshot_ref": self.snapshot_id,
+            "manifest_sha256": self.manifest_hash,
+        }
+
+
+class _FitSkillProvider:
+    def __init__(self, bundle) -> None:
+        self.bundle = bundle
+
+    def __call__(self, variant):
+        slot = self.bundle.skill_for(
+            variant["question_type"],
+            variant["evidence_state"],
+        )
+        spec = slot.as_spec()
+        return [spec], {
+            "mode": "fit_exact_slot_skill",
+            "bundle_id": self.bundle.bundle_id,
+            "snapshot_ref": self.bundle.bundle_id,
+            "manifest_sha256": self.bundle.manifest_sha256,
+            "slot_key": slot.slot_key,
+            "slot_role": slot.role,
+            "skill_version": f"{spec.skill_id}@{spec.version}",
+            "content_sha256": spec.content_sha256,
+            "evidence_state": spec.evidence_state,
+        }
+
+
+@dataclass(frozen=True)
+class _RevisionClientFactory:
+    config: dict
+    max_tokens: int
+
+    def __call__(self):
+        from skill3d.synthesis.bailian_client import BailianClient
+
+        model = online_model_from(self.config)
+        return BailianClient(
+            model=model.model, model_revision=model.model_revision,
+            base_url=model.base_url, api_key_env=model.api_key_env,
+            timeout_s=model.timeout_s, temperature=0.0,
+            max_output_tokens=self.max_tokens,
+        )
+
+
+@dataclass(frozen=True)
+class _GateClientFactory:
+    config: dict
+
+    def __call__(self, seed: int, output: Path):
+        return _SeededClientFactory(self.config, seed, output)
+
+
+@dataclass(frozen=True)
+class _SeededClientFactory:
+    config: dict
+    seed: int
+    output: Path
+
+    def __call__(self, variant_id: str):
+        from skill3d.evaluation.fitset_v11 import _variant_key
+        from skill3d.evolution.fitset_stream_v11 import SeededGateClient
+
+        client = _RevisionClientFactory(
+            self.config, online_model_from(self.config).max_tokens)()
+        return SeededGateClient(
+            client, self.seed,
+            self.output / "request_seeds" / (_variant_key(variant_id) + ".json"),
+        )
+
+
 def _active_skill_provider(library_root: Path):
     store = library_root / "snapshots"
     skills, warnings, snapshot_id = load_active_skills(store)
     active_id, manifest_hash = active_snapshot_provenance(store)
     if warnings or active_id != snapshot_id or not manifest_hash:
         raise FitSetError(f"active Skill snapshot is not trustworthy: {warnings}")
-
-    def provider(_variant):
-        return skills, {
-            "mode": "active_accumulation",
-            "snapshot_ref": snapshot_id,
-            "manifest_sha256": manifest_hash,
-        }
-
-    return provider
+    return _ActiveSkillProvider(
+        skills=skills,
+        snapshot_id=snapshot_id,
+        manifest_hash=manifest_hash,
+    )
 
 
 def _fit_skill_provider(bundle_path: Path):
     bundle = load_fit_skill_bundle(bundle_path)
-
-    def provider(variant):
-        method = bundle.methods[variant["question_type"]]
-        adapted = method.adapt(variant["evidence_state"])
-        return [adapted], {
-            "mode": "fit_task_method_runtime_adapter",
-            "bundle_id": bundle.bundle_id,
-            "snapshot_ref": bundle.bundle_id,
-            "manifest_sha256": bundle.manifest_sha256,
-            "canonical_skill_id": method.skill_id,
-            "canonical_version": method.version,
-            "canonical_content_sha256": method.content_sha256,
-            "runtime_skill_version": f"{adapted.skill_id}@{adapted.version}",
-            "runtime_evidence_state": adapted.evidence_state,
-        }
-
-    return provider
+    return _FitSkillProvider(bundle)
 
 
 def _run_system(args) -> int:
+    from skill3d.evolution.fitset_stream_v11 import FitSetEvolutionConfig
+
     panel = load_fitset_panel(args.panel)
     variants = select_panel_variants(panel, args.panel_name)
     bindings = load_variant_bindings(args.bindings, variants)
@@ -358,6 +440,20 @@ def _run_system(args) -> int:
         skills_for_variant=skill_provider,
         min_free_gib=args.min_free_gib,
         workers=args.workers,
+        evolution_config=(
+            FitSetEvolutionConfig(
+                gate_size=args.gate_size,
+                gate_seeds=(args.seed, args.seed + 1),
+                max_revision_attempts=args.max_revision_attempts,
+                max_tokens=args.revision_max_tokens,
+            ) if args.phase == "accumulation" else None
+        ),
+        label_metadata=(
+            load_label_metadata(args.metadata)
+            if args.phase == "accumulation" else None
+        ),
+        revision_client_factory=_RevisionClientFactory(raw, args.revision_max_tokens),
+        gate_client_factory=_GateClientFactory(raw),
     )
     action = runner.preflight if args.preflight_only else runner.run
     summary = action(
@@ -427,50 +523,38 @@ def _score(args) -> int:
     return 0
 
 
-def _revise(args) -> int:
-    from skill3d.evolution.fitset_revision_v11 import (
-        FitSetEightMethodReviser,
+def _audit_pilot(args) -> int:
+    report = audit_fitset_pilot(
+        output_root=args.system_root,
+        expected_variants=args.expected_variants,
     )
-    from skill3d.synthesis.bailian_client import BailianClient
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0 if report["expand_to_full"] else 2
 
-    panel = load_fitset_panel(args.panel)
-    variants = select_panel_variants(panel, args.panel_name)
-    raw = resolve_runtime(load_config(args.config), seed=args.seed)
-    model = online_model_from(raw)
-    if (
-        not model.enabled
-        or model.provider != "bailian"
-        or model.model != "qwen3.8-flash"
-    ):
-        raise FitSetError(
-            "fit-set revision requires enabled bailian/qwen3.8-flash")
-    if not os.environ.get(model.api_key_env, "").strip():
-        raise FitSetError(f"{model.api_key_env} is not configured")
-    client = BailianClient(
-        model=model.model,
-        model_revision=model.model_revision,
-        base_url=model.base_url,
-        api_key_env=model.api_key_env,
-        timeout_s=model.timeout_s,
-        temperature=0.0,
-        max_output_tokens=args.max_tokens,
-    )
-    paths = paths_from(raw)
-    summary = FitSetEightMethodReviser(
-        output_root=args.output_dir,
-        panel=panel,
-        panel_name=args.panel_name,
-        variants=variants,
-        accumulation_root=args.accumulation_root,
-        label_metadata=load_label_metadata(args.metadata),
-        library_root=args.library_root or paths.skill_library,
-        client=client,
-        max_attempts=args.max_attempts,
-        max_tokens=args.max_tokens,
-        method_context_max_chars=(
-            retrieval_policy_from(raw).method_context_max_chars),
-    ).run(resume=args.resume)
-    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+
+def _upgrade_panel(args) -> int:
+    from skill3d.evaluation.fitset_panel_v11 import upgrade_fitset_panel
+
+    panel = upgrade_fitset_panel(args.source, args.output)
+    print(json.dumps({
+        "schema_version": panel["schema_version"],
+        "proposal_sha256": panel["proposal_sha256"],
+        "panel_slot_counts": {
+            name: row["skill_slot_count"] for name, row in panel["panels"].items()
+        },
+    }, ensure_ascii=False))
+    return 0
+
+
+def _freeze(args) -> int:
+    from skill3d.evolution.fitset_stream_v11 import freeze_fitset_stream
+
+    summary = freeze_fitset_stream(args.accumulation_root, args.output_dir)
+    print(json.dumps({
+        "bundle_id": summary["bundle_id"],
+        "revised_slot_count": summary["revised_slot_count"],
+        "manifest_sha256": summary["manifest_sha256"],
+    }, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -482,8 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
         "validate", help="validate panel and prepared binding coverage")
     validate.add_argument("--panel", required=True)
     validate.add_argument("--panel-name", choices=(
-        "ready_579", "recommended_core_897", "maximum_1166"),
-        required=True)
+        PANEL_NAMES), required=True)
     validate.add_argument("--bindings", required=True)
     validate.set_defaults(handler=_validate)
 
@@ -493,21 +576,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate.add_argument("--panel", required=True)
     migrate.add_argument("--panel-name", choices=(
-        "ready_579", "recommended_core_897", "maximum_1166"),
-        required=True)
+        PANEL_NAMES), required=True)
     migrate.add_argument("--bindings", required=True)
     migrate.add_argument("--output-dir", required=True)
     migrate.add_argument("--min-free-gib", type=float, default=80.0)
     migrate.set_defaults(handler=_migrate_bindings)
 
     run = subparsers.add_parser(
-        "run-system", help="run accumulation or final Skill-3D variants")
+        "run-system", help="run accumulation or final Harness3D variants")
     run.add_argument("--config", default="configs/config.yaml")
     run.add_argument("--seed", type=int, default=137)
     run.add_argument("--panel", required=True)
     run.add_argument("--panel-name", choices=(
-        "ready_579", "recommended_core_897", "maximum_1166"),
-        required=True)
+        PANEL_NAMES), required=True)
     run.add_argument("--bindings", required=True)
     run.add_argument("--metadata", required=True)
     run.add_argument("--direct-run-root", required=True)
@@ -516,6 +597,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--scene-cache-size", type=int, default=2)
     run.add_argument("--min-free-gib", type=float, default=80.0)
     run.add_argument("--workers", type=int, default=1)
+    run.add_argument("--gate-size", type=int, default=8)
+    run.add_argument("--max-revision-attempts", type=int, default=3)
+    run.add_argument("--revision-max-tokens", type=int, default=8192)
     run.add_argument("--library-root", default="")
     run.add_argument(
         "--phase", choices=("accumulation", "final_system"), required=True)
@@ -527,34 +611,35 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--resume", action="store_true")
     run.set_defaults(handler=_run_system)
 
-    revise = subparsers.add_parser(
-        "revise", help="derive and freeze eight cross-state task methods")
-    revise.add_argument("--config", default="configs/config.yaml")
-    revise.add_argument("--seed", type=int, default=137)
-    revise.add_argument("--panel", required=True)
-    revise.add_argument("--panel-name", choices=(
-        "ready_579", "recommended_core_897", "maximum_1166"),
-        required=True)
-    revise.add_argument("--metadata", required=True)
-    revise.add_argument("--accumulation-root", required=True)
-    revise.add_argument("--library-root", default="")
-    revise.add_argument("--output-dir", required=True)
-    revise.add_argument("--max-attempts", type=int, default=3)
-    revise.add_argument("--max-tokens", type=int, default=8192)
-    revise.add_argument("--resume", action="store_true")
-    revise.set_defaults(handler=_revise)
+    freeze = subparsers.add_parser(
+        "freeze", help="freeze each slot's last successfully published version")
+    freeze.add_argument("--accumulation-root", required=True)
+    freeze.add_argument("--output-dir", required=True)
+    freeze.set_defaults(handler=_freeze)
 
     score = subparsers.add_parser(
         "score", help="join and rescore final system/direct results")
     score.add_argument("--panel", required=True)
     score.add_argument("--panel-name", choices=(
-        "ready_579", "recommended_core_897", "maximum_1166"),
-        required=True)
+        PANEL_NAMES), required=True)
     score.add_argument("--metadata", required=True)
     score.add_argument("--system-root", required=True)
     score.add_argument("--direct-root", required=True)
     score.add_argument("--output-dir", required=True)
     score.set_defaults(handler=_score)
+
+    audit = subparsers.add_parser(
+        "audit-pilot",
+        help="reject a pilot with sandbox, fallback, service, or count failures",
+    )
+    audit.add_argument("--system-root", required=True)
+    audit.add_argument("--expected-variants", type=int, required=True)
+    audit.set_defaults(handler=_audit_pilot)
+    upgrade = subparsers.add_parser(
+        "upgrade-panel", help="create a new reachable-slot v2 panel from v1")
+    upgrade.add_argument("--source", required=True)
+    upgrade.add_argument("--output", required=True)
+    upgrade.set_defaults(handler=_upgrade_panel)
     return parser
 
 

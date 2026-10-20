@@ -6,6 +6,12 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
 
+Harness3D 同题 fit-set 入口为 `scripts/run_fitset_v11.py`。每槽位由唯一 spawn
+worker 串行消费，12 条新合格轨迹触发修订，经双 seed 严格 A/B 后才发布到独立
+run-local library。ready_579 覆盖 16 槽位，米制扩展覆盖完整 19 槽位；最终冻结
+每槽位最后发布版本，5 个不可达 g1m1 保留 seed。旧线程并发实验无效且不能恢复，
+新实验需先运行 model-free preflight 和 pilot 审计。详见[同题槽位流合同](docs/v11_fitset_slot_stream.md)。
+
 当前在线合同使用 `program_synth_v11_8_en`、
 `solver-v11.8-task-tools` 和 `tool-docs-v11.8-task-tools`。类别匹配、对象覆盖、
 完整排名验收及检测器重试由两臂共用；评测时原 solver 失败后可预算外追加一次

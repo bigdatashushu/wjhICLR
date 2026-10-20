@@ -3,22 +3,31 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import multiprocessing
 from pathlib import Path
-import threading
-import time
+import pytest
 
 from skill3d.evaluation.direct_qwen_v11 import (
     DIRECT_RESPONSE_SCHEMA,
     DIRECT_RUN_SCHEMA,
 )
 from skill3d.evaluation.fitset_v11 import (
+    ALL_FIT_SLOTS,
     FIT_SKILL_BUNDLE_SCHEMA,
+    PANEL_SCHEMA,
+    PROCESS_SCHEDULER,
+    REACHABLE_FIT_SLOTS,
     SYSTEM_RESULT_SCHEMA,
     SYSTEM_RUN_SCHEMA,
+    UNREACHABLE_FIT_SLOTS,
     SystemVariantRunner,
+    _process_shard_worker,
+    _stable_slot_shards,
+    audit_fitset_pilot,
     build_fit_skill_bundle,
     build_fitset_comparison,
     direct_rows_for_variants,
+    fit_slot_key,
     load_fit_skill_bundle,
     load_fitset_panel,
     load_variant_bindings,
@@ -27,12 +36,32 @@ from skill3d.evaluation.fitset_v11 import (
 )
 from skill3d.evolution.fitset_revision_v11 import (
     FIT_FEEDBACK_SCHEMA,
-    FitSetEightMethodReviser,
+    FitSetSlotReviser,
     build_method_feedback,
+    load_active_parent_slots,
 )
 from skill3d.routing.task_classifier import TASK_TYPES
 from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
+
+
+class _SpawnTimeoutProbe:
+    def _run_one(self, variant):
+        import threading
+
+        from skill3d.sandbox.kernel import _Timeout
+
+        with _Timeout(1):
+            main_thread = threading.current_thread() is threading.main_thread()
+        return {
+            "variant_id": variant["variant_id"],
+            "status": "completed",
+            "main_thread": main_thread,
+        }
+
+    def _run_shard(self, index, owned, pending, stop_event, accept):
+        for variant in pending:
+            accept(self._run_one(variant))
 
 
 def _write(path: Path, value) -> None:
@@ -41,6 +70,12 @@ def _write(path: Path, value) -> None:
         json.dumps(value, ensure_ascii=False, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def _hash(value) -> str:
+    from skill3d.evaluation.fitset_v11 import content_sha256
+
+    return content_sha256(value)
 
 
 def _variant(
@@ -75,26 +110,36 @@ def _panel_rows() -> list[dict]:
             status="binding_preparation_required",
             task="object_abs_distance",
         ),
-        _variant(
-            "11",
-            "g1m1",
-            status="binding_preparation_required",
-            task="object_rel_distance",
-        ),
     ]
 
 
 def _panel_file(tmp_path: Path) -> Path:
     path = tmp_path / "panel.json"
     rows = _panel_rows()
-    _write(path, {
-        "schema_version": (
-            "v11-same-question-system-vs-direct-qwen-proposal/1.0"),
-        "proposal_sha256": "p" * 64,
+    body = {
+        "schema_version": PANEL_SCHEMA,
         "panels": {
-            "ready_579": {"system_input_variants": 1},
-            "recommended_core_897": {"system_input_variants": 2},
-            "maximum_1166": {"system_input_variants": 3},
+            "ready_579": {
+                "system_input_variants": 1,
+                "skill_slot_count": 1,
+                "skill_slots": ["object_abs_distance/g1m0"],
+            },
+            "recommended_core_897": {
+                "system_input_variants": 2,
+                "skill_slot_count": 2,
+                "skill_slots": [
+                    "object_abs_distance/g1m0",
+                    "object_abs_distance/g1m1",
+                ],
+            },
+        },
+        "skill_accumulation": {
+            "grouping_key": ["question_type", "evidence_state"],
+            "active_snapshot_physical_slot_count": 24,
+            "reachable_slot_count": 19,
+            "unreachable_slots": [
+                fit_slot_key(*slot) for slot in UNREACHABLE_FIT_SLOTS
+            ],
         },
         "system_variants": rows,
         "direct_qwen_rows": [
@@ -105,15 +150,9 @@ def _panel_file(tmp_path: Path) -> Path:
                 "split": "induction",
                 "system_variant_ids": ["10@g1m0", "10@g1m1"],
             },
-            {
-                "qa_id": "11",
-                "scene_id": "scene-1",
-                "question_type": "object_rel_distance",
-                "split": "induction",
-                "system_variant_ids": ["11@g1m1"],
-            },
         ],
-    })
+    }
+    _write(path, {**body, "proposal_sha256": _hash(body)})
     return path
 
 
@@ -121,13 +160,11 @@ def test_panel_selection_preserves_direct_reuse_mapping(tmp_path):
     panel = load_fitset_panel(_panel_file(tmp_path))
     ready = select_panel_variants(panel, "ready_579")
     core = select_panel_variants(panel, "recommended_core_897")
-    maximum = select_panel_variants(panel, "maximum_1166")
     assert [row["variant_id"] for row in ready] == ["10@g1m0"]
     assert [row["variant_id"] for row in core] == [
         "10@g1m0",
         "10@g1m1",
     ]
-    assert len(maximum) == 3
     direct = direct_rows_for_variants(panel, core)
     assert direct == [{
         "qa_id": "10",
@@ -254,60 +291,100 @@ def test_empty_m4_binding_migration_is_explicit_and_replayable(tmp_path):
     assert loaded.stats["generation"]["identity"]["sources"] == current_sources
 
 
-def _method(task: str, index: int) -> SkillSpecV11:
+def _method(
+    task: str,
+    index: int,
+    *,
+    state: str = "g0m0",
+    skill_id: str | None = None,
+    version: str = "2.0.0",
+    name: str | None = None,
+) -> SkillSpecV11:
+    method_name = name or f"fit-method-{index}"
     text = (
         "---\n"
-        f"name: fit-method-{index}\n"
-        f"description: Reusable method for {task} across evidence states.\n"
+        f"name: {method_name}\n"
+        f"description: Reusable method for exact slot {task}/{state}.\n"
         "---\n\n"
         "# Method\n\n"
-        "Inspect authorized evidence, use available tools, and fall back to "
-        "the original images when a capability is unavailable.\n"
+        f"Inspect authorized evidence for {state}, use available tools, and "
+        f"preserve exact-slot identity marker {index}.\n"
     )
     return SkillSpecV11(
-        skill_id=f"FIT-S{index:02d}",
-        version="2.0.0",
+        skill_id=skill_id or f"FIT-S{index:02d}",
+        version=version,
         question_type=task,
-        evidence_state="g0m0",
+        evidence_state=state,
         skill_md=text,
     )
 
 
-def test_fit_bundle_has_eight_bodies_and_read_only_state_adapters(tmp_path):
-    methods = {
-        task: _method(task, index)
-        for index, task in enumerate(TASK_TYPES, start=1)
-    }
+def test_fit_bundle_freezes_exact_slots_and_preserves_other_parents(tmp_path):
+    parents, _ = load_active_parent_slots(
+        Path(__file__).resolve().parents[2] / "skill_library")
+    selected = tuple(REACHABLE_FIT_SLOTS[:16])
+    candidates = {}
+    for index, slot in enumerate(selected, start=1):
+        parent = parents[slot]
+        candidates[slot] = SkillSpecV11(
+            skill_id=parent.skill_id,
+            version="1.1.0",
+            question_type=parent.question_type,
+            evidence_state=parent.evidence_state,
+            skill_md=(
+                parent.skill_md.rstrip("\n")
+                + f"\n\nExact-slot fit marker {index}.\n"
+            ),
+        )
     root = tmp_path / "bundle"
     manifest = build_fit_skill_bundle(
         output_dir=root,
-        bundle_id="fit-eight",
-        methods=methods,
+        bundle_id="fit-sixteen",
+        candidates=candidates,
+        active_parents=parents,
         source_run_identity={"sha256": "a" * 64},
     )
     assert manifest["schema_version"] == FIT_SKILL_BUNDLE_SCHEMA
-    assert len(list(root.glob("skills/*/SKILL.md"))) == 8
+    assert manifest["physical_slot_count"] == 24
+    assert manifest["reachable_slot_count"] == 19
+    assert manifest["revised_slot_count"] == 16
+    assert manifest["preserved_parent_slot_count"] == 8
+    assert len(list(root.glob("skills/*/*/SKILL.md"))) == 24
     loaded = load_fit_skill_bundle(root / "manifest.json")
-    method = loaded.methods["object_counting"]
-    adapters = [method.adapt(state) for state in ("g0m0", "g1m0", "g1m1")]
-    assert len({adapter.content_sha256 for adapter in adapters}) == 1
-    assert {adapter.evidence_state for adapter in adapters} == {
-        "g0m0", "g1m0", "g1m1",
-    }
-    assert len({adapter.skill_id for adapter in adapters}) == 3
+    assert set(loaded.slots) == set(ALL_FIT_SLOTS)
+    assert {
+        skill.role for slot, skill in loaded.slots.items()
+        if slot in selected
+    } == {"revised_candidate"}
+    assert {
+        skill.role for slot, skill in loaded.slots.items()
+        if slot in set(UNREACHABLE_FIT_SLOTS)
+    } == {"active_parent_unreachable"}
+    assert len({
+        loaded.slots[slot].content_sha256 for slot in selected
+    }) == 16
 
 
 def test_comparison_reuses_full_direct_run_and_rescores_both_arms(tmp_path):
     panel_path = tmp_path / "panel.json"
     variant = _variant("10", "g1m0")
-    _write(panel_path, {
-        "schema_version": (
-            "v11-same-question-system-vs-direct-qwen-proposal/1.0"),
-        "proposal_sha256": "p" * 64,
+    body = {
+        "schema_version": PANEL_SCHEMA,
         "panels": {
-            "ready_579": {"system_input_variants": 1},
-            "recommended_core_897": {"system_input_variants": 1},
-            "maximum_1166": {"system_input_variants": 1},
+            name: {
+                "system_input_variants": 1,
+                "skill_slot_count": 1,
+                "skill_slots": ["object_counting/g1m0"],
+            }
+            for name in ("ready_579", "recommended_core_897")
+        },
+        "skill_accumulation": {
+            "grouping_key": ["question_type", "evidence_state"],
+            "active_snapshot_physical_slot_count": 24,
+            "reachable_slot_count": 19,
+            "unreachable_slots": [
+                fit_slot_key(*slot) for slot in UNREACHABLE_FIT_SLOTS
+            ],
         },
         "system_variants": [variant],
         "direct_qwen_rows": [{
@@ -317,7 +394,8 @@ def test_comparison_reuses_full_direct_run_and_rescores_both_arms(tmp_path):
             "split": "induction",
             "system_variant_ids": ["10@g1m0"],
         }],
-    })
+    }
+    _write(panel_path, {**body, "proposal_sha256": _hash(body)})
     panel = load_fitset_panel(panel_path)
 
     system_root = tmp_path / "system"
@@ -330,6 +408,8 @@ def test_comparison_reuses_full_direct_run_and_rescores_both_arms(tmp_path):
     _write(system_root / "results" / result_name, {
         "schema_version": SYSTEM_RESULT_SCHEMA,
         "variant_id": "10@g1m0",
+        "question_type": "object_counting",
+        "evidence_state": "g1m0",
         "status": "completed",
         "final_state": "answer",
         "answer": "1",
@@ -390,15 +470,20 @@ def _fake_accumulation(tmp_path: Path):
     root = tmp_path / "accumulation"
     variants = []
     labels = {}
-    for index, task in enumerate(TASK_TYPES, start=1):
+    selected = [
+        (task, state)
+        for state in ("g0m0", "g1m0")
+        for task in TASK_TYPES
+    ]
+    for index, (task, state) in enumerate(selected, start=1):
         qa_id = f"fitcase{index}"
-        variant_id = f"{qa_id}@g0m0"
+        variant_id = f"{qa_id}@{state}"
         variants.append({
             "variant_id": variant_id,
             "qa_id": qa_id,
             "scene_id": f"fitscene{index}",
             "question_type": task,
-            "evidence_state": "g0m0",
+            "evidence_state": state,
             "split": "induction",
         })
         is_option = CANONICAL_UNIT_BY_QUESTION_TYPE[task] == "option"
@@ -414,7 +499,7 @@ def _fake_accumulation(tmp_path: Path):
             "schema_version": SYSTEM_RESULT_SCHEMA,
             "variant_id": variant_id,
             "question_type": task,
-            "evidence_state": "g0m0",
+            "evidence_state": state,
             "status": "completed",
             "final_state": "answer",
             "answer": answer,
@@ -456,12 +541,11 @@ class _RevisionClient:
         }
         prompt = messages[-1]["content"]
         prefix = "Parent complete SKILL.md:\n"
-        suffix = "\nAuthorized Tool interfaces by initial state:\n"
+        suffix = "\nAuthorized Tool interfaces for this exact slot:\n"
         parent = prompt.split(prefix, 1)[1].split(suffix, 1)[0]
         candidate = (
             parent.rstrip("\n")
-            + "\n\nThe three initial evidence branches must preserve the "
-            "same identity checks and fail closed on unavailable tools.\n"
+            + f"\n\nExact-slot revision marker {self.calls + 1}.\n"
         )
         self.calls += 1
         self.last_usage = {"prompt_tokens": 1, "completion_tokens": 1}
@@ -469,11 +553,11 @@ class _RevisionClient:
         self.last_response_identity = {"model": "qwen3.8-flash"}
         return json.dumps({
             "full_skill_md": candidate,
-            "modification_reason": "Add a cross-state fail-closed check.",
+            "modification_reason": "Add an exact-slot fail-closed check.",
         })
 
 
-def test_feedback_is_sanitized_and_reviser_freezes_eight_methods(tmp_path):
+def test_feedback_is_sanitized_and_ungated_freeze_is_refused(tmp_path):
     accumulation, variants, labels = _fake_accumulation(tmp_path)
     feedback = build_method_feedback(
         variants=variants,
@@ -491,7 +575,7 @@ def test_feedback_is_sanitized_and_reviser_freezes_eight_methods(tmp_path):
     )
     client = _RevisionClient()
     root = tmp_path / "revision"
-    summary = FitSetEightMethodReviser(
+    reviser = FitSetSlotReviser(
         output_root=root,
         panel={"proposal_sha256": "p" * 64},
         panel_name="ready_579",
@@ -500,11 +584,11 @@ def test_feedback_is_sanitized_and_reviser_freezes_eight_methods(tmp_path):
         label_metadata=labels,
         library_root=Path(__file__).resolve().parents[2] / "skill_library",
         client=client,
-    ).run(resume=False)
-    assert summary["status"] == "complete"
-    assert summary["candidate_methods"] == client.calls == 8
-    bundle = load_fit_skill_bundle(root / "frozen_bundle" / "manifest.json")
-    assert set(bundle.methods) == set(TASK_TYPES)
+    )
+    with pytest.raises(Exception, match="一次性 reviser"):
+        reviser.run(resume=False)
+    assert client.calls == 0
+    assert feedback["slot_count"] == 16
 
 
 def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
@@ -715,11 +799,7 @@ def test_shared_reconstruction_file_hash_is_cached_by_stable_file_stamp(
     assert info.hits == 1
 
 
-def test_system_runner_uses_four_workers_and_stable_scene_schedule(
-    tmp_path,
-):
-    from skill3d.online.runner import OnlineRunConfig
-
+def test_slot_shards_are_stable_and_never_split_a_slot():
     variants = [
         {
             "variant_id": f"qa-{index}@g0m0",
@@ -731,65 +811,41 @@ def test_system_runner_uses_four_workers_and_stable_scene_schedule(
         }
         for index, scene in enumerate(("scene-b", "scene-a", "scene-b", "scene-a"))
     ]
-    skill = _method("object_counting", 1)
-    runner = SystemVariantRunner(
-        output_root=tmp_path / "parallel",
-        panel={
-            "proposal_sha256": "p" * 64,
-            "panel_file_sha256": "f" * 64,
-        },
-        panel_name="ready_579",
-        variants=variants,
-        item_provider=lambda _variant: None,
-        input_receipt_provider=lambda _variant, _item: {},
-        input_contract_identity={"sha256": "d" * 64},
-        binding_refs={},
-        base_cfg=OnlineRunConfig(mode="real", semantic_review_config=None),
-        phase="accumulation",
-        min_free_gib=0,
-        workers=4,
-        skills_for_variant=lambda _variant: (
-            [skill],
-            {
-                "snapshot_ref": "parallel-test",
-                "manifest_sha256": "a" * 64,
-            },
+    shards = _stable_slot_shards(variants, 4)
+    assert shards == _stable_slot_shards(variants, 4)
+    slot_workers = {}
+    for worker, shard in enumerate(shards):
+        for row in shard:
+            prior = slot_workers.setdefault(row["slot_key"], worker)
+            assert prior == worker
+    assert sorted(
+        row["variant_id"] for shard in shards for row in shard
+    ) == sorted(row["variant_id"] for row in variants)
+
+
+def test_spawn_worker_runs_sigalrm_timeout_on_child_main_thread():
+    context = multiprocessing.get_context("spawn")
+    messages = context.Queue()
+    stop_event = context.Event()
+    process = context.Process(
+        target=_process_shard_worker,
+        args=(
+            _SpawnTimeoutProbe(),
+            0,
+            [{"variant_id": "qa-1@g0m0", "scene_id": "scene-a"}],
+            [{"variant_id": "qa-1@g0m0", "scene_id": "scene-a"}],
+            stop_event,
+            messages,
         ),
     )
-    state = {"active": 0, "max_active": 0}
-    lock = threading.Lock()
-    barrier = threading.Barrier(4)
-
-    def fake_run_one(variant):
-        with lock:
-            state["active"] += 1
-            state["max_active"] = max(state["max_active"], state["active"])
-        try:
-            barrier.wait(timeout=2)
-            time.sleep(0.02)
-            return {
-                "variant_id": variant["variant_id"],
-                "status": "completed",
-            }
-        finally:
-            with lock:
-                state["active"] -= 1
-
-    runner._run_one = fake_run_one
-    summary = runner.run(resume=False)
-    manifest = json.loads(
-        (tmp_path / "parallel" / "manifest.json").read_text(encoding="utf-8"))
-    assert summary["status"] == "complete"
-    assert summary["workers"] == 4
-    assert state["max_active"] == 4
-    assert manifest["execution"] == {
-        "workers": 4,
-        "scheduler": "stable_scene_grouped_v1",
-        "variant_ids": [
-            "qa-1@g0m0",
-            "qa-3@g0m0",
-            "qa-0@g0m0",
-            "qa-2@g0m0",
-        ],
-        "variant_ids_sha256": manifest["execution"]["variant_ids_sha256"],
-    }
+    process.start()
+    process.join(timeout=10)
+    assert not process.is_alive()
+    assert process.exitcode == 0
+    first = messages.get(timeout=2)
+    second = messages.get(timeout=2)
+    assert first["kind"] == "result"
+    assert first["result"]["main_thread"] is True
+    assert second == {"kind": "done", "shard_index": 0}
+    messages.close()
+    messages.join_thread()

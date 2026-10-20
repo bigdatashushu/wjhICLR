@@ -1,4 +1,4 @@
-"""Offline eight-method revision for the exploratory v11 fit-set run."""
+"""Offline exact-slot revision for the exploratory v11 fit-set run."""
 
 from __future__ import annotations
 
@@ -9,19 +9,22 @@ import os
 from pathlib import Path
 from typing import Mapping, Sequence
 import uuid
+import re
 
 from skill3d.evaluation.fitset_v11 import (
+    ALL_FIT_SLOTS,
+    REACHABLE_FIT_SLOTS,
     SYSTEM_RESULT_SCHEMA,
     SYSTEM_RUN_SCHEMA,
     FitSetError,
     build_fit_skill_bundle,
     canonical_json_bytes,
     content_sha256,
+    fit_slot_key,
     score_answer,
 )
 from skill3d.evolution.campaign_v11 import _unknown_tool_calls
 from skill3d.evolution.leakage import leakage_scan_text
-from skill3d.routing.task_classifier import TASK_TYPES
 from skill3d.schemas import EvidenceProfile, SkillSpecV11
 from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
 from skill3d.skills.delivery import (
@@ -29,46 +32,15 @@ from skill3d.skills.delivery import (
     check_service_limit,
 )
 from skill3d.skills.registry import bump_semver
+from skill3d.skills.registry import (
+    active_snapshot_provenance,
+    load_active_skills,
+)
 from skill3d.tools.contract import KNOWN_ARTIFACTS
 
-FIT_REVISION_SCHEMA = "v11-fit-set-eight-method-revision/1.0"
-FIT_FEEDBACK_SCHEMA = "v11-fit-set-method-feedback/1.0"
-FIT_REVISION_PROMPT_VERSION = "fit-set-eight-method-revision-v1"
-
-DEFAULT_PARENT_METHODS = {
-    "object_counting": (
-        "S01", "1.3.0",
-        "versions/S01/1.3.0/count-scene-objects/SKILL.md",
-    ),
-    "object_abs_distance": (
-        "S02", "1.2.0",
-        "versions/S02/1.2.0/estimate-object-distance/SKILL.md",
-    ),
-    "object_rel_distance": (
-        "S03", "1.2.0",
-        "versions/S03/1.2.0/rank-object-distances/SKILL.md",
-    ),
-    "object_size_estimation": (
-        "S04", "1.2.0",
-        "versions/S04/1.2.0/estimate-object-size/SKILL.md",
-    ),
-    "room_size_estimation": (
-        "S05", "1.2.0",
-        "versions/S05/1.2.0/estimate-room-area/SKILL.md",
-    ),
-    "object_rel_direction": (
-        "S06", "1.2.0",
-        "versions/S06/1.2.0/judge-relative-direction/SKILL.md",
-    ),
-    "obj_appearance_order": (
-        "S07", "1.2.0",
-        "versions/S07/1.2.0/order-first-appearances/SKILL.md",
-    ),
-    "route_planning": (
-        "S08", "1.3.0",
-        "versions/S08/1.3.0/infer-route-turns/SKILL.md",
-    ),
-}
+FIT_REVISION_SCHEMA = "v11-fit-set-slot-revision/2.0"
+FIT_FEEDBACK_SCHEMA = "v11-fit-set-slot-feedback/2.0"
+FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v2"
 
 
 def _write_create_once(path: Path, value: object) -> None:
@@ -123,47 +95,49 @@ def _parse_response(text: str) -> dict:
     return value
 
 
-def load_unified_parent_methods(
+def load_active_parent_slots(
     library_root: str | Path,
-) -> dict[str, SkillSpecV11]:
+) -> tuple[dict[tuple[str, str], SkillSpecV11], dict]:
     root = Path(library_root).resolve()
-    methods = {}
-    for task, (skill_id, version, relative) in DEFAULT_PARENT_METHODS.items():
-        text = (root / relative).read_text(encoding="utf-8")
-        methods[task] = SkillSpecV11(
-            skill_id=skill_id,
-            version=version,
-            question_type=task,
-            evidence_state="g0m0",
-            skill_md=text,
-        )
-    return methods
+    store = root / "snapshots"
+    skills, warnings, snapshot_id = load_active_skills(store)
+    active_id, manifest_hash = active_snapshot_provenance(store)
+    if warnings or active_id != snapshot_id or not manifest_hash:
+        raise FitSetError(
+            f"active Skill snapshot is not trustworthy: {warnings}")
+    parents = {
+        (skill.question_type, skill.evidence_state): skill
+        for skill in skills
+    }
+    if set(parents) != set(ALL_FIT_SLOTS):
+        raise FitSetError("active Skill snapshot does not cover 24 physical slots")
+    return parents, {
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": manifest_hash,
+    }
 
 
-def _tool_docs(question_type: str) -> dict[str, str]:
+def _tool_docs(question_type: str, evidence_state: str) -> str:
     from skill3d.tools import REGISTRY
 
-    rows = {}
-    for state in ("g0m0", "g1m0", "g1m1"):
-        geometry = state != "g0m0"
-        scale = state == "g1m1"
-        metric = scale and question_type in METRIC_TASK_TYPES
-        rows[state] = REGISTRY.docs(
-            scope=(
-                "fallback_2d_only"
-                if not geometry
-                else "metric_enabled" if metric else "full_3d"
-            ),
-            available=KNOWN_ARTIFACTS,
-            evidence_profile=EvidenceProfile(
-                geometry_3d="available" if geometry else "unavailable",
-                metric_scale="available" if scale else "unavailable",
-            ),
-            gate_passed=metric,
-            question_type=question_type,
-            local_facts={"world_frame": True},
-        )
-    return rows
+    geometry = evidence_state != "g0m0"
+    scale = evidence_state == "g1m1"
+    metric = scale and question_type in METRIC_TASK_TYPES
+    return REGISTRY.docs(
+        scope=(
+            "fallback_2d_only"
+            if not geometry
+            else "metric_enabled" if metric else "full_3d"
+        ),
+        available=KNOWN_ARTIFACTS,
+        evidence_profile=EvidenceProfile(
+            geometry_3d="available" if geometry else "unavailable",
+            metric_scale="available" if scale else "unavailable",
+        ),
+        gate_passed=metric,
+        question_type=question_type,
+        local_facts={"world_frame": True},
+    )
 
 
 def _bucket(value: int) -> str:
@@ -216,7 +190,16 @@ def build_method_feedback(
     expected = {str(row["variant_id"]) for row in variants}
     manifest, results = _load_accumulation_results(
         Path(accumulation_root).resolve(), expected)
-    by_task: dict[str, list[dict]] = {task: [] for task in TASK_TYPES}
+    selected_slots = {
+        (str(row["question_type"]), str(row["evidence_state"]))
+        for row in variants
+    }
+    if not selected_slots or not selected_slots <= set(REACHABLE_FIT_SLOTS):
+        raise FitSetError(
+            "fit-set feedback must cover a non-empty set of reachable slots")
+    by_slot: dict[tuple[str, str], list[dict]] = {
+        slot: [] for slot in selected_slots
+    }
     for variant in variants:
         variant_id = str(variant["variant_id"])
         qa_id = str(variant["qa_id"])
@@ -244,7 +227,6 @@ def build_method_feedback(
             available=available,
         )
         signature = {
-            "evidence_state": variant["evidence_state"],
             "source_split_role": variant["split"],
             "metric": scored["metric"],
             "score": round(float(scored["score"]), 3),
@@ -263,31 +245,16 @@ def build_method_feedback(
             "tool_call_bucket": _bucket(
                 int(row.get("tool_call_count") or 0)),
         }
-        by_task[variant["question_type"]].append(signature)
-    task_summaries = {}
-    for task in TASK_TYPES:
-        rows = by_task[task]
+        by_slot[
+            (variant["question_type"], variant["evidence_state"])
+        ].append(signature)
+    slot_summaries = {}
+    for question_type, evidence_state in sorted(selected_slots):
+        rows = by_slot[(question_type, evidence_state)]
         if not rows:
-            raise FitSetError(f"{task}: fit-set feedback has no cases")
-        states = {}
-        for state in ("g0m0", "g1m0", "g1m1"):
-            selected = [row for row in rows
-                        if row["evidence_state"] == state]
-            states[state] = {
-                "n": len(selected),
-                "mean_score": (
-                    sum(row["score"] for row in selected) / len(selected)
-                    if selected else None
-                ),
-                "legal_answer_rate": (
-                    sum(row["legal_answer"] for row in selected) / len(selected)
-                    if selected else None
-                ),
-                "available_rate": (
-                    sum(row["available"] for row in selected) / len(selected)
-                    if selected else None
-                ),
-            }
+            raise FitSetError(
+                f"{fit_slot_key(question_type, evidence_state)}: "
+                "fit-set feedback has no cases")
         counts = Counter(
             json.dumps(row, ensure_ascii=False, sort_keys=True)
             for row in rows
@@ -297,15 +264,16 @@ def build_method_feedback(
             for key, count in sorted(
                 counts.items(), key=lambda item: (-item[1], item[0]))
         ]
-        task_summaries[task] = {
+        slot_summaries[fit_slot_key(question_type, evidence_state)] = {
+            "question_type": question_type,
+            "evidence_state": evidence_state,
             "n_cases": len(rows),
             "mean_score": sum(row["score"] for row in rows) / len(rows),
             "legal_answer_rate": (
                 sum(row["legal_answer"] for row in rows) / len(rows)),
             "available_rate": (
                 sum(row["available"] for row in rows) / len(rows)),
-            "by_initial_evidence_state": states,
-            "method_outcome_signatures": signatures,
+            "slot_outcome_signatures": signatures,
         }
     body = {
         "schema_version": FIT_FEEDBACK_SCHEMA,
@@ -320,7 +288,9 @@ def build_method_feedback(
             "labels_used_only_to_compute_scores": True,
         },
         "source_accumulation_manifest_sha256": content_sha256(manifest),
-        "tasks": task_summaries,
+        "grouping_key": ["question_type", "evidence_state"],
+        "slot_count": len(slot_summaries),
+        "slots": slot_summaries,
     }
     return {**body, "identity_sha256": content_sha256(body)}
 
@@ -340,7 +310,7 @@ def _static_validate(
             skill_id=parent.skill_id,
             version=version,
             question_type=parent.question_type,
-            evidence_state="g0m0",
+            evidence_state=parent.evidence_state,
             skill_md=candidate_text,
         )
     except Exception as exc:
@@ -356,6 +326,16 @@ def _static_validate(
         unknown = _unknown_tool_calls(candidate.skill_md)
         if unknown:
             problems.append(f"candidate references unknown tools: {unknown}")
+        from skill3d.tools import REGISTRY
+
+        call_pattern = re.compile(r"\b(?:tools\.)?([A-Za-z_]\w*)\s*\(")
+        current = set(call_pattern.findall(candidate.skill_md))
+        inherited = set(call_pattern.findall(parent.skill_md))
+        docs = _tool_docs(parent.question_type, parent.evidence_state)
+        new_tools = (current - inherited) & set(REGISTRY.names())
+        for tool in sorted(new_tools):
+            if not re.search(rf"\b{re.escape(tool)}\s*\(", docs):
+                problems.append(f"candidate adds unavailable exact-slot tool: {tool}")
         leaks = leakage_scan_text(
             candidate.skill_md,
             forbidden_sample_ids=forbidden_sample_ids,
@@ -365,8 +345,8 @@ def _static_validate(
     return candidate, problems
 
 
-class FitSetEightMethodReviser:
-    """Create one final cross-state method per task from sanitized aggregates."""
+class FitSetSlotReviser:
+    """Create one independent final method for every selected reachable slot."""
 
     def __init__(
         self,
@@ -397,7 +377,22 @@ class FitSetEightMethodReviser:
         if self.max_attempts <= 0 or self.max_tokens <= 0:
             raise FitSetError("revision attempts and token budget must be positive")
 
-    def _manifest(self, parents: Mapping[str, SkillSpecV11]) -> dict:
+    def _selected_slots(self) -> tuple[tuple[str, str], ...]:
+        slots = tuple(sorted({
+            (str(row["question_type"]), str(row["evidence_state"]))
+            for row in self.variants
+        }))
+        if not slots or not set(slots) <= set(REACHABLE_FIT_SLOTS):
+            raise FitSetError(
+                "revision variants must cover reachable exact slots")
+        return slots
+
+    def _manifest(
+        self,
+        parents: Mapping[tuple[str, str], SkillSpecV11],
+        parent_snapshot: Mapping,
+    ) -> dict:
+        selected_slots = self._selected_slots()
         body = {
             "schema_version": FIT_REVISION_SCHEMA,
             "panel_name": self.panel_name,
@@ -412,13 +407,17 @@ class FitSetEightMethodReviser:
             "max_attempts": self.max_attempts,
             "max_tokens": self.max_tokens,
             "method_context_max_chars": self.method_context_max_chars,
+            "grouping_key": ["question_type", "evidence_state"],
+            "selected_slot_count": len(selected_slots),
+            "selected_slots": [fit_slot_key(*slot) for slot in selected_slots],
+            "active_parent_snapshot": dict(parent_snapshot),
             "parents": {
-                task: {
+                fit_slot_key(*slot): {
                     "skill_version": f"{parent.skill_id}@{parent.version}",
                     "content_sha256": parent.content_sha256,
                     "name": parent.name,
                 }
-                for task, parent in parents.items()
+                for slot, parent in sorted(parents.items())
             },
             "reference_answer_visible_to_online_accumulation": False,
             "raw_sample_content_visible_to_offline_reviser": False,
@@ -428,7 +427,6 @@ class FitSetEightMethodReviser:
     def _prompt(
         self,
         *,
-        task: str,
         parent: SkillSpecV11,
         feedback: Mapping,
         static_feedback: Sequence[str],
@@ -440,11 +438,9 @@ class FitSetEightMethodReviser:
             "and modification_reason. full_skill_md must contain the complete "
             "canonical SKILL.md with YAML frontmatter and full Markdown body. "
             "Use English for all natural-language text and code comments.\n"
-            f"The method handles question type {task!r}. It must contain "
-            "explicit branches for initial public evidence states g0m0 "
-            "(no geometry/no scale), g1m0 (geometry/no scale), and g1m1 "
-            "(geometry/scale). There is one canonical method body for the task; "
-            "do not create separate methods or identities for these states.\n"
+            f"The method handles only exact slot {parent.slot_key!r}. "
+            "Do not reuse text, identity, feedback, or runtime adaptation from "
+            "another evidence state. Do not add branches for other states.\n"
             "Keep the frontmatter name unchanged. Keep the method generic. "
             "Never include a question, options, answer, QA/sample/scene ID, "
             "or inferred GT 3D fact. The aggregate feedback contains no such "
@@ -453,9 +449,9 @@ class FitSetEightMethodReviser:
             "only when supported by the aggregate process facts. Do not invent "
             "tools or alter framework, model, prompt, scoring, or permissions.\n\n"
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
-            "Authorized Tool interfaces by initial state:\n"
-            f"{json.dumps(_tool_docs(task), ensure_ascii=False, sort_keys=True)}\n"
-            "Sanitized aggregate method feedback:\n"
+            "Authorized Tool interfaces for this exact slot:\n"
+            f"{_tool_docs(parent.question_type, parent.evidence_state)}\n"
+            "Sanitized aggregate feedback for this exact slot:\n"
             f"{json.dumps(feedback, ensure_ascii=False, sort_keys=True)}\n"
             "Static feedback from prior formatting attempts:\n"
             f"{json.dumps(list(static_feedback), ensure_ascii=False)}\n"
@@ -464,12 +460,13 @@ class FitSetEightMethodReviser:
     def _request(
         self,
         *,
-        task: str,
+        slot: tuple[str, str],
         attempt: int,
         prompt: str,
     ) -> dict:
-        task_root = self.root / "tasks" / task
-        exchange_path = task_root / f"attempt_{attempt:02d}.json"
+        slot_name = fit_slot_key(*slot)
+        slot_root = self.root / "slots" / slot[0] / slot[1]
+        exchange_path = slot_root / f"attempt_{attempt:02d}.json"
         request = {
             "prompt_version": FIT_REVISION_PROMPT_VERSION,
             "prompt_sha256": hashlib.sha256(
@@ -492,7 +489,8 @@ class FitSetEightMethodReviser:
         if exchange_path.is_file():
             exchange = json.loads(exchange_path.read_text(encoding="utf-8"))
             if exchange.get("request") != request:
-                raise FitSetError(f"{task}: revision request changed on resume")
+                raise FitSetError(
+                    f"{slot_name}: revision request changed on resume")
             return exchange
         text = self.client.chat(
             request["messages"],
@@ -503,7 +501,9 @@ class FitSetEightMethodReviser:
         )
         exchange = {
             "schema_version": FIT_REVISION_SCHEMA,
-            "task": task,
+            "slot_key": slot_name,
+            "question_type": slot[0],
+            "evidence_state": slot[1],
             "attempt": attempt,
             "request": request,
             "response_text": text,
@@ -518,16 +518,18 @@ class FitSetEightMethodReviser:
         _write_create_once(exchange_path, exchange)
         return exchange
 
-    def _revise_task(
+    def _revise_slot(
         self,
         *,
-        task: str,
+        slot: tuple[str, str],
         parent: SkillSpecV11,
         feedback: Mapping,
         forbidden_ids: set[str],
     ) -> SkillSpecV11:
-        final_path = self.root / "tasks" / task / "final.json"
-        skill_path = self.root / "tasks" / task / "SKILL.md"
+        slot_name = fit_slot_key(*slot)
+        slot_root = self.root / "slots" / slot[0] / slot[1]
+        final_path = slot_root / "final.json"
+        skill_path = slot_root / "SKILL.md"
         if final_path.is_file() and skill_path.is_file():
             receipt = json.loads(final_path.read_text(encoding="utf-8"))
             text = skill_path.read_text(encoding="utf-8")
@@ -542,18 +544,18 @@ class FitSetEightMethodReviser:
                 or candidate is None
                 or candidate.content_sha256 != receipt.get("content_sha256")
             ):
-                raise FitSetError(f"{task}: frozen candidate no longer validates")
+                raise FitSetError(
+                    f"{slot_name}: frozen candidate no longer validates")
             return candidate
         static_feedback: list[str] = []
         for attempt in range(1, self.max_attempts + 1):
             prompt = self._prompt(
-                task=task,
                 parent=parent,
                 feedback=feedback,
                 static_feedback=static_feedback,
             )
             exchange = self._request(
-                task=task,
+                slot=slot,
                 attempt=attempt,
                 prompt=prompt,
             )
@@ -569,21 +571,24 @@ class FitSetEightMethodReviser:
                 candidate, problems = None, [str(exc)]
             validation = {
                 "schema_version": FIT_REVISION_SCHEMA,
-                "task": task,
+                "slot_key": slot_name,
+                "question_type": slot[0],
+                "evidence_state": slot[1],
                 "attempt": attempt,
                 "problems": problems,
                 "passed": candidate is not None and not problems,
             }
             _write_create_once(
-                self.root / "tasks" / task
-                / f"validation_{attempt:02d}.json",
+                slot_root / f"validation_{attempt:02d}.json",
                 validation,
             )
             if candidate is not None and not problems:
                 _write_text_create_once(skill_path, candidate.skill_md)
                 _write_create_once(final_path, {
                     "schema_version": FIT_REVISION_SCHEMA,
-                    "task": task,
+                    "slot_key": slot_name,
+                    "question_type": slot[0],
+                    "evidence_state": slot[1],
                     "attempt": attempt,
                     "parent_skill_version": (
                         f"{parent.skill_id}@{parent.version}"),
@@ -594,90 +599,25 @@ class FitSetEightMethodReviser:
                     "exchange_sha256": content_sha256(exchange),
                 })
                 return candidate
-            static_feedback = problems
+            static_feedback = [
+                # 下一次 prompt 不回传候选正文或可能包含标签的校验详情。
+                "Static validation failed; preserve the parent's exact-slot "
+                "identity, known authorized tools, complete source and no sample content."
+            ]
         raise FitSetError(
-            f"{task}: no valid candidate after {self.max_attempts} attempts")
+            f"{slot_name}: no valid candidate after "
+            f"{self.max_attempts} attempts")
 
     def run(self, *, resume: bool) -> dict:
-        parents = load_unified_parent_methods(self.library_root)
-        manifest = self._manifest(parents)
-        manifest_path = self.root / "manifest.json"
-        if self.root.exists():
-            if not resume:
-                raise FitSetError(
-                    "revision output exists; use resume for the same run")
-            if (
-                not manifest_path.is_file()
-                or json.loads(manifest_path.read_text(encoding="utf-8"))
-                != manifest
-            ):
-                raise FitSetError("revision manifest changed during resume")
-        else:
-            self.root.mkdir(parents=True)
-            _write_create_once(manifest_path, manifest)
-        feedback = build_method_feedback(
-            variants=self.variants,
-            accumulation_root=self.accumulation_root,
-            label_metadata=self.label_metadata,
-        )
-        _write_create_once(self.root / "method_feedback.json", feedback)
-        forbidden_ids = {
-            str(value)
-            for row in self.variants
-            for value in (
-                row.get("variant_id"),
-                row.get("qa_id"),
-                row.get("scene_id"),
-            )
-            if value
-        }
-        candidates = {
-            task: self._revise_task(
-                task=task,
-                parent=parents[task],
-                feedback=feedback["tasks"][task],
-                forbidden_ids=forbidden_ids,
-            )
-            for task in TASK_TYPES
-        }
-        bundle_root = self.root / "frozen_bundle"
-        bundle_id = (
-            f"fit-{self.panel_name}-"
-            f"{manifest['identity_sha256'][:16]}"
-        )
-        if bundle_root.exists():
-            from skill3d.evaluation.fitset_v11 import load_fit_skill_bundle
-
-            bundle_manifest = load_fit_skill_bundle(
-                bundle_root / "manifest.json").manifest
-        else:
-            bundle_manifest = build_fit_skill_bundle(
-                output_dir=bundle_root,
-                bundle_id=bundle_id,
-                methods=candidates,
-                source_run_identity={
-                    "revision_manifest_sha256": manifest["identity_sha256"],
-                    "feedback_sha256": feedback["identity_sha256"],
-                },
-            )
-        summary = {
-            "schema_version": FIT_REVISION_SCHEMA,
-            "status": "complete",
-            "panel_name": self.panel_name,
-            "candidate_methods": len(candidates),
-            "bundle_id": bundle_manifest["bundle_id"],
-            "bundle_manifest_sha256": bundle_manifest["manifest_sha256"],
-            "bundle_manifest": str(bundle_root / "manifest.json"),
-        }
-        _write_create_once(self.root / "summary.json", summary)
-        return summary
+        raise FitSetError(
+            "一次性 reviser 不允许直接冻结未经 A/B 的候选；"
+            "请用 run-system accumulation 的 12 条槽位流，再用 freeze")
 
 
 __all__ = [
-    "DEFAULT_PARENT_METHODS",
     "FIT_FEEDBACK_SCHEMA",
     "FIT_REVISION_SCHEMA",
-    "FitSetEightMethodReviser",
+    "FitSetSlotReviser",
     "build_method_feedback",
-    "load_unified_parent_methods",
+    "load_active_parent_slots",
 ]
