@@ -156,7 +156,7 @@ def make_runner(tmp_path, *, workers=1, n=13, reference="2", episode_concurrency
             "snapshot_ref": snapshot, "manifest_sha256": "a" * 64,
         }), workers=workers, min_free_gib=0,
         episode_concurrency=episode_concurrency,
-        evolution_config=FitSetEvolutionConfig(),
+        evolution_config=FitSetEvolutionConfig(scheduling_mode="batch_v1"),
         label_metadata=labels, revision_client_factory=revision_factory,
         gate_client_factory=gate_factory,
     )

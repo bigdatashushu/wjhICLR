@@ -584,14 +584,29 @@ class FitSetSlotReviser:
             if exchange.get("request") != request:
                 raise FitSetError(
                     f"{slot_name}: revision request changed on resume")
+            if exchange.get("service_error"):
+                raise FitSetError(f"{slot_name}: recorded revision service failure")
             return exchange
-        text = self.client.chat(
-            request["messages"],
-            max_tokens=self.max_tokens,
-            seed=request["seed"],
-            temperature=0.0,
-            enable_thinking=False,
-        )
+        intent_path = slot_root / f"request_intent_{attempt:02d}.json"
+        if intent_path.exists():
+            raise FitSetError(
+                f"{slot_name}: revision request has no completion receipt; ambiguous request is not retried")
+        _write_create_once(intent_path, request)
+        try:
+            text = self.client.chat(
+                request["messages"],
+                max_tokens=self.max_tokens,
+                seed=request["seed"],
+                temperature=0.0,
+                enable_thinking=False,
+            )
+        except Exception as exc:
+            # Only a host-owned type crosses this boundary; never echo provider text.
+            _write_create_once(exchange_path, {
+                "schema_version": FIT_REVISION_SCHEMA, "request": request,
+                "service_error": True, "exception_type": type(exc).__name__,
+            })
+            raise FitSetError(f"{slot_name}: revision request failed") from exc
         exchange = {
             "schema_version": FIT_REVISION_SCHEMA,
             "slot_key": slot_name,

@@ -448,6 +448,9 @@ def _run_system(args) -> int:
                 gate_seeds=(args.seed, args.seed + 1),
                 max_revision_attempts=args.max_revision_attempts,
                 max_tokens=args.revision_max_tokens,
+                scheduling_mode=args.scheduling_mode,
+                max_revision_requests_per_slot=args.max_revision_requests_per_slot,
+                max_gate_candidates_per_slot=args.max_gate_candidates_per_slot,
             ) if args.phase == "accumulation" else None
         ),
         label_metadata=(
@@ -605,6 +608,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--gate-size", type=int, default=8)
     run.add_argument("--max-revision-attempts", type=int, default=3)
     run.add_argument("--revision-max-tokens", type=int, default=8192)
+    run.add_argument("--scheduling-mode", choices=("novel_failure_v1", "batch_v1"),
+                     default="novel_failure_v1")
+    run.add_argument("--max-revision-requests-per-slot", type=int, default=18)
+    run.add_argument("--max-gate-candidates-per-slot", type=int, default=6)
     run.add_argument("--library-root", default="")
     run.add_argument(
         "--phase", choices=("accumulation", "final_system"), required=True)

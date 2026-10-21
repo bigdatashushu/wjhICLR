@@ -27,6 +27,9 @@ from skill3d.evolution.fitset_revision_v11 import (
     load_active_parent_slots,
 )
 from skill3d.evolution.leakage import leakage_scan_text
+from skill3d.evolution.revision_schedule import (
+    candidate_dedup_key, normalized_method_sha256, scheduling_decision,
+)
 from skill3d.evolution.process_feedback import (
     FEEDBACK_SCHEMA_VERSION, FEEDBACK_WHITELIST_VERSION, FIELD_SEMANTICS,
     ProcessFacts, extract_process_facts, legacy_process_facts, safe_process_dict,
@@ -50,7 +53,7 @@ from skill3d.skills.v11_library import (
     write_v11_snapshot,
 )
 
-FIT_STREAM_SCHEMA = "harness3d-fitset-stream/3.0"
+FIT_STREAM_SCHEMA = "harness3d-fitset-stream/4.0"
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,9 @@ class FitSetEvolutionConfig:
     gate_seeds: tuple[int, ...] = (137, 138)
     max_revision_attempts: int = 3
     max_tokens: int = 8192
+    scheduling_mode: Literal["batch_v1", "novel_failure_v1"] = "novel_failure_v1"
+    max_revision_requests_per_slot: int = 18
+    max_gate_candidates_per_slot: int = 6
 
     def __post_init__(self):
         if self.batch_size != 12:
@@ -68,6 +74,10 @@ class FitSetEvolutionConfig:
             raise ValueError("gate/revision 配置必须为正数")
         if len(self.gate_seeds) != 2 or len(set(self.gate_seeds)) != 2:
             raise ValueError("fit-set A/B 必须使用两个不同的冻结 seed")
+        if self.scheduling_mode not in ("batch_v1", "novel_failure_v1"):
+            raise ValueError("unknown revision scheduling mode")
+        if min(self.max_revision_requests_per_slot, self.max_gate_candidates_per_slot) < 1:
+            raise ValueError("per-slot revision/gate limits must be positive")
 
 
 class FitSetExperienceCase(Spec):
@@ -567,10 +577,58 @@ class FitSetWorkerEvolution:
         _write_create_once(root / "feedback.json", feedback)
         _write_create_once(root / "request.json", {
             "slot": request.slot_key, "parent": parent.model_dump(mode="json"),
+            "parent_content_sha256": parent.content_sha256,
             "case_ids": [case.case_id for case in request.cases],
             "new_case_count": request.new_case_count,
             "run_identity": self.runner.run_identity,
         })
+        schedule_path = root / "schedule.json"
+        if schedule_path.exists():
+            schedule = json.loads(schedule_path.read_text())
+            _require(schedule.get("identity_sha256") == content_sha256({
+                key: value for key, value in schedule.items() if key != "identity_sha256"
+            }), "revision schedule receipt changed")
+        else:
+            prior_patterns = set()
+            revision_requests_used = 0
+            for path in sorted((self.root / "campaigns").glob("*/request.json")):
+                if path.parent == root:
+                    continue
+                prior = json.loads(path.read_text())
+                if prior["slot"] != request.slot_key:
+                    continue
+                revision_requests_used += len(list(
+                    (path.parent / "revision").glob("slots/*/*/request_intent_*.json")))
+                prior_schedule = path.parent / "schedule.json"
+                if (prior["parent_content_sha256"] == parent.content_sha256
+                        and prior_schedule.exists()):
+                    receipt = json.loads(prior_schedule.read_text())
+                    _require(receipt.get("identity_sha256") == content_sha256({
+                        key: value for key, value in receipt.items() if key != "identity_sha256"
+                    }), "prior revision schedule receipt changed")
+                    if receipt["scheduled"]:
+                        prior_patterns.update(receipt["pattern_refs"])
+            entries = [
+                json.loads(path.read_text())
+                for path in (self.root / "candidate_index").glob("*.json")
+            ]
+            schedule = scheduling_decision(
+                feedback=feedback, previous_patterns=prior_patterns,
+                mode=self.config.scheduling_mode,
+                revision_requests_used=revision_requests_used,
+                gate_candidates_used=sum(entry["slot"] == request.slot_key for entry in entries),
+                max_revision_requests=self.config.max_revision_requests_per_slot,
+                max_gate_candidates=self.config.max_gate_candidates_per_slot,
+            )
+            schedule["revision_attempt_budget"] = min(
+                self.config.max_revision_attempts, schedule["remaining_revision_requests"])
+            schedule["identity_sha256"] = content_sha256(schedule)
+            _write_create_once(schedule_path, schedule)
+        if not schedule["scheduled"]:
+            result = StreamingAttemptResult(
+                outcome="no_change", campaign_id=token, reason=schedule["reason_code"])
+            _write_create_once(result_path, asdict(result))
+            return result
         forbidden = {str(value) for row in self.runner.variants
                      for value in (row["qa_id"], row["scene_id"], row["variant_id"])}
         reviser = FitSetSlotReviser(
@@ -579,7 +637,7 @@ class FitSetWorkerEvolution:
             accumulation_root=self.runner.root,
             label_metadata={}, library_root=self.library,
             client=self.runner.revision_client_factory(),
-            max_attempts=self.config.max_revision_attempts,
+            max_attempts=schedule["revision_attempt_budget"],
             max_tokens=self.config.max_tokens,
             method_context_max_chars=self.runner.base_cfg.retrieval_policy.method_context_max_chars,
         )
@@ -601,6 +659,46 @@ class FitSetWorkerEvolution:
                     reason="Current process evidence does not support a method revision")
                 _write_create_once(result_path, asdict(result))
                 return result
+            dedup_key = candidate_dedup_key(
+                slot=request.slot_key, parent_hash=parent.content_sha256,
+                skill_md=candidate.skill_md)
+            index_path = self.root / "candidate_index" / f"{dedup_key}.json"
+            entry = {
+                "slot": request.slot_key, "parent_sha256": parent.content_sha256,
+                "method_sha256": normalized_method_sha256(candidate.skill_md),
+                "candidate_sha256": candidate.content_sha256,
+                "campaign_id": token, "dedup_key": dedup_key,
+            }
+            if index_path.exists():
+                previous = json.loads(index_path.read_text())
+                _require(all(previous[key] == entry[key] for key in (
+                    "slot", "parent_sha256", "method_sha256", "dedup_key")),
+                    "candidate index method identity changed")
+                if previous["campaign_id"] != token:
+                    prior_decision_path = (
+                        self.root / "campaigns" / previous["campaign_id"] / "decision.json")
+                    _require(prior_decision_path.exists(),
+                             "重复候选的原 A/B 未完成，不能伪造评估或重新请求")
+                    prior_decision = json.loads(prior_decision_path.read_text())
+                    prior_body = {key: value for key, value in prior_decision.items()
+                                  if key != "identity_sha256"}
+                    _require(prior_decision["identity_sha256"] == content_sha256(prior_body)
+                             and prior_decision["candidate_hash"] == previous["candidate_sha256"]
+                             and previous["parent_sha256"] == parent.content_sha256,
+                             "重复候选原始证据身份改变")
+                    _write_create_once(root / "duplicate.json", {
+                        **entry, "original_campaign_id": previous["campaign_id"],
+                        "original_decision_sha256": content_sha256(prior_decision),
+                        "gate_reexecuted": False,
+                    })
+                    result = StreamingAttemptResult(
+                        outcome="duplicate", campaign_id=token,
+                        reason="Identical method under the same parent; original gate retained")
+                    _write_create_once(result_path, asdict(result))
+                    return result
+                _require(previous == entry, "candidate index identity changed")
+            else:
+                _write_create_once(index_path, entry)
             if decision_path.exists():
                 decision = json.loads(decision_path.read_text())
                 body = {key: value for key, value in decision.items()
