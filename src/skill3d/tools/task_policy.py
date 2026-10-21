@@ -4,7 +4,7 @@ from types import MappingProxyType
 
 from skill3d.routing.task_classifier import UnknownQuestionTypeError, canonical_task
 
-TOOL_TASK_POLICY_VERSION = "tool-task-policy-v11.8"
+TOOL_TASK_POLICY_VERSION = "tool-task-policy-v11.9-complete-ranking"
 COMMON_TOOLS = frozenset({
     "inspect_frames", "detect_objects", "list_objects", "object_visible_frames",
 })
@@ -13,8 +13,9 @@ _SPATIAL = COMMON_TOOLS | SPATIAL_HELPERS
 TASK_TOOLS = MappingProxyType({
     "object_counting": _SPATIAL | {"count_objects"},
     "object_abs_distance": _SPATIAL | {"object_surface_distance"},
-    "object_rel_distance": _SPATIAL | {
-        "relative_distance_rank", "object_surface_distance"},
+    # Point/pair measurements cannot establish coverage of all answer options.
+    # Keep these local queries on their own tasks; ranking uses one collection contract.
+    "object_rel_distance": COMMON_TOOLS | {"relative_distance_rank"},
     "object_size_estimation": _SPATIAL | {"object_3d_extent"},
     "room_size_estimation": _SPATIAL | {
         "plane_fit_room_size", "connectivity_graph"},

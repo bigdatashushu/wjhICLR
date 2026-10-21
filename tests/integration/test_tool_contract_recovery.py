@@ -304,19 +304,20 @@ SNEAKY_CATCH = (
 )
 
 
-def test_answer_after_caught_contract_error_is_preserved(tmp_path, episode_item):
-    """自捕获工具异常后的预测可保留，但必须记录契约违规并保守归因。"""
+def test_answer_after_caught_contract_error_is_audited_and_rejected(tmp_path, episode_item):
+    """保存预测不等于接受答案；自捕获不能绕过信任拒绝。"""
     client = _FakeClient([SNEAKY_CATCH])
     cfg = _cfg(tmp_path, _write_v6_artifact(tmp_path, with_poses=False), max_recovery=0)
     out = run_episode(episode_item.episode, episode_item.pixels, cfg, llm=client)
 
     assert out.answer_untrusted is True
-    assert out.answer == "0.0"
-    assert out.answer_source == "tool_program"
-    assert out.final_state == "answer"
-    assert out.mra_value is not None
+    assert out.answer is None
+    assert out.final_state == "run_error"
+    assert out.mra_value == 0
+    assert out.rounds[0]["rejected_submission"]["answer"] == "0.0"
+    assert out.rounds[0]["submission_accepted"] is False
     assert "tool_contract_observed" in out.answer_flags
-    assert out.tool_contract_hits == 0
+    assert out.tool_contract_hits >= 1
 
 
 def test_validated_observation_is_not_replayed_after_invalidation(tmp_path,

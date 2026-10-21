@@ -184,7 +184,8 @@ def test_skill_on_off_requests_only_differ_by_complete_method(spec):
     assert "theta_deg" not in off_text
     assert "AnswerPayload" in off_text
     assert ("- object_centroid(" in off_text) == (
-        evidence_available and spec.question_type != "obj_appearance_order")
+        evidence_available and spec.question_type not in {
+            "obj_appearance_order", "object_rel_distance"})
     # 未提供 SceneHandle 的局部坐标约定；方向工具不可凭公共状态放行。
     assert "- relative_direction_of(" not in off_text
     assert "- object_visible_frames(" in off_text
@@ -257,6 +258,9 @@ def test_v11_contract_survives_solver_rounds_and_reaches_trace(
         assert feedback.endswith("Do not call tools after ReturnAnswer.")
     assert out.first_synthesis["template_version"] == PROMPT_TEMPLATE_VERSION
     assert out.first_synthesis["tool_docs_version"] == TOOL_DOCS_VERSION
+    assert out.first_synthesis["delivered_skill_versions"] == (
+        out.first_synthesis["skill_delivery"]["delivered_skill_versions"])
+    assert out.first_synthesis["delivered_skill_versions"] == [f"{spec.skill_id}@{spec.version}"]
     rows = (tmp_path / "traces/trace_record.jsonl").read_text().splitlines()
     assert len(rows) == 1
     assert json.loads(rows[0])["template_version"] == PROMPT_TEMPLATE_VERSION

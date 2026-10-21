@@ -212,6 +212,7 @@ class CellResult:
     # v7 §11.1：YieldObservations 指定的结果与理由（terminated == "yield" 时有意义）
     yielded_result_ids: list[str] = field(default_factory=list)
     yielded_reason: str = ""
+    host_observation_yield: bool = False
     # M3: complete local evidence; model feedback keeps its concise summary.
     stdout: str = ""
     traceback_text: str = ""
@@ -497,6 +498,7 @@ class RestrictedNamespaceKernel:
         except ValueError as exc:
             receipt["reason_code"] = "observation_read_rejected"
             self.authorization_receipts.append(receipt)
+            self.answer_untrusted = True
             raise ValueError(str(exc)) from exc
         receipt.update(allowed=True, reason_code="valid_episode_observation",
                        payload_hash=page["payload_hash"])
@@ -636,6 +638,7 @@ class RestrictedNamespaceKernel:
                 self._record_failed_call(name, call_args, exc, result=result)
                 raise exc
             if result.error is not None:
+                self.answer_untrusted = True
                 raise RuntimeError(f"Tool {name} execution failed: {result.error}")
             return model_tool_response(result)
 
@@ -646,7 +649,7 @@ class RestrictedNamespaceKernel:
         self.show_log.append(obj)
 
     # ---- 执行 ----
-    def run_cell(self, code: str) -> CellResult:
+    def run_cell(self, code: str, *, yield_on_fallthrough: bool = False) -> CellResult:
         """执行一个 cell；捕获 stdout / 错误；答案与 yield 经控制接口终结（v7 §10.2）。
 
         `ToolContractError` 家族（tool_contract / confidence_gate / domain_value）
@@ -661,6 +664,7 @@ class RestrictedNamespaceKernel:
         error: Optional[str] = None
         error_code: Optional[str] = None
         terminated: Optional[str] = None
+        host_observation_yield = False
         diagnostics = {}
         program_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
         filename = f"<episode_program:{program_sha256}>"
@@ -691,6 +695,25 @@ class RestrictedNamespaceKernel:
                     terminated = "yield"
                 else:
                     terminated = self._invoke_entry()
+                if (yield_on_fallthrough and terminated is None and self._tools_enabled
+                        and not self.answer_slot.given and not self.yield_slot.given
+                        and not self.answer_untrusted
+                        and all(r.status == "ok" and r.error is None
+                                and not (isinstance(r.payload, dict) and (
+                                    r.payload.get("status") == "fault"
+                                    or r.payload.get("service_healthy") is False))
+                                for r in self.cell_results)
+                        and all(row.get("allowed") is True for row in
+                                self.authorization_receipts[self._cell_authorization_mark:])):
+                    ids = [r.result_id for r in self.cell_results
+                           if r.status == "ok" and r.error is None and not r.invalidated_by
+                           and r.result_id not in self.unresolved_result_ids]
+                    ids.extend(page["result_id"] for page in
+                               self.observation_reads[self._cell_read_mark:])
+                    if ids:
+                        host_observation_yield = True
+                        self.yield_slot(list(dict.fromkeys(ids)),
+                                        "Host returned successful evidence from an observation-only program.")
         except AnswerTerminate:
             terminated = "answer"
         except YieldTerminate:
@@ -720,10 +743,12 @@ class RestrictedNamespaceKernel:
             answer=self.answer_slot.answer,
             new_vars=new_vars,
             answer_untrusted=self.answer_untrusted,
-            contract_violations=[r.model_dump() for r in self.contract_violations],
+            contract_violations=[r.model_dump() for r in
+                                 self.contract_violations[self._cell_violation_mark:]],
             terminated=terminated,
             yielded_result_ids=list(self.yield_slot.result_ids),
             yielded_reason=self.yield_slot.reason,
+            host_observation_yield=host_observation_yield,
             stdout=buf.getvalue(), program_sha256=program_sha256,
             source_filename=filename, **diagnostics,
         )
@@ -772,6 +797,8 @@ class RestrictedNamespaceKernel:
         self._cell_call_mark = len(self.tool_calls)
         self._cell_result_mark = len(self.tool_results)
         self._cell_read_mark = len(self.observation_reads)
+        self._cell_authorization_mark = len(self.authorization_receipts)
+        self._cell_violation_mark = len(self.contract_violations)
 
     @property
     def cell_calls(self) -> list[ToolCall]:

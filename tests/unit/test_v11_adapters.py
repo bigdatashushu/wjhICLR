@@ -140,8 +140,9 @@ def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_pa
     tool_text = client.calls[0][0][1]["content"].split("Current Tool interfaces", 1)[1].split(
         "Induction experience JSON", 1)[0]
     assert "- relative_distance_rank(" in tool_text
-    assert "- object_surface_distance(" in tool_text
-    assert "allowed units: normalized]" in tool_text
+    assert "- object_surface_distance(" not in tool_text
+    assert "- object_centroid(" not in tool_text
+    assert "- reproject(" not in tool_text
     assert "- plane_fit_room_size(" not in tool_text
     assert "- camera_object_distance(" not in tool_text
     assert not re.search(r"[\u4e00-\u9fff]", json.dumps(client.calls[0][0], ensure_ascii=False))

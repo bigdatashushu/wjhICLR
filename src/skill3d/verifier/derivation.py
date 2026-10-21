@@ -16,6 +16,7 @@ from skill3d.schemas import (
 )
 from skill3d.tools.category_match import matches, option_category
 from skill3d.tools.ranking_contract import ranking_problems
+from skill3d.schemas.answer import DERIVATION_PARAMETER_FIELDS, direction_option_mapping
 
 
 class DerivationIssue(BaseModel):
@@ -47,14 +48,7 @@ class DerivationReplayError(ValueError):
         self.result_id = result_id
 
 
-_ALLOWED_PARAMETERS = {
-    "field": frozenset({"field"}),
-    "convert": frozenset({"field", "from_unit", "to_unit"}),
-    "count": frozenset({"field"}),
-    "sort": frozenset({"field", "key", "descending", "labels"}),
-    "argmin": frozenset({"field", "key", "labels"}),
-    "option_map": frozenset({"field", "mapping"}),
-}
+_ALLOWED_PARAMETERS = DERIVATION_PARAMETER_FIELDS
 
 _CONVERSION_FACTORS = {
     ("m", "m"): 1.0,
@@ -372,6 +366,7 @@ def replay_derivation(
     *,
     question_type: str = "",
     options: Optional[Sequence[str]] = None,
+    evidence_result_ids: Sequence[str] = (),
 ) -> DerivationReplayResult:
     """Replay one operation against RAW ToolResult data and verify value/unit.
 
@@ -398,7 +393,24 @@ def replay_derivation(
             reason=f"Question type {question_type} requires unit={expected_unit}; got {payload.unit}",
         ))
     derivation = payload.derivation
-    referenced = set(payload.used_result_ids) | set(payload.derivation_inputs())
+    referenced = (set(payload.used_result_ids) | set(payload.derivation_inputs())
+                  | set(evidence_result_ids))
+    mapping = direction_option_mapping(options or [])
+    if (question_type == "object_rel_direction" and mapping
+            and derivation and derivation.get("op") == "option_map"):
+        for result in results:
+            if result.result_id not in set(payload.derivation_inputs()) or result.tool != "relative_direction_of":
+                continue
+            try:
+                direction = _decode_result(result).get("direction")
+                if direction in mapping and str(payload.value).strip().upper() != mapping[direction]:
+                    issues.append(DerivationIssue(
+                        code="direction_option_mismatch", result_id=result.result_id,
+                        reason="The declared option mapping does not match the direction vocabulary "
+                               "in the current answer options."))
+            except (DerivationReplayError, AttributeError):
+                # The ordinary decoder/replay below reports malformed inputs.
+                pass
     ranks = []
     for result in results:
         if result.result_id not in referenced or result.tool != "relative_distance_rank":
@@ -415,6 +427,18 @@ def replay_derivation(
         except DerivationReplayError as exc:
             issues.append(DerivationIssue(
                 code=exc.code, reason=str(exc), result_id=exc.result_id))
+    if question_type == "object_rel_distance":
+        spatial_results = [result for result in results
+                           if result.result_id in referenced and result.tool in {
+                               "object_surface_distance", "surface_distance_between_objects",
+                               "object_distance_m", "robust_distance", "euclidean_distance",
+                               "object_centroid", "reproject", "relative_distance_rank"}]
+        if spatial_results and not ranks:
+            issues.append(DerivationIssue(
+                code="ranking_coverage_required",
+                reason="Spatial measurements cannot establish a complete option ranking without "
+                       "a valid relative_distance_rank covering every current option. "
+                       "Missing or unmeasurable candidates remain unresolved."))
     # A model-provided mapping/labels array must not swap the measured winner.
     if options and payload.basis == "tool_derived" and question_type == "object_rel_distance":
         for rank in ranks:

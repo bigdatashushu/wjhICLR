@@ -39,7 +39,7 @@ def _context(task="object_abs_distance", state="g1m1"):
 @pytest.mark.parametrize(("task", "sizes"), [
     ("object_counting", (4, 7, 7)),
     ("object_abs_distance", (4, 7, 7)),
-    ("object_rel_distance", (4, 8, 8)),
+    ("object_rel_distance", (4, 5, 5)),
     ("object_size_estimation", (4, 6, 7)),
     ("room_size_estimation", (4, 7, 8)),
     ("object_rel_direction", (4, 7, 7)),
@@ -151,7 +151,7 @@ def test_metric_downgrade_invalidates_only_metric_mode_and_allows_normalized(tmp
 def test_docs_only_advertise_allowed_unit_modes():
     for task, expected in (
         ("object_abs_distance", "allowed units: normalized, m"),
-        ("object_rel_distance", "allowed units: normalized]")):
+        ("object_rel_distance", "- relative_distance_rank(")):
         ctx = _context(task)
         docs = REGISTRY.docs(
             ctx["scope"], ctx["available_artifacts"], evidence_profile=ctx["profile"],
@@ -160,6 +160,10 @@ def test_docs_only_advertise_allowed_unit_modes():
         assert expected in docs
         assert "- object_distance_m(" not in docs
         assert "- surface_distance_between_objects(" not in docs
+        if task == "object_rel_distance":
+            assert "- object_surface_distance(" not in docs
+            assert "- object_centroid(" not in docs
+            assert "- reproject(" not in docs
 
 
 def test_distance_unit_mismatch_is_rejected_by_verifier(tmp_path):
@@ -186,11 +190,10 @@ def test_unknown_unit_modes_are_refused_before_execution(tmp_path, unit):
 def test_nonmetric_g1m1_keeps_geometry_but_rejects_metric_distance(tmp_path):
     handle = _handle(tmp_path, task="object_rel_distance")
     assert handle.evidence_profile.metric_scale == "available"
-    assert REGISTRY.call_tool(
-        "object_surface_distance", {"obj_a": "a", "obj_b": "b"}, handle).status == "ok"
-    with pytest.raises(ToolContractError):
-        REGISTRY.call_tool("object_surface_distance",
-                           {"obj_a": "a", "obj_b": "b", "unit": "m"}, handle)
+    for unit in ("normalized", "m"):
+        with pytest.raises(ToolContractError, match="not exposed"):
+            REGISTRY.call_tool("object_surface_distance",
+                               {"obj_a": "a", "obj_b": "b", "unit": unit}, handle)
 
 
 def test_tool_snapshot_changes_only_two_slot_sources_and_keeps_parents():

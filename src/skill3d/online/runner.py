@@ -52,7 +52,10 @@ from skill3d.routing.skill_retriever import (
 )
 from skill3d.routing.task_classifier import TaskClassification, canonical_task, classify
 from skill3d.sandbox.ast_guard import ast_guard
-from skill3d.sandbox.action_check import ARGUMENT_ERROR_REASONS, check_action
+from skill3d.sandbox.action_check import (
+    ARGUMENT_ERROR_REASONS, OBSERVATION_FALLTHROUGH_VERSION, check_action,
+    permits_observation_fallthrough,
+)
 from skill3d.sandbox.kernel import CellResult, RestrictedNamespaceKernel
 from skill3d.sandbox.receipt import ReceiptChain, SandboxReceipt, verify_chain
 from skill3d.schemas import (
@@ -678,7 +681,8 @@ def _round_record(
         "execution_diagnostics": ({
             key: getattr(program_trace, key) for key in (
                 "traceback_text", "error_type", "error_message", "error_line",
-                "error_source_line", "source_filename", "program_sha256", "stdout")
+                "error_source_line", "source_filename", "program_sha256", "stdout",
+                "answer_untrusted")
         } if program_trace is not None else {}),
         "service_errors": [
             {"tool": r.tool, "error": (r.payload or {}).get("error", "service fault")}
@@ -1754,11 +1758,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 finalization_observations=(observations() if finalizing else None),
                 finalization_pages=(valid_pages()[-3:] if finalizing else None),
                 round_index=index, trigger=trigger)
+        _record_skill_delivery(outcome, res.delivery, round_index=index,
+                               skills=skills, program=res.program)
         if index == 1:
             _record_first_synthesis(outcome, res, scene, cfg)
             outcome.m8_prompt = str(res.prompt or "")
-        _record_skill_delivery(outcome, res.delivery, round_index=index,
-                               skills=skills, program=res.program)
         outcome.synthesis_source = res.source
         outcome.n_images_to_synthesizer = int(res.n_images)
         outcome.m8_notes.append(f"round={index} source={res.source} {res.note}")
@@ -1786,6 +1790,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         deterministic_failure = False
         yielded = False
         round_results = []
+        observation_fallthrough = False
         feedback = None
         observation_images = []
         if program is None:
@@ -1811,6 +1816,18 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             check = ast_guard(program.program_source, allowed_tools=set(REGISTRY.names()))
             action = (check_action(program.program_source, finalizing=finalizing,
                                    tool_names=set(REGISTRY.names())) if check.ok else None)
+            if (action is not None and action.error_code == "program_missing_action"
+                    and not finalizing):
+                observation_fallthrough = permits_observation_fallthrough(
+                    program.program_source, tool_names=set(REGISTRY.model_names()))
+                if observation_fallthrough:
+                    record["observation_adapter"] = {
+                        "version": OBSERVATION_FALLTHROUGH_VERSION,
+                        "original_action_error": action.error_code,
+                        "program_sha256": hashlib.sha256(
+                            program.program_source.encode()).hexdigest(),
+                        "answer_inference": False,
+                    }
             if not check.ok:
                 problems = list(check.violations)
                 outcome.static_check_errors.extend(problems)
@@ -1819,7 +1836,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     else "ast_violation")
                 feedback = "The previous program was rejected by the AST check: " + "; ".join(problems)
                 failure_key = "ast"
-            elif not action.ok:
+            elif not action.ok and not observation_fallthrough:
                 record["error_code"] = action.error_code
                 feedback = action.reason
                 failure_key = action.error_code
@@ -1855,7 +1872,14 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 start = time.perf_counter()
                 kernel, cell, trace = _execute_program(
                     episode, program, handle, pixels, cfg, receipts, kernel=kernel,
-                    tools_enabled=not finalizing)
+                    tools_enabled=not finalizing,
+                    yield_on_fallthrough=observation_fallthrough)
+                if observation_fallthrough:
+                    record["observation_adapter"].update(
+                        yielded=cell.host_observation_yield,
+                        result_ids=list(cell.yielded_result_ids))
+                    receipts.append("observation_adapter", {
+                        "round": index, **record["observation_adapter"]})
                 trace = trace.model_copy(update={
                     "wallclock_s": 0.0 if cfg.deterministic_replay else time.perf_counter() - start,
                     "answer_untrusted": bool(cell.answer_untrusted)})
@@ -1879,7 +1903,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     cause = cell.contract_violations[-1]
                     if cause.get("error_code"):
                         record["cause_code"] = str(cause["error_code"])
-                if finalizing and cell.answer_untrusted:
+                if cell.answer_untrusted:
                     error = "tool_contract"
                 if error is None and str(cell.answer or "").strip():
                     step("ok")
@@ -1901,6 +1925,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         kernel.tool_results,
                         question_type=str(outcome.task or episode.question_type or ""),
                         options=episode.options,
+                        evidence_result_ids=[r.result_id for r in scope.results],
                     )
                     if not replay.passed:
                         derivation_issues = [
@@ -1955,6 +1980,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         return scene, handle, skills, kernel, trace
                     record["submission_accepted"] = False
                     record["rejected_submission"] = rejected_submission(kernel)
+                    prior_source = None
+                    record["recovery_previous_program_omitted"] = "rejected_submission"
                     # 保存审计后立即清空 answer/payload/given 和用户变量，账本保留。
                     kernel.reset_user_namespace()
                     ids = invalidate_results(
@@ -2023,6 +2050,18 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         "runtime_error")
                     if kernel.answer_slot.given:
                         record["rejected_submission"] = rejected_submission(kernel)
+                        record["submission_accepted"] = False
+                        prior_source = None
+                        record["recovery_previous_program_omitted"] = "rejected_submission"
+                        record["submission_rejection"] = {
+                            "reason": "untrusted_execution" if cell.answer_untrusted else "execution_error",
+                            "answer_untrusted": bool(cell.answer_untrusted),
+                        }
+                        feedback += (
+                            "\nThe prediction was saved for audit and rejected, not accepted. "
+                            "A caught tool failure still blocks this cell's submission. "
+                            "The answer slot and program variables are cleared before recovery; "
+                            "use independent valid evidence and declare actual dependencies.")
                     if error in _RECOVERABLE_CONTRACT_ERRORS:
                         outcome.tool_contract_hits += 1
                         outcome.recovery_count += 1
@@ -3009,7 +3048,8 @@ def _make_online_client(cfg: OnlineRunConfig):
 
 def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, receipts,
                      kernel: Optional[RestrictedNamespaceKernel] = None,
-                     tools_enabled: Optional[bool] = None):
+                     tools_enabled: Optional[bool] = None,
+                     yield_on_fallthrough: bool = False):
     """M10：建/复用 kernel → 执行 program → 收集 ProgramExecutionTrace（§5.4）。
 
     `kernel` 非空时**先 reset user namespace 再重注入**（SpatialClaw §E.3 先例）：
@@ -3035,7 +3075,7 @@ def _execute_program(episode, program, handle, pixels, cfg: OnlineRunConfig, rec
     if tools_enabled is not None:
         kernel.set_tools_enabled(tools_enabled)
     receipts.append("sandbox_start", {"episode_id": episode.qa_id, "mode": cfg.mode})
-    cell = kernel.run_cell(program.program_source)
+    cell = kernel.run_cell(program.program_source, yield_on_fallthrough=yield_on_fallthrough)
     # 逐轮视图：账本跨轮只增不减（§17.1），但本轮 trace 只报本轮产生的调用/结果
     results = list(kernel.cell_results)
     if cfg.deterministic_replay:

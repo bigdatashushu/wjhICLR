@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, Optional
 
 from . import Spec
@@ -56,7 +57,50 @@ DERIVATION_OPS: frozenset[str] = frozenset({
     "option_map",   # 选项映射
 })
 
+DERIVATION_PARAMETER_FIELDS = {
+    "field": frozenset({"field"}),
+    "convert": frozenset({"field", "from_unit", "to_unit"}),
+    "count": frozenset({"field"}),
+    "sort": frozenset({"field", "key", "descending", "labels"}),
+    "argmin": frozenset({"field", "key", "labels"}),
+    "option_map": frozenset({"field", "mapping"}),
+}
+
+
+def direction_option_mapping(options) -> dict[str, str]:
+    """Map only explicit, unambiguous direction vocabulary in current options."""
+    vocabulary = {"front", "back", "left", "right", "front-left", "front-right",
+                  "back-left", "back-right"}
+    mapping = {}
+    for index, option in enumerate(options):
+        text = re.sub(r"^[A-Za-z][.)]\s*", "", str(option).strip()).lower()
+        text = re.sub(r"[\s_]+", "-", text)
+        text = text.replace("backward", "back").replace("forward", "front")
+        if text not in vocabulary or text in mapping:
+            return {}
+        mapping[text] = chr(ord("A") + index)
+    return mapping
+
+
+def derivation_contract() -> dict:
+    """The prompt and replay share the exact fields; examples are data only."""
+    return {
+        "required_fields": ["op", "input_result_ids", "parameters"],
+        "allowed_parameters": {op: sorted(keys) for op, keys in DERIVATION_PARAMETER_FIELDS.items()},
+        "input_result_ids": "nonempty unique host-issued IDs, all declared in used_result_ids",
+        "data_root": "raw tool payload, no envelope data prefix; empty field selects the entire root",
+        "raw_list_count_example": {
+            "op": "count", "input_result_ids": ["<valid-result-id>"],
+            "parameters": {"field": ""}},
+        "direction_option_example": {
+            "op": "option_map", "input_result_ids": ["<valid-direction-result-id>"],
+            "parameters": {"field": "direction", "mapping": "<current direction-to-letter map>"}},
+        "examples_require_actual_results": True,
+        "list_length_is_not_physical_instance_coverage": True,
+    }
+
 ADAPTER_VERSION_LEGACY_SHORT_FORM = "answer-adapter-v9-legacy-short-form"
+
 
 
 class AnswerPayload(Spec):

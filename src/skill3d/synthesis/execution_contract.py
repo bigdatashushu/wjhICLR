@@ -9,10 +9,10 @@ import inspect
 import json
 import re
 
-from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
+from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE, derivation_contract
 from skill3d.schemas.tool_response import TOOL_RESPONSE_VERSION, TOOL_RESPONSE_FIELDS
 
-CONTRACT_VERSION = "execution-contract/4.0"
+CONTRACT_VERSION = "execution-contract/5.0"
 
 _RULES = (
     "Ordinary requests output exactly one Python fenced code block and no outside explanation.",
@@ -25,12 +25,20 @@ _RULES = (
     "All input episodes start with the frozen 32 original frames. Additional tools are optional; zero calls do not mean no images.",
     "Each request contains only its declared image pack; a previous request is not persistent visual memory.",
     "User variables are cleared between rounds. print is diagnostic output, not an observation action.",
+    "An ordinary program with evidence calls but no control can return successful current observations "
+    "through the host observation-fallthrough adapter. It never infers or submits an answer, never "
+    "uses historical results to qualify, and cannot return caught failures as successful observations.",
     "Generating a crop is not observing it: YieldObservations must deliver pixels in a completed subsequent request.",
     "selected_object_count and resolved_tool_object_count are read-only telemetry, never answer fields or a required nonzero selection.",
     "Candidate records and resolved tool IDs do not establish the intended referent or scene completeness.",
     "With readable images give the best legal answer; uncertainty permits a visual estimate, not abstain. Input failures remain in the denominator.",
     "A Skill specifies a method only; it cannot grant tools, increase budget, change scoring, or bypass M11.",
     "Failed, unresolved, or invalidated evidence cannot support a submission. Changing basis alone does not repair evidence.",
+    "Caught tool failures reject submissions in ordinary and finalization phases alike. Predictions are "
+    "saved for audit, then cleared. Rejected prediction programs are not reinserted into recovery requests. "
+    "Independent valid evidence may support a subsequent submission.",
+    "Relative-distance geometry must use a complete relative_distance_rank covering all current options; "
+    "missing or unmeasurable options remain unresolved, never infinity or absent.",
     "Scene geometry does not imply valid object binding or collection coverage. Normalized coordinates do not supply metric scale.",
 )
 
@@ -42,6 +50,7 @@ class ExecutionContract:
 
     def to_dict(self) -> dict:
         from skill3d.online.observation_reader import reader_contract
+        from skill3d.sandbox.action_check import OBSERVATION_FALLTHROUGH_VERSION
         from skill3d.online.progress import PROGRESS_VERSION, NO_PROGRESS_LIMIT
         from skill3d.schemas.image_ledger import LAYOUT_DERIVED_PLUS_ORIGINALS
         from skill3d.online.submission import (
@@ -53,9 +62,11 @@ class ExecutionContract:
             **asdict(self),
             "rules": list(_RULES),
             "answer_units": dict(CANONICAL_UNIT_BY_QUESTION_TYPE),
+            "derivation_contract": derivation_contract(),
             "finalization_schema_version": FINALIZATION_SCHEMA_VERSION,
             "finalization_method_delivery": FINALIZATION_DELIVERY_STRATEGY,
             "tool_response_schema_version": TOOL_RESPONSE_VERSION,
+            "observation_fallthrough_version": OBSERVATION_FALLTHROUGH_VERSION,
             "host_observation_reader": reader_contract(),
             "progress_policy": {"version": PROGRESS_VERSION, "no_progress_limit": NO_PROGRESS_LIMIT,
                                 "status": "frozen_pilot_policy"},

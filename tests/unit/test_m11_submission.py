@@ -335,3 +335,53 @@ def test_rank_derivation_checks_actual_option_coverage_and_mapping():
     assert not replay("A", {"chair": "A"}, ["chair", "lamp", "table"]).passed
     wrong = replay("B", {"chair": "B", "lamp": "A"}, ["chair", "lamp"])
     assert "ranking_option_mismatch" in {i.code for i in wrong.issues}
+
+
+@pytest.mark.parametrize("basis", ["mixed", "visual_estimate"])
+def test_current_pair_measurement_cannot_replace_collection_coverage_or_be_omitted(basis):
+    from skill3d.online.submission import accepted_result_ids
+    result = _result("pair", {"distance_normalized": 1.0}, tool="object_surface_distance")
+    payload = AnswerPayload(value="A", unit="option", basis=basis)
+    replay = replay_derivation(
+        payload, [result], question_type="object_rel_distance", options=["chair", "heater"],
+        evidence_result_ids=["pair"])
+    assert not replay.passed
+    assert "ranking_coverage_required" in {issue.code for issue in replay.issues}
+    kernel = RestrictedNamespaceKernel(REGISTRY, _ranking_handle())
+    kernel.tool_results = [result]
+    with pytest.raises(AnswerTerminate):
+        kernel.answer_slot(payload)
+    trace = ProgramExecutionTrace(
+        program_id="p", calls=[], results=[result], stdout_tail="",
+        error_code=None, steps=1, wallclock_s=0)
+    assert accepted_result_ids(kernel, submission_scope(kernel, trace)) == ["pair"]
+    # Independent zero-tool visual reasoning need not use old pair measurements.
+    if basis == "visual_estimate":
+        assert submission_scope(kernel, trace.model_copy(update={"results": []})).results == []
+
+
+def test_explicit_valid_reference_cannot_hide_current_incomplete_rank():
+    handle = _ranking_handle(missing=True)
+    listed = _result("listed", [], tool="list_objects")
+    rank = _result(
+        "rank", relative_distance_rank(handle, "desk", ["chair", "lamp"]),
+        tool="relative_distance_rank")
+    replay = replay_derivation(
+        AnswerPayload(value="A", unit="option", basis="mixed", used_result_ids=["listed"]),
+        [listed, rank], question_type="object_rel_distance", options=["chair", "lamp"],
+        evidence_result_ids=["listed", "rank"])
+    assert not replay.passed and "incomplete_ranking" in {i.code for i in replay.issues}
+
+
+def test_current_direction_mapping_cannot_swap_option_letters_even_with_mixed_basis():
+    result = _result("direction", {"direction": "front-right"}, tool="relative_direction_of")
+    options = ["A. back-left", "B. back-right", "C. front-left", "D. front-right"]
+    for value, expected in [("D", True), ("C", False)]:
+        payload = AnswerPayload(
+            value=value, unit="option", basis="mixed", used_result_ids=["direction"],
+            derivation={"op": "option_map", "input_result_ids": ["direction"],
+                        "parameters": {"field": "direction", "mapping": {"front-right": value}}})
+        replay = replay_derivation(payload, [result], question_type="object_rel_direction", options=options)
+        assert replay.passed is expected
+        if not expected:
+            assert "direction_option_mismatch" in {i.code for i in replay.issues}

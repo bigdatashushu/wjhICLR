@@ -55,7 +55,7 @@ from skill3d.tools.task_policy import MODEL_TOOLS, TOOL_TASK_POLICY_VERSION
 # v9 §9.2/§9.4：工具面新增 `inspect_frames` / `detect_objects`（主动图像与补检）。
 # 工具面变了就升版本 —— prompt 里列出的 Tool 集合与 trace 的 tool_face_version
 # 必须对得上，否则"这次跑的是哪套工具面"无法回答。
-TOOL_FACE_VERSION: str = "tool-face-v11.10-observation-guidance"
+TOOL_FACE_VERSION: str = "tool-face-v11.11-complete-ranking"
 
 
 class ToolNotFoundError(KeyError):

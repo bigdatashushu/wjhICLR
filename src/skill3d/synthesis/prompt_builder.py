@@ -13,12 +13,14 @@ from typing import Optional, Sequence
 from jinja2 import Environment, StrictUndefined
 
 from skill3d.schemas import SkillSpecV11
-from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
+from skill3d.schemas.answer import (
+    CANONICAL_UNIT_BY_QUESTION_TYPE, derivation_contract, direction_option_mapping,
+)
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 from skill3d.synthesis.execution_contract import ExecutionContract
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_12_en"
-FINALIZATION_PROMPT_VERSION = "finalization_v11_3_en"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_13_en"
+FINALIZATION_PROMPT_VERSION = "finalization_v11_4_en"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -48,6 +50,7 @@ with `return ReturnAnswer(AnswerPayload(...))`.
 - `return ReturnAnswer(AnswerPayload(...))` submits a provisional answer and immediately ends the current program segment. The episode ends only after geometry and valid-evidence checks pass. A rejected submission is revoked; the same model receives failed checks, affected results, and still-valid observations to correct it within the remaining budget.
 - `return YieldObservations([result_id, ...], "reason")` ends this segment and sends the named results' actual values into the next request. The framework controls the round and retry budgets.
 - `ReadObservation(result_id, fields=None, offset=0, limit=8)` reads a bounded page of an existing valid result without rerunning tools. Then YieldObservations to receive the page in the next request. Use next_cursor for missing candidates. print is diagnostic only.
+- If evidence calls finish successfully without a control action, the host may return only their current valid observations. This never submits a variable, print output, or prose as an answer. A caught tool failure rejects the cell's submission in every phase.
 - Reason only from images actually received and valid tool observations. Invalidated results must not support the answer.
 - Answer whenever readable images are available. Insufficient evidence permits a visual estimate with an honest basis declaration; `ReturnAnswer("abstain")` is not a valid answer.
 - Missing tools, failed calls, and invalid results do not mean zero. Do not invent geometry, scale, observations, or result_id values.
@@ -75,6 +78,9 @@ with `return ReturnAnswer(AnswerPayload(...))`.
   sort is similar to argmin and also accepts `descending`; option_map=
   `{"field":"direction","mapping":{"left":"A","right":"B"}}`.
   All derivation field paths address the original tool data, without the envelope's `data` prefix.
+  The exact required fields and raw-root examples are: {{ derivation_contract_json }}
+{% if direction_mapping_json %}  Current direction vocabulary to option letters: {{ direction_mapping_json }}. Use option_map to map a direction field; a raw direction word is not an option letter.
+{% endif %}
   Parameters may contain only these structured fields, never code or expressions. If a single registered operation cannot fully establish the answer, use mixed, not tool_derived.
 - `ReturnAnswer(value)` remains compatible and is conservatively recorded as mixed.
   Use the complete AnswerPayload in new programs. Short-form answers cause historical valid successful results to be checked even if the current segment calls no tools.
@@ -186,6 +192,9 @@ class PromptBuilder:
             answer_unit=CANONICAL_UNIT_BY_QUESTION_TYPE.get(question_type, ""),
             task_definition=_TASK_DEFINITIONS.get(question_type, ""),
             options=list(options) if options else None,
+            derivation_contract_json=json.dumps(derivation_contract(), sort_keys=True),
+            direction_mapping_json=(json.dumps(direction_option_mapping(options or []), sort_keys=True)
+                                    if question_type == "object_rel_direction" else ""),
             skill_entries=[e.text for e in (plan.entries if plan is not None else [])],
         )
 
@@ -264,6 +273,12 @@ def build_finalization_prompt(*, question: str, options: Sequence[str], question
         "tool_derived also requires a replayable derivation with op, input_result_ids, parameters. "
         "Every input_result_id must appear in used_result_ids.",
         "Derivation field paths start at the original tool data, without the envelope's data prefix.",
+        "Exact derivation contract and raw-root examples: "
+        + json.dumps(derivation_contract(), sort_keys=True),
+        ("Current direction vocabulary to option letters: "
+         + json.dumps(direction_option_mapping(options), sort_keys=True)
+         + ". Declare option_map over field=direction; do not submit the raw direction word."
+         if question_type == "object_rel_direction" else ""),
         "Allowed derivations: field(parameters={field}); convert({field,from_unit,to_unit}); "
         "count({field}); sort({field,key,descending,labels}); argmin({field,key,labels}); "
         "option_map({field,mapping}). Use dot-separated paths into raw tool data, not expressions. "

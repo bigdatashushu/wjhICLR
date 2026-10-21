@@ -10,7 +10,7 @@ from skill3d.schemas import AnswerPayload, CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.verifier.geometry_oracle import GeometryIssue
 from skill3d.schemas.tool import FailureCause
 
-EXECUTION_PROTOCOL_VERSION = "solver-v11.11-observation-context"
+EXECUTION_PROTOCOL_VERSION = "solver-v11.12-trusted-observation-recovery"
 FINALIZATION_SCHEMA_VERSION = "answer-finalization/1.0"
 FINALIZATION_DELIVERY_STRATEGY = "omit_complete_method"
 
@@ -171,14 +171,13 @@ def rejected_submission(kernel) -> dict:
 
 
 def accepted_result_ids(kernel, trace) -> list[str]:
-    """最终关联集合：显式声明优先；短写答案保守关联整个验收范围。"""
-    payload = kernel.answer_slot.payload
-    if payload is not None and payload.basis == "visual_estimate":
-        return []
-    referenced = (set(payload.used_result_ids) | set(payload.derivation_inputs())
-                  if payload is not None else set())
-    available = [r.result_id for r in trace.results if r.result_id]
-    return [rid for rid in available if not referenced or rid in referenced]
+    """Retain the verified conservative scope, including this cell's results.
+
+    Explicit references cannot hide current measurements. A zero-tool visual
+    segment still has an empty scope; the declaration and inferred scope remain
+    separately recorded by the attribution ledger.
+    """
+    return list(dict.fromkeys(r.result_id for r in trace.results if r.result_id))
 
 
 def used_evidence_flags(kernel, result_ids, handle=None) -> list[dict]:

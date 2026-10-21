@@ -1,6 +1,6 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.11-observation-guidance"
+TOOL_DOCS_VERSION = "tool-docs-v11.12-complete-ranking"
 
 
 DESCRIPTIONS = {

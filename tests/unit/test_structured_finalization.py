@@ -24,7 +24,8 @@ def answer(**changes):
 
 def parse(raw, **changes):
     args = dict(question_type="object_counting", options=[],
-                valid_result_ids=[], readable_images=True, **changes)
+                valid_result_ids=[], readable_images=True)
+    args.update(changes)
     return parse_finalization(json.dumps(raw) if not isinstance(raw, str) else raw, **args)
 
 
@@ -128,3 +129,26 @@ def test_conditional_control_is_left_to_runtime_and_final_tools_are_distinct():
     result = check_action("ctx.tools.list_objects()\nReturnAnswer(3)", finalizing=True,
                           tool_names=set(REGISTRY.names()))
     assert result.error_code == "finalization_tool_call_disallowed"
+
+
+@pytest.mark.parametrize("derivation", [
+    {"op": "count", "parameters": {"field": ""}},
+    {"op": "count", "input_result_ids": ["r"]},
+    {"input_result_ids": ["r"], "parameters": {"field": ""}},
+    {"op": "count", "input_result_ids": ["r"], "parameters": {}, "field": "data"},
+])
+def test_derivation_fields_are_required_and_never_filled_from_prediction(derivation):
+    with pytest.raises(SubmissionFormatError):
+        parse(answer(basis="tool_derived", used_result_ids=["r"], derivation=derivation),
+              valid_result_ids=["r"])
+
+
+def test_raw_list_root_is_explicit_and_envelope_data_is_not_a_replay_path():
+    result = ToolResult(result_id="r", source_tool="list_objects", tool="list_objects",
+                        status="ok", value='["one","two"]', request_digest="d")
+    for field, expected in [("", True), ("data", False), ("objects", False)]:
+        payload = parse(
+            answer(value=2, basis="tool_derived", used_result_ids=["r"],
+                   derivation={"op": "count", "input_result_ids": ["r"],
+                               "parameters": {"field": field}}), valid_result_ids=["r"])
+        assert replay_derivation(payload, [result], question_type="object_counting").passed is expected

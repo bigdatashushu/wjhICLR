@@ -17,6 +17,37 @@ ARGUMENT_ERROR_REASONS = frozenset({
     "crop_frame_count_mismatch", "invalid_crop_box", "frame_slot_out_of_range",
 })
 
+OBSERVATION_FALLTHROUGH_VERSION = "observation-fallthrough/1.0"
+
+
+def permits_observation_fallthrough(source: str, *, tool_names: set[str]) -> bool:
+    """Only a missing observation control may be adapted, never an answer.
+
+    Static intent is necessary but insufficient: the kernel must also observe
+    successful evidence in this cell. A helper definition or dead branch alone
+    cannot make a host yield, and historical ledger entries cannot qualify.
+    """
+    tree = ast.parse(normalize_program_source(source))
+    if any((isinstance(node, ast.Name) and node.id in {
+            "ReturnAnswer", "YieldObservations", "AnswerPayload"})
+           or (isinstance(node, ast.Attribute) and node.attr in {
+               "ReturnAnswer", "YieldObservations", "AnswerPayload"})
+           for node in ast.walk(tree)):
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif (isinstance(node.func, ast.Attribute)
+              and ast.unparse(node.func.value) in {"tools", "ctx.tools"}):
+            name = node.func.attr
+        else:
+            continue
+        if name in tool_names | {"ReadObservation"}:
+            return True
+    return False
+
 
 @dataclass(frozen=True)
 class ActionCheck:

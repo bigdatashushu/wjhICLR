@@ -100,3 +100,67 @@ def test_host_generated_submission_still_uses_geometry_acceptance(source, tmp_pa
     assert out.failure_code == "geometry_verification_rejected"
     assert out.rounds[-1]["rejected_submission"]["given"] is True
     assert out.rounds[-1]["submission_accepted"] is False
+
+
+def test_missing_yield_executes_requested_observation_in_first_request(source, tmp_path):
+    out, client = run(source, tmp_path, [
+        "result = list_objects()\nprint(result['data'])", response()])
+    assert len(client.calls) == 2 and out.final_state == "answer"
+    first = out.rounds[0]
+    assert first["executed"] and first["observation_adapter"]["yielded"]
+    assert first["observation_adapter"]["answer_inference"] is False
+    assert first["observation_adapter"]["result_ids"]
+    assert first["program_source"] == "result = list_objects()\nprint(result['data'])"
+    assert out.yield_count == 1 and not out.answer_untrusted
+
+
+def test_caught_failure_prediction_is_rejected_and_independent_visual_can_recover(source, tmp_path):
+    bad = (
+        "try:\n    exists_in_scene('anything')\nexcept Exception:\n    pass\n"
+        "ReturnAnswer(AnswerPayload(value=3, unit='m2', basis='visual_estimate'))")
+    out, client = run(source, tmp_path, [bad, response(value=4)])
+    first = out.rounds[0]
+    assert first["rejected_submission"]["answer"] == "3"
+    assert first["submission_accepted"] is False
+    assert first["submission_rejection"]["answer_untrusted"] is True
+    assert first["execution_diagnostics"]["answer_untrusted"] is True
+    assert first["error_code"] == "tool_precondition_rejected"
+    assert out.answer == "4" and out.final_state == "answer"
+    assert not out.answer_untrusted and out.verify.passed
+    assert len(client.calls) == 2
+    assert out.rounds[1]["results"] == [] and out.used_result_ids == []
+    assert out.authorization_receipts[0]["allowed"] is False
+
+
+def test_six_request_cap_counts_missing_actions_and_finalizer(source, tmp_path):
+    item, artifact = source
+    client = Client(["answer = 3"] * 5 + [response()])
+    out = runner.run_episode(
+        item.episode, item.pixels, OnlineRunConfig(
+            mode="real", reuse_artifact=artifact, max_solver_rounds=6,
+            finalization_rounds=1, max_retries_per_operation=10,
+            eval_visual_fallback=False, trace_dir=str(tmp_path / "six")), llm=client)
+    assert len(client.calls) == out.agent_rounds == 6
+    assert [phase for phase, _, _ in client.calls] == ["program"] * 5 + ["finalization"]
+    assert all(not row["executed"] for row in out.rounds[:5])
+    assert out.answer == "3" and out.final_state == "answer"
+
+
+def test_rejected_prediction_program_is_audit_only_and_not_in_ordinary_recovery(source, tmp_path):
+    item, artifact = source
+    marker = "AUDIT_ONLY_REJECTED_PROGRAM"
+    bad = (
+        f"# {marker}\ntry:\n    exists_in_scene('anything')\nexcept Exception:\n    pass\n"
+        "ReturnAnswer(AnswerPayload(value=3, unit='m2', basis='visual_estimate'))")
+    client = Client([bad, "ReturnAnswer(AnswerPayload(value=4, unit='m2', basis='visual_estimate'))"])
+    out = runner.run_episode(
+        item.episode, item.pixels, OnlineRunConfig(
+            mode="real", reuse_artifact=artifact, max_solver_rounds=3,
+            finalization_rounds=1, eval_visual_fallback=False,
+            trace_dir=str(tmp_path / "independent")), llm=client)
+    assert out.answer == "4" and not out.answer_untrusted
+    assert len(client.calls) == 2 and client.calls[1][0] == "program"
+    assert out.rounds[0]["recovery_previous_program_omitted"] == "rejected_submission"
+    assert marker in out.rounds[0]["response_text"]
+    assert marker not in json.dumps(client.calls[1][1])
+    assert out.rounds[1]["submission_accepted"] is True

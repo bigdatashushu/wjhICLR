@@ -730,9 +730,8 @@ def test_state_observation_namespace_and_disk_are_isolated(panel, tmp_path, monk
         return arr
     monkeypatch.setattr(SceneHandle, "object_points", get_points)
     item = panel[0]
-    obj = item.geometry.objects[0].obj_id
     reference = item.geometry.objects[1].obj_id
-    first = (f'x = object_surface_distance("{obj}", "{reference}")\n'
+    first = (f'x = relative_distance_rank("{reference}", {item.episode.options!r})\n'
              'secret = 123\n'
              'im = inspect_frames([0])\n'
              'return YieldObservations([im["result_id"]], "look")\n')
@@ -750,8 +749,8 @@ def test_state_observation_namespace_and_disk_are_isolated(panel, tmp_path, monk
     assert a["answer"] == b["answer"] == "A"
     assert len(a["requests"]) == 2 and len(b["requests"]) == 1
     assert len(kernels) == 2
-    assert not kernels[0]._scene.binding_usable(obj)
-    assert kernels[1]._scene.binding_usable(obj)
+    assert not kernels[0]._scene.binding_usable(reference)
+    assert kernels[1]._scene.binding_usable(reference)
     assert kernels[0]._ns is not kernels[1]._ns
     assert kernels[0]._scene._state is not kernels[1]._scene._state
     assert kernels[0].answer_slot is not kernels[1].answer_slot
@@ -947,11 +946,11 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_12_en"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_13_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.11-observation-context")
+        "solver-v11.12-trusted-observation-recovery")
     assert manifest["common_config"]["tool_docs_version"] == (
-        "tool-docs-v11.11-observation-guidance")
+        "tool-docs-v11.12-complete-ranking")
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-task-tools"
 
 
