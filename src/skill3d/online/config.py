@@ -119,7 +119,7 @@ _FALLBACK: dict[str, Any] = {
         "max_regenerate": 3,
     },
     # v9 §9.4 主动图像布局（缺键时的默认，与 configs/config.yaml 一致）
-    "active_vision": {"layout": "derived_plus_originals_v1", "max_derived_images": 8},
+    "active_vision": {"layout": "derived_related_spread_v2", "max_derived_images": 8},
     "split_config": "configs/vsi_bench_split.yaml",
     # v6 §20：v4/v5 的 `scale` 段（冻结 conformal 校准器 / 标定池 / 逐题型授权校准）
     # 随"放弃一切需要校准的路线"整体废止，键已删除；米制尺度改由
@@ -420,14 +420,14 @@ def sandbox_from(cfg: dict) -> SandboxSettings:
 class ActiveVisionSettings:
     """§9.4 主动图像的声明布局（图像上限内怎么装图）。"""
 
-    layout: str = "derived_plus_originals_v1"
+    layout: str = "derived_related_spread_v2"
     max_derived_images: int = 8
 
 
 def active_vision_from(cfg: dict) -> ActiveVisionSettings:
     settings = _settings(ActiveVisionSettings, cfg.get("active_vision", {}), "active_vision")
     _integer(settings.max_derived_images, "active_vision.max_derived_images", minimum=0)
-    if settings.layout != "derived_plus_originals_v1":
+    if settings.layout != "derived_related_spread_v2":
         raise ValueError("Unsupported active_vision.layout")
     return settings
 

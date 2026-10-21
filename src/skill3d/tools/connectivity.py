@@ -26,7 +26,7 @@ OBSTACLE_BAND_HI_REL: float = 1.00  # TODO_CALIBRATE: 障碍高度带上界 / �
 AGENT_RADIUS_REL: float = 0.03     # TODO_CALIBRATE: agent 半径 / 场景尺度（膨胀量）
 FLOOR_PERCENTILE: float = 10.0     # TODO_CALIBRATE: 地面高度取点云高度第 10 百分位
 MAX_GRID_CELLS: int = 4_000_000    # 内存护栏：栅格单元上限（超限自动放大格子）
-CONNECTIVITY_VERSION: str = "connectivity-v6"
+CONNECTIVITY_VERSION: str = "connectivity-v11.1-normalized-span"
 
 
 def _ground_basis(up: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -167,7 +167,8 @@ def build_connectivity_graph(
 
     notes = [
         f"Connectivity graph v{CONNECTIVITY_VERSION}: {n} nodes / {len(edges)} reachable edges; "
-        f"{int(n_comp)} free-space components; grid {nx}x{ny}, cell={cell:.4g} (scene scale {span:.4g}); "
+        f"{int(n_comp)} free-space components; grid {nx}x{ny}, cell={cell:.4g} normalized "
+        f"(scene_span_normalized={span:.4g}); "
         f"obstacle dilation r={r_cells} cells; all thresholds TODO_CALIBRATE",
     ]
     if n_comp > 1:
@@ -181,6 +182,9 @@ def build_connectivity_graph(
         "node_components": node_labels,
         "start_node": "start" if start is not None else None,
         "grid": {"nx": nx, "ny": ny, "cell": cell, "n_components": int(n_comp)},
+        "scene_span_normalized": span,
+        "scene_span_unit": "normalized",
+        "scene_span_definition": "median axis-aligned point-cloud span; max span if median is nonpositive",
         "version": CONNECTIVITY_VERSION,
         "notes": notes,
     }

@@ -114,7 +114,7 @@ def test_crop_reaches_the_next_request_with_an_explicit_layout(fixture_episode, 
     assert crop["image_id"] in text                      # 明确映射：图 ↔ 源帧/框
     assert "[Crop]" in text
     rnd = next(r for r in ledger["rounds"] if r["round_index"] == 2)
-    assert rnd["layout"] == "derived_plus_originals_v1"
+    assert rnd["layout"] == "derived_related_spread_v2"
     assert crop["image_id"] in rnd["derived_image_ids"]
     assert rnd["prompt_tokens"] == client.last_usage["prompt_tokens"]
     assert rnd["delivered"] and rnd["observed"]

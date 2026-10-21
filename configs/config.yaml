@@ -46,11 +46,11 @@ retrieval:
   method_context_max_chars: 8000
 
 # v9 §9.4 主动图像（inspect_frames / detect_objects）：图像布局必须**事先声明**。
-# 单次请求上限冻结为 32 张图。观察轮用声明布局 `derived_plus_originals_v1`：
-# 派生图（裁剪）优先占位，其余名额按帧序补原帧；被省略的原帧已在更早请求里
-# 交付过，被省略的派生图保持 unobserved。
+# 单次请求上限冻结为 32 张图。观察轮用声明布局 `derived_related_spread_v2`：
+# 引用裁剪优先，再保留源帧，其余名额均匀覆盖冻结帧；按时间顺序交付原帧。
+# 每请求记录当前实际图像，不把历史请求当作持续视觉记忆。
 active_vision:
-  layout: derived_plus_originals_v1
+  layout: derived_related_spread_v2
   max_derived_images: 8        # 单次请求里派生图的占位上限（服务上限内）
 
 # M5 题目解析、M8 程序生成、评测视觉补答使用百炼；M5 类别审核独立配置。

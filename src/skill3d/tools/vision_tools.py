@@ -28,7 +28,7 @@ from typing import Optional, Sequence
 import numpy as np
 
 from skill3d.schemas import ObjectRecord
-from skill3d.schemas.tool import ToolSpec
+from skill3d.schemas.tool import ToolSpec, FailureCause
 
 from .contract import ArtifactUnavailableError, DomainValueError
 from .registry import REGISTRY
@@ -46,6 +46,8 @@ def _clamp_box(box: Sequence[float], h: int, w: int) -> tuple[int, int, int, int
     if len(box) != 4:
         raise ValueError(f"box must be [x0, y0, x1, y1]; got {list(box)!r}")
     x0, y0, x1, y1 = (float(v) for v in box)
+    if not np.isfinite([x0, y0, x1, y1]).all():
+        raise ValueError("Crop box endpoints must be finite")
     xa, xb = sorted((x0, x1))
     ya, yb = sorted((y0, y1))
     xa = int(max(0, min(round(xa), w - 1)))
@@ -118,7 +120,8 @@ def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
             "inspect_frames",
             f"The number of boxes ({len(boxes)}) must match frame_ids ({len(ids)}); "
             "omit boxes entirely to return full frames",
-            args={"frame_ids": ids, "n_boxes": len(boxes)})
+            args={"frame_ids": ids, "n_boxes": len(boxes)},
+            failure_cause=FailureCause(code="crop_frame_count_mismatch", scope="local_call"))
     if len(ids) > MAX_BOXES_PER_CALL * 4:
         raise DomainValueError(
             "inspect_frames", f"At most {MAX_BOXES_PER_CALL * 4} frames per call; got {len(ids)}",
@@ -135,7 +138,8 @@ def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
                 "inspect_frames",
                 f"Frame slot {fid} is not in this episode's frozen frame set"
                 f" (available slots: 0..{len(ledger.frame_ids) - 1})",
-                args={"frame_ids": ids}) from None
+                args={"frame_ids": ids},
+                failure_cause=FailureCause(code="frame_slot_out_of_range", scope="local_call")) from None
         src_h, src_w = int(frame.shape[0]), int(frame.shape[1])
         box = boxes[k] if (boxes and len(boxes) == len(ids)) else None
         if box is None:
@@ -151,7 +155,8 @@ def inspect_frames(handle: SceneHandle, frame_ids: Sequence[int],
             except ValueError as exc:
                 raise DomainValueError(
                     "inspect_frames", f"Invalid crop box for frame={fid}: {exc}",
-                    args={"frame_id": fid, "box": list(box)}) from None
+                    args={"frame_id": fid, "box": list(box)},
+                    failure_cause=FailureCause(code="invalid_crop_box", scope="local_call")) from None
             sub = np.asarray(frame)[y0:y1, x0:x1]
             if sub.size == 0:
                 raise DomainValueError(

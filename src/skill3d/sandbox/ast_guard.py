@@ -29,13 +29,13 @@ from skill3d.sandbox.safe_runtime import NUMERICAL_EXPORTS
 
 # 保留名：禁止 program 重赋值（§4 M10 字段 5）
 RESERVED_NAMES = frozenset(
-    {"show", "ReturnAnswer", "YieldObservations", "AnswerPayload", "tools", "scene",
+    {"show", "ReturnAnswer", "YieldObservations", "AnswerPayload", "ReadObservation", "tools", "scene",
      "frames", "ctx"})
 
 # 控制接口与答案合同构造器（§10.1/§10.2）：不属 Tool 面，不受证据门过滤。
 # `AnswerPayload` 必须在这里 —— 否则 §10.2 的规范示例
 # `ReturnAnswer(AnswerPayload(...))` 会被静态检查判为"未定义函数调用"而拒掉。
-CONTROL_INTERFACE_NAMES = frozenset({"ReturnAnswer", "YieldObservations", "AnswerPayload"})
+CONTROL_INTERFACE_NAMES = frozenset({"ReturnAnswer", "YieldObservations", "AnswerPayload", "ReadObservation"})
 
 # 禁止调用的内建/危险函数名
 FORBIDDEN_CALLS = frozenset(

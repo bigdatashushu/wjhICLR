@@ -396,6 +396,9 @@ class RestrictedNamespaceKernel:
         self.contract_violations: list[ToolResult] = []
         # v9 §6.4：每次实际调用的统一授权收据（含执行前被拒绝的调用）
         self.authorization_receipts: list[dict] = []
+        self.observation_reads: list[dict] = []
+        self.unresolved_result_ids: set[str] = set()
+        self._cell_read_mark = 0
         self.answer_untrusted: bool = False
 
         # tools 命名空间：tools.<name>(**args) → 经 REGISTRY.call_tool
@@ -416,6 +419,7 @@ class RestrictedNamespaceKernel:
             "AnswerPayload": lambda *args, **kwargs: AnswerPayload(*args, **kwargs),
             "YieldObservations": lambda result_ids=None, reason="": self.yield_slot(
                 result_ids, reason),
+            "ReadObservation": self._read_observation,
         }
         # 同步注入 Tool 顶层名（program 可直接写 euclidean_distance(...)）
         for name in tool_registry.names():
@@ -467,11 +471,39 @@ class RestrictedNamespaceKernel:
     # ---- 注入 ----
     def inject(self, **kwargs: Any) -> None:
         for k, v in kwargs.items():
-            if k in ("show", "ReturnAnswer", "YieldObservations", "AnswerPayload",
+            if k in ("show", "ReturnAnswer", "YieldObservations", "AnswerPayload", "ReadObservation",
                  "tools", "scene",
                      "frames"):
                 raise ValueError(f"Overwriting reserved names is forbidden: {k}")
             self._ns[k] = v
+
+    def _read_observation(self, result_id, fields=None, offset=0, limit=8):
+        from skill3d.online.observation_reader import (
+            MAX_READS_PER_ROUND, read_observation, OBSERVATION_READER_VERSION,
+        )
+        from skill3d.online.recovery import collect_validated
+        args = {"result_id": result_id, "fields": fields, "offset": offset, "limit": limit}
+        receipt = {
+            "name": "ReadObservation", "schema_version": OBSERVATION_READER_VERSION,
+            "episode_id": self.episode_id, "args": args, "allowed": False,
+        }
+        try:
+            if not self._tools_enabled or self.answer_slot.given or self.yield_slot.given:
+                raise ValueError("ReadObservation is only available before ordinary-phase termination")
+            if len(self.observation_reads) - self._cell_read_mark >= MAX_READS_PER_ROUND:
+                raise ValueError("ReadObservation per-round budget exhausted")
+            valid = [o for o in collect_validated(self) if o.result_id not in self.unresolved_result_ids]
+            page = read_observation(valid, result_id, fields, offset, limit)
+        except ValueError as exc:
+            receipt["reason_code"] = "observation_read_rejected"
+            self.authorization_receipts.append(receipt)
+            raise ValueError(str(exc)) from exc
+        receipt.update(allowed=True, reason_code="valid_episode_observation",
+                       payload_hash=page["payload_hash"])
+        self.authorization_receipts.append(receipt)
+        # The model receives a separate copy: local edits cannot rewrite host feedback.
+        self.observation_reads.append(json.loads(json.dumps(page)))
+        return page
 
     def _record_failed_call(self, name: str, call_args: dict, exc: ToolContractError,
                             result: Optional[ToolResult] = None) -> None:
@@ -482,6 +514,8 @@ class RestrictedNamespaceKernel:
         证据门、finalization 封锁、重复提交）若记成成功，`collect_validated`
         会把它们当作有效观测回灌给模型（§14.1）。
         """
+        from skill3d.tools.failure_guidance import failure_guidance
+
         if result is None:
             request_digest = _request_digest(self._scene, name, call_args)
             result = ToolResult(
@@ -494,6 +528,9 @@ class RestrictedNamespaceKernel:
                 request_digest=request_digest, latency_ms=0.0,
                 error=f"{type(exc).__name__}: {exc}", error_code=exc.error_code,  # type: ignore[arg-type]
                 failure_cause=exc.failure_cause,
+                failure_guidance=failure_guidance(
+                    self._registry, self._scene, name=name, cause=exc.failure_cause,
+                    missing=exc.missing, tools_enabled=self._tools_enabled),
                 missing_artifacts=list(exc.missing),
                 available_artifacts=list(exc.available))
             self.tool_calls.append(
@@ -715,7 +752,7 @@ class RestrictedNamespaceKernel:
         逐轮视图由 `cell_calls` / `cell_results` 提供。
         """
         keep = ("frames", "scene", "tools", "show", "ReturnAnswer",
-                "YieldObservations", "AnswerPayload", "__builtins__")
+                "YieldObservations", "AnswerPayload", "ReadObservation", "__builtins__")
         preserved = {k: self._ns[k] for k in keep if k in self._ns}
         self._ns.clear()
         self._ns.update(preserved)
@@ -734,6 +771,7 @@ class RestrictedNamespaceKernel:
         """记录本轮起点，供 `cell_calls` / `cell_results` 切出逐轮视图。"""
         self._cell_call_mark = len(self.tool_calls)
         self._cell_result_mark = len(self.tool_results)
+        self._cell_read_mark = len(self.observation_reads)
 
     @property
     def cell_calls(self) -> list[ToolCall]:
@@ -751,6 +789,8 @@ class RestrictedNamespaceKernel:
         self.tool_results = []
         self.contract_violations = []
         self.authorization_receipts = []
+        self.observation_reads = []
+        self.unresolved_result_ids = set()
         self.mark_cell_start()
 
     def run_program(self, program_source: str) -> CellResult:

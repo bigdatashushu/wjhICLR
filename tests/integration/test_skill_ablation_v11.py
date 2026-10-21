@@ -947,11 +947,11 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_11_en"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_12_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.10-response-envelope")
+        "solver-v11.11-observation-context")
     assert manifest["common_config"]["tool_docs_version"] == (
-        "tool-docs-v11.10-response-envelope")
+        "tool-docs-v11.11-observation-guidance")
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-task-tools"
 
 

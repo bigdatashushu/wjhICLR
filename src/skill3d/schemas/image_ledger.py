@@ -33,7 +33,7 @@ from pydantic import field_validator
 
 from . import Spec
 
-IMAGE_LEDGER_SCHEMA_VERSION = "1.0"
+IMAGE_LEDGER_SCHEMA_VERSION = "2.0"
 
 # 图像种类：原帧 / 裁剪 / 拼版（多张派生图合并成一张，用于服务图像上限内交付）
 ImageKind = Literal["frame", "crop", "contact_sheet"]
@@ -42,9 +42,9 @@ ImageKind = Literal["frame", "crop", "contact_sheet"]
 # - `originals_only`：只有冻结 FrameSet 的原帧（无派生图时的常态）
 # - `derived_plus_originals_v1`：派生图优先占位，其后按帧序补原帧，总数不超过服务上限
 LAYOUT_ORIGINALS_ONLY = "originals_only"
-LAYOUT_DERIVED_PLUS_ORIGINALS = "derived_plus_originals_v1"
+LAYOUT_DERIVED_PLUS_ORIGINALS = "derived_related_spread_v2"
 IMAGE_LAYOUTS: tuple[str, ...] = (
-    LAYOUT_ORIGINALS_ONLY, LAYOUT_DERIVED_PLUS_ORIGINALS,
+    LAYOUT_ORIGINALS_ONLY, LAYOUT_DERIVED_PLUS_ORIGINALS, "derived_plus_originals_v1",
 )
 
 # 裁剪/缩放变换的版本（§9.4"记录源帧、像素范围和变换"）
@@ -78,6 +78,9 @@ class ProducedImage(Spec):
     # ---- 三态 ----
     delivered_rounds: list[int] = []
     observed_rounds: list[int] = []
+    sent_in_requests: list[str] = []
+    response_completed_in_requests: list[str] = []
+    present_in_current_request: bool = False
     unobserved_reason: str = ""                 # 未交付/未观察的原因（不静默）
     n_pixels_sent: int = 0
     token_estimate: int = 0
@@ -118,6 +121,10 @@ class ProducedImage(Spec):
                 raise ValueError(f"Invalid dimensions {hw!r}; expected positive [H, W]")
         if self.box_xyxy and len(self.box_xyxy) != 4:
             raise ValueError(f"box_xyxy must be [x0, y0, x1, y1]; got {self.box_xyxy!r}")
+        if not set(self.response_completed_in_requests) <= set(self.sent_in_requests):
+            raise ValueError("Completed image requests must be a subset of sent requests")
+        if self.present_in_current_request and not self.sent_in_requests:
+            raise ValueError("Current image presence requires a sent request")
 
     def observed(self) -> bool:
         """是否已被模型实际看到（收到响应才算）。"""
@@ -128,6 +135,9 @@ class ImageRound(Spec):
     """一次模型请求的图像清单（§9.4"实际传入图像、缩放和 token 成本完整记录"）。"""
 
     round_index: int = 0
+    request_id: str = ""
+    request_sha256: str = ""
+    jpeg_sha256: list[str] = []           # Exact encoded image bytes, in request order
     layout: str = LAYOUT_ORIGINALS_ONLY
     trigger: str = ""                      # initial / observation / ...
     image_ids: list[str] = []              # 实际装进请求的顺序（与请求里逐一对齐）

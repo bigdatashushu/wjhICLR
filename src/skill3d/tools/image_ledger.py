@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import json
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Sequence
 
@@ -202,59 +204,61 @@ class ImageLedger:
     def plan_round(self, *, round_index: int, trigger: str,
                    derived_image_ids: Sequence[str],
                    original_frame_ids: Sequence[int]) -> ImageRound:
-        """按**声明布局**排本轮实际进请求的图像，并如记录被省略的图。
+        """Referenced crops, their sources, then spread across the frozen originals.
 
-        `derived_plus_originals_v1`：派生图优先占位（上限 `max_derived_images`），
-        其余名额按帧序补原帧；总数不超过 `max_images`（服务上限，实测 8100 为 32）。
-        被省略的原帧**已经在本轮之前的请求里交付过**（否则它们不可能不是首次出现），
-        被省略的派生图保持未交付并记 `unobserved_reason` —— 两者都不静默消失。
+        Replanning an unsent request replaces its exact manifest. A sent request
+        cannot be overwritten or merged with another request under the same index.
         """
+        existing = next((r for r in self.rounds if r.round_index == int(round_index)), None)
+        if existing is not None and existing.delivered:
+            raise ValueError("A sent image request is immutable; use a new round_index")
         limit = max(1, int(self.max_images))
-        derived = [i for i in derived_image_ids if i in self._entries][
-            : max(0, int(self.max_derived_images))]
-        originals = [f"frame-{int(fid)}" for fid in original_frame_ids]
+        unknown = set(derived_image_ids) - self._entries.keys()
+        if unknown:
+            raise ValueError(f"Unknown requested images: {sorted(unknown)}")
+        requested = list(dict.fromkeys(
+            i for i in derived_image_ids if self.get(i).kind != "frame"))
+        originals = [f"frame-{fid}" for fid in sorted(set(map(int, original_frame_ids)))]
+        # Keep at least one original for spatial context and the multimodal contract.
+        derived = requested[:min(max(0, int(self.max_derived_images)),
+                                 max(0, limit - bool(originals)))]
         chosen, omitted_derived = list(derived), []
         remaining = max(0, limit - len(chosen))
-        chosen_originals = originals[:remaining]
+        relevant = list(dict.fromkeys(
+            f"frame-{self.get(i).source_frame_id}" for i in derived
+            if f"frame-{self.get(i).source_frame_id}" in originals))
+        selected = relevant[:remaining]
+        pool = [i for i in originals if i not in selected]
+        count = min(len(pool), remaining - len(selected))
+        if count:
+            selected.extend(pool[i] for i in np.linspace(0, len(pool) - 1, count, dtype=int))
+        # Keep temporal order in the real request, independent of selection priority.
+        chosen_originals = [i for i in originals if i in set(selected)]
         chosen += chosen_originals
-        omitted_originals = originals[remaining:]
+        omitted_originals = [i for i in originals if i not in set(chosen_originals)]
         chosen_set = set(chosen)
-        omitted_derived = [i for i in derived_image_ids if i not in chosen_set]
+        omitted_derived = [i for i in requested if i not in chosen_set]
         for i in omitted_derived:
             rec = self._entries[i].record
             if not rec.delivered_rounds:
                 rec.unobserved_reason = (
-                    "This round's image limit is full (layout=derived_plus_originals_v1); remains unobserved")
+                    f"This request's image limit is full (layout={LAYOUT_DERIVED_PLUS_ORIGINALS}); remains unobserved")
         n_pixels = 0
         tokens = 0
         for i in chosen:
             rec = self._entries[i].record
             n_pixels += int(rec.n_pixels_sent)
             tokens += int(rec.token_estimate)
-        existing = next((r for r in self.rounds
-                         if r.round_index == int(round_index)), None)
-        merged_ids = list(chosen)
-        if existing is not None:
-            # 同一轮内的**第二次**请求（M9 重生成 / 退化重生成）：并入既有轮记录，
-            # 不新开一轮 —— 否则 trace 里会出现两轮同号、图像集合互相矛盾。
-            merged_ids = list(dict.fromkeys(list(existing.image_ids) + merged_ids))
         rnd = ImageRound(
             round_index=int(round_index), trigger=str(trigger),
+            request_id=f"image-request-{int(round_index)}",
             layout=(LAYOUT_DERIVED_PLUS_ORIGINALS
-                    if any(not i.startswith("frame-") for i in merged_ids)
+                    if derived
                     else LAYOUT_ORIGINALS_ONLY),
-            image_ids=merged_ids,
-            original_image_ids=[i for i in merged_ids if i.startswith("frame-")],
-            derived_image_ids=[i for i in merged_ids if not i.startswith("frame-")],
-            n_images=len(merged_ids), max_images=limit,
-            omitted_originals=sorted(set(omitted_originals)
-                                     | set(existing.omitted_originals if existing else [])),
-            omitted_derived=sorted(set(omitted_derived)
-                                   | set(existing.omitted_derived if existing else [])),
-            n_pixels_total=n_pixels, token_estimate_total=tokens,
-            delivered=bool(existing.delivered) if existing else False,
-            observed=bool(existing.observed) if existing else False,
-            prompt_tokens=(existing.prompt_tokens if existing else None))
+            image_ids=chosen, original_image_ids=chosen_originals,
+            derived_image_ids=derived, n_images=len(chosen), max_images=limit,
+            omitted_originals=omitted_originals, omitted_derived=omitted_derived,
+            n_pixels_total=n_pixels, token_estimate_total=tokens)
         if existing is not None:
             self.rounds[self.rounds.index(existing)] = rnd
         else:
@@ -289,6 +293,25 @@ class ImageLedger:
             self._order.append(key)
 
     # ---- 三态迁移 ----
+    def bind_request(self, round_index: int, messages: list[dict]) -> None:
+        """Hash actual request bytes after all text/history has been appended."""
+        rnd = next(r for r in self.rounds if r.round_index == int(round_index))
+        urls = [
+            part["image_url"]["url"] for message in messages
+            if isinstance(message.get("content"), list) for part in message["content"]
+            if part.get("type") == "image_url"
+        ]
+        if len(urls) != len(rnd.image_ids):
+            raise ValueError("Image manifest does not match the actual request image count")
+        hashes = []
+        for url in urls:
+            if not url.startswith("data:image/jpeg;base64,"):
+                raise ValueError("Expected embedded JPEG bytes for image identity")
+            hashes.append(hashlib.sha256(base64.b64decode(url.split(",", 1)[1], validate=True)).hexdigest())
+        rnd.jpeg_sha256 = hashes
+        rnd.request_sha256 = hashlib.sha256(json.dumps(
+            messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
     def mark_delivered(self, round_index: int, image_ids: Iterable[str]) -> None:
         """请求**发出前**标记：这些图进了本次请求（§9.4 delivered = 进入请求）。"""
         for i in image_ids:
@@ -329,6 +352,10 @@ class ImageLedger:
         for rnd in self.rounds:
             if rnd.round_index == int(round_index):
                 rnd.delivered = True
+                for rec in self.all_images():
+                    rec.present_in_current_request = rec.image_id in rnd.image_ids
+                    if rec.present_in_current_request and rnd.request_id not in rec.sent_in_requests:
+                        rec.sent_in_requests.append(rnd.request_id)
                 if prompt_tokens is not None:
                     rnd.prompt_tokens = int(prompt_tokens)
 
@@ -339,6 +366,10 @@ class ImageLedger:
             if rnd.round_index == int(round_index):
                 rnd.delivered = True
                 rnd.observed = True
+                for image_id in rnd.image_ids:
+                    rec = self.get(image_id)
+                    if rnd.request_id not in rec.response_completed_in_requests:
+                        rec.response_completed_in_requests.append(rnd.request_id)
                 if prompt_tokens is not None:
                     rnd.prompt_tokens = int(prompt_tokens)
 

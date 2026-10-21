@@ -12,7 +12,7 @@ import re
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.schemas.tool_response import TOOL_RESPONSE_VERSION, TOOL_RESPONSE_FIELDS
 
-CONTRACT_VERSION = "execution-contract/3.0"
+CONTRACT_VERSION = "execution-contract/4.0"
 
 _RULES = (
     "Ordinary requests output exactly one Python fenced code block and no outside explanation.",
@@ -41,6 +41,9 @@ class ExecutionContract:
     contract_version: str = CONTRACT_VERSION
 
     def to_dict(self) -> dict:
+        from skill3d.online.observation_reader import reader_contract
+        from skill3d.online.progress import PROGRESS_VERSION, NO_PROGRESS_LIMIT
+        from skill3d.schemas.image_ledger import LAYOUT_DERIVED_PLUS_ORIGINALS
         from skill3d.online.submission import (
             FINALIZATION_SCHEMA_VERSION, FINALIZATION_DELIVERY_STRATEGY,
         )
@@ -53,6 +56,10 @@ class ExecutionContract:
             "finalization_schema_version": FINALIZATION_SCHEMA_VERSION,
             "finalization_method_delivery": FINALIZATION_DELIVERY_STRATEGY,
             "tool_response_schema_version": TOOL_RESPONSE_VERSION,
+            "host_observation_reader": reader_contract(),
+            "progress_policy": {"version": PROGRESS_VERSION, "no_progress_limit": NO_PROGRESS_LIMIT,
+                                "status": "frozen_pilot_policy"},
+            "image_pack_version": LAYOUT_DERIVED_PLUS_ORIGINALS,
             "tool_response": (
                 "Every tool returns {result_id, source_tool, status, data, schema_version, evidence_version}. "
                 "Read the unchanged list/dict/scalar via result['data']; use result['result_id'] for references. "

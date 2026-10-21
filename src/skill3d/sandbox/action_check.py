@@ -14,6 +14,7 @@ from skill3d.sandbox.ast_guard import normalize_program_source
 ARGUMENT_ERROR_REASONS = frozenset({
     "invalid_tool_arguments", "invalid_point_argument", "invalid_candidate_categories",
     "direction_arguments_invalid",
+    "crop_frame_count_mismatch", "invalid_crop_box", "frame_slot_out_of_range",
 })
 
 
@@ -41,7 +42,7 @@ def check_action(source: str, *, finalizing: bool = False,
         called = {node.func.id if isinstance(node.func, ast.Name) else node.func.attr
                   for node in ast.walk(tree) if isinstance(node, ast.Call)
                   and isinstance(node.func, (ast.Name, ast.Attribute))}
-        if called & (set(tool_names or ()) | {"YieldObservations"}):
+        if called & (set(tool_names or ()) | {"YieldObservations", "ReadObservation"}):
             return ActionCheck(False, "finalization_tool_call_disallowed",
                                "Finalization cannot call evidence tools or YieldObservations.")
         if "ReturnAnswer" not in controls:

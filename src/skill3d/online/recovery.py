@@ -109,59 +109,50 @@ def _payload_of(result):
         return raw
 
 
-def _list_objects_summary(payload: list, max_chars: int) -> str:
-    """先装候选身份，再按列补质量；审计正文只通过完整 payload 摘要标识。"""
+def _list_objects_summary(payload: list, max_chars: int, *, question_type: str = "") -> str:
+    """完整关键列优先；剩余候选通过有界读取接口取得。"""
+    from skill3d.online.observation_reader import (
+        canonical_payload, object_summary_row, payload_hash,
+    )
+    payload = canonical_payload(payload, tool="list_objects")
     digest = hashlib.sha256(json.dumps(
         payload, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
     rows = []
-    priority = (
-        "binding_flags", "grounding_status", "track_id", "det_conf", "det_conf_source",
-        "mask_support_ratio", "duplicate_suspect",
-    )
     audit_omitted = any(o.get("binding_flags") or o.get("binding_provenance")
                         or o.get("audit") for o in payload if isinstance(o, dict))
 
     def encode():
-        omitted_fields = sum(
-            len(o) - len(row) for o, row in zip(payload, rows) if isinstance(o, dict))
+        omitted_fields = sorted({key for o, row in zip(payload, rows) if isinstance(o, dict)
+                                 for key in o if key not in row})
         body = {
             "objects": rows, "total": len(payload), "shown": len(rows),
             "omitted": len(payload) - len(rows), "fields_omitted": omitted_fields,
             "coverage_complete": len(rows) == len(payload),
             "audit_omitted": audit_omitted, "payload_sha256": digest,
+            "payload_hash": payload_hash(payload, tool="list_objects"),
+            "next_cursor": len(rows) if len(rows) < len(payload) else None,
         }
         return json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str)
 
     for obj in payload:
         if not isinstance(obj, dict):
             break
-        identity = {k: obj[k] for k in ("obj_id", "category_name", "category") if k in obj}
-        rows.append(identity)
+        rows.append(object_summary_row(obj, question_type=question_type))
         if len(encode()) > max_chars:
             rows.pop()
             break
     if not rows and payload:
         return json.dumps({"omitted": True, "payload_sha256": digest}, separators=(",", ":"))
-    for key in priority:
-        for source, row in zip(payload, rows):
-            if key not in source:
-                continue
-            value = source[key]
-            if key == "binding_flags":
-                value = [{k: flag[k] for k in ("code", "audit_id", "audit_sha256") if k in flag}
-                         for flag in value if isinstance(flag, dict)]
-            row[key] = value
-            if len(encode()) > max_chars:
-                row.pop(key)
     return encode()
 
 
-def summarize_payload(payload: object, *, tool: str = "", max_chars: int = 1200) -> str:
+def summarize_payload(payload: object, *, tool: str = "", max_chars: int = 1200,
+                      question_type: str = "") -> str:
     """按完整字段/列表项压缩，所有省略明示；不截断 JSON 或把省略误作空值。"""
     if max_chars < 128:
         raise ValueError("summary max_chars must be at least 128")
     if tool == "list_objects" and isinstance(payload, list):
-        text = _list_objects_summary(payload, max_chars)
+        text = _list_objects_summary(payload, max_chars, question_type=question_type)
         if len(text) <= max_chars:
             return text
         return '{"omitted":true,"coverage_complete":false}'
@@ -253,8 +244,9 @@ class ValidatedObservation:
     args: dict = field(default_factory=dict)
     degraded_evidence: list[str] = field(default_factory=list)
 
-    def summary(self, max_chars: int = 1200) -> str:
-        text = summarize_payload(self.payload, tool=self.source_tool, max_chars=max_chars)
+    def summary(self, max_chars: int = 1200, *, question_type: str = "") -> str:
+        text = summarize_payload(self.payload, tool=self.source_tool, max_chars=max_chars,
+                                 question_type=question_type)
         flags = (f" degraded_evidence={_json(self.degraded_evidence)}"
                  if self.degraded_evidence else "")
         return (f"- {self.source_tool}({_json(self.args)}) [result_id={self.result_id}]"
@@ -262,7 +254,8 @@ class ValidatedObservation:
                 f"\n  data/raw payload={text}")
 
 
-def observation_feedback(observations: list[ValidatedObservation]) -> str:
+def observation_feedback(observations: list[ValidatedObservation], *, question_type: str = "",
+                         include_reader: bool = True) -> str:
     """仅合并同版本、同参数、同完整内容的观察；账本与真实 ID 不变。"""
     groups: dict[str, list[ValidatedObservation]] = {}
     for obs in observations:
@@ -274,7 +267,7 @@ def observation_feedback(observations: list[ValidatedObservation]) -> str:
     if not groups:
         lines.append("No valid prior observations are available; obtain further observations or reason from original images.")
     for group in groups.values():
-        lines.append(group[0].summary())
+        lines.append(group[0].summary(question_type=question_type))
         aliases = list(dict.fromkeys(o.result_id for o in group[1:]
                                     if o.result_id != group[0].result_id))
         if aliases:
@@ -283,6 +276,11 @@ def observation_feedback(observations: list[ValidatedObservation]) -> str:
                  "derivation field paths start at this data root. "
                  "Check data.status, missing items, ambiguity, and degradation flags. "
                  "No detection does not prove absence; None/unmeasurable does not mean zero.")
+    if include_reader:
+        lines.append("For omitted candidates/fields use ReadObservation(result_id, fields=None, "
+                     "offset=next_cursor, limit=8), then YieldObservations. Pages use stable object-ID "
+                     "ordering; a page retains the original result reference. Do not rerun detection "
+                     "or list_objects merely to obtain a longer summary.")
     return "\n".join(lines)
 
 
@@ -294,10 +292,12 @@ def failed_call_feedback(results) -> str:
             continue
         cause = (f"; failure_cause={_json(result.failure_cause.model_dump(mode='json'))}"
                  if result.failure_cause else "")
+        guidance = (f"; available_next_steps={_json(result.failure_guidance)}"
+                    if getattr(result, "failure_guidance", None) else "")
         lines.append(
             f"Failed call: {result.source_tool or result.tool}({_json(result.args)})"
             f" [result_id={result.result_id}] error_code={result.error_code}"
-            f"; reason={result.error}{cause}")
+            f"; reason={result.error}{cause}{guidance}")
     return "\n".join(lines)
 
 

@@ -206,7 +206,7 @@ def test_layout_keeps_the_request_within_the_service_limit():
     assert len(rnd.omitted_derived) == 2                        # 第 9/10 张裁剪没进
     for i in rnd.omitted_derived:
         assert ledger.get(i).unobserved_reason                # 未交付要写明原因
-    assert rnd.layout == "derived_plus_originals_v1"
+    assert rnd.layout == "derived_related_spread_v2"
     assert rnd.token_estimate_total > 0
 
 

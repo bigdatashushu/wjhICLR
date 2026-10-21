@@ -55,7 +55,7 @@ from skill3d.tools.task_policy import MODEL_TOOLS, TOOL_TASK_POLICY_VERSION
 # v9 §9.2/§9.4：工具面新增 `inspect_frames` / `detect_objects`（主动图像与补检）。
 # 工具面变了就升版本 —— prompt 里列出的 Tool 集合与 trace 的 tool_face_version
 # 必须对得上，否则"这次跑的是哪套工具面"无法回答。
-TOOL_FACE_VERSION: str = "tool-face-v11.9-response-envelope"
+TOOL_FACE_VERSION: str = "tool-face-v11.10-observation-guidance"
 
 
 class ToolNotFoundError(KeyError):
@@ -453,6 +453,10 @@ class ToolRegistry:
                 code=type(exc).__name__, scope="unknown", message=error)
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
+        from skill3d.tools.failure_guidance import failure_guidance
+
+        guidance = (failure_guidance(self, scene, name=name, cause=failure_cause, missing=missing)
+                    if error is not None else {})
         degraded = degraded_evidence_flags(entry.spec, profile)
         receipt = receipt.model_copy(update={"result_id": digest[:16]})
         return ToolResult(
@@ -472,6 +476,7 @@ class ToolRegistry:
             error=error,
             error_code=error_code,  # type: ignore[arg-type]
             failure_cause=failure_cause,
+            failure_guidance=guidance,
             object_dependencies=(list(scene._consumed_object_ids) if error is None else []),
             resolved_object_ids=list(scene._resolved_object_ids),
             missing_artifacts=missing,

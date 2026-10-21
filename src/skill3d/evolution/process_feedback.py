@@ -204,7 +204,9 @@ def extract_process_facts(outcome: Mapping) -> ProcessFacts:
             assignment and "ReturnAnswer" not in calls)
         if row.get("executed") and not row.get("error_code") and "YieldObservations" in calls:
             facts.execution.successful_yields += 1
-        if (row.get("progress") or {}).get("made_progress") is False:
+        progress = row.get("progress") or {}
+        if (progress.get("made_progress") is False and progress.get("eligible", True)
+                and not progress.get("transient_service_error", False)):
             facts.execution.repeated_no_progress_rounds += 1
         results = row.get("results") or []
         for result in results:

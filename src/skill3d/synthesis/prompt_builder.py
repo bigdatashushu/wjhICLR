@@ -17,8 +17,8 @@ from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 from skill3d.synthesis.execution_contract import ExecutionContract
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_11_en"
-FINALIZATION_PROMPT_VERSION = "finalization_v11_2_en"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_12_en"
+FINALIZATION_PROMPT_VERSION = "finalization_v11_3_en"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -44,9 +44,10 @@ with `return ReturnAnswer(AnswerPayload(...))`.
 - Output exactly one ```python code block, with no explanation outside it. Write comments and observation reasons in English.
 - Write top-level code or define `def solve(ctx): ...`; the host automatically calls this entry point.
 - Only numpy / scipy / math / statistics may be imported. Other imports, eval/exec/__import__/open, file writes, and network access are prohibited.
-- Do not assign to show / ReturnAnswer / YieldObservations / AnswerPayload / tools / scene / frames.
+- Do not assign to show / ReturnAnswer / YieldObservations / AnswerPayload / ReadObservation / tools / scene / frames.
 - `return ReturnAnswer(AnswerPayload(...))` submits a provisional answer and immediately ends the current program segment. The episode ends only after geometry and valid-evidence checks pass. A rejected submission is revoked; the same model receives failed checks, affected results, and still-valid observations to correct it within the remaining budget.
 - `return YieldObservations([result_id, ...], "reason")` ends this segment and sends the named results' actual values into the next request. The framework controls the round and retry budgets.
+- `ReadObservation(result_id, fields=None, offset=0, limit=8)` reads a bounded page of an existing valid result without rerunning tools. Then YieldObservations to receive the page in the next request. Use next_cursor for missing candidates. print is diagnostic only.
 - Reason only from images actually received and valid tool observations. Invalidated results must not support the answer.
 - Answer whenever readable images are available. Insufficient evidence permits a visual estimate with an honest basis declaration; `ReturnAnswer("abstain")` is not a valid answer.
 - Missing tools, failed calls, and invalid results do not mean zero. Do not invent geometry, scale, observations, or result_id values.

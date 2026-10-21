@@ -1663,6 +1663,9 @@ def run_episode(
 def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                    states, receipts, *, pixels, geometry):
     """M8–M11 单一循环。每轮最多一次生成请求；所有出口都撤掉未验收的答案。"""
+    from skill3d.online.progress import ProgressState, transient_results
+
+    progress = ProgressState()
     kernel = None
     trace = None
     feedback = None
@@ -1710,6 +1713,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
     def observations():
         return [o for o in collect_validated(kernel) if o.result_id not in unresolved_ids]
 
+    def valid_pages():
+        valid_ids = {o.result_id for o in observations()}
+        return [page for page in getattr(kernel, "observation_reads", [])
+                if page["result_id"] in valid_ids]
+
     for index in range(1, int(cfg.max_solver_rounds) + 1):
         _record_evidence_context(outcome, scene, handle, trigger=f"round:{index}")
         round_downgraded.clear()
@@ -1740,6 +1748,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 traceback_feedback=feedback, prior_program=prior_source,
                 observation_image_ids=observation_images,
                 finalization_observations=(observations() if finalizing else None),
+                finalization_pages=(valid_pages()[-3:] if finalizing else None),
                 round_index=index, trigger=trigger)
         if index == 1:
             _record_first_synthesis(outcome, res, scene, cfg)
@@ -1771,6 +1780,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         failure_key = ""
         field_repair = ""
         deterministic_failure = False
+        yielded = False
+        round_results = []
         feedback = None
         observation_images = []
         if program is None:
@@ -1834,6 +1845,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 step("pass")
                 if kernel is not None:
                     kernel.set_tools_enabled(not finalizing)
+                    kernel.unresolved_result_ids = set(unresolved_ids)
                 if handle is not None:
                     handle._ledger.current_round = index  # noqa: SLF001
                 start = time.perf_counter()
@@ -1851,6 +1863,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     response_text=res.response_text))
                 record["executed"] = True
                 record["results"] = [r.model_dump(mode="json") for r in trace.results]
+                record["observation_reads"] = kernel.observation_reads[kernel._cell_read_mark:]
+                round_results = trace.results
                 receipts.append("cell_run", {"program_id": program.program_id,
                                              "error_code": cell.error_code,
                                              "execution_diagnostics": record["execution_diagnostics"]})
@@ -1965,6 +1979,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     if unlocated - {"derivation_replay"}:
                         # 归因不足：不猜共享根因，也不把尚未通过验收的结果回灌成可信观察。
                         unresolved_ids.update(r.result_id for r in scope.results)
+                        kernel.unresolved_result_ids = set(unresolved_ids)
                     feedback = (
                         "M11 rejected the previous submission; the answer slot and program variables have been cleared.\n"
                         f"Failed checks: {verify.violations}\n"
@@ -1976,6 +1991,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     record["error_code"] = "geometry_verification_rejected"
                     step("reject")
                 elif error is None and cell.terminated == "yield" and not finalizing:
+                    yielded = True
                     outcome.yield_count += 1
                     feedback = _yield_feedback(
                         cell, kernel, scene, cfg, include_observations=False)
@@ -2047,9 +2063,43 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             termination_reason = "finalization_failed"
             outcome.notes.append(f"M11 终结轮未通过验收（round={index}），不再请求模型")
             break
+        progress_facts = progress.update(
+            observations(), getattr(handle, "_ledger", None),
+            context={
+                "evidence": getattr(scene, "evidence_profile", None),
+                "artifacts": sorted(getattr(scene, "available_artifacts", []) or []),
+                "objects": [
+                    [o.obj_id, o.category_name, o.visible_frames, o.track_id,
+                     o.grounding_status, o.binding_validation, o.binding_flags]
+                    for o in (handle.object_records() if handle is not None else [])],
+                "invalidated": sorted(outcome.invalidated_result_ids),
+                "unresolved": sorted(unresolved_ids),
+            },
+            eligible=yielded, transient=transient_results(round_results), pages=valid_pages())
+        record["progress"] = progress_facts
+        if yielded and not progress_facts["made_progress"]:
+            feedback = (feedback or "") + (
+                "\nNo new observation content, completed image content, candidate or capability "
+                "change occurred. Reuse the existing result IDs. Identify a specific unresolved "
+                "question before requesting different evidence; repeating the same successful call "
+                "does not add information.")
+        if progress_facts["finalize_required"]:
+            receipts.append("no_progress_limit", {"round": index, **progress_facts})
+            if int(cfg.finalization_rounds) <= 0 or index >= int(cfg.max_solver_rounds):
+                record["error_code"] = "no_progress_budget_exhausted"
+                termination_reason = "no_progress_budget_exhausted"
+                break
+            force_next = True
         if feedback:
             valid = observations()
-            feedback += "\n" + observation_feedback(valid)
+            feedback += "\n" + observation_feedback(valid, question_type=str(outcome.task))
+            # Pages are host records, not program stdout, and are never summarized again.
+            current_ids = {o.result_id for o in valid}
+            pages = [page for page in record.get("observation_reads", [])
+                     if page["result_id"] in current_ids]
+            if pages:
+                feedback += "\nRequested observation pages (raw data, original references):\n" + json.dumps(
+                    pages, ensure_ascii=False, sort_keys=True)
             record["recovery_observation_ids"] = [o.result_id for o in valid]
         if failure_key:
             retry_counts[failure_key] = retry_counts.get(failure_key, 0) + 1
@@ -2485,22 +2535,22 @@ def _yield_image_ids(cell: CellResult, kernel, handle) -> list[str]:
     if ledger is None or not ledger.has_frames():
         return []
     wanted = list(getattr(cell, "yielded_result_ids", []) or [])
-    ids = [i for i in ledger.image_ids_for_results(wanted) if not i.startswith("frame-")]
-    if not ids and wanted and kernel is not None:
-        # 点名的是 **result_id**（prompt 教的写法）：从该结果的 payload 里取 image_id
-        payload_ids: list[str] = []
-        for r in (getattr(kernel, "tool_results", []) or []):
-            if str(getattr(r, "result_id", "") or "") not in set(wanted):
-                continue
-            for item in ((getattr(r, "payload", None) or {}).get("images") or []):
-                iid = str((item or {}).get("image_id", "") or "")
-                if iid:
-                    payload_ids.append(iid)
-        ids = [i for i in payload_ids if not i.startswith("frame-")]
+    valid = [o for o in collect_validated(kernel)
+             if o.result_id not in getattr(kernel, "unresolved_result_ids", set())]
+    # Include all requested valid sources, including a mixture of result and image IDs.
+    image_sources = {}
+    for obs in valid:
+        if isinstance(obs.payload, dict):
+            for item in obs.payload.get("images", []) or []:
+                if isinstance(item, dict) and item.get("image_id"):
+                    image_sources[str(item["image_id"])] = obs.result_id
+    ids = [iid for iid, rid in image_sources.items()
+           if (iid in wanted or rid in wanted) and not iid.startswith("frame-")]
     if not ids:
         # 兜底：本轮**新产出且从未交付**的派生图（模型让出但没点名具体图）。
         # 有界（≤ max_derived_images）且不含陈图，避免把旧裁剪反复塞进请求。
-        ids = ledger.undelivered_images_produced_in_round(int(ledger.current_round))
+        ids = [iid for iid in ledger.undelivered_images_produced_in_round(int(ledger.current_round))
+               if iid in image_sources]
     return ids
 
 
@@ -2526,8 +2576,9 @@ def _image_manifest_text(ledger, plan) -> str:
         lines.append(f"{idx}. [Original frame] frame_id={i.split('-', 1)[1]}")
     if plan.omitted_originals:
         lines.append(
-            f"({len(plan.omitted_originals)} additional original frames are not resent this round. "
-            "They were provided in earlier requests; derived images use those slots this round.)")
+            f"({len(plan.omitted_originals)} original frames are absent from this request: "
+            f"{plan.omitted_originals}. Only the images listed above are currently present; "
+            "earlier requests do not provide persistent visual memory.)")
     return "\n".join(lines) + "\n"
 
 
@@ -2540,6 +2591,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                 prior_program: Optional[str] = None,
                 observation_image_ids: Optional[Sequence[str]] = None,
                 finalization_observations: Optional[Sequence] = None,
+                finalization_pages: Optional[Sequence] = None,
                 round_index: int = 1,
                 trigger: str = "initial") -> _SynthResult:
     """M8：生成 program。
@@ -2582,7 +2634,11 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         prompt = build_finalization_prompt(
             question=episode.question, options=list(episode.options or []),
             question_type=canonical_task(episode.question_type),
-            observations=observation_feedback(list(finalization_observations or [])),
+            observations=observation_feedback(
+                list(finalization_observations or []), question_type=canonical_task(episode.question_type),
+                include_reader=False)
+                + "\nRecent requested valid pages (at most 3):\n"
+                + json.dumps(list(finalization_pages or []), ensure_ascii=False, sort_keys=True),
             remaining_requests=int(cfg.max_solver_rounds) - round_index + 1,
             method_context_max_chars=delivery.max_chars)
     else:
@@ -2628,15 +2684,15 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                     if isinstance(m.get("content"), list)
                     for part in m["content"]
                     if isinstance(part, dict) and part.get("type") == "image_url"])
-    if ledger is not None and ledger.has_frames():
-        # §9.4 delivered = "进了实际发出的请求"：请求发出前的最后一刻标记
-        ledger.mark_round_sent(int(round_index))
-        ledger.mark_delivered(int(round_index), plan.image_ids)
     if prior_program is not None and not finalizing:
         # 回灌：assistant(上一轮 program) → user(裁剪 traceback + 可用产物)
         messages = messages + [{"role": "assistant", "content": prior_program}]
         if traceback_feedback:
             messages.append({"role": "user", "content": traceback_feedback})
+    if ledger is not None and ledger.has_frames():
+        ledger.bind_request(int(round_index), messages)
+        ledger.mark_round_sent(int(round_index))
+        ledger.mark_delivered(int(round_index), plan.image_ids)
     try:
         # 请求级 seed：钉住在线模型采样随机性（§7 复现纪律）
         with request_phase("finalization" if finalizing else "program"):

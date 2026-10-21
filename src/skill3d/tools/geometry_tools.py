@@ -239,6 +239,8 @@ def list_objects(handle: SceneHandle, category_filter: str = "") -> list[dict]:
             "det_conf": float(o.det_conf),
             "det_conf_source": o.det_conf_source,
             "mask_support_ratio": float(o.mask_support_ratio),
+            "mask_source_present": bool(o.mask_per_frame),
+            "mask_available": None if o.mask_per_frame else False,  # Not read/verified by listing
             "binding_flags": list(o.binding_flags or []),
             "question_roles": list(o.question_roles),
             "binding_validation": ({"status": o.binding_validation.status,

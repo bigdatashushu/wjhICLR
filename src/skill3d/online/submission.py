@@ -10,7 +10,7 @@ from skill3d.schemas import AnswerPayload, CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.verifier.geometry_oracle import GeometryIssue
 from skill3d.schemas.tool import FailureCause
 
-EXECUTION_PROTOCOL_VERSION = "solver-v11.10-response-envelope"
+EXECUTION_PROTOCOL_VERSION = "solver-v11.11-observation-context"
 FINALIZATION_SCHEMA_VERSION = "answer-finalization/1.0"
 FINALIZATION_DELIVERY_STRATEGY = "omit_complete_method"
 

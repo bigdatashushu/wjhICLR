@@ -111,6 +111,7 @@ class ToolResult(Spec):
     # 答案来自"降级证据"时的显式标记（§7.2：degraded 但容忍 → 暴露且带标记）
     degraded_evidence: list[str] = []
     failure_cause: Optional[FailureCause] = None
+    failure_guidance: dict = {}  # Descriptive scope/actions; never changes authorization or invalidation
     # 名称解析后的实际几何输入；观察工具不声明对象几何依赖。
     object_dependencies: list[str] = []
     # 实参实际解析到的 ID（包括局部校验失败），不声称语义选择正确。

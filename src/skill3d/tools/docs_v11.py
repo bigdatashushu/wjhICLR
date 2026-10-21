@@ -1,6 +1,6 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.10-response-envelope"
+TOOL_DOCS_VERSION = "tool-docs-v11.11-observation-guidance"
 
 
 DESCRIPTIONS = {
@@ -15,10 +15,12 @@ DESCRIPTIONS = {
         "This is an object-surface measurement, not a centroid or camera distance."),
     "list_objects": (
         "Return object records as list[dict] with obj_id, category_name, visible_frames, track_id, "
-        "source_label, binding_provenance, det_conf, det_conf_source, mask_support_ratio, "
+        "source_label, binding_provenance, det_conf, det_conf_source, mask_available, mask_support_ratio, "
         "binding_flags, grounding_status, and "
         "duplicate_suspect. det_conf is detector confidence; mask_support_ratio is the fraction of "
         "frozen frames with a nonempty propagated mask. Never substitute one for the other. "
+        "mask_source_present only records whether a source is declared. mask_available is false "
+        "without a source, otherwise unknown (None) until the mask-reading tool validates it. "
         "An empty filter returns all records. "
         "Category filtering matches complete categories after case, separator, number, and synonym "
         "normalization, optionally removing registered appearance prefixes. It does not use substring "
@@ -45,7 +47,8 @@ DESCRIPTIONS = {
         "n_without_track, duplicate_suspect, diagnostic_warnings, and instance_consolidation "
         "(method, min_overlap, error). Question-driven M5 instances are already consolidated. "
         "Requires complete technical scan coverage and usable bindings for the requested category; "
-        "this does not prove that visual detection found every real instance."),
+        "this does not prove that visual detection found every real instance. "
+        "Counting questions may use direct image reasoning; this tool is conditional evidence."),
     "object_centroid": (
         "Return dict: centroid_normalized (3D centroid in world coordinates, normalized units), "
         "centroid_metric (3D coordinates in meters, or None without metric authorization), "
@@ -118,11 +121,15 @@ DESCRIPTIONS = {
         "Return mask-verified visible frames as list[int], independently of 3D validity. "
         "Values are frame slots (0..N-1) in the frozen FrameSet, not physical video frame indices. "
         "An empty list means this record has no registered visible frames; it does not "
-        "prove the object is absent from the entire video."),
+        "prove the object is absent from the entire video. "
+        "Box-only candidates do not have valid masks; missing masks are unknown, not absence. "
+        "Mask visibility and the first registered mask frame do not prove true first appearance."),
     "connectivity_graph": (
         "Project the point cloud onto the ground plane defined by world_up and derive reachability "
         "from connected free-space regions in an occupancy grid. Return dict: nodes, edges, "
         "traversable_matrix, start_node, and grid diagnostics. The graph is a geometric approximation. "
+        "scene_span_normalized is a point-cloud span statistic in normalized units; "
+        "it does not calibrate metric scale. No floor/free-cell mask or room area is returned. "
         "Raise an error without a point cloud or world up vector."),
     "exists_in_scene": (
         "Resolve an object ID or category and return bool. False means the currently loaded object "
@@ -137,7 +144,9 @@ DESCRIPTIONS = {
     "inspect_frames": (
         "Read/crop the frozen FrameSet. frame_ids is a list of frame slots (0..N-1), at most 32 per call. "
         "boxes is optional; otherwise provide one [x0,y0,x1,y1] pixel box per frame with a top-left origin "
-        "and at least 8 pixels per cropped side. Return dict: images (each with image_id, frame_id, "
+        "and at least 8 pixels per cropped side. Finite box endpoints are sorted, clamped to the "
+        "frame and rounded to pixels; wholly outside or too-small boxes are rejected. "
+        "Return dict: images (each with image_id, frame_id, "
         "source_frame_index, box_xyxy, source_hw, sent_hw, scale, content_sha256, transform_version), "
         "n_images, frame_ids, note. Resize the longest side to at most 640 pixels; do not resample "
         "the video. After YieldObservations, the framework delivers derived images within the image "
