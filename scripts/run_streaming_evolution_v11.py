@@ -799,6 +799,7 @@ def main(argv: list[str] | None = None) -> int:
             audit_root=run_root / "campaigns",
             max_tokens=args.deepseek_max_tokens,
             require_health_check=True,
+            method_context_max_chars=base_cfg.retrieval_policy.method_context_max_chars,
         )
         production_attempt = V11ProductionAttempt(
             library_root=library_root,

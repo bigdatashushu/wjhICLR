@@ -22,6 +22,16 @@
 
 A/B 结果只能用于准入，不进入下一批 revision。离线模型只接收当前 parent 正文、本槽位工具文档和去标识的聚合过程反馈；不能执行实验、评分或决定晋升。
 
+## r10 后的反馈与修订协议
+
+新流使用 `harness3d-fitset-stream/3.0`、`skill-evolution-stream-v11/2.0`，修订使用 `v11-fit-set-slot-revision/3.0`。旧 case 的计数字段可离线读取；旧 checkpoint 不能以新行为继续运行，须新建运行身份。历史结果和分母不修改。
+
+`fitset-process-feedback/3.0` 分开记录图像交付、工具解析 ID、候选清单、动作和错误链。图像收到响应不证明理解正确；零工具次数不表示没有视觉输入；候选数不是对象真值，`resolved_tool_object_count` 不是语义选择或答案。没有遥测的旧记录保留 unknown/null。聚合评分分为 full_score、partial_score、zero_score_answered、no_answer；白名单只允许固定类型、计数、错误码和字段名，原题、选项、答案、对象 ID 和原始模型响应不进入 reviser。
+
+在线 prompt 与修订器同源读取 `ExecutionContract`，合同携带版本/hash、方法完整字符上限、提交/观察动作及工具返回约束。工具目录从实际签名生成，明确能力上界和运行时对象/集合前置条件。静态检查增加带行号和合同依据的确定性冲突检查、示例编译、参数与返回类型检查；它不能证明任意自然语言算法正确，也不能代替性能 gate。
+
+修订响应必须声明 `action: revise | no_change`。revise 包含完整正文、单一 change_hypothesis、实际变更的 changed_sections、expected_process_effect 和 evidence_signature_refs；改动声明与实际段落差异校验。no_change 不生成候选、不运行 gate、不切换 parent、不阻塞后续批次，独立保存可恢复的身份收据。静态重试只返回安全错误码、行号、合同规则和字符长度，不回显可能含样本内容的错误细节。
+
 ## 冻结与评分
 
 `freeze` 只合并每个唯一 owner 的最后成功发布版本，不做额外终版修订。检查 worker 所有权、结果分母、未解决触发、active loader 和其他槽位仍等于 seed。全部候选被拒绝时也能冻结 seed；不声称已产生学习增益。

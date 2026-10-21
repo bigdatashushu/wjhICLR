@@ -150,6 +150,30 @@ class ToolRegistry:
     def spec(self, name: str) -> ToolSpec:
         return self.get(name).spec
 
+    def interface_catalog(self, names: Iterable[str]) -> list[dict]:
+        """Structured, implementation-derived interfaces; not episode authorization."""
+        rows = []
+        for name in sorted(set(names)):
+            entry = self.get(name)
+            signature = inspect.signature(entry.fn)
+            parameters = list(signature.parameters.values())[1:]
+            rows.append({
+                "name": name,
+                "arguments": [{
+                    "name": p.name, "kind": p.kind.name,
+                    "required": p.default is inspect.Parameter.empty,
+                    "annotation": str(p.annotation),
+                } for p in parameters],
+                "return_annotation": str(signature.return_annotation),
+                "return_schema_ref": entry.spec.returns_schema_ref,
+                "public_capabilities_required": entry.spec.requires_evidence,
+                "local_facts_required": entry.spec.requires_local_facts,
+                "artifacts_required": entry.spec.requires_artifacts,
+                "definition_and_preconditions": DESCRIPTIONS.get(name, entry.spec.description),
+                "availability": "upper_bound; runtime authorization and object/collection checks required",
+            })
+        return rows
+
     def requires_artifacts(self, name: str) -> list[str]:
         return list(self.get(name).spec.requires_artifacts)
 

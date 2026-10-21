@@ -27,6 +27,11 @@ from skill3d.evolution.fitset_revision_v11 import (
     load_active_parent_slots,
 )
 from skill3d.evolution.leakage import leakage_scan_text
+from skill3d.evolution.process_feedback import (
+    FEEDBACK_SCHEMA_VERSION, FEEDBACK_WHITELIST_VERSION, FIELD_SEMANTICS,
+    ProcessFacts, extract_process_facts, legacy_process_facts, safe_process_dict,
+    score_band,
+)
 from skill3d.evolution.streaming_v11 import (
     StreamingAttemptResult,
     StreamingEvolutionConfig,
@@ -45,7 +50,7 @@ from skill3d.skills.v11_library import (
     write_v11_snapshot,
 )
 
-FIT_STREAM_SCHEMA = "harness3d-fitset-stream/2.0"
+FIT_STREAM_SCHEMA = "harness3d-fitset-stream/3.0"
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,7 @@ class FitSetExperienceCase(Spec):
     outcome: Literal["success", "failure"]
     failure_categories: list[str]
     process_signature: dict = Field(default_factory=dict)
+    process_facts: ProcessFacts | None = None
     trace_ref: str
     trace_sha256: str
     initial_evidence_states: dict
@@ -252,6 +258,7 @@ def collect_fitset_case(variant: Mapping, outcome: Mapping,
         failure_categories=[] if score == 1 else [
             str(outcome.get("failure_code") or "answer_incorrect")],
         trace_ref=trace_ref, trace_sha256=content_sha256(outcome),
+        process_facts=extract_process_facts(outcome),
         process_signature={
             "final_state": outcome.get("final_state"),
             "answer_source": outcome.get("answer_source"),
@@ -259,7 +266,7 @@ def collect_fitset_case(variant: Mapping, outcome: Mapping,
                 str(row["error_code"]) for row in rounds if row.get("error_code")}),
             "model_rounds": len(rounds),
             "tool_calls": sum(len(row.get("results") or []) for row in rounds),
-            "selected_object_count": len({
+            "resolved_tool_object_count": len({
                 str(obj) for row in rounds for observation in row.get("results") or []
                 for obj in observation.get("resolved_object_ids", [])
             }),
@@ -273,20 +280,30 @@ def sanitized_slot_feedback(cases) -> dict:
     slots = {case.evidence_state + "/" + case.question_type for case in cases}
     parents = {case.delivered_skill_version for case in cases}
     _require(len(slots) == len(parents) == 1, "反馈混入不同槽位或 parent")
-    counts = Counter(json.dumps({
-        "outcome": case.outcome, "failure_categories": case.failure_categories,
-        "process": case.process_signature,
-    }, sort_keys=True) for case in cases)
-    return {
+    signatures = []
+    for case in cases:
+        facts = case.process_facts or legacy_process_facts(case.process_signature)
+        signatures.append({
+            "score_band": score_band(case.score, facts.execution.answer_submitted),
+            "process": safe_process_dict(facts.model_dump(mode="json")),
+        })
+    counts = Counter(json.dumps(row, sort_keys=True) for row in signatures)
+    body = {
+        "schema_version": FEEDBACK_SCHEMA_VERSION,
+        "whitelist_version": FEEDBACK_WHITELIST_VERSION,
+        "field_semantics": dict(FIELD_SEMANTICS),
         "question_type": cases[0].question_type,
         "evidence_state": cases[0].evidence_state,
         "n_cases": len(cases),
         "mean_score": sum(case.score for case in cases) / len(cases),
+        "score_bands": dict(sorted(Counter(row["score_band"] for row in signatures).items())),
         "signatures": [
-            {**json.loads(signature), "n": n}
+            {**json.loads(signature), "n": n,
+             "signature_ref": content_sha256(json.loads(signature))}
             for signature, n in sorted(counts.items())
         ],
     }
+    return {**body, "identity_sha256": content_sha256(body)}
 
 
 class FitSetWorkerEvolution:
@@ -578,6 +595,12 @@ class FitSetWorkerEvolution:
             result = StreamingAttemptResult(
                 outcome="rejected", campaign_id=token, reason=str(exc))
         else:
+            if candidate is None:
+                result = StreamingAttemptResult(
+                    outcome="no_change", campaign_id=token,
+                    reason="Current process evidence does not support a method revision")
+                _write_create_once(result_path, asdict(result))
+                return result
             if decision_path.exists():
                 decision = json.loads(decision_path.read_text())
                 body = {key: value for key, value in decision.items()

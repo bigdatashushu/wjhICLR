@@ -37,10 +37,11 @@ from skill3d.skills.registry import (
     load_active_skills,
 )
 from skill3d.tools.contract import KNOWN_ARTIFACTS
+from skill3d.synthesis.execution_contract import ExecutionContract, review_method_contract
 
-FIT_REVISION_SCHEMA = "v11-fit-set-slot-revision/2.0"
-FIT_FEEDBACK_SCHEMA = "v11-fit-set-slot-feedback/2.0"
-FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v2"
+FIT_REVISION_SCHEMA = "v11-fit-set-slot-revision/3.0"
+FIT_FEEDBACK_SCHEMA = "v11-fit-set-slot-feedback/3.0"
+FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v3"
 
 
 def _write_create_once(path: Path, value: object) -> None:
@@ -88,10 +89,27 @@ def _parse_response(text: str) -> dict:
             f"offline reviser returned invalid JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise FitSetError("offline reviser response must be one JSON object")
-    if not isinstance(value.get("full_skill_md"), str):
-        raise FitSetError("offline reviser response lacks full_skill_md")
     if not isinstance(value.get("modification_reason"), str):
         raise FitSetError("offline reviser response lacks modification_reason")
+    if not value["modification_reason"].strip():
+        raise FitSetError("offline reviser modification_reason must not be empty")
+    action = value.get("action")
+    if action not in ("revise", "no_change"):
+        raise FitSetError("offline reviser action must be revise or no_change")
+    if action == "no_change":
+        if "full_skill_md" in value:
+            raise FitSetError("no_change must not include full_skill_md")
+        return value
+    if not isinstance(value.get("full_skill_md"), str):
+        raise FitSetError("offline reviser response lacks full_skill_md")
+    for key in ("change_hypothesis", "expected_process_effect"):
+        if not isinstance(value.get(key), str) or not value[key].strip():
+            raise FitSetError(f"revision lacks {key}")
+    for key in ("changed_sections", "evidence_signature_refs"):
+        if not isinstance(value.get(key), list) or not all(isinstance(v, str) for v in value[key]):
+            raise FitSetError(f"revision lacks {key}")
+    if not value["changed_sections"]:
+        raise FitSetError("revision changed_sections must not be empty")
     skill_md = value["full_skill_md"].replace("\r\n", "\n").replace("\r", "\n")
     value["full_skill_md"] = skill_md.rstrip("\n") + "\n"
     return value
@@ -125,7 +143,7 @@ def _tool_docs(question_type: str, evidence_state: str) -> str:
     geometry = evidence_state != "g0m0"
     scale = evidence_state == "g1m1"
     metric = scale and question_type in METRIC_TASK_TYPES
-    return REGISTRY.docs(
+    context = dict(
         scope=(
             "fallback_2d_only"
             if not geometry
@@ -139,6 +157,16 @@ def _tool_docs(question_type: str, evidence_state: str) -> str:
         gate_passed=metric,
         question_type=question_type,
         local_facts={"world_frame": True},
+    )
+    return (
+        "This catalog is the exact-slot capability upper bound, not episode authorization. "
+        "Each call still requires the current artifact/local-fact checks and object/collection "
+        "preconditions. world_frame here is hypothetical, never guaranteed. Missing object "
+        "binding or collection coverage requires a supported visual fallback.\n"
+        + REGISTRY.docs(**context)
+        + "\nStructured interface catalog:\n"
+        + json.dumps(REGISTRY.interface_catalog(REGISTRY.names_for_scope(**context)),
+                     sort_keys=True, ensure_ascii=False)
     )
 
 
@@ -331,13 +359,15 @@ def _static_validate(
         from skill3d.tools import REGISTRY
 
         call_pattern = re.compile(r"\b(?:tools\.)?([A-Za-z_]\w*)\s*\(")
-        current = set(call_pattern.findall(candidate.skill_md))
-        inherited = set(call_pattern.findall(parent.skill_md))
         docs = _tool_docs(parent.question_type, parent.evidence_state)
-        new_tools = (current - inherited) & set(REGISTRY.names())
-        for tool in sorted(new_tools):
-            if not re.search(rf"\b{re.escape(tool)}\s*\(", docs):
-                problems.append(f"candidate adds unavailable exact-slot tool: {tool}")
+        allowed_tools = set(call_pattern.findall(docs)) & set(REGISTRY.names())
+        for issue in review_method_contract(candidate.skill_md, allowed_tools=allowed_tools):
+            if issue.severity != "error":
+                continue
+            if issue.code == "unavailable_tool_reference":
+                problems.append(f"candidate adds unavailable exact-slot tool: {issue.rule}")
+            else:
+                problems.append(f"{issue.code}: line={issue.line}; rule={issue.rule}")
         leaks = leakage_scan_text(
             candidate.skill_md,
             forbidden_sample_ids=forbidden_sample_ids,
@@ -345,6 +375,60 @@ def _static_validate(
         if leaks:
             problems.append(f"candidate matched leakage patterns: {leaks}")
     return candidate, problems
+
+
+def _safe_static_feedback(problems: Sequence[str], *, candidate: SkillSpecV11 | None,
+                          max_chars: int) -> list[dict]:
+    """Only host-owned codes and numeric lengths enter a repair request."""
+    codes = []
+    for problem in problems:
+        if problem.startswith("candidate is identical"):
+            codes.append({"code": "candidate_identical", "repair": "Use no_change or make the declared method change."})
+        elif problem.startswith("candidate changed"):
+            codes.append({"code": "stable_name_changed"})
+        elif problem.startswith("Method body"):
+            codes.append({"code": "method_too_long", "actual_chars": len(candidate.skill_md) if candidate else None,
+                          "max_chars": max_chars})
+        elif problem.startswith("candidate matched leakage"):
+            codes.append({"code": "leakage_detected", "repair": "Remove sample content; do not copy validation details."})
+        elif problem.startswith("candidate adds unavailable"):
+            codes.append({"code": "unavailable_tool_reference"})
+        elif problem.startswith("candidate references unknown"):
+            codes.append({"code": "unknown_tool_reference"})
+        elif problem.split(":")[0] in {
+            "execution_contract_conflict", "telemetry_as_api", "return_schema_mismatch",
+            "answer_schema_mismatch", "example_syntax_error", "tool_argument_schema_mismatch",
+            "declared_change_not_present", "unknown_evidence_signature",
+        }:
+            match = re.search(r"line=(\d+); rule=([a-z_]+)", problem)
+            codes.append({"code": problem.split(":")[0],
+                          **({"line": int(match[1]), "rule": match[2]} if match else {})})
+        else:
+            codes.append({"code": "invalid_revision_schema"})
+    return codes
+
+
+def _declaration_problems(value: Mapping, parent: SkillSpecV11, feedback: Mapping) -> list[str]:
+    def sections(text):
+        out = {"__body__": text}
+        current = None
+        for line in text.splitlines():
+            if re.match(r"^#{1,6} ", line):
+                current = line.lstrip("# ").strip()
+                out.setdefault(current, "")
+            if current is not None:
+                out[current] += line + "\n"
+        return out
+
+    old, new = sections(parent.skill_md), sections(value["full_skill_md"])
+    problems = []
+    for section in value["changed_sections"]:
+        if section not in new or new.get(section) == old.get(section):
+            problems.append("declared_change_not_present: rule=compare_actual_section_diff")
+    known = {row.get("signature_ref") for row in feedback.get("signatures", [])}
+    if any(ref not in known for ref in value["evidence_signature_refs"]):
+        problems.append("unknown_evidence_signature: rule=use_supplied_signature_refs")
+    return problems
 
 
 class FitSetSlotReviser:
@@ -431,13 +515,19 @@ class FitSetSlotReviser:
         *,
         parent: SkillSpecV11,
         feedback: Mapping,
-        static_feedback: Sequence[str],
+        static_feedback: Sequence,
     ) -> str:
         return (
             "Revise one reusable method for a visual-spatial coding agent.\n"
             f"Protocol: {FIT_REVISION_PROMPT_VERSION}.\n"
-            "Return exactly one JSON object with string fields full_skill_md "
-            "and modification_reason. full_skill_md must contain the complete "
+            "Return exactly one JSON object with action='revise' or action='no_change', "
+            "and string modification_reason. For no_change omit full_skill_md: insufficient "
+            "process evidence is a valid reason to keep the parent. For revise include "
+            "change_hypothesis (one main hypothesis), changed_sections, expected_process_effect, "
+            "and evidence_signature_refs. These declarations are audited against the actual diff; "
+            "changed_sections is a list of exact Markdown heading titles, or ['__body__'] for "
+            "a whole-body change. evidence_signature_refs is a list of supplied signature_ref values. "
+            "they are not performance evidence. full_skill_md must contain the complete "
             "canonical SKILL.md with YAML frontmatter and full Markdown body. "
             "Use English for all natural-language text and code comments.\n"
             f"The method handles only exact slot {parent.slot_key!r}. "
@@ -450,6 +540,7 @@ class FitSetSlotReviser:
             "failure. Improve decision rules, checks, tool use, and fallbacks "
             "only when supported by the aggregate process facts. Do not invent "
             "tools or alter framework, model, prompt, scoring, or permissions.\n\n"
+            f"{ExecutionContract(self.method_context_max_chars).render()}\n\n"
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
             "Authorized Tool interfaces for this exact slot:\n"
             f"{_tool_docs(parent.question_type, parent.evidence_state)}\n"
@@ -527,13 +618,22 @@ class FitSetSlotReviser:
         parent: SkillSpecV11,
         feedback: Mapping,
         forbidden_ids: set[str],
-    ) -> SkillSpecV11:
+    ) -> SkillSpecV11 | None:
         slot_name = fit_slot_key(*slot)
         slot_root = self.root / "slots" / slot[0] / slot[1]
         final_path = slot_root / "final.json"
         skill_path = slot_root / "SKILL.md"
-        if final_path.is_file() and skill_path.is_file():
+        if final_path.is_file():
             receipt = json.loads(final_path.read_text(encoding="utf-8"))
+            body = {k: v for k, v in receipt.items() if k != "identity_sha256"}
+            if (receipt.get("schema_version") != FIT_REVISION_SCHEMA
+                    or receipt.get("identity_sha256") != content_sha256(body)
+                    or receipt.get("parent_content_sha256") != parent.content_sha256
+                    or receipt.get("contract_sha256") != ExecutionContract(self.method_context_max_chars).sha256
+                    or receipt.get("feedback_sha256") != content_sha256(feedback)):
+                raise FitSetError(f"{slot_name}: frozen revision identity changed")
+            if receipt.get("action") == "no_change":
+                return None
             text = skill_path.read_text(encoding="utf-8")
             candidate, problems = _static_validate(
                 parent=parent,
@@ -549,13 +649,16 @@ class FitSetSlotReviser:
                 raise FitSetError(
                     f"{slot_name}: frozen candidate no longer validates")
             return candidate
-        static_feedback: list[str] = []
+        static_feedback: list[dict] = []
         for attempt in range(1, self.max_attempts + 1):
             prompt = self._prompt(
                 parent=parent,
                 feedback=feedback,
                 static_feedback=static_feedback,
             )
+            # Scan the complete request, including the parent and retry feedback.
+            if leakage_scan_text(prompt, forbidden_sample_ids=forbidden_ids):
+                raise FitSetError("offline request leakage scan failed")
             exchange = self._request(
                 slot=slot,
                 attempt=attempt,
@@ -563,12 +666,26 @@ class FitSetSlotReviser:
             )
             try:
                 value = _parse_response(exchange["response_text"])
+                if value["action"] == "no_change":
+                    body = {
+                        "schema_version": FIT_REVISION_SCHEMA, "action": "no_change",
+                        "slot_key": slot_name, "attempt": attempt,
+                        "parent_skill_version": f"{parent.skill_id}@{parent.version}",
+                        "parent_content_sha256": parent.content_sha256,
+                        "contract_sha256": ExecutionContract(self.method_context_max_chars).sha256,
+                        "feedback_sha256": content_sha256(feedback),
+                        "modification_reason": value["modification_reason"],
+                        "exchange_sha256": content_sha256(exchange),
+                    }
+                    _write_create_once(final_path, {**body, "identity_sha256": content_sha256(body)})
+                    return None
                 candidate, problems = _static_validate(
                     parent=parent,
                     candidate_text=value["full_skill_md"],
                     forbidden_sample_ids=forbidden_ids,
                     method_context_max_chars=self.method_context_max_chars,
                 )
+                problems.extend(_declaration_problems(value, parent, feedback))
             except FitSetError as exc:
                 candidate, problems = None, [str(exc)]
             validation = {
@@ -586,8 +703,9 @@ class FitSetSlotReviser:
             )
             if candidate is not None and not problems:
                 _write_text_create_once(skill_path, candidate.skill_md)
-                _write_create_once(final_path, {
+                body = {
                     "schema_version": FIT_REVISION_SCHEMA,
+                    "action": "revise",
                     "slot_key": slot_name,
                     "question_type": slot[0],
                     "evidence_state": slot[1],
@@ -597,15 +715,20 @@ class FitSetSlotReviser:
                     "candidate_skill_version": (
                         f"{candidate.skill_id}@{candidate.version}"),
                     "content_sha256": candidate.content_sha256,
+                    "parent_content_sha256": parent.content_sha256,
+                    "contract_sha256": ExecutionContract(self.method_context_max_chars).sha256,
+                    "feedback_sha256": content_sha256(feedback),
                     "modification_reason": value["modification_reason"],
+                    "change_declaration": {
+                        key: value.get(key) for key in (
+                            "change_hypothesis", "changed_sections",
+                            "expected_process_effect", "evidence_signature_refs")},
                     "exchange_sha256": content_sha256(exchange),
-                })
+                }
+                _write_create_once(final_path, {**body, "identity_sha256": content_sha256(body)})
                 return candidate
-            static_feedback = [
-                # 下一次 prompt 不回传候选正文或可能包含标签的校验详情。
-                "Static validation failed; preserve the parent's exact-slot "
-                "identity, known authorized tools, complete source and no sample content."
-            ]
+            static_feedback = _safe_static_feedback(
+                problems, candidate=candidate, max_chars=self.method_context_max_chars)
         raise FitSetError(
             f"{slot_name}: no valid candidate after "
             f"{self.max_attempts} attempts")

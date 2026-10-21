@@ -373,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
             audit_root=args.run_root,
             max_tokens=args.deepseek_max_tokens,
             require_health_check=True,
+            method_context_max_chars=base_cfg.retrieval_policy.method_context_max_chars,
         )
         evaluator = V11PairedEvaluator(
             items=inner,

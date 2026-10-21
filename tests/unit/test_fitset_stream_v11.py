@@ -28,13 +28,27 @@ class RevisionClient:
         parent = text.split("Parent complete SKILL.md:\n")[1].split(
             "\nAuthorized Tool interfaces for this exact slot:\n")[0]
         return json.dumps({
+            "action": "revise",
             "full_skill_md": parent.rstrip("\n") + "\n\nUse FITREV checks.\n",
             "modification_reason": "Add process checks.",
+            "change_hypothesis": "Process checks may improve completeness.",
+            "changed_sections": ["__body__"],
+            "expected_process_effect": "Check completeness.",
+            "evidence_signature_refs": [],
         })
 
 
 def revision_factory():
     return RevisionClient()
+
+
+class NoChangeRevisionClient:
+    def chat(self, messages, **kwargs):
+        return json.dumps({"action": "no_change", "modification_reason": "No supported method change."})
+
+
+def no_change_revision_factory():
+    return NoChangeRevisionClient()
 
 
 class AnswerClient:
@@ -211,6 +225,19 @@ def test_equal_scores_reject_and_keep_seed(tmp_path):
         "skill_version"] == "S01-g0m0@1.0.0"
     bundle = freeze_fitset_stream(runner.root, tmp_path / "bundle")
     assert bundle["revised_slot_count"] == 0
+
+
+def test_no_change_skips_gate_and_next_episode_keeps_parent(tmp_path):
+    runner = make_runner(tmp_path)
+    runner.revision_client_factory = no_change_revision_factory
+    runner.run(resume=False)
+    stream = json.loads(next(
+        (runner.root / "workers").glob("*/buffer/stream.json")).read_text())
+    assert stream["attempts"][0]["outcome"] == "no_change"
+    assert not list((runner.root / "workers").glob("*/campaigns/*/decision.json"))
+    assert runner.completed()["fit-012@g0m0"]["initial_skill_selection"][
+        "skill_version"] == "S01-g0m0@1.0.0"
+    assert freeze_fitset_stream(runner.root, tmp_path / "bundle")["revised_slot_count"] == 0
 
 
 def test_short_slot_does_not_trigger_tail_revision(tmp_path):

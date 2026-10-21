@@ -278,3 +278,24 @@ def test_ready_attempt_can_be_recovered_after_callback_boundary(tmp_path):
         "object_rel_distance/g1m0",
         attempt=reject,
     ) is None
+
+
+def test_no_change_keeps_parent_and_does_not_block_next_batch_on_resume(tmp_path):
+    config = StreamingEvolutionConfig(batch_size=1)
+    runner = StreamingEvolutionRunner(tmp_path, stream_id="no-change", config=config)
+
+    def no_change(request):
+        return StreamingAttemptResult(
+            outcome="no_change", campaign_id=f"no-change-{request.attempt_index}",
+            reason="No new method hypothesis")
+
+    runner.ingest(_case(1), parent_snapshot_id="parent", attempt=no_change)
+    resumed = StreamingEvolutionRunner(tmp_path, stream_id="no-change", config=config)
+    result = resumed.ingest(_case(2), parent_snapshot_id="parent", attempt=no_change)
+    assert result.outcome == "no_change"
+    slot = _checkpoint(tmp_path)["slots"]["object_rel_distance/g1m0"]
+    assert slot["parent_skill_version"] == "S03-g1m0@1.0.0"
+    assert slot["new_since_attempt"] == 0
+    assert slot["deferred_reason"] == ""
+    assert len(slot["case_refs"]) == 2
+    assert slot["attempt_count"] == 2

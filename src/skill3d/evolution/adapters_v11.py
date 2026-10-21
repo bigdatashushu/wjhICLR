@@ -49,12 +49,14 @@ from skill3d.segmentation.prepared_binding_store import (
     PreparedBindingStore,
 )
 from skill3d.routing.task_classifier import canonical_task
-from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION, _PROGRAM_SYNTH
+from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
+from skill3d.synthesis.execution_contract import ExecutionContract
+from skill3d.skills.delivery import DEFAULT_METHOD_CONTEXT_MAX_CHARS
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
 
-REVISION_PROMPT_VERSION = "skill-revision-v11.5-task-tools"
+REVISION_PROMPT_VERSION = "skill-revision-v11.6-shared-contract"
 _SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -148,11 +150,13 @@ class V11OfflineReviser:
         audit_root: str | Path,
         max_tokens: int = 32768,
         require_health_check: bool = True,
+        method_context_max_chars: int = DEFAULT_METHOD_CONTEXT_MAX_CHARS,
     ) -> None:
         self.client = client
         self.audit_root = Path(audit_root).resolve()
         self.max_tokens = int(max_tokens)
         self.require_health_check = bool(require_health_check)
+        self.method_context_max_chars = int(method_context_max_chars)
         self._health_checked = False
 
     def _prompt(self, **kwargs) -> str:
@@ -203,7 +207,7 @@ class V11OfflineReviser:
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
             f"Keep the stable frontmatter name exactly {parent.name!r}.\n"
             "Current online execution contract:\n"
-            f"{_PROGRAM_SYNTH.split('## Current question and answer requirements')[0]}\n"
+            f"{ExecutionContract(self.method_context_max_chars).render()}\n"
             f"Current Tool interfaces ({TOOL_DOCS_VERSION}) for this initial slot:\n{tool_docs}\n"
             "This is the slot's maximum interface set. Actual objects, artifacts and local "
             "conditions can restrict it further; use only currently authorized interfaces "

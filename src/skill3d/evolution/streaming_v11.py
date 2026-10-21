@@ -12,7 +12,7 @@ from typing import Callable, Literal
 
 from skill3d.schemas import V11ExperienceCase
 
-STREAM_SCHEMA_VERSION = "skill-evolution-stream-v11/1.0"
+STREAM_SCHEMA_VERSION = "skill-evolution-stream-v11/2.0"
 
 
 class StreamingEvolutionError(RuntimeError):
@@ -100,7 +100,7 @@ class StreamingAttemptRequest:
 
 @dataclass(frozen=True)
 class StreamingAttemptResult:
-    outcome: Literal["promoted", "rejected", "deferred"]
+    outcome: Literal["promoted", "rejected", "deferred", "no_change", "duplicate"]
     campaign_id: str
     reason: str = ""
     active_snapshot_id: str = ""
@@ -109,6 +109,8 @@ class StreamingAttemptResult:
     post_publish_cases: tuple[V11ExperienceCase, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.outcome not in ("promoted", "rejected", "deferred", "no_change", "duplicate"):
+            raise ValueError("unknown streaming attempt outcome")
         if not self.campaign_id:
             raise ValueError("campaign_id must not be empty")
         if self.outcome == "promoted":
@@ -398,7 +400,7 @@ class StreamingEvolutionRunner:
         slot.attempted_ever = True
         slot.new_since_attempt = 0
         slot.deferred_reason = ""
-        if result.outcome == "rejected":
+        if result.outcome in ("rejected", "no_change", "duplicate"):
             self._save()
             return result
 

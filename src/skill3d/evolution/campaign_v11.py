@@ -58,6 +58,7 @@ from skill3d.skills.v11_library import (
     write_v11_snapshot,
 )
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
+from skill3d.synthesis.execution_contract import review_method_contract
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 
@@ -622,6 +623,13 @@ class V11CampaignRunner:
         checks["tools_known"] = not unknown_tools
         if unknown_tools:
             problems.append(f"The candidate references unknown tools: {unknown_tools}")
+
+        contract_issues = review_method_contract(raw)
+        checks["execution_contract_consistent"] = not any(
+            issue.severity == "error" for issue in contract_issues)
+        problems.extend(
+            f"{issue.code}: line={issue.line}; rule={issue.rule}"
+            for issue in contract_issues if issue.severity == "error")
 
         if candidate_spec is not None:
             try:

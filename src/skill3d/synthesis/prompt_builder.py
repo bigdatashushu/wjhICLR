@@ -14,8 +14,9 @@ from jinja2 import Environment, StrictUndefined
 from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
+from skill3d.synthesis.execution_contract import ExecutionContract
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_8_en"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_9_en"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -33,6 +34,9 @@ _TASK_DEFINITIONS = {
 _PROGRAM_SYNTH = """You are a spatial reasoning coding agent. Use the question, images, and
 currently available tools to generate a Python program for execution, then submit
 with `return ReturnAnswer(AnswerPayload(...))`.
+
+## Immutable execution contract
+{{ execution_contract }}
 
 ## Shared execution rules
 - Output exactly one ```python code block, with no explanation outside it. Write comments and observation reasons in English.
@@ -163,6 +167,9 @@ class PromptBuilder:
             plan = plan_delivery(skills, max_chars=method_context_max_chars)
         tpl = self._env.from_string(_PROGRAM_SYNTH)
         return tpl.render(
+            execution_contract=ExecutionContract(
+                plan.max_chars if plan is not None else (
+                    method_context_max_chars or 8000)).render(),
             question=question,
             scene_summary=scene_summary,
             scene_frame=scene_frame,

@@ -553,8 +553,13 @@ class _RevisionClient:
         self.last_generation = {"finish_reason": "stop"}
         self.last_response_identity = {"model": "qwen3.8-flash"}
         return json.dumps({
+            "action": "revise",
             "full_skill_md": candidate,
             "modification_reason": "Add an exact-slot fail-closed check.",
+            "change_hypothesis": "Add a consistency check.",
+            "changed_sections": ["__body__"],
+            "expected_process_effect": "More consistent decisions.",
+            "evidence_signature_refs": [],
         })
 
 
@@ -567,8 +572,13 @@ class _RevisionClient:
 )
 def test_fitset_revision_normalizes_canonical_skill_newlines(skill_md):
     value = _parse_response(json.dumps({
+        "action": "revise",
         "full_skill_md": skill_md,
         "modification_reason": "Keep the complete method.",
+        "change_hypothesis": "Keep complete source.",
+        "changed_sections": ["__body__"],
+        "expected_process_effect": "Preserve the method.",
+        "evidence_signature_refs": [],
     }))
     assert "\r" not in value["full_skill_md"]
     assert value["full_skill_md"].endswith("\n")
