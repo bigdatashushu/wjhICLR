@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Mapping, Sequence
 import uuid
 import re
+import time
+from datetime import datetime, timezone
 
 from skill3d.evaluation.fitset_v11 import (
     ALL_FIT_SLOTS,
@@ -38,6 +40,7 @@ from skill3d.skills.registry import (
 )
 from skill3d.tools.contract import KNOWN_ARTIFACTS
 from skill3d.synthesis.execution_contract import ExecutionContract, review_method_contract
+from skill3d.synthesis.request_audit import describe_request
 
 FIT_REVISION_SCHEMA = "v11-fit-set-slot-revision/3.0"
 FIT_FEEDBACK_SCHEMA = "v11-fit-set-slot-feedback/3.0"
@@ -579,6 +582,15 @@ class FitSetSlotReviser:
             "temperature": 0.0,
             "enable_thinking": False,
         }
+        parameters = {key: request[key] for key in (
+            "max_tokens", "seed", "temperature", "enable_thinking")}
+        build_payload = getattr(self.client, "build_payload", None)
+        payload = (build_payload(request["messages"], **parameters) if callable(build_payload)
+                   else {"messages": request["messages"], **parameters})
+        identity_fn = getattr(self.client, "audit_identity", None)
+        request["model_request_identity"] = describe_request(
+            payload, model_identity=identity_fn(seed=request["seed"]) if callable(identity_fn) else {},
+            wire_encoding_known=callable(build_payload))
         if exchange_path.is_file():
             exchange = json.loads(exchange_path.read_text(encoding="utf-8"))
             if exchange.get("request") != request:
@@ -591,7 +603,9 @@ class FitSetSlotReviser:
         if intent_path.exists():
             raise FitSetError(
                 f"{slot_name}: revision request has no completion receipt; ambiguous request is not retried")
-        _write_create_once(intent_path, request)
+        _write_create_once(intent_path, {
+            "request": request, "started_at": datetime.now(timezone.utc).isoformat()})
+        started = time.perf_counter()
         try:
             text = self.client.chat(
                 request["messages"],
@@ -605,6 +619,7 @@ class FitSetSlotReviser:
             _write_create_once(exchange_path, {
                 "schema_version": FIT_REVISION_SCHEMA, "request": request,
                 "service_error": True, "exception_type": type(exc).__name__,
+                "elapsed_s": time.perf_counter() - started,
             })
             raise FitSetError(f"{slot_name}: revision request failed") from exc
         exchange = {
@@ -622,6 +637,10 @@ class FitSetSlotReviser:
                 getattr(self.client, "last_generation", None) or {}),
             "response_identity": dict(
                 getattr(self.client, "last_response_identity", None) or {}),
+            "actual_request_identity": dict(
+                getattr(self.client, "last_request_identity", None) or {}),
+            "elapsed_s": time.perf_counter() - started,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_create_once(exchange_path, exchange)
         return exchange

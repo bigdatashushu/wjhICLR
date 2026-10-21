@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 
 from .client_errors import ServiceUnavailable
+from .request_audit import describe_request, payload_bytes
 
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen3.8-flash"
@@ -115,6 +116,7 @@ class BailianClient:
         self.last_usage: dict = {}
         self.last_generation: dict = {}
         self.last_response_identity: dict = {}
+        self.last_request_identity: dict = {}
 
     @property
     def configured(self) -> bool:
@@ -141,7 +143,7 @@ class BailianClient:
             "cache_eligible": bool(self.model_revision),
         }
 
-    def chat(
+    def build_payload(
         self,
         messages: list[dict],
         max_tokens: int = 2048,
@@ -149,10 +151,8 @@ class BailianClient:
         temperature: Optional[float] = None,
         response_format: Optional[dict] = None,
         enable_thinking: bool = False,
-    ) -> str:
-        api_key = os.environ.get(self.api_key_env, "").strip()
-        if not api_key:
-            raise ServiceUnavailable(f"{self.api_key_env} is not configured")
+        top_p: Optional[float] = None,
+    ) -> dict:
         payload = {
             "model": self.model,
             "messages": messages,
@@ -164,21 +164,44 @@ class BailianClient:
             payload["seed"] = int(seed)
         if response_format is not None:
             payload["response_format"] = response_format
+        if top_p is not None:
+            payload["top_p"] = float(top_p)
+        return payload
+
+    def chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 2048,
+        seed: Optional[int] = None,
+        temperature: Optional[float] = None,
+        response_format: Optional[dict] = None,
+        enable_thinking: bool = False,
+        top_p: Optional[float] = None,
+    ) -> str:
+        payload = self.build_payload(
+            messages, max_tokens=max_tokens, seed=seed, temperature=temperature,
+            response_format=response_format, enable_thinking=enable_thinking, top_p=top_p)
+        self.last_request_identity = describe_request(
+            payload, model_identity=self.audit_identity(seed=seed))
+        self.last_usage = {}
+        self.last_response_identity = {}
+        self.last_generation = {
+            "mode": "nonstream", "usage_status": "unknown",
+            "provider": self.provider, "endpoint_sha256": self.endpoint_hash,
+            "request_identity": self.last_request_identity,
+        }
+        api_key = os.environ.get(self.api_key_env, "").strip()
+        if not api_key:
+            raise ServiceUnavailable(f"{self.api_key_env} is not configured")
         request = urllib.request.Request(
             self.base_url + "/chat/completions",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            data=payload_bytes(payload),
             method="POST",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
         )
-        self.last_usage = {}
-        self.last_generation = {
-            "mode": "nonstream", "usage_status": "unknown",
-            "provider": self.provider, "endpoint_sha256": self.endpoint_hash,
-        }
-        self.last_response_identity = {}
         try:
             with self._opener(request, timeout=self.timeout_s) as response:
                 body = json.loads(response.read().decode("utf-8"))
@@ -205,7 +228,9 @@ class BailianClient:
                 "id": str(body.get("id") or ""),
                 "model": str(body.get("model") or self.model),
                 "created": body.get("created"),
+                "backend_fingerprint": body.get("system_fingerprint"),
             }
+            self.last_generation["response_identity"] = self.last_response_identity
             return content
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid Bailian response: {exc}") from exc

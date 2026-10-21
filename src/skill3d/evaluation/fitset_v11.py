@@ -1673,6 +1673,19 @@ class SystemVariantRunner:
             if self.client_factory is not None
             else None
         )
+        set_context = getattr(llm, "set_audit_context", None)
+        if callable(set_context):
+            shared_plan = {key: value for key, value in prepared_run["plan"].items()
+                           if key != "skill_identity"}
+            set_context({
+                "run_identity": self.run_identity,
+                "shared_input_sha256": content_sha256(shared_plan),
+                "skill_identity": skill_identity,
+                "skill_content_sha256": [skill.content_sha256 for skill in skills],
+                "solver_config_sha256": content_sha256(_json_value(asdict(runtime_base_cfg))),
+                "concurrency_limit": self.episode_concurrency,
+                "scheduler": self.execution_scheduler,
+            })
         started = time.perf_counter()
         outcomes, evaluation_run = runner.run_split(
             [item],

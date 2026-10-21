@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import time
 from typing import Literal, Mapping
 
 from skill3d.evaluation.fitset_v11 import (
@@ -22,6 +23,9 @@ from skill3d.evaluation.fitset_v11 import (
     fit_slot_key,
     score_answer,
 )
+from skill3d.evaluation.gate_process_metrics import (
+    episode_process_metrics, aggregate_gate_process_metrics,
+)
 from skill3d.evolution.fitset_revision_v11 import (
     FitSetSlotReviser,
     load_active_parent_slots,
@@ -30,6 +34,7 @@ from skill3d.evolution.leakage import leakage_scan_text
 from skill3d.evolution.revision_schedule import (
     candidate_dedup_key, normalized_method_sha256, scheduling_decision,
 )
+from skill3d.synthesis.request_audit import describe_request
 from skill3d.evolution.process_feedback import (
     FEEDBACK_SCHEMA_VERSION, FEEDBACK_WHITELIST_VERSION, FIELD_SEMANTICS,
     ProcessFacts, extract_process_facts, legacy_process_facts, safe_process_dict,
@@ -144,29 +149,66 @@ class SeededGateClient:
         self.seed = seed
         self.audit_path = audit_path
         self.requests = []
+        self.audit_context = {}
+        self.request_context = {}
 
     def __getattr__(self, name):
         return getattr(self.client, name)
 
+    def set_audit_context(self, context: Mapping):
+        self.audit_context = copy.deepcopy(dict(context))
+
+    def set_request_context(self, context: Mapping):
+        self.request_context = copy.deepcopy(dict(context))
+
     def chat(self, *args, **kwargs):
         kwargs["seed"] = self.seed
-        self.requests.append({"seed": self.seed})
+        build_payload = getattr(self.client, "build_payload", None)
+        identity_fn = getattr(self.client, "audit_identity", None)
+        model_identity = identity_fn(seed=self.seed) if callable(identity_fn) else {}
+        payload = (build_payload(*args, **kwargs) if callable(build_payload) else {
+            "messages": args[0] if args else kwargs.get("messages", []),
+            **{key: value for key, value in kwargs.items() if key != "messages"},
+        })
+        request_identity = describe_request(
+            payload, model_identity=model_identity, wire_encoding_known=callable(build_payload))
+        index = len(self.requests) + 1
+        request = {
+            "request_seed": self.seed, "request_index": index,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "request_identity": request_identity,
+            "frozen_context": self.audit_context,
+            "request_context": self.request_context,
+            "retry_of": None,
+        }
+        self.requests.append(copy.deepcopy(request))
         _write_create_once(
             self.audit_path.with_name(
-                f"{self.audit_path.stem}-{len(self.requests):03d}.json"),
-            {"request_seed": self.seed, "request_index": len(self.requests)},
+                f"{self.audit_path.stem}-{index:03d}.json"), request,
         )
-        text = self.client.chat(*args, **kwargs)
-        _write_create_once(
-            self.audit_path.with_name(
-                f"{self.audit_path.stem}-response-{len(self.requests):03d}.json"),
-            {
+        started = time.perf_counter()
+        error_type = None
+        try:
+            text = self.client.chat(*args, **kwargs)
+            return text
+        except Exception as exc:
+            error_type = type(exc).__name__
+            raise
+        finally:
+            _write_create_once(self.audit_path.with_name(
+                f"{self.audit_path.stem}-response-{index:03d}.json"), {
                 "request_seed": self.seed,
+                "request_index": index, "request_identity_sha256": content_sha256(request_identity),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "elapsed_s": time.perf_counter() - started,
+                "status": "error" if error_type else "completed",
+                "exception_type": error_type,
+                "usage": dict(getattr(self.client, "last_usage", {}) or {}) if not error_type else {},
                 "response_identity": dict(
-                    getattr(self.client, "last_response_identity", {}) or {}),
-            },
-        )
-        return text
+                    getattr(self.client, "last_response_identity", {}) or {}) if not error_type else {},
+                "actual_request_identity": dict(
+                    getattr(self.client, "last_request_identity", {}) or {}),
+            })
 
 
 def _active(root: Path):
@@ -408,8 +450,14 @@ class FitSetWorkerEvolution:
     def _gate(self, request, parent, candidate, attempt_root):
         panel_ids = self.runner.gate_panels[request.slot_key]
         if len(panel_ids) < self.config.gate_size:
-            return {"passed": False, "conditions": {"gate_size": False},
-                    "reason": "槽位题量不足冻结 gate_size", "arms": []}
+            body = {
+                "passed": False, "conditions": {"gate_size": False},
+                "reason": "槽位题量不足冻结 gate_size", "arms": [],
+                "panel_ids": panel_ids, "candidate_hash": candidate.content_sha256,
+                "parent_hash": parent.content_sha256,
+                "run_identity": self.runner.run_identity,
+            }
+            return {**body, "identity_sha256": content_sha256(body)}
         # Phase 1 — set up each (seed, arm) runner deterministically and collect
         # every panel episode as an independent work item. Setup writes the
         # run-local library and frozen identity; it performs no model request.
@@ -452,10 +500,19 @@ class FitSetWorkerEvolution:
                 }
                 _write_create_once(output / "gate_identity.json", frozen)
                 arm_runners[(seed, name)] = gate_runner
-                episodes.extend(
-                    (gate_runner, self.rows[variant_id])
-                    for variant_id in panel_ids
-                )
+        schedule = []
+        for seed_index, seed in enumerate(self.config.gate_seeds):
+            for panel_index, variant_id in enumerate(panel_ids):
+                order = ("parent", "candidate") if (seed_index + panel_index) % 2 == 0 else (
+                    "candidate", "parent")
+                for name in order:
+                    episodes.append((arm_runners[(seed, name)], self.rows[variant_id]))
+                    schedule.append({"seed": seed, "arm": name, "variant_id": variant_id})
+        _write_create_once(attempt_root / "gate_schedule.json", {
+            "schema_version": "gate-balanced-order/1.0", "submission_order": schedule,
+            "concurrency_limit": self.runner.episode_concurrency,
+            "completion_order_guaranteed": False,
+        })
         # Phase 2 — run every episode under the global permit. Each result lands
         # in its own arm directory; completed results from a prior attempt are
         # reused, so a resumed gate relaunches only the missing episodes.
@@ -504,6 +561,13 @@ class FitSetWorkerEvolution:
                         for path in seed_paths
                         if "-response-" in path.name
                     })
+                    responses = [json.loads(path.read_text()) for path in seed_paths
+                                 if "-response-" in path.name]
+                    fingerprints = sorted({
+                        str((record.get("response_identity") or {}).get("backend_fingerprint"))
+                        for record in responses
+                        if (record.get("response_identity") or {}).get("backend_fingerprint") is not None
+                    })
                     input_plan = json.loads((output / "variants"
                                              / _variant_key(variant_id)
                                              / "plan.json").read_text())
@@ -526,6 +590,8 @@ class FitSetWorkerEvolution:
                             for path in seed_paths),
                         "shared_input_sha256": content_sha256(shared_plan),
                         "returned_models": returned_models,
+                        "backend_fingerprints": fingerprints,
+                        "process_metrics": episode_process_metrics(outcome, responses),
                     })
                 pair[name] = {
                     "mean_score": sum(r["score"] for r in rows) / len(rows),
@@ -540,6 +606,10 @@ class FitSetWorkerEvolution:
                         row["shared_input_sha256"] for row in rows],
                     "returned_models": sorted({
                         model for row in rows for model in row["returned_models"]}),
+                    "backend_fingerprints": sorted({
+                        value for row in rows for value in row["backend_fingerprints"]}),
+                    "process_metrics": aggregate_gate_process_metrics(
+                        [row["process_metrics"] for row in rows]),
                 }
             pa, ca = pair["parent"], pair["candidate"]
             conditions[str(seed)] = (
@@ -549,12 +619,16 @@ class FitSetWorkerEvolution:
                 and ca["legal_rate"] >= pa["legal_rate"]
                 and pa["shared_input_hashes"] == ca["shared_input_hashes"]
                 and pa["returned_models"] == ca["returned_models"]
+                and pa["backend_fingerprints"] == ca["backend_fingerprints"]
                 and all(arm[key] for arm in (pa, ca) for key in (
                     "trusted", "delivered", "service_ok", "seed_observed"))
             )
             arms.append({"seed": seed, **pair})
         body = {"passed": all(conditions.values()), "conditions": conditions,
                 "arms": arms, "panel_ids": panel_ids,
+                "schedule_sha256": content_sha256(schedule),
+                "admission_program_error_rule": "legacy_any_round_error_code",
+                "missing_backend_fingerprint_means": "unknown_backend_identity",
                 "candidate_hash": candidate.content_sha256,
                 "parent_hash": parent.content_sha256,
                 "run_identity": self.runner.run_identity}

@@ -2693,6 +2693,45 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         ledger.bind_request(int(round_index), messages)
         ledger.mark_round_sent(int(round_index))
         ledger.mark_delivered(int(round_index), plan.image_ids)
+    set_context = getattr(client, "set_request_context", None)
+    if callable(set_context):
+        from skill3d.synthesis.execution_contract import ExecutionContract
+
+        scope = scope_override or getattr(scene, "question_tool_scope", "")
+        gate = getattr(scene, "metric_evidence_gate_result", None)
+        tools = REGISTRY.docs(
+            scope or None, available=(handle.available_artifacts if handle is not None else None),
+            evidence_profile=getattr(scene, "evidence_profile", None),
+            gate_passed=None if gate is None else gate.gate_passed,
+            local_facts=handle.local_facts if handle is not None else {},
+            question_type=canonical_task(episode.question_type))
+        image_mapping = []
+        if ledger is not None and ledger.has_frames():
+            for image_id in plan.image_ids:
+                if image_id.startswith("orig-"):
+                    slot = int(image_id.split("-", 1)[1])
+                    image_mapping.append({
+                        "image_id": image_id, "frame_slot": slot,
+                        "source_frame_index": ledger.physical_index_of(slot)})
+                else:
+                    entry = ledger.get(image_id)
+                    image_mapping.append({
+                        "image_id": image_id, "frame_slot": entry.source_frame_id,
+                        "source_frame_index": entry.source_frame_index,
+                        "crop_box": entry.box_xyxy,
+                    })
+        set_context({
+            "round_index": round_index, "phase": "finalization" if finalizing else "program",
+            "prompt_version": FINALIZATION_PROMPT_VERSION if finalizing else PROMPT_TEMPLATE_VERSION,
+            "execution_contract_sha256": ExecutionContract(
+                cfg.retrieval_policy.method_context_max_chars).sha256,
+            "tool_docs_version": TOOL_DOCS_VERSION,
+            "tool_directory_sha256": hashlib.sha256(tools.encode()).hexdigest(),
+            "tool_execution_allowed": not finalizing,
+            "delivered_method_hashes": [entry.content_sha256 for entry in delivery.entries],
+            "image_round": _round_dict(ledger, round_index),
+            "images_in_order": image_mapping,
+        })
     try:
         # 请求级 seed：钉住在线模型采样随机性（§7 复现纪律）
         with request_phase("finalization" if finalizing else "program"):
