@@ -25,6 +25,7 @@ from typing import Any, Callable, Optional
 
 from skill3d.schemas import AnswerPayload, ToolCall, ToolResult, parse_answer_payload
 from skill3d.schemas.tool import FailureCause
+from skill3d.schemas.tool_response import TOOL_RESPONSE_VERSION, model_tool_response
 from skill3d.tools.contract import (
     AnswerAlreadyGiven,
     ArtifactUnavailableError,
@@ -488,6 +489,7 @@ class RestrictedNamespaceKernel:
                 result_id=_failed_result_id(request_digest, len(self.tool_results)),
                 source_tool=name,
                 status="failed",
+                model_response_schema_version=TOOL_RESPONSE_VERSION,
                 evidence_version=_evidence_version_of(self._scene),
                 request_digest=request_digest, latency_ms=0.0,
                 error=f"{type(exc).__name__}: {exc}", error_code=exc.error_code,  # type: ignore[arg-type]
@@ -563,6 +565,7 @@ class RestrictedNamespaceKernel:
                 authorization["result_id"] = result_id
             result = result.model_copy(update={
                 "result_id": result_id, "authorization": authorization,
+                "model_response_schema_version": TOOL_RESPONSE_VERSION,
             })
             # 记录到 ProgramExecutionTrace（§5.4）：调用与结果成对入库
             self.tool_calls.append(
@@ -597,16 +600,7 @@ class RestrictedNamespaceKernel:
                 raise exc
             if result.error is not None:
                 raise RuntimeError(f"Tool {name} execution failed: {result.error}")
-            import json
-
-            payload = json.loads(result.value)
-            # v7 §10.2：把本结果的 `result_id` 一并交给程序。`YieldObservations`
-            # 的参数就是 result_id 列表，而 id 由 host 生成 —— 程序拿不到它就无法
-            # 点名要回灌哪条结果。dict 载荷额外挂一个键（不改动原有键），
-            # 列表/标量载荷则保持原样（可用空列表让出，语义是"回灌本轮全部结果"）。
-            if isinstance(payload, dict) and result.result_id:
-                payload.setdefault("result_id", result.result_id)
-            return payload
+            return model_tool_response(result)
 
         return _fn
 

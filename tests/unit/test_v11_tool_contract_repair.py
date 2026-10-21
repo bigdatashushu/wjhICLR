@@ -128,7 +128,7 @@ def test_control_examples_run_in_real_kernel():
     kernel = RestrictedNamespaceKernel(REGISTRY, handle)
     cell = kernel.run_cell('records = list_objects("chair")\n'
                            'import math\ndistance = math.dist([0,0,0], [3,4,0])\n'
-                           'show(records)\nshow(distance)\n' + request_all)
+                           'show(records["data"])\nshow(distance)\n' + request_all)
     assert cell.error is None
     assert isinstance(kernel.show_log[0], list)
     assert kernel.show_log[1] == 5

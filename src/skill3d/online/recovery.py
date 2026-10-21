@@ -259,7 +259,7 @@ class ValidatedObservation:
                  if self.degraded_evidence else "")
         return (f"- {self.source_tool}({_json(self.args)}) [result_id={self.result_id}]"
                 f" ToolResult.status=ok evidence_version={self.evidence_version!r}{flags}"
-                f"\n  payload={text}")
+                f"\n  data/raw payload={text}")
 
 
 def observation_feedback(observations: list[ValidatedObservation]) -> str:
@@ -279,7 +279,9 @@ def observation_feedback(observations: list[ValidatedObservation]) -> str:
                                     if o.result_id != group[0].result_id))
         if aliases:
             lines.append(f"  Identical observations also have result_ids={_json(aliases)}; content is shown once.")
-    lines.append("Check payload.status, missing items, ambiguity, and degradation flags. "
+    lines.append("These are raw data values, the contents of each tool response's data field; "
+                 "derivation field paths start at this data root. "
+                 "Check data.status, missing items, ambiguity, and degradation flags. "
                  "No detection does not prove absence; None/unmeasurable does not mean zero.")
     return "\n".join(lines)
 

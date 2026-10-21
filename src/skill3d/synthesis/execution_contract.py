@@ -10,8 +10,9 @@ import json
 import re
 
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
+from skill3d.schemas.tool_response import TOOL_RESPONSE_VERSION, TOOL_RESPONSE_FIELDS
 
-CONTRACT_VERSION = "execution-contract/2.0"
+CONTRACT_VERSION = "execution-contract/3.0"
 
 _RULES = (
     "Ordinary requests output exactly one Python fenced code block and no outside explanation.",
@@ -51,9 +52,13 @@ class ExecutionContract:
             "answer_units": dict(CANONICAL_UNIT_BY_QUESTION_TYPE),
             "finalization_schema_version": FINALIZATION_SCHEMA_VERSION,
             "finalization_method_delivery": FINALIZATION_DELIVERY_STRATEGY,
+            "tool_response_schema_version": TOOL_RESPONSE_VERSION,
             "tool_response": (
-                "Legacy model boundary: dicts include host result_id, lists/scalars do not. "
-                "YieldObservations([], reason) retrieves valid results and their IDs."),
+                "Every tool returns {result_id, source_tool, status, data, schema_version, evidence_version}. "
+                "Read the unchanged list/dict/scalar via result['data']; use result['result_id'] for references. "
+                "The outer status=ok means call success only; inspect inner data status and coverage. "
+                "Errors raise, never fabricate successful evidence. M11 derivation fields address the raw data "
+                "root, without a data prefix. Old trace storage remains raw."),
             "length_measurement": "len(normalized complete SKILL.md), including frontmatter; LF and one final newline",
         }
 
@@ -77,6 +82,58 @@ class ContractIssue:
     def to_dict(self) -> dict:
         # No candidate excerpts: safe even if the source contains sample labels.
         return asdict(self)
+
+
+def _response_shape_issues(tree: ast.AST, registry, offset: int) -> list[ContractIssue]:
+    """Follow unambiguous bindings only; never infer types after reassignment."""
+    writes: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            writes[node.id] = writes.get(node.id, 0) + 1
+        elif isinstance(node, ast.arg):
+            writes[node.arg] = writes.get(node.arg, 0) + 1
+    bindings = {
+        node.targets[0].id: node.value for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and writes.get(node.targets[0].id) == 1
+    }
+
+    def shape(node, visited=frozenset()):
+        if isinstance(node, ast.Name) and node.id in bindings and node.id not in visited:
+            value = bindings[node.id]
+            if value.lineno < node.lineno:
+                return shape(value, visited | {node.id})
+        if isinstance(node, ast.Call):
+            name = (node.func.id if isinstance(node.func, ast.Name) else
+                    node.func.attr if isinstance(node.func, ast.Attribute)
+                    and ast.unparse(node.func.value) in {"tools", "ctx.tools"} else "")
+            if name in registry:
+                return ("envelope", str(inspect.signature(registry.get(name).fn).return_annotation))
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            parent = shape(node.value, visited)
+            if parent and parent[0] == "envelope" and node.slice.value == "data":
+                return ("data", parent[1])
+        return None
+
+    issues = []
+    for node in ast.walk(tree):
+        parent, key = None, None
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            parent, key = shape(node.value), node.slice.value
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Constant)):
+            parent, key = shape(node.func.value), node.args[0].value
+        if not parent:
+            continue
+        reason = ""
+        if parent[0] == "envelope" and key not in TOOL_RESPONSE_FIELDS:
+            reason = "tool_data_requires_envelope_data"
+        elif parent[0] == "data" and parent[1].startswith(("list", "float", "bool", "int")):
+            if isinstance(key, str):
+                reason = "non_dict_data_string_index"
+        if reason:
+            issues.append(ContractIssue("return_schema_mismatch", offset + node.lineno, reason))
+    return issues
 
 
 def review_method_contract(skill_md: str, *, allowed_tools: set[str] | None = None) -> list[ContractIssue]:
@@ -124,13 +181,7 @@ def review_method_contract(skill_md: str, *, allowed_tools: set[str] | None = No
         except (SyntaxError, ValueError):
             issues.append(ContractIssue("example_syntax_error", offset + 1, "python_example_must_compile"))
             continue
-        assignments = {
-            node.targets[0].id: node.value.func.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign) and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name) and node.value.func.id in all_tools
-        }
+        issues.extend(_response_shape_issues(tree, REGISTRY, offset))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 name = node.func.id
@@ -148,10 +199,4 @@ def review_method_contract(skill_md: str, *, allowed_tools: set[str] | None = No
                         issues.append(ContractIssue("answer_schema_mismatch", offset + node.lineno, "answer_payload_fields"))
                 if name == "ReturnAnswer" and (len(node.args) != 1 or node.keywords):
                     issues.append(ContractIssue("answer_schema_mismatch", offset + node.lineno, "return_answer_one_argument"))
-            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-                tool = assignments.get(node.value.id)
-                if tool and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
-                    annotation = str(inspect.signature(REGISTRY.get(tool).fn).return_annotation)
-                    if annotation.startswith(("list", "float", "bool", "int")):
-                        issues.append(ContractIssue("return_schema_mismatch", offset + node.lineno, "non_dict_result_string_index"))
     return issues

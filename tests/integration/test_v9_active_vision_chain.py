@@ -29,8 +29,7 @@ FRAME_SIZE = (120, 160)
 # 真实链路里会用到的那段程序（真实 smoke 用的就是它）：裁剪 + 让出
 CROP_THEN_YIELD = (
     'crop = inspect_frames([8], [[0, 0, 60, 48]])\n'
-    'img = crop["images"][0]["image_id"]\n'
-    'return YieldObservations([img], "需要放大看清这一块区域")\n'
+    'return YieldObservations([crop["result_id"]], "需要放大看清这一块区域")\n'
 )
 
 

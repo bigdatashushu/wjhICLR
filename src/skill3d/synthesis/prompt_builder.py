@@ -17,8 +17,8 @@ from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 from skill3d.synthesis.execution_contract import ExecutionContract
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_10_en"
-FINALIZATION_PROMPT_VERSION = "finalization_v11_1_en"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_11_en"
+FINALIZATION_PROMPT_VERSION = "finalization_v11_2_en"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -73,15 +73,19 @@ with `return ReturnAnswer(AnswerPayload(...))`.
   count=`{"field":"items"}`; argmin accepts one dictionary or multiple results, with `labels` required for multiple results.
   sort is similar to argmin and also accepts `descending`; option_map=
   `{"field":"direction","mapping":{"left":"A","right":"B"}}`.
+  All derivation field paths address the original tool data, without the envelope's `data` prefix.
   Parameters may contain only these structured fields, never code or expressions. If a single registered operation cannot fully establish the answer, use mixed, not tool_derived.
 - `ReturnAnswer(value)` remains compatible and is conservatively recorded as mixed.
   Use the complete AnswerPayload in new programs. Short-form answers cause historical valid successful results to be checked even if the current segment calls no tools.
   A comment claiming a "visual estimate" does not change this rule. Only a zero-tool segment genuinely based entirely on original images may discard historical tool evidence using visual_estimate, empty used_result_ids, and derivation=None.
   Results produced in the current segment are always checked. Do not merely change basis to bypass a failed check.
   ReturnAnswer accepts exactly one argument; do not pass basis or unit directly as keyword arguments.
-- For a dict result, the framework attaches a `result_id` string. Request feedback with
-  `return YieldObservations([result["result_id"]], "reason")`.
-  Lists, numbers, and booleans do not carry an attached ID. `return YieldObservations([], "reason")`
+- Every tool returns the same envelope: result_id, source_tool, status, data, schema_version, evidence_version.
+  Read list/dict/scalar values from result["data"]. All tools expose the host ID at result["result_id"].
+  For example: `result = list_objects(); objects = result["data"]`.
+  Request feedback with `return YieldObservations([result["result_id"]], "reason")`.
+  An inner data.result_id, if present, is a business field, not the host ID.
+  `return YieldObservations([], "reason")`
   returns this episode's still-valid successful results and their IDs. Invalidated results are not returned as usable observations.
 
 ## Current question and answer requirements
@@ -258,6 +262,7 @@ def build_finalization_prompt(*, question: str, options: Sequence[str], question
         "For mixed support, list the actual valid result IDs used. "
         "tool_derived also requires a replayable derivation with op, input_result_ids, parameters. "
         "Every input_result_id must appear in used_result_ids.",
+        "Derivation field paths start at the original tool data, without the envelope's data prefix.",
         "Allowed derivations: field(parameters={field}); convert({field,from_unit,to_unit}); "
         "count({field}); sort({field,key,descending,labels}); argmin({field,key,labels}); "
         "option_map({field,mapping}). Use dot-separated paths into raw tool data, not expressions. "

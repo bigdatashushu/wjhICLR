@@ -101,6 +101,9 @@ class ToolResult(Spec):
     status: Literal["ok", "failed"] = "ok"
     evidence_version: str = ""
     payload: Optional[dict] = None
+    # Empty in legacy/internal records; model kernels stamp their fixed boundary.
+    # payload/value remain RAW data, never the model response envelope.
+    model_response_schema_version: str = ""
     # 级联撤销时填入导致失效的 result_id 列表（§14.1）
     invalidated_by: Optional[list[str]] = None
     # v9 §6.4：本次调用的统一授权收据（含被拒绝的调用 —— 同样要有凭据）

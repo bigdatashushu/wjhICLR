@@ -36,12 +36,12 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
 # 第 1 轮的固定程序（scripted-first 模式）：真实调用 inspect_frames 裁剪真实像素，
-# 再把裁剪图的 image_id 交给 YieldObservations —— 这正是 §9.4 的主动观察入口。
+# 再把 host result_id 交给 YieldObservations，由结果定位需要交付的裁剪图。
 SCRIPTED_FIRST_PROGRAM = (
     'crop = inspect_frames([8], [[0, 0, 96, 96]])\n'
-    'img = crop["images"][0]["image_id"]\n'
+    'img = crop["data"]["images"][0]["image_id"]\n'
     'print("crop:", img)\n'
-    'return YieldObservations([img], "需要放大看清这一块区域")\n'
+    'return YieldObservations([crop["result_id"]], "需要放大看清这一块区域")\n'
 )
 
 

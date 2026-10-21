@@ -206,9 +206,9 @@ def room_source_and_artifact(tmp_path_factory):
     ("", 4, "error_recovery"),
     ("import os\nReturnAnswer(1)\n", 4, "ast_feedback"),
     ("euclidean_distance([0.0, 0.0], 1.0)\nReturnAnswer(1)\n", 4, "error_recovery"),
-    ('img = inspect_frames([0])\nreturn YieldObservations([img], "inspect images")\n',
+    ('img = inspect_frames([0])\nreturn YieldObservations([img["result_id"]], "inspect images")\n',
      4, "observation"),
-    ('img = inspect_frames([0])\nreturn YieldObservations([img], "inspect images")\n',
+    ('img = inspect_frames([0])\nreturn YieldObservations([img["result_id"]], "inspect images")\n',
      2, "finalize"),
 ])
 def test_v11_contract_survives_solver_rounds_and_reaches_trace(
@@ -437,7 +437,7 @@ def test_m11_accepts_a_matching_replayed_derivation(
     program = (
         "r = plane_fit_room_size()\n"
         "ReturnAnswer(AnswerPayload("
-        "value=r['room_area_m2'], unit='m2', basis='tool_derived', "
+        "value=r['data']['room_area_m2'], unit='m2', basis='tool_derived', "
         "used_result_ids=[r['result_id']], "
         "derivation={'op':'field', "
         "'input_result_ids':[r['result_id']], "

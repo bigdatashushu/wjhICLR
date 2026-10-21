@@ -22,18 +22,18 @@ def test_current_protocol_identity_is_fixed_and_not_cli_selectable():
     }
     assert PromptBuilder().template_version == PROMPT_TEMPLATE_VERSION
     versions = current_version_fields()
-    assert versions["template_version"] == "program_synth_v11_10_en"
-    assert versions["execution_protocol_version"] == "solver-v11.9-structured-finalization"
+    assert versions["template_version"] == "program_synth_v11_11_en"
+    assert versions["execution_protocol_version"] == "solver-v11.10-response-envelope"
     assert versions["tool_docs_version"] == TOOL_DOCS_VERSION
 
 
-def test_list_objects_documents_plain_list_and_counting_contract():
+def test_list_objects_documents_envelope_data_and_counting_contract():
     text = DESCRIPTIONS["list_objects"]
-    assert "plain list with no attached result_id" in text
-    assert "do not index it as result['result_id']" in text
-    assert "do not" in text and "pass obj_id values to YieldObservations" in text
-    assert "call inspect_frames" in text
-    assert "prefer count_objects" in text
+    assert "envelope's data is list[dict]" in text
+    assert "result['data']" in text and "result['result_id']" in text
+    assert "never obj_id values" in text
+    assert "candidate inventory" in text
+    assert "collection coverage preconditions" in text
 
 
 def test_detect_objects_documents_no_repeat_transition():

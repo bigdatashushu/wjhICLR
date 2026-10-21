@@ -286,7 +286,7 @@ def test_kernel_maps_contract_violation_to_tool_contract_and_untrusts_answer():
     handle = _handle(scene)
     kernel = RestrictedNamespaceKernel(REGISTRY, handle, frames=[], mode="real")
     cell = kernel.run_cell(
-        'n = list_objects("table")\nReturnAnswer(len(n))\n')
+        'n = list_objects("table")["data"]\nReturnAnswer(len(n))\n')
     assert cell.error_code == "tool_contract"
     assert cell.answer is None
     assert cell.answer_untrusted is True
@@ -330,7 +330,7 @@ def test_scene_handle_narrows_available_artifacts_to_loaded_arrays():
 # ------------------------------------- §15.1：答后调 Tool 的双层保护 ----
 
 _RETURN_ANSWER_THEN_TOOL = (
-    'ids = list_objects(category_filter="spaceship")\n'   # 空清单 → 走"无力回答"分支
+    'ids = list_objects(category_filter="spaceship")["data"]\n'   # 空清单 → 早退
     'if not ids:\n'
     '    ReturnAnswer(0)\n'
     'n = count_objects(category_name="chair")\n'          # 答后调 Tool → 必须受控抛错
@@ -380,10 +380,10 @@ def test_guarded_early_return_passes_static_and_is_terminated_at_runtime():
     顺序检查因此既无必要、又会误拒模型最自然的防御式写法。
     """
     assert ast_guard(_RETURN_ANSWER_THEN_TOOL).ok, "防御式早退写法必须通过静态层"
-    assert ast_guard('ids = list_objects()\nReturnAnswer(len(ids))\n').ok
+    assert ast_guard('ids = list_objects()["data"]\nReturnAnswer(len(ids))\n').ok
     assert ast_guard('ids = list_objects()\nYieldObservations([], "r")\n').ok
     # 顶层"答完继续算"也通过静态层 —— 运行层保证它不会真的执行第二步
-    top_level = ('ids = list_objects()\nReturnAnswer(len(ids))\n'
+    top_level = ('ids = list_objects()["data"]\nReturnAnswer(len(ids))\n'
                  'n = count_objects(category_name="chair")\nReturnAnswer(n)\n')
     assert ast_guard(top_level).ok
 

@@ -1,6 +1,6 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.9-list-result-contract"
+TOOL_DOCS_VERSION = "tool-docs-v11.10-response-envelope"
 
 
 DESCRIPTIONS = {
@@ -33,10 +33,9 @@ DESCRIPTIONS = {
         "remain audit diagnostics; they do not establish semantic correctness or merge instances. "
         "Category agreement and even a unique candidate do not prove that it is the question's referent. "
         "Use frames/crops to select an explicit obj_id. Candidate inspection remains available without 3D. "
-        "The return is a plain list with no attached result_id, unlike detect_objects, which returns a dict; "
-        "do not index it as result['result_id'] or pass obj_id values to YieldObservations. Read fields from "
-        "each list element in the same program. To request image feedback, call inspect_frames and yield that "
-        "dict result's result_id. For instance counts, prefer count_objects over summing list length."),
+        "The envelope's data is list[dict]. Iterate result['data']; use result['result_id'] "
+        "for YieldObservations, never obj_id values. This is a candidate inventory, not a count "
+        "of all real instances. count_objects has its own collection coverage preconditions."),
     "count_objects": (
         "Count instances using the same category rules as list_objects. Group records sharing a "
         "nonempty track_id; each untracked record forms its own group. Merge each group's point clouds, "

@@ -1051,7 +1051,7 @@ def stub_program(question_type: str, episode: VSIBenchEpisode,
         # NA 数值题：答案是被查询类别的对象数（合成场景中即基础清单长度）
         return (
             f"{_STUB_BANNER}\n"
-            f"n = len(list_objects())\n"
+            f"n = len(list_objects()['data'])\n"
             f"ReturnAnswer(str(n))\n"
         )
     if question_type == "object_rel_direction":
@@ -1062,7 +1062,7 @@ def stub_program(question_type: str, episode: VSIBenchEpisode,
             f'res = relative_direction_of("{anchor_c}", "{anchor_b}", "{anchor_a}")\n'
             f'answer = pairs[0][1]\n'
             f"for text, letter in pairs:\n"
-            f'    if text == res["direction"]:\n'
+            f'    if text == res["data"]["direction"]:\n'
             f"        answer = letter\n"
             f"ReturnAnswer(answer)\n"
         )
@@ -1073,7 +1073,7 @@ def stub_program(question_type: str, episode: VSIBenchEpisode,
             f"{_STUB_BANNER}\n"
             f"pairs = [{pairs}]\n"
             f'rank = relative_distance_rank("{names[1]}", [text for text, _ in pairs])\n'
-            f'nearest = rank["closest_category"]\n'
+            f'nearest = rank["data"]["closest_category"]\n'
             f'answer = pairs[0][1]\n'
             f"for text, letter in pairs:\n"
             f"    if text == nearest:\n"
@@ -1092,7 +1092,7 @@ def stub_program(question_type: str, episode: VSIBenchEpisode,
             f"pairs = [{pairs}]\n"
             f"best, answer = None, pairs[0][1]\n"
             f"for text, letter in pairs:\n"
-            f"    vis = object_visible_frames(text)\n"
+            f"    vis = object_visible_frames(text)['data']\n"
             f"    if not vis:\n"
             f"        continue\n"
             f"    first = min(vis)\n"
@@ -1103,20 +1103,20 @@ def stub_program(question_type: str, episode: VSIBenchEpisode,
     if question_type == "room_size_estimation":
         return (
             f"{_STUB_BANNER}\n"
-            f'ReturnAnswer(str(round(plane_fit_room_size()["room_area_m2"], 2)))\n'
+            f'ReturnAnswer(str(round(plane_fit_room_size()["data"]["room_area_m2"], 2)))\n'
         )
     if question_type == "object_size_estimation":
         return (
             f"{_STUB_BANNER}\n"
             f'ext = object_3d_extent("{anchor_a}")\n'
-            f'ReturnAnswer(str(round(max(ext["extent_metric"]), 2)))\n'
+            f'ReturnAnswer(str(round(max(ext["data"]["extent_metric"]), 2)))\n'
         )
     if question_type == "object_abs_distance":
         # Same object-surface unit contract as the current public tool.
         return (
             f"{_STUB_BANNER}\n"
             f'd = object_surface_distance("{anchor_a}", "{anchor_b}", unit="m")\n'
-            f'ReturnAnswer(str(round(d["distance"], 2)))\n'
+            f'ReturnAnswer(str(round(d["data"]["distance"], 2)))\n'
         )
     raise ValueError(f"未支持的合成题型: {question_type}")
 

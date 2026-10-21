@@ -121,7 +121,7 @@ def test_failure_gets_exactly_one_clean_visual_answer(source, tmp_path, split):
 
 def test_crop_from_failed_solver_never_enters_visual_request(source, tmp_path):
     out, client = run_case(source, tmp_path, [
-        "img = inspect_frames([0])\nreturn YieldObservations([img], 'inspect')",
+        'img = inspect_frames([0])\nreturn YieldObservations([img["result_id"]], "inspect")',
         "x = 1", "12.5"])
     assert out.final_state == "answer"
     # Original solver's finalization still receives the yielded crop.

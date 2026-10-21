@@ -373,7 +373,11 @@ def replay_derivation(
     question_type: str = "",
     options: Optional[Sequence[str]] = None,
 ) -> DerivationReplayResult:
-    """Replay one declared operation and verify its value and unit against the answer."""
+    """Replay one operation against RAW ToolResult data and verify value/unit.
+
+    Field paths omit the model envelope's ``data`` prefix. This preserves the
+    same math and archive replay across tool-response protocol versions.
+    """
     if payload is None:
         return DerivationReplayResult(
             passed=False,

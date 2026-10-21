@@ -225,7 +225,7 @@ def test_real_runner_seed_skill_geometry_and_recomputed_summary(panel, tmp_path)
     a, b = item.episode.options
     program = (
         f'rank = relative_distance_rank("{ref}", ["{a}", "{b}"])\n'
-        f'ReturnAnswer("A" if rank["closest_category"] == "{a}" else "B")\n')
+        f'ReturnAnswer("A" if rank["data"]["closest_category"] == "{a}" else "B")\n')
     result, pairs, clients, root = run(
         panel, tmp_path, programs={"B01": [program], "B11": [program]})
     assert result["status"] == "completed"
@@ -735,10 +735,10 @@ def test_state_observation_namespace_and_disk_are_isolated(panel, tmp_path, monk
     first = (f'x = object_surface_distance("{obj}", "{reference}")\n'
              'secret = 123\n'
              'im = inspect_frames([0])\n'
-             'return YieldObservations([im], "look")\n')
+             'return YieldObservations([im["result_id"]], "look")\n')
     second = ('ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate", '
               'used_result_ids=[], derivation=None))\n')
-    other = ('objects = list_objects()\n'
+    other = ('objects = list_objects()["data"]\n'
              'answer = "A"\n'
              'for o in objects:\n'
              '    if o["obj_id"] == "only-B01":\n'
@@ -868,7 +868,7 @@ def test_detection_service_fault_after_yield_stays_incomplete(panel, tmp_path, m
         return []
     monkeypatch.setattr(ovd, "detect", broken)
     program = ('r = detect_objects([0], ["chair"])\n'
-               'return YieldObservations([r], "inspect result")\n')
+               'return YieldObservations([r["result_id"]], "inspect result")\n')
     result, pairs, _, _ = run(panel, tmp_path, programs={
         "B01": [program, 'ReturnAnswer("A")\n']})
     assert result["status"] == "incomplete"
@@ -889,7 +889,7 @@ def test_detector_transport_attempts_reach_pair_and_online_trace(panel, tmp_path
     monkeypatch.setattr(requests, "post", post)
     monkeypatch.setattr(ovd.time, "sleep", lambda _: None)
     program = ('r = detect_objects([0], ["chair"])\n'
-               'return YieldObservations([r], "inspect result")\n')
+               'return YieldObservations([r["result_id"]], "inspect result")\n')
     summary, pairs, _, root = run(panel, tmp_path, programs={
         "B01": [program, 'ReturnAnswer(AnswerPayload(value="A", unit="option", basis="visual_estimate"))\n']})
     row = pairs[0]["arms"]["B01"]
@@ -947,11 +947,11 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_10_en"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_11_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.9-structured-finalization")
+        "solver-v11.10-response-envelope")
     assert manifest["common_config"]["tool_docs_version"] == (
-        "tool-docs-v11.9-list-result-contract")
+        "tool-docs-v11.10-response-envelope")
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-task-tools"
 
 

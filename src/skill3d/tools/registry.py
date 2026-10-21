@@ -27,6 +27,7 @@ from skill3d.schemas import ToolResult, ToolSpec
 from skill3d.schemas.evidence import CAPABILITIES, EvidenceProfile
 from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
 from skill3d.schemas.tool import FailureCause, ToolSource
+from skill3d.schemas.tool_response import TOOL_RESPONSE_VERSION, ModelToolResponse
 from skill3d.tools.contract import (
     EVIDENCE_METRIC_SCALE,
     KNOWN_ARTIFACTS,
@@ -54,7 +55,7 @@ from skill3d.tools.task_policy import MODEL_TOOLS, TOOL_TASK_POLICY_VERSION
 # v9 §9.2/§9.4：工具面新增 `inspect_frames` / `detect_objects`（主动图像与补检）。
 # 工具面变了就升版本 —— prompt 里列出的 Tool 集合与 trace 的 tool_face_version
 # 必须对得上，否则"这次跑的是哪套工具面"无法回答。
-TOOL_FACE_VERSION: str = "tool-face-v11.8-task-tools"
+TOOL_FACE_VERSION: str = "tool-face-v11.9-response-envelope"
 
 
 class ToolNotFoundError(KeyError):
@@ -164,8 +165,11 @@ class ToolRegistry:
                     "required": p.default is inspect.Parameter.empty,
                     "annotation": str(p.annotation),
                 } for p in parameters],
-                "return_annotation": str(signature.return_annotation),
-                "return_schema_ref": entry.spec.returns_schema_ref,
+                "return_annotation": "ModelToolResponse",
+                "return_schema_ref": TOOL_RESPONSE_VERSION,
+                "return_schema": ModelToolResponse.model_json_schema(),
+                "data_annotation": str(signature.return_annotation),
+                "data_schema_ref": entry.spec.returns_schema_ref,
                 "public_capabilities_required": entry.spec.requires_evidence,
                 "local_facts_required": entry.spec.requires_local_facts,
                 "artifacts_required": entry.spec.requires_artifacts,
@@ -235,7 +239,15 @@ class ToolRegistry:
         `docs(full_3d) ⊆ docs(metric_enabled)` 仅在"多出米制 Tool"的意义上成立，
         不新增任何非米制工具。
         """
-        lines = []
+        lines = [
+            f"Every tool returns a {TOOL_RESPONSE_VERSION} envelope: "
+            "{result_id, source_tool, status, data, schema_version, evidence_version}. "
+            "The return types/fields below describe result['data']. "
+            "Use result['result_id'] for YieldObservations and AnswerPayload references. "
+            "Outer status=ok means execution succeeded, not that data.status is conclusive. "
+            "Errors still raise; no failed call is a successful observation. "
+            "M11 derivation field paths start at the raw data root (omit the envelope's data prefix).",
+        ]
         for name in self.names_for_scope(
                 scope, available, evidence_profile=evidence_profile,
                 gate_passed=gate_passed,
@@ -298,6 +310,7 @@ class ToolRegistry:
             if evidence_profile is not None else "")
         return (f"Current question_tool_scope={scope}; available reconstruction artifacts={avail}.\n"
                 f"{evidence}{metric_line}\nTool documentation version={TOOL_DOCS_VERSION}. "
+                f"Tool response schema={TOOL_RESPONSE_VERSION}. "
                 f"Tool task policy={TOOL_TASK_POLICY_VERSION}. "
                 "The tools below are filtered by question type, scope, evidence, and loaded artifacts. "
                 "Object bindings, arguments, and actual numerical validity are checked at call time.")

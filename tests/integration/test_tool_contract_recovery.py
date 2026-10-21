@@ -130,10 +130,10 @@ LOCAL_FAIL_THEN_OK = [
     # 第一次：成功的 plane_fit_room_size + 一个域值错误（局部：参数错，不涉及共享前提）
     ('area = plane_fit_room_size()\n'
      'bad = euclidean_distance([0.0, 0.0], 1.0)\n'
-     'ReturnAnswer(str(round(area["room_area_m2"], 2)))\n'),
+     'ReturnAnswer(str(round(area["data"]["room_area_m2"], 2)))\n'),
     # 第二次（重生成后）：只用仍然可信的既有结果作答
     ('area = plane_fit_room_size()\n'
-     'ReturnAnswer(str(round(area["room_area_m2"], 2)))\n'),
+     'ReturnAnswer(str(round(area["data"]["room_area_m2"], 2)))\n'),
 ]
 
 
@@ -177,7 +177,7 @@ PREMISE_FAIL_THEN_OK = [
     # 第一次：先成功拿到房间面积，再调用依赖位姿的 reproject（poses 缺失 → 共享前提失效）
     ('area = plane_fit_room_size()\n'
      'uv = reproject([0.0, 0.0, 1.0], 0)\n'
-     'ReturnAnswer(str(round(area["room_area_m2"], 2)))\n'),
+     'ReturnAnswer(str(round(area["data"]["room_area_m2"], 2)))\n'),
     # 第二次：只用一个不依赖被撤销证据的 Tool 作答（不碰已失效的数值）
     ('ReturnAnswer("1.0")\n'),
 ]
@@ -435,7 +435,7 @@ def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
 def test_actual_derivation_replay_reports_execution_and_inputs(tmp_path, episode_item):
     program = (
         'r = plane_fit_room_size()\n'
-        'ReturnAnswer(AnswerPayload(value=r["room_area_m2"], unit="m2", basis="tool_derived", '
+        'ReturnAnswer(AnswerPayload(value=r["data"]["room_area_m2"], unit="m2", basis="tool_derived", '
         'used_result_ids=[r["result_id"]], derivation={"op": "field", '
         '"input_result_ids": [r["result_id"]], "parameters": {"field": "room_area_m2"}}))\n')
     client = _FakeClient([program])
