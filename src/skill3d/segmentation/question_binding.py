@@ -439,7 +439,8 @@ def refresh_coverage(grounding, objects):
 
 def validate_prepared_binding(binding, *, frames, depth, c2w, intrinsics, point_conf,
                               depth_conf, point_map, inputs, scene_identity,
-                              seed=None, model_weights_sha256="", parameters=None):
+                              seed=None, model_weights_sha256="", parameters=None,
+                              source_compatibility=None):
     """Frozen preparation may be consumed without requiring a live detector."""
     stats = binding.stats
     generation = stats.get("generation") or {}
@@ -455,8 +456,14 @@ def validate_prepared_binding(binding, *, frames, depth, c2w, intrinsics, point_
             or identity.get("geometry") != expected_geometry
             or identity.get("reconstruction_identity") != scene_identity):
         raise ValueError("prepared M5 binding identity mismatch or legacy version")
-    if (identity.get("parameters") != (parameters or PARAMETERS)
-            or identity.get("sources") != source_identity(Path(__file__).resolve().parents[1])):
+    if identity.get("parameters") != (parameters or PARAMETERS):
+        raise ValueError("prepared M5 parameters or implementation changed")
+    current_sources = source_identity(Path(__file__).resolve().parents[1])
+    if source_compatibility is not None:
+        from .frozen_source_compatibility import reviewed_source_compatibility
+        reviewed_source_compatibility(
+            identity.get("sources"), current_sources, source_compatibility)
+    elif identity.get("sources") != current_sources:
         raise ValueError("prepared M5 parameters or implementation changed")
     model = identity.get("vlm") or {}
     if seed is not None and model.get("seed", seed) != seed:

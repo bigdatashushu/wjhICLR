@@ -525,3 +525,75 @@ def test_main_binary_m5_only_category_admits_geometry_and_validates_receipts(har
         changed=copy.deepcopy(obj.binding_provenance)
         changed[0]['semantic_binary_response']['result']['answers']['target_match']['probabilities']['yes']=.9
         assert validate_binding(obj.model_copy(update={'binding_provenance':changed})).status=='unavailable'
+
+
+@pytest.fixture
+def reviewed_frozen_binding(harness, monkeypatch):
+    from skill3d.infra.m5_identity import content_sha256, source_identity
+    from skill3d.segmentation.frozen_source_compatibility import REVIEWED_SOURCE_PAIRS
+    current = source_identity(Path(qb.__file__).resolve().parents[1])
+    frozen = copy.deepcopy(current)
+    for name, (old, new) in REVIEWED_SOURCE_PAIRS.items():
+        assert current[name] == new
+        frozen[name] = copy.deepcopy(old)
+    original = qb.inventory_generation_identity
+
+    def frozen_generation(**kwargs):
+        generation = original(**kwargs)
+        generation["identity"]["sources"] = copy.deepcopy(frozen)
+        generation["sha256"] = content_sha256(generation["identity"])
+        return generation
+
+    monkeypatch.setattr(qb, "inventory_generation_identity", frozen_generation)
+    objects, stats, notes = qb.bind_question_objects(**harness.args)
+    binding = SimpleNamespace(objects=objects, stats=stats, notes=notes)
+    args = harness.args
+    validation = dict(
+        frames=args["frames"], depth=args["depth_maps"], c2w=args["c2w_list"],
+        intrinsics=args["intrinsics"], point_conf=args["point_conf"],
+        depth_conf=args["depth_conf"], point_map=None,
+        inputs=qb.question_input(args["question"], args["question_type"], []),
+        scene_identity=args["scene_identity"], seed=137,
+    )
+    return binding, validation, current
+
+
+def test_reviewed_replay_preserves_generation_and_object_receipts(reviewed_frozen_binding):
+    from skill3d.segmentation.frozen_source_compatibility import R10_TRANSPORT_REVIEW
+    binding, args, _ = reviewed_frozen_binding
+    generation = copy.deepcopy(binding.stats["generation"])
+    receipts = [obj.model_dump() for obj in binding.objects]
+    with pytest.raises(ValueError, match="implementation changed"):
+        qb.validate_prepared_binding(binding, **args)
+    qb.validate_prepared_binding(binding, **args, source_compatibility=R10_TRANSPORT_REVIEW)
+    assert binding.stats["generation"] == generation
+    assert [obj.model_dump() for obj in binding.objects] == receipts
+    with pytest.raises(ValueError, match="parameters"):
+        qb.validate_prepared_binding(binding, **args, parameters={"changed": True},
+                                     source_compatibility=R10_TRANSPORT_REVIEW)
+    np.save(binding.objects[0].pointcloud_world, np.zeros((128, 3)))
+    with pytest.raises(ValueError, match="binding changed"):
+        qb.validate_prepared_binding(binding, **args, source_compatibility=R10_TRANSPORT_REVIEW)
+
+
+@pytest.mark.parametrize("mutation", ["unknown_review", "unreviewed_source", "reviewed_source",
+                                    "missing_source", "missing_identity"])
+def test_reviewed_replay_rejects_unknown_or_incomplete_sources(reviewed_frozen_binding, mutation):
+    from skill3d.segmentation.frozen_source_compatibility import (
+        R10_TRANSPORT_REVIEW, reviewed_source_compatibility,
+    )
+    binding, _, current = reviewed_frozen_binding
+    frozen = copy.deepcopy(binding.stats["generation"]["identity"]["sources"])
+    review = R10_TRANSPORT_REVIEW
+    if mutation == "unknown_review":
+        review = "invented"
+    elif mutation == "unreviewed_source":
+        frozen["segmentation/binding_validation.py"]["sha256"] = "a" * 64
+    elif mutation == "reviewed_source":
+        current["synthesis/bailian_client.py"]["sha256"] = "a" * 64
+    elif mutation == "missing_source":
+        frozen.pop("coords.py")
+    else:
+        frozen["coords.py"] = None
+    with pytest.raises(ValueError):
+        reviewed_source_compatibility(frozen, current, review)

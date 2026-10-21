@@ -86,7 +86,7 @@ _EMPTY_M4_PARENT_QUESTION_BINDING_SHA256 = (
     "945301bce9b0f5167bd5c8feb3878ec0873ac384288930bccb0e7b702a2cd72f"
 )
 _EMPTY_M4_CURRENT_QUESTION_BINDING_SHA256 = (
-    "894baaf8cd3447fa19160f597c781db08c1a72197f5b32b072b68de6c458c57b"
+    "8d163a595a0bb584b3a907c4fd51d8e6fc8b3b74962a9a335c04ce8bfb5c5bf6"
 )
 PROCESS_SCHEDULER = "stable_slot_spawn_process_v1"
 SINGLE_PROCESS_SCHEDULER = "single_main_process_v1"
@@ -1572,7 +1572,20 @@ class SystemVariantRunner:
             seed=int(runtime_base_cfg.seed),
             model_weights_sha256="",
             parameters=runtime_parameters,
+            source_compatibility=(
+                runtime_base_cfg.prepared_binding_source_compatibility),
         )
+        compatibility_receipt = None
+        if runtime_base_cfg.prepared_binding_source_compatibility is not None:
+            from skill3d.infra.m5_identity import source_identity
+            from skill3d.segmentation.frozen_source_compatibility import (
+                reviewed_source_compatibility,
+            )
+            compatibility_receipt = reviewed_source_compatibility(
+                prepared.stats["generation"]["identity"]["sources"],
+                source_identity(Path(__file__).resolve().parents[1]),
+                runtime_base_cfg.prepared_binding_source_compatibility,
+            )
         skills, skill_identity = self.skills_for_variant(variant)
         _require(bool(skills), f"{variant_id}: no runtime Skill was supplied")
         matching = [
@@ -1591,6 +1604,7 @@ class SystemVariantRunner:
             "direct_input_receipt": input_receipt,
             "binding_key": reference["key"],
             "binding_manifest_sha256": reference["manifest_sha256"],
+            "binding_source_compatibility": compatibility_receipt,
             "m5_parameters_sha256": content_sha256(frozen_parameters),
             "skill_identity": dict(skill_identity),
         }
