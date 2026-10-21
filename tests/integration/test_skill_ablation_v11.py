@@ -773,7 +773,7 @@ def test_service_failure_is_incomplete_and_never_fabricates_score(panel, tmp_pat
         assert pairs[0]["arms"][arm]["score"] is None
         assert pairs[0]["arms"][arm]["service_errors"]
         if failed_arm != "prepare":
-            assert pairs[0]["arms"][arm]["failure_code"] == "online_model_service_error"
+            assert pairs[0]["arms"][arm]["failure_code"] == "service_error"
             assert pairs[0]["arms"][arm]["terminal_failure"]["stage"] == "M8"
     assert pairs[0]["delta"] is None
     assert result["groups"]["all"]["B11_minus_B01"]["Accuracy"] is None
@@ -909,7 +909,7 @@ def test_detector_transport_attempts_reach_pair_and_online_trace(panel, tmp_path
 def test_synthesis_service_error_keeps_specific_terminal_reason(panel, tmp_path):
     _, pairs, _, _ = run(panel, tmp_path, programs={"B01": [ConnectionError("unavailable")]})
     row = pairs[0]["arms"]["B01"]
-    assert row["failure_code"] == "online_model_service_error"
+    assert row["failure_code"] == "service_error"
     assert row["terminal_failure"]["stage"] == "M8"
     assert row["terminal_failure"]["termination_reason"] == "synthesis_unavailable"
     assert row["score"] is None
@@ -947,9 +947,9 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_8_en"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_10_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.8-task-tools")
+        "solver-v11.9-structured-finalization")
     assert manifest["common_config"]["tool_docs_version"] == (
         "tool-docs-v11.9-list-result-contract")
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-task-tools"
@@ -1098,7 +1098,8 @@ def test_partial_rank_rejected_then_visual_answer_keeps_pair_denominator(panel, 
     candidates = list(item.episode.options)
     item.episode.options.append("unmeasured candidate")
     program = f"rank = relative_distance_rank({ref!r}, {candidates!r})\nReturnAnswer('A')\n"
-    visual = "ReturnAnswer(AnswerPayload(value='A', unit='option', basis='visual_estimate'))\n"
+    visual = json.dumps({"action": "answer", "value": "A", "basis": "visual_estimate",
+                         "used_result_ids": [], "derivation": None})
     result, pairs, _, _ = run(panel, tmp_path, programs={
         "B01": [program, visual], "B11": [program, visual]})
     assert result["status"] == "completed"

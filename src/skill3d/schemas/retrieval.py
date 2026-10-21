@@ -77,7 +77,7 @@ VERSION_SELECTION_REASONS: frozenset[str] = frozenset({
 # `not_selected`：没被选中（硬条件未过，或排序未进 top-k）——没选中就谈不上交付。
 DELIVERY_STATES: frozenset[str] = frozenset({
     "delivered", "not_selected", "context_cap_exceeded",
-    "no_model_request", "request_failed",
+    "no_model_request", "request_failed", "finalization_omitted",
 })
 
 # 交付渠道
@@ -260,18 +260,24 @@ class SkillRetrievalRecord(Spec):
                 set(self.delivered_skill_versions) | set(delivered))
             for key, digest in plan.delivered_content_sha256.items():
                 self.delivered_content_sha256[key] = digest
-        dropped = {d.skill_version for d in plan.dropped}
+        drop_reasons = {d.skill_version: d.reason for d in plan.dropped}
+        dropped = set(drop_reasons)
         selected_ids = set(plan.selected_skill_versions)
         if plan.dropped:
-            self.dropped_for_context = [d.to_dict() for d in plan.dropped]
+            self.dropped_for_context = [
+                d.to_dict() for d in plan.dropped if d.reason == "context_cap_exceeded"]
         for row in self.candidates:
             if not row.selected:
                 continue
             if row.skill_version in delivered:
                 row.delivered = True
                 row.delivery_reason = "delivered"
+            elif row.delivered:
+                # Candidate facts aggregate the episode; omissions belong to the
+                # per-request summaries and do not undo a prior real delivery.
+                continue
             elif row.skill_version in dropped:
-                row.delivery_reason = "context_cap_exceeded"
+                row.delivery_reason = drop_reasons[row.skill_version]
             elif plan.channel == DELIVERY_CHANNEL_REQUEST_FAILED:
                 row.delivery_reason = "request_failed"
             elif plan.channel == DELIVERY_CHANNEL_MODEL_REQUEST:
@@ -286,6 +292,8 @@ class SkillRetrievalRecord(Spec):
             "retrieved_skill_versions": list(self.retrieved_skill_versions),
             "delivered_skill_versions": list(delivered),
             "dropped_skill_versions": sorted(dropped),
+            "omitted_skill_reasons": drop_reasons,
+            "delivery_strategy": str(plan.channel_note or ""),
             "max_chars": int(plan.max_chars),
             "used_chars": int(plan.used_chars),
             "short": [

@@ -12,6 +12,7 @@ import json
 from typing import Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
+from skill3d.sandbox.action_check import ARGUMENT_ERROR_REASONS
 
 FEEDBACK_SCHEMA_VERSION = "fitset-process-feedback/3.0"
 FEEDBACK_WHITELIST_VERSION = "process-facts/1.0"
@@ -22,6 +23,7 @@ ERROR_CODES = frozenset({
     "finalization_tool_call_disallowed", "tool_argument_error",
     "tool_precondition_rejected", "geometry_verification_rejected",
     "no_progress_budget_exhausted", "service_error", "input_error",
+    "answer_contract_rejected",
     "runtime_error", "unknown_error",
 })
 EXCEPTION_TYPES = frozenset({
@@ -153,7 +155,7 @@ def classify_round(row: Mapping) -> str | None:
     if code == "geometry_rejected":
         return "geometry_verification_rejected"
     diagnostics = row.get("execution_diagnostics") or {}
-    if any((result.get("failure_cause") or {}).get("code") == "invalid_tool_arguments"
+    if any((result.get("failure_cause") or {}).get("code") in ARGUMENT_ERROR_REASONS
            for result in row.get("results", [])):
         return "tool_argument_error"
     if code in ("tool_contract", "confidence_gate", "domain_value"):

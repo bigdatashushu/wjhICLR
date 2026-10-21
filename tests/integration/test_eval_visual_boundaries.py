@@ -80,10 +80,10 @@ def test_only_authorized_evaluation_splits_receive_one_supplement(
     visual = [c for c in client.calls if c[0] == "eval_visual_fallback"]
     assert len(visual) == int(expected)
     if expected:
-        assert [c[0] for c in client.calls] == ["program", "program", "eval_visual_fallback"]
+        assert [c[0] for c in client.calls] == ["program", "finalization", "eval_visual_fallback"]
         assert out.answer == "1" and out.answer_basis == "visual_estimate"
         assert out.eval_visual_fallback["original_result"]["final_state"] == "run_error"
-        assert out.eval_visual_fallback["original_result"]["terminal_failure"]["stage"] == "M9"
+        assert out.eval_visual_fallback["original_result"]["terminal_failure"]["stage"] == "M8"
         assert out.failure_code is None
         assert out.attribution.ledger.verified_used_result_ids == []
         messages = visual[0][1]

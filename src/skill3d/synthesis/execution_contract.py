@@ -11,12 +11,14 @@ import re
 
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 
-CONTRACT_VERSION = "execution-contract/1.0"
+CONTRACT_VERSION = "execution-contract/2.0"
 
 _RULES = (
     "Ordinary requests output exactly one Python fenced code block and no outside explanation.",
     "ReturnAnswer(AnswerPayload(...)) submits; YieldObservations(result_ids, reason) requests observation feedback.",
-    "Finalization allows only a zero-tool answer submission; no further evidence tools or YieldObservations.",
+    "Finalization outputs one strict JSON object: action=answer, value, basis, used_result_ids, derivation; "
+    "optional unit must match the task. No code, evidence tools or YieldObservations. "
+    "The host constructs AnswerPayload and submits through the same M11 checks within the original request budget.",
     "AnswerPayload fields are value, unit, basis, used_result_ids, derivation. "
     "basis is visual_estimate, mixed, or tool_derived. tool_derived requires valid result IDs and replayable derivation.",
     "All input episodes start with the frozen 32 original frames. Additional tools are optional; zero calls do not mean no images.",
@@ -38,12 +40,17 @@ class ExecutionContract:
     contract_version: str = CONTRACT_VERSION
 
     def to_dict(self) -> dict:
+        from skill3d.online.submission import (
+            FINALIZATION_SCHEMA_VERSION, FINALIZATION_DELIVERY_STRATEGY,
+        )
         if self.method_context_max_chars <= 0:
             raise ValueError("method_context_max_chars must be positive")
         return {
             **asdict(self),
             "rules": list(_RULES),
             "answer_units": dict(CANONICAL_UNIT_BY_QUESTION_TYPE),
+            "finalization_schema_version": FINALIZATION_SCHEMA_VERSION,
+            "finalization_method_delivery": FINALIZATION_DELIVERY_STRATEGY,
             "tool_response": (
                 "Legacy model boundary: dicts include host result_id, lists/scalars do not. "
                 "YieldObservations([], reason) retrieves valid results and their IDs."),

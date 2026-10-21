@@ -54,6 +54,10 @@ TH_MIN_DISTINCT_RATIO: float = 0.05   # TODO_CALIBRATE: 去重后行占比下限
 class SynthesisError(RuntimeError):
     """program 无法解析；上层据此触发有限次重生成。"""
 
+    def __init__(self, message: str, *, code: str = "model_output_format_error") -> None:
+        super().__init__(message)
+        self.code = code
+
 
 def executable_ast_fingerprint(source: str) -> str:
     """M4: retain executable identity while ignoring comments and docstrings."""
@@ -176,7 +180,7 @@ def extract_program_source_ex(text: str) -> tuple[str, bool]:
         recovered = _recover_truncated(source)
         if recovered is None:
             exc = _syntax_error(source)
-            raise SynthesisError(f"Program syntax error: {exc}") from exc
+            raise SynthesisError(f"Program syntax error: {exc}", code="program_syntax_error") from exc
         return recovered, True
 
     remainder = _open_fence_remainder(raw)
@@ -226,7 +230,7 @@ def extract_program_source(text: str) -> str:
             recovered = _recover_truncated(source)
             if recovered is None:
                 exc = _syntax_error(source)
-                raise SynthesisError(f"Program syntax error: {exc}") from exc
+                raise SynthesisError(f"Program syntax error: {exc}", code="program_syntax_error") from exc
             return recovered
         return source
 

@@ -22,8 +22,8 @@ def test_current_protocol_identity_is_fixed_and_not_cli_selectable():
     }
     assert PromptBuilder().template_version == PROMPT_TEMPLATE_VERSION
     versions = current_version_fields()
-    assert versions["template_version"] == "program_synth_v11_9_en"
-    assert versions["execution_protocol_version"] == "solver-v11.8-task-tools"
+    assert versions["template_version"] == "program_synth_v11_10_en"
+    assert versions["execution_protocol_version"] == "solver-v11.9-structured-finalization"
     assert versions["tool_docs_version"] == TOOL_DOCS_VERSION
 
 
@@ -47,7 +47,7 @@ def test_historical_prompt_selectors_are_absent():
     source = inspect.getsource(prompt_builder)
     for stale in (
         "program_synth_v8",
-        "program_synth_v11_1",
+        "program_synth_v11_1_en",
         "V11_TEMPLATE_VERSIONS",
         "SUPPORTED_TEMPLATE_VERSIONS",
         "validate_template_version",

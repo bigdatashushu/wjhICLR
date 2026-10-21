@@ -2,10 +2,113 @@
 
 from __future__ import annotations
 
+import json
+import math
+from typing import Sequence
+
+from skill3d.schemas import AnswerPayload, CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.verifier.geometry_oracle import GeometryIssue
 from skill3d.schemas.tool import FailureCause
 
-EXECUTION_PROTOCOL_VERSION = "solver-v11.8-task-tools"
+EXECUTION_PROTOCOL_VERSION = "solver-v11.9-structured-finalization"
+FINALIZATION_SCHEMA_VERSION = "answer-finalization/1.0"
+FINALIZATION_DELIVERY_STRATEGY = "omit_complete_method"
+
+
+class SubmissionFormatError(ValueError):
+    """A response failed the strict finalization boundary; never execute it."""
+
+    def __init__(self, reason: str, code: str = "model_output_format_error") -> None:
+        super().__init__(reason)
+        self.code = code
+
+
+def _json_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise SubmissionFormatError("Duplicate JSON keys are not allowed")
+        value[key] = item
+    return value
+
+
+def _nonfinite(value):
+    raise SubmissionFormatError("Non-finite JSON numbers are not allowed")
+
+
+def _finite_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        _nonfinite(value)
+    return parsed
+
+
+def parse_finalization(text: str, *, question_type: str, options: Sequence[str],
+                       valid_result_ids: Sequence[str], readable_images: bool) -> AnswerPayload:
+    """Accept one typed JSON object, with no extraction, coercion or code execution.
+
+    Only host-issued, currently valid result IDs may be declared. Geometry and
+    derivation checks still run at M11 after this format boundary succeeds.
+    """
+    try:
+        raw = json.loads(text, object_pairs_hook=_json_pairs, parse_constant=_nonfinite,
+                         parse_float=_finite_float)
+    except (ValueError, TypeError, RecursionError) as exc:
+        raise SubmissionFormatError("Expected exactly one JSON answer object") from exc
+    required = {"action", "value", "basis", "used_result_ids", "derivation"}
+    if type(raw) is not dict or not required <= raw.keys() or raw.keys() - required - {"unit"}:
+        raise SubmissionFormatError("Use only action, value, basis, used_result_ids, derivation and optional unit")
+    if raw["action"] != "answer":
+        raise SubmissionFormatError("The only finalization action is answer",
+                                    "finalization_tool_call_disallowed")
+    unit = CANONICAL_UNIT_BY_QUESTION_TYPE.get(question_type)
+    if unit is None or ("unit" in raw and raw["unit"] != unit):
+        raise SubmissionFormatError("Unit must match the host task contract", "answer_contract_rejected")
+    value = raw["value"]
+    if unit == "option":
+        if type(value) is not str or value not in list("ABCDEFGHIJKLMNOPQRSTUVWXYZ"[:len(options)]):
+            raise SubmissionFormatError("value must be one current option letter", "answer_contract_rejected")
+    else:
+        try:
+            valid_number = type(value) in (int, float) and math.isfinite(value) and value >= 0
+        except OverflowError:
+            valid_number = False
+        if not valid_number or (unit == "count" and value != int(value)):
+            raise SubmissionFormatError("value must be one finite non-negative number; count must be integral",
+                                        "answer_contract_rejected")
+    ids = raw["used_result_ids"]
+    if (type(ids) is not list or not all(type(rid) is str and rid for rid in ids)
+            or len(ids) != len(set(ids))):
+        raise SubmissionFormatError("used_result_ids must be unique nonempty strings")
+    if set(ids) - set(valid_result_ids):
+        raise SubmissionFormatError("A result reference is missing, failed, unresolved or invalidated",
+                                    "answer_contract_rejected")
+    if raw["basis"] not in ("visual_estimate", "mixed", "tool_derived"):
+        raise SubmissionFormatError("Unknown answer basis", "answer_contract_rejected")
+    if raw["basis"] in ("visual_estimate", "mixed") and not readable_images:
+        raise SubmissionFormatError("Visual support requires readable images", "input_error")
+    if raw["derivation"] is not None and type(raw["derivation"]) is not dict:
+        raise SubmissionFormatError("derivation must be an object or null")
+    payload = AnswerPayload(
+        value=value, unit=unit, basis=raw["basis"], used_result_ids=ids,
+        derivation=raw["derivation"])
+    problems = payload.problems()
+    if problems:
+        raise SubmissionFormatError("; ".join(problems), "answer_contract_rejected")
+    return payload
+
+
+def finalization_program(payload: AnswerPayload):
+    """Encode validated data as literals in a single host-built submission call.
+
+    The model response itself is never interpreted as source. Existing M10/M11
+    recording and rejection handling remain the sole submission acceptance path.
+    """
+    from skill3d.synthesis.program_assembler import assemble_program
+
+    arguments = ", ".join(f"{key}={value!r}"
+                          for key, value in payload.model_dump(mode="json").items())
+    return assemble_program(f"ReturnAnswer(AnswerPayload({arguments}))\n", [])
 
 
 def submission_scope(kernel, trace):

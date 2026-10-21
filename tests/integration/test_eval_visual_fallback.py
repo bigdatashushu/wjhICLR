@@ -23,7 +23,7 @@ class Client:
 
     def chat(self, messages, **kwargs):
         phase = current_request_phase()
-        assert phase in {"program", "eval_visual_fallback"}
+        assert phase in {"program", "finalization", "eval_visual_fallback"}
         self.calls.append((copy.deepcopy(messages), phase, kwargs))
         reply = self.replies.pop(0)
         if isinstance(reply, Exception):
@@ -76,12 +76,13 @@ def test_failure_gets_exactly_one_clean_visual_answer(source, tmp_path, split):
     out, client = run_case(
         source, tmp_path,
         ["r = list_objects()\nReturnAnswer(-1)",
-         "ReturnAnswer(-1)", "12.5"], split=split)
+         json.dumps({"action": "answer", "value": -1, "basis": "visual_estimate",
+                     "used_result_ids": [], "derivation": None}), "12.5"], split=split)
     assert out.final_state == "answer" and out.answer == "12.5" and out.mra_value == 1.0
     assert out.agent_rounds == 2 and len(out.rounds) == 2
     assert len(client.calls) == 3 and out.finalization_used
     assert [phase for _, phase, _ in client.calls] == [
-        "program", "program", "eval_visual_fallback"]
+        "program", "finalization", "eval_visual_fallback"]
     messages = client.calls[-1][0]
     assert len(messages) == 1 and messages[0]["role"] == "user"
     content = messages[0]["content"]
@@ -103,10 +104,10 @@ def test_failure_gets_exactly_one_clean_visual_answer(source, tmp_path, split):
     assert out.attribution.ledger.verified_used_result_ids == []
     audit = out.eval_visual_fallback
     assert audit["request_count"] == 1 and audit["accepted"]
-    assert audit["original_result"]["failure_code"] == "geometry_rejected"
+    assert audit["original_result"]["failure_code"] == "answer_contract_rejected"
     assert audit["original_result"]["score"] == 0.0
     assert out.failure_code is None and out.terminal_failure == {}
-    assert all(not r["submission_accepted"] for r in out.rounds)
+    assert all(not r.get("submission_accepted") for r in out.rounds)
     assert out.episode_trace.eval_visual_fallback == audit
     assert out.episode_trace.derivation_replay["passed"]
     for topic in ("trace_record", "evaluation_result"):
@@ -124,7 +125,7 @@ def test_crop_from_failed_solver_never_enters_visual_request(source, tmp_path):
         "x = 1", "12.5"])
     assert out.final_state == "answer"
     # Original solver's finalization still receives the yielded crop.
-    assert len(client.calls[1][0]) == 3
+    assert len(client.calls[1][0]) == 1
     assert "crop_box" in client.calls[1][0][0]["content"][0]["text"]
     assert client.calls[-1][0][0]["content"][1:] == client.calls[0][0][0]["content"][1:]
     assert out.eval_visual_fallback["image_round"]["derived_image_ids"] == []
@@ -153,7 +154,7 @@ def test_failed_visual_answer_has_no_retry(source, tmp_path, reply):
     out, client = run_case(source, tmp_path, ["x = 1", "x = 1", reply])
     assert len(client.calls) == 3 and out.answer is None
     assert not out.eval_visual_fallback["accepted"]
-    assert out.eval_visual_fallback["original_result"]["failure_code"] == "ast_violation"
+    assert out.eval_visual_fallback["original_result"]["failure_code"] == "model_output_format_error"
     if isinstance(reply, Exception):
         assert out.final_state == "unavailable"
         assert not out.eval_visual_fallback["image_round"]["observed"]

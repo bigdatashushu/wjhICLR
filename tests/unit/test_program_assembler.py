@@ -138,7 +138,7 @@ def test_prompt_states_control_interfaces_terminate_and_ban_abstain():
     assert "host automatically calls" in text
     # 头部与摘要同源（§5.3）：scope 由调用方传入并透传
     assert f"question_tool_scope={SCOPE_FULL_3D}" in text
-    assert PROMPT_TEMPLATE_VERSION == "program_synth_v11_8_en"
+    assert PROMPT_TEMPLATE_VERSION == "program_synth_v11_10_en"
 
 
 def test_prompt_header_carries_scope_evidence_and_metric_gate():

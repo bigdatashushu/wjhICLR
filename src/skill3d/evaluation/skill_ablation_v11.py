@@ -606,7 +606,7 @@ class _RecordingClient:
                     part["text"] = text
             if isinstance(content, str):
                 message["content"] = parts[0]["text"]
-        row = {"request_index": len(self.requests), "solver": phase == "program",
+        row = {"request_index": len(self.requests), "solver": phase in {"program", "finalization"},
                "phase": phase,
                "seed": kwargs.get("seed"), "max_tokens": max_tokens,
                "request_sha256": _hash(messages), "common_request_sha256": _hash(plain),
@@ -636,6 +636,9 @@ class _RecordingClient:
 
 _PROGRAM_ERROR_CODES = frozenset({
     "ast_violation",
+    "program_syntax_error", "program_missing_action", "model_output_format_error",
+    "finalization_missing_submission", "finalization_tool_call_disallowed",
+    "answer_contract_rejected", "runtime_error", "tool_argument_error",
     "no_answer",
     "violation_runtime",
     "violation_syntax",
@@ -658,7 +661,8 @@ def _arm_result(
     for record in out.retrieval_records:
         data = record.model_dump(mode="json") if hasattr(record, "model_dump") else record
         delivered.update(data.get("delivered_content_sha256") or {})
-    program_requests = [r for r in client.requests if r["phase"] == "program"]
+    program_requests = [r for r in client.requests if r["phase"] in {"program", "finalization"}]
+    finalization_requests = [r for r in program_requests if r["phase"] == "finalization"]
     visual_requests = [r for r in client.requests if r["phase"] == "eval_visual_fallback"]
     requests = program_requests + visual_requests
     successful = [r for r in program_requests if r["success"]]
@@ -667,7 +671,14 @@ def _arm_result(
     incomplete = bool(service_errors) or out.final_state == "unavailable"
     errors = [r for r in out.rounds if r.get("error_code")]
     error_codes = {str(row.get("error_code") or "") for row in errors}
-    delivery_ok = (all(r["skill_content_sha256"] == expected for r in program_requests)
+    # Preserve the historical any-program-error gate metric when refining labels:
+    # a protective kernel tool_contract error must not become a program error
+    # merely because its new diagnostic category is tool_argument_error.
+    program_error_codes = {
+        str(row.get("runtime_error_code") or row.get("error_code") or "")
+        for row in errors}
+    delivery_ok = (all(r["skill_content_sha256"] == (
+                       {} if r["phase"] == "finalization" else expected) for r in program_requests)
                    and all(not r["skill_content_sha256"] for r in visual_requests)
                    and len(visual_requests) <= 1
                    and (not successful or delivered == expected)
@@ -692,12 +703,13 @@ def _arm_result(
         "mra_value": out.mra_value if scoring_status == "scored" else None,
         "legal_answer": bool(legal),
         "program_error": bool(
-            error_codes & _PROGRAM_ERROR_CODES
+            program_error_codes & _PROGRAM_ERROR_CODES
             or out.static_check_errors
             or out.synthesis_source == "online_model_parse_error"),
         "runtime_error": out.final_state == "run_error",
-        "tool_contract_error": "tool_contract" in error_codes,
-        "geometry_rejection": "geometry_rejected" in error_codes,
+        "tool_contract_error": bool(error_codes & {"tool_contract", "tool_precondition_rejected",
+                                                  "tool_argument_error"}),
+        "geometry_rejection": bool(error_codes & {"geometry_rejected", "geometry_verification_rejected"}),
         "untrusted_geometry_used": bool(
             out.answer
             and (
@@ -709,6 +721,7 @@ def _arm_result(
         "yield_count": int(out.yield_count),
         "model_request_count": len(requests),
         "program_request_count": len(program_requests),
+        "finalization_request_count": len(finalization_requests),
         "eval_visual_request_count": len(visual_requests),
         "eval_visual_accepted": bool(out.eval_visual_fallback.get("accepted")),
         "eval_visual_request_sha256": (

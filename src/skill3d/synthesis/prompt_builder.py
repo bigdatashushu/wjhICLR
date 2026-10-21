@@ -7,6 +7,7 @@ than selected at runtime.
 
 from __future__ import annotations
 
+import json
 from typing import Optional, Sequence
 
 from jinja2 import Environment, StrictUndefined
@@ -16,7 +17,8 @@ from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 from skill3d.synthesis.execution_contract import ExecutionContract
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_9_en"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_10_en"
+FINALIZATION_PROMPT_VERSION = "finalization_v11_1_en"
 
 
 # These definitions are part of the shared task contract, not solving recipes.
@@ -188,18 +190,18 @@ class PromptBuilder:
 
 def round_action_instructions(question_type: str, *, finalizing: bool = False) -> str:
     """反馈末尾的公共执行合同；不包含选项答案或 Skill 方法。"""
+    if finalizing:
+        return ("Required action this round: output exactly one JSON answer object. "
+                "No code fences, prose, tool calls, or YieldObservations. "
+                "Use the finalization schema shown in the current request.")
     unit = CANONICAL_UNIT_BY_QUESTION_TYPE.get(question_type)
     unit_expr = repr(unit) if unit else "unit"
     lines = ["Required action this round: output exactly one ```python code block. "
              "Repair executable statements; do not merely edit comments or repeat the previous program."]
-    if finalizing:
-        lines.append("This is the final answer request within the budget. "
-                     "Only a zero-tool program is allowed; do not call YieldObservations.")
-    else:
-        lines.append(
-            "Call only currently documented tools. Do not repeat a deterministically invalid call "
-            "with unchanged arguments and evidence premises. Request new observations with "
-            "`return YieldObservations([actual_result_id], 'reason')`; old variables no longer exist.")
+    lines.append(
+        "Call only currently documented tools. Do not repeat a deterministically invalid call "
+        "with unchanged arguments and evidence premises. Request new observations with "
+        "`return YieldObservations([actual_result_id], 'reason')`; old variables no longer exist.")
     lines.append(
         "First define answer in code from the question and valid evidence "
         "(an option letter or a finite number for this question). "
@@ -219,6 +221,52 @@ def round_action_instructions(question_type: str, *, finalizing: bool = False) -
         "Do not bypass validation with short-form answers or by merely changing basis. "
         "Answer when images are available; do not submit abstain. Do not call tools after ReturnAnswer.")
     return "\n".join(lines)
+
+
+def build_finalization_prompt(*, question: str, options: Sequence[str], question_type: str,
+                              observations: str, remaining_requests: int,
+                              method_context_max_chars: int) -> str:
+    """Dedicated finalizer: task data and valid observations, no program/retry history.
+
+    The canonical method is wholly omitted under an explicit versioned delivery
+    strategy. Historical failed programs and their tool instructions are absent.
+    """
+    from skill3d.online.submission import (
+        FINALIZATION_DELIVERY_STRATEGY, FINALIZATION_SCHEMA_VERSION,
+    )
+
+    unit = CANONICAL_UNIT_BY_QUESTION_TYPE[question_type]
+    contract = ExecutionContract(method_context_max_chars)
+    return "\n".join([
+        f"Final answer request ({FINALIZATION_PROMPT_VERSION}).",
+        f"Schema: {FINALIZATION_SCHEMA_VERSION}; execution_contract_sha256={contract.sha256}.",
+        "The host submits validated data through ReturnAnswer and M11. "
+        "Your response is data only; tools are disabled and no Python is executed from your response.",
+        f"Method delivery strategy: {FINALIZATION_DELIVERY_STRATEGY}.",
+        f"Remaining requests including this request: {remaining_requests}. No repair request is added.",
+        f"Question: {question}",
+        f"Question type: {question_type}. Task meaning: {_TASK_DEFINITIONS.get(question_type, '')}",
+        "Options: " + json.dumps(list(options), ensure_ascii=False),
+        f"Required unit: {unit}. The host supplies it; an optional unit field must match exactly.",
+        'Output exactly one JSON object with action="answer", value, basis, used_result_ids, derivation. '
+        "No additional fields, prose, code fence, NaN, Infinity or duplicate keys.",
+        ("value must be exactly one current option letter." if unit == "option" else
+         "value must be one finite non-negative JSON number; a count must be integral."),
+        "basis must be visual_estimate, mixed or tool_derived. "
+        "For an answer entirely from currently delivered images, use visual_estimate, "
+        "used_result_ids=[] and derivation=null.",
+        "For mixed support, list the actual valid result IDs used. "
+        "tool_derived also requires a replayable derivation with op, input_result_ids, parameters. "
+        "Every input_result_id must appear in used_result_ids.",
+        "Allowed derivations: field(parameters={field}); convert({field,from_unit,to_unit}); "
+        "count({field}); sort({field,key,descending,labels}); argmin({field,key,labels}); "
+        "option_map({field,mapping}). Use dot-separated paths into raw tool data, not expressions. "
+        "A single declared operation must establish the value. M11 checks actual results and units.",
+        "Use only current images and still-valid observations. Missing or rejected results are not zero. "
+        "Do not invent IDs or reinterpret invalid geometry as valid measurements. "
+        "With readable images submit the best legal answer; do not abstain.",
+        observations,
+    ])
 
 
 def build_image_messages(text: str, frames, *, max_images: int = 32,

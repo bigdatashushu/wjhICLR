@@ -20,7 +20,6 @@ INGEST → INPUT_GATE → RECONSTRUCT → QUALITY_GATE → CLASSIFY_TASK → RET
 
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import os
@@ -52,7 +51,8 @@ from skill3d.routing.skill_retriever import (
     retrieve_ex,
 )
 from skill3d.routing.task_classifier import TaskClassification, canonical_task, classify
-from skill3d.sandbox.ast_guard import ast_guard, normalize_program_source
+from skill3d.sandbox.ast_guard import ast_guard
+from skill3d.sandbox.action_check import ARGUMENT_ERROR_REASONS, check_action
 from skill3d.sandbox.kernel import CellResult, RestrictedNamespaceKernel
 from skill3d.sandbox.receipt import ReceiptChain, SandboxReceipt, verify_chain
 from skill3d.schemas import (
@@ -76,6 +76,7 @@ from skill3d.schemas import (
 from skill3d.schemas.image_ledger import LAYOUT_DERIVED_PLUS_ORIGINALS
 from skill3d.schemas.retrieval import SkillCandidateRecord
 from skill3d.skills.delivery import (
+    DroppedSkill,
     SkillDeliveryPlan,
     plan_delivery,
     skill_body_length,
@@ -91,8 +92,10 @@ from skill3d.synthesis.program_assembler import (
     executable_ast_fingerprint,
 )
 from skill3d.synthesis.prompt_builder import (
+    FINALIZATION_PROMPT_VERSION,
     PROMPT_TEMPLATE_VERSION,
     PromptBuilder,
+    build_finalization_prompt,
     round_action_instructions,
 )
 from skill3d.synthesis.eval_visual_fallback import (
@@ -136,8 +139,13 @@ from skill3d.verifier.geometry_oracle import (
 from . import synthetic as synth
 from .submission import (
     EXECUTION_PROTOCOL_VERSION,
+    FINALIZATION_DELIVERY_STRATEGY,
+    FINALIZATION_SCHEMA_VERSION,
+    SubmissionFormatError,
     accepted_result_ids,
+    finalization_program,
     invalid_reference_issues,
+    parse_finalization,
     rejected_submission,
     submission_scope,
     used_evidence_flags,
@@ -437,6 +445,7 @@ class _SynthResult:
     # v9 §9.4：本轮图像清单（布局、实际装入的图像、被省略的图与 token 成本）
     image_round: dict = field(default_factory=dict)
     generation: dict = field(default_factory=dict)
+    error_code: str = ""
 
 
 class _Counter:
@@ -1717,11 +1726,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         outcome.round_trigger = trigger
         # _synthesize 对 v11 不在内部追加退化重试，所有请求都经过这里计数。
         if finalizing and cfg.mode == "mock_light":
-            forced, source = _forced_answer_program(
-                episode, scene, handle, skills, cfg, llm, pixels=pixels, geometry=geometry)
+            forced = assemble_program(
+                f"{synth._STUB_BANNER}\nReturnAnswer({synth.stub_direct_answer(episode)!r})\n", [])
             res = _SynthResult(
                 forced,
-                source,
+                "mock_stub",
                 "",
                 response_text=str(getattr(forced, "program_source", "") or ""),
             )
@@ -1730,6 +1739,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 episode, scene, handle, skills, cfg, llm, pixels=pixels, geometry=geometry,
                 traceback_feedback=feedback, prior_program=prior_source,
                 observation_image_ids=observation_images,
+                finalization_observations=(observations() if finalizing else None),
                 round_index=index, trigger=trigger)
         if index == 1:
             _record_first_synthesis(outcome, res, scene, cfg)
@@ -1746,6 +1756,15 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         record.update(execution_protocol_version=EXECUTION_PROTOCOL_VERSION,
                       feedback=feedback or "", executed=False,
                       generation=dict(res.generation))
+        if finalizing:
+            record["finalization"] = {
+                "schema_version": FINALIZATION_SCHEMA_VERSION,
+                "prompt_version": FINALIZATION_PROMPT_VERSION,
+                "method_delivery_strategy": FINALIZATION_DELIVERY_STRATEGY,
+                "parser": "strict_json" if cfg.mode == "real" else "mock_stub",
+                "response_format_enforced_by_service": False,
+                "host_generated_program": res.program is not None,
+            }
         outcome.rounds.append(record)
         outcome.round_trace_refs = [f"round:{r['index']}" for r in outcome.rounds]
         program = res.program
@@ -1755,7 +1774,9 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         feedback = None
         observation_images = []
         if program is None:
-            record["error_code"] = res.source
+            record["error_code"] = res.error_code or (
+                "service_error" if res.source in ("none", "online_model_service_error")
+                else "model_output_format_error")
             feedback = f"The previous program generation failed: {res.note}."
             failure_key = "synthesis"
             if res.source in ("none", "online_model_service_error"):
@@ -1773,17 +1794,26 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                           evidence_fingerprint=evidence_fingerprint)
             step("done")  # SYNTHESIZE_PROGRAM → STATIC_CHECK
             check = ast_guard(program.program_source, allowed_tools=set(REGISTRY.names()))
-            if not check.ok or (finalizing and not _is_zero_tool_answer_program(program)):
-                problems = list(check.violations) or ["The final program must call no tools and submit an answer"]
+            action = (check_action(program.program_source, finalizing=finalizing,
+                                   tool_names=set(REGISTRY.names())) if check.ok else None)
+            if not check.ok:
+                problems = list(check.violations)
                 outcome.static_check_errors.extend(problems)
-                record["error_code"] = "ast_violation"
+                record["error_code"] = (
+                    "program_syntax_error" if any(p.startswith("Syntax error:") for p in problems)
+                    else "ast_violation")
                 feedback = "The previous program was rejected by the AST check: " + "; ".join(problems)
                 failure_key = "ast"
+            elif not action.ok:
+                record["error_code"] = action.error_code
+                feedback = action.reason
+                failure_key = action.error_code
             elif previous_failure is not None and not finalizing:
                 # M4: same deterministic failure with unchanged prerequisites.
                 # This generated response still consumes its existing solver round.
                 failure_key = previous_failure["error_code"]
-                record.update(error_code=failure_key, repeated_failure={
+                record.update(error_code=previous_failure["classification"],
+                              runtime_error_code=previous_failure["error_code"], repeated_failure={
                     "reason": "same_failed_ast_and_unchanged_evidence",
                     "prior_round": previous_failure["round"],
                     "ast_fingerprint": ast_fingerprint,
@@ -1943,7 +1973,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                         "Failures without an established shared cause are handled locally; "
                         "unresolved results are not treated as valid observations.")
                     failure_key = "geometry_verify"
-                    record["error_code"] = "geometry_rejected"
+                    record["error_code"] = "geometry_verification_rejected"
                     step("reject")
                 elif error is None and cell.terminated == "yield" and not finalizing:
                     outcome.yield_count += 1
@@ -1961,7 +1991,16 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     if details:
                         feedback += "\n" + details
                     failure_key = str(error or "no_answer")
-                    record["error_code"] = failure_key
+                    record["runtime_error_code"] = error
+                    record["error_code"] = (
+                        "finalization_missing_submission" if finalizing and not error else
+                        "program_missing_action" if not error else
+                        "tool_argument_error" if (
+                            any((r.failure_cause and r.failure_cause.code in ARGUMENT_ERROR_REASONS)
+                                for r in trace.results)) else
+                        "tool_precondition_rejected" if error in _RECOVERABLE_CONTRACT_ERRORS else
+                        "program_syntax_error" if cell.error_type == "SyntaxError" else
+                        "runtime_error")
                     if kernel.answer_slot.given:
                         record["rejected_submission"] = rejected_submission(kernel)
                     if error in _RECOVERABLE_CONTRACT_ERRORS:
@@ -1998,6 +2037,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     if deterministic_failure:
                         failed_programs[failure_identity] = {
                             "round": index, "error_code": failure_key,
+                            "classification": record["error_code"],
                             "error": cell.error, "field_repair": field_repair,
                         }
 
@@ -2035,10 +2075,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
     if outcome.final_state != "unavailable":
         outcome.final_state = "run_error"
     last = outcome.rounds[-1] if outcome.rounds else {}
-    outcome.failure_code = str(last.get("cause_code") or last.get("error_code") or "no_answer")
+    outcome.failure_code = str(last.get("error_code") or "program_missing_action")
     stage = ("M8" if not last.get("program_source") and not last.get("executed")
-             else "M9" if outcome.failure_code == "ast_violation"
-             else "M11" if outcome.failure_code == "geometry_rejected" else "M10")
+             else "M9" if outcome.failure_code in (
+                 "ast_violation", "program_syntax_error", "program_missing_action") and not last.get("executed")
+             else "M11" if outcome.failure_code == "geometry_verification_rejected" else "M10")
     outcome.terminal_failure = {
         "code": outcome.failure_code, "stage": stage,
         "termination_reason": termination_reason, "round": outcome.agent_rounds,
@@ -2498,6 +2539,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                 traceback_feedback: Optional[str] = None,
                 prior_program: Optional[str] = None,
                 observation_image_ids: Optional[Sequence[str]] = None,
+                finalization_observations: Optional[Sequence] = None,
                 round_index: int = 1,
                 trigger: str = "initial") -> _SynthResult:
     """M8：生成 program。
@@ -2528,7 +2570,23 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             response_text=src,
         )
 
-    prompt, delivery = _build_prompt_ex(episode, scene, handle, skills, feedback,
+    finalizing = trigger == "finalize"
+    if finalizing:
+        delivery = plan_delivery(skills, max_chars=cfg.retrieval_policy.method_context_max_chars)
+        delivery.dropped = [
+            DroppedSkill(e.skill_version, "finalization_omitted", e.chars)
+            for e in delivery.entries]
+        delivery.entries = []
+        delivery.used_chars = 0
+        delivery.channel_note = FINALIZATION_DELIVERY_STRATEGY
+        prompt = build_finalization_prompt(
+            question=episode.question, options=list(episode.options or []),
+            question_type=canonical_task(episode.question_type),
+            observations=observation_feedback(list(finalization_observations or [])),
+            remaining_requests=int(cfg.max_solver_rounds) - round_index + 1,
+            method_context_max_chars=delivery.max_chars)
+    else:
+        prompt, delivery = _build_prompt_ex(episode, scene, handle, skills, feedback,
                                         scope_override=scope_override,
                                         # 带 prior_program 时反馈作为下一条 user turn 发送；
                                         # 不再同时复制进首条公共 prompt。
@@ -2574,14 +2632,14 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         # §9.4 delivered = "进了实际发出的请求"：请求发出前的最后一刻标记
         ledger.mark_round_sent(int(round_index))
         ledger.mark_delivered(int(round_index), plan.image_ids)
-    if prior_program is not None:
+    if prior_program is not None and not finalizing:
         # 回灌：assistant(上一轮 program) → user(裁剪 traceback + 可用产物)
         messages = messages + [{"role": "assistant", "content": prior_program}]
         if traceback_feedback:
             messages.append({"role": "user", "content": traceback_feedback})
     try:
         # 请求级 seed：钉住在线模型采样随机性（§7 复现纪律）
-        with request_phase("program"):
+        with request_phase("finalization" if finalizing else "program"):
             text = client.chat(messages, max_tokens=cfg.max_tokens, seed=int(cfg.seed))
     except Exception as exc:  # noqa: BLE001 - 网络/服务不可用
         from skill3d.synthesis.client_errors import ServiceUnavailable
@@ -2611,6 +2669,23 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
     generation = dict(getattr(client, "last_generation", None) or {})
     generation["usage"] = dict(getattr(client, "last_usage", None) or {})
     generation.setdefault("usage_status", "measured" if generation["usage"] else "unknown")
+    if finalizing:
+        try:
+            payload = parse_finalization(
+                text, question_type=canonical_task(episode.question_type),
+                options=list(episode.options or []), readable_images=n_images > 0,
+                valid_result_ids=[o.result_id for o in finalization_observations or []])
+        except SubmissionFormatError as exc:
+            return _SynthResult(
+                None, "online_model_parse_error", str(exc), error_code=exc.code,
+                prompt=prompt, n_images=n_images, delivery=delivery,
+                image_round=_round_dict(ledger, round_index), response_text=text,
+                generation=generation)
+        return _SynthResult(
+            finalization_program(payload), "online_model_ok", "",
+            prompt=prompt, n_images=n_images, delivery=delivery,
+            image_round=_round_dict(ledger, round_index), response_text=text,
+            generation=generation)
     reason = (generation.get("reason")
               if generation.get("stop_reason") == "degenerate_repetition"
               else degenerate_reason(text))
@@ -2634,6 +2709,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             None,
             "online_model_parse_error",
             f"M8 program parsing failed: {exc}",
+            error_code=exc.code,
             prompt=prompt,
             n_images=n_images,
             delivery=delivery,
@@ -2912,70 +2988,6 @@ def _yield_feedback(cell: CellResult, kernel, scene,
         selected = [obs for obs in valid if obs.result_id in wanted] if wanted else valid
         lines.append(observation_feedback(selected or valid))
     return "\n".join(lines)
-
-
-_FORCED_ANSWER_FEEDBACK = (
-    "The tool path is exhausted; the previous round did not obtain a usable measurement.\n"
-    "You must answer this question. The images are readable; use your own visual estimate "
-    "for unavailable measurements.\n"
-    "Write a zero-tool program using the spatial layout visible in the images and common knowledge, "
-    "then submit the best answer with `return ReturnAnswer(AnswerPayload(...))`.\n"
-    "Output exactly one ```python code block, with no explanation."
-)
-
-
-def _forced_answer_program(episode: VSIBenchEpisode, scene, handle, skills,
-                           cfg: OnlineRunConfig, llm,
-                           pixels: Optional[Sequence[np.ndarray]] = None,
-                           geometry=None,
-                           delivery_sink: Optional[list] = None,
-                           observation_image_ids: Optional[Sequence[str]] = None,
-                           round_index: Optional[int] = None,
-                           trigger: str = "finalize"):
-    """v7 D1：预算/恢复用尽时**必须产出答案**，而不是拒答。
-
-    这是"有图必答"的最后一级：让**同一个在线 agent** 写一个零工具 program，
-    把它已经看到的图片转成视觉估计（D2 允许零感知/计算工具调用，是因为视觉推断
-    本身发生在模型看图、写代码的时候）。文件、解析、AST 全部复用正常路径，
-    因此产出的仍是可审计的 program 轨迹，而不是一条旁路直答。
-
-    `delivery_sink`：调用方传入列表即可拿到本次生成的**方法交付计划**（§13.6）——
-    收口轮同样会交付方法，不记就会漏掉一轮的交付事实。
-    """
-    if cfg.mode == "mock_light":
-        src = (f"{synth._STUB_BANNER}\n"
-               f"ReturnAnswer({synth.stub_direct_answer(episode)!r})\n")
-        return assemble_program(src, []), "mock_stub"
-    try:
-        res = _synthesize(episode, scene, handle, skills, cfg, llm,
-                          feedback=None, geometry=geometry, pixels=pixels,
-                          traceback_feedback=_FORCED_ANSWER_FEEDBACK,
-                          observation_image_ids=observation_image_ids,
-                          round_index=(1 if round_index is None else int(round_index)),
-                          trigger=str(trigger))
-    except Exception as exc:  # noqa: BLE001 - 兜底链自身失败不能冒泡成崩溃
-        return None, f"forced_answer 生成异常: {type(exc).__name__}: {exc}"
-    if delivery_sink is not None:
-        delivery_sink.append(res.delivery)
-    if res.program is None:
-        return None, f"forced_answer 生成失败: {res.note}"
-    return res.program, res.source
-
-
-def _is_zero_tool_answer_program(program: EpisodeProgram) -> bool:
-    source = str(getattr(program, "program_source", "") or "")
-    check = ast_guard(source, allowed_tools=set())
-    if not check.ok or check.allowed_tool_calls:
-        return False
-    try:
-        tree = ast.parse(normalize_program_source(source))
-    except SyntaxError:
-        return False
-    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    return (any(isinstance(node.func, ast.Name) and node.func.id == "ReturnAnswer"
-                for node in calls)
-            and not any(isinstance(node.func, ast.Name)
-                        and node.func.id == "YieldObservations" for node in calls))
 
 
 def _evaluate(episode: VSIBenchEpisode, answer: Optional[str], cls: TaskClassification):

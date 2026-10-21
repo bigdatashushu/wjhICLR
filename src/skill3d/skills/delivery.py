@@ -47,6 +47,7 @@ DELIVERY_REASON_CODES: frozenset[str] = frozenset({
     "context_cap_exceeded",  # §13.5：整条放不下 → 丢弃整条（不截断）
     "no_model_request",      # C0/mock/未配置客户端：没有发出请求
     "request_failed",        # 请求失败（服务不可用），不假装模型见过
+    "finalization_omitted",  # 新 finalizer 合同：整条方法不交付，不截断
 })
 
 

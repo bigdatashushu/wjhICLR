@@ -214,7 +214,9 @@ def room_source_and_artifact(tmp_path_factory):
 def test_v11_contract_survives_solver_rounds_and_reaches_trace(
         room_source_and_artifact, tmp_path, first_program, round_limit, expected_trigger):
     item, spec, artifact = room_source_and_artifact
-    final_response = "```python\nReturnAnswer(1)\n```\n"
+    final_response = (json.dumps({"action": "answer", "value": 1, "basis": "visual_estimate",
+                                 "used_result_ids": [], "derivation": None})
+                      if expected_trigger == "finalize" else "```python\nReturnAnswer(1)\n```\n")
     client = _RecordingClient([first_program, final_response])
     cfg = OnlineRunConfig(
         mode="real", reuse_artifact=artifact, skills=[spec], seed=7,
@@ -225,27 +227,34 @@ def test_v11_contract_survives_solver_rounds_and_reaches_trace(
         item.episode, item.pixels, cfg, llm=client, trace_store=TraceStore(cfg.trace_dir))
     assert out.final_state == "answer", out.notes
     assert len(client.calls) == 2, out.notes
-    for messages in client.calls:
+    for index, messages in enumerate(client.calls):
         # Prior programs and feedback can follow this first text part.
         text = messages[0]["content"][0]["text"]
-        assert "## Shared execution rules" in text
+        is_final = expected_trigger == "finalize" and index == 1
+        assert ("Final answer request" if is_final else "## Shared execution rules") in text
         assert "## 题目口径" not in text
-        assert text.count(spec.skill_md) == 1
+        assert text.count(spec.skill_md) == (0 if is_final else 1)
         assert not re.search(r"[\u4e00-\u9fff]", _prompt_text(messages))
     assert all(p["seed"] == 7 for p in client.request_params)
     if expected_trigger == "ast_feedback":
         assert "The previous program was rejected by the AST check" in _prompt_text(client.calls[1])
     elif expected_trigger == "finalize":
         assert out.finalization_used
+        final_delivery = out.retrieval_records[-1].method_summaries[-1]
+        assert final_delivery["delivered_skill_versions"] == []
+        assert final_delivery["omitted_skill_reasons"] == {
+            f"{spec.skill_id}@{spec.version}": "finalization_omitted"}
+        assert out.retrieval_records[-1].dropped_for_context == []
     else:
         assert any(r.get("trigger") == expected_trigger for r in out.rounds), out.rounds
     feedback = out.rounds[1]["feedback"]
     assert feedback.count("Still-valid observations") == 1
     assert feedback.count("Required action this round") == 1
     assert feedback.index("Remaining model request limit") < feedback.index("Required action this round")
-    assert feedback.endswith("Do not call tools after ReturnAnswer.")
     if expected_trigger == "finalize":
-        assert "unit='m2', basis='visual_estimate', used_result_ids=[], derivation=None" in feedback
+        assert "one JSON answer object" in feedback
+    else:
+        assert feedback.endswith("Do not call tools after ReturnAnswer.")
     assert out.first_synthesis["template_version"] == PROMPT_TEMPLATE_VERSION
     assert out.first_synthesis["tool_docs_version"] == TOOL_DOCS_VERSION
     rows = (tmp_path / "traces/trace_record.jsonl").read_text().splitlines()
@@ -257,7 +266,10 @@ def test_v11_contract_survives_solver_rounds_and_reaches_trace(
     )
     assert program_row["response_text"] == final_response
     assert program_row["response_texts"] == [first_program, final_response]
-    assert program_row["program_source"] == "ReturnAnswer(1)\n"
+    if expected_trigger == "finalize":
+        assert "ReturnAnswer(AnswerPayload(value=1, unit='m2'" in program_row["program_source"]
+    else:
+        assert program_row["program_source"] == "ReturnAnswer(1)\n"
 
 
 def _verify_result(*, passed, issue=None):
@@ -456,7 +468,9 @@ def test_m11_budget_exhaustion_clears_rejected_answer_and_keeps_denominator(
 
     out, client = _run_m11_case(
         room_source_and_artifact, tmp_path, monkeypatch,
-        ["ReturnAnswer(1)\n", "ReturnAnswer(1)\n"],
+        ["ReturnAnswer(1)\n", json.dumps({
+            "action": "answer", "value": 1, "basis": "visual_estimate",
+            "used_result_ids": [], "derivation": None})],
         verifier, max_rounds=2, retries=1)
 
     assert len(client.calls) == 2
@@ -465,17 +479,17 @@ def test_m11_budget_exhaustion_clears_rejected_answer_and_keeps_denominator(
     assert out.mra_value == 0.0
     assert all(r["submission_accepted"] is False for r in out.rounds)
     assert out.rounds[-1]["trigger"] == "finalize"
-    assert out.failure_code == "geometry_rejected"
+    assert out.failure_code == "geometry_verification_rejected"
     assert out.terminal_failure == {
-        "code": "geometry_rejected", "stage": "M11",
+        "code": "geometry_verification_rejected", "stage": "M11",
         "termination_reason": "finalization_failed", "round": 2}
     assert out.episode_trace.terminal_failure == out.terminal_failure
 
 
 @pytest.mark.parametrize(("program", "code", "stage"), [
     ("import os\nReturnAnswer(1)", "ast_violation", "M9"),
-    ("reproject([0, 0], 0)", "domain_value", "M10"),
-    ("x = 1", "no_answer", "M10"),
+    ("reproject([0, 0], 0)\nReturnAnswer(1)", "tool_argument_error", "M10"),
+    ("x = 1", "program_missing_action", "M9"),
 ])
 def test_solver_budget_retains_terminal_error_and_stage(
         room_source_and_artifact, tmp_path, monkeypatch, program, code, stage):
@@ -485,6 +499,6 @@ def test_solver_budget_retains_terminal_error_and_stage(
     assert out.failure_code == code
     assert out.terminal_failure["stage"] == stage
     assert out.terminal_failure["termination_reason"] == "solver_round_budget_exhausted"
-    if code == "domain_value":
-        assert out.rounds[-1]["error_code"] == "tool_contract"
+    if code == "tool_argument_error":
+        assert out.rounds[-1]["error_code"] == "tool_argument_error"
         assert out.rounds[-1]["cause_code"] == "domain_value"

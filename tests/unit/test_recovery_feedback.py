@@ -162,8 +162,8 @@ def test_failed_call_reports_actual_runtime_arguments():
 
 
 @pytest.mark.parametrize("question_type,unit", CANONICAL_UNIT_BY_QUESTION_TYPE.items())
-def test_finalization_example_runs_with_explicit_visual_payload(question_type, unit):
-    text = round_action_instructions(question_type, finalizing=True)
+def test_ordinary_visual_submission_example_runs_with_explicit_payload(question_type, unit):
+    text = round_action_instructions(question_type, finalizing=False)
     line = next(line for line in text.splitlines() if line.startswith("For an answer genuinely based entirely on original images"))
     code = line.split(": ", 1)[1]
     value = "B" if unit == "option" else 2
