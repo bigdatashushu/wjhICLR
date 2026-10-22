@@ -137,10 +137,10 @@ def native_server(state):
 
 
 @pytest.fixture
-def replicas():
+def replicas(request):
     totals = {"lock": threading.Lock(), "active": 0, "maximum": 0}
     with ExitStack() as stack:
-        states = [NativeState(index, totals) for index in range(4)]
+        states = [NativeState(index, totals) for index in range(getattr(request, "param", 4))]
         backends = []
         for state in states:
             endpoint = stack.enter_context(running_server(native_server(state)))
@@ -189,6 +189,126 @@ def call(endpoint, path, body=None, *, token=TOKEN, method=None, headers=None):
         return response.status, response.read(), dict(response.getheaders())
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("replicas", [1, 2, 3, 4], indirect=True)
+def test_configured_backends_preflight_and_forward_in_order(replicas, tmp_path):
+    states, backends, _ = replicas
+    states.reverse()
+    backends.reverse()
+    with central(backends, tmp_path) as (transport, endpoint):
+        assert [replica.endpoint for replica in transport.replicas] == [
+            row["endpoint"] for row in backends]
+        assert transport.semantic_identity_sha256 == content_sha256({
+            key: value for key, value in states[0].identity.items() if key != "device"})
+        assert all([(row[0], row[1]) for row in state.requests] == [("GET", "/health")]
+                   for state in states)
+        for index, state in enumerate(states):
+            status, raw, _ = call(endpoint, f"/replicas/{index}/health")
+            assert status == 200 and raw == state.health()
+            payload = RAW + b" " * index
+            content_type = "application/json; charset=utf-8"
+            status, raw, _ = call(endpoint, f"/replicas/{index}/decisions", payload,
+                                  headers={"Content-Type": content_type})
+            assert status == 200 and raw == payload
+            assert [(row[0], row[1]) for row in state.requests] == [
+                ("GET", "/health"), ("GET", "/health"), ("GET", "/health"),
+                ("POST", "/decisions")]
+            assert state.requests[-1][2] == payload
+            assert state.requests[-1][3]["Content-Type"] == content_type
+            assert all("Authorization" not in row[3] for row in state.requests)
+            assert state.maximum == 1
+
+
+@pytest.mark.parametrize("replicas", [1], indirect=True)
+@pytest.mark.parametrize("pin", ["full", "semantic"])
+def test_single_backend_preflight_rejects_identity_mismatch(replicas, tmp_path, pin):
+    states, backends, _ = replicas
+    kwargs = {}
+    if pin == "full":
+        backends[0]["expected_identity_sha256"] = "f" * 64
+    else:
+        kwargs["semantic_identity_sha256"] = "f" * 64
+    with pytest.raises(gateway.GatewayError) as error:
+        with central(backends, tmp_path, **kwargs):
+            pass
+    assert error.value.status == 502
+    assert error.value.code == "reviewer_health_identity_mismatch"
+    assert [(row[0], row[1]) for row in states[0].requests] == [("GET", "/health")]
+
+
+@pytest.mark.parametrize("replicas", [1, 2, 3], indirect=True)
+def test_missing_and_invalid_replicas_are_stable_unknown_routes(replicas, tmp_path):
+    states, backends, _ = replicas
+    indices = [str(index) for index in range(len(backends), 4)]
+    indices += ["-1", "4", "5", "00", "+1", "1.0", "invalid"]
+    with central(backends, tmp_path) as (transport, endpoint):
+        counts = [len(state.requests) for state in states]
+        for index in indices:
+            for method, native_path, body in [
+                    ("GET", "/health", None), ("POST", "/review", RAW)]:
+                path = f"/replicas/{index}{native_path}"
+                with pytest.raises(gateway.GatewayError) as error:
+                    transport.forward(method, path, body, time.monotonic() + 5,
+                                      "application/json")
+                assert error.value.status == 404 and error.value.code == "unknown_route"
+                for _ in range(2):
+                    status, raw, _ = call(endpoint, path, body)
+                    assert status == 404
+                    assert json.loads(raw) == {"error": "unknown_route", "retryable": False}
+        assert [len(state.requests) for state in states] == counts
+        assert all(not replica.queue and not replica.quarantined for replica in transport.replicas)
+        assert call(endpoint, "/replicas/0/review", RAW)[:2] == (200, RAW)
+
+
+@pytest.mark.parametrize("replicas", [1], indirect=True)
+def test_proxy_missing_replica_forwards_unknown_route(replicas, tmp_path):
+    states, backends, _ = replicas
+    with central(backends, tmp_path) as (_, endpoint):
+        counts = [len(state.requests) for state in states]
+        for index in range(1, 4):
+            proxy = gateway.LoopbackProxy(endpoint, index, backends[0]["expected_identity_sha256"])
+            for method, path, body in [("GET", "/health", None), ("POST", "/review", RAW)]:
+                reply = proxy.forward(method, path, body, time.monotonic() + 5, "application/json")
+                assert reply.status == 404
+                assert json.loads(reply.body) == {"error": "unknown_route", "retryable": False}
+        assert [len(state.requests) for state in states] == counts
+
+
+@pytest.mark.parametrize("count", [0, 5])
+def test_backend_count_outside_one_to_four_is_rejected(tmp_path, count):
+    backends = [{"endpoint": f"http://127.0.0.1:{27145 + index}",
+                 "expected_identity_sha256": "a" * 64} for index in range(count)]
+    with pytest.raises(ValueError, match="between 1 and 4"):
+        gateway.ReviewerGateway(backends, lock_dir=tmp_path / "locks")
+    assert not (tmp_path / "locks").exists()
+
+
+@pytest.mark.parametrize("count", [2, 3, 4])
+def test_duplicate_normalized_backend_endpoints_are_rejected(tmp_path, count):
+    backends = [{"endpoint": f"http://127.0.0.1:{27145 + index}",
+                 "expected_identity_sha256": "a" * 64} for index in range(count)]
+    backends[-1]["endpoint"] = "http://localhost:27145/"
+    with pytest.raises(ValueError, match="backend endpoints must be distinct"):
+        gateway.ReviewerGateway(backends, lock_dir=tmp_path / "locks")
+    assert not (tmp_path / "locks").exists()
+
+
+@pytest.mark.parametrize("replica", [-1, 4, True, "0", None])
+def test_proxy_replica_must_be_an_integer_zero_to_three(replica):
+    with pytest.raises(ValueError, match="replica must be between 0 and 3"):
+        gateway.LoopbackProxy("http://127.0.0.1:27034", replica, "a" * 64)
+
+
+@pytest.mark.parametrize("replica", ["-1", "4"])
+def test_cli_replica_still_rejects_values_outside_zero_to_three(replica, capsys):
+    with pytest.raises(SystemExit) as error:
+        gateway.main(["localproxy", "--gateway", "http://127.0.0.1:27034",
+                      "--replica", replica, "--expected-identity-sha256", "a" * 64])
+    assert error.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "invalid choice" in captured.err and "--replica" in captured.err
 
 
 def test_eight_workers_four_replicas_globally_serialized_and_byte_exact(replicas, tmp_path):
@@ -375,6 +495,7 @@ def test_request_and_response_limits_and_opaque_invalid_json(replicas, tmp_path)
         assert transport.replicas[0].quarantined
 
 
+@pytest.mark.parametrize("replicas", [1, 4], indirect=True)
 def test_fifo_queue_capacity_and_deadline_are_retryable(replicas, tmp_path):
     states, backends, _ = replicas
     states[0].release = threading.Event()
@@ -468,6 +589,7 @@ def test_reply_strips_connection_nominated_headers_and_rejects_incomplete_body(r
         assert call(endpoint, "/replicas/0/health")[1] == states[0].health()
 
 
+@pytest.mark.parametrize("replicas", [1, 4], indirect=True)
 def test_exclusive_gateway_ownership_across_processes(replicas, tmp_path):
     _, backends, _ = replicas
     with central(backends, tmp_path):
@@ -514,6 +636,7 @@ def test_environment_credentials_only_and_loopback_binding(replicas, tmp_path, m
             gateway.LoopbackProxy(url, 0, "a" * 64)
 
 
+@pytest.mark.parametrize("replicas", [1, 4], indirect=True)
 def test_cli_serve_and_localproxy_ready_and_no_credentials_in_output(replicas, tmp_path):
     _, backends, _ = replicas
     config = tmp_path / "backends.json"
@@ -533,8 +656,9 @@ def test_cli_serve_and_localproxy_ready_and_no_credentials_in_output(replicas, t
         ready = start(["serve", "--backends-config", str(config), "--host", "127.0.0.1",
                        "--port", "0", "--lock-dir", str(tmp_path / "locks")])
         endpoint = f"http://127.0.0.1:{ready['port']}"
-        proxy = start(["localproxy", "--gateway", endpoint, "--replica", "3", "--port", "0",
-                       "--expected-identity-sha256", backends[3]["expected_identity_sha256"]])
+        replica = len(backends) - 1
+        proxy = start(["localproxy", "--gateway", endpoint, "--replica", str(replica), "--port", "0",
+                       "--expected-identity-sha256", backends[replica]["expected_identity_sha256"]])
         assert call(f"http://127.0.0.1:{proxy['port']}", "/review", RAW, token=None)[:2] == (200, RAW)
     finally:
         for process in reversed(processes):

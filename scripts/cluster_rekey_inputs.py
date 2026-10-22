@@ -123,9 +123,17 @@ def _validate_scene(scene: dict, scene_id: str, scope: dict,
         raise ValueError("source scene lacks the full question group")
     public = copy.deepcopy(scene)
     for question in public["questions"]:
+        episodes = [question.get("episode")]
         logical = question.get("logical_input_identity", {})
         if isinstance(logical, dict) and isinstance(logical.get("episode"), dict):
             logical["episode"].pop("ground_truth", None)
+            episodes.append(logical["episode"])
+        for episode in episodes:
+            if not isinstance(episode, dict) or not isinstance(episode.get("question"), str):
+                raise ValueError("frozen episode question must be text")
+            # Only raw question line endings in this validation copy are projected.
+            # Equality, hashes and repackaging below still use the original scene.
+            episode["question"] = episode["question"].replace("\r", " ").replace("\n", " ")
     canonical_json(public)
     if (scene.get("schema") != "harness3d-frozen-scene/1"
             or scene.get("status") != "frozen"

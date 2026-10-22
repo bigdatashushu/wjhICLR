@@ -26,6 +26,15 @@ SPEC = importlib.util.spec_from_file_location("cluster_rekey_inputs_test", SCRIP
 module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
 
+# Frozen public questions from r02 scene 0d2ee665be (QA 1584 and 2700).
+MULTILINE_QUESTIONS = (
+    "If I am standing by the door and facing the cutting board, is the computer mouse "
+    "to my left, right, or back?\n"
+    "An object is to my back if I would have to turn at least 135 degrees in order to face it.",
+    "What is the size of this room (in square meters)? \n"
+    "If multiple rooms are shown, estimate the size of the combined space.",
+)
+
 
 def _sha(raw):
     return hashlib.sha256(raw).hexdigest()
@@ -74,7 +83,8 @@ def _tar(path, scene, payloads, extra=(), omit=(), scene_raw=None):
             stream.addfile(header, io.BytesIO(raw) if raw is not None else None)
 
 
-def _source(tmp_path, counts=(2, 9), geometry_bytes=b"frozen geometry dependency"):
+def _source(tmp_path, counts=(2, 9), geometry_bytes=b"frozen geometry dependency",
+            question_texts=None):
     root = tmp_path / "r02"
     scenes, payloads, scopes = {}, {}, {}
     for index, count in enumerate(counts):
@@ -105,7 +115,7 @@ def _source(tmp_path, counts=(2, 9), geometry_bytes=b"frozen geometry dependency
                 files[original], data[relative] = relative, raw
                 identities[relative] = {"sha256": _sha(raw), "size": len(raw)}
         questions = []
-        for qa_id in qa_ids:
+        for offset, qa_id in enumerate(qa_ids):
             frame_ids = list(range(32))
             frame_set = {
                 "frame_ids": frame_ids, "source_frame_indices": frame_ids,
@@ -119,7 +129,9 @@ def _source(tmp_path, counts=(2, 9), geometry_bytes=b"frozen geometry dependency
             }
             episode = {
                 "qa_id": qa_id, "scene_name": scene_id, "split": split, "dataset": "scannet",
-                "question": f"Public question {qa_id}?", "question_type": "object_counting",
+                "question": (question_texts[offset] if question_texts is not None
+                             else f"Public question {qa_id}?"),
+                "question_type": "object_counting",
                 "options": None,
                 "frames": [{"frame_idx": i, "timestamp": float(i), "height": 2, "width": 2}
                            for i in range(32)],
@@ -244,6 +256,197 @@ def test_rekeys_exact_public_manifest_and_only_scene_identity(tmp_path):
 
 def _read_tar_scene(stream):
     return json.load(stream.extractfile("scene.json"))
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+def test_rekeys_real_multiline_questions_without_normalizing_frozen_bytes(tmp_path, line_ending):
+    texts = tuple(text.replace("\n", line_ending) for text in MULTILINE_QUESTIONS)
+    case = _source(tmp_path, counts=(2, 2), question_texts=texts)
+    source_before, scenes_before = _snapshot(case.root), copy.deepcopy(case.scenes)
+    progress = _prepare(case)
+    output = _read(case.destination / "jobs.json")
+    new_identity = FrozenIdentity.from_dict(output["identity"])
+    assert new_identity.manifest_json == case.identity.manifest_json
+    assert new_identity.manifest_hash == case.identity.manifest_hash
+    assert new_identity.identity_hash != case.identity.identity_hash
+    assert {row["geometry"] for row in progress["scenes"].values()} == {
+        "verified_reuse", "fresh_required",
+    }
+    for row in output["jobs"]:
+        scene_id = row["job_key"].split("/")[1]
+        archive = module._archive_path(case.destination, row["job_key"])
+        with tarfile.open(archive, "r:") as stream:
+            scene = _read_tar_scene(stream)
+            expected = {**scenes_before[scene_id], "cluster_identity_hash": new_identity.identity_hash}
+            assert _bytes(scene) == _bytes(expected)
+            for name, raw in case.payloads[scene_id].items():
+                assert stream.extractfile(name).read() == raw
+        for question, text in zip(scene["questions"], texts):
+            assert question["episode"]["question"].encode("utf-8") == text.encode("utf-8")
+            if "logical_input_identity" in question:
+                logical = question["logical_input_identity"]
+                assert logical["episode"]["question"] == text
+                assert logical["sha256"] == _sha(_bytes({
+                    k: v for k, v in logical.items() if k != "sha256"
+                }))
+    destination_before = _snapshot(case.destination)
+    assert _prepare(case) == progress
+    assert _snapshot(case.destination) == destination_before
+    assert _snapshot(case.root) == source_before
+    assert case.scenes == scenes_before
+
+
+@pytest.mark.parametrize("snapshot", ["manifest", "method"])
+def test_canonical_identity_contract_still_rejects_multiline_text(snapshot):
+    with pytest.raises(ValueError, match="control characters"):
+        module.canonical_json({"question": MULTILINE_QUESTIONS[0]})
+    manifest, method = {"schema": "cluster-scope/1"}, {"detector": "r03"}
+    (manifest if snapshot == "manifest" else method)["question"] = MULTILINE_QUESTIONS[0]
+    with pytest.raises(ValueError, match="control characters"):
+        FrozenIdentity.freeze(manifest, method)
+
+
+@pytest.mark.parametrize("location", ["public", "logical"])
+@pytest.mark.parametrize("control", ["\0", "\t", "\v", "\f", "\x1f"])
+def test_question_line_break_exception_does_not_allow_other_controls(tmp_path, location, control):
+    case = _source(tmp_path, counts=(1,), question_texts=MULTILINE_QUESTIONS)
+    question = case.scenes["scene-0"]["questions"][0]
+    logical = question["logical_input_identity"]
+    episode = question["episode"] if location == "public" else logical["episode"]
+    episode["question"] += control
+    logical["sha256"] = _sha(_bytes({k: v for k, v in logical.items() if k != "sha256"}))
+    _replace_source_tar(case)
+    before = _snapshot(case.root)
+    with pytest.raises(ValueError, match="control characters"):
+        _prepare(case)
+    assert _snapshot(case.root) == before
+    assert not (case.destination / "jobs.json").exists()
+    assert not list((case.destination / "inputs/jobs").glob("*.tar"))
+
+
+@pytest.mark.parametrize("path", [
+    ("scene_id",),
+    ("questions", 0, "source"),
+    ("questions", 0, "video_path"),
+    ("questions", 0, "episode", "qa_id"),
+    ("questions", 0, "episode", "dataset"),
+    ("questions", 0, "episode", "question_type"),
+    ("questions", 0, "episode", "frame_set", "video_id"),
+    ("questions", 0, "logical_input_identity", "artifact_id"),
+    ("questions", 0, "logical_input_identity", "episode", "dataset"),
+    ("questions", 0, "logical_input_identity", "files", "point_map", "path"),
+])
+def test_multiline_questions_do_not_relax_identifier_or_metadata_validation(tmp_path, path):
+    case = _source(tmp_path, counts=(1,), question_texts=MULTILINE_QUESTIONS)
+    owner = case.scenes["scene-0"]
+    for key in path[:-1]:
+        owner = owner[key]
+    owner[path[-1]] += "\n"
+    _replace_source_tar(case)
+    before = _snapshot(case.root)
+    with pytest.raises(ValueError, match="control characters"):
+        _prepare(case)
+    assert _snapshot(case.root) == before
+    assert not list((case.destination / "inputs/jobs").glob("*.tar"))
+
+
+@pytest.mark.parametrize("field", ["nested_question", "options", "key", "credential", "label"])
+def test_multiline_question_exception_keeps_recursive_safety_checks(tmp_path, field):
+    case = _source(tmp_path, counts=(1,), question_texts=MULTILINE_QUESTIONS)
+    scene = case.scenes["scene-0"]
+    episode = scene["questions"][0]["episode"]
+    if field == "nested_question":
+        scene["metadata"] = {"question": MULTILINE_QUESTIONS[0]}
+    elif field == "options":
+        episode["options"] = ["A\nB"]
+    elif field == "key":
+        episode["extra\nkey"] = "value"
+    elif field == "credential":
+        episode["question"] += "\napi_key=forbidden"
+    else:
+        episode["reference_answer"] = "forbidden"
+    _replace_source_tar(case)
+    before = _snapshot(case.root)
+    with pytest.raises(ValueError, match="control characters|credential|forbidden"):
+        _prepare(case)
+    assert _snapshot(case.root) == before
+    assert not list((case.destination / "inputs/jobs").glob("*.tar"))
+
+
+@pytest.mark.parametrize("location", ["public", "logical"])
+@pytest.mark.parametrize("value", [None, 1, True, [], {}, "", " \r\n "])
+def test_frozen_question_requires_nonempty_text(tmp_path, location, value):
+    case = _source(tmp_path, counts=(1,))
+    question = case.scenes["scene-0"]["questions"][0]
+    logical = question["logical_input_identity"]
+    episode = question["episode"] if location == "public" else logical["episode"]
+    episode["question"] = value
+    logical["sha256"] = _sha(_bytes({k: v for k, v in logical.items() if k != "sha256"}))
+    _replace_source_tar(case)
+    with pytest.raises(ValueError):
+        _prepare(case)
+    assert not list((case.destination / "inputs/jobs").glob("*.tar"))
+
+
+@pytest.mark.parametrize("invalid", [
+    "duplicate_question", "escaped_duplicate_question", "literal_newline",
+    "NaN", "Infinity", "-Infinity", "1e999",
+])
+def test_multiline_questions_keep_json_duplicate_and_nonfinite_rejection(tmp_path, invalid):
+    case = _source(tmp_path, counts=(1,), question_texts=MULTILINE_QUESTIONS)
+    raw = _bytes(case.scenes["scene-0"])
+    if invalid == "duplicate_question":
+        raw = raw.replace(b'"question":', b'"question":"duplicate","question":', 1)
+    elif invalid == "escaped_duplicate_question":
+        raw = raw.replace(b'"question":', b'"\\u0071uestion":"duplicate","question":', 1)
+    elif invalid == "literal_newline":
+        raw = raw.replace(b"\\n", b"\n", 1)
+    else:
+        raw = b'{"extra_number":' + invalid.encode("ascii") + b"," + raw[1:]
+    _replace_source_tar(case, scene_raw=raw)
+    before = _snapshot(case.root)
+    with pytest.raises(ValueError, match="duplicate JSON|Invalid control|nonfinite"):
+        _prepare(case)
+    assert _snapshot(case.root) == before
+    assert not list((case.destination / "inputs/jobs").glob("*.tar"))
+
+
+@pytest.mark.parametrize("change", ["logical_question", "logical_hash"])
+def test_question_validation_projection_is_not_used_for_logical_equality_or_hash(tmp_path, change):
+    case = _source(tmp_path, counts=(1,), question_texts=MULTILINE_QUESTIONS)
+    logical = case.scenes["scene-0"]["questions"][0]["logical_input_identity"]
+    body = copy.deepcopy({k: v for k, v in logical.items() if k != "sha256"})
+    body["episode"]["question"] = body["episode"]["question"].replace("\n", " ")
+    if change == "logical_question":
+        logical["episode"]["question"] = body["episode"]["question"]
+    logical["sha256"] = _sha(_bytes(body))
+    _replace_source_tar(case)
+    before = _snapshot(case.root)
+    with pytest.raises(ValueError, match="logical input identity"):
+        _prepare(case)
+    assert _snapshot(case.root) == before
+    assert not list((case.destination / "inputs/jobs").glob("*.tar"))
+
+
+@pytest.mark.parametrize("replacement", [" ", "\r\n"])
+def test_resume_rejects_normalized_question_bytes_without_overwriting(tmp_path, replacement):
+    case = _source(tmp_path, counts=(1,), question_texts=MULTILINE_QUESTIONS)
+    progress = _prepare(case)
+    progress.update(status="running", scenes={})
+    _write(case.destination / "receipts/package_progress.json", progress)
+    for name in ("jobs.json", "coordinator_jobs.json"):
+        (case.destination / name).unlink()
+    archive = next((case.destination / "inputs/jobs").glob("*.tar"))
+    with tarfile.open(archive, "r:") as stream:
+        scene = _read_tar_scene(stream)
+    question = scene["questions"][0]
+    for episode in (question["episode"], question["logical_input_identity"]["episode"]):
+        episode["question"] = episode["question"].replace("\n", replacement)
+    _tar(archive, scene, case.payloads["scene-0"])
+    before = _snapshot(case.destination)
+    with pytest.raises(ValueError, match="expected rekey"):
+        _prepare(case)
+    assert _snapshot(case.destination) == before
 
 
 def test_cli_runs_with_stdlib_only_and_all_arguments_required(tmp_path):

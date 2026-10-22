@@ -6,9 +6,11 @@ localproxy --gateway http://SERVICE:27034 --replica N --port 27145+N
            --expected-identity-sha256 SHA
 
 Both modes require HARNESS3D_REVIEWER_TOKEN in the environment, never in JSON,
-arguments, receipts, or logs. FILE contains four ordered ``backends`` rows with
-``endpoint`` and ``expected_identity_sha256``; optional
+arguments, receipts, or logs. FILE contains 1..4 ordered ``backends`` rows with
+distinct ``endpoint`` values and ``expected_identity_sha256``; optional
 ``semantic_identity_sha256`` pins the canonical identity minus ONLY ``device``.
+Replica IDs are zero-based positions in FILE. CLI --replica remains 0..3;
+routes for unconfigured replicas return 404 unknown_route.
 
 Deploy exactly one central gateway on the service host. Lifetime advisory locks
 also prevent another local gateway from owning the same backend. All workers
@@ -240,15 +242,15 @@ class ReviewerGateway:
         self.max_response_bytes = _byte_limit(max_response_bytes, MAX_RESPONSE_BYTES)
         if type(max_pending) is not int or not 0 <= max_pending <= 64:
             raise ValueError("max_pending must be between 0 and 64")
-        if not isinstance(backends, list) or len(backends) != 4:
-            raise ValueError("exactly four ordered backends are required")
+        if not isinstance(backends, list) or not 1 <= len(backends) <= 4:
+            raise ValueError("ordered backends must contain between 1 and 4 rows")
         self.replicas = []
         for row in backends:
             if not isinstance(row, dict) or set(row) != {"endpoint", "expected_identity_sha256"}:
                 raise ValueError("backend requires only endpoint and expected_identity_sha256")
             self.replicas.append(_Replica(_url(row["endpoint"], backend=True),
                                           _sha(row["expected_identity_sha256"]), max_pending))
-        if len({row.endpoint for row in self.replicas}) != 4:
+        if len({row.endpoint for row in self.replicas}) != len(self.replicas):
             raise ValueError("backend endpoints must be distinct")
         self.semantic_identity_sha256 = (
             None if semantic_identity_sha256 is None else _sha(semantic_identity_sha256))
@@ -285,7 +287,7 @@ class ReviewerGateway:
 
     def forward(self, method, path, body, deadline, content_type):
         match = re.fullmatch(r"/replicas/([0-3])(/.*)", path)
-        if not match:
+        if not match or int(match[1]) >= len(self.replicas):
             raise GatewayError(404, "unknown_route")
         native_path = match[2]
         _route(method, native_path)
