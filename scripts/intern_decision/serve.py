@@ -7,6 +7,7 @@ Client paths/IDs never enter compiler evidence. No generate() is used.
 from __future__ import annotations
 import argparse
 import base64
+import csv
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -47,10 +48,15 @@ def distribution_identity(name, *, distribution=importlib.metadata.distribution)
         dist = distribution(name)
     except importlib.metadata.PackageNotFoundError:
         return {'present': False, 'version': None, 'files': {}, 'sha256': None}
-    if not dist.files:
+    # Python 3.12's high-level files property can omit missing payloads. Keep
+    # the wheel's complete declared inventory and read every actual byte.
+    read_text = getattr(dist, 'read_text', None)
+    record = read_text('RECORD') if read_text is not None else None
+    inventory = [row[0] for row in csv.reader(io.StringIO(record)) if row] if record else dist.files
+    if not inventory:
         raise RuntimeError(f'No file inventory for kernel distribution: {name}')
     files = {}
-    for entry in dist.files:
+    for entry in inventory:
         relative = PurePosixPath(str(entry))
         # Entry-point shebangs, install metadata and bytecode are location/time dependent.
         if (relative.is_absolute() or '..' in relative.parts

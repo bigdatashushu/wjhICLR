@@ -160,7 +160,10 @@ def test_installed_package_is_distinct_from_absence(tmp_path):
 
 
 def test_missing_native_payload_refuses_incomplete_identity(tmp_path):
-    dist = fake_distribution(tmp_path, 'causal-conv1d', {'causal_conv1d_cuda.so': b'ELF'})
+    dist = fake_distribution(tmp_path, 'causal-conv1d', {
+        'causal_conv1d/__init__.py': b'import causal_conv1d_cuda\n',
+        'causal_conv1d_cuda.so': b'ELF',
+    })
     (tmp_path / 'causal_conv1d_cuda.so').unlink()
     with pytest.raises(RuntimeError, match='Cannot hash kernel distribution file'):
         serve.distribution_identity('causal-conv1d', distribution=lambda _: dist)
