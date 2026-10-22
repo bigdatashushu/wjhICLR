@@ -20,6 +20,12 @@ from skill3d.segmentation.question_binding import (
     M5_BINDING_VERSION,
     binding_parameters,
 )
+from skill3d.storage.relocation import (
+    RelocationError,
+    ValidatedRelocation,
+    create_relocation_receipt,
+    validate_relocation_receipt,
+)
 
 STORE_SCHEMA_VERSION = "prepared-question-binding-store-v1"
 REQUEST_SCHEMA_VERSION = "prepared-question-binding-request-v1"
@@ -340,14 +346,122 @@ class PreparedBindingStore:
             "manifest_sha256": manifest["manifest_sha256"],
         }
 
+    def _migration_binding_identity(self, key: str, manifest: Mapping) -> dict:
+        if (
+            self.key_for(manifest["request_identity"]) != key
+            or manifest["request_identity"].get("input_sha256")
+            != manifest["scene_input_identity_sha256"]
+        ):
+            raise PreparedBindingStoreError(
+                "prepared binding migration request/input identity changed"
+            )
+        entry = self.entry_path(key)
+        path = entry / "manifest.json"
+        if any(
+            candidate.is_symlink()
+            for candidate in (entry / "payload", path, *path.parents)
+            if candidate.is_relative_to(self.root)
+        ):
+            raise PreparedBindingStoreError(
+                "symlink is forbidden in prepared binding migration"
+            )
+        if self._payload_identity(entry) != manifest.get("payload"):
+            raise PreparedBindingStoreError(
+                "prepared binding payload identity changed"
+            )
+        return {
+            "schema_version": STORE_SCHEMA_VERSION,
+            "key": key,
+            "manifest_sha256": manifest["manifest_sha256"],
+            "manifest_json": file_identity(path),
+        }
+
+    def create_migration_receipt(
+        self,
+        key: str,
+        *,
+        scene_input_identity: Mapping,
+        destination_root: str | Path,
+        scene_artifact_ref: str,
+        dependency_refs: Mapping[str, str],
+    ) -> dict:
+        """Receipt already copied bytes without changing manifest/hash/key.
+
+        Requires the full saved pre-migration input identity, not just its hash.
+        All refs are explicit paths relative to ``destination_root``; dependencies
+        include confidence and metric files. Persist the returned receipt outside
+        the immutable entry. Original source-host files may already be absent.
+        """
+        manifest = self.manifest(key)
+        anchor = self._migration_binding_identity(key, manifest)
+        try:
+            receipt = create_relocation_receipt(
+                logical_input_identity=scene_input_identity,
+                destination_root=destination_root,
+                artifact_ref=scene_artifact_ref,
+                dependency_refs=dependency_refs,
+                binding_identity=anchor,
+            )
+            self.validate_migration_receipt(key, receipt)
+            return receipt
+        except RelocationError as exc:
+            raise PreparedBindingStoreError(
+                f"prepared binding migration rejected: {exc}"
+            ) from exc
+
+    def validate_migration_receipt(
+        self,
+        key: str,
+        receipt: Mapping | str | Path,
+        *,
+        scene_artifact: str | Path | None = None,
+        scene_input_identity: Mapping | None = None,
+        destination_root: str | Path | None = None,
+    ) -> ValidatedRelocation:
+        """Verify the immutable binding, full scene closure and optional input.
+
+        The returned resolver also serves geometry loaders and can recompute the
+        original logical input identity using local copied bytes and actual RGB.
+        ``destination_root`` can pin a worker-approved destination directory.
+        """
+        manifest = self.manifest(key)
+        anchor = self._migration_binding_identity(key, manifest)
+        try:
+            resolver = validate_relocation_receipt(
+                receipt,
+                expected_input_sha256=manifest["scene_input_identity_sha256"],
+                expected_binding_identity=anchor,
+                expected_artifact_identity=manifest["scene_artifact_json"],
+                expected_source_artifact=manifest["scene_artifact_ref"],
+                destination_root=destination_root,
+            )
+            if scene_artifact is not None and (
+                Path(scene_artifact).expanduser().absolute() != resolver.artifact_path
+            ):
+                raise RelocationError("requested scene is not the receipted artifact")
+            if scene_input_identity is not None:
+                resolver.validate_input_identity(scene_input_identity)
+            return resolver
+        except RelocationError as exc:
+            raise PreparedBindingStoreError(
+                f"prepared binding migration rejected: {exc}"
+            ) from exc
+
     def load(
         self,
         key: str,
         *,
         expected_request_identity: Mapping,
-        scene_artifact: str | Path,
+        scene_artifact: str | Path | None = None,
         scene_input_identity: Mapping,
+        migration_receipt: Mapping | str | Path | None = None,
+        migration_destination_root: str | Path | None = None,
     ) -> PreparedObjectBinding:
+        """Replay unchanged legacy entries, or explicitly validate a relocation.
+
+        Migration requires a full input identity and never falls back to legacy
+        loading on failure. ``scene_artifact`` may be omitted only with a receipt.
+        """
         expected_key = self.key_for(expected_request_identity)
         if key != expected_key:
             raise PreparedBindingStoreError(
@@ -358,16 +472,27 @@ class PreparedBindingStore:
             raise PreparedBindingStoreError(
                 "prepared binding request identity changed"
             )
-        scene_path = Path(scene_artifact).expanduser().resolve()
-        if (
-            str(scene_path) != manifest.get("scene_artifact_ref")
-            or file_identity(scene_path) != manifest.get("scene_artifact_json")
-            or scene_input_identity.get("sha256")
-            != manifest.get("scene_input_identity_sha256")
-        ):
-            raise PreparedBindingStoreError(
-                "prepared binding scene artifact identity changed"
+        if migration_receipt is not None:
+            self.validate_migration_receipt(
+                key,
+                migration_receipt,
+                scene_artifact=scene_artifact,
+                scene_input_identity=scene_input_identity,
+                destination_root=migration_destination_root,
             )
+        else:
+            if scene_artifact is None:
+                raise PreparedBindingStoreError("scene artifact is required without migration")
+            scene_path = Path(scene_artifact).expanduser().resolve()
+            if (
+                str(scene_path) != manifest.get("scene_artifact_ref")
+                or file_identity(scene_path) != manifest.get("scene_artifact_json")
+                or scene_input_identity.get("sha256")
+                != manifest.get("scene_input_identity_sha256")
+            ):
+                raise PreparedBindingStoreError(
+                    "prepared binding scene artifact identity changed"
+                )
         entry = self.entry_path(key)
         if self._payload_identity(entry) != manifest.get("payload"):
             raise PreparedBindingStoreError(
@@ -417,6 +542,9 @@ def load_prepared_binding_reference(
     reference: Mapping,
     *,
     scene_input_identity: Mapping,
+    migration_receipt: Mapping | str | Path | None = None,
+    scene_artifact: str | Path | None = None,
+    migration_destination_root: str | Path | None = None,
 ) -> PreparedObjectBinding:
     """Replay a serialized store reference with full request and scene checks."""
     store = PreparedBindingStore(reference["store_root"])
@@ -425,11 +553,25 @@ def load_prepared_binding_reference(
         raise PreparedBindingStoreError(
             "prepared binding reference manifest changed"
         )
+    if migration_receipt is not None and (
+        reference.get("scene_artifact_ref") != manifest.get("scene_artifact_ref")
+        or reference.get("scene_input_identity_sha256")
+        != manifest.get("scene_input_identity_sha256")
+    ):
+        raise PreparedBindingStoreError(
+            "prepared binding reference scene identity changed"
+        )
     return store.load(
         str(reference["key"]),
         expected_request_identity=reference["request_identity"],
-        scene_artifact=reference["scene_artifact_ref"],
+        scene_artifact=(
+            scene_artifact if scene_artifact is not None
+            else reference["scene_artifact_ref"] if migration_receipt is None
+            else None
+        ),
         scene_input_identity=scene_input_identity,
+        migration_receipt=migration_receipt,
+        migration_destination_root=migration_destination_root,
     )
 
 

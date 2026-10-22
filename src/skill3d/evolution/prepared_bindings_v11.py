@@ -55,8 +55,12 @@ def prepare_shared_bindings_v11(
     client_factory: Callable[[str], object] | None = None,
     max_questions_per_scene: int = 8,
     min_free_gib: float = 80.0,
+    identity_factory: Callable[[EpisodeItem, str | Path], dict] | None = None,
+    artifact_loader: Callable[[str | Path], object] | None = None,
 ) -> dict:
-    """Prepare, cross-audit and publish one immutable binding per question."""
+    """Prepare and publish; explicit factories can validate relocated geometry."""
+    identify = identity_factory or input_identity
+    load_artifact = artifact_loader or load_artifact_v5
     if int(max_questions_per_scene) <= 0:
         raise ValueError("max_questions_per_scene must be positive")
     if not math.isfinite(float(min_free_gib)) or float(min_free_gib) < 0:
@@ -94,7 +98,7 @@ def prepare_shared_bindings_v11(
 
     store = PreparedBindingStore(store_root)
     identities = {
-        qa_id: input_identity(item, artifact_paths[qa_id])
+        qa_id: identify(item, artifact_paths[qa_id])
         for qa_id, item in indexed.items()
     }
     requests = {
@@ -140,7 +144,7 @@ def prepare_shared_bindings_v11(
                     )
                     scene_cache_hits.add(qa_id)
                     cache_hits.add(qa_id)
-                    artifacts[qa_id] = load_artifact_v5(
+                    artifacts[qa_id] = load_artifact(
                         artifact_path
                     )
                     continue
@@ -149,9 +153,9 @@ def prepare_shared_bindings_v11(
                         key, expected_request_identity=request, scene_artifact=artifact_path,
                         scene_input_identity=identities[qa_id])
                     artifacts[qa_id] = runner._prepare_m4_quality(
-                        load_artifact_v5(artifact_path), item.pixels, persist_quality=False)
+                        load_artifact(artifact_path), item.pixels, persist_quality=False)
                     continue
-                art = load_artifact_v5(artifact_path)
+                art = load_artifact(artifact_path)
                 art = runner._prepare_m4_quality(
                     art,
                     item.pixels,
