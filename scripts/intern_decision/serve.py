@@ -8,17 +8,24 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import importlib.metadata
 import importlib.util
+import inspect
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import signal
 import socket
+import sys
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+KERNEL_PACKAGES = ('fla-core', 'flash-linear-attention', 'causal-conv1d',
+                   'triton', 'einops', 'ninja')
 
 
 def digest(value):
@@ -34,6 +41,164 @@ def file_sha(path):
     return h.hexdigest()
 
 
+def distribution_identity(name, *, distribution=importlib.metadata.distribution):
+    """Hash installed payload bytes, not RECORD's claimed hashes or install metadata."""
+    try:
+        dist = distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        return {'present': False, 'version': None, 'files': {}, 'sha256': None}
+    if not dist.files:
+        raise RuntimeError(f'No file inventory for kernel distribution: {name}')
+    files = {}
+    for entry in dist.files:
+        relative = PurePosixPath(str(entry))
+        # Entry-point shebangs, install metadata and bytecode are location/time dependent.
+        if (relative.is_absolute() or '..' in relative.parts
+                or '__pycache__' in relative.parts
+                or any(part.endswith(('.dist-info', '.egg-info')) for part in relative.parts)
+                or relative.suffix in {'.pyc', '.pyo', '.pth'}):
+            continue
+        key = relative.as_posix()
+        if key in files:
+            raise RuntimeError(f'Duplicate kernel distribution file: {name}/{key}')
+        try:
+            files[key] = file_sha(Path(dist.locate_file(entry)))
+        except OSError as exc:
+            raise RuntimeError(f'Cannot hash kernel distribution file: {name}/{key}') from exc
+    if not files:
+        raise RuntimeError(f'No runtime payload for kernel distribution: {name}')
+    files = dict(sorted(files.items()))
+    return {'present': True, 'version': dist.version, 'files': files,
+            'sha256': digest(files)}
+
+
+def operator_identity(operator, *, hash_file=file_sha):
+    """Identify the bound implementation and every decorator's actual source file."""
+    if operator is None:
+        return {'present': False}
+    if not callable(operator):
+        raise RuntimeError('Kernel binding is not callable')
+    chain = []
+    seen = set()
+    operator = getattr(operator, '__func__', operator)
+    while operator is not None:
+        if id(operator) in seen:
+            raise RuntimeError('Cyclic kernel wrapper chain')
+        seen.add(id(operator))
+        module_name = getattr(operator, '__module__', None)
+        qualname = getattr(operator, '__qualname__', None)
+        if not module_name or not qualname:
+            raise RuntimeError('Kernel binding has no source identity')
+        try:
+            source = inspect.getfile(operator)
+        except TypeError:
+            source = getattr(sys.modules.get(module_name), '__file__', None)
+        if not source:
+            raise RuntimeError(f'No source file for kernel binding: {module_name}.{qualname}')
+        if source.endswith(('.pyc', '.pyo')):
+            source = importlib.util.source_from_cache(source)
+        try:
+            sha = hash_file(Path(source))
+        except OSError as exc:
+            raise RuntimeError(f'Cannot hash kernel binding: {module_name}.{qualname}') from exc
+        chain.append({'module': module_name, 'qualname': qualname, 'source_sha256': sha})
+        operator = getattr(operator, '__wrapped__', None)
+    return {'present': True, 'sources': chain}
+
+
+def kernel_runtime_identity(model, qwen, *, kernel_mode=None,
+                            distribution=importlib.metadata.distribution):
+    """Observe loaded Qwen3.5 layer bindings without importing or executing kernels.
+
+    An omitted contract preserves upstream selection. Explicit torch/fla/full modes
+    require matching prefill AND cached-update paths; they never patch the model.
+    """
+    if kernel_mode not in {None, 'torch', 'fla', 'full'}:
+        raise ValueError(f'Unknown kernel mode: {kernel_mode}')
+    hashes = {}
+
+    def hash_file(path):
+        path = path.resolve()
+        if path not in hashes:
+            hashes[path] = file_sha(path)
+        return hashes[path]
+
+    def operator_row(value, fast, fallback, fast_backend):
+        if fallback is not None and value is fallback:
+            backend = 'torch'
+        elif fast is not None and value is fast:
+            backend = fast_backend
+        else:
+            backend = 'unknown'
+        return {'backend': backend, **operator_identity(value, hash_file=hash_file)}
+
+    def same_forward(instance, cls):
+        actual = inspect.unwrap(instance.forward)
+        expected = inspect.unwrap(cls.forward)
+        return getattr(actual, '__func__', actual) is expected
+
+    bindings = {name: getattr(qwen, name) for name in (
+        'chunk_gated_delta_rule', 'fused_recurrent_gated_delta_rule',
+        'causal_conv1d_fn', 'causal_conv1d_update', 'FusedRMSNormGated')}
+    implementations = {}
+    modes = set()
+    for name, layer in sorted(model.named_modules(), key=lambda row: row[0]):
+        if not isinstance(layer, qwen.Qwen3_5GatedDeltaNet):
+            continue
+        operators = {
+            'attention_prefill': operator_row(layer.chunk_gated_delta_rule,
+                bindings['chunk_gated_delta_rule'], qwen.torch_chunk_gated_delta_rule, 'fla'),
+            'attention_update': operator_row(layer.recurrent_gated_delta_rule,
+                bindings['fused_recurrent_gated_delta_rule'], qwen.torch_recurrent_gated_delta_rule, 'fla'),
+            'convolution_update': operator_row(layer.causal_conv1d_update,
+                bindings['causal_conv1d_update'], qwen.torch_causal_conv1d_update, 'causal-conv1d')}
+        if layer.causal_conv1d_fn is None:
+            operators['convolution_prefill'] = {
+                'backend': 'torch' if same_forward(layer.conv1d, qwen.nn.Conv1d) else 'unknown',
+                **operator_identity(layer.conv1d.forward, hash_file=hash_file)}
+        else:
+            operators['convolution_prefill'] = operator_row(layer.causal_conv1d_fn,
+                bindings['causal_conv1d_fn'], None, 'causal-conv1d')
+        norm_type = type(layer.norm)
+        norm_backend = ('torch' if norm_type is qwen.Qwen3_5RMSNormGated else
+                        'fla' if norm_type is bindings['FusedRMSNormGated'] else 'unknown')
+        if not same_forward(layer.norm, norm_type):
+            norm_backend = 'unknown'
+        attention = {operators[key]['backend'] for key in ('attention_prefill', 'attention_update')}
+        convolution = {operators[key]['backend'] for key in ('convolution_prefill', 'convolution_update')}
+        mode = 'mixed'
+        if attention == {'torch'} and convolution == {'torch'} and norm_backend == 'torch':
+            mode = 'torch'
+        elif attention == {'fla'} and norm_backend in {'torch', 'fla'}:
+            if convolution == {'torch'}:
+                mode = 'fla'
+            elif convolution == {'causal-conv1d'}:
+                mode = 'full'
+        if not same_forward(layer, qwen.Qwen3_5GatedDeltaNet):
+            mode = 'mixed'
+        if kernel_mode is not None and mode != kernel_mode:
+            raise RuntimeError(f'Kernel contract mismatch at {name}: requested {kernel_mode}, observed {mode}')
+        modes.add(mode)
+        row = {'mode': mode, 'operators': operators,
+               'normalization': {'backend': norm_backend,
+                   **operator_identity(layer.norm.forward, hash_file=hash_file)},
+               'forward': operator_identity(layer.forward, hash_file=hash_file)}
+        key = digest(row)
+        if key not in implementations:
+            implementations[key] = {'layers': [], **row}
+        implementations[key]['layers'].append(name)
+    if not implementations:
+        raise RuntimeError('Cannot establish kernel identity: no Qwen3.5 GatedDeltaNet layers')
+    return {'schema': 'intern-kernel-runtime/1', 'requested_mode': kernel_mode or 'auto',
+            'mode': next(iter(modes)) if len(modes) == 1 else 'mixed',
+            'distributions': {name: distribution_identity(name, distribution=distribution)
+                              for name in KERNEL_PACKAGES},
+            'qwen3_5': {'module': qwen.__name__, 'source_sha256': hash_file(Path(qwen.__file__)),
+                'bindings': {name: operator_identity(value, hash_file=hash_file)
+                             for name, value in bindings.items()},
+                'implementations': [implementations[key] for key in sorted(implementations)]}}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model-dir', type=Path, required=True)
@@ -41,6 +206,9 @@ def main():
     parser.add_argument('--port', type=int, default=18445)
     parser.add_argument('--startup', type=Path, required=True)
     parser.add_argument('--temp-root', type=Path, required=True)
+    parser.add_argument('--kernel-mode', choices=('torch', 'fla', 'full'),
+        help='Require torch only, FLA attention with torch convolution, or FLA with causal-conv1d; '
+             'omitting this flag preserves automatic upstream selection')
     args = parser.parse_args()
     start = time.perf_counter()
     args.temp_root.mkdir(parents=True, exist_ok=True)
@@ -53,7 +221,6 @@ def main():
             raise ValueError(f'Model artifact hash mismatch: {name}')
     spec = importlib.util.spec_from_file_location('intern_native_inference', args.model_dir / 'inference.py')
     module = importlib.util.module_from_spec(spec)
-    import sys
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     import torch
@@ -63,12 +230,17 @@ def main():
     temperature = module.DEFAULT_TEMPERATURE
     engine = module.DecisionEngine(checkpoint=str(args.model_dir), temperature=1,
         device='cuda', dtype='bfloat16', max_length=8192, attn_implementation='sdpa')
-    identity = {'model': 'internlm/Intern-Decision-4B', 'model_revision': args.revision,
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+    kernels = kernel_runtime_identity(engine.backend.model, modeling_qwen3_5,
+        kernel_mode=args.kernel_mode)
+    identity = {'schema': 'intern-decision-service/2',
+        'model': 'internlm/Intern-Decision-4B', 'model_revision': args.revision,
         'backend': 'native-hf-model-package', 'dtype': 'bfloat16',
         'implementation_sha256': file_sha(args.model_dir / 'inference.py'),
         'service_sha256': file_sha(Path(__file__)), 'files': expected['files'],
         'runtime': {'python': sys.version.split()[0], 'torch': torch.__version__,
-                    'transformers': transformers.__version__, 'cuda': torch.version.cuda},
+                    'transformers': transformers.__version__, 'cuda': torch.version.cuda,
+                    'kernels': kernels},
         'processor': json.loads((args.model_dir / 'preprocessor_config.json').read_text()),
         'limits': {'max_length': 8192, 'max_images': 3, 'max_body_bytes': 32*1024*1024,
                    'max_image_bytes': 12*1024*1024, 'max_pixels': 16000000,

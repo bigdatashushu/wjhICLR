@@ -30,6 +30,19 @@ bash scripts/intern_decision/start.sh "$DEPLOY_ROOT" 2 18445
 `/health` 保存 PID、冷启动、权重、processor、tokenizer、backend、温度与实现身份。
 实际响应另含三个图像 grid、图像 token 数、合法 token IDs 和 marker 读出位置。
 
+新版服务身份使用 `intern-decision-service/2`，额外记录实际加载的 Qwen3.5
+逐层注意力、卷积和 normalization 实现，以及 fla-core、flash-linear-attention、
+causal-conv1d、triton、einops、ninja 的存在状态、版本和实际文件哈希（包括 native
+extension）。安装目录、bytecode 和安装时间不进入身份；同版本但字节改变仍会改变
+identity。`--kernel-mode torch|fla|full` 分别要求原生算子、FLA 注意力加原生卷积、
+FLA 加 causal-conv1d，任一层不匹配便拒绝启动。省略参数保留 upstream 自动选择；
+不会改写算子。总括的 “fast path unavailable” 日志不足以判断 FLA 是否启用。
+
+既有冻结服务的身份不会追溯升级。新增内核、修改 service.py 或改变算子模式时，
+必须重新冻结实验版本、四个副本 identity pins 和 prepared-binding 方法身份，
+不得把旧版与新版副本放进同一个审核池，也不得复用旧审核输出。
+本机编译成功与可导入只证明 ABI 兼容，实际 GPU 请求、输入哈希和吞吐仍需独立验证。
+
 三图调用：
 
 ```bash

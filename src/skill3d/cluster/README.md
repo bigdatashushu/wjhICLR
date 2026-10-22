@@ -22,7 +22,7 @@ pass raw exception traces, private receipts, signed URLs or raw dataset rows.
 
 Scope comes exclusively from the caller's frozen manifest. This package does
 not discover scenes or expand a benchmark. For the current deployment the
-caller seeds the frozen r03 1154-question scope, with a new unified M5 method
+caller seeds the frozen r02 1154-question scope, with a new unified M5 method
 identity, rather than mixing the old 579 outputs into a new completed key.
 Archiving old bytes, private identity receipts and validated reuse of existing
 geometry for 219 scenes remain outside this package.
@@ -220,6 +220,21 @@ Progress methods use read-only SQLite connections and a consistent summary
 snapshot. They distinguish queued, leased, running, publishing, complete,
 skipped and failed, expose transport counters/expired leases/worker host+GPU
 counts, and do not silently repair or advance anything.
+
+`scripts/cluster_drain_coordinator.py` is a separate control-plane wrapper for
+draining an existing run. It keeps the frozen HTTP handlers, heartbeats, model
+completion and publication validation unchanged, but admits only queued
+`resume_phase="publish"` work. Fresh computation and expired computation remain
+queued. Thus failed return transfers can recover without rerunning models.
+There is no hot pause flag in the original server: deploy this wrapper on the
+same endpoint only after stopping the receipt-identified original coordinator,
+checking publication activity and live lease headroom, and preserving the
+startup and SQLite backup receipts. Never run both masters simultaneously.
+Its `receipts/drain_launch.json` records control code, handler hash and initial
+queue state; authenticated `/progress` and the normal startup receipt establish
+that the server actually started. Restore the unchanged original coordinator
+to resume queued work. Do not stop workers or model services until active
+leases and retained publication checkpoints are reconciled.
 
 `scripts/cluster_audit.py --root RUN_ROOT --watch` independently validates each
 committed publication against the frozen job and the queue's committed receipt,
