@@ -17,7 +17,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from skill3d.cluster.identity import QueueError, digest_json
+from skill3d.cluster.identity import QueueError, canonical_json, digest_json
 from skill3d.cluster.publication import hash_file, inspect_receipt, validate_artifacts
 from skill3d.cluster.queue import JobSpec, Lease, SQLiteJobQueue, WorkerIdentity
 
@@ -98,7 +98,7 @@ class Coordinator:
                             temporary, expected_scene_id=scene,
                             expected_qa_ids=scope["qa_ids"],
                             expected_method_config=json.loads(lease.spec.identity.method_config_json))
-                        if publication.validator != "harness3d-scene-qa-validator-v1":
+                        if publication.receipt.validator != "harness3d-scene-qa-validator-v1":
                             raise QueueError("untrusted scene publication validator")
                     target.parent.mkdir(parents=True, exist_ok=True)
                     os.rename(temporary, target)
@@ -229,7 +229,18 @@ def serve(coordinator: Coordinator, host: str, port: int) -> None:
             archive = coordinator.root / ".uploads" / (uuid.uuid4().hex + ".tar")
             archive.parent.mkdir(parents=True, exist_ok=True)
             try:
-                lease = Lease.from_dict(json.loads(base64.b64decode(self.headers["X-Lease-JSON"], validate=True)))
+                wire = json.loads(base64.b64decode(self.headers["X-Lease-JSON"], validate=True))
+                if wire.get("schema") == "harness3d-lease-header/1":
+                    job_key = wire["job_key"]
+                    if job_key not in coordinator.specs:
+                        raise QueueError("publication is outside frozen scope")
+                    job = coordinator.queue.get_job(job_key)
+                    lease = Lease(
+                        coordinator.specs[job_key], WorkerIdentity(**wire["worker"]),
+                        wire["token"], wire["expires_at"], wire["attempt"], "publish",
+                        canonical_json(job["output_metadata"]))
+                else:
+                    lease = Lease.from_dict(wire)
                 size = int(self.headers.get("Content-Length", "0"))
                 if not 0 < size <= 20 * 1024 ** 3:
                     raise QueueError("archive size outside limit")

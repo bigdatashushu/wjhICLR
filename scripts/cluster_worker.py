@@ -25,6 +25,10 @@ class TransportError(RuntimeError):
     pass
 
 
+class CoordinatorRejected(TransportError):
+    pass
+
+
 class Client:
     def __init__(self, endpoint: str, token: str):
         self.endpoint = endpoint.rstrip("/")
@@ -42,9 +46,9 @@ class Client:
                     return json.load(response)
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
-                    raise TransportError("coordinator rejected " + route) from exc
+                    raise CoordinatorRejected("coordinator rejected " + route) from exc
                 if exc.code not in (429, 500, 502, 503, 504):
-                    raise TransportError("coordinator HTTP failure") from exc
+                    raise CoordinatorRejected("coordinator HTTP failure") from exc
             except (urllib.error.URLError, OSError, TimeoutError):
                 pass
             if attempt + 1 < attempts:
@@ -85,7 +89,11 @@ class Client:
             connection.putheader("Content-Type", "application/x-tar")
             connection.putheader("X-Archive-SHA256", metadata["archive_sha256"])
             connection.putheader("X-Lease-JSON", base64.b64encode(
-                json.dumps(lease.to_dict()).encode()).decode())
+                json.dumps({
+                    "schema": "harness3d-lease-header/1", "job_key": lease.job_key,
+                    "worker": lease.worker.to_dict(), "token": lease.token,
+                    "expires_at": lease.expires_at, "attempt": lease.attempt,
+                }).encode()).decode())
             connection.endheaders()
             with archive.open("rb") as stream:
                 while block := stream.read(4 * 1024 * 1024):
@@ -93,7 +101,9 @@ class Client:
             response = connection.getresponse()
             raw = response.read(1024 * 1024)
             if response.status != 200:
-                raise TransportError("publication rejected with HTTP " + str(response.status))
+                error = (TransportError if response.status in (429, 500, 502, 503, 504)
+                         else CoordinatorRejected)
+                raise error("publication rejected with HTTP " + str(response.status))
             result = json.loads(raw)
             if result.get("status") != "complete" or result.get("job_key") != lease.job_key:
                 raise TransportError("invalid durable publication ACK")
@@ -103,10 +113,14 @@ class Client:
 
 
 class Heartbeat:
+    interval = 25
+
     def __init__(self, client: Client, lease: Lease):
         self.client, self.lease = client, lease
         self.stop_event = threading.Event()
         self.failed = False
+        self.lock = threading.Lock()
+        self.pending = None
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def __enter__(self):
@@ -114,11 +128,30 @@ class Heartbeat:
         return self
 
     def run(self):
-        while not self.stop_event.wait(25):
+        while not self.stop_event.wait(self.interval):
             try:
-                self.client.request("/heartbeat", {"lease": self.lease.to_dict()})
+                renewed = Lease.from_dict(self.client.request(
+                    "/heartbeat", {"lease": self.lease.to_dict()})["lease"])
+                with self.lock:
+                    # A delayed heartbeat ACK must not overwrite a newer phase.
+                    if (renewed.attempt >= self.lease.attempt and
+                            (renewed.phase == "publish" or self.lease.phase != "publish")):
+                        self.lease = renewed
+                    if self.pending is not None:
+                        path, metadata = self.pending
+                        save_pending(path, self.lease, metadata)
             except TransportError:
                 self.failed = True
+
+    def retain(self, lease: Lease, path: Path, metadata: dict):
+        with self.lock:
+            self.lease = lease
+            self.pending = (path, metadata)
+            save_pending(path, lease, metadata)
+
+    def clear_pending(self):
+        with self.lock:
+            self.pending = None
 
     def __exit__(self, *args):
         self.stop_event.set()
@@ -166,66 +199,167 @@ def checkpoint(root: Path, output: Path, lease: Lease) -> dict:
     return metadata
 
 
+def save_pending(path: Path, lease: Lease, metadata: dict) -> None:
+    atomic_json(path, {
+        "schema": "harness3d-pending-checkpoint/1",
+        "lease": lease.to_dict(), "metadata": metadata,
+    })
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def block_pending(path: Path, detail: str) -> dict:
+    pending = json.loads(path.read_text())
+    pending["blocked"] = detail
+    atomic_json(path, pending)
+    return {"status": "checkpoint_blocked", "job_key": pending["lease"]["spec"]["job_key"],
+            "output_locator": pending["metadata"]["output_locator"], "error": detail}
+
+
+def finish_with_retry(client: Client, lease: Lease, metadata: dict) -> Lease:
+    """Keep the running lease and its heartbeat until finish is acknowledged."""
+    while True:
+        try:
+            return Lease.from_dict(client.request(
+                "/finish", {"lease": lease.to_dict(), "metadata": metadata})["lease"])
+        except CoordinatorRejected:
+            raise
+        except TransportError:
+            time.sleep(5)
+
+
+def publish_with_retry(client: Client, lease: Lease, archive: Path, metadata: dict,
+                       *, attempts: int = 4) -> dict:
+    for attempt in range(attempts):
+        # Recheck outside the retry handler: corrupt retained output is not retried.
+        if hash_file(archive) != (metadata["archive_sha256"], metadata["archive_bytes"]):
+            raise TransportError("retained output checkpoint changed")
+        try:
+            return client.publish(lease, archive, metadata)
+        except CoordinatorRejected:
+            raise
+        except (TransportError, OSError, ValueError, http.client.HTTPException):
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(min(5, attempt + 1))
+    raise ValueError("publication attempts must be positive")
+
+
+def recover_pending(client: Client, root: Path, worker: dict, reserve: int) -> dict | None:
+    """Resume only this worker's stored lease, never invent a replacement lease."""
+    for path in sorted((root / "jobs").glob("*/attempt-*/pending.json")):
+        try:
+            pending = json.loads(path.read_text())
+        except FileNotFoundError:
+            # Another worker may have cleaned its acknowledged output meanwhile.
+            continue
+        if pending.get("blocked") or pending["lease"]["worker"] != worker:
+            continue
+        lease = Lease.from_dict(pending["lease"])
+        if pending.get("schema") != "harness3d-pending-checkpoint/1":
+            return block_pending(path, "unknown pending checkpoint schema")
+        if lease.phase != "publish":
+            try:
+                lease = Lease.from_dict(client.request(
+                    "/heartbeat", {"lease": lease.to_dict()})["lease"])
+            except CoordinatorRejected:
+                return block_pending(path, "stored lease expired or fenced; retained output "
+                                     "cannot be checkpointed without a live lease")
+        # Accepted publication retries are idempotent even after lease expiry.
+        return run_job(client, root, lease, reserve)
+    return None
+
+
 def run_job(client: Client, root: Path, lease: Lease, reserve: int) -> dict:
     key = hashlib.sha256(lease.job_key.encode()).hexdigest()
     staging = root / "jobs" / key
     staging.mkdir(parents=True, exist_ok=True)
-    with Heartbeat(client, lease):
+    with Heartbeat(client, lease) as heartbeat:
         if lease.phase != "publish":
-            archive = staging / "input.tar"
-            inputs = staging / "input"
-            try:
-                if not archive.is_file():
-                    client.download(lease, archive)
-                if not inputs.is_dir():
-                    temp = staging / "input.unpacking"
-                    shutil.rmtree(temp, ignore_errors=True)
-                    temp.mkdir()
-                    safe_extract(archive, temp, archive.stat().st_size)
-                    os.rename(temp, inputs)
-                if shutil.disk_usage(root).free < reserve + 4 * archive.stat().st_size:
-                    raise TransportError("worker disk reserve would be crossed")
-            except (TransportError, OSError, urllib.error.URLError, ValueError) as exc:
-                client.request("/transfer-failed", {
-                    "lease": lease.to_dict(), "phase": "prefetch",
-                    "error_code": "input_transfer_failed", "detail": type(exc).__name__})
-                return {"status": "prefetch_retry", "job_key": lease.job_key}
-            lease = Lease.from_dict(client.request("/start", {"lease": lease.to_dict()})["lease"])
-            output = staging / f"attempt-{lease.attempt}" / "output"
-            output.mkdir(parents=True, exist_ok=True)
-            try:
-                from skill3d.cluster.scene_compute import compute_scene
-                from skill3d.cluster.perception_client import RemoteBailianClient
+            pending_path = staging / f"attempt-{lease.attempt}" / "pending.json"
+            if pending_path.is_file():
+                pending = json.loads(pending_path.read_text())
+                stored = Lease.from_dict(pending["lease"])
+                if (stored.spec, stored.worker, stored.token, stored.attempt) != (
+                        lease.spec, lease.worker, lease.token, lease.attempt):
+                    return block_pending(pending_path, "pending checkpoint belongs to another lease")
+                metadata = pending["metadata"]
+                archive = local_path(root, metadata["output_locator"])
+                if hash_file(archive) != (metadata["archive_sha256"], metadata["archive_bytes"]):
+                    return block_pending(pending_path, "retained output checkpoint changed")
+            else:
+                archive = staging / "input.tar"
+                inputs = staging / "input"
+                try:
+                    if not archive.is_file():
+                        client.download(lease, archive)
+                    if not inputs.is_dir():
+                        temp = staging / "input.unpacking"
+                        shutil.rmtree(temp, ignore_errors=True)
+                        temp.mkdir()
+                        safe_extract(archive, temp, archive.stat().st_size)
+                        os.rename(temp, inputs)
+                    if shutil.disk_usage(root).free < reserve + 4 * archive.stat().st_size:
+                        raise TransportError("worker disk reserve would be crossed")
+                except (TransportError, OSError, urllib.error.URLError, ValueError,
+                        tarfile.TarError) as exc:
+                    if isinstance(exc, tarfile.TarError):
+                        archive.unlink(missing_ok=True)
+                        shutil.rmtree(staging / "input.unpacking", ignore_errors=True)
+                    client.request("/transfer-failed", {
+                        "lease": lease.to_dict(), "phase": "prefetch",
+                        "error_code": "input_transfer_failed", "detail": type(exc).__name__})
+                    return {"status": "prefetch_retry", "job_key": lease.job_key}
+                lease = Lease.from_dict(client.request("/start", {"lease": lease.to_dict()})["lease"])
+                output = staging / f"attempt-{lease.attempt}" / "output"
+                output.mkdir(parents=True, exist_ok=True)
+                try:
+                    from skill3d.cluster.scene_compute import compute_scene
+                    from skill3d.cluster.perception_client import RemoteBailianClient
 
-                method = json.loads(lease.spec.identity.method_config_json)
-                result = compute_scene(
-                    inputs, output, method,
-                    client_factory=lambda *args, **kwargs: RemoteBailianClient(**kwargs))
-                atomic_json(output / "scene_result.json", result)
-                metadata = checkpoint(root, output, lease)
-            except Exception as exc:
-                client.request("/fail", {
-                    "lease": lease.to_dict(), "error_code": "scene_compute_failed",
-                    "detail": type(exc).__name__, "retryable": True, "retry_delay": 15})
-                atomic_json(staging / f"attempt-{lease.attempt}" / "failure.json", {
-                    "job_key": lease.job_key, "error": type(exc).__name__,
-                    "message": str(exc)[:1500], "at": time.time()})
-                return {"status": "model_retry", "job_key": lease.job_key,
-                        "error": type(exc).__name__}
-            lease = Lease.from_dict(client.request(
-                "/finish", {"lease": lease.to_dict(), "metadata": metadata})["lease"])
+                    method = json.loads(lease.spec.identity.method_config_json)
+                    result = compute_scene(
+                        inputs, output, method,
+                        client_factory=lambda *args, **kwargs: RemoteBailianClient(**kwargs))
+                    atomic_json(output / "scene_result.json", result)
+                    metadata = checkpoint(root, output, lease)
+                except Exception as exc:
+                    client.request("/fail", {
+                        "lease": lease.to_dict(), "error_code": "scene_compute_failed",
+                        "detail": type(exc).__name__, "retryable": True, "retry_delay": 15})
+                    atomic_json(staging / f"attempt-{lease.attempt}" / "failure.json", {
+                        "job_key": lease.job_key, "error": type(exc).__name__,
+                        "message": str(exc)[:1500], "at": time.time()})
+                    return {"status": "model_retry", "job_key": lease.job_key,
+                            "error": type(exc).__name__}
+                pending_path = output.parent / "pending.json"
+            heartbeat.retain(lease, pending_path, metadata)
+            try:
+                lease = finish_with_retry(client, lease, metadata)
+            except CoordinatorRejected as exc:
+                heartbeat.clear_pending()
+                return block_pending(pending_path, str(exc))
         metadata = json.loads(lease.output_metadata_json)
+        pending_path = staging / f"attempt-{lease.attempt}" / "pending.json"
+        heartbeat.retain(lease, pending_path, metadata)
         archive = local_path(root, metadata["output_locator"])
         try:
-            if hash_file(archive) != (metadata["archive_sha256"], metadata["archive_bytes"]):
-                raise TransportError("retained output checkpoint changed")
-            ack = client.publish(lease, archive, metadata)
+            ack = publish_with_retry(client, lease, archive, metadata)
+        except CoordinatorRejected as exc:
+            heartbeat.clear_pending()
+            return block_pending(pending_path, str(exc))
         except (TransportError, OSError, ValueError, http.client.HTTPException) as exc:
             client.request("/transfer-failed", {
                 "lease": lease.to_dict(), "phase": "return",
                 "error_code": "output_transfer_failed", "detail": type(exc).__name__})
+            heartbeat.clear_pending()
+            pending_path.unlink(missing_ok=True)
             return {"status": "publish_retry", "job_key": lease.job_key}
         atomic_json(root / "acks" / (key + ".json"), ack)
+        heartbeat.clear_pending()
         # All eight workers share this root. A reclaimed publishing lease reads
         # the original archive; deletion only follows the durable commit ACK.
         shutil.rmtree(staging)
@@ -249,6 +383,12 @@ def main() -> None:
     done = 0
     while not args.max_jobs or done < args.max_jobs:
         try:
+            result = recover_pending(client, root, worker, args.reserve_gib * 1024 ** 3)
+            if result is not None:
+                print(json.dumps(result), flush=True)
+                if result["status"] == "complete":
+                    done += 1
+                continue
             # Claim is not request-idempotent; never retry an uncertain claim.
             payload = client.request("/claim", {
                 "worker": worker, "lease_seconds": 600, "stages": ["gpu_aggregate"]},

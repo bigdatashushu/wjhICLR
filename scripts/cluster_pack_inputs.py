@@ -20,17 +20,21 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--export-manifest", type=Path, required=True)
     parser.add_argument("--method-config", type=Path, required=True)
+    parser.add_argument("--imports-root", type=Path)
+    parser.add_argument("--run-id", default="precompute-20261022-r01")
+    parser.add_argument("--pilot-scene")
     args = parser.parse_args()
     root = args.root.resolve()
+    imports = (args.imports_root or root / "imports").resolve()
     exports = json.loads(args.export_manifest.read_text())
     mapping = {row["source"]: row for row in exports["files"]}
     if len(mapping) != len(exports["files"]):
         raise ValueError("source mapping is ambiguous")
-    attachment = json.loads((root / "imports/attachment/geometry_attachment.json").read_text())
+    attachment = json.loads((imports / "attachment/geometry_attachment.json").read_text())
     if attachment["status"] != "verified" or attachment["verified_scenes"] != 219:
         raise ValueError("legacy geometry attachment is not fully verified")
     method = json.loads(args.method_config.read_text())
-    scene_paths = sorted((root / "imports/frozen/scenes").glob("*.json"))
+    scene_paths = sorted((imports / "frozen/scenes").glob("*.json"))
     if len(scene_paths) != 230:
         raise ValueError("authorized scene scope changed")
     public = {"schema": "harness3d-cluster-scope/1", "scenes": {}}
@@ -70,10 +74,11 @@ def main() -> None:
     for scene_id, original in sorted(scenes.items()):
         scene = copy.deepcopy(original)
         spec = JobSpec(
-            f"precompute-20261022-r01/{scene_id}/gpu_aggregate",
+            f"{args.run_id}/{scene_id}/gpu_aggregate",
             f"{identity.identity_hash}/{scene_id}/gpu_aggregate",
             identity, "gpu_aggregate", max_attempts=3,
-            priority=10 if len(scene["qa_ids"]) == 2 and scene.get("artifact_source_path") else 0)
+            priority=(100 if scene_id == args.pilot_scene else
+                      10 if len(scene["qa_ids"]) == 2 and scene.get("artifact_source_path") else 0))
         jobs.append(spec.to_dict())
         key = hashlib.sha256(spec.job_key.encode()).hexdigest()
         archive = root / "inputs/jobs" / (key + ".tar")
@@ -85,7 +90,7 @@ def main() -> None:
             # The freeze step replayed all frames from source videos. Its
             # supplemental transfer preserves these exact newly frozen PNGs.
             relative = f"frozen/new_frames/{scene_id}/{index:04d}.png"
-            local = root / "imports" / relative
+            local = imports / relative
             if hash_file(local) != (row["png_sha256"], row["size"]):
                 raise ValueError("transferred frozen PNG differs from manifest")
             sources[original_path] = (local, f"data/frames/{index:04d}.png")
@@ -94,7 +99,7 @@ def main() -> None:
             logical = scene["questions"][0]["logical_input_identity"]
             for path in [geometry, *(v["path"] for v in logical["files"].values())]:
                 row = mapping[path]
-                local = root / "imports" / row["relative"]
+                local = imports / row["relative"]
                 if path not in verified:
                     if hash_file(local) != (row["sha256"], row["size"]):
                         raise ValueError("archived geometry dependency differs from frozen export")
