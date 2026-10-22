@@ -1,6 +1,7 @@
 """Cache correctness regressions using small real arrays and files."""
 
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +12,30 @@ import pytest
 
 from skill3d.infra import m5_identity as identity
 from skill3d.segmentation import sam2_tracker as st
+
+
+def _stat_from_stamp(stamp):
+    return SimpleNamespace(st_dev=stamp[0], st_ino=stamp[1], st_size=stamp[2],
+                           st_mtime_ns=stamp[3], st_ctime_ns=stamp[4])
+
+
+def _mutate_after_hash_block(monkeypatch, mutate):
+    original_sha256 = identity.hashlib.sha256
+
+    def sha256():
+        digest = original_sha256()
+        mutated = False
+
+        def update(block):
+            nonlocal mutated
+            digest.update(block)
+            if not mutated:
+                mutated = True
+                mutate()
+
+        return SimpleNamespace(update=update, hexdigest=digest.hexdigest)
+
+    monkeypatch.setattr(identity.hashlib, "sha256", sha256)
 
 
 def _inputs():
@@ -75,6 +100,69 @@ def test_relocation_does_not_change_file_or_generation_identity(tmp_path):
     assert identity.generation_identity(**inputs) == before
 
 
+@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+@pytest.mark.parametrize("spelling", ["actual/asset", "alias", "link/../asset"],
+                         ids=["plain", "symlink", "symlink-parent"])
+def test_file_identity_preserves_absolute_spelling_and_os_path_semantics(
+        tmp_path, monkeypatch, relative, spelling):
+    nested = tmp_path / "actual" / "nested"
+    nested.mkdir(parents=True)
+    asset = nested.parent / "asset"
+    asset.write_bytes(b"OS target")
+    (tmp_path / "asset").write_bytes(b"wrong one")
+    (tmp_path / "alias").symlink_to(asset)
+    (tmp_path / "link").symlink_to(nested, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    expected_path = tmp_path / spelling
+    path = spelling if relative else expected_path
+    stamp = identity._file_stamp(asset)
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(stamp[3:]) + identity.FILE_HASH_SETTLE_NS + 1))
+    original_open = Path.open
+    opened_paths = []
+
+    def record_open(open_path, *args, **kwargs):
+        opened_paths.append(open_path)
+        return original_open(open_path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", record_open)
+    identity._file_digest.cache_clear()
+    expected = {"size": 9, "sha256": hashlib.sha256(b"OS target").hexdigest()}
+    assert identity.file_identity(path) == expected
+    assert identity.file_identity(path) == expected
+    assert opened_paths == [expected_path]
+    assert identity._file_digest.cache_info().hits == 1
+
+
+def test_symlink_retarget_invalidates_cached_digest(tmp_path, monkeypatch):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.write_bytes(b"before")
+    second.write_bytes(b"after!")
+    previous_mtime = first.stat().st_mtime_ns
+    identity.os.utime(second, ns=(previous_mtime, previous_mtime))
+    path = tmp_path / "alias"
+    path.symlink_to(first)
+    first_stamp = identity._file_stamp(first)
+    second_stamp = identity._file_stamp(second)
+    assert first_stamp[2:4] == second_stamp[2:4]
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(first_stamp[3:] + second_stamp[3:]) + identity.FILE_HASH_SETTLE_NS + 1))
+    identity._file_digest.cache_clear()
+    before = identity.file_identity(path)
+    assert identity.file_identity(path) == before
+    path.unlink()
+    path.symlink_to(second)
+    after = identity.file_identity(path)
+    assert after == {"size": 6, "sha256": hashlib.sha256(b"after!").hexdigest()}
+    assert after != before
+    assert identity.file_identity(path) == after
+    assert identity._file_stamp(first) == first_stamp
+    assert identity._file_stamp(second) == second_stamp
+    assert identity._file_digest.cache_info().hits == 2
+    assert identity._file_digest.cache_info().misses == 2
+
+
 def test_file_hash_cache_reuses_reads_and_detects_same_size_edit(tmp_path, monkeypatch):
     path = tmp_path / "weights.bin"
     path.write_bytes(b"original")
@@ -137,6 +225,7 @@ def test_every_file_stamp_component_is_part_of_hash_cache_key(
     path.write_bytes(b"content")
     stamp = list(identity._file_stamp(path))
     monkeypatch.setattr(identity, "_file_stamp", lambda _: tuple(stamp))
+    monkeypatch.setattr(identity.os, "fstat", lambda _: _stat_from_stamp(stamp))
     monkeypatch.setattr(identity.time, "time_ns", lambda: (
         max(stamp[3:]) + identity.FILE_HASH_SETTLE_NS + 1))
     identity._file_digest.cache_clear()
@@ -146,6 +235,165 @@ def test_every_file_stamp_component_is_part_of_hash_cache_key(
     identity.file_identity(path)
     assert identity._file_digest.cache_info().hits == 1
     assert identity._file_digest.cache_info().misses == 2
+
+
+@pytest.mark.parametrize("settled", [False, True])
+@pytest.mark.parametrize("checkpoint", ["before", "after"])
+@pytest.mark.parametrize("stamp_index", range(5),
+                         ids=["device", "inode", "size", "mtime", "ctime"])
+def test_every_open_fd_stamp_component_is_checked_before_and_after_hashing(
+        tmp_path, monkeypatch, settled, checkpoint, stamp_index):
+    path = tmp_path / "asset"
+    path.write_bytes(b"content")
+    stamp = identity._file_stamp(path)
+    changed = list(stamp)
+    changed[stamp_index] += 1
+    original_fstat = identity.os.fstat
+    observed = []
+
+    def fstat(fd):
+        stat = original_fstat(fd)
+        assert identity._stat_stamp(stat) == stamp
+        observed.append(fd)
+        if checkpoint == "before" or len(observed) == 2:
+            return _stat_from_stamp(changed)
+        return stat
+
+    monkeypatch.setattr(identity.os, "fstat", fstat)
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(stamp[3:]) + (identity.FILE_HASH_SETTLE_NS + 1 if settled else 0)))
+    identity._file_digest.cache_clear()
+    with pytest.raises(ValueError, match="changed during hashing"):
+        identity.file_identity(path)
+    assert len(observed) == (1 if checkpoint == "before" else 2)
+    assert identity._file_stamp(path) == stamp
+    assert identity._file_digest.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize("settled", [False, True])
+def test_symlink_aba_opening_wrong_file_is_rejected_before_reading(
+        tmp_path, monkeypatch, settled):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.write_bytes(b"content")
+    second.write_bytes(b"WRONG!!")
+    path = tmp_path / "alias"
+    path.symlink_to(first)
+    stamp = identity._file_stamp(path)
+    identity.os.utime(second, ns=(stamp[3], stamp[3]))
+    assert identity._file_stamp(second)[2:4] == stamp[2:4]
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(stamp[3:]) + (identity.FILE_HASH_SETTLE_NS + 1 if settled else 0)))
+    original_open = Path.open
+    opened_stamps = []
+    reads = []
+
+    @contextmanager
+    def switched_open(open_path, *args, **kwargs):
+        if open_path != path:
+            with original_open(open_path, *args, **kwargs) as stream:
+                yield stream
+            return
+        path.unlink()
+        path.symlink_to(second)
+        with original_open(open_path, *args, **kwargs) as stream:
+            opened_stamps.append(identity._stat_stamp(identity.os.fstat(stream.fileno())))
+            path.unlink()
+            path.symlink_to(first)
+            assert identity._file_stamp(path) == stamp
+
+            def read(size):
+                reads.append(size)
+                return stream.read(size)
+
+            yield SimpleNamespace(fileno=stream.fileno, read=read)
+
+    identity._file_digest.cache_clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", switched_open)
+        with pytest.raises(ValueError, match="changed during hashing"):
+            identity.file_identity(path)
+    assert opened_stamps == [identity._file_stamp(second)]
+    assert opened_stamps[0] != stamp
+    assert reads == []
+    assert identity._file_stamp(path) == stamp
+    assert identity._file_digest.cache_info().currsize == 0
+    assert identity.file_identity(path) == {
+        "size": 7, "sha256": hashlib.sha256(b"content").hexdigest()}
+    assert identity._file_digest.cache_info().currsize == int(settled)
+
+
+@pytest.mark.parametrize("settled", [False, True])
+def test_real_open_file_mutation_during_hashing_is_rejected_with_stable_path_stamp(
+        tmp_path, monkeypatch, settled):
+    path = tmp_path / "asset"
+    path.write_bytes(b"content")
+    original_file_stamp = identity._file_stamp
+    stamp = original_file_stamp(path)
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(original_file_stamp(path)[3:])
+        + (identity.FILE_HASH_SETTLE_NS + 1 if settled else 0)))
+    monkeypatch.setattr(identity, "HASH_BLOCK_BYTES", 3)
+    mutations = []
+
+    def mutate():
+        with path.open("ab") as writer:
+            writer.write(b"!")
+        mutations.append(original_file_stamp(path))
+
+    identity._file_digest.cache_clear()
+    with monkeypatch.context() as patch:
+        # Keep pathname observations stable to isolate the real descriptor check.
+        patch.setattr(identity, "_file_stamp", lambda _: stamp)
+        _mutate_after_hash_block(patch, mutate)
+        with pytest.raises(ValueError, match="changed during hashing"):
+            identity.file_identity(path)
+    assert len(mutations) == 1
+    assert mutations[0][2] == stamp[2] + 1
+    assert identity._file_digest.cache_info().currsize == 0
+    assert identity.file_identity(path) == {
+        "size": 8, "sha256": hashlib.sha256(b"content!").hexdigest()}
+    assert identity._file_digest.cache_info().currsize == int(settled)
+
+
+@pytest.mark.parametrize("settled", [False, True])
+def test_symlink_retarget_during_hashing_is_rejected_with_unchanged_open_fd(
+        tmp_path, monkeypatch, settled):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.write_bytes(b"content")
+    second.write_bytes(b"changed")
+    path = tmp_path / "alias"
+    path.symlink_to(first)
+    stamp = identity._file_stamp(path)
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(identity._file_stamp(path)[3:])
+        + (identity.FILE_HASH_SETTLE_NS + 1 if settled else 0)))
+    monkeypatch.setattr(identity, "HASH_BLOCK_BYTES", 3)
+    original_fstat = identity.os.fstat
+    fd_stamps = []
+
+    def fstat(fd):
+        stat = original_fstat(fd)
+        fd_stamps.append(identity._stat_stamp(stat))
+        return stat
+
+    def retarget():
+        path.unlink()
+        path.symlink_to(second)
+
+    identity._file_digest.cache_clear()
+    with monkeypatch.context() as patch:
+        patch.setattr(identity.os, "fstat", fstat)
+        _mutate_after_hash_block(patch, retarget)
+        with pytest.raises(ValueError, match="changed during hashing"):
+            identity.file_identity(path)
+    assert fd_stamps == [stamp, stamp]
+    assert identity._file_stamp(path) != stamp
+    assert identity._file_digest.cache_info().currsize == 0
+    assert identity.file_identity(path) == {
+        "size": 7, "sha256": hashlib.sha256(b"changed").hexdigest()}
+    assert identity._file_digest.cache_info().currsize == int(settled)
 
 
 @pytest.mark.parametrize("settled", [False, True])

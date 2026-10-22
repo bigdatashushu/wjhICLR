@@ -1037,6 +1037,68 @@ def test_true_parallel_native_fifo_and_no_per_replica_overlap_through_eof(replic
         assert all(state.maximum == 1 and state.active == 0 for state in replicas)
 
 
+def test_pool_serializes_identity_checks_but_keeps_three_native_exchanges(
+        replicas, tmp_path, monkeypatch):
+    verifier = identity.detector_identity
+    verify_started, verify_release = threading.Event(), threading.Event()
+    counts = {"active": 0, "maximum": 0, "calls": 0}
+    lock = threading.Lock()
+
+    def blocked_verifier(*args):
+        with lock:
+            counts["active"] += 1
+            counts["calls"] += 1
+            counts["maximum"] = max(counts["maximum"], counts["active"])
+        try:
+            verify_started.set()
+            assert verify_release.wait(3)
+            return verifier(*args)
+        finally:
+            with lock:
+                counts["active"] -= 1
+
+    for state in replicas:
+        state.release = threading.Event()
+    with pooled(replicas, tmp_path, cache=False) as (transport, endpoint):
+        monkeypatch.setattr(identity, "detector_identity", blocked_verifier)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            requests = [executor.submit(call, endpoint, "/infer",
+                                       ('{"id":%d}' % index).encode())
+                        for index in range(3)]
+            try:
+                assert verify_started.wait(2)
+                wait_until(lambda: len(transport.busy) == 3)
+                assert counts["active"] == counts["calls"] == 1
+                verify_release.set()
+                for state in replicas:
+                    assert state.started.wait(2)
+                assert all(state.active == 1 for state in replicas)
+            finally:
+                verify_release.set()
+                for state in replicas:
+                    state.release.set()
+            assert all(request.result(timeout=5)[0] == 200 for request in requests)
+        assert counts == {"active": 0, "maximum": 1, "calls": 3}
+
+
+def test_pool_identity_mutex_wait_is_bounded_without_dispatch_or_quarantine(
+        replicas, tmp_path):
+    with pooled(replicas, tmp_path, cache=False) as (transport, endpoint):
+        before = sum(len(state.verifications) for state in replicas)
+        with transport.identity_lock:
+            result = call(endpoint, "/infer", RAW,
+                          headers={gateway.BUDGET_HEADER: "0.10"})
+        assert result[0] == 429
+        assert json.loads(result[1])["error"] == "detector_queue_deadline"
+        assert sum(len(state.verifications) for state in replicas) == before
+        assert not any(posts(state) for state in replicas)
+        assert not any(backend.quarantined for backend in transport.backends)
+        assert not transport.busy and not transport.queue
+        metrics = transport.metrics.snapshot()
+        assert metrics["queue_wait_ms"] >= 50 and metrics.get("identity_ms", 0) == 0
+        assert call(endpoint, "/infer", RAW)[0] == 200
+
+
 def test_pool_pending_bounds_include_singleflight_waiters_and_deadlines(replicas, tmp_path):
     state = replicas[0]
     state.release = threading.Event()

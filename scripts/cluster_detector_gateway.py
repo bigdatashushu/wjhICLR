@@ -637,6 +637,7 @@ class DetectorGateway:
         started = time.monotonic()
         if method == "POST":
             measurements["model_calls"] = 1
+            measurements["native_start_monotonic_s"] = started
         try:
             reply = _exchange(self.backend, method, path, body, deadline,
                               self.max_response_bytes, content_type=content_type)
@@ -651,7 +652,9 @@ class DetectorGateway:
             raise
         finally:
             if method == "POST":
-                measurements["native_infer_ms"] = (time.monotonic() - started) * 1000
+                finished = time.monotonic()
+                measurements["native_end_monotonic_s"] = finished
+                measurements["native_infer_ms"] = (finished - started) * 1000
         headers = [(name, value) for name, value in reply.headers
                    if name.lower() not in PUBLIC_HEADERS]
         headers.append((MODEL_HEADER, self.expected_model_sha256))
@@ -696,6 +699,9 @@ class DetectorPool:
         self.backends = []
         self.cache = None
         self.condition = threading.Condition()
+        # Asset stat/hash checks contend under the GIL; serialize this short CPU
+        # section across replicas while leaving native exchanges independent.
+        self.identity_lock = threading.Lock()
         self.queue = deque()
         self.busy = set()
         self.flights = {}
@@ -785,7 +791,15 @@ class DetectorPool:
                 self.condition.notify_all()
 
     def _verify(self, backend, deadline, measurements):
+        started = time.monotonic()
+        acquired = False
         try:
+            acquired = self.identity_lock.acquire(timeout=_remaining(deadline))
+            measurements["queue_wait_ms"] = measurements.get("queue_wait_ms", 0) + (
+                time.monotonic() - started) * 1000
+            if not acquired:
+                raise GatewayError(429, "detector_queue_deadline", retryable=True)
+            _remaining(deadline)
             return backend._verify_timed(deadline, measurements)
         except GatewayError as error:
             if error.code == "detector_backend_identity_mismatch":
@@ -793,6 +807,9 @@ class DetectorPool:
                     backend.quarantined = True
                     self.condition.notify_all()
             raise
+        finally:
+            if acquired:
+                self.identity_lock.release()
 
     def _cached_reply(self, reply, backend, outcome):
         headers = [(key, value) for key, value in reply.headers

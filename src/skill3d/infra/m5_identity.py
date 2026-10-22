@@ -41,18 +41,25 @@ def content_sha256(value) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
-def _file_stamp(path: Path) -> tuple:
-    stat = path.stat()
+def _stat_stamp(stat) -> tuple:
     return (stat.st_dev, stat.st_ino, stat.st_size,
             stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _file_stamp(path: Path) -> tuple:
+    return _stat_stamp(path.stat())
 
 
 @lru_cache(maxsize=8192)
 def _file_digest(path: str, stamp: tuple) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
+        if _stat_stamp(os.fstat(stream.fileno())) != stamp:
+            raise ValueError(f"identity file changed during hashing: {path}")
         for block in iter(lambda: stream.read(HASH_BLOCK_BYTES), b""):
             digest.update(block)
+        if _stat_stamp(os.fstat(stream.fileno())) != stamp:
+            raise ValueError(f"identity file changed during hashing: {path}")
     if _file_stamp(Path(path)) != stamp:
         raise ValueError(f"identity file changed during hashing: {path}")
     return digest.hexdigest()
@@ -60,7 +67,9 @@ def _file_digest(path: str, stamp: tuple) -> str:
 
 def file_identity(path: str | Path) -> dict:
     """Reuse hashes in this process only while inode, size and timestamps match."""
-    path = Path(path).resolve()
+    # Preserve the OS meaning of symlink/.. while avoiding component-by-component
+    # resolution on every lookup. The opened descriptor must match the path stamp.
+    path = Path(path).absolute()
     stamp = _file_stamp(path)
     settled = time.time_ns() - max(stamp[3:]) > FILE_HASH_SETTLE_NS
     digest = (_file_digest(str(path), stamp)
