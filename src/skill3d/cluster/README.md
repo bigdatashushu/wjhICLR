@@ -225,12 +225,21 @@ counts, and do not silently repair or advance anything.
 committed publication against the frozen job and the queue's committed receipt,
 checks every published file, and replays the prepared-binding loader at its
 final destination. It opens SQLite in `mode=ro` with `query_only=ON` and writes
-only separate `audits/` sidecars. A cached audit refers to an immutable
+only separate `audits/` sidecars and `deliverables/prepared_catalog.json`.
+A cached audit refers to an immutable
 publication; `--recheck` repeats all byte and loader checks, including detection
 of damage after publication. `audits/summary.json` reaches `verified` only when
 the completed run covers every frozen scene and question variant without audit
 errors. Binding unavailability and failed metric fusion remain explicit outcome
 counts and are not evidence of model correctness.
+
+The catalog overlays each reference's `store_root` with its published location
+and preserves the sealed worker artifact/input identities. Every entry is
+replayed through `load_prepared_binding_reference()` with the final migration
+receipt after worker paths can be removed. `cluster_audit.load_catalog_entry()`
+loads a catalog entry with input/receipt hash checks. Catalog completeness and
+binding outcomes are distinct: a validated entry can honestly have unavailable
+geometry or binding. Do not rewrite immutable worker manifests to change paths.
 
 CPU-only verification:
 

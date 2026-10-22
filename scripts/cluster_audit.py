@@ -47,6 +47,27 @@ def completed_rows(root: Path) -> dict:
         connection.close()
 
 
+def load_catalog_entry(entry: dict):
+    """Replay an audited transport reference through the normal binding loader."""
+    from skill3d.segmentation.prepared_binding_store import load_prepared_binding_reference
+
+    identity_path = Path(entry["scene_input_identity_file"])
+    validation_path = Path(entry["migration_receipt_file"])
+    if (
+        file_sha256(identity_path) != entry["scene_input_identity_file_sha256"]
+        or file_sha256(validation_path) != entry["migration_receipt_file_sha256"]
+    ):
+        raise ValueError("catalog identity or migration receipt changed")
+    identity = read_json(identity_path)
+    validation = read_json(validation_path)
+    receipt = validation["variants"][entry["variant"]]["migration_receipts"][entry["qa_id"]]
+    return load_prepared_binding_reference(
+        entry["reference"], scene_input_identity=identity,
+        migration_receipt=receipt, scene_artifact=entry["scene_artifact"],
+        migration_destination_root=entry["publication_root"],
+    )
+
+
 def audit_scene(root: Path, spec: dict, row: dict, db_row: dict) -> dict:
     key = spec["job_key"]
     scene = key.split("/")[-2]
@@ -89,6 +110,8 @@ def audit_scene(root: Path, spec: dict, row: dict, db_row: dict) -> dict:
         raise ValueError("independent loader replay differs from the publication validation")
     provenance = read_json(output / "source_provenance.json")
     variants = {}
+    consumers = {}
+    preparation = read_json(output / "prepare_manifest.json")
     for name, variant in validation["variants"].items():
         artifact = read_json(output / variant["artifact"])
         variants[name] = {
@@ -97,8 +120,37 @@ def audit_scene(root: Path, spec: dict, row: dict, db_row: dict) -> dict:
             "world_frame_status": artifact.get("world_frame_status"),
             "quality_main_gate_passed": (artifact.get("quality") or {}).get("main_gate_passed"),
         }
+        prepared = read_json(output / variant["binding_manifest"])
+        consumers[name] = {}
+        for qa_id, original_reference in prepared["bindings"].items():
+            # Preserve the sealed source identity. Only the transport locator is
+            # overlaid; canonical worker manifests and artifact JSON stay intact.
+            reference = {**original_reference, "store_root": str(output / "prepared" / name)}
+            identity_path = output / preparation["variants"][name]["input_identity_refs"][qa_id]
+            entry = {
+                "qa_id": qa_id, "scene_id": scene, "split": scope["split"], "variant": name,
+                "reference": reference,
+                "scene_artifact": str(output / variant["artifact"]),
+                "scene_input_identity_file": str(identity_path),
+                "scene_input_identity_file_sha256": file_sha256(identity_path),
+                "migration_receipt_file": str(validation_path),
+                "migration_receipt_file_sha256": file_sha256(validation_path),
+                "publication_root": str(output),
+                "publication_receipt_sha256": receipt_hash,
+                "outcome": variant["outcomes"][qa_id],
+            }
+            binding = load_catalog_entry(entry)
+            outcome = entry["outcome"]
+            if (
+                len(binding.objects) != outcome["n_objects"]
+                or binding.materialized != outcome["materialized"]
+                or binding.stats.get("binding_error") != outcome["binding_error"]
+            ):
+                raise ValueError("normal catalog loader differs from the audited binding")
+            consumers[name][qa_id] = entry
     return {
         "schema": "harness3d-independent-scene-audit/1",
+        "audit_version": 2,
         "status": "verified",
         "checked_at": time.time(),
         "job_key": key,
@@ -113,6 +165,7 @@ def audit_scene(root: Path, spec: dict, row: dict, db_row: dict) -> dict:
         "artifact_bytes": sum(item.size_bytes for item in receipt.artifacts),
         "geometry_source": provenance["geometry_source"],
         "variants": variants,
+        "consumer_bindings": consumers,
         "solver_ran": False,
         "scoring_ran": False,
         "real_labels_available": False,
@@ -158,6 +211,7 @@ def audit(root: Path, *, recheck: bool = False) -> dict:
             if not (
                 verified
                 and verified.get("status") == "verified"
+                and verified.get("audit_version") == 2
                 and verified.get("identity_hash") == identity_hash
                 and verified.get("publication_receipt_sha256") == db_row["receipt_sha256"]
                 and verified.get("attempt") == db_row["attempt"]
@@ -212,6 +266,19 @@ def audit(root: Path, *, recheck: bool = False) -> dict:
         "scoring_ran": False,
         "real_labels_available": False,
     }
+    atomic_json(root / "deliverables/prepared_catalog.json", {
+        "schema": "harness3d-published-binding-catalog/1",
+        "updated_at": result["updated_at"], "identity_hash": identity_hash,
+        "status": result["status"], "planned_questions": result["planned_questions"],
+        "verified_questions": result["verified_questions"],
+        "variants": {
+            name: {
+                qa_id: entry for row in rows.values()
+                for qa_id, entry in row["consumer_bindings"][name].items()
+            } for name in names
+        },
+        "no_labels": True, "no_solver": True,
+    })
     atomic_json(destination / "summary.json", result)
     return result
 

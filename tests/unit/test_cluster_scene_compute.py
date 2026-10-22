@@ -606,7 +606,10 @@ def test_independent_audit_replays_committed_output_and_detects_later_corruption
     spec = JobSpec("run/scene-one/gpu_aggregate", "completed-one", identity, "gpu_aggregate")
     root = tmp_path / "coordinator"
     output = root / "results" / hashlib.sha256(spec.job_key.encode()).hexdigest() / "attempt-1"
-    compute_scene(case.root, output, method, client_factory=fake_perception.client_factory)
+    worker_output = tmp_path / "worker-output"
+    compute_scene(case.root, worker_output, method, client_factory=fake_perception.client_factory)
+    shutil.copytree(worker_output, output)
+    shutil.rmtree(worker_output)
     artifacts = tuple(
         ArtifactDigest(str(path.relative_to(output)), *hash_file(path))
         for path in sorted(output.rglob("*")) if path.is_file()
@@ -643,6 +646,12 @@ def test_independent_audit_replays_committed_output_and_detects_later_corruption
     verified = auditor.audit(root)
     assert verified["status"] == "verified" and verified["verified_questions"] == {"base": 2}
     assert verified["question_outcomes"]["base"]["binding_unavailable"] == 1
+    catalog = json.loads((root / "deliverables/prepared_catalog.json").read_text())
+    entry = catalog["variants"]["base"]["qa-01"]
+    loaded = auditor.load_catalog_entry(entry)
+    assert loaded.materialized and len(loaded.objects) == 1
+    assert Path(loaded.objects[0].pointcloud_world).is_relative_to(output)
+    assert not worker_output.exists()
     assert queue.get_job(spec.job_key) == before
     (output / "geometry/base/depth_maps.npy").write_bytes(b"corrupted after publication")
     rejected = auditor.audit(root, recheck=True)
