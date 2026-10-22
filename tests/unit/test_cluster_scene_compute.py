@@ -587,3 +587,65 @@ def test_worker_checkpoint_wrappers_validate_without_model_or_original_inputs(
     _write(output / "scene_result.json", {**result, "no_solver": False})
     with pytest.raises(SceneComputeError, match="worker scene result"):
         validate_scene_output(output)
+
+
+def test_independent_audit_replays_committed_output_and_detects_later_corruption(
+        tmp_path, fake_perception, monkeypatch):
+    import importlib
+    from skill3d.cluster.identity import FrozenIdentity
+    from skill3d.cluster.publication import ArtifactDigest, PublicationReceipt, hash_file
+    from skill3d.cluster.queue import JobSpec, SQLiteJobQueue, WorkerIdentity
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+    auditor = importlib.import_module("cluster_audit")
+    case = _frozen(tmp_path)
+    method = {"runtime_config": {}, "min_free_gib": 0}
+    identity = FrozenIdentity.freeze(
+        {"scenes": {"scene-one": {"qa_ids": case.manifest["qa_ids"],
+                                   "split": "inner_validation"}}}, method)
+    spec = JobSpec("run/scene-one/gpu_aggregate", "completed-one", identity, "gpu_aggregate")
+    root = tmp_path / "coordinator"
+    output = root / "results" / hashlib.sha256(spec.job_key.encode()).hexdigest() / "attempt-1"
+    compute_scene(case.root, output, method, client_factory=fake_perception.client_factory)
+    artifacts = tuple(
+        ArtifactDigest(str(path.relative_to(output)), *hash_file(path))
+        for path in sorted(output.rglob("*")) if path.is_file()
+    )
+    receipt = PublicationReceipt(
+        spec.job_key, spec.completed_key, identity.identity_hash, spec.stage,
+        1, "harness3d-scene-qa-validator-v1", artifacts)
+    _write(output / "publication.json", receipt.to_dict())
+    receipt_hash = hash_file(output / "publication.json")[0]
+    queue = SQLiteJobQueue(root / "state/jobs.sqlite3")
+    queue.enqueue_many([spec])
+    lease = queue.claim(WorkerIdentity("audit-fixture", "local", "cpu"))
+    lease = queue.start_attempt(lease)
+    lease = queue.finish_attempt(lease, output_metadata={"receipt_sha256": receipt_hash})
+    queue.complete(lease, receipt_path=output / "publication.json",
+                   expected_receipt_hash=receipt_hash, artifact_root=output)
+    validation = root / "receipts/scene_validation" / (
+        hashlib.sha256(spec.job_key.encode()).hexdigest() + ".json")
+    _write(validation, validate_published_scene(
+        output, case.manifest["qa_ids"], "scene-one", method))
+    _write(root / "coordinator_jobs.json",
+           {"identity": identity.to_dict(), "jobs": [spec.to_dict()]})
+    _write(root / "deliverables/coverage.json", {
+        "identity_hash": identity.identity_hash, "updated_at": 1,
+        "status": "completed", "integrity_errors": [],
+        "queue": {"counts": {"complete": 1}},
+        "scenes": {"scene-one": {
+            "status": "complete", "model_attempts": 1, "receipt_sha256": receipt_hash,
+            "output_root": str(output), "validation_receipt": str(validation),
+            "qa_ids": case.manifest["qa_ids"], "split": "inner_validation",
+        }},
+    })
+    before = queue.get_job(spec.job_key)
+    verified = auditor.audit(root)
+    assert verified["status"] == "verified" and verified["verified_questions"] == {"base": 2}
+    assert verified["question_outcomes"]["base"]["binding_unavailable"] == 1
+    assert queue.get_job(spec.job_key) == before
+    (output / "geometry/base/depth_maps.npy").write_bytes(b"corrupted after publication")
+    rejected = auditor.audit(root, recheck=True)
+    assert rejected["status"] == "audit_errors" and rejected["verified_scenes"] == 0
+    assert rejected["errors"][0]["error_type"] == "PublicationError"
+    assert queue.get_job(spec.job_key) == before

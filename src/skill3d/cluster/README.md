@@ -221,6 +221,17 @@ snapshot. They distinguish queued, leased, running, publishing, complete,
 skipped and failed, expose transport counters/expired leases/worker host+GPU
 counts, and do not silently repair or advance anything.
 
+`scripts/cluster_audit.py --root RUN_ROOT --watch` independently validates each
+committed publication against the frozen job and the queue's committed receipt,
+checks every published file, and replays the prepared-binding loader at its
+final destination. It opens SQLite in `mode=ro` with `query_only=ON` and writes
+only separate `audits/` sidecars. A cached audit refers to an immutable
+publication; `--recheck` repeats all byte and loader checks, including detection
+of damage after publication. `audits/summary.json` reaches `verified` only when
+the completed run covers every frozen scene and question variant without audit
+errors. Binding unavailability and failed metric fusion remain explicit outcome
+counts and are not evidence of model correctness.
+
 CPU-only verification:
 
 ```bash
