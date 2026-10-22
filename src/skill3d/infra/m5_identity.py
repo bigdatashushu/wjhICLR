@@ -64,7 +64,7 @@ def file_identity(path: str | Path) -> dict:
     stamp = _file_stamp(path)
     settled = time.time_ns() - max(stamp[3:]) > FILE_HASH_SETTLE_NS
     digest = (_file_digest(str(path), stamp)
-              if stamp[2] >= HASH_BLOCK_BYTES and settled
+              if settled
               else _file_digest.__wrapped__(str(path), stamp))
     result = {"size": stamp[2], "sha256": digest}
     if _file_stamp(path) != stamp:

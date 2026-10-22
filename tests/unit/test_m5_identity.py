@@ -78,7 +78,6 @@ def test_relocation_does_not_change_file_or_generation_identity(tmp_path):
 def test_file_hash_cache_reuses_reads_and_detects_same_size_edit(tmp_path, monkeypatch):
     path = tmp_path / "weights.bin"
     path.write_bytes(b"original")
-    monkeypatch.setattr(identity, "HASH_BLOCK_BYTES", 8)
     future = identity.time.time_ns() + 3_000_000_000
     monkeypatch.setattr(identity.time, "time_ns", lambda: future)
     identity._file_digest.cache_clear()
@@ -88,29 +87,97 @@ def test_file_hash_cache_reuses_reads_and_detects_same_size_edit(tmp_path, monke
     previous_mtime = path.stat().st_mtime_ns
     path.write_bytes(b"modified")
     identity.os.utime(path, ns=(previous_mtime, previous_mtime))
-    future = path.stat().st_ctime_ns
+    future = path.stat().st_ctime_ns + 3_000_000_000
     changed = identity.file_identity(path)
     assert changed != first
     assert changed["sha256"] == hashlib.sha256(b"modified").hexdigest()
+    assert identity._file_digest.cache_info().misses == 2
 
 
-def test_small_or_recent_files_never_reuse_hash_cache(tmp_path):
+@pytest.mark.parametrize("size", [0, 7, 8, 9])
+@pytest.mark.parametrize("age_ns", [0, identity.FILE_HASH_SETTLE_NS,
+                                  identity.FILE_HASH_SETTLE_NS + 1])
+def test_file_hash_reuse_requires_settling_regardless_of_size(
+        tmp_path, monkeypatch, size, age_ns):
     path = tmp_path / "small"
-    path.write_bytes(b"original")
+    path.write_bytes(b"x" * size)
+    monkeypatch.setattr(identity, "HASH_BLOCK_BYTES", 8)
+    stamp = identity._file_stamp(path)
+    monkeypatch.setattr(identity.time, "time_ns", lambda: max(stamp[3:]) + age_ns)
+    identity._file_digest.cache_clear()
+    first = identity.file_identity(path)
+    assert first == {"size": size, "sha256": hashlib.sha256(b"x" * size).hexdigest()}
+    assert identity.file_identity(path) == first
+    info = identity._file_digest.cache_info()
+    settled = age_ns > identity.FILE_HASH_SETTLE_NS
+    assert info.hits == int(settled)
+    assert info.currsize == int(settled)
+
+
+def test_replaced_inode_invalidates_file_hash_cache(tmp_path, monkeypatch):
+    path = tmp_path / "asset"
+    path.write_bytes(b"before")
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(identity._file_stamp(path)[3:]) + identity.FILE_HASH_SETTLE_NS + 1))
+    identity._file_digest.cache_clear()
+    first = identity.file_identity(path)
+    previous_mtime = path.stat().st_mtime_ns
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"after!")
+    identity.os.utime(replacement, ns=(previous_mtime, previous_mtime))
+    replacement.replace(path)
+    assert identity.file_identity(path) != first
+    assert identity._file_digest.cache_info().misses == 2
+
+
+@pytest.mark.parametrize("stamp_index", range(5), ids=["device", "inode", "size", "mtime", "ctime"])
+def test_every_file_stamp_component_is_part_of_hash_cache_key(
+        tmp_path, monkeypatch, stamp_index):
+    path = tmp_path / "asset"
+    path.write_bytes(b"content")
+    stamp = list(identity._file_stamp(path))
+    monkeypatch.setattr(identity, "_file_stamp", lambda _: tuple(stamp))
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(stamp[3:]) + identity.FILE_HASH_SETTLE_NS + 1))
     identity._file_digest.cache_clear()
     identity.file_identity(path)
     identity.file_identity(path)
-    assert identity._file_digest.cache_info().hits == 0
+    stamp[stamp_index] += 1
+    identity.file_identity(path)
+    assert identity._file_digest.cache_info().hits == 1
+    assert identity._file_digest.cache_info().misses == 2
 
 
-def test_replaced_inode_invalidates_file_hash_cache(tmp_path):
+@pytest.mark.parametrize("settled", [False, True])
+def test_file_change_during_hashing_is_rejected_and_not_cached(
+        tmp_path, monkeypatch, settled):
     path = tmp_path / "asset"
-    path.write_bytes(b"before")
-    first = identity.file_identity(path)
-    replacement = tmp_path / "replacement"
-    replacement.write_bytes(b"after!")
-    replacement.replace(path)
-    assert identity.file_identity(path) != first
+    path.write_bytes(b"content")
+    stamp = identity._file_stamp(path)
+    changed = (*stamp[:4], stamp[4] + 1)
+    stamps = iter([stamp, changed])
+    monkeypatch.setattr(identity, "_file_stamp", lambda _: next(stamps))
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(stamp[3:]) + (identity.FILE_HASH_SETTLE_NS + 1 if settled else 0)))
+    identity._file_digest.cache_clear()
+    with pytest.raises(ValueError, match="changed during hashing"):
+        identity.file_identity(path)
+    assert identity._file_digest.cache_info().currsize == 0
+
+
+def test_file_change_during_cached_lookup_is_rejected(tmp_path, monkeypatch):
+    path = tmp_path / "asset"
+    path.write_bytes(b"content")
+    stamp = identity._file_stamp(path)
+    monkeypatch.setattr(identity.time, "time_ns", lambda: (
+        max(stamp[3:]) + identity.FILE_HASH_SETTLE_NS + 1))
+    identity._file_digest.cache_clear()
+    identity.file_identity(path)
+    stamps = iter([stamp, (*stamp[:4], stamp[4] + 1)])
+    monkeypatch.setattr(identity, "_file_stamp", lambda _: next(stamps))
+    with pytest.raises(ValueError, match="changed during lookup"):
+        identity.file_identity(path)
+    assert identity._file_digest.cache_info().hits == 1
 
 
 @pytest.mark.parametrize("name", ["model", "sam2", "detector"])

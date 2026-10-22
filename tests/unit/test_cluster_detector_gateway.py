@@ -1,7 +1,7 @@
 """Real HTTP transport regressions using stubs, never live detector inference."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
-import copy
+import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
@@ -28,6 +28,10 @@ gateway = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gateway)
 TOKEN = "detector-unit-test-environment-only"
 RAW = b'{ "image":"AA==", "text_prompt":"\\u0061.", "box_threshold":2.5e-1 }\n'
+NATIVE_RAW = (b'{ "success":true, "detections":[{"bbox":[1.0,2e0,8,9],'
+              b'"label":"chair","confidence":0.7,"id":0,"normalizedbox":[0.1,0.2,0.3,0.4]}],'
+              b'"annotated_image":"AA==","shape":[12,12,3],"image_size":[12,12] }\n')
+EMPTY_RAW = b'{ "success":true, "detections":[],"annotated_image":"AA==" }\n'
 MODEL = {"model": "GroundingDINO_SwinB", "files": {"weights": {"sha256": "a" * 64}},
          "bert_model": "bert-base-uncased", "mode": "eval", "annotate_fallback": "0"}
 PIN = identity.content_sha256(MODEL)
@@ -41,7 +45,7 @@ class NativeState:
         self.delay = 0.01
         self.cleanup_delay = 0
         self.status = self.health_status = 200
-        self.response = None
+        self.response = NATIVE_RAW
         self.response_headers = []
         self.health = b'{ "success":true, "model":"GroundingDINO", "opaque":[1.00,2e0] }\n'
         self.started = threading.Event()
@@ -219,9 +223,9 @@ def test_public_identity_health_and_plain_proxy_preserve_bytes(native, tmp_path)
             assert headers[gateway.MODEL_HEADER] == PIN
             before = len(native.verifications)
             status, raw, headers = call(address, "/infer", RAW, token=None)
-            assert (status, raw) == (200, RAW)
+            assert (status, raw) == (200, NATIVE_RAW)
             assert headers[gateway.MODEL_HEADER] == PIN
-            assert len(native.verifications) == before + 2
+            assert len(native.verifications) == before + 1
             assert native.verifications[-1] == (transport.backend, native.receipt)
             assert all("Authorization" not in row[3] for row in native.requests)
             assert posts(native)[0][2] == RAW
@@ -263,7 +267,7 @@ def test_eight_workers_share_one_backend_through_post_response_cleanup(native, t
         def worker(index):
             payload = RAW + b" " * index
             barrier.wait(timeout=5)
-            assert call(addresses[index % 2], "/infer", payload, token=None)[:2] == (200, payload)
+            assert call(addresses[index % 2], "/infer", payload, token=None)[:2] == (200, NATIVE_RAW)
             return payload
 
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -365,17 +369,17 @@ def test_proxy_model_pin_blocks_startup_and_each_inference(native, tmp_path, mon
             original = transport.forward
 
             def forged(method, path, body, deadline, content_type):
-                if path == "/identity":
-                    changed = copy.deepcopy(MODEL)
-                    changed["mode"] = "train"
-                    raw = json.dumps({"enabled": True, "model": changed, "model_sha256": PIN}).encode()
-                    return gateway.Reply(200, raw, [("Content-Type", "application/json")])
-                return original(method, path, body, deadline, content_type)
+                reply = original(method, path, body, deadline, content_type)
+                if path == "/infer":
+                    return gateway.Reply(reply.status, reply.body,
+                        [(name, "f" * 64 if name.lower() == gateway.MODEL_HEADER.lower() else value)
+                         for name, value in reply.headers])
+                return reply
 
             monkeypatch.setattr(transport, "forward", forged)
             status, raw, _ = call(address, "/infer", RAW, token=None)
             assert status == 502 and json.loads(raw)["error"] == "detector_model_identity_mismatch"
-            assert not posts(native)
+            assert len(posts(native)) == 1
 
 
 @pytest.mark.parametrize("raw", [
@@ -422,7 +426,8 @@ def test_request_limits_and_opaque_native_json(native, tmp_path):
     with central(native, tmp_path, max_request_bytes=16) as (_, endpoint):
         assert call(endpoint, "/infer", RAW)[0] == 413
         assert not posts(native)
-        assert call(endpoint, "/infer", b"{native handles}")[:2] == (200, b"{native handles}")
+        assert call(endpoint, "/infer", b"{native handles}")[:2] == (200, NATIVE_RAW)
+        assert posts(native)[0][2] == b"{native handles}"
         for headers, expected in [({"Content-Type": "text/plain"}, 415),
                                   ({"Transfer-Encoding": "chunked"}, 400),
                                   ({"Content-Length": "-1"}, 400)]:
@@ -579,7 +584,7 @@ def test_default_source_uses_launcher_package_and_large_identity_is_supported(na
                 status, raw, _ = call(address, "/identity", token=None)
                 assert status == 200 and len(raw) > 334 * 1024
                 assert json.loads(raw)["model_sha256"] == pin
-                assert call(address, "/infer", RAW, token=None)[:2] == (200, RAW)
+                assert call(address, "/infer", RAW, token=None)[:2] == (200, NATIVE_RAW)
     finally:
         transport.close()
 
@@ -641,7 +646,7 @@ def test_cli_localproxy_is_stdlib_only_and_ready_output_is_public(native, tmp_pa
             assert ready["status"] == "ready" and ready["model_sha256"] == PIN
             assert TOKEN.encode() not in ready_line
             address = f"http://127.0.0.1:{ready['port']}"
-            assert call(address, "/infer", RAW, token=None)[:2] == (200, RAW)
+            assert call(address, "/infer", RAW, token=None)[:2] == (200, NATIVE_RAW)
         finally:
             process.send_signal(signal.SIGINT)
             output, error = process.communicate(timeout=10)
@@ -682,3 +687,480 @@ def test_cli_serve_accepts_launcher_pythonpath_without_source_root(native, tmp_p
     assert ready["status"] == "ready" and ready["model_sha256"] == PIN
     assert not captured.err and TOKEN not in captured.out
     assert len(native.requests) == 1 and not posts(native)
+
+
+@pytest.fixture
+def replicas(tmp_path, monkeypatch):
+    """Independent HTTP natives with real file identity checks and per-process receipts."""
+    states = []
+
+    def verify(endpoint, receipt):
+        state = next(item for item in states if item.endpoint == endpoint)
+        state.verifications.append((endpoint, receipt))
+        value = json.loads(Path(receipt).read_bytes())
+        if (value["process"] != state.process or not state.listening
+                or value["port"] != state.port
+                or any(identity.file_identity(row["path"]) != row["identity"]
+                       for row in value["identity_files"])):
+            return None
+        return {"enabled": True, "model": value["generation_identity"]}
+
+    monkeypatch.setattr(identity, "detector_identity", verify)
+    with ExitStack() as stack:
+        for index in range(3):
+            state = NativeState()
+            state.process["pid"] += index
+            state.endpoint = stack.enter_context(running_server(native_server(state)))
+            state.port = gateway.urlsplit(state.endpoint).port
+            state.asset = tmp_path / f"weights-{index}"
+            state.asset.write_bytes(b"original weights")
+            state.receipt = tmp_path / f"receipt-{index}.json"
+            state.receipt.write_text(json.dumps({
+                "process": state.process, "port": state.port, "status": "starting_service",
+                "generation_identity": MODEL,
+                "identity_files": [{"path": str(state.asset),
+                                    "identity": identity.file_identity(state.asset)}],
+            }))
+            states.append(state)
+        yield states
+
+
+@contextmanager
+def pooled(states, tmp_path, *, cache=True, pin=PIN, **kwargs):
+    transport = gateway.DetectorPool(
+        [{"backend": state.endpoint, "receipt": str(state.receipt)} for state in states],
+        ROOT, pin, lock_dir=tmp_path / "locks",
+        cache_dir=tmp_path / "cache" if cache else None, **kwargs)
+    try:
+        with running_server(gateway.make_server(transport, "127.0.0.1", 0)) as endpoint:
+            yield transport, endpoint
+    finally:
+        transport.close()
+
+
+def wait_until(predicate):
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    pytest.fail("expected concurrent state was not reached")
+
+
+@pytest.mark.parametrize("response", [NATIVE_RAW, EMPTY_RAW])
+def test_pool_persistent_exact_cache_and_provenance(replicas, tmp_path, response):
+    replicas[0].response = response
+    first_source = identity.file_identity(replicas[0].receipt)["sha256"]
+    request_sha = hashlib.sha256(RAW).hexdigest()
+    response_sha = hashlib.sha256(response).hexdigest()
+    with pooled(replicas, tmp_path) as (transport, endpoint), local(endpoint) as (_, address):
+        before = len(replicas[0].verifications)
+        miss = call(address, "/infer", RAW, token=None)
+        hit = call(address, "/infer", RAW, token=None)
+        assert miss[:2] == hit[:2] == (200, response)
+        assert len(replicas[0].verifications) == before + 2
+        assert len(posts(replicas[0])) == 1
+        for reply, outcome in [(miss, "miss"), (hit, "hit")]:
+            headers = reply[2]
+            assert headers[gateway.CACHE_HEADER] == outcome
+            assert headers[gateway.REQUEST_HEADER] == request_sha
+            assert headers[gateway.RESPONSE_HEADER] == response_sha
+            assert headers[gateway.SOURCE_HEADER] == headers[gateway.SERVING_HEADER] == first_source
+            assert headers[gateway.MODEL_HEADER] == PIN
+            assert all(float(headers[header]) >= 0 for header in gateway.TIMING_HEADERS.values())
+        assert float(hit[2][gateway.TIMING_HEADERS["native_infer_ms"]]) == 0
+        assert transport.metrics.snapshot()["model_calls"] == 1
+        assert transport.metrics.snapshot()["logical_requests"] == 2
+    # New pool owner may serve persisted bytes on another replica, retaining the original source.
+    with pooled(list(reversed(replicas)), tmp_path) as (transport, endpoint):
+        status, raw, headers = call(endpoint, "/infer", RAW)
+        assert (status, raw) == (200, response)
+        assert headers[gateway.CACHE_HEADER] == "hit"
+        assert headers[gateway.SOURCE_HEADER] == first_source
+        assert headers[gateway.SERVING_HEADER] == identity.file_identity(replicas[2].receipt)["sha256"]
+        assert transport.metrics.snapshot()["model_calls"] == 0
+        assert sum(len(posts(state)) for state in replicas) == 1
+
+
+def test_exact_key_separates_body_content_type_parameters_and_model(replicas, tmp_path):
+    with pooled(replicas, tmp_path) as (_, endpoint):
+        for body, content_type in [
+            (RAW, "application/json"), (RAW + b" ", "application/json"),
+            (RAW, "application/json; charset=utf-8"),
+            (RAW.replace(b"2.5e-1", b"0.5"), "application/json"),
+            (RAW.replace(b"\\u0061.", b"chair."), "application/json"),
+        ]:
+            result = call(endpoint, "/infer", body, headers={"Content-Type": content_type})
+            assert result[0] == 200 and result[2][gateway.CACHE_HEADER] == "miss"
+        assert call(endpoint, "/infer", RAW)[2][gateway.CACHE_HEADER] == "hit"
+    assert sum(len(posts(state)) for state in replicas) == 5
+    changed = {**MODEL, "mode": "different-frozen-source"}
+    changed_pin = identity.content_sha256(changed)
+    for state in replicas:
+        receipt = json.loads(state.receipt.read_bytes())
+        receipt["generation_identity"] = changed
+        state.receipt.write_text(json.dumps(receipt))
+    with pooled(replicas, tmp_path, pin=changed_pin) as (_, endpoint):
+        assert call(endpoint, "/infer", RAW)[2][gateway.CACHE_HEADER] == "miss"
+    assert sum(len(posts(state)) for state in replicas) == 6
+
+
+@pytest.mark.parametrize("damage", ["bytes", "metadata", "schema"])
+def test_corrupt_cache_entry_evicted_not_returned(replicas, tmp_path, damage):
+    with pooled(replicas, tmp_path) as (transport, endpoint):
+        assert call(endpoint, "/infer", RAW)[0] == 200
+        with transport.cache.lock, transport.cache.connection:
+            if damage == "bytes":
+                transport.cache.connection.execute("UPDATE entries SET response=?", (b"garbled",))
+            elif damage == "metadata":
+                transport.cache.connection.execute("UPDATE entries SET metadata='not-json'")
+            else:
+                metadata = json.loads(transport.cache.connection.execute(
+                    "SELECT metadata FROM entries").fetchone()[0])
+                bad_raw = b'{"success":true,"detections":[{"label":"missing bbox"}]}'
+                metadata["response_sha"] = hashlib.sha256(bad_raw).hexdigest()
+                transport.cache.connection.execute("UPDATE entries SET metadata=?,response=?",
+                                                   (json.dumps(metadata), bad_raw))
+        result = call(endpoint, "/infer", RAW)
+        assert result[:2] == (200, NATIVE_RAW)
+        assert result[2][gateway.CACHE_HEADER] == "miss"
+        assert len(posts(replicas[0])) == 2
+        assert not transport.backends[0].quarantined
+
+
+def test_corrupt_database_fails_startup_and_releases_all_backend_owners(replicas, tmp_path):
+    directory = tmp_path / "cache"
+    directory.mkdir()
+    (directory / f"{gateway.CACHE_VERSION}.sqlite3").write_bytes(b"corrupt database")
+    with pytest.raises(ValueError, match="cache unavailable"):
+        with pooled(replicas, tmp_path):
+            pass
+    with pooled(replicas, tmp_path, cache=False):
+        pass
+
+
+def test_cache_lru_entry_and_byte_bounds(replicas, tmp_path):
+    with pooled(replicas, tmp_path, cache_max_entries=2, cache_max_bytes=2000) as (transport, endpoint):
+        for body in [RAW, RAW + b" ", RAW, RAW + b"  "]:
+            assert call(endpoint, "/infer", body)[0] == 200
+        count, size = transport.cache.connection.execute(
+            "SELECT count(*),sum(size) FROM entries").fetchone()
+        assert count == 2 and size <= 2000
+        assert call(endpoint, "/infer", RAW)[2][gateway.CACHE_HEADER] == "hit"
+        assert call(endpoint, "/infer", RAW + b" ")[2][gateway.CACHE_HEADER] == "miss"
+        assert transport.cache.connection.execute("PRAGMA auto_vacuum").fetchone() == (1,)
+    with pooled(replicas, tmp_path, cache_max_bytes=1) as (transport, endpoint):
+        for _ in range(2):
+            assert call(endpoint, "/infer", RAW)[2][gateway.CACHE_HEADER] == "miss"
+        assert transport.cache.connection.execute("SELECT count(*) FROM entries").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("change", ["receipt", "model", "process", "asset"])
+def test_identity_mutation_on_cache_hit_is_rejected_and_replica_quarantined(replicas, tmp_path, change):
+    with pooled(replicas, tmp_path) as (transport, endpoint):
+        assert call(endpoint, "/infer", RAW)[0] == 200
+        state = replicas[0]
+        if change == "receipt":
+            state.receipt.write_bytes(state.receipt.read_bytes() + b" ")
+        elif change == "model":
+            value = json.loads(state.receipt.read_bytes())
+            value["generation_identity"]["mode"] = "train"
+            state.receipt.write_text(json.dumps(value))
+        elif change == "process":
+            state.process["start_ticks"] = "changed"
+        else:
+            state.asset.write_bytes(b"changed weights")
+        result = call(endpoint, "/infer", RAW)
+        assert result[0] == 503
+        assert json.loads(result[1])["error"] == "detector_backend_identity_mismatch"
+        assert transport.backends[0].quarantined and len(posts(state)) == 1
+        # A separate logical request may use a healthy replica; the rejected request was not retried.
+        result = call(endpoint, "/infer", RAW)
+        assert result[0] == 200 and result[2][gateway.CACHE_HEADER] == "hit"
+        assert sum(len(posts(item)) for item in replicas) == 1
+
+
+def test_many_workers_singleflight_each_identity_check_and_metrics(replicas, tmp_path):
+    replicas[0].release = threading.Event()
+    with pooled(replicas, tmp_path, max_pending=32) as (transport, endpoint):
+        before = sum(len(state.verifications) for state in replicas)
+        with ThreadPoolExecutor(max_workers=24) as executor:
+            first = executor.submit(call, endpoint, "/infer", RAW)
+            assert replicas[0].started.wait(2)
+            rest = [executor.submit(call, endpoint, "/infer", RAW) for _ in range(23)]
+            try:
+                wait_until(lambda: transport.waiters == 23)
+            finally:
+                replicas[0].release.set()
+            replies = [future.result(timeout=5) for future in [first, *rest]]
+        assert all(reply[:2] == (200, NATIVE_RAW) for reply in replies)
+        assert [reply[2][gateway.CACHE_HEADER] for reply in replies].count("shared") == 23
+        assert sum(len(posts(state)) for state in replicas) == 1
+        assert sum(len(state.verifications) for state in replicas) == before + 24
+        metrics = transport.metrics.snapshot()
+        assert (metrics["logical_requests"], metrics["model_calls"], metrics["cache_hits"],
+                metrics["shared_requests"], metrics["errors"]) == (24, 1, 23, 23, 0)
+        assert not transport.flights and not transport.waiters
+
+
+@pytest.mark.parametrize("status", [200, 400, 429, 500])
+def test_singleflight_shares_failure_but_never_caches_errors(replicas, tmp_path, status):
+    state = replicas[0]
+    state.release = threading.Event()
+    state.status, state.response = status, b'{"success":false,"error":"native failed"}'
+    with pooled(replicas[:1], tmp_path) as (transport, endpoint):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            first = executor.submit(call, endpoint, "/infer", RAW)
+            assert state.started.wait(2)
+            rest = [executor.submit(call, endpoint, "/infer", RAW) for _ in range(7)]
+            try:
+                wait_until(lambda: transport.waiters == 7)
+            finally:
+                state.release.set()
+            assert all(future.result(timeout=5)[:2] == (status, state.response)
+                       for future in [first, *rest])
+        assert len(posts(state)) == 1 and not transport.backends[0].quarantined
+        assert transport.cache.connection.execute("SELECT count(*) FROM entries").fetchone() == (0,)
+        assert transport.metrics.snapshot()["cache_hits"] == 0
+        assert transport.metrics.snapshot()["errors"] == 8
+        state.status, state.response = 200, NATIVE_RAW
+        assert call(endpoint, "/infer", RAW)[2][gateway.CACHE_HEADER] == "miss"
+        assert len(posts(state)) == 2
+
+
+def test_native_invalid_boxes_failure_preserves_error_without_quarantining_model(replicas, tmp_path):
+    state = replicas[0]
+    state.response = b'{"success":false,"detections":[],"message":"no valid boxes"}'
+    with pooled(replicas[:1], tmp_path) as (transport, endpoint):
+        assert call(endpoint, "/infer", RAW)[:2] == (200, state.response)
+        assert call(endpoint, "/infer", RAW)[:2] == (200, state.response)
+        assert len(posts(state)) == 2
+        assert not transport.backends[0].quarantined
+        assert transport.cache.connection.execute("SELECT count(*) FROM entries").fetchone() == (0,)
+        assert transport.metrics.snapshot()["cache_hits"] == 0
+        assert transport.metrics.snapshot()["errors"] == 2
+
+
+@pytest.mark.parametrize("raw", [
+    b"not-json", b"[]", b'{"success":false,"detections":[]}',
+    b'{"success":1,"detections":[]}', b'{"success":true}',
+    b'{"success":true,"detections":{},"detections":[]}',
+    b'{"success":true,"detections":[{}]}',
+    b'{"success":true,"detections":[{"bbox":[1,2,3],"label":"x","confidence":0.5}]}',
+    b'{"success":true,"detections":[{"bbox":[1,2,3,4],"label":2,"confidence":0.5}]}',
+    b'{"success":true,"detections":[{"bbox":[1,2,3,4],"label":"","confidence":0.5}]}',
+    b'{"success":true,"detections":[{"bbox":[1,2,3,4],"label":"x","confidence":true}]}',
+    b'{"success":true,"detections":[{"bbox":[1,2,3,4],"label":"x","confidence":1.5}]}',
+    b'{"success":true,"detections":[{"bbox":[1,2,3,4],"label":"x","confidence":NaN}]}',
+    b'{"success":true,"detections":[{"bbox":[1,2,3,4],"label":"x","confidence":1e999}]}',
+    b'{"success":true,"detections":[{"bbox":[9,2,3,4],"label":"x","confidence":0.5}]}',
+])
+def test_bad_success_schema_quarantines_without_retry_or_cache(replicas, tmp_path, raw):
+    replicas[0].response = raw
+    with pooled(replicas, tmp_path) as (transport, endpoint):
+        result = call(endpoint, "/infer", RAW)
+        assert result[0] == 502 and json.loads(result[1])["error"] == "detector_native_schema"
+        assert transport.backends[0].quarantined
+        assert sum(len(posts(state)) for state in replicas) == 1
+        assert transport.cache.connection.execute("SELECT count(*) FROM entries").fetchone() == (0,)
+        assert call(endpoint, "/infer", RAW)[2][gateway.CACHE_HEADER] == "miss"
+        assert [len(posts(state)) for state in replicas] == [1, 1, 0]
+
+
+def test_ambiguous_post_quarantine_shared_failure_independent_other_replica(replicas, tmp_path):
+    replicas[0].delay = 0.3
+    with pooled(replicas, tmp_path, deadline_s=2) as (transport, endpoint):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(call, endpoint, "/infer", RAW,
+                                    headers={gateway.BUDGET_HEADER: "0.12"})
+            assert replicas[0].started.wait(2)
+            second = executor.submit(call, endpoint, "/infer", RAW)
+            wait_until(lambda: transport.waiters == 1)
+            replies = [first.result(timeout=3), second.result(timeout=3)]
+        assert all(reply[0] in {502, 504} for reply in replies)
+        assert replies[0][:2] == replies[1][:2]
+        assert transport.backends[0].quarantined
+        assert [len(posts(state)) for state in replicas] == [1, 0, 0]
+        assert call(endpoint, "/infer", RAW)[0] == 200
+        assert [len(posts(state)) for state in replicas] == [1, 1, 0]
+        time.sleep(0.35)
+        assert transport.backends[0].quarantined and replicas[0].maximum == 1
+
+
+def test_pool_uncached_default_executes_identical_requests_each_time(replicas, tmp_path):
+    with pooled(replicas, tmp_path, cache=False) as (transport, endpoint):
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            results = list(executor.map(lambda _: call(endpoint, "/infer", RAW), range(12)))
+        assert all(reply[0] == 200 and reply[2][gateway.CACHE_HEADER] == "disabled"
+                   for reply in results)
+        assert sum(len(posts(state)) for state in replicas) == 12
+        assert transport.metrics.snapshot()["model_calls"] == 12
+        assert all(state.maximum == 1 for state in replicas)
+
+
+def test_true_parallel_native_fifo_and_no_per_replica_overlap_through_eof(replicas, tmp_path):
+    for state in replicas:
+        state.release = threading.Event()
+        state.cleanup_delay = 0.03
+    with pooled(replicas, tmp_path, cache=False) as (transport, endpoint):
+        with ThreadPoolExecutor(max_workers=7) as executor:
+            first = []
+            for index, state in enumerate(replicas):
+                first.append(executor.submit(call, endpoint, "/infer", ('{"id":%d}' % index).encode()))
+                assert state.started.wait(2)
+            assert all(state.active == 1 for state in replicas)
+            rest = []
+            for index in range(3, 7):
+                rest.append(executor.submit(call, endpoint, "/infer", ('{"id":%d}' % index).encode()))
+                wait_queue(transport, index - 2)
+            order = []
+            original = gateway._exchange
+            # Record dispatch order centrally; response completion order need not be FIFO.
+            def observed(endpoint, method, path, body, *args, **kwargs):
+                if method == "POST":
+                    order.append(json.loads(body)["id"])
+                return original(endpoint, method, path, body, *args, **kwargs)
+
+            try:
+                with pytest.MonkeyPatch.context() as patch:
+                    patch.setattr(gateway, "_exchange", observed)
+                    # Only one free replica makes FIFO reservation/dispatch observable.
+                    replicas[0].release.set()
+                    assert first[0].result(timeout=5)[0] == 200
+                    assert all(future.result(timeout=5)[0] == 200 for future in rest)
+            finally:
+                for state in replicas:
+                    state.release.set()
+            assert order == [3, 4, 5, 6]
+            assert all(future.result(timeout=5)[0] == 200 for future in first)
+        assert not transport.queue and not transport.busy
+        assert all(state.maximum == 1 and state.active == 0 for state in replicas)
+
+
+def test_pool_pending_bounds_include_singleflight_waiters_and_deadlines(replicas, tmp_path):
+    state = replicas[0]
+    state.release = threading.Event()
+    with pooled(replicas[:1], tmp_path, max_pending=1, deadline_s=2) as (transport, endpoint):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(call, endpoint, "/infer", RAW)
+            assert state.started.wait(2)
+            second = executor.submit(call, endpoint, "/infer", RAW,
+                                     headers={gateway.BUDGET_HEADER: "0.15"})
+            try:
+                wait_until(lambda: transport.waiters == 1)
+                for payload in [RAW, RAW + b" "]:
+                    status, raw, headers = call(endpoint, "/infer", payload)
+                    assert status == 429 and json.loads(raw)["error"] == "detector_capacity"
+                    assert headers["Retry-After"] == "1"
+                assert not first.done()
+                result = second.result(timeout=2)
+                assert result[0] == 429 and json.loads(result[1])["error"] == "detector_queue_deadline"
+                assert not transport.waiters
+            finally:
+                state.release.set()
+            assert first.result(timeout=3)[0] == 200
+        assert len(posts(state)) == 1 and not transport.backends[0].quarantined
+        assert call(endpoint, "/infer", RAW)[2][gateway.CACHE_HEADER] == "hit"
+
+
+def test_pool_zero_pending_allows_only_free_slots_not_shared_waiters(replicas, tmp_path):
+    replicas[0].release = threading.Event()
+    with pooled(replicas[:1], tmp_path, max_pending=0) as (_, endpoint):
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first = executor.submit(call, endpoint, "/infer", RAW)
+            assert replicas[0].started.wait(2)
+            try:
+                assert call(endpoint, "/infer", RAW)[0] == 429
+                assert call(endpoint, "/infer", RAW + b" ")[0] == 429
+            finally:
+                replicas[0].release.set()
+            assert first.result(timeout=3)[0] == 200
+
+
+def test_pool_ownership_config_failures_and_independent_process_requirement(replicas, tmp_path):
+    rows = [{"backend": state.endpoint, "receipt": str(state.receipt)} for state in replicas]
+    with central(replicas[1], tmp_path):
+        with pytest.raises(ValueError, match="already owned"):
+            gateway.DetectorPool(rows, ROOT, PIN, lock_dir=tmp_path / "locks")
+        # Partial construction must release the earlier free replica's lock.
+        with central(replicas[0], tmp_path):
+            pass
+    for invalid in [[], rows + [rows[0]], [{"backend": rows[0]["backend"]}],
+                    [rows[0], {**rows[1], "receipt": rows[0]["receipt"]}]]:
+        with pytest.raises(ValueError):
+            gateway.DetectorPool(invalid, ROOT, PIN, lock_dir=tmp_path / "locks")
+    replicas[1].process = dict(replicas[0].process)
+    value = json.loads(replicas[1].receipt.read_bytes())
+    value["process"] = replicas[1].process
+    replicas[1].receipt.write_text(json.dumps(value))
+    with pytest.raises(gateway.GatewayError, match="pool_process_identity"):
+        with pooled(replicas, tmp_path, cache=False):
+            pass
+    with central(replicas[0], tmp_path):
+        pass
+
+
+def test_cache_exclusive_owner_across_processes_and_release(replicas, tmp_path):
+    with pooled(replicas, tmp_path) as (transport, _):
+        with pytest.raises(ValueError, match="already owned"):
+            gateway.ExactResponseCache(tmp_path / "cache")
+        code = ("import sys;sys.path.insert(0,sys.argv[1]);"
+                "from cluster_detector_gateway import ExactResponseCache;"
+                "ExactResponseCache(sys.argv[2])")
+        result = subprocess.run([sys.executable, "-S", "-c", code, str(ROOT / "scripts"),
+                                 str(tmp_path / "cache")], capture_output=True, timeout=10)
+        assert result.returncode != 0 and b"already owned" in result.stderr
+        assert TOKEN.encode() not in result.stdout + result.stderr
+        assert transport.cache.connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
+    cache = gateway.ExactResponseCache(tmp_path / "cache")
+    cache.close()
+
+
+def test_cache_hit_still_requires_auth_and_telemetry_never_logs_payloads(replicas, tmp_path, capsys):
+    with pooled(replicas, tmp_path, log_metrics=True) as (transport, endpoint):
+        assert call(endpoint, "/infer", RAW)[0] == 200
+        before = len(replicas[0].verifications)
+        assert call(endpoint, "/infer", RAW, token=None)[0] == 401
+        assert len(replicas[0].verifications) == before
+        assert call(endpoint, "/infer", RAW)[0] == 200
+        metrics = transport.metrics.snapshot()
+        assert metrics["logical_requests"] == 2 and metrics["model_calls"] == 1
+    captured = capsys.readouterr()
+    records = [json.loads(line) for line in captured.out.splitlines()]
+    assert len(records) == 2 and not captured.err
+    assert sum(row.get("cache_hits", 0) for row in records) == 1
+    assert all(row["event"] == "detector_request" for row in records)
+    assert [row["model_calls"] for row in records] == [1, 0]
+    assert records[1]["native_infer_ms"] == 0 and records[1]["cache_outcome"] == "hit"
+    assert records[1]["response_sha256"] == hashlib.sha256(NATIVE_RAW).hexdigest()
+    assert all(value not in captured.out for value in (
+        TOKEN, "AA==", "annotated_image", "text_prompt", str(replicas[0].receipt)))
+
+
+def test_cli_pool_config_limits_ready_and_cleanup(replicas, tmp_path, monkeypatch, capsys):
+    config = tmp_path / "pool.json"
+    config.write_text(json.dumps({"backends": [
+        {"backend": state.endpoint, "receipt": str(state.receipt)} for state in replicas]}))
+    make_server = gateway.make_server
+    observed = []
+
+    def ready_server(transport, host, port, **kwargs):
+        observed.append(transport)
+        server = make_server(transport, host, port, **kwargs)
+        def stop(**kwargs):
+            raise KeyboardInterrupt
+        server.serve_forever = stop
+        return server
+
+    monkeypatch.setattr(gateway, "make_server", ready_server)
+    gateway.main(["pool", "--backends-config", str(config), "--expected-model-sha256", PIN,
+                  "--cache-dir", str(tmp_path / "cache"), "--cache-max-entries", "5",
+                  "--cache-max-bytes", "2147483648", "--max-pending", "8",
+                  "--lock-dir", str(tmp_path / "locks"), "--host", "127.0.0.1", "--port", "0"])
+    ready = json.loads(capsys.readouterr().out)
+    assert ready["mode"] == "pool" and ready["status"] == "ready" and ready["model_sha256"] == PIN
+    assert observed[0].max_pending == 8 and observed[0].cache is None
+    assert all(backend._ownership is None for backend in observed[0].backends)
+    monkeypatch.setattr(gateway, "make_server", make_server)
+    with pooled(replicas, tmp_path):
+        pass

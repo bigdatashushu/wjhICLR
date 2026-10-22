@@ -4,14 +4,27 @@
 serve --backend http://127.0.0.1:20025 --receipt /existing/groundingdino_startup.json
       [--source-root /frozen/repository] --expected-model-sha256 SHA --port 27037
 localproxy --gateway http://SERVICE:27037 --expected-model-sha256 SHA --port 20027
+pool --backends-config /new-version/backends.json --expected-model-sha256 SHA
+     [--cache-dir /new-version/exact-cache] [--source-root /frozen/repository]
 
-Both modes read HARNESS3D_DETECTOR_TOKEN only from the environment. POST /infer
+Pool config is {"backends":[{"backend":"http://127.0.0.1:20028",
+"receipt":"/existing/groundingdino_startup.json"}, ...]}. All replicas must have
+the same launch-source/model pin, but independent receipts, ports and processes.
+Use a new gateway/run identity and cache directory, never an existing result pool.
+Caching is opt-in and pool-only (one replica is supported). Exact raw request
+bytes, the complete Content-Type and the frozen model pin define its namespace.
+Only validated native success bytes are cached, including empty detections.
+SQLite LRU bounds stored payload/metadata bytes and entry count; FULL auto-vacuum
+also reclaims evicted pages. Database/page/index overhead is outside that budget.
+One cache owner prevents cross-process single-flight/eviction races.
+
+All modes read HARNESS3D_DETECTOR_TOKEN only from the environment. POST /infer
 requires this bearer at the central service; the loopback-only proxy injects it
 for unchanged native clients. GET /health preserves native bytes, with the public
 pin in X-Detector-Model-Sha256. GET /identity publishes the verified model and its
 canonical model_sha256, without receipt metadata.
 
-Only serve lazily imports the frozen m5_identity implementation. Its unchanged
+Only serve/pool lazily import the frozen m5_identity implementation. Its unchanged
 detector_identity verifies the receipt, process lifetime, listener, command line,
 working directory and model/source files at startup and before every dispatch.
 The startup receipt itself is also pinned. No model is loaded or restarted.
@@ -19,12 +32,20 @@ Without --source-root, the launcher's frozen PYTHONPATH selects m5_identity.
 No fabricated local process receipt is provided for the proxy: native generation
 identity remains incomplete, while the separately frozen method pins the model.
 
-One central owner and FIFO queue cover all workers, including backend cleanup
-through peer EOF. An ambiguous POST failure quarantines the backend until an
+One exclusive owner and execution slot per replica cover backend cleanup through
+peer EOF. The pool assigns ready FIFO tickets to the first free configured replica;
+pending tickets plus single-flight waiters are bounded by max_pending.
+An ambiguous POST failure or malformed 200 quarantines that replica until an
 operator verifies/restarts it and restarts this gateway; health cannot prove idle.
 All clients must use this gateway; direct native access bypasses serialization.
 Use native detector timeout_s=180 (total_timeout_s=180) above the service/proxy
 170s/175s deadlines. No transport retries or detection JSON rewriting occur here.
+The proxy independently checks identity and health at startup, then uses only
+POST /infer and checks its model pin. Provenance SHA256 headers describe the raw
+request, native bytes, source receipt and serving receipt, without exposing paths.
+Timing headers cover identity, queue and native exchange through EOF. In-memory
+metrics count logical requests, cache/shared hits and attempted native POSTs;
+--log-metrics emits only timings, counts, sizes and hashes, never images or tokens.
 """
 from __future__ import annotations
 
@@ -43,6 +64,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -56,6 +78,20 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 LOOPBACK = {"127.0.0.1", "localhost", "::1"}
 BUDGET_HEADER = "X-Detector-Budget-S"
 MODEL_HEADER = "X-Detector-Model-Sha256"
+REQUEST_HEADER = "X-Detector-Request-Sha256"
+RESPONSE_HEADER = "X-Detector-Native-Response-Sha256"
+SOURCE_HEADER = "X-Detector-Source-Receipt-Sha256"
+SERVING_HEADER = "X-Detector-Serving-Receipt-Sha256"
+CACHE_HEADER = "X-Detector-Cache"
+CACHE_VERSION = "groundingdino-exact-raw-v1"
+TIMING_HEADERS = {
+    "identity_ms": "X-Detector-Identity-Ms",
+    "queue_wait_ms": "X-Detector-Queue-Wait-Ms",
+    "native_infer_ms": "X-Detector-Native-Infer-Ms",
+}
+PUBLIC_HEADERS = {name.lower() for name in (
+    MODEL_HEADER, REQUEST_HEADER, RESPONSE_HEADER, SOURCE_HEADER, SERVING_HEADER,
+    CACHE_HEADER, *TIMING_HEADERS.values())}
 
 
 def digest(value):
@@ -126,7 +162,7 @@ class Reply:
         self.headers = tuple((name, value) for name, value in headers
                              if name.lower() in {
                                  "content-type", "retry-after", "content-encoding",
-                                 MODEL_HEADER.lower()}
+                                 *PUBLIC_HEADERS}
                              and name.lower() not in hop_headers
                              and len(value) <= 4096 and "\r" not in value and "\n" not in value)
 
@@ -235,6 +271,216 @@ def validate_identity(raw, expected_model_sha256):
         raise GatewayError(502, "detector_model_identity_mismatch") from None
 
 
+def _json(raw):
+    def pairs(rows):
+        result = {}
+        for key, value in rows:
+            if key in result:
+                raise ValueError("duplicate JSON field")
+            result[key] = value
+        return result
+
+    def constant(value):
+        raise ValueError("non-finite JSON constant")
+
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+
+
+def _native_error_reply(reply):
+    """Recognize a completed native failure without treating it as detections."""
+    try:
+        types = [value for name, value in reply.headers if name.lower() == "content-type"]
+        if (len(types) != 1
+                or types[0].split(";", 1)[0].strip().lower() != "application/json"
+                or any(name.lower() == "content-encoding" for name, _ in reply.headers)):
+            return False
+        value = _json(reply.body)
+        return (isinstance(value, dict) and value.get("success") is False
+                and value.get("detections", []) == []
+                and any(isinstance(value.get(key), str) and value[key].strip()
+                        for key in ("error", "message")))
+    except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+        return False
+
+
+def validate_success(reply):
+    """Validate native schema only; never normalize, clip or rewrite detections."""
+    try:
+        types = [value for name, value in reply.headers if name.lower() == "content-type"]
+        if (len(types) != 1
+                or types[0].split(";", 1)[0].strip().lower() != "application/json"
+                or any(name.lower() == "content-encoding" for name, _ in reply.headers)):
+            raise ValueError
+        value = _json(reply.body)
+        if (not isinstance(value, dict) or value.get("success") is not True
+                or not isinstance(value.get("detections"), list)):
+            raise ValueError
+        for row in value["detections"]:
+            if (not isinstance(row, dict) or not isinstance(row.get("label"), str)
+                    or not row["label"].strip()
+                    or not isinstance(row.get("bbox"), list) or len(row["bbox"]) != 4):
+                raise ValueError
+            numbers = [*row["bbox"], row.get("confidence")]
+            if any(type(number) not in (int, float) or not math.isfinite(number)
+                   for number in numbers):
+                raise ValueError
+            if (not 0 <= row["confidence"] <= 1
+                    or row["bbox"][0] > row["bbox"][2]
+                    or row["bbox"][1] > row["bbox"][3]):
+                raise ValueError
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
+        raise GatewayError(502, "detector_native_schema") from None
+
+
+def _header(reply, name):
+    values = [value for key, value in reply.headers if key.lower() == name.lower()]
+    if len(values) != 1:
+        raise ValueError("missing or duplicate provenance")
+    return values[0]
+
+
+def _timed_reply(reply, measurements):
+    headers = [(key, value) for key, value in reply.headers
+               if key.lower() not in {name.lower() for name in TIMING_HEADERS.values()}]
+    return Reply(reply.status, reply.body, [
+        *headers, *((header, f"{measurements.get(key, 0):.3f}")
+                    for key, header in TIMING_HEADERS.items())])
+
+
+class Metrics:
+    def __init__(self, log=False):
+        self.lock = threading.Lock()
+        self.log = log
+        self.totals = dict.fromkeys((
+            "logical_requests", "cache_hits", "shared_requests", "model_calls", "errors",
+            "identity_ms", "queue_wait_ms", "native_infer_ms", "request_bytes"), 0)
+
+    def record(self, measurements):
+        measurements = {**dict.fromkeys(self.totals, 0), **measurements}
+        with self.lock:
+            for key in self.totals:
+                self.totals[key] += measurements.get(key, 0)
+            if self.log:
+                print(json.dumps({"event": "detector_request", **measurements},
+                                 sort_keys=True, allow_nan=False), flush=True)
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.totals)
+
+
+class ExactResponseCache:
+    """Exclusive, bounded persistent LRU of verified raw replies, not request images."""
+    def __init__(self, directory, *, max_entries=4096, max_bytes=2 * 1024**3,
+                 max_response_bytes=MAX_RESPONSE_BYTES):
+        if type(max_entries) is not int or not 1 <= max_entries <= 1_000_000:
+            raise ValueError("invalid cache entry limit")
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 16 * 1024**3:
+            raise ValueError("invalid cache byte limit")
+        self.max_entries, self.max_bytes = max_entries, max_bytes
+        self.max_response_bytes = max_response_bytes
+        self.lock = threading.Lock()
+        self.connection = self.ownership = None
+        directory = Path(directory).expanduser().resolve()
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.path = directory / f"{CACHE_VERSION}.sqlite3"
+        try:
+            fd = os.open(directory / "owner.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            self.ownership = os.fdopen(fd, "rb+")
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError
+            fcntl.flock(self.ownership, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if self.path.is_symlink():
+                raise OSError
+            self.connection = sqlite3.connect(self.path, check_same_thread=False)
+            self.connection.execute("PRAGMA auto_vacuum=FULL")
+            self.connection.execute(
+                "CREATE TABLE IF NOT EXISTS entries "
+                "(key TEXT PRIMARY KEY, metadata TEXT NOT NULL, response BLOB NOT NULL, "
+                "used INTEGER NOT NULL, size INTEGER NOT NULL)")
+            if self.connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError
+            os.chmod(self.path, 0o600)
+            with self.connection:
+                # Recompute accounting instead of trusting possibly damaged size values.
+                self.connection.execute(
+                    "UPDATE entries SET size=length(CAST(metadata AS BLOB))+length(response)")
+                self._prune()
+        except (OSError, ValueError, sqlite3.Error):
+            self.close()
+            raise ValueError("cache unavailable, corrupt, or already owned") from None
+
+    @staticmethod
+    def key(model, request_sha, content_type):
+        return digest([CACHE_VERSION, model, request_sha, content_type])
+
+    def _prune(self):
+        count, size = self.connection.execute(
+            "SELECT count(*), coalesce(sum(size),0) FROM entries").fetchone()
+        while count > self.max_entries or size > self.max_bytes:
+            key, removed = self.connection.execute(
+                "SELECT key,size FROM entries ORDER BY used,key LIMIT 1").fetchone()
+            self.connection.execute("DELETE FROM entries WHERE key=?", (key,))
+            count, size = count - 1, size - removed
+
+    def get(self, model, request_sha, content_type):
+        key = self.key(model, request_sha, content_type)
+        with self.lock, self.connection:
+            row = self.connection.execute(
+                "SELECT metadata,response FROM entries WHERE key=?", (key,)).fetchone()
+            if row is None:
+                return None
+            try:
+                metadata, raw = _json(row[0]), row[1]
+                if (not isinstance(raw, bytes) or len(raw) > self.max_response_bytes
+                        or metadata["namespace"] != CACHE_VERSION
+                        or metadata["model"] != model or metadata["request"] != request_sha
+                        or metadata["content_type"] != content_type
+                        or metadata["response_sha"] != hashlib.sha256(raw).hexdigest()):
+                    raise ValueError
+                source = _sha(metadata["source_receipt"])
+                reply = Reply(200, raw, [("Content-Type", metadata["response_type"]),
+                    (MODEL_HEADER, model), (REQUEST_HEADER, request_sha),
+                    (RESPONSE_HEADER, metadata["response_sha"]), (SOURCE_HEADER, source)])
+                validate_success(reply)
+            except (GatewayError, KeyError, TypeError, ValueError, UnicodeError,
+                    RecursionError, OverflowError):
+                self.connection.execute("DELETE FROM entries WHERE key=?", (key,))
+                return None
+            self.connection.execute("UPDATE entries SET used=? WHERE key=?", (time.time_ns(), key))
+            return reply
+
+    def put(self, model, request_sha, content_type, reply):
+        if reply.status != 200 or _native_error_reply(reply):
+            return
+        validate_success(reply)
+        response_sha = hashlib.sha256(reply.body).hexdigest()
+        if (_header(reply, MODEL_HEADER) != model
+                or _header(reply, REQUEST_HEADER) != request_sha
+                or _header(reply, RESPONSE_HEADER) != response_sha):
+            raise ValueError("cache provenance mismatch")
+        metadata = json.dumps({
+            "namespace": CACHE_VERSION, "model": model, "request": request_sha,
+            "content_type": content_type, "response_type": _header(reply, "Content-Type"),
+            "response_sha": response_sha, "source_receipt": _sha(_header(reply, SOURCE_HEADER)),
+        }, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        size = len(metadata.encode()) + len(reply.body)
+        if size > self.max_bytes:
+            return
+        with self.lock, self.connection:
+            self.connection.execute("INSERT OR REPLACE INTO entries VALUES (?,?,?,?,?)",
+                (self.key(model, request_sha, content_type), metadata, reply.body, time.time_ns(), size))
+            self._prune()
+
+    def close(self):
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = None
+        if self.ownership is not None:
+            self.ownership.close()
+            self.ownership = None
+
+
 def _deadline_setting(value, ceiling):
     if type(value) not in (float, int) or not math.isfinite(value) or not 0 < value <= ceiling:
         raise ValueError(f"deadline_s must be finite, positive, and <={ceiling}")
@@ -253,7 +499,7 @@ class DetectorGateway:
 
     def __init__(self, backend, receipt, source_root=None, expected_model_sha256=None, *,
                  deadline_s=170, max_pending=16, max_request_bytes=MAX_REQUEST_BYTES,
-                 max_response_bytes=MAX_RESPONSE_BYTES, lock_dir=None):
+                 max_response_bytes=MAX_RESPONSE_BYTES, lock_dir=None, log_metrics=False):
         self.token = _token()
         self.backend = _url(backend, backend=True)
         self.receipt = Path(receipt).expanduser().resolve()
@@ -265,6 +511,8 @@ class DetectorGateway:
             raise ValueError("max_pending must be between 0 and 64")
         self.max_pending = max_pending
         self.condition = threading.Condition()
+        self.identity_lock = threading.Lock()
+        self.metrics = Metrics(log_metrics)
         self.queue = deque()
         self.quarantined = False
         self._ownership = None
@@ -316,6 +564,10 @@ class DetectorGateway:
                 self.condition.notify_all()
 
     def _verify_identity(self):
+        with self.identity_lock:
+            return self._verify_identity_locked()
+
+    def _verify_identity_locked(self):
         if self.quarantined:
             raise GatewayError(503, "detector_backend_quarantined")
         try:
@@ -346,28 +598,298 @@ class DetectorGateway:
 
     def forward(self, method, path, body, deadline, content_type):
         _route(method, path)
-        with self.slot(deadline):
+        measurements = {"logical_requests": int(method == "POST"), "request_bytes": len(body or b"")}
+        started = time.monotonic()
+        try:
+            with self.slot(deadline):
+                measurements["queue_wait_ms"] = (time.monotonic() - started) * 1000
+                value = self._verify_timed(deadline, measurements)
+                return _timed_reply(self._forward_owned(
+                    method, path, body, deadline, content_type, value, measurements), measurements)
+        except Exception:
+            measurements["errors"] = 1
+            raise
+        finally:
+            if method == "POST":
+                measurements.setdefault("queue_wait_ms", (time.monotonic() - started) * 1000)
+                self.metrics.record(measurements)
+
+    def _verify_timed(self, deadline, measurements):
+        started = time.monotonic()
+        try:
             value = self._verify_identity()
             _remaining(deadline)
-            if path == "/identity":
-                raw = json.dumps(value, sort_keys=True, separators=(",", ":"),
-                                 ensure_ascii=False, allow_nan=False).encode("utf-8")
-                if len(raw) > self.max_response_bytes:
-                    raise GatewayError(502, "detector_response_limit")
-                return Reply(200, raw, [("Content-Type", "application/json"),
-                                        (MODEL_HEADER, self.expected_model_sha256)])
+            return value
+        finally:
+            measurements["identity_ms"] = measurements.get("identity_ms", 0) + (
+                time.monotonic() - started) * 1000
+
+    def _forward_owned(self, method, path, body, deadline, content_type, value, measurements):
+        """Caller owns this replica's execution slot until exchange/cleanup finishes."""
+        if path == "/identity":
+            raw = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False).encode("utf-8")
+            if len(raw) > self.max_response_bytes:
+                raise GatewayError(502, "detector_response_limit")
+            return Reply(200, raw, [("Content-Type", "application/json"),
+                                    (MODEL_HEADER, self.expected_model_sha256)])
+        _remaining(deadline)
+        started = time.monotonic()
+        if method == "POST":
+            measurements["model_calls"] = 1
+        try:
+            reply = _exchange(self.backend, method, path, body, deadline,
+                              self.max_response_bytes, content_type=content_type)
+            if method == "POST" and reply.status == 200:
+                if not _native_error_reply(reply):
+                    validate_success(reply)
+                _remaining(deadline)
+        except GatewayError:
+            if method == "POST":
+                # Neither lost bytes nor a malformed success proves safe native reuse.
+                self.quarantined = True
+            raise
+        finally:
+            if method == "POST":
+                measurements["native_infer_ms"] = (time.monotonic() - started) * 1000
+        headers = [(name, value) for name, value in reply.headers
+                   if name.lower() not in PUBLIC_HEADERS]
+        headers.append((MODEL_HEADER, self.expected_model_sha256))
+        if method == "POST":
+            if reply.status >= 400 or _native_error_reply(reply):
+                measurements["errors"] = 1
+            request_sha = hashlib.sha256(body).hexdigest()
+            response_sha = hashlib.sha256(reply.body).hexdigest()
+            source = self._receipt_identity["sha256"]
+            headers.extend([(REQUEST_HEADER, request_sha), (RESPONSE_HEADER, response_sha),
+                            (SOURCE_HEADER, source), (SERVING_HEADER, source),
+                            (CACHE_HEADER, "disabled")])
+            measurements.update(request_sha256=request_sha, response_sha256=response_sha,
+                                model_sha256=self.expected_model_sha256, source_receipt_sha256=source)
+        return Reply(reply.status, reply.body, headers)
+
+
+class _Flight:
+    def __init__(self):
+        self.event = threading.Event()
+        self.reply = self.error = self.backend = None
+
+
+class DetectorPool:
+    """FIFO free-replica scheduler; each DetectorGateway retains its slot and flock."""
+    authenticated = True
+
+    def __init__(self, backends, source_root=None, expected_model_sha256=None, *,
+                 deadline_s=170, max_pending=16, max_request_bytes=MAX_REQUEST_BYTES,
+                 max_response_bytes=MAX_RESPONSE_BYTES, lock_dir=None, cache_dir=None,
+                 cache_max_entries=4096, cache_max_bytes=2 * 1024**3, log_metrics=False):
+        self.token = _token()
+        self.expected_model_sha256 = _sha(expected_model_sha256)
+        self.deadline_s = _deadline_setting(deadline_s, 170)
+        self.max_request_bytes = _byte_limit(max_request_bytes, MAX_REQUEST_BYTES)
+        self.max_response_bytes = _byte_limit(max_response_bytes, MAX_RESPONSE_BYTES)
+        if type(max_pending) is not int or not 0 <= max_pending <= 64:
+            raise ValueError("max_pending must be between 0 and 64")
+        if not isinstance(backends, list) or not 1 <= len(backends) <= 16:
+            raise ValueError("pool requires between 1 and 16 backend receipts")
+        self.max_pending = max_pending
+        self.backends = []
+        self.cache = None
+        self.condition = threading.Condition()
+        self.queue = deque()
+        self.busy = set()
+        self.flights = {}
+        self.waiters = 0
+        self.metrics = Metrics(log_metrics)
+        try:
+            receipts = set()
+            for row in backends:
+                if not isinstance(row, dict) or set(row) != {"backend", "receipt"}:
+                    raise ValueError("invalid pool backend config")
+                receipt = Path(row["receipt"]).expanduser().resolve()
+                if receipt in receipts:
+                    raise ValueError("pool requires independent backend receipts")
+                receipts.add(receipt)
+                self.backends.append(DetectorGateway(
+                    row["backend"], receipt, source_root, self.expected_model_sha256,
+                    deadline_s=self.deadline_s, max_pending=0, lock_dir=lock_dir,
+                    max_request_bytes=self.max_request_bytes,
+                    max_response_bytes=self.max_response_bytes))
+            if cache_dir is not None:
+                self.cache = ExactResponseCache(
+                    cache_dir, max_entries=cache_max_entries, max_bytes=cache_max_bytes,
+                    max_response_bytes=self.max_response_bytes)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.cache is not None:
+            self.cache.close()
+            self.cache = None
+        for backend in self.backends:
+            backend.close()
+
+    def preflight(self):
+        processes = set()
+        for backend in self.backends:
+            backend.preflight()
+            # Replicas must be actual independent model processes, not two listeners.
             try:
-                reply = _exchange(self.backend, method, path, body, deadline,
-                                  self.max_response_bytes, content_type=content_type)
-            except GatewayError:
-                if method == "POST":
-                    # A lost response does not prove the existing process stopped work.
-                    self.quarantined = True
+                process = digest(_json(backend.receipt.read_bytes())["process"])
+                backend._verify_identity()
+                if process in processes:
+                    raise ValueError
+                processes.add(process)
+            except Exception:
+                raise GatewayError(503, "detector_pool_process_identity") from None
+
+    @contextmanager
+    def slot(self, deadline):
+        ticket = object()
+        backend = None
+        with self.condition:
+            available = [item for item in self.backends if not item.quarantined]
+            if not available:
+                raise GatewayError(503, "detector_backend_quarantined")
+            free = any(item not in self.busy for item in available)
+            if (self.queue or not free) and len(self.queue) + self.waiters >= self.max_pending:
+                raise GatewayError(429, "detector_capacity", retryable=True)
+            self.queue.append(ticket)
+            try:
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise GatewayError(429, "detector_queue_deadline", retryable=True)
+                    available = [item for item in self.backends if not item.quarantined]
+                    if not available:
+                        raise GatewayError(503, "detector_backend_quarantined")
+                    if self.queue[0] is ticket:
+                        backend = next((item for item in available if item not in self.busy), None)
+                        if backend is not None:
+                            self.queue.popleft()
+                            self.busy.add(backend)
+                            self.condition.notify_all()
+                            break
+                    self.condition.wait(timeout=deadline - time.monotonic())
+            except BaseException:
+                self.queue.remove(ticket)
+                self.condition.notify_all()
                 raise
-            headers = [(name, value) for name, value in reply.headers
-                       if name.lower() != MODEL_HEADER.lower()]
-            return Reply(reply.status, reply.body,
-                         [*headers, (MODEL_HEADER, self.expected_model_sha256)])
+        try:
+            # Pool reservation and the backend's real slot both cover exchange through EOF.
+            with backend.slot(deadline):
+                yield backend
+        finally:
+            with self.condition:
+                self.busy.remove(backend)
+                self.condition.notify_all()
+
+    def _verify(self, backend, deadline, measurements):
+        try:
+            return backend._verify_timed(deadline, measurements)
+        except GatewayError as error:
+            if error.code == "detector_backend_identity_mismatch":
+                with self.condition:
+                    backend.quarantined = True
+                    self.condition.notify_all()
+            raise
+
+    def _cached_reply(self, reply, backend, outcome):
+        headers = [(key, value) for key, value in reply.headers
+                   if key.lower() not in {CACHE_HEADER.lower(), SERVING_HEADER.lower()}]
+        return Reply(reply.status, reply.body, [
+            *headers, (CACHE_HEADER, outcome), (SERVING_HEADER, backend._receipt_identity["sha256"])])
+
+    def _forward(self, method, path, body, deadline, content_type, measurements, flight):
+        started = time.monotonic()
+        with self.slot(deadline) as backend:
+            measurements["queue_wait_ms"] = (time.monotonic() - started) * 1000
+            if flight is not None:
+                flight.backend = backend
+            value = self._verify(backend, deadline, measurements)
+            if method == "POST" and self.cache is not None:
+                request_sha = hashlib.sha256(body).hexdigest()
+                reply = self.cache.get(self.expected_model_sha256, request_sha, content_type)
+                _remaining(deadline)
+                if reply is not None:
+                    measurements["cache_hits"] = 1
+                    return self._cached_reply(reply, backend, "hit")
+            reply = backend._forward_owned(
+                method, path, body, deadline, content_type, value, measurements)
+            if method == "POST" and self.cache is not None:
+                _remaining(deadline)
+                self.cache.put(self.expected_model_sha256, request_sha, content_type, reply)
+                return self._cached_reply(reply, backend, "miss")
+            return reply
+
+    def forward(self, method, path, body, deadline, content_type):
+        _route(method, path)
+        measurements = {"logical_requests": int(method == "POST"), "request_bytes": len(body or b"")}
+        key = flight = None
+        follower = owner = False
+        started = time.monotonic()
+        try:
+            if method == "POST" and self.cache is not None:
+                request_sha = hashlib.sha256(body).hexdigest()
+                measurements.update(request_sha256=request_sha,
+                                    model_sha256=self.expected_model_sha256)
+                key = self.cache.key(self.expected_model_sha256, request_sha, content_type)
+                with self.condition:
+                    flight = self.flights.get(key)
+                    if flight is not None:
+                        if len(self.queue) + self.waiters >= self.max_pending:
+                            raise GatewayError(429, "detector_capacity", retryable=True)
+                        self.waiters += 1
+                        follower = True
+                    else:
+                        flight = self.flights[key] = _Flight()
+                        owner = True
+            if follower:
+                measurements["shared_requests"] = 1
+                if not flight.event.wait(timeout=_remaining(deadline)):
+                    raise GatewayError(429, "detector_queue_deadline", retryable=True)
+                measurements["queue_wait_ms"] = (time.monotonic() - started) * 1000
+                if flight.error is not None:
+                    raise GatewayError(flight.error.status, flight.error.code,
+                                       retryable=flight.error.retryable)
+                # A shared response is still a separate authorized logical request.
+                self._verify(flight.backend, deadline, measurements)
+                reply = self._cached_reply(flight.reply, flight.backend, "shared")
+                if reply.status >= 400 or _native_error_reply(reply):
+                    measurements["errors"] = 1
+                elif reply.status == 200:
+                    measurements["cache_hits"] = 1
+            else:
+                reply = self._forward(
+                    method, path, body, deadline, content_type, measurements, flight)
+                if flight is not None:
+                    flight.reply = reply
+            if method == "POST":
+                measurements.update(
+                    cache_outcome=_header(reply, CACHE_HEADER),
+                    response_sha256=_header(reply, RESPONSE_HEADER),
+                    source_receipt_sha256=_header(reply, SOURCE_HEADER))
+                if reply.status >= 400:
+                    measurements["errors"] = 1
+            return _timed_reply(reply, measurements)
+        except BaseException as error:
+            measurements["errors"] = 1
+            if owner:
+                flight.error = (error if isinstance(error, GatewayError)
+                                else GatewayError(503, "detector_service_unavailable"))
+            raise
+        finally:
+            with self.condition:
+                if follower:
+                    self.waiters -= 1
+                elif owner:
+                    # Publish before removing: admitted waiters retain the same outcome.
+                    flight.event.set()
+                    del self.flights[key]
+                self.condition.notify_all()
+            if method == "POST":
+                measurements.setdefault("queue_wait_ms", (time.monotonic() - started) * 1000)
+                self.metrics.record(measurements)
 
 
 class LoopbackProxy:
@@ -395,6 +917,7 @@ class LoopbackProxy:
         return reply
 
     def preflight(self):
+        self._identity(time.monotonic() + self.deadline_s)
         reply = self.forward("GET", "/health", None, time.monotonic() + self.deadline_s,
                              "application/json")
         if reply.status != 200:
@@ -402,9 +925,8 @@ class LoopbackProxy:
 
     def forward(self, method, path, body, deadline, content_type):
         _route(method, path)
-        identity = self._identity(deadline)
         if path == "/identity":
-            return identity
+            return self._identity(deadline)
         reply = _exchange(self.gateway, method, path, body, deadline,
                           self.max_response_bytes, token=self.token, content_type=content_type)
         if reply.status == 200:
@@ -562,11 +1084,24 @@ def main(argv=None):
     serve.add_argument("--port", type=int, default=27037)
     serve.add_argument("--max-pending", type=int, default=16)
     serve.add_argument("--lock-dir", type=Path)
+    serve.add_argument("--log-metrics", action="store_true")
+    pool = subparsers.add_parser("pool")
+    pool.add_argument("--backends-config", type=Path, required=True)
+    pool.add_argument("--source-root", type=Path,
+                      help="frozen identity verifier; defaults to launcher PYTHONPATH")
+    pool.add_argument("--host", default="0.0.0.0")
+    pool.add_argument("--port", type=int, default=27038)
+    pool.add_argument("--max-pending", type=int, default=16)
+    pool.add_argument("--lock-dir", type=Path)
+    pool.add_argument("--cache-dir", type=Path, help="opt-in persistent exact response cache")
+    pool.add_argument("--cache-max-entries", type=int, default=4096)
+    pool.add_argument("--cache-max-bytes", type=int, default=2 * 1024**3)
+    pool.add_argument("--log-metrics", action="store_true")
     proxy = subparsers.add_parser("localproxy")
     proxy.add_argument("--gateway", required=True)
     proxy.add_argument("--host", default="127.0.0.1")
     proxy.add_argument("--port", type=int, default=20027)
-    for command, deadline in ((serve, 170), (proxy, 175)):
+    for command, deadline in ((serve, 170), (pool, 170), (proxy, 175)):
         command.add_argument("--expected-model-sha256", required=True)
         command.add_argument("--deadline-s", type=float, default=deadline)
         command.add_argument("--max-request-bytes", type=int, default=MAX_REQUEST_BYTES)
@@ -580,7 +1115,16 @@ def main(argv=None):
         if args.mode == "serve":
             transport = DetectorGateway(args.backend, args.receipt, args.source_root,
                 args.expected_model_sha256, max_pending=args.max_pending,
-                lock_dir=args.lock_dir, **limits)
+                lock_dir=args.lock_dir, log_metrics=args.log_metrics, **limits)
+        elif args.mode == "pool":
+            config = _json(args.backends_config.read_bytes())
+            if not isinstance(config, dict) or set(config) != {"backends"}:
+                raise ValueError("invalid pool config")
+            transport = DetectorPool(config["backends"], args.source_root,
+                args.expected_model_sha256, max_pending=args.max_pending,
+                lock_dir=args.lock_dir, cache_dir=args.cache_dir,
+                cache_max_entries=args.cache_max_entries, cache_max_bytes=args.cache_max_bytes,
+                log_metrics=args.log_metrics, **limits)
         else:
             transport = LoopbackProxy(args.gateway, args.expected_model_sha256, **limits)
         server = make_server(transport, args.host, args.port, max_connections=args.max_connections)

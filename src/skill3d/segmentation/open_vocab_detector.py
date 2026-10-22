@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 import os
 import time
 from dataclasses import dataclass
+from threading import Lock
 from typing import Optional, Sequence
 
 import numpy as np
@@ -21,6 +23,11 @@ DEFAULT_ENDPOINT = os.environ.get("SKILL3D_DETECTOR_ENDPOINT", "")
 DEFAULT_BOX_THRESHOLD = 0.25   # TODO_CALIBRATE
 DEFAULT_TIMEOUT_S = 120
 DEFAULT_TOTAL_TIMEOUT_S = 180
+JPEG_CACHE_MAX_ENTRIES = 64
+JPEG_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_jpeg_cache: OrderedDict[tuple, bytes] = OrderedDict()
+_jpeg_cache_bytes = 0
+_jpeg_cache_lock = Lock()
 _failure_sink: ContextVar[Optional[list[str]]] = ContextVar("detector_failure_sink", default=None)
 _attempt_sinks: ContextVar[tuple] = ContextVar("detector_attempt_sinks", default=())
 
@@ -88,6 +95,36 @@ def available() -> bool:
     return bool(detector_endpoint())
 
 
+def _encode_jpeg(img: np.ndarray) -> tuple[Optional[bytes], bool]:
+    """Reuse immutable JPEG bytes by owned, normalized pixel content and settings."""
+    import cv2
+
+    global _jpeg_cache_bytes
+    encoding = (".jpg", int(cv2.COLOR_RGB2BGR), int(cv2.IMWRITE_JPEG_QUALITY), 90)
+    key = (img.dtype.str, img.shape,
+           hashlib.sha256(memoryview(img).cast("B")).digest(), encoding)
+    with _jpeg_cache_lock:
+        cached = _jpeg_cache.get(key)
+        if cached is not None:
+            _jpeg_cache.move_to_end(key)
+            return cached, True
+    ok, buf = cv2.imencode(encoding[0], cv2.cvtColor(img, encoding[1]),
+                          list(encoding[2:]))
+    if not ok:
+        return None, False
+    encoded = buf.tobytes()
+    if JPEG_CACHE_MAX_ENTRIES > 0 and len(encoded) <= JPEG_CACHE_MAX_BYTES:
+        with _jpeg_cache_lock:
+            previous = _jpeg_cache.pop(key, b"")
+            _jpeg_cache_bytes += len(encoded) - len(previous)
+            _jpeg_cache[key] = encoded
+            while (len(_jpeg_cache) > JPEG_CACHE_MAX_ENTRIES
+                   or _jpeg_cache_bytes > JPEG_CACHE_MAX_BYTES):
+                _, evicted = _jpeg_cache.popitem(last=False)
+                _jpeg_cache_bytes -= len(evicted)
+    return encoded, False
+
+
 def detect(frame: np.ndarray, prompt: str, *,
            endpoint: Optional[str] = None,
            box_threshold: float = DEFAULT_BOX_THRESHOLD,
@@ -106,24 +143,30 @@ def detect(frame: np.ndarray, prompt: str, *,
     detect.last_error = ""
     if not ep or not prompt.strip() or frame is None:
         return _failed("endpoint is not configured / prompt is empty / frame is None")
-    import cv2
     import requests
 
+    encode_started = time.perf_counter()
     img = np.asarray(frame)
     if img.dtype != np.uint8:
         img = np.clip(img, 0, 255).astype(np.uint8)
     if img.ndim == 2:
         img = np.stack([img] * 3, axis=-1)
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
-                          [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
+    # Hash and encode the same snapshot even if the caller later mutates its frame.
+    img = np.array(img, copy=True, order="C")
+    jpeg, cache_hit = _encode_jpeg(img)
+    encode_ms = (time.perf_counter() - encode_started) * 1000
+    if jpeg is None:
         return _failed("JPEG encoding failed")
     if timeout_s <= 0 or total_timeout_s <= 0 or not 1 <= max_attempts <= 5:
         return _failed("invalid detector retry budget")
-    body = {"image": base64.b64encode(buf.tobytes()).decode("ascii"),
+    body = {"image": base64.b64encode(jpeg).decode("ascii"),
             "text_prompt": prompt, "box_threshold": float(box_threshold)}
     from skill3d.infra.m5_identity import content_sha256
     digest = content_sha256(body)
+    preparation = {
+        "encode_ms": encode_ms, "jpeg_cache_hit": cache_hit,
+        "request_bytes": len(requests.compat.json.dumps(body, allow_nan=False).encode("utf-8")),
+    }
     deadline = time.monotonic() + total_timeout_s
     data = None
     for attempt in range(1, max_attempts + 1):
@@ -157,6 +200,7 @@ def detect(frame: np.ndarray, prompt: str, *,
             message = f"{type(exc).__name__}: {exc}"
             _record_attempt({
                 "request_sha256": digest, "prompt": prompt, "attempt": attempt,
+                **preparation,
                 "status": "error", "http_status": status_code, "error": message,
                 "retryable": retryable, "will_retry": retry,
                 "elapsed_s": time.monotonic() - started,
@@ -167,6 +211,7 @@ def detect(frame: np.ndarray, prompt: str, *,
             continue
         _record_attempt({
             "request_sha256": digest, "prompt": prompt, "attempt": attempt,
+            **preparation,
             "status": "ok" if data["detections"] else "empty",
             "http_status": status_code, "recovered": attempt > 1,
             "n_detections": len(data["detections"]),
