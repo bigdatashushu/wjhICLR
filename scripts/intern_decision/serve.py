@@ -199,6 +199,47 @@ def kernel_runtime_identity(model, qwen, *, kernel_mode=None,
                 'implementations': [implementations[key] for key in sorted(implementations)]}}
 
 
+def configure_patch_projection(model, qwen, projection='native'):
+    """Keep native startup import-free; load the standalone adapter only on opt-in."""
+    if projection == 'native':
+        return None
+    if projection != 'linear':
+        raise ValueError(f'Unknown patch projection: {projection}')
+    cls = getattr(qwen, 'Qwen3_5VisionPatchEmbed', None)
+    layers = [(name, layer) for name, layer in model.named_modules()
+              if cls is not None and isinstance(layer, cls)]
+    if len(layers) != 1:
+        raise RuntimeError('Linear patch projection requires exactly one official vision patch embed')
+    path = Path(__file__).resolve().with_name('patch_projection.py')
+    spec = importlib.util.spec_from_file_location('intern_patch_projection', path)
+    adapter_module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = adapter_module
+    spec.loader.exec_module(adapter_module)
+    name, layer = layers[0]
+    adapter = adapter_module.apply_patch_projection(layer, qwen, projection)
+    return name, adapter
+
+
+def patch_projection_identity(configured):
+    if configured is None:
+        return {'schema': 'intern-patch-projection/1',
+                'requested_projection': 'native', 'observed_projection': 'native'}
+    name, adapter = configured
+    return {'layer': name, **adapter.identity()}
+
+
+def verify_patch_projection(model, qwen, configured):
+    if configured is None:
+        return
+    name, adapter = configured
+    layers = [(key, layer) for key, layer in model.named_modules()
+              if isinstance(layer, qwen.Qwen3_5VisionPatchEmbed)]
+    if (len(layers) != 1 or layers[0][0] != name
+            or layers[0][1] is not adapter.original_forward.__self__):
+        raise RuntimeError('Model vision patch embed changed after applying adapter')
+    adapter.verify()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model-dir', type=Path, required=True)
@@ -209,6 +250,9 @@ def main():
     parser.add_argument('--kernel-mode', choices=('torch', 'fla', 'full'),
         help='Require torch only, FLA attention with torch convolution, or FLA with causal-conv1d; '
              'omitting this flag preserves automatic upstream selection')
+    parser.add_argument('--patch-projection', choices=('native', 'linear'), default='native',
+        help='Preserve native Conv3d (default), or opt into the r03 linear vision patch adapter; '
+             'BF16 genuine-request equivalence is not established by this flag')
     args = parser.parse_args()
     start = time.perf_counter()
     args.temp_root.mkdir(parents=True, exist_ok=True)
@@ -233,14 +277,18 @@ def main():
     from transformers.models.qwen3_5 import modeling_qwen3_5
     kernels = kernel_runtime_identity(engine.backend.model, modeling_qwen3_5,
         kernel_mode=args.kernel_mode)
-    identity = {'schema': 'intern-decision-service/2',
+    projection = configure_patch_projection(engine.backend.model, modeling_qwen3_5,
+        args.patch_projection)
+    projection_identity = patch_projection_identity(projection)
+    identity = {'schema': ('intern-decision-service/3' if projection is not None
+                           else 'intern-decision-service/2'),
         'model': 'internlm/Intern-Decision-4B', 'model_revision': args.revision,
         'backend': 'native-hf-model-package', 'dtype': 'bfloat16',
         'implementation_sha256': file_sha(args.model_dir / 'inference.py'),
         'service_sha256': file_sha(Path(__file__)), 'files': expected['files'],
         'runtime': {'python': sys.version.split()[0], 'torch': torch.__version__,
                     'transformers': transformers.__version__, 'cuda': torch.version.cuda,
-                    'kernels': kernels},
+                    'kernels': kernels, 'patch_projection': projection_identity},
         'processor': json.loads((args.model_dir / 'preprocessor_config.json').read_text()),
         'limits': {'max_length': 8192, 'max_images': 3, 'max_body_bytes': 32*1024*1024,
                    'max_image_bytes': 12*1024*1024, 'max_pixels': 16000000,
@@ -250,6 +298,12 @@ def main():
         'readout': 'official compile_row; logits at marker minus 1; legal single-token symbols',
         'device': {'name': torch.cuda.get_device_name(0), 'visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES')}}
     identity_sha = digest(identity)
+
+    def verify_projection():
+        verify_patch_projection(engine.backend.model, modeling_qwen3_5, projection)
+        if projection is not None and file_sha(Path(__file__)) != identity['service_sha256']:
+            raise RuntimeError('Service source changed after applying patch adapter')
+
     trace = {}
     original_encode = engine.backend.encode
 
@@ -301,6 +355,10 @@ def main():
         def do_GET(self):
             if self.path != '/health':
                 return self.send(404, {'error': 'unknown route'})
+            try:
+                verify_projection()
+            except Exception as exc:
+                return self.send(503, {'error': f'{type(exc).__name__}: {exc}'})
             self.send(200, {**startup, 'counters': counters,
                 'gpu_peak_allocated_bytes': torch.cuda.max_memory_allocated(),
                 'gpu_peak_reserved_bytes': torch.cuda.max_memory_reserved()})
@@ -329,6 +387,7 @@ def main():
                 # Empty images only for explicitly measured no-image diagnostics.
                 if len(images) not in {0, 3}:
                     raise ValueError('supply zero diagnostic images or exactly three audit images')
+                verify_projection()
                 with tempfile.TemporaryDirectory(dir=args.temp_root, prefix='request-') as temp:
                     paths = []
                     for index, data_url in enumerate(images):
@@ -355,6 +414,7 @@ def main():
                     result = module.scale_result(raw_result, temperature)
                     for answer in result['answers'].values():
                         answer['decision'] = module.argmax(answer['probabilities'])
+                    verify_projection()
                     self.send(200, {'request_sha256': request_sha, 'identity_sha256': identity_sha,
                         'result': result, 'uncalibrated_result': raw_result,
                         'vision_evidence': dict(trace), 'elapsed_s': time.perf_counter()-began,
