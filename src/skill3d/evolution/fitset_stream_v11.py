@@ -45,7 +45,10 @@ from skill3d.evolution.streaming_v11 import (
     StreamingEvolutionConfig,
     StreamingEvolutionRunner,
 )
-from skill3d.schemas import SkillCandidateV11, SkillSpecV11, Spec, EvidenceProfile
+from skill3d.schemas import (
+    SkillCandidateV11, SkillSpecV11, Spec, EvidenceProfile,
+    V11ExperienceCase, V11ExperienceBundle, DataAccessRecord,
+)
 from skill3d.schemas.evidence import skill_evidence_state
 from pydantic import Field, model_validator
 from skill3d.skills.promote_atomic import read_snapshot
@@ -58,7 +61,7 @@ from skill3d.skills.v11_library import (
     write_v11_snapshot,
 )
 
-FIT_STREAM_SCHEMA = "harness3d-fitset-stream/4.0"
+FIT_STREAM_SCHEMA = "harness3d-fitset-stream/5.0"
 
 
 @dataclass(frozen=True)
@@ -71,6 +74,12 @@ class FitSetEvolutionConfig:
     scheduling_mode: Literal["batch_v1", "novel_failure_v1"] = "novel_failure_v1"
     max_revision_requests_per_slot: int = 18
     max_gate_candidates_per_slot: int = 6
+    learning_input_mode: str = "aggregate_v1"
+    gate_mode: str = "same_question"
+    diagnosis_max_cases: int = 4
+    diagnosis_max_input_chars: int = 64000
+    diagnosis_max_images: int = 8
+    diagnosis_max_output_tokens: int = 4096
 
     def __post_init__(self):
         if self.batch_size != 12:
@@ -83,6 +92,14 @@ class FitSetEvolutionConfig:
             raise ValueError("unknown revision scheduling mode")
         if min(self.max_revision_requests_per_slot, self.max_gate_candidates_per_slot) < 1:
             raise ValueError("per-slot revision/gate limits must be positive")
+        if self.learning_input_mode not in {
+                "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"}:
+            raise ValueError("unknown learning input mode")
+        if self.gate_mode not in {"same_question", "scene_disjoint"}:
+            raise ValueError("unknown gate mode")
+        if min(self.diagnosis_max_cases, self.diagnosis_max_input_chars,
+               self.diagnosis_max_images, self.diagnosis_max_output_tokens) < 1:
+            raise ValueError("diagnosis budgets must be positive")
 
 
 class FitSetExperienceCase(Spec):
@@ -107,6 +124,7 @@ class FitSetExperienceCase(Spec):
     trace_sha256: str
     initial_evidence_states: dict
     evidence_history: list[dict]
+    full_case: V11ExperienceCase | None = None
 
     @model_validator(mode="after")
     def _validate_identity(self):
@@ -124,6 +142,14 @@ class FitSetExperienceCase(Spec):
             EvidenceProfile.model_validate(row["evidence_states"])
         if (self.outcome == "success") != (self.score == 1):
             raise ValueError("fit-set case outcome 与 score 不符")
+        if self.full_case is not None:
+            for field in (
+                "qa_id", "scene_id", "question_type", "evidence_state", "source_split",
+                "delivered_skill_version", "delivered_content_sha256", "delivered_skill_md",
+                "score", "outcome", "trace_ref", "initial_evidence_states", "evidence_history",
+            ):
+                if getattr(self, field) != getattr(self.full_case, field):
+                    raise ValueError(f"fit-set buffer/canonical case {field} mismatch")
         return self
 
 
@@ -381,6 +407,7 @@ class FitSetWorkerEvolution:
                 batch_size=self.config.batch_size, tail_for_unattempted_slots=False),
         )
         self.rows = {row["variant_id"]: row for row in runner.variants}
+        self.rows.update(getattr(runner, "gate_variant_rows", {}))
 
     def provider(self, variant):
         parents, snapshot = _active(self.library)
@@ -407,6 +434,31 @@ class FitSetWorkerEvolution:
         accessed_at = datetime.now(timezone.utc).isoformat()
         label = self.runner.label_metadata[variant["qa_id"]]
         case = collect_fitset_case(variant, outcome, parent, label, str(outcome_path))
+        if self.config.learning_input_mode != "aggregate_v1":
+            from skill3d.evolution.case_records_v11 import case_from_fitset_outcome
+
+            source = self.runner.offline_case_input(variant)
+            canonical_path = self.root / "canonical_cases" / f"{case.case_id}.json"
+            if canonical_path.exists():
+                full_case = V11ExperienceCase.model_validate_json(canonical_path.read_bytes())
+                _require(full_case.delivered_content_sha256 == parent.content_sha256
+                         and full_case.qa_id == variant["qa_id"]
+                         and full_case.trace_ref == str(outcome_path),
+                         "canonical learning case identity changed")
+            else:
+                full_case = case_from_fitset_outcome(
+                    variant=variant, outcome=outcome, parent=parent, label=label,
+                    trace_ref=str(outcome_path), question_text=source["question_text"],
+                    options=source["options"], frame_set_hash=source["frame_set_hash"],
+                    image_refs=source["image_refs"],
+                )
+                _write_create_once(canonical_path, full_case.model_dump(mode="json"))
+            case = FitSetExperienceCase.model_validate({
+                **case.model_dump(mode="json"),
+                "full_case": full_case.model_dump(mode="json"),
+                "score": full_case.score, "outcome": full_case.outcome,
+                "failure_categories": full_case.failure_categories,
+            })
         access_path = self.root / "label_access" / f"{case.case_id}.json"
         access = {
                 "experiment_role": "fit_set_learning",
@@ -694,6 +746,8 @@ class FitSetWorkerEvolution:
                     continue
                 revision_requests_used += len(list(
                     (path.parent / "revision").glob("slots/*/*/request_intent_*.json")))
+                revision_requests_used += len(list(
+                    (path.parent / "diagnosis").glob("*/request_intent.json")))
                 prior_schedule = path.parent / "schedule.json"
                 if (prior["parent_content_sha256"] == parent.content_sha256
                         and prior_schedule.exists()):
@@ -709,14 +763,22 @@ class FitSetWorkerEvolution:
             ]
             schedule = scheduling_decision(
                 feedback=feedback, previous_patterns=prior_patterns,
-                mode=self.config.scheduling_mode,
+                mode=(self.config.scheduling_mode
+                      if self.config.learning_input_mode == "aggregate_v1" else "batch_v1"),
                 revision_requests_used=revision_requests_used,
                 gate_candidates_used=sum(entry["slot"] == request.slot_key for entry in entries),
                 max_revision_requests=self.config.max_revision_requests_per_slot,
                 max_gate_candidates=self.config.max_gate_candidates_per_slot,
             )
+            schedule["requested_mode"] = self.config.scheduling_mode
+            schedule["learning_input_mode"] = self.config.learning_input_mode
+            diagnosis_cost = int(self.config.learning_input_mode.startswith("diagnosis"))
+            if schedule["scheduled"] and schedule["remaining_revision_requests"] <= diagnosis_cost:
+                schedule["scheduled"] = False
+                schedule["reason_code"] = "revision_request_budget_exhausted"
             schedule["revision_attempt_budget"] = min(
-                self.config.max_revision_attempts, schedule["remaining_revision_requests"])
+                self.config.max_revision_attempts,
+                max(0, schedule["remaining_revision_requests"] - diagnosis_cost))
             schedule["identity_sha256"] = content_sha256(schedule)
             _write_create_once(schedule_path, schedule)
         if not schedule["scheduled"]:
@@ -743,11 +805,68 @@ class FitSetWorkerEvolution:
         _require(not leakage_scan_text(
             json.dumps(feedback), forbidden_sample_ids=forbidden),
                  "offline prompt 泄漏扫描失败")
+        experience = None
+        diagnosis = None
+        if self.config.learning_input_mode != "aggregate_v1":
+            full_cases = [case.full_case for case in request.cases]
+            _require(all(case is not None for case in full_cases),
+                     "complete learning mode requires canonical cases")
+            bundle_path = root / "experience_bundle.json"
+            if bundle_path.exists():
+                experience = V11ExperienceBundle.model_validate_json(bundle_path.read_bytes())
+                _require([case.case_id for case in experience.cases]
+                         == [case.case_id for case in full_cases],
+                         "canonical experience changed during resume")
+            else:
+                access = DataAccessRecord(
+                    record_id=f"fit-label-access-{token}",
+                    at=datetime.now(timezone.utc).isoformat(), split="induction",
+                    purpose="skill_induction", component_role="inducer",
+                    run_id=token, n_items=len(full_cases), label_access=True,
+                    input_manifest_sha256=content_sha256(
+                        [case.model_dump(mode="json") for case in full_cases]),
+                    source_refs=[case.trace_ref for case in full_cases],
+                    notes=["Question-level induction labels only; no GT 3D access"],
+                )
+                experience = V11ExperienceBundle(
+                    campaign_id=token, parent_snapshot_id=request.parent_snapshot_id,
+                    parent_skill_version=request.parent_skill_version,
+                    parent_content_sha256=parent.content_sha256,
+                    question_type=parent.question_type, evidence_state=parent.evidence_state,
+                    source_split="induction", split="learning", label_access=True,
+                    source_run_ref=str(root), label_access_record=access, cases=full_cases,
+                )
+                _write_create_once(bundle_path, experience.model_dump(mode="json"))
+            if self.config.learning_input_mode.startswith("diagnosis"):
+                from skill3d.evolution.diagnosis_v11 import (
+                    FrozenCaseImageProvider, OfflineDiagnosisConfig, V11CaseDiagnoser,
+                )
+
+                multimodal = self.config.learning_input_mode == "diagnosis_multimodal_v1"
+                diagnoser = V11CaseDiagnoser(
+                    self.runner._govern_client(
+                        self.runner.revision_client_factory(), "diagnosis",
+                        {"slot_key": request.slot_key, "campaign_id": token,
+                         "run_identity": self.runner.run_identity}),
+                    root / "diagnosis",
+                    OfflineDiagnosisConfig(
+                        mode="multimodal" if multimodal else "text",
+                        max_cases=self.config.diagnosis_max_cases,
+                        max_input_chars=self.config.diagnosis_max_input_chars,
+                        max_images=self.config.diagnosis_max_images,
+                        max_output_tokens=self.config.diagnosis_max_output_tokens),
+                )
+                diagnosis = diagnoser.diagnose(
+                    parent, experience, context={"campaign_id": token},
+                    image_provider=FrozenCaseImageProvider(
+                        [self.runner.root]) if multimodal else None,
+                )
         decision_path = root / "decision.json"
         try:
             candidate = reviser._revise_slot(
                 slot=(request.question_type, request.evidence_state),
-                parent=parent, feedback=feedback, forbidden_ids=forbidden)
+                parent=parent, feedback=feedback, forbidden_ids=forbidden,
+                experience=experience, diagnosis=diagnosis)
         except FitSetError as exc:
             result = StreamingAttemptResult(
                 outcome="rejected", campaign_id=token, reason=str(exc))

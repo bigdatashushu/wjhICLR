@@ -1,8 +1,8 @@
 """Fit-set Harness3D execution and direct-Qwen comparison for v11.
 
-This exploratory path intentionally reuses the same questions for Skill
-induction and final comparison. It does not modify the production active Skill
-pointer. Every reachable ``(question_type, evidence_state)`` slot receives an
+The legacy exploratory path reuses questions for induction and comparison;
+scene-disjoint evolution instead freezes a separate held-out gate. Neither path
+modifies the production active Skill pointer. Every reachable slot receives an
 independent candidate body; the frozen bundle also preserves the active parent
 for physical slots that are not revised by the selected panel.
 """
@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 import copy
 import hashlib
+import io
 import json
 import math
 import multiprocessing
@@ -1241,6 +1242,7 @@ class SystemVariantRunner:
         skill_owners: int = 4,
         request_governor_config=None,
         published_inputs=None,
+        gate_variants: Sequence[Mapping] | None = None,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -1248,6 +1250,23 @@ class SystemVariantRunner:
         self.panel = panel
         self.panel_name = panel_name
         self.variants = [dict(row) for row in variants]
+        _require(bool(self.variants), "learning/execution variants must not be empty")
+        self.gate_variant_rows: dict[str, dict] = {}
+        self.variant_rows: dict[str, dict] = {}
+        for rows, is_gate in ((self.variants, False), (gate_variants or (), True)):
+            for raw in rows:
+                row = dict(raw)
+                variant_id = str(row.get("variant_id") or "")
+                _require(bool(variant_id) and variant_id not in self.variant_rows,
+                         f"duplicate or empty frozen variant_id: {variant_id!r}")
+                key = fit_slot_key(row["question_type"], row["evidence_state"])
+                _require(row.get("slot_key", key) == key,
+                         f"{variant_id}: frozen slot identity changed")
+                row["slot_key"] = key
+                self.variant_rows[variant_id] = row
+                if is_gate:
+                    self.gate_variant_rows[variant_id] = row
+        self.variants = [self.variant_rows[row["variant_id"]] for row in self.variants]
         self.item_provider = item_provider
         self.published_inputs = published_inputs
         self.input_receipt_provider = input_receipt_provider
@@ -1304,6 +1323,8 @@ class SystemVariantRunner:
                 ),
             )
         ]
+        _require(not self.gate_variant_rows or self.evolution_config is not None,
+                 "separate gate variants require accumulation evolution")
         if self.evolution_config is not None:
             _require(phase == "accumulation", "只有 accumulation 可启动演化")
             _require(self.revision_client_factory is not None
@@ -1316,22 +1337,58 @@ class SystemVariantRunner:
                 == set(ALL_FIT_SLOTS),
                 "演化初始 provider 必须提供完整 24 槽位 seed",
             )
+            learning_mode = self.evolution_config.learning_input_mode
+            gate_mode = self.evolution_config.gate_mode
+            legacy = learning_mode == "aggregate_v1" and gate_mode == "same_question"
+            _require(gate_mode in {"same_question", "scene_disjoint"},
+                     "unknown gate mode")
+            _require(learning_mode in {
+                "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1",
+            }, "unknown learning input mode")
+            _require(gate_mode != "same_question" or not self.gate_variant_rows,
+                     "same_question cannot accept separate gate variants")
             by_slot: dict[str, list[dict]] = {}
-            for row in self.execution_variants:
-                _require(row["qa_id"] in self.label_metadata, "演化缺少 label metadata")
+            for row in [*self.execution_variants, *self.gate_variant_rows.values()]:
+                variant_id = row["variant_id"]
+                _require(bool(row.get("scene_id")), f"{variant_id}: scene_id is missing")
                 key = fit_slot_key(row["question_type"], row["evidence_state"])
                 _require((row["question_type"], row["evidence_state"])
-                         in set(REACHABLE_FIT_SLOTS), "演化包含不可达槽位")
-                by_slot.setdefault(key, []).append(row)
+                         in set(REACHABLE_FIT_SLOTS), "evolution contains an unreachable slot")
+                label = self.label_metadata.get(row["qa_id"])
+                _require(label is not None, f"{variant_id}: evolution lacks label metadata")
+                _require(label.get("scene_id") == row["scene_id"]
+                         and label.get("question_type") == row["question_type"],
+                         f"{variant_id}: label metadata identity changed")
+                if variant_id not in self.gate_variant_rows:
+                    _require(legacy or row.get("split") == "induction",
+                             f"{variant_id}: rich/disjoint learning requires induction-only variants")
+                    by_slot.setdefault(key, []).append(row)
+            gate_by_slot: dict[str, list[dict]] = {}
+            if gate_mode == "scene_disjoint":
+                _require(bool(self.gate_variant_rows),
+                         "scene_disjoint requires supplied held-out gate variants")
+                learning_scenes = {row["scene_id"] for row in self.variants}
+                for row in self.gate_variant_rows.values():
+                    variant_id = row["variant_id"]
+                    _require(row.get("split") in {"induction", "inner_validation"},
+                             f"{variant_id}: gate requires held-out induction or inner_validation")
+                    _require(row["scene_id"] not in learning_scenes,
+                             f"{variant_id}: gate scene overlaps learning scenes")
+                    _require(variant_id in self.binding_refs,
+                             f"{variant_id}: gate prepared binding reference is missing")
+                    gate_by_slot.setdefault(row["slot_key"], []).append(row)
             for key, rows in by_slot.items():
                 selected = []
                 scenes = set()
-                for row in rows:
+                gate_rows = gate_by_slot.get(key, ()) if gate_mode == "scene_disjoint" else rows
+                for row in gate_rows:
                     if row["scene_id"] not in scenes:
                         selected.append(row["variant_id"])
                         scenes.add(row["scene_id"])
                     if len(selected) == self.evolution_config.gate_size:
                         break
+                _require(legacy or len(selected) == self.evolution_config.gate_size,
+                         f"{key}: incomplete frozen gate_size; distinct scenes required")
                 self.gate_panels[key] = selected
 
     def __getstate__(self) -> dict:
@@ -1391,6 +1448,11 @@ class SystemVariantRunner:
             "panel_file_sha256": self.panel["panel_file_sha256"],
             "variant_ids": [row["variant_id"] for row in self.variants],
             "variant_rows_sha256": content_sha256(self.variants),
+            "gate_variant_ids": list(self.gate_variant_rows),
+            "gate_variant_rows": list(self.gate_variant_rows.values()),
+            "gate_variant_rows_sha256": content_sha256(list(self.gate_variant_rows.values())),
+            "frozen_union_rows_sha256": content_sha256(list(self.variant_rows.values())),
+            "binding_refs_sha256": content_sha256(self.binding_refs),
             "skill_identities_sha256": content_sha256(identities),
             "input_contract_identity": self.input_contract_identity,
             "min_free_gib": self.min_free_gib,
@@ -1446,6 +1508,13 @@ class SystemVariantRunner:
             "online_executor_input_is_label_free": self.published_inputs is not None,
             "reference_answer_visible_to_online_model": False,
             "solver_config_sha256": content_sha256(_json_value(asdict(self.base_cfg))),
+            "request_input_config": {
+                "solver_config": _json_value(asdict(self.base_cfg)),
+                "evolution_config": (
+                    _json_value(asdict(self.evolution_config))
+                    if self.evolution_config is not None else None),
+                "offline_case_input_schema": "v11-fit-set-offline-input/1.0",
+            },
         }
         if self.scheduler == "episode_pool":
             body["execution"].update({
@@ -1476,6 +1545,113 @@ class SystemVariantRunner:
 
     def _result_path(self, variant_id: str) -> Path:
         return self.root / "results" / f"{_variant_key(variant_id)}.json"
+
+    def _validate_gate_inputs(self) -> None:
+        if not self.gate_variant_rows:
+            return
+        # Validate every held-out input before any learning request, even when
+        # --max-variants restricts execution to a smaller learning subset.
+        for variant in self.gate_variant_rows.values():
+            values = self._prepare_one(variant, preflight=True)
+            _require(values["state"] == variant["evidence_state"],
+                     f"{variant['variant_id']}: gate runtime evidence state changed")
+            for field, reference_field in (
+                ("binding_key", "key"), ("binding_manifest_sha256", "manifest_sha256"),
+            ):
+                _require(not variant.get(field)
+                         or variant[field] == values["reference"][reference_field],
+                         f"{variant['variant_id']}: frozen gate binding identity changed")
+            _write_create_once(
+                self.root / "gate_preflight" / f"{_variant_key(variant['variant_id'])}.json",
+                {
+                    "variant": variant,
+                    "input_identity_sha256": values["identity"]["sha256"],
+                    "runtime_evidence_state": values["state"],
+                    "binding_key": values["reference"]["key"],
+                    "binding_manifest_sha256": values["reference"]["manifest_sha256"],
+                    "model_requests": 0,
+                },
+            )
+
+    def _freeze_offline_case_input(self, variant: Mapping, item: EpisodeItem) -> None:
+        from PIL import Image
+
+        variant_root = self.root / "variants" / _variant_key(str(variant["variant_id"]))
+        fs = item.episode.frame_set
+        _require(fs is not None and len(fs.frame_ids) == len(item.pixels) == 32,
+                 "offline case requires the frozen 32-frame public input")
+        image_refs = []
+        for index, pixels in enumerate(item.pixels):
+            _require(pixels.dtype == np.uint8 and pixels.ndim == 3 and pixels.shape[2] == 3,
+                     "offline case requires original RGB uint8 frames")
+            image = Image.fromarray(pixels)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            data = buffer.getvalue()
+            path = variant_root / "offline_images" / f"{index:02d}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with path.open("xb") as stream:
+                    stream.write(data)
+            except FileExistsError:
+                _require(path.read_bytes() == data, f"immutable offline image changed: {path}")
+            digest = hashlib.sha256(data).hexdigest()
+            image_refs.append({
+                "path": str(path), "file_sha256": digest, "content_sha256": digest,
+                "image_id": f"{variant['variant_id']}:frame:{fs.frame_ids[index]}",
+                "kind": "frame", "frame_id": fs.frame_ids[index],
+                "source_frame_index": fs.source_frame_indices[index],
+                "source_hw": [image.height, image.width],
+                "frame_set_hash": fs.frame_set_hash,
+            })
+        _write_create_once(variant_root / "offline_input.json", {
+            "schema_version": "v11-fit-set-offline-input/1.0",
+            "variant_id": variant["variant_id"],
+            "variant_sha256": content_sha256(variant),
+            "qa_id": variant["qa_id"], "scene_id": variant["scene_id"],
+            "split": variant["split"],
+            "question_text": item.episode.question,
+            "options": list(item.episode.options or []),
+            "frame_set_hash": fs.frame_set_hash,
+            "image_refs": image_refs,
+        })
+
+    def offline_case_input(self, variant: Mapping) -> dict:
+        """Read the public input frozen during execution; never recover labels."""
+        path = (self.root / "variants" / _variant_key(str(variant["variant_id"]))
+                / "offline_input.json")
+        _require(path.is_file(), f"{variant['variant_id']}: offline_input.json is missing")
+        value = json.loads(path.read_text(encoding="utf-8"))
+        _require(set(value) == {
+            "schema_version", "variant_id", "variant_sha256", "qa_id", "scene_id",
+            "split", "question_text", "options", "frame_set_hash", "image_refs",
+        } and value.get("schema_version") == "v11-fit-set-offline-input/1.0"
+                 and value.get("variant_id") == variant["variant_id"]
+                 and value.get("variant_sha256") == content_sha256(variant)
+                 and value.get("qa_id") == variant["qa_id"]
+                 and value.get("scene_id") == variant["scene_id"]
+                 and value.get("split") == variant["split"],
+                 f"{variant['variant_id']}: offline input identity changed")
+        result_path = self._result_path(str(variant["variant_id"]))
+        if result_path.is_file():
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            _require(result.get("offline_input_sha256") == file_identity(path)["sha256"],
+                     f"{variant['variant_id']}: offline input differs from completed result")
+        _require(isinstance(value["image_refs"], list) and len(value["image_refs"]) == 32,
+                 f"{variant['variant_id']}: incomplete frozen offline image refs")
+        for ref in value["image_refs"]:
+            _require(set(ref) == {
+                "path", "file_sha256", "content_sha256", "image_id", "kind",
+                "frame_id", "source_frame_index", "source_hw", "frame_set_hash",
+            } and ref["frame_set_hash"] == value["frame_set_hash"],
+                     f"{variant['variant_id']}: offline image provenance changed")
+            image_path = Path(ref["path"])
+            _require(image_path.parent == path.parent / "offline_images"
+                     and image_path.is_file()
+                     and file_identity(image_path)["sha256"] == ref["file_sha256"]
+                     == ref["content_sha256"],
+                     f"{variant['variant_id']}: frozen offline image changed")
+        return value
 
     def _require_storage_reserve(self, variant_id: str) -> None:
         free_gib = shutil.disk_usage(self.root).free / (1024 ** 3)
@@ -1736,6 +1912,11 @@ class SystemVariantRunner:
         trace_dir = variant_root / "trace"
         _require(not trace_dir.exists(),
                  f"{variant_id}: incomplete trace exists without a result")
+        rich_input = (
+            self.evolution_config is not None
+            and self.evolution_config.learning_input_mode != "aggregate_v1")
+        if rich_input:
+            self._freeze_offline_case_input(variant, item)
         cfg = replace(
             copy.deepcopy(runtime_base_cfg),
             skills=[skill.model_copy(deep=True) for skill in skills],
@@ -1801,6 +1982,9 @@ class SystemVariantRunner:
             elapsed_s=elapsed,
             skill_identity=skill_identity,
         )
+        if rich_input:
+            row["offline_input_sha256"] = file_identity(
+                variant_root / "offline_input.json")["sha256"]
         _write_create_once(self._result_path(variant_id), row)
         if any(
             (record.get("execution_diagnostics") or {}).get("error_message")
@@ -2113,6 +2297,7 @@ class SystemVariantRunner:
         variant_ids: Sequence[str] = (),
     ) -> dict:
         manifest = self.initialize(resume=resume)
+        self._validate_gate_inputs()
         wanted = set(variant_ids)
         known = {row["variant_id"] for row in self.variants}
         _require(not (wanted - known),
@@ -2168,6 +2353,7 @@ class SystemVariantRunner:
         variant_ids: Sequence[str] = (),
     ) -> dict:
         manifest = self.initialize(resume=resume)
+        self._validate_gate_inputs()
         completed = self.completed()
         wanted = set(variant_ids)
         known = {row["variant_id"] for row in self.variants}

@@ -1113,6 +1113,12 @@ class V11ProductionAttempt:
                 campaign_id=campaign_id,
                 reason=str(exc),
             )
+        if checkpoint.status == "no_change":
+            return StreamingAttemptResult(
+                outcome="no_change",
+                campaign_id=campaign_id,
+                reason="offline revision kept the parent method",
+            )
         if checkpoint.status == "rejected":
             return StreamingAttemptResult(
                 outcome="rejected",

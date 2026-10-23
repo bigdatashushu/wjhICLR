@@ -102,3 +102,48 @@ the streaming CLI with:
 The runtime keeps the configured 80 GiB free-space reserve. Binding preparation
 should run in rolling scene batches when the remaining capacity cannot cover
 the complete frozen panel.
+
+## Complete cases and optional offline diagnosis
+
+Production collection now writes `skill-experience-bundle-v11/6.0`. Cases retain
+the original round programs, tool results, read/use/invalidation relationships,
+frame-set identity and image provenance. Missing historical fields remain
+unknown; a final program never substitutes for an unrecorded earlier round.
+Resolved tool IDs remain distinct from explicitly recorded object selections.
+Version 5 bundles remain readable for audit, but new campaigns require version 6.
+
+`--diagnosis-mode off` keeps the complete text-case revision baseline. `text`
+adds one source-linked offline diagnosis per campaign. `multimodal` additionally
+requires an explicit `--diagnosis-image-root` allowlist or injected image provider
+and verifiable local image references. The provider reads original bytes and
+checks their recorded hashes. Image paths or image-ledger entries alone never
+count as supplied pixels. The production offline model's actual image support
+requires service validation before a multimodal experiment.
+
+The frozen diagnosis defaults are 4 cases, 64000 input characters, 8 images and
+4096 output tokens. Corresponding CLI flags are
+`--diagnosis-max-cases`, `--diagnosis-max-input-chars`,
+`--diagnosis-max-images` and `--diagnosis-max-output-tokens`.
+Selection alternates success, failure and partial-score cases deterministically;
+oversized cases are omitted whole and recorded. Observations cite original
+evidence. Hypotheses additionally cite parent headings bound to the parent
+source hash, declare low/medium confidence and alternative explanations.
+The full original bundle remains in the revision input alongside the diagnosis.
+The diagnosis cannot execute tools, score candidates or decide publication.
+
+Revision returns `revise` or `no_change`. The latter is a normal, resumable
+terminal campaign decision: no candidate, gate or pointer change is produced,
+and the slot continues gathering new cases. A formatting repair receives the
+previous failed candidate with its original hash, safe issue codes and line
+positions; copied sample content is redacted. Over-budget repair input stops
+the attempt instead of silently truncating the source.
+
+Execution requires an explicit `--max-requests` budget. Solver, reviser,
+diagnosis and gate share the governor's cumulative request cap, concurrency
+permits and optional rate limit. The CLI disables hidden offline retries.
+Durable request intents and completion receipts prevent automatic replay of an
+unknown completion. Completed diagnosis is reused across static repairs.
+Induction question-level labels remain offline only; GT 3D and inner/outer/test
+feedback never enter diagnosis or revision. Every new input/method configuration
+requires a new experiment identity, and these engineering checks do not establish
+an accuracy improvement.

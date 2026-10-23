@@ -84,9 +84,12 @@ class V11CampaignBlocked(RuntimeError):
 class V11RevisionFormatError(RuntimeError):
     """A durably recorded model response consumed a revision attempt."""
 
-    def __init__(self, message: str, *, source_run_ref: str) -> None:
+    def __init__(
+        self, message: str, *, source_run_ref: str, candidate_text: str = ""
+    ) -> None:
         super().__init__(message)
         self.source_run_ref = source_run_ref
+        self.candidate_text = candidate_text
 
 
 @dataclass(frozen=True)
@@ -223,6 +226,29 @@ def _sample_copy_leaks(
             if len(normalized) >= 24 and normalized in candidate:
                 hits.append(f"option:{case.case_id}:{index}")
     return hits
+
+
+def _markdown_sections(source: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
+    heading = ""
+    fence = ""
+    for line in source.splitlines(keepends=True):
+        marker = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if marker:
+            token = marker.group(1)[0]
+            if not fence:
+                fence = token
+            elif fence == token:
+                fence = ""
+        match = re.match(r"^#{1,6}\s+(.+?)\s*#*\s*$", line) if not fence else None
+        if match:
+            heading = match.group(1).strip()
+            sections.setdefault(heading, [])
+        if heading:
+            sections[heading].append(line)
+    if not sections:
+        return {"__body__": source}
+    return {name: "".join(lines) for name, lines in sections.items()}
 
 
 class V11CampaignRunner:
@@ -456,6 +482,10 @@ class V11CampaignRunner:
         bundle: V11ExperienceBundle,
         parent: SkillSpecV11,
     ) -> None:
+        from skill3d.schemas.evolution_v11 import V11_EXPERIENCE_SCHEMA_VERSION
+
+        if bundle.schema_version != V11_EXPERIENCE_SCHEMA_VERSION:
+            raise V11CampaignBlocked("legacy experience bundles are read-only")
         assert self.checkpoint is not None
         expected = {
             "campaign_id": self.campaign_id,
@@ -487,6 +517,7 @@ class V11CampaignRunner:
         *,
         attempt: int,
         feedback: list[str],
+        repair_context: dict | None = None,
     ) -> V11RevisionAttemptReceipt:
         key = f"revision_attempt_{attempt:02d}"
         experience_sha256 = _sha256(_json_bytes(bundle))
@@ -502,6 +533,8 @@ class V11CampaignRunner:
                 raise V11CampaignBlocked("修订收据与当前父版本/经验包不一致")
             return existing
         self._set_status("revising")
+        format_problems: list[str] = []
+        format_candidate_text: str | None = None
         try:
             value = self.reviser(
                 campaign_id=self.campaign_id,
@@ -509,14 +542,19 @@ class V11CampaignRunner:
                 experience=bundle.model_copy(deep=True),
                 attempt=int(attempt),
                 static_feedback=list(feedback),
+                repair_context=repair_context,
                 idempotency_key=f"{self.campaign_id}:revise:{attempt}",
             )
         except V11RevisionFormatError as exc:
-            # Deliberately invalid source: static validation records the failure,
-            # provides feedback, and consumes the same bounded attempt budget.
+            # Preserve the actual failed response for candidate-aware repair.
+            format_problems = [str(exc)]
+            format_candidate_text = exc.candidate_text
             value = V11RevisionProposal(
-                full_skill_md=f"Invalid offline response: {exc}\n",
-                modification_reason=f"Response format failure: {exc}",
+                full_skill_md=(
+                    exc.candidate_text if exc.candidate_text.strip()
+                    else "Invalid offline response.\n"
+                ),
+                modification_reason="Response format failure",
                 source_run_ref=exc.source_run_ref,
             )
         proposal = _coerce(V11RevisionProposal, value)
@@ -526,6 +564,8 @@ class V11CampaignRunner:
             parent_skill_version=self.checkpoint.parent_skill_version,
             experience_sha256=experience_sha256,
             proposal=proposal,
+            format_problems=format_problems,
+            format_candidate_text=format_candidate_text,
         )
         self._record_receipt(key, receipt)
         return receipt
@@ -543,7 +583,10 @@ class V11CampaignRunner:
             return existing
 
         proposal = proposal_receipt.proposal
+        if proposal.action != "revise":
+            raise V11CampaignBlocked("no_change must not enter static validation")
         raw = proposal.full_skill_md
+        assert raw is not None
         raw_sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         version = bump_semver(parent.version, "MINOR")
         candidate_id = _candidate_id(parent.skill_id, version, raw_sha)
@@ -557,11 +600,29 @@ class V11CampaignRunner:
         )
         diff_sha = hashlib.sha256(source_diff.encode("utf-8")).hexdigest()
         checks: dict[str, bool] = {}
-        problems: list[str] = []
+        problems: list[str] = list(proposal_receipt.format_problems)
+        checks["revision_response_valid"] = not proposal_receipt.format_problems
 
         checks["content_changed"] = raw != parent.skill_md
         if not checks["content_changed"]:
             problems.append("The candidate's complete SKILL.md is identical to the parent version")
+
+        parent_sections = _markdown_sections(parent.skill_md)
+        candidate_sections = _markdown_sections(raw)
+        invalid_sections = [
+            section for section in proposal.changed_sections
+            if section not in candidate_sections
+            or candidate_sections[section] == parent_sections.get(section)
+        ]
+        checks["declared_sections_changed"] = not invalid_sections
+        for section in invalid_sections:
+            line = next(
+                (number for number, text in enumerate(raw.splitlines(), 1)
+                 if re.match(r"^#{1,6}\s", text) and section in text),
+                1,
+            )
+            problems.append(
+                f"declared_change_not_present: line={line}; rule=compare_actual_section_diff")
 
         candidate_spec: SkillSpecV11 | None = None
         candidate: SkillCandidateV11 | None = None
@@ -577,6 +638,7 @@ class V11CampaignRunner:
         except Exception as exc:
             checks["complete_source_valid"] = False
             problems.append(f"Invalid complete SKILL.md: {type(exc).__name__}: {exc}")
+            problems.append("complete_source_invalid: line=1; rule=canonical_skill_source")
 
         checks["same_lineage"] = candidate_spec is not None and (
             candidate_spec.skill_id == parent.skill_id
@@ -623,6 +685,10 @@ class V11CampaignRunner:
         checks["tools_known"] = not unknown_tools
         if unknown_tools:
             problems.append(f"The candidate references unknown tools: {unknown_tools}")
+            for number, line in enumerate(raw.splitlines(), 1):
+                if set(_unknown_tool_calls(line)) & set(unknown_tools):
+                    problems.append(
+                        f"unknown_tool: line={number}; rule=registered_tool")
 
         contract_issues = review_method_contract(raw)
         checks["execution_contract_consistent"] = not any(
@@ -672,8 +738,12 @@ class V11CampaignRunner:
         self,
         parent: SkillSpecV11,
         bundle: V11ExperienceBundle,
-    ) -> tuple[SkillCandidateV11 | None, V11StaticValidationReceipt]:
+    ) -> tuple[
+        SkillCandidateV11 | None,
+        V11StaticValidationReceipt | V11RevisionAttemptReceipt,
+    ]:
         feedback: list[str] = []
+        repair_context: dict | None = None
         last: V11StaticValidationReceipt | None = None
         for attempt in range(1, int(self.cfg.max_revision_attempts) + 1):
             proposal = self._proposal(
@@ -681,7 +751,12 @@ class V11CampaignRunner:
                 bundle,
                 attempt=attempt,
                 feedback=feedback,
+                repair_context=repair_context,
             )
+            if proposal.proposal.action == "no_change":
+                self.checkpoint.revision_attempt = attempt
+                self._save_checkpoint()
+                return None, proposal
             last = self._static_validate(parent, bundle, proposal)
             self.checkpoint.revision_attempt = attempt
             self._save_checkpoint()
@@ -697,9 +772,58 @@ class V11CampaignRunner:
                 )
                 self._save_checkpoint()
                 return candidate, last
-            feedback = list(last.problems)
+            if attempt < int(self.cfg.max_revision_attempts):
+                from skill3d.evolution.revision_input_v11 import (
+                    RepairContextError,
+                    build_repair_context,
+                )
+
+                try:
+                    repair_context = build_repair_context(
+                        proposal.format_candidate_text
+                        if proposal.format_candidate_text is not None
+                        else proposal.proposal.full_skill_md or "",
+                        last.problems,
+                        cases=bundle.cases,
+                        forbidden_ids=tuple(
+                            token for case in bundle.cases
+                            for token in (case.case_id, case.qa_id, case.scene_id)
+                        ),
+                        max_chars=int(self.cfg.method_context_max_chars),
+                    )
+                except RepairContextError:
+                    break
+                # Detailed issues and locations travel only in the safe context.
+                feedback = [
+                    f"Static check failed: {name}"
+                    for name, passed in last.checks.items() if not passed
+                ]
         assert last is not None
         return None, last
+
+    def _finish_no_change(
+        self, receipt: V11RevisionAttemptReceipt
+    ) -> V11CampaignCheckpoint:
+        assert self.checkpoint is not None
+        decision = V11CampaignDecision(
+            campaign_id=self.campaign_id,
+            question_type=self.cfg.question_type,
+            evidence_state=self.cfg.evidence_state,
+            stage="revision",
+            outcome="no_change",
+            parent_snapshot_id=self.checkpoint.parent_snapshot_id,
+            parent_skill_version=self.checkpoint.parent_skill_version,
+            conditions={"revision_no_change": True},
+            reasons=[receipt.proposal.modification_reason],
+        )
+        self._record_receipt("decision", decision)
+        self.checkpoint.decision = "no_change"
+        self.checkpoint.status = "no_change"
+        self.checkpoint.candidate_id = ""
+        self.checkpoint.candidate_skill_version = ""
+        self.checkpoint.candidate_content_sha256 = ""
+        self._save_checkpoint()
+        return self.checkpoint
 
     def _evaluate(
         self,
@@ -1174,7 +1298,7 @@ class V11CampaignRunner:
         return receipt
 
     def run(self) -> V11CampaignCheckpoint:
-        """Run or resume one campaign through reject, promote, or blocked."""
+        """Run or resume through no_change, reject, promote, or blocked."""
         parent, _snapshot = self._initialize()
         assert self.checkpoint is not None
         rollback_intent = self.root / "rollback_intent.json"
@@ -1184,13 +1308,15 @@ class V11CampaignRunner:
             self._rollback_failed_publication(publication, reason=intent["reason"])
             self.checkpoint.published_snapshot_id = ""
             self._block(intent["reason"])
-        if self.checkpoint.status in {"promoted", "rejected"}:
+        if self.checkpoint.status in {"promoted", "rejected", "no_change"}:
             return self.checkpoint
         if self.checkpoint.status == "blocked":
             raise V11CampaignBlocked(self.checkpoint.blocked_reason)
 
         bundle = self._collect(parent)
         candidate, static_receipt = self._generate_candidate(parent, bundle)
+        if isinstance(static_receipt, V11RevisionAttemptReceipt):
+            return self._finish_no_change(static_receipt)
         evaluation = (
             self._evaluate(parent, candidate, bundle)
             if candidate is not None

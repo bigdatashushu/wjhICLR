@@ -54,6 +54,11 @@ from skill3d.online.runner import OnlineRunConfig
 from skill3d.reconstruction.run import resolve_artifact_path
 from skill3d.routing.task_classifier import canonical_task
 from skill3d.skills.registry import active_snapshot_provenance
+from skill3d.synthesis.request_governor import (
+    GovernedClient,
+    RequestGovernor,
+    RequestGovernorConfig,
+)
 
 
 class V11StreamingCliError(ValueError):
@@ -340,6 +345,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--library-root", default="")
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--max-revision-attempts", type=int, default=3)
+    parser.add_argument(
+        "--diagnosis-mode", choices=["off", "text", "multimodal"], default="off",
+    )
+    parser.add_argument("--diagnosis-max-cases", type=int, default=4)
+    parser.add_argument("--diagnosis-max-input-chars", type=int, default=64000)
+    parser.add_argument("--diagnosis-max-images", type=int, default=8)
+    parser.add_argument("--diagnosis-max-output-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--diagnosis-image-root", action="append", default=[],
+        help="explicit allowlisted frozen-image root; repeat for multiple roots",
+    )
+    parser.add_argument("--request-governor-root", default="")
+    parser.add_argument("--max-requests", type=int, default=0,
+                        help="explicit shared paid-request budget for execution")
+    parser.add_argument("--max-inflight-requests", type=int, default=1)
+    parser.add_argument("--requests-per-second", type=float, default=0.0)
     parser.add_argument("--binding-store", default="")
     parser.add_argument("--prepared-bindings-json", default="")
     parser.add_argument(
@@ -371,7 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deepseek-base-url", default=BASE_URL)
     parser.add_argument("--deepseek-model", default=MODEL_ID)
     parser.add_argument("--deepseek-timeout-s", type=float, default=300.0)
-    parser.add_argument("--deepseek-max-retries", type=int, default=3)
+    parser.add_argument("--deepseek-max-retries", type=int, default=0)
     parser.add_argument("--deepseek-max-tokens", type=int, default=32768)
     parser.add_argument(
         "--deepseek-reasoning-effort",
@@ -381,9 +402,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, diagnosis_image_provider=None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.diagnosis_image_root:
+            if diagnosis_image_provider is not None:
+                raise V11StreamingCliError(
+                    "supply diagnosis image roots or an injected image provider, not both")
+            from skill3d.evolution.diagnosis_v11 import FrozenCaseImageProvider
+
+            diagnosis_image_provider = FrozenCaseImageProvider(args.diagnosis_image_root)
+        if args.diagnosis_mode == "multimodal" and diagnosis_image_provider is None:
+            raise V11StreamingCliError(
+                "multimodal diagnosis requires an explicitly injected image provider")
+        if args.deepseek_max_retries != 0:
+            raise V11StreamingCliError(
+                "production revision cannot replay unknown completions; "
+                "--deepseek-max-retries must be zero")
+        if not args.prepare_only and args.max_requests <= 0:
+            raise V11StreamingCliError("execution requires an explicit --max-requests budget")
         raw = resolve_runtime(load_config(args.config), seed=args.seed)
         args.seed = int(raw["seed"])
         targets = _target_slots(args)
@@ -794,12 +831,50 @@ def main(argv: list[str] | None = None) -> int:
             prompt_version=REVISION_PROMPT_VERSION,
             default_max_tokens=args.deepseek_max_tokens,
         )
+        governor = RequestGovernor(
+            args.request_governor_root or run_root / "request_governor",
+            RequestGovernorConfig(
+                max_requests=args.max_requests,
+                max_inflight=args.max_inflight_requests,
+                requests_per_second=args.requests_per_second,
+            ),
+        )
+        revision_client = GovernedClient(
+            offline_client, governor, category="reviser",
+            context={"run_identity": args.stream_id},
+        )
+        diagnosis_config = {
+            "mode": args.diagnosis_mode,
+            "max_cases": args.diagnosis_max_cases,
+            "max_input_chars": args.diagnosis_max_input_chars,
+            "max_images": args.diagnosis_max_images,
+            "max_output_tokens": args.diagnosis_max_output_tokens,
+        }
+        diagnoser = None
+        if args.diagnosis_mode != "off":
+            from skill3d.evolution.diagnosis_v11 import (
+                OfflineDiagnosisConfig,
+                V11CaseDiagnoser,
+            )
+
+            diagnosis_config = OfflineDiagnosisConfig(**diagnosis_config)
+            diagnoser = V11CaseDiagnoser(
+                GovernedClient(
+                    offline_client, governor, category="diagnosis",
+                    context={"run_identity": args.stream_id},
+                ),
+                audit_root=run_root / "campaigns",
+                config=diagnosis_config,
+            )
         reviser = V11OfflineReviser(
-            offline_client,
+            revision_client,
             audit_root=run_root / "campaigns",
             max_tokens=args.deepseek_max_tokens,
             require_health_check=True,
             method_context_max_chars=base_cfg.retrieval_policy.method_context_max_chars,
+            diagnosis_config=diagnosis_config,
+            diagnoser=diagnoser,
+            image_provider=diagnosis_image_provider,
         )
         production_attempt = V11ProductionAttempt(
             library_root=library_root,

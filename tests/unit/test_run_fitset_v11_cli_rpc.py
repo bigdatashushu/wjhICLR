@@ -72,7 +72,10 @@ def case(tmp_path, monkeypatch):
         model_revision="frozen-test-revision", max_tokens=3072,
         timeout_s=27.0, api_key_env="TEST_UNUSED_UPSTREAM_KEY",
     )
-    panel = {"proposal_sha256": "a" * 64, "panel_file_sha256": "b" * 64}
+    panel = {
+        "proposal_sha256": "a" * 64, "panel_file_sha256": "b" * 64,
+        "system_variants": variants,
+    }
     skills, _, snapshot = load_active_skills(ROOT / "skill_library/snapshots")
     skills_for_variant = FrozenSkillProvider(skills, {
         "snapshot_ref": snapshot, "manifest_sha256": "c" * 64,
@@ -129,6 +132,7 @@ def case(tmp_path, monkeypatch):
         "--max-requests", "120", "--request-concurrency", "8",
         "--perception-endpoint", ENDPOINT, "--perception-capacity", "8",
         "--episode-concurrency", "32", "--revision-max-tokens", "1536",
+        "--learning-input-mode", "aggregate_v1", "--gate-mode", "same_question",
     ]
     return value
 
@@ -205,6 +209,9 @@ def test_published_preflight_wires_provider_budget_and_all_factories(case, capsy
     assert kwargs["base_cfg"].seed == 137
     assert kwargs["evolution_config"].gate_seeds == (137, 138)
     assert kwargs["evolution_config"].max_tokens == 1536
+    assert kwargs["evolution_config"].learning_input_mode == "aggregate_v1"
+    assert kwargs["evolution_config"].gate_mode == "same_question"
+    assert kwargs["gate_variants"] == []
     assert set(kwargs["label_metadata"]) == {"qa-00", "qa-01"}
     assert case.label_reads == case.identity_reads == [case.metadata]
     assert case.actions == [("preflight", {
@@ -524,3 +531,129 @@ def test_published_gate_copies_keep_transport_but_drop_offline_metadata_and_labe
         }
     assert runner.label_metadata["qa-00"]["reference_answer"] == LABEL
     assert runner.input_contract_identity["offline_metadata"]["path"] == case.metadata
+
+
+def test_cli_defaults_and_explicit_diagnosis_flags_are_frozen(case):
+    args = cli.build_parser().parse_args(case.argv[:-4])
+    assert args.learning_input_mode == "full_cases_v1"
+    assert args.gate_mode == "scene_disjoint"
+    assert args.scheduling_mode == "batch_v1"
+    assert (args.diagnosis_max_cases, args.diagnosis_max_input_chars,
+            args.diagnosis_max_images, args.diagnosis_max_output_tokens) == (4, 64000, 8, 4096)
+    assert _invoke(
+        case, "--preflight-only", "--learning-input-mode", "diagnosis_multimodal_v1",
+        "--diagnosis-max-cases", "3", "--diagnosis-max-input-chars", "32000",
+        "--diagnosis-max-images", "4", "--diagnosis-max-output-tokens", "2048",
+    ) == 0
+    config = case.runners[0].kwargs["evolution_config"]
+    assert config.learning_input_mode == "diagnosis_multimodal_v1"
+    assert (config.diagnosis_max_cases, config.diagnosis_max_input_chars,
+            config.diagnosis_max_images, config.diagnosis_max_output_tokens) == (3, 32000, 4, 2048)
+
+
+@pytest.mark.parametrize("mode", ["diagnosis_v1", "diagnosis_multimodal_v1"])
+@pytest.mark.parametrize("budget", ["0", "4096"])
+def test_diagnosis_rpc_output_budget_fails_before_client_or_metadata(case, capsys, mode, budget):
+    assert _invoke(
+        case, "--preflight-only", "--learning-input-mode", mode,
+        "--diagnosis-max-output-tokens", budget,
+    ) == 2
+    assert "diagnosis token budget" in capsys.readouterr().err
+    assert case.runners == case.actions == case.label_reads == []
+
+
+@pytest.mark.parametrize("extra,message", [
+    (["--gate-mode", "scene_disjoint"], "requires unique explicit"),
+    (["--gate-mode", "scene_disjoint", "--gate-variant-ids", "unknown"], "outside the normalized panel"),
+    (["--gate-mode", "scene_disjoint", "--gate-variant-ids", "id,id"], "requires unique explicit"),
+    (["--gate-variant-ids", "published/qa-00"], "cannot accept separate"),
+    (["--gate-panel-name", "ready_579"], "cannot accept separate"),
+    (["--phase", "final_system", "--gate-variant-ids", "published/qa-00"], "only valid for accumulation"),
+])
+def test_gate_selection_errors_stop_before_input_or_model_access(case, capsys, extra, message):
+    assert _invoke(case, "--preflight-only", *extra) == 2
+    assert message in capsys.readouterr().err
+    assert case.runners == case.actions == case.label_reads == []
+
+
+def test_gate_panel_selector_uses_normalized_panel_selection(case, monkeypatch):
+    calls = []
+    gate = {**case.variants[0], "variant_id": "heldout@g1m0", "qa_id": "heldout",
+            "scene_id": "heldout-scene", "split": "inner_validation"}
+
+    def select(panel, name):
+        calls.append(name)
+        return [gate] if name == "recommended_core_897" else case.variants
+
+    monkeypatch.setattr(cli, "select_panel_variants", select)
+    args = cli.build_parser().parse_args([
+        *case.argv, "--gate-mode", "scene_disjoint", "--gate-panel-name", "recommended_core_897",
+    ])
+    assert cli._select_gate_variants({}, args) == [gate]
+    assert calls == ["recommended_core_897"]
+
+
+def test_legacy_binding_and_offline_label_load_cover_frozen_learning_gate_union(case, monkeypatch):
+    learning = list(case.variants)
+    gate = {**learning[0], "variant_id": "heldout@g1m0", "qa_id": "heldout",
+            "scene_id": "heldout-scene", "split": "inner_validation"}
+    case.variants.append(gate)
+    calls = []
+    provider = SimpleNamespace(receipt=_forbidden, input_contract_identity={"legacy": "frozen"})
+
+    def bindings(path, rows):
+        calls.append((path, rows))
+        return {row["variant_id"]: {"key": "f" * 64} for row in rows}
+
+    monkeypatch.setattr(cli, "_FitSetItemProvider", lambda **_kwargs: provider)
+    monkeypatch.setattr(cli, "load_variant_bindings", bindings)
+    monkeypatch.setattr(cli, "file_identity", lambda path: {"path": path, "sha256": "f" * 64})
+    assert _invoke(
+        case, "--preflight-only", "--published-inputs", "",
+        "--bindings", "union-bindings.json", "--direct-run-root", "frozen-direct",
+        "--learning-input-mode", "full_cases_v1", "--gate-mode", "scene_disjoint",
+        "--gate-variant-ids", gate["variant_id"], "--gate-size", "1",
+    ) == 0
+    kwargs = case.runners[0].kwargs
+    assert kwargs["variants"] == learning and kwargs["gate_variants"] == [gate]
+    assert calls == [("union-bindings.json", [*learning, gate])]
+    assert set(kwargs["label_metadata"]) == {"qa-00", "qa-01", "heldout"}
+    assert set(kwargs["binding_refs"]) == {row["variant_id"] for row in [*learning, gate]}
+
+
+def test_published_manifest_must_cover_gate_union_before_health_or_requests(case, capsys):
+    gate = {**case.variants[0], "variant_id": "missing@g1m0", "qa_id": "missing",
+            "scene_id": "heldout-scene"}
+    case.variants.append(gate)
+    assert _invoke(
+        case, "--gate-mode", "scene_disjoint", "--gate-variant-ids", gate["variant_id"],
+    ) == 2
+    assert "published manifest lacks frozen union entry" in capsys.readouterr().err
+    assert case.runners == case.actions == case.label_reads == []
+
+
+def test_published_union_preserves_input_identity_and_excludes_gates_from_learning(case, monkeypatch):
+    from skill3d.evaluation import published_fitset_v11
+
+    learning = list(case.variants)
+    gate = {**learning[0], "variant_id": "heldout@g1m0", "qa_id": "heldout",
+            "scene_id": "heldout-scene"}
+    case.variants.append(gate)
+    entries = deepcopy(case.published.catalog)
+    entries[gate["qa_id"]] = {
+        **deepcopy(entries[learning[0]["qa_id"]]), "qa_id": gate["qa_id"],
+        "scene_id": gate["scene_id"],
+    }
+    provider = SimpleNamespace(entries=entries, receipt=_forbidden,
+                               input_contract_identity={"manifest": "frozen-union"})
+    monkeypatch.setattr(published_fitset_v11, "PublishedFitSetInputProvider", lambda *_a, **_k: provider)
+    assert _invoke(
+        case, "--preflight-only", "--learning-input-mode", "full_cases_v1",
+        "--gate-mode", "scene_disjoint", "--gate-variant-ids", gate["variant_id"],
+        "--gate-size", "1",
+    ) == 0
+    kwargs = case.runners[0].kwargs
+    assert kwargs["variants"] == learning and kwargs["gate_variants"] == [gate]
+    assert kwargs["item_provider"] is provider
+    assert set(kwargs["binding_refs"]) == {row["variant_id"] for row in [*learning, gate]}
+    assert set(kwargs["label_metadata"]) == {"qa-00", "qa-01", "heldout"}

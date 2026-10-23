@@ -10,6 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from skill3d.evaluation.mra import parse_numeric_answer
+from skill3d.evolution.case_records_v11 import (
+    V11ExperienceBuildError,
+    case_from_fitset_outcome,
+    collect_case_tool_observations,
+    extract_case_image_refs,
+    extract_case_rounds,
+    extract_recorded_selected_object_ids,
+)
 from skill3d.online.submission import EXECUTION_PROTOCOL_VERSION
 from skill3d.routing.task_classifier import canonical_task
 from skill3d.schemas import (
@@ -27,10 +35,6 @@ from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION
 from skill3d.schemas.evidence import skill_evidence_state
-
-
-class V11ExperienceBuildError(ValueError):
-    """Trace rows cannot be bound into trustworthy parent-learning evidence."""
 
 
 def _read_jsonl(path: Path, *, required: bool = True) -> list[dict]:
@@ -193,25 +197,7 @@ def _all_tool_observations(
     trace: EpisodeTrace,
     program_trace: ProgramExecutionTrace | None,
 ) -> list[dict]:
-    """Collect every round's ToolResult once, including pre-final observations."""
-    candidates: list[dict] = []
-    for round_row in trace.rounds:
-        for result in round_row.get("results") or []:
-            if isinstance(result, dict):
-                candidates.append(dict(result))
-    if program_trace is not None:
-        candidates.extend(
-            result.model_dump(mode="json") for result in program_trace.results
-        )
-    observations: list[dict] = []
-    seen: set[str] = set()
-    for row in candidates:
-        identity = str(row.get("result_id") or "") or _json_sha256(row)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        observations.append(row)
-    return observations
+    return collect_case_tool_observations(trace, program_trace)
 
 
 def build_v11_experience_bundle_from_trace_store(
@@ -469,6 +455,7 @@ def build_v11_experience_bundle_from_trace_store(
         categories = _failure_categories(trace, program_trace, score=score)
         direction = _error_direction(result, score)
         observations = _all_tool_observations(trace, program_trace)
+        trace_ref = f"{run_ref}:qa:{qa_id}"
         cases.append(V11ExperienceCase(
             case_id=_case_id(campaign_id, run_ref, qa_id, parent_key),
             qa_id=qa_id,
@@ -488,22 +475,22 @@ def build_v11_experience_bundle_from_trace_store(
             response_text=response_text,
             response_texts=response_texts,
             program_source=program_source,
+            rounds=extract_case_rounds(trace, trace_ref=trace_ref),
             tool_observations=observations,
             initial_evidence_states=trace.initial_evidence_states,
             evidence_states=trace.evidence_states,
             evidence_history=list(trace.evidence_history),
             candidate_objects=list(trace.evidence_history[-1].get("candidates") or []),
-            selected_object_ids=sorted({
-                str(oid) for row in observations
-                for oid in row.get("resolved_object_ids", row.get("object_dependencies", []))
-            }),
+            selected_object_ids=extract_recorded_selected_object_ids(trace),
             image_observations=dict(trace.image_ledger),
+            image_refs=extract_case_image_refs(trace, trace_ref=trace_ref),
+            frame_set_hash=episode_input.frame_set_hash or trace.frame_set_hash,
             model_answer=_answer_text(result.answer_text),
             reference_answer=episode_input.reference_answer,
             score=score,
             failure_categories=categories,
             error_direction=direction,
-            trace_ref=f"{run_ref}:qa:{qa_id}",
+            trace_ref=trace_ref,
         ))
 
     access_manifest = [
@@ -723,5 +710,6 @@ __all__ = [
     "V11TraceCollector",
     "build_v11_experience_bundle_from_cases",
     "build_v11_experience_bundle_from_trace_store",
+    "case_from_fitset_outcome",
     "collect_v11_streaming_case",
 ]

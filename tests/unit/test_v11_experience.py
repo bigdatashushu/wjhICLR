@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -75,6 +76,8 @@ def _write_case(
     source_split: str = "induction",
     delivered_hash: str | None = None,
     program_id: str = "",
+    rounds: list[dict] | None = None,
+    image_ledger: dict | None = None,
 ) -> None:
     key = f"{parent.skill_id}@{parent.version}"
     program_id = program_id or f"program-{qa_id}"
@@ -88,7 +91,7 @@ def _write_case(
         options=["lamp", "table", "sofa", "door"],
         reference_answer="B",
         source_split=source_split,
-        frame_set_hash=f"frames-{qa_id}",
+        frame_set_hash=hashlib.sha256(f"frames-{qa_id}".encode()).hexdigest(),
     ))
     digest = delivered_hash or parent.content_sha256
     initial = {
@@ -107,7 +110,7 @@ def _write_case(
         evaluation_ref=f"evaluation_result:{qa_id}",
         failure=None,
         active_snapshot_ref="S0-v11-learning",
-        frame_set_hash=f"frames-{qa_id}",
+        frame_set_hash=hashlib.sha256(f"frames-{qa_id}".encode()).hexdigest(),
         episode_status="answered",
         evidence_states=final,
         initial_evidence_states=initial,
@@ -117,7 +120,9 @@ def _write_case(
         evidence_history=[
             {"trigger": "initial", "evidence_states": initial, "candidates": candidates},
             {"trigger": "final", "evidence_states": final, "candidates": candidates}],
-        image_ledger={"observed_image_ids": ["frame-0"]},
+        rounds=rounds or [],
+        image_ledger=image_ledger if image_ledger is not None else {
+            "observed_image_ids": ["frame-0"]},
         retrieval_records=[{
             "candidates": [{
                 "skill_version": key,
@@ -222,7 +227,8 @@ def test_builds_complete_learning_bundle_from_structured_trace(tmp_path):
     assert by_qa["success"].evidence_states["metric_scale"] == "unavailable"
     assert len(by_qa["success"].evidence_history) == 2
     assert len(by_qa["success"].candidate_objects) == 3
-    assert by_qa["success"].selected_object_ids == ["chair_2", "table_1"]
+    assert by_qa["success"].selected_object_ids == []
+    assert by_qa["success"].tool_observations[0]["resolved_object_ids"] == ["chair_2", "table_1"]
     assert by_qa["success"].image_observations["observed_image_ids"] == ["frame-0"]
     assert by_qa["success"].tool_observations[0]["tool"] == (
         "relative_distance_rank"
@@ -235,6 +241,53 @@ def test_builds_complete_learning_bundle_from_structured_trace(tmp_path):
     assert by_qa["failure"].error_direction == "wrong_option"
     assert by_qa["failure"].failure_categories == ["answer_incorrect"]
     assert all(case.delivered_skill_md == parent.skill_md for case in bundle.cases)
+
+
+def test_production_collector_attaches_actual_all_round_records(tmp_path):
+    parent = _parent()
+    store = TraceStore(tmp_path)
+    _write_run(store)
+    rounds = [
+        {
+            "index": 1, "program_source": "inspect_frames([0])",
+            "response_text": "original first response",
+            "results": [{"result_id": "first-result", "source": "real",
+                         "payload": {"note": "preserve the early observation"}}],
+            "observed_result_ids": ["first-result"],
+        },
+        {
+            "index": 2, "program_source": "return ReturnAnswer('B')",
+            "response_text": "original second response",
+            "results": [], "used_result_ids": ["first-result"],
+            "invalidated_result_ids": ["first-result"],
+            "observation_reads": [{"result_id": "first-result"}],
+        },
+    ]
+    ledger = {
+        "images": [{"image_id": "frame-0", "content_sha256": "a" * 64,
+                    "observed_rounds": [2], "delivered_rounds": [2]}],
+        "rounds": [{"round_index": 2, "image_ids": ["frame-0"],
+                    "delivered": True, "observed": True}],
+    }
+    _write_case(store, parent, qa_id="case", correct=True,
+                rounds=rounds, image_ledger=ledger)
+
+    bundle = V11TraceCollector(tmp_path)(
+        campaign_id="round-evidence", parent_snapshot_id="S0-v11-learning",
+        parent=parent, question_type=parent.question_type)
+    case = bundle.cases[0]
+
+    assert len(case.rounds) == 2
+    for actual, original in zip(case.rounds, rounds):
+        assert {key: actual[key] for key in original} == original
+    assert case.rounds[0]["experience_provenance"]["image_attribution"] == "unknown"
+    assert case.rounds[1]["experience_provenance"]["image_refs"][0]["image_id"] == "frame-0"
+    assert case.rounds[1]["experience_provenance"]["result_links"][0]["source_refs"] == [
+        f"{case.trace_ref}#/rounds/0/results/0"]
+    assert case.tool_observations[0] == rounds[0]["results"][0]
+    assert case.frame_set_hash == hashlib.sha256(b"frames-case").hexdigest()
+    assert case.image_observations == ledger
+    assert case.image_refs[0]["observed_rounds"] == [2]
 
 
 def test_injectable_collector_passes_full_bundle(tmp_path):

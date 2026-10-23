@@ -6,9 +6,11 @@ import copy
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
+
+from pydantic import ValidationError
 
 from skill3d.adapters.episode_source import EpisodeItem
 from skill3d.evaluation.skill_ablation_v11 import (
@@ -28,6 +30,8 @@ from skill3d.evaluation.skill_ablation_v11 import (
 from skill3d.evolution.experience_v11 import (
     build_v11_experience_bundle_from_trace_store,
 )
+from skill3d.evolution.diagnosis_v11 import OfflineDiagnosisConfig
+from skill3d.evolution.revision_input_v11 import offline_client_identity
 from skill3d.evolution.campaign_v11 import V11RevisionFormatError, _write_create_once
 from skill3d.online import runner
 from skill3d.online.runner import OnlineRunConfig
@@ -56,7 +60,7 @@ from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
 from skill3d.trace.store import TraceStore
 
-REVISION_PROMPT_VERSION = "skill-revision-v11.6-shared-contract"
+REVISION_PROMPT_VERSION = "skill-revision-v11.7-case-diagnosis-repair"
 _SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -151,21 +155,91 @@ class V11OfflineReviser:
         max_tokens: int = 32768,
         require_health_check: bool = True,
         method_context_max_chars: int = DEFAULT_METHOD_CONTEXT_MAX_CHARS,
+        diagnosis_config=None,
+        diagnoser=None,
+        image_provider=None,
     ) -> None:
         self.client = client
         self.audit_root = Path(audit_root).resolve()
         self.max_tokens = int(max_tokens)
         self.require_health_check = bool(require_health_check)
         self.method_context_max_chars = int(method_context_max_chars)
+        if self.max_tokens <= 0 or self.method_context_max_chars <= 0:
+            raise ValueError("revision token and context limits must be positive")
+        self.diagnoser = diagnoser
+        self.image_provider = image_provider
+        config = (
+            diagnosis_config if diagnosis_config is not None
+            else getattr(diagnoser, "config", None)
+        )
+        self.diagnosis_config = (
+            config if isinstance(config, OfflineDiagnosisConfig)
+            else OfflineDiagnosisConfig(**dict(config or {}))
+        )
+        if self.diagnosis_config.mode != "off" and diagnoser is None:
+            raise V11AdapterError("enabled diagnosis requires an injected diagnoser")
+        if self.diagnosis_config.mode == "multimodal" and image_provider is None:
+            raise V11AdapterError("multimodal diagnosis requires an explicit image provider")
         self._health_checked = False
+
+    def _diagnosis_config_identity(self) -> dict:
+        return asdict(self.diagnosis_config)
+
+    def _diagnosis(self, **kwargs) -> dict | None:
+        directory = self.audit_root / _safe_component(str(kwargs["campaign_id"]))
+        parent = kwargs["parent"]
+        experience = kwargs["experience"]
+        # Keep campaign identity seed-stable; exchanges record each repair seed.
+        frozen = {
+            "campaign_id": str(kwargs["campaign_id"]),
+            "parent_content_sha256": parent.content_sha256,
+            "parent_skill_version": f"{parent.skill_id}@{parent.version}",
+            "experience_sha256": _sha256(experience),
+            "prompt_version": REVISION_PROMPT_VERSION,
+            "diagnosis_config": self._diagnosis_config_identity(),
+            "max_tokens": self.max_tokens,
+            "method_context_max_chars": self.method_context_max_chars,
+            "client_identity": offline_client_identity(self.client, seed=1),
+        }
+        input_path = directory / "revision_input.json"
+        if input_path.is_file() and json.loads(input_path.read_bytes()) != frozen:
+            raise V11AdapterError("frozen revision input changed during resume")
+        self._write_audit(input_path, frozen)
+        if frozen["diagnosis_config"]["mode"] == "off":
+            return None
+        path = directory / "revision_diagnosis.json"
+        if path.is_file():
+            receipt = json.loads(path.read_bytes())
+            if receipt["input_sha256"] != _sha256(frozen):
+                raise V11AdapterError("diagnosis input changed during resume")
+            return receipt["diagnosis"]
+        result = self.diagnoser.diagnose(
+            parent.model_copy(deep=True),
+            experience.model_copy(deep=True),
+            image_provider=self.image_provider,
+            context={
+                "campaign_id": str(kwargs["campaign_id"]),
+                "idempotency_key": f"{kwargs['campaign_id']}:diagnose",
+            },
+        )
+        if not isinstance(result, dict):
+            raise V11AdapterError("offline diagnosis must return a dict receipt")
+        self._write_audit(path, {
+            "input_sha256": _sha256(frozen),
+            "diagnosis": result,
+        })
+        return result
 
     def _prompt(self, **kwargs) -> str:
         from skill3d.tools import REGISTRY
+        from skill3d.evolution.revision_input_v11 import (
+            render_case_evidence,
+            revision_contract_text,
+        )
 
         parent: SkillSpecV11 = kwargs["parent"]
         experience = kwargs["experience"]
         feedback = list(kwargs.get("static_feedback") or [])
-        evidence = experience.model_dump(mode="json")
         from skill3d.schemas import EvidenceProfile
         from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
         from skill3d.tools.contract import KNOWN_ARTIFACTS
@@ -185,8 +259,10 @@ class V11OfflineReviser:
         return (
             "You revise one reusable 3D reasoning method for a coding agent.\n"
             f"Protocol: {REVISION_PROMPT_VERSION}.\n"
-            "Return exactly one JSON object with string fields full_skill_md and "
-            "modification_reason. full_skill_md must be the complete canonical "
+            "Return exactly one JSON object with action='revise' or action='no_change' "
+            "and a string modification_reason. For no_change omit full_skill_md; "
+            "keeping the parent is a normal outcome when evidence does not support a "
+            "method change. For revise, full_skill_md must be the complete canonical "
             "SKILL.md, including YAML frontmatter and the full Markdown body. "
             "Write all natural-language content and code comments in English.\n"
             "Keep the method generic. Never copy case_id, qa_id, scene_id, a "
@@ -202,6 +278,10 @@ class V11OfflineReviser:
             "referent-selection or binding error; never invent that attribution. "
             "The cases expose only question-level induction answers; no GT 3D "
             "annotation is authorized.\n\n"
+            f"{revision_contract_text()}\n\n"
+            "For revise, declare one change_hypothesis, expected_process_effect and "
+            "changed_sections containing exact Markdown heading titles that actually "
+            "changed (or '__body__' when the method has no headings).\n\n"
             f"Parent identity: {parent.skill_id}@{parent.version} "
             f"({parent.slot_key}, sha256={parent.content_sha256})\n"
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
@@ -213,9 +293,11 @@ class V11OfflineReviser:
             "conditions can restrict it further; use only currently authorized interfaces "
             "and unit modes. The method may retain visual fallback checks.\n"
             "Induction experience JSON:\n"
-            f"{json.dumps(evidence, ensure_ascii=False, sort_keys=True)}\n"
+            f"{render_case_evidence(experience, diagnosis=kwargs.get('diagnosis'))}\n"
             "Static-validation feedback from earlier attempts:\n"
             f"{json.dumps(feedback, ensure_ascii=False)}\n"
+            "Previous candidate repair context (safe text, hash and positions):\n"
+            f"{json.dumps(kwargs.get('repair_context'), ensure_ascii=False, sort_keys=True)}\n"
         )
 
     def _write_audit(self, path: Path, payload: dict) -> None:
@@ -226,7 +308,11 @@ class V11OfflineReviser:
         _write_create_once(path, data.encode("utf-8"))
 
     def __call__(self, **kwargs) -> V11RevisionProposal:
-        prompt = self._prompt(**kwargs)
+        attempt = int(kwargs["attempt"])
+        if not 1 <= attempt <= 100:
+            raise V11AdapterError("revision attempt must be in [1, 100]")
+        diagnosis = self._diagnosis(**kwargs)
+        prompt = self._prompt(**{**kwargs, "diagnosis": diagnosis})
         messages = [
             {
                 "role": "system",
@@ -243,14 +329,19 @@ class V11OfflineReviser:
             / f"revision_{int(kwargs['attempt']):02d}.json"
         )
         exchange_path = audit_path.with_suffix(".exchange.json")
+        intent_path = audit_path.with_suffix(".intent.json")
         request = {"messages": messages, "max_tokens": self.max_tokens,
                    "seed": int(kwargs.get("attempt", 0)),
-                   "idempotency_key": str(kwargs["idempotency_key"])}
+                   "idempotency_key": str(kwargs["idempotency_key"]),
+                   "client_identity": offline_client_identity(self.client, seed=attempt)}
         if exchange_path.is_file():
             exchange = json.loads(exchange_path.read_bytes())
             if exchange["request"] != request:
                 raise V11AdapterError("revision request changed during resume")
         else:
+            if intent_path.exists():
+                raise V11AdapterError(
+                    "revision completion is unknown; refusing to replay the request")
             if self.require_health_check and not self._health_checked:
                 require_service = getattr(self.client, "require_service", None)
                 if require_service is None:
@@ -260,16 +351,30 @@ class V11OfflineReviser:
             call = getattr(self.client, "chat_with_meta", None)
             if call is None:
                 raise V11AdapterError("offline client lacks chat_with_meta()")
-            meta = call(messages, max_tokens=self.max_tokens, seed=request["seed"])
-            text = str(getattr(meta, "text", "") or "")
-            exchange = {
-                "request": request, "text": text,
-                "truncated": bool(getattr(meta, "truncated", False)),
-                "request_id": str(getattr(meta, "request_id", "") or "no-request-id"),
-                "call": meta.manifest_fields() if callable(
-                    getattr(meta, "manifest_fields", None)) else {},
-            }
-            self._write_audit(exchange_path, exchange)
+            # Hold the attempt's OS lock from intent reservation through receipt.
+            import fcntl
+
+            with intent_path.with_suffix(".lock").open("a+b") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if exchange_path.is_file():
+                    exchange = json.loads(exchange_path.read_bytes())
+                    if exchange["request"] != request:
+                        raise V11AdapterError("revision request changed during resume")
+                else:
+                    if intent_path.exists():
+                        raise V11AdapterError(
+                            "revision completion is unknown; refusing to replay the request")
+                    self._write_audit(intent_path, {"request": request})
+                    meta = call(messages, max_tokens=self.max_tokens, seed=request["seed"])
+                    text = str(getattr(meta, "text", "") or "")
+                    exchange = {
+                        "request": request, "text": text,
+                        "truncated": bool(getattr(meta, "truncated", False)),
+                        "request_id": str(getattr(meta, "request_id", "") or "no-request-id"),
+                        "call": meta.manifest_fields() if callable(
+                            getattr(meta, "manifest_fields", None)) else {},
+                    }
+                    self._write_audit(exchange_path, exchange)
         text, request_id = exchange["text"], exchange["request_id"]
         output_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
         self._write_audit(audit_path, {
@@ -287,23 +392,35 @@ class V11OfflineReviser:
             f"{audit_path}:request:{_safe_component(request_id)}:"
             f"prompt:{prompt_sha}:response:{output_sha}"
         )
+        candidate_text = text
         try:
             if exchange["truncated"]:
                 raise V11AdapterError("offline revision response was truncated")
             value = _parse_json_response(text)
             full_skill_md = value.get("full_skill_md")
             modification_reason = value.get("modification_reason")
-            if not isinstance(full_skill_md, str) or not full_skill_md.strip():
-                raise V11AdapterError("offline revision JSON lacks full_skill_md")
+            if isinstance(full_skill_md, str):
+                candidate_text = full_skill_md
+            if value.get("action") == "no_change" and "full_skill_md" in value:
+                raise V11AdapterError("offline no_change must omit full_skill_md")
             if not isinstance(modification_reason, str) or not modification_reason.strip():
                 raise V11AdapterError("offline revision JSON lacks modification_reason")
-        except V11AdapterError as exc:
-            raise V11RevisionFormatError(str(exc), source_run_ref=source_ref) from exc
-        return V11RevisionProposal(
-            full_skill_md=full_skill_md,
-            modification_reason=modification_reason,
-            source_run_ref=source_ref,
-        )
+            proposal_fields = {
+                key: value[key] for key in (
+                    "action", "full_skill_md", "change_hypothesis", "changed_sections",
+                    "expected_process_effect", "evidence_signature_refs",
+                ) if key in value
+            }
+            return V11RevisionProposal(
+                **proposal_fields, modification_reason=modification_reason,
+                source_run_ref=source_ref,
+            )
+        except (V11AdapterError, ValidationError) as exc:
+            message = str(exc) if isinstance(exc, V11AdapterError) else (
+                "offline revision JSON violates the revise/no_change proposal contract")
+            raise V11RevisionFormatError(
+                message, source_run_ref=source_ref, candidate_text=candidate_text
+            ) from exc
 
 
 @dataclass

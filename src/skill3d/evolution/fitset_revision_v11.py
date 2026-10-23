@@ -27,6 +27,10 @@ from skill3d.evaluation.fitset_v11 import (
 )
 from skill3d.evolution.campaign_v11 import _unknown_tool_calls
 from skill3d.evolution.leakage import leakage_scan_text
+from skill3d.evolution.revision_input_v11 import (
+    RepairContextError, build_repair_context, candidate_sample_copy_leaks,
+    render_case_evidence, revision_contract_text,
+)
 from skill3d.schemas import EvidenceProfile, SkillSpecV11
 from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
 from skill3d.skills.delivery import (
@@ -42,9 +46,9 @@ from skill3d.tools.contract import KNOWN_ARTIFACTS
 from skill3d.synthesis.execution_contract import ExecutionContract, review_method_contract
 from skill3d.synthesis.request_audit import describe_request
 
-FIT_REVISION_SCHEMA = "v11-fit-set-slot-revision/3.0"
+FIT_REVISION_SCHEMA = "v11-fit-set-slot-revision/4.0"
 FIT_FEEDBACK_SCHEMA = "v11-fit-set-slot-feedback/3.0"
-FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v3"
+FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v4-case-repair"
 
 
 def _write_create_once(path: Path, value: object) -> None:
@@ -519,6 +523,9 @@ class FitSetSlotReviser:
         parent: SkillSpecV11,
         feedback: Mapping,
         static_feedback: Sequence,
+        experience=None,
+        diagnosis=None,
+        repair_context=None,
     ) -> str:
         return (
             "Revise one reusable method for a visual-spatial coding agent.\n"
@@ -541,7 +548,7 @@ class FitSetSlotReviser:
             "or inferred GT 3D fact. The aggregate feedback contains no such "
             "content. A wrong score alone does not prove a binding or referent "
             "failure. Improve decision rules, checks, tool use, and fallbacks "
-            "only when supported by the aggregate process facts. Do not invent "
+            "only when supported by the supplied process facts or original induction evidence. Do not invent "
             "tools or alter framework, model, prompt, scoring, or permissions.\n\n"
             f"{ExecutionContract(self.method_context_max_chars).render()}\n\n"
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
@@ -551,6 +558,14 @@ class FitSetSlotReviser:
             f"{json.dumps(feedback, ensure_ascii=False, sort_keys=True)}\n"
             "Static feedback from prior formatting attempts:\n"
             f"{json.dumps(list(static_feedback), ensure_ascii=False)}\n"
+            f"{revision_contract_text()}\n"
+            + (
+                "Complete authorized induction cases and source-linked diagnosis:\n"
+                f"{render_case_evidence(experience, diagnosis=diagnosis)}\n"
+                if experience is not None else ""
+            )
+            + "Previous candidate repair context (full safe text, hash and line positions):\n"
+            + json.dumps(repair_context, ensure_ascii=False, sort_keys=True) + "\n"
         )
 
     def _request(
@@ -652,11 +667,28 @@ class FitSetSlotReviser:
         parent: SkillSpecV11,
         feedback: Mapping,
         forbidden_ids: set[str],
+        experience=None,
+        diagnosis=None,
     ) -> SkillSpecV11 | None:
         slot_name = fit_slot_key(*slot)
         slot_root = self.root / "slots" / slot[0] / slot[1]
         final_path = slot_root / "final.json"
         skill_path = slot_root / "SKILL.md"
+        evidence_sha = content_sha256({
+            "experience": experience.model_dump(mode="json") if experience is not None else None,
+            "diagnosis": diagnosis,
+        })
+        cases = experience.cases if experience is not None else []
+        # Trusted method and aggregate control text must be sample-free. Full
+        # induction evidence is validated by the canonical schema separately.
+        if leakage_scan_text(parent.skill_md + json.dumps(feedback), forbidden_sample_ids=forbidden_ids):
+            raise FitSetError("offline control text leakage scan failed")
+        if experience is not None:
+            render_case_evidence(experience, diagnosis=diagnosis)
+            if (experience.parent_content_sha256 != parent.content_sha256
+                    or experience.question_type != parent.question_type
+                    or experience.evidence_state != parent.evidence_state):
+                raise FitSetError("complete revision input parent/slot mismatch")
         if final_path.is_file():
             receipt = json.loads(final_path.read_text(encoding="utf-8"))
             body = {k: v for k, v in receipt.items() if k != "identity_sha256"}
@@ -664,7 +696,8 @@ class FitSetSlotReviser:
                     or receipt.get("identity_sha256") != content_sha256(body)
                     or receipt.get("parent_content_sha256") != parent.content_sha256
                     or receipt.get("contract_sha256") != ExecutionContract(self.method_context_max_chars).sha256
-                    or receipt.get("feedback_sha256") != content_sha256(feedback)):
+                    or receipt.get("feedback_sha256") != content_sha256(feedback)
+                    or receipt.get("evidence_sha256") != evidence_sha):
                 raise FitSetError(f"{slot_name}: frozen revision identity changed")
             if receipt.get("action") == "no_change":
                 return None
@@ -679,26 +712,32 @@ class FitSetSlotReviser:
                 problems
                 or candidate is None
                 or candidate.content_sha256 != receipt.get("content_sha256")
+                or candidate_sample_copy_leaks(text, cases)
             ):
                 raise FitSetError(
                     f"{slot_name}: frozen candidate no longer validates")
             return candidate
         static_feedback: list[dict] = []
+        repair_context = None
         for attempt in range(1, self.max_attempts + 1):
             prompt = self._prompt(
                 parent=parent,
                 feedback=feedback,
                 static_feedback=static_feedback,
+                experience=experience, diagnosis=diagnosis, repair_context=repair_context,
             )
             # Scan the complete request, including the parent and retry feedback.
-            if leakage_scan_text(prompt, forbidden_sample_ids=forbidden_ids):
+            if experience is None and leakage_scan_text(prompt, forbidden_sample_ids=forbidden_ids):
                 raise FitSetError("offline request leakage scan failed")
             exchange = self._request(
                 slot=slot,
                 attempt=attempt,
                 prompt=prompt,
             )
+            previous_text = exchange["response_text"]
             try:
+                if str((exchange.get("generation") or {}).get("finish_reason", "")).casefold() == "length":
+                    raise FitSetError("offline revision response was truncated")
                 value = _parse_response(exchange["response_text"])
                 if value["action"] == "no_change":
                     body = {
@@ -708,11 +747,13 @@ class FitSetSlotReviser:
                         "parent_content_sha256": parent.content_sha256,
                         "contract_sha256": ExecutionContract(self.method_context_max_chars).sha256,
                         "feedback_sha256": content_sha256(feedback),
+                        "evidence_sha256": evidence_sha,
                         "modification_reason": value["modification_reason"],
                         "exchange_sha256": content_sha256(exchange),
                     }
                     _write_create_once(final_path, {**body, "identity_sha256": content_sha256(body)})
                     return None
+                previous_text = value["full_skill_md"]
                 candidate, problems = _static_validate(
                     parent=parent,
                     candidate_text=value["full_skill_md"],
@@ -720,6 +761,8 @@ class FitSetSlotReviser:
                     method_context_max_chars=self.method_context_max_chars,
                 )
                 problems.extend(_declaration_problems(value, parent, feedback))
+                if candidate_sample_copy_leaks(value["full_skill_md"], cases):
+                    problems.append("candidate matched leakage patterns: sample_content_copy")
             except FitSetError as exc:
                 candidate, problems = None, [str(exc)]
             validation = {
@@ -752,6 +795,7 @@ class FitSetSlotReviser:
                     "parent_content_sha256": parent.content_sha256,
                     "contract_sha256": ExecutionContract(self.method_context_max_chars).sha256,
                     "feedback_sha256": content_sha256(feedback),
+                    "evidence_sha256": evidence_sha,
                     "modification_reason": value["modification_reason"],
                     "change_declaration": {
                         key: value.get(key) for key in (
@@ -763,6 +807,11 @@ class FitSetSlotReviser:
                 return candidate
             static_feedback = _safe_static_feedback(
                 problems, candidate=candidate, max_chars=self.method_context_max_chars)
+            try:
+                repair_context = build_repair_context(
+                    previous_text, static_feedback, cases=cases, forbidden_ids=forbidden_ids)
+            except RepairContextError as exc:
+                raise FitSetError("candidate cannot fit frozen static repair context") from exc
         raise FitSetError(
             f"{slot_name}: no valid candidate after "
             f"{self.max_attempts} attempts")

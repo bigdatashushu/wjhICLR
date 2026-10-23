@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and score the exploratory v11 same-question fit-set experiment."""
+"""Run and score v11 fit-set learning with a frozen, scene-disjoint gate."""
 
 from __future__ import annotations
 
@@ -387,28 +387,67 @@ def _fit_skill_provider(bundle_path: Path):
     return _FitSkillProvider(bundle)
 
 
+def _select_gate_variants(panel: dict, args) -> list[dict]:
+    if args.phase != "accumulation":
+        if args.gate_variant_ids or args.gate_panel_name:
+            raise FitSetError("gate selectors are only valid for accumulation")
+        return []
+    if args.gate_mode == "same_question":
+        if args.gate_variant_ids or args.gate_panel_name:
+            raise FitSetError("same_question cannot accept separate gate selectors")
+        return []
+    if args.gate_panel_name:
+        return select_panel_variants(panel, args.gate_panel_name)
+    ids = [value.strip() for value in args.gate_variant_ids.split(",") if value.strip()]
+    if not ids or len(ids) != len(set(ids)):
+        raise FitSetError("scene_disjoint requires unique explicit gate variant IDs or --gate-panel-name")
+    rows = {row["variant_id"]: row for row in panel["system_variants"]}
+    unknown = set(ids) - set(rows)
+    if unknown:
+        raise FitSetError(f"gate variant IDs are outside the normalized panel: {sorted(unknown)}")
+    return [rows[variant_id] for variant_id in ids]
+
+
 def _run_system(args) -> int:
     from skill3d.evolution.fitset_stream_v11 import FitSetEvolutionConfig
 
     panel = load_fitset_panel(args.panel)
     variants = select_panel_variants(panel, args.panel_name)
+    gate_variants = _select_gate_variants(panel, args)
+    gate_ids = {row["variant_id"] for row in gate_variants}
+    variants = [row for row in variants if row["variant_id"] not in gate_ids]
+    if not variants:
+        raise FitSetError("gate selection leaves no learning/execution variants")
+    frozen_union = [*variants, *gate_variants]
+    if (args.phase == "accumulation"
+            and (args.learning_input_mode != "aggregate_v1" or args.gate_mode == "scene_disjoint")
+            and any(row["split"] != "induction" for row in variants)):
+        raise FitSetError("rich/disjoint learning requires induction-only variants")
     published_inputs = None
     if args.published_inputs:
         from skill3d.evaluation.published_fitset_v11 import PublishedFitSetInputProvider
         published_inputs = PublishedFitSetInputProvider(
             args.published_inputs, max_scenes=args.scene_cache_size)
-        bindings = {
-            row["variant_id"]: published_inputs.entries[row["qa_id"]]["reference"]
-            for row in variants
-        }
         if args.bindings or args.direct_run_root or args.video_root or args.video_fallback_root:
             raise FitSetError("published inputs cannot be mixed with legacy input locators")
         if any(row["split"] != "induction" for row in variants):
             raise FitSetError("published live learning requires induction-only variants")
+        entries = published_inputs.entries
+        for row in frozen_union:
+            entry = entries.get(row["qa_id"])
+            if entry is None:
+                raise FitSetError(f"{row['variant_id']}: published manifest lacks frozen union entry")
+            if (entry["scene_id"] != row["scene_id"] or entry["split"] != row["split"]
+                    or entry["reference"]["scene_artifact_ref"] != row["artifact_ref"]):
+                raise FitSetError(f"{row['variant_id']}: panel/published frozen union identity changed")
+        bindings = {
+            row["variant_id"]: entries[row["qa_id"]]["reference"]
+            for row in frozen_union
+        }
     else:
         if not args.bindings or not args.direct_run_root:
             raise FitSetError("legacy inputs require --bindings and --direct-run-root")
-        bindings = load_variant_bindings(args.bindings, variants)
+        bindings = load_variant_bindings(args.bindings, frozen_union)
     raw = resolve_runtime(load_config(args.config), seed=args.seed)
     model = online_model_from(raw)
     if (
@@ -432,6 +471,10 @@ def _run_system(args) -> int:
             raise FitSetError("request concurrency exceeds frozen RPC gateway capacity")
         if args.phase == "accumulation" and not 1 <= args.revision_max_tokens <= model.max_tokens:
             raise FitSetError("revision token budget must be 1..frozen RPC model max_tokens")
+        if (args.phase == "accumulation" and args.learning_input_mode in {
+                "diagnosis_v1", "diagnosis_multimodal_v1"}
+                and not 1 <= args.diagnosis_max_output_tokens <= model.max_tokens):
+            raise FitSetError("diagnosis token budget must be 1..frozen RPC model max_tokens")
     elif args.perception_capacity:
         raise FitSetError("--perception-capacity requires --perception-endpoint")
     if not args.preflight_only:
@@ -488,6 +531,7 @@ def _run_system(args) -> int:
         panel=panel,
         panel_name=args.panel_name,
         variants=variants,
+        gate_variants=gate_variants,
         item_provider=item_provider,
         input_receipt_provider=item_provider.receipt,
         input_contract_identity={
@@ -525,11 +569,17 @@ def _run_system(args) -> int:
                 scheduling_mode=args.scheduling_mode,
                 max_revision_requests_per_slot=args.max_revision_requests_per_slot,
                 max_gate_candidates_per_slot=args.max_gate_candidates_per_slot,
+                learning_input_mode=args.learning_input_mode,
+                gate_mode=args.gate_mode,
+                diagnosis_max_cases=args.diagnosis_max_cases,
+                diagnosis_max_input_chars=args.diagnosis_max_input_chars,
+                diagnosis_max_images=args.diagnosis_max_images,
+                diagnosis_max_output_tokens=args.diagnosis_max_output_tokens,
             ) if args.phase == "accumulation" else None
         ),
         label_metadata=(
             {qa: label for qa, label in load_label_metadata(args.metadata).items()
-             if qa in {row["qa_id"] for row in variants}}
+             if qa in {row["qa_id"] for row in frozen_union}}
             if args.phase == "accumulation" else None
         ),
         revision_client_factory=_RevisionClientFactory(
@@ -694,7 +744,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--skill-owners", type=int, default=4,
                      help="fixed Skill library owners, independent of episode executors")
     run.add_argument("--max-requests", type=int, default=0,
-                     help="shared solver/reviser/gate request budget; required for episode_pool")
+                     help="shared solver/diagnosis/reviser/gate request budget; required for episode_pool")
     run.add_argument("--request-concurrency", type=int, default=0)
     run.add_argument("--requests-per-second", type=float, default=0)
     run.add_argument("--perception-endpoint", default="",
@@ -705,10 +755,24 @@ def build_parser() -> argparse.ArgumentParser:
                      help="global cap on concurrently executing episodes "
                           "across every worker and gate; 0 uses the scheduler default")
     run.add_argument("--gate-size", type=int, default=8)
+    run.add_argument("--learning-input-mode", choices=(
+        "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"),
+        default="full_cases_v1")
+    run.add_argument("--gate-mode", choices=("same_question", "scene_disjoint"),
+                     default="scene_disjoint")
+    gate_selector = run.add_mutually_exclusive_group()
+    gate_selector.add_argument("--gate-variant-ids", default="",
+                               help="comma-separated held-out IDs from the normalized panel")
+    gate_selector.add_argument("--gate-panel-name", choices=PANEL_NAMES, default="",
+                               help="freeze a separate panel selection as the held-out gate")
+    run.add_argument("--diagnosis-max-cases", type=int, default=4)
+    run.add_argument("--diagnosis-max-input-chars", type=int, default=64000)
+    run.add_argument("--diagnosis-max-images", type=int, default=8)
+    run.add_argument("--diagnosis-max-output-tokens", type=int, default=4096)
     run.add_argument("--max-revision-attempts", type=int, default=3)
     run.add_argument("--revision-max-tokens", type=int, default=8192)
     run.add_argument("--scheduling-mode", choices=("novel_failure_v1", "batch_v1"),
-                     default="novel_failure_v1")
+                     default="batch_v1")
     run.add_argument("--max-revision-requests-per-slot", type=int, default=18)
     run.add_argument("--max-gate-candidates-per-slot", type=int, default=6)
     run.add_argument("--library-root", default="")

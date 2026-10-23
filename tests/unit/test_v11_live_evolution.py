@@ -293,7 +293,8 @@ def test_post_panel_excludes_request_and_previously_used_scenes(tmp_path):
     ]
 
 
-def test_live_scheduler_runs_isolated_episodes_and_triggers_at_twelve(tmp_path):
+@pytest.mark.parametrize("outcome", ["rejected", "no_change"])
+def test_live_scheduler_runs_isolated_episodes_and_triggers_at_twelve(tmp_path, outcome):
     parent = _parent()
     items = [_item(index, split="induction") for index in range(1, 13)]
     artifacts = {
@@ -340,7 +341,7 @@ def test_live_scheduler_runs_isolated_episodes_and_triggers_at_twelve(tmp_path):
     def reject(request):
         attempt_calls.append(request)
         return StreamingAttemptResult(
-            outcome="rejected",
+            outcome=outcome,
             campaign_id="live-campaign-001",
             reason="candidate did not improve",
         )
@@ -370,9 +371,85 @@ def test_live_scheduler_runs_isolated_episodes_and_triggers_at_twelve(tmp_path):
                for row in execution_calls)
     assert len(attempt_calls) == 1
     assert len(attempt_calls[0].cases) == 12
-    assert summary["attempt_outcomes"] == ["rejected"]
+    assert summary["attempt_outcomes"] == [outcome]
 
     resumed = scheduler.run()
     assert resumed == summary
     assert len(active_calls) == 12
     assert len(execution_calls) == 12
+
+
+def test_production_attempt_forwards_no_change_without_gate_publish_or_post_usage(
+    tmp_path, monkeypatch,
+):
+    import skill3d.evolution.live_v11 as live
+    from skill3d.schemas import V11RevisionProposal
+    from skill3d.skills.registry import load_active_skills
+    from skill3d.skills.v11_library import (
+        build_v11_snapshot, load_skill_source_v11, write_v11_snapshot,
+    )
+
+    library = tmp_path / "library"
+    source_ref = "versions/S03/1.2.0/rank-object-distances/SKILL.md"
+    source = library / source_ref
+    source.parent.mkdir(parents=True)
+    source.write_text(SOURCE, encoding="utf-8")
+    loaded = load_skill_source_v11(
+        library, source_ref=source_ref, skill_id="S03", version="1.2.0",
+        question_type="object_rel_distance", evidence_state="g1m0",
+    )
+    snapshot, manifest = build_v11_snapshot([loaded], snapshot_id="no-change-parent")
+    write_v11_snapshot(library, snapshot, manifest, activate=True)
+    parent = loaded.spec
+    item = _item(1, split="induction")
+    request = StreamingAttemptRequest(
+        stream_id="production-no-change", question_type=parent.question_type,
+        evidence_state=parent.evidence_state, parent_snapshot_id=snapshot["snapshot_id"],
+        parent_skill_version=f"{parent.skill_id}@{parent.version}",
+        parent_content_sha256=parent.content_sha256, attempt_index=1,
+        trigger="batch", cases=(_case(parent, item, 1),), new_case_count=1,
+    )
+    inner = [_item(i, split="inner_validation") for i in range(8)]
+    panels = prepare_validation_panels(
+        inner, {item.episode.qa_id: tmp_path / f"inner-{i}.json"
+                for i, item in enumerate(inner)},
+        required_slots=[(parent.question_type, parent.evidence_state)],
+        state_resolver=lambda *_args: "g1m0",
+    )
+    post = [_item(i, split="induction", scene=f"fresh-post-{i}") for i in range(2, 6)]
+    revision_calls = []
+
+    def unchanged(**kwargs):
+        revision_calls.append(kwargs)
+        return V11RevisionProposal(
+            action="no_change", modification_reason="Keep the adequate method.",
+            source_run_ref="revision:production-no-change",
+        )
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("no_change invoked a gate or publication")
+
+    monkeypatch.setattr(live.V11PairedEvaluator, "__call__", forbidden)
+    monkeypatch.setattr(live.V11PostPublishVerifier, "__call__", forbidden)
+    import skill3d.evolution.campaign_v11 as campaign
+    monkeypatch.setattr(campaign, "publish_v11_candidate", forbidden)
+    attempt = V11ProductionAttempt(
+        library_root=library, campaign_root=tmp_path / "campaigns",
+        base_cfg=OnlineRunConfig(), validation_panels=panels,
+        post_items_by_slot={request.slot_key: post},
+        post_artifact_paths={item.episode.qa_id: tmp_path / f"post-{i}.json"
+                             for i, item in enumerate(post)},
+        reviser=unchanged, quality_confirmation={},
+    )
+    result = attempt(request)
+    assert result.outcome == "no_change"
+    assert result.post_publish_cases == ()
+    assert attempt._used_post_ids == set()
+    assert not attempt._usage_path.exists()
+    assert len(revision_calls) == 1
+    assert attempt(request).outcome == "no_change"
+    assert len(revision_calls) == 1
+    active, warnings, active_snapshot = load_active_skills(library / "snapshots")
+    assert not warnings
+    assert active_snapshot == snapshot["snapshot_id"]
+    assert active[0].content_sha256 == parent.content_sha256

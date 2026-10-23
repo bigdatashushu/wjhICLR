@@ -801,6 +801,20 @@ def test_system_runner_is_variant_keyed_and_resumes_without_reexecution(
     ).read_text(encoding="utf-8"))
     assert outcome["overall_quality"] is None
 
+    rich_runner = build_runner()
+    rich_runner.root = tmp_path / "rich-input"
+    rich_runner.root.mkdir()
+    rich_runner.evolution_config = SimpleNamespace(learning_input_mode="full_cases_v1")
+    rich_result = rich_runner._run_one(variant)
+    public_input = rich_runner.offline_case_input(variant)
+    assert public_input["question_text"] == item.episode.question
+    assert public_input["options"] == list(item.episode.options or [])
+    assert len(public_input["image_refs"]) == 32
+    assert rich_result["offline_input_sha256"]
+    assert len(calls) == 2
+    assert calls[0][0][0].episode.model_dump() == calls[1][0][0].episode.model_dump()
+    assert item.episode.ground_truth == ""
+
 
 def test_shared_reconstruction_file_hash_is_cached_by_stable_file_stamp(
     tmp_path,

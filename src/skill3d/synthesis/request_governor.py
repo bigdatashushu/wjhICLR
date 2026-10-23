@@ -82,7 +82,7 @@ class RequestGovernor:
 
     @contextmanager
     def request(self, category, context):
-        if category not in {"solver", "reviser", "gate"}:
+        if category not in {"solver", "reviser", "diagnosis", "gate"}:
             raise ValueError("unknown request category")
         # No prompt, label, URL, environment or exception text is persisted.
         safe_context = {key: str(context[key]) for key in (
@@ -196,12 +196,21 @@ class GovernedClient:
         return getattr(self.client, name)
 
     def chat(self, *args, **kwargs):
+        return self._call("chat", *args, **kwargs)
+
+    def chat_with_meta(self, *args, **kwargs):
+        return self._call("chat_with_meta", *args, **kwargs)
+
+    def _call(self, method, *args, **kwargs):
         with self.governor.request(self.category, self.context) as receipt:
-            text = self.client.chat(*args, **kwargs)
-            usage = getattr(self.client, "last_usage", {}) or {}
+            response = getattr(self.client, method)(*args, **kwargs)
+            usage = (getattr(response, "usage", None)
+                     or getattr(self.client, "last_usage", None)
+                     or {key: getattr(response, key, None) for key in (
+                         "prompt_tokens", "completion_tokens", "total_tokens")})
             receipt["usage"] = {
                 key: value for key, value in usage.items()
                 if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
                 and isinstance(value, (int, float)) and math.isfinite(value)
             }
-            return text
+            return response

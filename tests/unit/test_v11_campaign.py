@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import replace
@@ -98,6 +99,7 @@ class _Callbacks:
         self.n_pairs = int(n_pairs)
         self.calls = {"collect": 0, "revise": 0, "evaluate": 0, "post": 0}
         self.revision_experiences = []
+        self.revision_requests = []
 
     def collect(self, **kwargs):
         self.calls["collect"] += 1
@@ -191,6 +193,7 @@ class _Callbacks:
 
     def revise(self, **kwargs):
         self.calls["revise"] += 1
+        self.revision_requests.append(kwargs)
         self.revision_experiences.append(kwargs["experience"].model_copy(deep=True))
         parent = kwargs["parent"]
         index = kwargs["attempt"] - 1
@@ -480,6 +483,12 @@ def test_v11_campaign_retries_static_failure_with_feedback(tmp_path):
     assert first.passed is False
     assert first.checks["tools_known"] is False
     assert "invented_tool" in " ".join(first.problems)
+    repair = callbacks.revision_requests[1]["repair_context"]
+    assert repair["candidate_text"] == invalid
+    assert repair["candidate_sha256"] == hashlib.sha256(invalid.encode()).hexdigest()
+    assert repair["fully_delivered"] is True
+    assert {"code": "unknown_tool", "line": len(invalid.splitlines()),
+            "rule": "registered_tool"} in repair["errors"]
     assert not re.search(r"[\u4e00-\u9fff]", " ".join(first.problems))
     assert second.passed is True
     assert _pointer(tmp_path / "library")["snapshot_id"] == original["snapshot_id"]
@@ -519,6 +528,12 @@ def test_v11_campaign_retries_candidate_that_copies_a_question(tmp_path):
     )
     assert first.checks["no_leakage"] is False
     assert "question_text:case-alpha" in " ".join(first.problems)
+    repair = callbacks.revision_requests[1]["repair_context"]
+    assert repair["candidate_sha256"] == hashlib.sha256(copied.encode()).hexdigest()
+    assert "Which object is closest to the chair?" not in json.dumps(repair)
+    assert "case-alpha" not in json.dumps(repair)
+    assert repair["redacted_lines"] == [len(copied.splitlines())]
+    assert repair["fully_delivered"] is False
 
 
 def test_v11_campaign_resume_does_not_repeat_completed_callbacks(tmp_path):
@@ -711,3 +726,303 @@ def test_revision_format_error_consumes_one_attempt_and_keeps_response_ref(tmp_p
     assert callbacks.calls["evaluate"] == 1
     proposal = campaign._receipt_path("revision_attempt_01").read_text()
     assert "revision:captured-response" in proposal
+
+
+def test_no_change_is_terminal_without_static_gate_or_publication(tmp_path):
+    _parent, snapshot = _activate_parent(tmp_path / "library")
+    callbacks = _Callbacks()
+    campaign = _runner(tmp_path, callbacks)
+    requests = []
+
+    def unchanged(**kwargs):
+        requests.append(kwargs)
+        return V11RevisionProposal(
+            action="no_change",
+            modification_reason="The evidence does not justify a method change.",
+            source_run_ref="revision:no-change",
+        )
+
+    campaign.reviser = unchanged
+    result = campaign.run()
+    assert result.status == result.decision == "no_change"
+    assert result.revision_attempt == 1
+    assert result.candidate_id == result.candidate_skill_version == ""
+    assert not result.published_snapshot_id
+    assert set(result.receipts) == {
+        "experience_bundle", "revision_attempt_01", "decision",
+    }
+    decision = json.loads(campaign._receipt_path("decision").read_bytes())
+    assert decision["stage"] == "revision"
+    assert decision["outcome"] == "no_change"
+    assert decision["reasons"] == ["The evidence does not justify a method change."]
+    proposal = json.loads(campaign._receipt_path("revision_attempt_01").read_bytes())
+    assert proposal["proposal"]["source_run_ref"] == "revision:no-change"
+    assert "full_skill_md" not in proposal["proposal"]
+    assert callbacks.calls == {"collect": 1, "revise": 0, "evaluate": 0, "post": 0}
+    assert _pointer(tmp_path / "library")["snapshot_id"] == snapshot["snapshot_id"]
+    resumed = _runner(tmp_path, callbacks)
+
+    def repeated(**_kwargs):
+        raise AssertionError("no_change was regenerated")
+
+    resumed.collector = resumed.reviser = resumed.evaluator = resumed.post_publish_verifier = repeated
+    assert resumed.run().status == "no_change"
+    assert len(requests) == 1
+
+
+def test_interrupted_no_change_resumes_from_proposal_without_regenerating(tmp_path):
+    _activate_parent(tmp_path / "library")
+    campaign = _runner(tmp_path, _Callbacks())
+    campaign.reviser = lambda **_kwargs: V11RevisionProposal(
+        action="no_change", modification_reason="Keep the existing method.",
+        source_run_ref="revision:unchanged",
+    )
+    record = campaign._record_receipt
+
+    class ProcessExit(BaseException):
+        pass
+
+    def interrupted(key, receipt):
+        record(key, receipt)
+        if key == "decision":
+            raise ProcessExit()
+
+    campaign._record_receipt = interrupted
+    with pytest.raises(ProcessExit):
+        campaign.run()
+    resumed = _runner(tmp_path, _Callbacks())
+
+    def repeated(**_kwargs):
+        raise AssertionError("a completed revision was repeated")
+
+    resumed.reviser = resumed.evaluator = resumed.post_publish_verifier = repeated
+    assert resumed.run().status == "no_change"
+
+
+@pytest.mark.parametrize("malformed", ['{"full_skill_md": "incomplete', "", "   "])
+def test_malformed_response_delivers_actual_prior_candidate_to_repair(tmp_path, malformed):
+    from skill3d.evolution.campaign_v11 import V11RevisionFormatError
+
+    _activate_parent(tmp_path / "library")
+    callbacks = _Callbacks(candidate_score=0.5)
+    campaign = _runner(tmp_path, callbacks)
+    requests = []
+
+    def revise(**kwargs):
+        requests.append(kwargs)
+        if kwargs["attempt"] == 1:
+            raise V11RevisionFormatError(
+                "invalid JSON", source_run_ref="revision:malformed",
+                candidate_text=malformed,
+            )
+        return callbacks.revise(**kwargs)
+
+    campaign.reviser = revise
+    assert campaign.run().revision_attempt == 2
+    repair = requests[1]["repair_context"]
+    assert repair["candidate_text"] == malformed
+    assert repair["candidate_sha256"] == hashlib.sha256(malformed.encode()).hexdigest()
+    first = json.loads(campaign._receipt_path("revision_attempt_01").read_bytes())
+    assert first["format_candidate_text"] == malformed
+    if malformed.strip():
+        assert first["proposal"]["full_skill_md"] == malformed
+    assert first["format_problems"] == ["invalid JSON"]
+
+
+def test_fresh_collection_cannot_write_legacy_experience_bundle(tmp_path):
+    _activate_parent(tmp_path / "library")
+    callbacks = _Callbacks()
+    campaign = _runner(tmp_path, callbacks)
+
+    def legacy(**kwargs):
+        bundle = callbacks.collect(**kwargs)
+        return bundle.model_copy(update={"schema_version": "skill-experience-bundle-v11/5.0"})
+
+    campaign.collector = legacy
+    with pytest.raises(V11CampaignBlocked, match="read-only"):
+        campaign.run()
+    assert not campaign._receipt_path("experience_bundle").exists()
+
+
+def test_experience_schema6_defaults_and_legacy_read_preserves_identity(tmp_path):
+    parent, snapshot = _activate_parent(tmp_path / "library")
+    bundle = _Callbacks().collect(
+        campaign_id="schema", parent=parent, parent_snapshot_id=snapshot["snapshot_id"],
+    )
+    assert bundle.schema_version == "skill-experience-bundle-v11/6.0"
+    assert bundle.cases[0].rounds == bundle.cases[0].image_refs == []
+    assert bundle.cases[0].frame_set_hash == ""
+    data = bundle.model_dump(mode="json")
+    data["schema_version"] = "skill-experience-bundle-v11/5.0"
+    for row in data["cases"]:
+        for field in ("rounds", "image_refs", "frame_set_hash"):
+            del row[field]
+    raw = json.dumps(data).encode()
+    legacy = V11ExperienceBundle.model_validate_json(raw)
+    assert legacy.schema_version == "skill-experience-bundle-v11/5.0"
+    assert legacy.cases[0].rounds == []
+    assert legacy.parent_content_sha256 == parent.content_sha256
+    case = bundle.cases[0].model_dump(mode="json")
+    case.update(rounds=[{"round": 1, "program_source": "print('observed')"}],
+                image_refs=[{"frame_slot": 0}], frame_set_hash="e" * 64)
+    assert V11ExperienceCase.model_validate(case).rounds == case["rounds"]
+    case["frame_set_hash"] = "not-a-hash"
+    with pytest.raises(ValueError, match="frame_set_hash"):
+        V11ExperienceCase.model_validate(case)
+
+
+def test_resume_cannot_revise_from_an_existing_legacy_bundle_receipt(tmp_path):
+    _activate_parent(tmp_path / "library")
+    callbacks = _Callbacks()
+    campaign = _runner(tmp_path, callbacks)
+    parent, _snapshot = campaign._initialize()
+    bundle = callbacks.collect(
+        campaign_id=campaign.campaign_id, parent=parent,
+        parent_snapshot_id=campaign.checkpoint.parent_snapshot_id)
+    campaign._record_receipt("experience_bundle", bundle.model_copy(
+        update={"schema_version": "skill-experience-bundle-v11/5.0"}))
+    with pytest.raises(V11CampaignBlocked, match="read-only"):
+        _runner(tmp_path, callbacks).run()
+    assert callbacks.calls["revise"] == callbacks.calls["evaluate"] == 0
+
+
+@pytest.mark.parametrize("declaration", ["changed", "unchanged", "nonexistent"])
+def test_provided_sections_must_exist_and_actually_change(tmp_path, declaration):
+    parent, _snapshot = _activate_parent(tmp_path / "library")
+    headings = re.findall(r"^## (.+)$", parent.skill_md, flags=re.MULTILINE)
+    section = {
+        "changed": headings[0], "unchanged": headings[1], "nonexistent": "Invented heading",
+    }[declaration]
+    callbacks = _Callbacks(candidate_score=0.5)
+    campaign = _runner(tmp_path, callbacks)
+
+    def revise(**kwargs):
+        proposal = callbacks.revise(**kwargs)
+        if kwargs["attempt"] == 1:
+            proposal = proposal.model_copy(update={
+                "change_hypothesis": "Clarify the ambiguity trigger.",
+                "changed_sections": [section],
+                "expected_process_effect": "Check before ranking.",
+            })
+        return proposal
+
+    campaign.reviser = revise
+    result = campaign.run()
+    assert result.status == "rejected"
+    assert result.revision_attempt == (1 if declaration == "changed" else 2)
+    first = json.loads(campaign._receipt_path("static_validation_01").read_bytes())
+    assert first["checks"]["declared_sections_changed"] is (declaration == "changed")
+    receipt = json.loads(campaign._receipt_path("revision_attempt_01").read_bytes())
+    assert receipt["proposal"]["changed_sections"] == [section]
+    assert receipt["proposal"]["change_hypothesis"] == "Clarify the ambiguity trigger."
+    if declaration != "changed":
+        errors = callbacks.revision_requests[1]["repair_context"]["errors"]
+        assert any(error["code"] == "declared_change_not_present" and "line" in error
+                   for error in errors)
+    assert callbacks.calls["evaluate"] == 1
+
+
+def test_governed_text_diagnosis_and_repair_share_one_frozen_campaign(tmp_path):
+    from types import SimpleNamespace
+    from skill3d.evolution.adapters_v11 import V11OfflineReviser
+    from skill3d.evolution.diagnosis_v11 import OfflineDiagnosisConfig, V11CaseDiagnoser
+    from skill3d.synthesis.request_governor import (
+        GovernedClient, RequestGovernor, RequestGovernorConfig,
+    )
+
+    parent, snapshot = _activate_parent(tmp_path / "library")
+    invalid = _candidate_md(parent).rstrip("\n") + "\n\n`invented_tool()`\n"
+    requests = []
+
+    class FakeClient:
+        revision_count = 0
+
+        def require_service(self):
+            pass
+
+        def chat_with_meta(self, messages, **kwargs):
+            requests.append((messages, kwargs))
+            if "evidence analyst" in messages[0]["content"]:
+                value = {
+                    "observations": [{
+                        "statement": "The observed answer received an offline score.",
+                        "evidence_refs": ["/cases/0/score"],
+                    }],
+                    "hypotheses": [],
+                    "unknowns": ["The score does not establish a cause."],
+                }
+            else:
+                self.revision_count += 1
+                value = (
+                    {"full_skill_md": invalid, "modification_reason": "Clarify checks."}
+                    if self.revision_count == 1 else
+                    {"action": "no_change", "modification_reason": "Keep the parent method."}
+                )
+            return SimpleNamespace(
+                text=json.dumps(value), request_id=f"fake-{len(requests)}", truncated=False,
+                usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            )
+
+    client = FakeClient()
+    governor = RequestGovernor(
+        tmp_path / "governor", RequestGovernorConfig(max_requests=3, max_inflight=1),
+    )
+    diagnosis_config = OfflineDiagnosisConfig(mode="text")
+    diagnoser = V11CaseDiagnoser(
+        GovernedClient(client, governor, category="diagnosis"),
+        tmp_path / "diagnosis", diagnosis_config,
+    )
+    reviser = V11OfflineReviser(
+        GovernedClient(client, governor, category="reviser"),
+        audit_root=tmp_path / "offline", diagnoser=diagnoser,
+        diagnosis_config=diagnosis_config,
+    )
+    callbacks = _Callbacks()
+    campaign = _runner(tmp_path, callbacks)
+    revision_kwargs = []
+
+    def revise(**kwargs):
+        revision_kwargs.append(kwargs)
+        return reviser(**kwargs)
+
+    campaign.reviser = revise
+    result = campaign.run()
+    assert result.status == "no_change"
+    assert result.revision_attempt == 2
+    assert not campaign._receipt_path("static_validation_02").exists()
+    assert callbacks.calls["evaluate"] == callbacks.calls["post"] == 0
+    assert _pointer(tmp_path / "library")["snapshot_id"] == snapshot["snapshot_id"]
+    summary = governor.summary()
+    assert summary["categories"] == {"diagnosis": 1, "reviser": 2}
+    assert summary["usage"]["total_tokens"] == 9
+    assert summary["unknown_requests"] == 0
+    assert len(requests) == 3
+    assert invalid in revision_kwargs[1]["repair_context"]["candidate_text"]
+    for messages, _kwargs in requests[1:]:
+        text = messages[1]["content"]
+        assert "Which object is closest to the chair?" in text
+        assert "The score does not establish a cause." in text
+    resumed = V11OfflineReviser(
+        GovernedClient(client, governor, category="reviser"),
+        audit_root=tmp_path / "offline", diagnoser=diagnoser,
+        diagnosis_config=diagnosis_config,
+    )
+    assert resumed(**revision_kwargs[1]).action == "no_change"
+    assert len(requests) == 3
+    assert governor.summary()["reserved_requests"] == 3
+
+
+def test_oversized_prior_candidate_stops_without_a_truncated_repair(tmp_path):
+    parent, _snapshot = _activate_parent(tmp_path / "library")
+    oversized = _candidate_md(parent) + "\n" + "Generic reasoning. " * 500
+    callbacks = _Callbacks(revision_values=[oversized])
+    campaign = _runner(tmp_path, callbacks)
+    campaign.cfg = replace(
+        campaign.cfg, method_context_max_chars=len(parent.skill_md) + 100,
+    )
+    result = campaign.run()
+    assert result.status == "rejected"
+    assert result.revision_attempt == 1
+    assert callbacks.calls["revise"] == 1
+    assert callbacks.calls["evaluate"] == 0
+    assert not campaign._receipt_path("revision_attempt_02").exists()

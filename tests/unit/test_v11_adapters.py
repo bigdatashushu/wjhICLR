@@ -77,8 +77,17 @@ class _Meta:
 class _OfflineClient:
     def __init__(self, text: str):
         self.text = text
+        self.model = "fixture-offline-model"
         self.health_calls = 0
         self.calls = []
+
+    def manifest_fields(self):
+        return {
+            "provider": "fixture", "model_id": self.model,
+            "endpoint_hash": "e" * 64, "prompt_version": "fixture-prompt",
+            "request_params": {"temperature": 0},
+            "health_checks": self.health_calls, "statistics": {"calls": len(self.calls)},
+        }
 
     def require_service(self):
         self.health_calls += 1
@@ -91,6 +100,9 @@ class _OfflineClient:
 class _Experience:
     parent_snapshot_id = "snapshot-parent"
     cases = []
+
+    def model_copy(self, **_kwargs):
+        return _Experience()
 
     def model_dump(self, **_kwargs):
         return {
@@ -152,6 +164,13 @@ def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_pa
         attempt=1, static_feedback=feedback, idempotency_key="campaign-test:revise:1")
     assert repeated == proposal
     assert len(client.calls) == 1
+    frozen = json.loads((tmp_path / "campaign-test/revision_input.json").read_bytes())
+    identity = frozen["client_identity"]
+    assert set(identity) == {
+        "provider", "model_id", "endpoint_hash", "prompt_version", "request_params",
+    }
+    exchange = json.loads((tmp_path / "campaign-test/revision_01.exchange.json").read_bytes())
+    assert exchange["request"]["client_identity"] == identity
 
 
 def test_invalid_offline_response_is_recorded_and_not_requested_again(tmp_path):
@@ -165,6 +184,202 @@ def test_invalid_offline_response_is_recorded_and_not_requested_again(tmp_path):
     assert len(client.calls) == 1
     exchange = json.loads((tmp_path / "bad/revision_01.exchange.json").read_bytes())
     assert exchange["text"] == "not JSON"
+
+
+def _revision_kwargs(**changes):
+    return {
+        "campaign_id": "revision-test", "parent": _parent(),
+        "experience": _Experience(), "attempt": 1, "static_feedback": [],
+        "idempotency_key": "revision-test:revise:1", **changes,
+    }
+
+
+def test_offline_no_change_preserves_reason_and_response_receipt(tmp_path):
+    client = _OfflineClient(json.dumps({
+        "action": "no_change", "modification_reason": "Evidence is insufficient.",
+    }))
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    proposal = reviser(**_revision_kwargs())
+    assert proposal.action == "no_change"
+    assert proposal.full_skill_md is None
+    assert proposal.modification_reason == "Evidence is insufficient."
+    assert "response:" in proposal.source_run_ref
+    assert reviser(**_revision_kwargs()) == proposal
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("source", [None, "", "method source"])
+def test_offline_no_change_rejects_any_explicit_source_field(tmp_path, source):
+    client = _OfflineClient(json.dumps({
+        "action": "no_change", "full_skill_md": source, "modification_reason": "Keep parent.",
+    }))
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    with pytest.raises(adapters.V11RevisionFormatError, match="must omit full_skill_md"):
+        reviser(**_revision_kwargs())
+    assert len(client.calls) == 1
+
+
+def test_offline_revision_preserves_declared_change_metadata(tmp_path):
+    client = _OfflineClient(json.dumps({
+        "action": "revise", "full_skill_md": _candidate().full_skill_spec.skill_md,
+        "modification_reason": "Clarify the check.",
+        "change_hypothesis": "An explicit trigger reduces omissions.",
+        "changed_sections": ["Method"], "expected_process_effect": "Check ambiguity first.",
+        "evidence_signature_refs": ["evidence:test"],
+    }))
+    proposal = adapters.V11OfflineReviser(client, audit_root=tmp_path)(**_revision_kwargs())
+    assert proposal.change_hypothesis == "An explicit trigger reduces omissions."
+    assert proposal.changed_sections == ["Method"]
+    assert proposal.expected_process_effect == "Check ambiguity first."
+    assert proposal.evidence_signature_refs == ["evidence:test"]
+
+
+@pytest.mark.parametrize("response", [
+    '{"full_skill_md": "incomplete',
+    json.dumps({"full_skill_md": "prior complete candidate", "modification_reason": ""}),
+    json.dumps({"action": "invalid", "full_skill_md": "prior complete candidate",
+                "modification_reason": "A reason."}),
+])
+def test_format_failure_keeps_actual_candidate_or_malformed_response(tmp_path, response):
+    client = _OfflineClient(response)
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    with pytest.raises(adapters.V11RevisionFormatError) as captured:
+        reviser(**_revision_kwargs())
+    expected = response if response.endswith("incomplete") else "prior complete candidate"
+    assert captured.value.candidate_text == expected
+    assert "response:" in captured.value.source_run_ref
+
+
+def test_unknown_completion_never_replays_even_with_a_new_reviser(tmp_path):
+    class InterruptedClient(_OfflineClient):
+        def chat_with_meta(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            raise RuntimeError("connection lost after request submission")
+
+    client = InterruptedClient("")
+    first = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    with pytest.raises(RuntimeError, match="connection lost"):
+        first(**_revision_kwargs())
+    assert (tmp_path / "revision-test/revision_01.intent.json").is_file()
+    assert not (tmp_path / "revision-test/revision_01.exchange.json").exists()
+    resumed = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    with pytest.raises(adapters.V11AdapterError, match="unknown"):
+        resumed(**_revision_kwargs())
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize("changed", ["evidence", "max_tokens", "model", "feedback", "repair"])
+def test_frozen_revision_request_rejects_changed_resume_inputs(tmp_path, changed):
+    client = _OfflineClient(json.dumps({
+        "action": "no_change", "modification_reason": "Keep the parent.",
+    }))
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    reviser(**_revision_kwargs())
+    kwargs = _revision_kwargs()
+    if changed == "evidence":
+        class ChangedExperience(_Experience):
+            def model_dump(self, **kwargs):
+                value = super().model_dump(**kwargs)
+                value["cases"][0]["question_text"] = "Different frozen evidence"
+                return value
+
+        kwargs["experience"] = ChangedExperience()
+    elif changed == "max_tokens":
+        reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path, max_tokens=100)
+    elif changed == "model":
+        client.model = "different-offline-model"
+    elif changed == "feedback":
+        kwargs["static_feedback"] = ["changed feedback"]
+    else:
+        kwargs["repair_context"] = {"candidate_text": "changed previous candidate"}
+    with pytest.raises(adapters.V11AdapterError, match="changed"):
+        reviser(**kwargs)
+    assert len(client.calls) == 1
+
+
+def test_text_diagnosis_is_frozen_once_and_original_cases_reach_every_revision(tmp_path):
+    class Diagnoser:
+        config = {"mode": "text", "max_cases": 4, "max_input_chars": 64000,
+                  "max_images": 8, "max_output_tokens": 4096}
+
+        def __init__(self):
+            self.calls = []
+
+        def diagnose(self, parent, experience, image_provider=None, context=None):
+            self.calls.append((parent, experience, image_provider, context))
+            return {"facts": ["observed failure"], "hypotheses": ["uncertain cause"]}
+
+    diagnosis = Diagnoser()
+    client = _OfflineClient(json.dumps({
+        "action": "no_change", "modification_reason": "Insufficient evidence.",
+    }))
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path, diagnoser=diagnosis)
+    reviser(**_revision_kwargs())
+    repair = {"candidate_text": "prior failed candidate", "candidate_sha256": "c" * 64}
+    second_kwargs = _revision_kwargs(
+        attempt=2, idempotency_key="revision-test:revise:2", repair_context=repair,
+    )
+    reviser(**second_kwargs)
+    resumed = adapters.V11OfflineReviser(client, audit_root=tmp_path, diagnoser=diagnosis)
+    resumed(**second_kwargs)
+    assert len(diagnosis.calls) == 1
+    assert diagnosis.calls[0][2] is None
+    assert diagnosis.calls[0][3]["idempotency_key"] == "revision-test:diagnose"
+    assert len(client.calls) == 2
+    for messages, _ in client.calls:
+        prompt = messages[1]["content"]
+        assert "Which object is closest?" in prompt
+        assert "reference_answer" in prompt
+        assert "observed failure" in prompt
+        assert "uncertain cause" in prompt
+    assert "prior failed candidate" in client.calls[1][0][1]["content"]
+    assert "c" * 64 in client.calls[1][0][1]["content"]
+    off = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    with pytest.raises(adapters.V11AdapterError, match="frozen revision input changed"):
+        off(**_revision_kwargs())
+
+
+def test_multimodal_diagnosis_requires_explicit_real_image_provider(tmp_path):
+    diagnosis = SimpleNamespace(config={"mode": "multimodal"})
+    with pytest.raises(adapters.V11AdapterError, match="explicit image provider"):
+        adapters.V11OfflineReviser(_OfflineClient(""), audit_root=tmp_path, diagnoser=diagnosis)
+
+
+@pytest.mark.parametrize("attempt", [0, 101])
+def test_revision_fresh_request_guard_has_a_bounded_attempt_identity(tmp_path, attempt):
+    client = _OfflineClient("")
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    with pytest.raises(adapters.V11AdapterError, match=r"\[1, 100\]"):
+        reviser(**_revision_kwargs(attempt=attempt))
+    assert not client.calls
+
+
+def test_audit_identity_is_shared_stable_across_repairs_and_bound_to_request_seed(tmp_path):
+    class AuditedClient(_OfflineClient):
+        def audit_identity(self, *, seed):
+            return {"provider": "audited", "model_id": self.model, "seed": seed}
+
+    client = AuditedClient(json.dumps({
+        "action": "no_change", "modification_reason": "Keep the method.",
+    }))
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+    reviser(**_revision_kwargs())
+    second = _revision_kwargs(attempt=2, idempotency_key="revision-test:revise:2")
+    reviser(**second)
+    frozen = json.loads((tmp_path / "revision-test/revision_input.json").read_bytes())
+    exchange = json.loads((tmp_path / "revision-test/revision_02.exchange.json").read_bytes())
+    assert frozen["client_identity"] == {
+        "provider": "audited", "model_id": client.model, "seed": 1,
+    }
+    assert exchange["request"]["client_identity"] == {
+        "provider": "audited", "model_id": client.model, "seed": 2,
+    }
+    assert reviser(**second).action == "no_change"
+    assert len(client.calls) == 2
+    client.model = "changed-offline-model"
+    with pytest.raises(adapters.V11AdapterError, match="changed"):
+        reviser(**second)
+    assert len(client.calls) == 2
 
 
 def _pair_row(seed: int, parent: SkillSpecV11, candidate: SkillSpecV11) -> dict:

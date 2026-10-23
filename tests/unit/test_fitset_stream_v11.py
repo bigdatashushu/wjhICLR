@@ -1,6 +1,8 @@
 """流式 fit-set 的版本边界、双 seed、恢复和冻结行为回归。"""
 
 from dataclasses import dataclass
+import hashlib
+from io import BytesIO
 import json
 import threading
 
@@ -11,7 +13,7 @@ from skill3d.evaluation.fitset_v11 import (
 )
 from skill3d.evolution.fitset_revision_v11 import load_active_parent_slots
 from skill3d.evolution.fitset_stream_v11 import (
-    FitSetEvolutionConfig, FrozenSkillProvider, SeededGateClient,
+    FitSetEvolutionConfig, FitSetExperienceCase, FrozenSkillProvider, SeededGateClient,
     freeze_fitset_stream,
 )
 from skill3d.online.runner import OnlineRunConfig
@@ -49,6 +51,26 @@ class NoChangeRevisionClient:
 
 def no_change_revision_factory():
     return NoChangeRevisionClient()
+
+
+class FullEvidenceClient:
+    def chat(self, messages, **_kwargs):
+        if "evidence analyst" in messages[0]["content"]:
+            return json.dumps({
+                "observations": [], "hypotheses": [],
+                "unknowns": ["The cause cannot be established from the recorded program."],
+            })
+        text = messages[-1]["content"]
+        assert "How many chairs are visible" in text
+        assert '"reference_answer": "2"' in text
+        assert '"program_source": "ReturnAnswer()"' in text
+        assert "experience_provenance" in text
+        return json.dumps({
+            "action": "no_change", "modification_reason": "No supported method change."})
+
+
+def full_evidence_factory():
+    return FullEvidenceClient()
 
 
 class AnswerClient:
@@ -102,16 +124,25 @@ class ProbeRunner(SystemVariantRunner):
             client.chat([], seed=self.base_cfg.seed)
         outcome = {
             "qa_id": variant["qa_id"], "final_state": "answer", "answer": cell.answer,
+            "scene_id": variant["scene_id"], "question_type": variant["question_type"],
             "answer_source": "tool_program", "episode_status": "answered",
             "delivered_skill_versions": [f"{spec.skill_id}@{spec.version}"],
             "initial_skill_selection": {
                 "skill_version": f"{spec.skill_id}@{spec.version}",
                 "content_sha256": spec.content_sha256,
                 "evidence_state": spec.evidence_state,
+                "question_type": spec.question_type,
             },
+            "retrieval_records": [{
+                "candidates": [{"skill_version": f"{spec.skill_id}@{spec.version}", "delivered": True}],
+                "delivered_skill_versions": [f"{spec.skill_id}@{spec.version}"],
+                "delivered_content_sha256": {
+                    f"{spec.skill_id}@{spec.version}": spec.content_sha256},
+            }],
             "initial_evidence_states": initial,
             "evidence_history": [{"evidence_states": initial}],
             "rounds": [{
+                "index": 0, "synthesis_source": "online_model_ok",
                 "executed": True, "response_text": "a program",
                 "program_source": "ReturnAnswer()", "results": [], "error_code": "",
             }],
@@ -122,6 +153,31 @@ class ProbeRunner(SystemVariantRunner):
             "input_hash": content_sha256(variant),
         })
         _write_create_once(variant_root / "outcome.json", outcome)
+        if self.evolution_config is not None and self.evolution_config.learning_input_mode != "aggregate_v1":
+            from PIL import Image
+
+            buffer = BytesIO()
+            Image.new("RGB", (4, 4), (30, 60, 90)).save(buffer, format="PNG")
+            data = buffer.getvalue()
+            digest = hashlib.sha256(data).hexdigest()
+            images = []
+            for index in range(32):
+                image_path = variant_root / "offline_images" / f"{index:02d}.png"
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                image_path.write_bytes(data)
+                images.append({
+                    "path": str(image_path), "file_sha256": digest, "content_sha256": digest,
+                    "image_id": f"frame-{index}", "kind": "frame",
+                    "frame_id": index, "source_frame_index": index,
+                    "source_hw": [4, 4], "frame_set_hash": "c" * 64,
+                })
+            _write_create_once(variant_root / "offline_input.json", {
+                "schema_version": "v11-fit-set-offline-input/1.0",
+                "variant_id": variant["variant_id"], "variant_sha256": content_sha256(variant),
+                "qa_id": variant["qa_id"], "scene_id": variant["scene_id"], "split": variant["split"],
+                "question_text": f"How many chairs are visible in room {variant['qa_id']}?",
+                "options": [], "frame_set_hash": "c" * 64, "image_refs": images,
+            })
         row = {
             "variant_id": variant["variant_id"], "qa_id": variant["qa_id"],
             "question_type": variant["question_type"],
@@ -131,16 +187,21 @@ class ProbeRunner(SystemVariantRunner):
             "answer": value, "status": "completed", "final_state": "answer",
             "skill_identity": identity,
         }
+        if self.evolution_config is not None and self.evolution_config.learning_input_mode != "aggregate_v1":
+            row["offline_input_sha256"] = hashlib.sha256(
+                (variant_root / "offline_input.json").read_bytes()).hexdigest()
         _write_create_once(self._result_path(variant["variant_id"]), row)
         return row
 
 
-def make_runner(tmp_path, *, workers=1, n=13, reference="2", episode_concurrency=None):
+def make_runner(tmp_path, *, workers=1, n=13, reference="2", episode_concurrency=None,
+                learning_input_mode="aggregate_v1", revision_client_factory=revision_factory):
     skills, _, snapshot = load_active_skills(LIBRARY / "snapshots")
     variants = [{
         "variant_id": f"fit-{i:03d}@g0m0", "qa_id": f"fit-{i:03d}",
         "scene_id": f"scene-{i:03d}", "question_type": "object_counting",
-        "evidence_state": "g0m0", "split": "inner_validation",
+        "evidence_state": "g0m0", "split": (
+            "inner_validation" if learning_input_mode == "aggregate_v1" else "induction"),
     } for i in range(n)]
     labels = {row["qa_id"]: {
         "question_type": "object_counting", "scene_id": row["scene_id"],
@@ -156,10 +217,72 @@ def make_runner(tmp_path, *, workers=1, n=13, reference="2", episode_concurrency
             "snapshot_ref": snapshot, "manifest_sha256": "a" * 64,
         }), workers=workers, min_free_gib=0,
         episode_concurrency=episode_concurrency,
-        evolution_config=FitSetEvolutionConfig(scheduling_mode="batch_v1"),
-        label_metadata=labels, revision_client_factory=revision_factory,
+        evolution_config=FitSetEvolutionConfig(
+            scheduling_mode="batch_v1", learning_input_mode=learning_input_mode),
+        label_metadata=labels, revision_client_factory=revision_client_factory,
         gate_client_factory=gate_factory,
     )
+
+
+@pytest.mark.parametrize("mode", ["full_cases_v1", "diagnosis_v1"])
+def test_complete_induction_cases_and_diagnosis_reach_reviser_and_resume(tmp_path, mode):
+    runner = make_runner(
+        tmp_path, learning_input_mode=mode, revision_client_factory=full_evidence_factory)
+    first = runner.run(resume=False, max_variants=12)
+    assert first["completed_variants"] == 12
+    resumed = make_runner(
+        tmp_path, learning_input_mode=mode, revision_client_factory=full_evidence_factory)
+    assert resumed.run(resume=True)["completed_variants"] == 13
+    campaign = next((runner.root / "workers").glob("*/campaigns/*/experience_bundle.json"))
+    bundle = json.loads(campaign.read_text())
+    assert bundle["source_split"] == "induction" and bundle["label_access"]
+    assert len(bundle["cases"]) == 12
+    assert bundle["cases"][0]["rounds"][0]["experience_provenance"]["source_ref"]
+    assert json.loads((campaign.parent / "result.json").read_text())["outcome"] == "no_change"
+    assert len(list(campaign.parent.glob("revision/slots/*/*/request_intent_*.json"))) == 1
+    assert len(list(campaign.parent.glob("diagnosis/*/request_intent.json"))) == int(mode == "diagnosis_v1")
+    assert not (campaign.parent / "gate").exists()
+    buffer = next((runner.root / "workers").glob("*/buffer/stream.json"))
+    slot = json.loads(buffer.read_text())["slots"]["object_counting/g0m0"]
+    stored = json.loads((buffer.parent / slot["case_refs"][0]).read_text())
+    assert FitSetExperienceCase.model_validate(stored).full_case
+    stored["full_case"]["scene_id"] = "a-different-scene"
+    with pytest.raises(ValueError, match="buffer/canonical case scene_id mismatch"):
+        FitSetExperienceCase.model_validate(stored)
+
+
+def test_new_complete_cases_trigger_again_even_when_aggregate_signature_does_not_change(tmp_path):
+    from dataclasses import replace
+
+    runner = make_runner(
+        tmp_path, n=25, learning_input_mode="full_cases_v1",
+        revision_client_factory=full_evidence_factory)
+    runner.evolution_config = replace(runner.evolution_config, scheduling_mode="novel_failure_v1")
+    assert runner.run(resume=False)["completed_variants"] == 25
+    schedules = list((runner.root / "workers").glob("*/campaigns/*/schedule.json"))
+    assert len(schedules) == 2
+    for path in schedules:
+        schedule = json.loads(path.read_text())
+        assert schedule["scheduled"] and schedule["mode"] == "batch_v1"
+        assert schedule["requested_mode"] == "novel_failure_v1"
+
+
+@pytest.mark.parametrize("mode", ["diagnosis_v1", "diagnosis_multimodal_v1"])
+def test_diagnosis_requires_budget_for_diagnosis_and_at_least_one_revision(tmp_path, mode):
+    from dataclasses import replace
+
+    runner = make_runner(
+        tmp_path, n=12, learning_input_mode=mode,
+        revision_client_factory=full_evidence_factory)
+    runner.evolution_config = replace(runner.evolution_config, max_revision_requests_per_slot=1)
+    assert runner.run(resume=False)["completed_variants"] == 12
+    schedule = next((runner.root / "workers").glob("*/campaigns/*/schedule.json"))
+    row = json.loads(schedule.read_text())
+    assert not row["scheduled"] and row["reason_code"] == "revision_request_budget_exhausted"
+    assert row["revision_attempt_budget"] == 0
+    assert not list(schedule.parent.glob("diagnosis/*/request_intent.json"))
+    assert not list(schedule.parent.glob("revision/slots/*/*/request_intent_*.json"))
+    assert runner.run(resume=True)["status"] == "complete"
 
 
 @pytest.mark.parametrize("workers", [1, 2])

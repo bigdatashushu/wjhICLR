@@ -6,7 +6,7 @@ import hashlib
 import re
 from typing import Literal, Optional
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_serializer, model_validator
 
 from . import Spec
 from .data_access import DataAccessRecord
@@ -14,7 +14,7 @@ from .skill import SkillCandidateV11
 from .evidence import SkillEvidenceState, skill_evidence_state
 
 V11_CAMPAIGN_SCHEMA_VERSION = "skill-evolution-campaign-v11/2.0"
-V11_EXPERIENCE_SCHEMA_VERSION = "skill-experience-bundle-v11/5.0"
+V11_EXPERIENCE_SCHEMA_VERSION = "skill-experience-bundle-v11/6.0"
 V11_EVALUATION_SCHEMA_VERSION = "skill-paired-evaluation-v11/3.0"
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -55,6 +55,9 @@ class V11ExperienceCase(Spec):
     candidate_objects: list[dict] = Field(default_factory=list)
     selected_object_ids: list[str] = Field(default_factory=list)
     image_observations: dict = Field(default_factory=dict)
+    rounds: list[dict] = Field(default_factory=list)
+    image_refs: list[dict] = Field(default_factory=list)
+    frame_set_hash: str = ""
     model_answer: Optional[str] = None
     reference_answer: str
     score: float = Field(ge=0.0, le=1.0)
@@ -84,6 +87,11 @@ class V11ExperienceCase(Spec):
     @classmethod
     def _valid_delivery_sha(cls, value: str) -> str:
         return _require_sha256(value, field_name="delivered_content_sha256")
+
+    @field_validator("frame_set_hash")
+    @classmethod
+    def _valid_optional_frame_sha(cls, value: str) -> str:
+        return _require_sha256(value, field_name="frame_set_hash") if value else ""
 
     @model_validator(mode="after")
     def _delivery_body_matches_hash(self):
@@ -121,7 +129,10 @@ class V11ExperienceCase(Spec):
 class V11ExperienceBundle(Spec):
     """Parent-version learning evidence consumed by one offline revision."""
 
-    schema_version: Literal["skill-experience-bundle-v11/5.0"] = (
+    schema_version: Literal[
+        "skill-experience-bundle-v11/6.0",
+        "skill-experience-bundle-v11/5.0",
+    ] = (
         V11_EXPERIENCE_SCHEMA_VERSION
     )
     campaign_id: str
@@ -195,16 +206,59 @@ class V11ExperienceBundle(Spec):
 class V11RevisionProposal(Spec):
     """Offline reviser output; framework identity and version are deliberately absent."""
 
-    full_skill_md: str
+    action: Literal["revise", "no_change"] = "revise"
+    full_skill_md: Optional[str] = None
     modification_reason: str
     source_run_ref: str
+    change_hypothesis: Optional[str] = None
+    changed_sections: list[str] = Field(default_factory=list)
+    expected_process_effect: Optional[str] = None
+    evidence_signature_refs: list[str] = Field(default_factory=list)
 
-    @field_validator("full_skill_md", "modification_reason", "source_run_ref")
+    @model_validator(mode="before")
+    @classmethod
+    def _no_change_omits_source(cls, value):
+        if isinstance(value, dict) and value.get("action") == "no_change" and (
+            "full_skill_md" in value
+        ):
+            raise ValueError("action=no_change must omit full_skill_md")
+        return value
+
+    @model_serializer(mode="wrap")
+    def _serialize_proposal(self, handler):
+        value = handler(self)
+        if self.action == "no_change":
+            value.pop("full_skill_md", None)
+        return value
+
+    @field_validator("modification_reason", "source_run_ref")
     @classmethod
     def _nonempty(cls, value: str) -> str:
         if not str(value or "").strip():
             raise ValueError("修订提案字段不能为空")
         return str(value)
+
+    @field_validator("change_hypothesis", "expected_process_effect")
+    @classmethod
+    def _optional_nonempty(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("declared revision metadata must be nonempty")
+        return value
+
+    @field_validator("changed_sections", "evidence_signature_refs")
+    @classmethod
+    def _valid_declared_refs(cls, values: list[str]) -> list[str]:
+        if any(not value.strip() for value in values) or len(set(values)) != len(values):
+            raise ValueError("declared revision references must be nonempty and unique")
+        return values
+
+    @model_validator(mode="after")
+    def _revision_requires_complete_source(self):
+        if self.action == "revise" and not (self.full_skill_md or "").strip():
+            raise ValueError("action=revise requires nonempty full_skill_md")
+        if self.action == "no_change" and self.full_skill_md is not None:
+            raise ValueError("action=no_change must omit full_skill_md")
+        return self
 
 
 class V11RevisionAttemptReceipt(Spec):
@@ -213,6 +267,8 @@ class V11RevisionAttemptReceipt(Spec):
     parent_skill_version: str
     experience_sha256: str
     proposal: V11RevisionProposal
+    format_problems: list[str] = Field(default_factory=list)
+    format_candidate_text: Optional[str] = None
 
     @field_validator("experience_sha256")
     @classmethod
@@ -354,17 +410,29 @@ class V11CampaignDecision(Spec):
     campaign_id: str
     question_type: str
     evidence_state: SkillEvidenceState
-    stage: Literal["static_validation", "paired_evaluation"]
-    outcome: Literal["promote", "reject"]
+    stage: Literal["revision", "static_validation", "paired_evaluation"]
+    outcome: Literal["promote", "reject", "no_change"]
     parent_snapshot_id: str
     parent_skill_version: str
-    candidate_id: str
-    candidate_skill_version: str
+    candidate_id: str = ""
+    candidate_skill_version: str = ""
     conditions: dict[str, bool]
     reasons: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _decision_consistent(self):
+        if self.outcome == "no_change":
+            if (
+                self.stage != "revision"
+                or self.candidate_id
+                or self.candidate_skill_version
+                or self.conditions != {"revision_no_change": True}
+                or not self.reasons
+            ):
+                raise ValueError("no_change requires a revision decision without a candidate")
+            return self
+        if self.stage == "revision":
+            raise ValueError("revision decisions must have outcome=no_change")
         promotes = bool(self.conditions) and all(self.conditions.values())
         expected = "promote" if promotes else "reject"
         if self.outcome != expected:
@@ -465,6 +533,7 @@ V11CampaignStatus = Literal[
     "verifying",
     "promoted",
     "rejected",
+    "no_change",
     "blocked",
 ]
 
