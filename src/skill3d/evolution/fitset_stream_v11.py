@@ -481,6 +481,8 @@ class FitSetWorkerEvolution:
                 _, evaluation_snapshot = _active(output / "library")
                 gate_runner = copy.copy(self.runner)
                 gate_runner.root = output
+                gate_runner._request_governor_root = self.runner.request_governor_root
+                gate_runner._request_category = "gate"
                 gate_runner.evolution_config = None
                 gate_runner.skills_for_variant = FrozenSkillProvider([spec], {
                     "snapshot_ref": evaluation_snapshot["snapshot_id"],
@@ -710,7 +712,11 @@ class FitSetWorkerEvolution:
             panel_name=self.runner.panel_name, variants=[],
             accumulation_root=self.runner.root,
             label_metadata={}, library_root=self.library,
-            client=self.runner.revision_client_factory(),
+            client=self.runner._govern_client(
+                self.runner.revision_client_factory(), "reviser",
+                {"slot_key": request.slot_key, "campaign_id": token,
+                 "run_identity": self.runner.run_identity},
+            ),
             max_attempts=schedule["revision_attempt_budget"],
             max_tokens=self.config.max_tokens,
             method_context_max_chars=self.runner.base_cfg.retrieval_policy.method_context_max_chars,

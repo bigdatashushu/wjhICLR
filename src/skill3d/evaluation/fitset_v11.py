@@ -1237,6 +1237,9 @@ class SystemVariantRunner:
         revision_client_factory=None,
         gate_client_factory=None,
         episode_concurrency: int | None = None,
+        scheduler: str = "slot_shards",
+        skill_owners: int = 4,
+        request_governor_config=None,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -1262,6 +1265,9 @@ class SystemVariantRunner:
         self.label_metadata = copy.deepcopy(dict(label_metadata or {}))
         self.revision_client_factory = revision_client_factory
         self.gate_client_factory = gate_client_factory
+        self.scheduler = scheduler
+        self.skill_owners = int(skill_owners)
+        self.request_governor_config = request_governor_config
         self.episode_concurrency = (
             None if episode_concurrency is None else int(episode_concurrency))
         # The cross-process permit is a runtime-only resource. It is created by
@@ -1276,8 +1282,11 @@ class SystemVariantRunner:
             math.isfinite(self.min_free_gib) and self.min_free_gib >= 0,
             "min_free_gib must be finite and non-negative",
         )
-        _require(1 <= self.workers <= 16,
-                 "workers must be between 1 and 16")
+        _require(scheduler in {"slot_shards", "episode_pool"},
+                 "unknown episode scheduler")
+        _require(1 <= self.workers <= (32 if scheduler == "episode_pool" else 16),
+                 "workers must be 1..16 for slot_shards or 1..32 for episode_pool")
+        _require(1 <= self.skill_owners <= 19, "skill_owners must be 1..19")
         _require(
             self.episode_concurrency is None
             or 1 <= self.episode_concurrency <= 128,
@@ -1337,6 +1346,9 @@ class SystemVariantRunner:
 
     @property
     def execution_scheduler(self) -> str:
+        if self.scheduler == "episode_pool":
+            from skill3d.evaluation.episode_pool_v11 import EPISODE_POOL_SCHEDULER
+            return EPISODE_POOL_SCHEDULER
         return (
             SINGLE_PROCESS_SCHEDULER
             if self.workers == 1
@@ -1349,7 +1361,7 @@ class SystemVariantRunner:
     ) -> list[list[dict]]:
         return _stable_slot_shards(
             self.execution_variants if variants is None else variants,
-            self.workers,
+            self.skill_owners if self.scheduler == "episode_pool" else self.workers,
         )
 
     def _manifest(self) -> dict:
@@ -1384,7 +1396,8 @@ class SystemVariantRunner:
                 "workers": self.workers,
                 "scheduler": self.execution_scheduler,
                 "process_start_method": (
-                    "none" if self.workers == 1 else "spawn"
+                    "none" if self.workers == 1 and self.scheduler == "slot_shards"
+                    else "spawn"
                 ),
                 "sandbox_timeout_runtime": "main_thread_sigalrm",
                 "variant_ids": [
@@ -1431,6 +1444,15 @@ class SystemVariantRunner:
             "reference_answer_visible_to_online_model": False,
             "solver_config_sha256": content_sha256(_json_value(asdict(self.base_cfg))),
         }
+        if self.scheduler == "episode_pool":
+            body["execution"].update({
+                "skill_owners": self.skill_owners,
+                "episode_concurrency": self.episode_concurrency or self.workers,
+                "lineage_ingest_order": "scene_id_then_variant_id",
+                "learning_window_policy": "remaining_cases_before_revision_boundary",
+            })
+        if self.request_governor_config is not None:
+            body["request_policy"] = asdict(self.request_governor_config)
         return {**body, "identity_sha256": content_sha256(body)}
 
     def initialize(self, *, resume: bool) -> dict:
@@ -1648,6 +1670,20 @@ class SystemVariantRunner:
         with self._episode_permit():
             return self._run_one_locked(variant)
 
+    def _govern_client(self, client, category: str, context: Mapping):
+        if self.request_governor_config is None:
+            return client
+        _require(client is not None, "governed runs require an explicit model client")
+        from skill3d.synthesis.request_governor import GovernedClient, RequestGovernor
+        return GovernedClient(
+            client, RequestGovernor(self.request_governor_root, self.request_governor_config),
+            category=category, context=context,
+        )
+
+    @property
+    def request_governor_root(self) -> Path:
+        return getattr(self, "_request_governor_root", self.root / "request_governor")
+
     def _run_one_locked(self, variant: Mapping) -> dict:
         from skill3d.online import runner
         from skill3d.sandbox.kernel import _Timeout
@@ -1686,6 +1722,10 @@ class SystemVariantRunner:
             self.client_factory(variant_id)
             if self.client_factory is not None
             else None
+        )
+        llm = self._govern_client(
+            llm, getattr(self, "_request_category", "solver"),
+            {"variant_id": variant_id, "run_identity": self.run_identity},
         )
         set_context = getattr(llm, "set_audit_context", None)
         if callable(set_context):
@@ -1791,6 +1831,10 @@ class SystemVariantRunner:
         pending: Sequence[Mapping],
         accept: Callable[[dict], None],
     ) -> None:
+        if self.scheduler == "episode_pool":
+            from skill3d.evaluation.episode_pool_v11 import execute_episode_pool
+            execute_episode_pool(self, pending, accept)
+            return
         context = multiprocessing.get_context("spawn")
         # One global permit pool, created from the spawn context so it can be
         # inherited by shard workers and their gate children. It bounds the
@@ -2140,6 +2184,10 @@ class SystemVariantRunner:
                 self.evolution_finished if self.evolution_config is not None else None),
             "updated_at": time.time(),
         }
+        if self.request_governor_config is not None:
+            from skill3d.synthesis.request_governor import RequestGovernor
+            summary["requests"] = RequestGovernor(
+                self.request_governor_root, self.request_governor_config).summary()
         _write_json_atomic(self.root / "summary.json", summary)
         return summary
 

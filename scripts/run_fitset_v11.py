@@ -440,6 +440,11 @@ def _run_system(args) -> int:
         skills_for_variant=skill_provider,
         min_free_gib=args.min_free_gib,
         workers=args.workers,
+        scheduler=args.scheduler,
+        skill_owners=args.skill_owners,
+        request_governor_config=(
+            _request_policy(args) if args.max_requests else None),
+        client_factory=_SeededClientFactory(raw, args.seed, Path(args.output_dir)),
         episode_concurrency=(
             args.episode_concurrency if args.episode_concurrency else None),
         evolution_config=(
@@ -468,6 +473,15 @@ def _run_system(args) -> int:
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def _request_policy(args):
+    from skill3d.synthesis.request_governor import RequestGovernorConfig
+    return RequestGovernorConfig(
+        max_requests=args.max_requests,
+        max_inflight=args.request_concurrency or args.workers,
+        requests_per_second=args.requests_per_second,
+    )
 
 
 def _validate(args) -> int:
@@ -602,9 +616,17 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--scene-cache-size", type=int, default=2)
     run.add_argument("--min-free-gib", type=float, default=80.0)
     run.add_argument("--workers", type=int, default=1)
+    run.add_argument("--scheduler", choices=("slot_shards", "episode_pool"),
+                     default="slot_shards")
+    run.add_argument("--skill-owners", type=int, default=4,
+                     help="fixed Skill library owners, independent of episode executors")
+    run.add_argument("--max-requests", type=int, default=0,
+                     help="shared solver/reviser/gate request budget; required for episode_pool")
+    run.add_argument("--request-concurrency", type=int, default=0)
+    run.add_argument("--requests-per-second", type=float, default=0)
     run.add_argument("--episode-concurrency", type=int, default=0,
                      help="global cap on concurrently executing episodes "
-                          "across every worker and gate; 0 keeps serial runs")
+                          "across every worker and gate; 0 uses the scheduler default")
     run.add_argument("--gate-size", type=int, default=8)
     run.add_argument("--max-revision-attempts", type=int, default=3)
     run.add_argument("--revision-max-tokens", type=int, default=8192)
@@ -658,6 +680,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if (args.command == "run-system" and args.scheduler == "episode_pool"
+                and args.max_requests < 1):
+            raise FitSetError("episode_pool requires an explicit --max-requests budget")
         return int(args.handler(args))
     except (FitSetError, FileNotFoundError, ValueError, KeyError) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
