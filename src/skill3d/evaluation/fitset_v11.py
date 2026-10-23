@@ -1240,6 +1240,7 @@ class SystemVariantRunner:
         scheduler: str = "slot_shards",
         skill_owners: int = 4,
         request_governor_config=None,
+        published_inputs=None,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -1248,6 +1249,7 @@ class SystemVariantRunner:
         self.panel_name = panel_name
         self.variants = [dict(row) for row in variants]
         self.item_provider = item_provider
+        self.published_inputs = published_inputs
         self.input_receipt_provider = input_receipt_provider
         self.input_contract_identity = copy.deepcopy(
             dict(input_contract_identity))
@@ -1440,7 +1442,8 @@ class SystemVariantRunner:
                 }
                 if self.evolution_config is not None else None
             ),
-            "reference_answer_retained_for_input_identity_and_m12": True,
+            "reference_answer_retained_for_input_identity_and_m12": self.published_inputs is None,
+            "online_executor_input_is_label_free": self.published_inputs is not None,
             "reference_answer_visible_to_online_model": False,
             "solver_config_sha256": content_sha256(_json_value(asdict(self.base_cfg))),
         }
@@ -1537,23 +1540,41 @@ class SystemVariantRunner:
             and len(item.pixels) == 32,
             f"{variant_id}: system input requires exactly 32 readable frames",
         )
-        artifact_path = Path(variant["artifact_ref"]).resolve()
-        _require(artifact_path.is_file(),
-                 f"{variant_id}: frozen artifact is missing")
-        state = initial_state_for_item(item, artifact_path)
+        artifact_relocation = None
+        transport_receipt = None
+        if self.published_inputs is not None:
+            from skill3d.schemas.evidence import skill_evidence_state
+            published = self.published_inputs.prepare_published(variant, item)
+            artifact_path = published["artifact_path"]
+            artifact = published["artifact"]
+            identity = published["identity"]
+            reference = published["reference"]
+            prepared = published["prepared"]
+            artifact_relocation = published["artifact_relocation"]
+            transport_receipt = published["transport_receipt"]
+            _require(reference == self.binding_refs.get(variant_id),
+                     f"{variant_id}: published binding reference changed")
+            quality_artifact = runner._prepare_m4_quality(
+                artifact, item.pixels, persist_quality=False)
+            state = skill_evidence_state(runner.build_scene_state(
+                quality_artifact, question_type=variant["question_type"]).evidence_profile)
+        else:
+            artifact_path = Path(variant["artifact_ref"]).resolve()
+            _require(artifact_path.is_file(),
+                     f"{variant_id}: frozen artifact is missing")
+            state = initial_state_for_item(item, artifact_path)
+            identity = input_identity(item, artifact_path)
+            reference = self.binding_refs.get(variant_id)
+            _require(reference is not None,
+                     f"{variant_id}: prepared binding reference is missing")
+            _require(reference.get("scene_input_identity_sha256")
+                     == identity["sha256"],
+                     f"{variant_id}: prepared binding input identity changed")
+            prepared = load_prepared_binding_reference(
+                reference, scene_input_identity=identity)
+            artifact = load_artifact_v5(artifact_path)
         _require(state == variant["evidence_state"],
                  f"{variant_id}: runtime evidence state changed to {state}")
-        identity = input_identity(item, artifact_path)
-        reference = self.binding_refs.get(variant_id)
-        _require(reference is not None,
-                 f"{variant_id}: prepared binding reference is missing")
-        _require(reference.get("scene_input_identity_sha256")
-                 == identity["sha256"],
-                 f"{variant_id}: prepared binding input identity changed")
-        prepared = load_prepared_binding_reference(
-            reference,
-            scene_input_identity=identity,
-        )
         frozen_parameters = dict(
             (reference.get("request_identity") or {}).get("parameters") or {})
         frozen_review = copy.deepcopy(
@@ -1562,6 +1583,12 @@ class SystemVariantRunner:
             copy.deepcopy(self.base_cfg),
             semantic_review_config=frozen_review,
         )
+        if self.published_inputs is not None:
+            binding_seed = reference["request_identity"]["seed"]
+            _require(type(binding_seed) is int,
+                     f"{variant_id}: invalid sealed binding seed")
+            runtime_base_cfg = replace(
+                runtime_base_cfg, prepared_binding_seed=binding_seed)
         runtime_parameters = binding_parameters(
             semantic_min_pixels=runtime_base_cfg.semantic_min_pixels,
             semantic_max_pixels=runtime_base_cfg.semantic_max_pixels,
@@ -1571,7 +1598,6 @@ class SystemVariantRunner:
         )
         _require(runtime_parameters == frozen_parameters,
                  f"{variant_id}: sealed M5 parameters no longer replay")
-        artifact = load_artifact_v5(artifact_path)
         validate_prepared_binding(
             prepared,
             frames=item.pixels,
@@ -1591,7 +1617,8 @@ class SystemVariantRunner:
                 or artifact.frame_set_hash
                 or artifact.artifact_id
             ),
-            seed=int(runtime_base_cfg.seed),
+            seed=(runtime_base_cfg.prepared_binding_seed
+                  if self.published_inputs is not None else int(runtime_base_cfg.seed)),
             model_weights_sha256="",
             parameters=runtime_parameters,
             source_compatibility=(
@@ -1630,12 +1657,15 @@ class SystemVariantRunner:
             "m5_parameters_sha256": content_sha256(frozen_parameters),
             "skill_identity": dict(skill_identity),
         }
+        if transport_receipt is not None:
+            plan["published_transport"] = transport_receipt
         if not preflight:
             _write_create_once(variant_root / "plan.json", plan)
         return {
             "variant_id": variant_id,
             "item": item,
             "artifact_path": artifact_path,
+            "artifact_relocation": artifact_relocation,
             "state": state,
             "identity": identity,
             "reference": reference,
@@ -1746,6 +1776,9 @@ class SystemVariantRunner:
             cfg,
             llm=llm,
             prepared_bindings={item.episode.qa_id: prepared},
+            **({"artifact_relocations": {
+                item.episode.qa_id: prepared_run["artifact_relocation"]}}
+               if prepared_run["artifact_relocation"] is not None else {}),
         )
         elapsed = time.perf_counter() - started
         _require(len(outcomes) == 1,
@@ -2063,6 +2096,8 @@ class SystemVariantRunner:
             "skill_identity": dict(values["skill_identity"]),
             "model_requests": 0,
         }
+        if values["plan"].get("published_transport") is not None:
+            receipt["published_transport"] = values["plan"]["published_transport"]
         _write_create_once(
             self.root / "preflight"
             / f"{_variant_key(values['variant_id'])}.json",

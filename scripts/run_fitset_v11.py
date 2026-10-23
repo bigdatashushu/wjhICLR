@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
@@ -317,25 +317,36 @@ class _FitSkillProvider:
 class _RevisionClientFactory:
     config: dict
     max_tokens: int
+    perception_endpoint: str = ""
 
     def __call__(self):
         from skill3d.synthesis.bailian_client import BailianClient
 
         model = online_model_from(self.config)
-        return BailianClient(
+        client_type = BailianClient
+        options = {}
+        if self.perception_endpoint:
+            from skill3d.cluster.perception_client import RemoteBailianClient
+            client_type = RemoteBailianClient
+            options["endpoint"] = self.perception_endpoint
+        return client_type(
             model=model.model, model_revision=model.model_revision,
             base_url=model.base_url, api_key_env=model.api_key_env,
             timeout_s=model.timeout_s, temperature=0.0,
-            max_output_tokens=self.max_tokens,
+            # RPC identity pins the service limit; chat carries its own budget.
+            max_output_tokens=(
+                model.max_tokens if self.perception_endpoint else self.max_tokens),
+            **options,
         )
 
 
 @dataclass(frozen=True)
 class _GateClientFactory:
     config: dict
+    perception_endpoint: str = ""
 
     def __call__(self, seed: int, output: Path):
-        return _SeededClientFactory(self.config, seed, output)
+        return _SeededClientFactory(self.config, seed, output, self.perception_endpoint)
 
 
 @dataclass(frozen=True)
@@ -343,13 +354,15 @@ class _SeededClientFactory:
     config: dict
     seed: int
     output: Path
+    perception_endpoint: str = ""
 
     def __call__(self, variant_id: str):
         from skill3d.evaluation.fitset_v11 import _variant_key
         from skill3d.evolution.fitset_stream_v11 import SeededGateClient
 
         client = _RevisionClientFactory(
-            self.config, online_model_from(self.config).max_tokens)()
+            self.config, online_model_from(self.config).max_tokens,
+            self.perception_endpoint)()
         return SeededGateClient(
             client, self.seed,
             self.output / "request_seeds" / (_variant_key(variant_id) + ".json"),
@@ -379,7 +392,23 @@ def _run_system(args) -> int:
 
     panel = load_fitset_panel(args.panel)
     variants = select_panel_variants(panel, args.panel_name)
-    bindings = load_variant_bindings(args.bindings, variants)
+    published_inputs = None
+    if args.published_inputs:
+        from skill3d.evaluation.published_fitset_v11 import PublishedFitSetInputProvider
+        published_inputs = PublishedFitSetInputProvider(
+            args.published_inputs, max_scenes=args.scene_cache_size)
+        bindings = {
+            row["variant_id"]: published_inputs.entries[row["qa_id"]]["reference"]
+            for row in variants
+        }
+        if args.bindings or args.direct_run_root or args.video_root or args.video_fallback_root:
+            raise FitSetError("published inputs cannot be mixed with legacy input locators")
+        if any(row["split"] != "induction" for row in variants):
+            raise FitSetError("published live learning requires induction-only variants")
+    else:
+        if not args.bindings or not args.direct_run_root:
+            raise FitSetError("legacy inputs require --bindings and --direct-run-root")
+        bindings = load_variant_bindings(args.bindings, variants)
     raw = resolve_runtime(load_config(args.config), seed=args.seed)
     model = online_model_from(raw)
     if (
@@ -389,11 +418,42 @@ def _run_system(args) -> int:
     ):
         raise FitSetError(
             "fit-set system execution requires enabled bailian/qwen3.8-flash")
-    if (
-        not args.preflight_only
-        and not os.environ.get(model.api_key_env, "").strip()
-    ):
-        raise FitSetError(f"{model.api_key_env} is not configured")
+    client_config = {"online_model": asdict(model)}
+    if args.perception_endpoint:
+        from skill3d.cluster.perception_client import gateway_endpoint
+        gateway_endpoint(args.perception_endpoint)
+        if not 1 <= args.perception_capacity <= 8:
+            raise FitSetError("RPC gateway capacity must be frozen between 1 and 8")
+        request_concurrency = (
+            args.request_concurrency or args.workers
+            if args.max_requests else max(args.workers, args.episode_concurrency)
+        )
+        if request_concurrency > args.perception_capacity:
+            raise FitSetError("request concurrency exceeds frozen RPC gateway capacity")
+        if args.phase == "accumulation" and not 1 <= args.revision_max_tokens <= model.max_tokens:
+            raise FitSetError("revision token budget must be 1..frozen RPC model max_tokens")
+    elif args.perception_capacity:
+        raise FitSetError("--perception-capacity requires --perception-endpoint")
+    if not args.preflight_only:
+        client = _RevisionClientFactory(
+            client_config, model.max_tokens, args.perception_endpoint)()
+        if not client.configured:
+            raise FitSetError(
+                "RPC endpoint/token is not configured" if args.perception_endpoint
+                else f"{model.api_key_env} is not configured")
+        if args.perception_endpoint:
+            import urllib.request
+            from skill3d.cluster.perception_client import RPC_SCHEMA, json_object
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                with opener.open(args.perception_endpoint.rstrip("/") + "/health", timeout=10) as response:
+                    health = json_object(response.read(65537))
+            except Exception:
+                raise FitSetError("RPC gateway health unavailable") from None
+            if (health.get("schema_version") != RPC_SCHEMA or health.get("status") != "ready"
+                    or health.get("identity") != client.audit_identity()
+                    or health.get("max_concurrency") != args.perception_capacity):
+                raise FitSetError("RPC gateway identity or capacity differs from frozen run")
     detector = raw.get("detection", {}).get("endpoint")
     if detector:
         os.environ.setdefault("SKILL3D_DETECTOR_ENDPOINT", str(detector))
@@ -403,7 +463,7 @@ def _run_system(args) -> int:
         if args.video_fallback_root
         else list(paths.raw_video_fallbacks)
     )
-    item_provider = _FitSetItemProvider(
+    item_provider = published_inputs or _FitSetItemProvider(
         metadata_path=args.metadata,
         direct_run_root=args.direct_run_root,
         video_root=args.video_root or paths.raw_videos,
@@ -432,11 +492,19 @@ def _run_system(args) -> int:
         input_receipt_provider=item_provider.receipt,
         input_contract_identity={
             **item_provider.input_contract_identity,
-            "prepared_bindings_manifest": file_identity(args.bindings),
+            **({"offline_metadata": file_identity(args.metadata)}
+               if published_inputs is not None else
+               {"prepared_bindings_manifest": file_identity(args.bindings)}),
+            "model_transport": {
+                "kind": "perception_rpc" if args.perception_endpoint else "direct_bailian",
+                "endpoint": args.perception_endpoint,
+                "upstream_capacity": args.perception_capacity or None,
+            },
         },
         binding_refs=bindings,
         base_cfg=_base_config(raw),
         phase=args.phase,
+        published_inputs=published_inputs,
         skills_for_variant=skill_provider,
         min_free_gib=args.min_free_gib,
         workers=args.workers,
@@ -444,7 +512,8 @@ def _run_system(args) -> int:
         skill_owners=args.skill_owners,
         request_governor_config=(
             _request_policy(args) if args.max_requests else None),
-        client_factory=_SeededClientFactory(raw, args.seed, Path(args.output_dir)),
+        client_factory=_SeededClientFactory(
+            client_config, args.seed, Path(args.output_dir), args.perception_endpoint),
         episode_concurrency=(
             args.episode_concurrency if args.episode_concurrency else None),
         evolution_config=(
@@ -459,11 +528,13 @@ def _run_system(args) -> int:
             ) if args.phase == "accumulation" else None
         ),
         label_metadata=(
-            load_label_metadata(args.metadata)
+            {qa: label for qa, label in load_label_metadata(args.metadata).items()
+             if qa in {row["qa_id"] for row in variants}}
             if args.phase == "accumulation" else None
         ),
-        revision_client_factory=_RevisionClientFactory(raw, args.revision_max_tokens),
-        gate_client_factory=_GateClientFactory(raw),
+        revision_client_factory=_RevisionClientFactory(
+            client_config, args.revision_max_tokens, args.perception_endpoint),
+        gate_client_factory=_GateClientFactory(client_config, args.perception_endpoint),
     )
     action = runner.preflight if args.preflight_only else runner.run
     summary = action(
@@ -608,9 +679,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--panel", required=True)
     run.add_argument("--panel-name", choices=(
         PANEL_NAMES), required=True)
-    run.add_argument("--bindings", required=True)
+    run.add_argument("--bindings", default="")
+    run.add_argument("--published-inputs", default="",
+                     help="hash-pinned label-free r04 catalog and frozen scene inputs")
     run.add_argument("--metadata", required=True)
-    run.add_argument("--direct-run-root", required=True)
+    run.add_argument("--direct-run-root", default="")
     run.add_argument("--video-root")
     run.add_argument("--video-fallback-root", action="append", default=[])
     run.add_argument("--scene-cache-size", type=int, default=2)
@@ -624,6 +697,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="shared solver/reviser/gate request budget; required for episode_pool")
     run.add_argument("--request-concurrency", type=int, default=0)
     run.add_argument("--requests-per-second", type=float, default=0)
+    run.add_argument("--perception-endpoint", default="",
+                     help="public RPC origin; upstream API key stays on the service node")
+    run.add_argument("--perception-capacity", type=int, default=0,
+                     help="frozen gateway API capacity, checked before online execution")
     run.add_argument("--episode-concurrency", type=int, default=0,
                      help="global cap on concurrently executing episodes "
                           "across every worker and gate; 0 uses the scheduler default")

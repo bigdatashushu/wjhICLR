@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
+from skill3d.adapters.episode_source import EpisodeItem
 from skill3d.online.config import default_mask_review
 
 from skill3d.evaluation.accuracy import extract_option_letter
@@ -131,6 +132,7 @@ from skill3d.online.recovery import (
 )
 from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION, TraceRecord
 from skill3d.schemas.tool import FailureCause
+from skill3d.storage.relocation import ValidatedRelocation
 from skill3d.trace.store import TraceStore
 from skill3d.verifier.derivation import replay_derivation
 from skill3d.verifier.geometry_oracle import (
@@ -192,6 +194,8 @@ class OnlineRunConfig:
     # Explicit host authorization for replaying an exact reviewed source delta.
     # No generation identity, object receipt or prepared payload is rewritten.
     prepared_binding_source_compatibility: str | None = None
+    # Pin only frozen M5 request validation; solver/gate randomness stays on seed.
+    prepared_binding_seed: int | None = None
     model_weights_sha256: str = field(
         default_factory=lambda: os.environ.get("SKILL3D_MODEL_WEIGHTS_SHA256", ""))
     environment_sha256: str = field(
@@ -236,6 +240,9 @@ class OnlineRunConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"real", "mock_light"}:
             raise ValueError("mode 只支持 real 或 mock_light")
+        if (self.prepared_binding_seed is not None
+                and type(self.prepared_binding_seed) is not int):
+            raise ValueError("prepared_binding_seed must be an int or None")
         for value in (self.model_weights_sha256, self.environment_sha256):
             if value and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value)):
                 raise ValueError("模型/环境身份必须是 SHA256")
@@ -1173,18 +1180,30 @@ def run_episode(
     m5_llm=None,
     prepared_binding: Optional[PreparedObjectBinding] = None,
     input_error: Optional[InputErrorRecord] = None,
+    artifact_relocation: ValidatedRelocation | None = None,
+    original_item: EpisodeItem | None = None,
 ) -> EpisodeOutcome:
     """跑完一条在线链 episode。
 
     llm：可注入的 `chat` 兼容对象（测试用 fake）；为 None 且 `mode="real"` 时
     按共享的百炼在线模型配置构造；`mock_light` 下不需要。
+
+    Relocation requires a validated resolver and the original EpisodeItem for
+    source/video identity. Actual episode/pixels are checked before M2 annotations;
+    M3 resolves local refs in memory without rewriting the frozen artifact.
     """
     if any(not isinstance(skill, SkillSpecV11) for skill in cfg.skills):
         raise ValueError(
             "当前在线协议只接受 SkillSpecV11；运行配置在构造后被注入了旧 SkillSpec")
     if prepared_binding is not None and not cfg.reuse_artifact:
         raise ValueError("prepared_binding requires an episode-local reuse_artifact")
+    if (cfg.prepared_binding_seed is not None
+            and type(cfg.prepared_binding_seed) is not int):
+        raise ValueError("prepared_binding_seed must be an int or None")
     pixels = list(pixels)
+    if artifact_relocation is not None:
+        _validate_artifact_relocation(
+            artifact_relocation, cfg, episode, pixels, original_item=original_item)
     if input_error is not None:
         if pixels:
             raise ValueError("input_error 条目不得同时携带可读像素")
@@ -1278,11 +1297,14 @@ def run_episode(
     if fsm.state is OnlineState.RECONSTRUCT:
         if cfg.reuse_artifact:
             # 复用既有 artifact（离线 paired A/B 两臂必须同源，硬约束 18）
-            # v5 HC39：运行时**唯一**加载入口是 legacy 门 —— 版本不符/含旧字段的
-            # artifact 在这里 hard fail（并提示重跑 v5 pipeline），不得静默反序列化。
-            from skill3d.legacy.readers import load_artifact_v5
+            # Relocated JSON is already schema/byte checked; only runtime refs move.
+            # Ordinary reuse retains the legacy schema gate.
+            if artifact_relocation is not None:
+                art = artifact_relocation.resolved_artifact()
+            else:
+                from skill3d.legacy.readers import load_artifact_v5
 
-            art = load_artifact_v5(cfg.reuse_artifact)
+                art = load_artifact_v5(cfg.reuse_artifact)
             art_path = cfg.reuse_artifact
             notes.append(f"M3 复用既有 artifact（A/B 同源，硬约束 18）: {cfg.reuse_artifact}")
             _validate_artifact_identity(art, episode, pixels)
@@ -1423,7 +1445,9 @@ def run_episode(
                         scene_identity=str(
                             art.reconstruction_input_identity or art.frame_set_hash
                             or art.artifact_id),
-                        seed=int(cfg.seed), model_weights_sha256="",
+                        seed=(int(cfg.seed) if cfg.prepared_binding_seed is None
+                              else cfg.prepared_binding_seed),
+                        model_weights_sha256="",
                         source_compatibility=cfg.prepared_binding_source_compatibility,
                         parameters=binding_parameters(
                             semantic_min_pixels=cfg.semantic_min_pixels,
@@ -3442,6 +3466,32 @@ def _finalize(outcome: EpisodeOutcome, fsm: OnlineFSM, cfg: OnlineRunConfig,
 # --------------------------------------------------------------- split 批量 ----
 
 
+def _validate_artifact_relocation(
+    relocation: ValidatedRelocation,
+    cfg: OnlineRunConfig,
+    episode: VSIBenchEpisode,
+    pixels: Sequence[np.ndarray],
+    *,
+    original_item: EpisodeItem | None,
+) -> None:
+    """Replay a validated capability against actual, unannotated online inputs."""
+    if not isinstance(relocation, ValidatedRelocation):
+        raise ValueError("artifact_relocation must be a ValidatedRelocation")
+    if not isinstance(original_item, EpisodeItem):
+        raise ValueError("artifact_relocation requires an original EpisodeItem")
+    if (
+        not cfg.reuse_artifact
+        or Path(cfg.reuse_artifact).absolute() != relocation.artifact_path
+    ):
+        raise ValueError("reuse_artifact is not the receipted artifact")
+    original_episode = episode.model_dump(mode="json")
+    if original_item.episode.model_dump(mode="json") != original_episode:
+        raise ValueError("artifact_relocation original episode mismatch")
+    relocation.recompute_scene_input_identity(
+        episode=original_episode, source=original_item.source,
+        video_path=original_item.video_path, pixels=pixels)
+
+
 def _validate_artifact_identity(art, episode, pixels) -> None:
     """Reject a cached reconstruction from a different source or frame order."""
     from skill3d.adapters.frame_set import frame_set_hash
@@ -3488,14 +3538,31 @@ def run_split(
     trace_store: Optional[TraceStore] = None,
     llm=None,
     prepared_bindings: Optional[Mapping[str, PreparedObjectBinding]] = None,
+    artifact_relocations: Mapping[str, ValidatedRelocation] | None = None,
 ) -> tuple[list[EpisodeOutcome], EvaluationRun]:
-    """跑一批 episode 并聚合为 `EvaluationRun`（§5.7）。items 为 EpisodeItem 序列。"""
+    """Run EpisodeItems and aggregate outcomes.
+
+    An explicit relocation mapping must cover exactly the run's qa_ids. Replay
+    all original inputs before starting any episode; run_episode rechecks them.
+    """
     from datetime import datetime, timezone
 
     if len({it.episode.qa_id for it in items}) != len(items):
         raise ValueError("run_split requires unique qa_id within one run")
     if len({it.episode.split for it in items}) > 1:
         raise ValueError("run_split cannot mix source splits")
+    relocations = {}
+    if artifact_relocations is not None:
+        if not isinstance(artifact_relocations, Mapping):
+            raise ValueError("artifact_relocations must be a qa_id mapping")
+        relocations = dict(artifact_relocations)
+        qa_ids = {it.episode.qa_id for it in items}
+        if set(relocations) != qa_ids:
+            raise ValueError("artifact_relocations must cover exactly the run's qa_ids")
+        for it in items:
+            _validate_artifact_relocation(
+                relocations[it.episode.qa_id], cfg, it.episode, it.pixels,
+                original_item=it)
     run_id = _run_id(cfg, items[0].episode.split if items else "", len(items))
     store = trace_store
     if store is None and items:
@@ -3525,6 +3592,8 @@ def run_split(
             llm=llm,
             prepared_binding=prepared.get(it.episode.qa_id),
             input_error=getattr(it, "input_error", None),
+            artifact_relocation=relocations.get(it.episode.qa_id),
+            original_item=it if relocations else None,
         )
         for it in items
     ]

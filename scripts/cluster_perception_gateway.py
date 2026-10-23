@@ -19,6 +19,13 @@ One active owner of a private, persistent LOCAL filesystem cache is required.
 SQLite FULL transactions persist pending BEFORE inference and exact reply bytes
 BEFORE ACK. Restart converts pending to indeterminate, never blindly reexecuting.
 Responses have no expiration: retain the cache for all worker transport retries.
+
+upstream_audit in the same private SQLite database contains only safe receipts
+at the client.chat boundary, not episode or RPC concurrency. Health adds lifetime
+upstream counters; pre-instrumentation cache entries are not counted retroactively.
+An unfinished receipt becomes unknown on restart, with no invented end time.
+The durable start precedes client.chat: a crash in that gap is also unknown,
+not proof of a wire request or provider-side execution.
 """
 
 from __future__ import annotations
@@ -64,6 +71,26 @@ def _error_reply(error: GatewayError) -> tuple[int, bytes]:
     return error.status, payload_bytes({
         "schema_version": RPC_SCHEMA, "error": error.code, "retryable": error.retryable,
     })
+
+
+def _safe_usage(value) -> dict:
+    if type(value) is not dict:
+        return {}
+    usage = {}
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        number = value.get(name)
+        if (type(number) in (int, float) and 0 <= number <= 2**53 - 1
+                and int(number) == number):
+            usage[name] = int(number)
+    return usage
+
+
+def _safe_error_type(error: BaseException) -> str:
+    # Class names on arbitrary exceptions, as well as their bodies, are untrusted.
+    for kind in (ServiceUnavailable, TimeoutError, OSError, ValueError, TypeError, RuntimeError):
+        if isinstance(error, kind):
+            return kind.__name__
+    return "Exception" if isinstance(error, Exception) else "interrupted"
 
 
 def _public_config(value):
@@ -191,7 +218,31 @@ class PerceptionGateway:
                     "request_id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, "
                     "identity_sha256 TEXT NOT NULL, state TEXT NOT NULL, "
                     "http_status INTEGER, reply BLOB)")
+                self._db.execute(
+                    "CREATE TABLE IF NOT EXISTS upstream_audit ("
+                    "request_id TEXT PRIMARY KEY, payload_sha256 TEXT NOT NULL, "
+                    "started_at_ns INTEGER NOT NULL, ended_at_ns INTEGER, duration_ns INTEGER, "
+                    "active_at_start INTEGER NOT NULL, peak_at_start INTEGER NOT NULL, "
+                    "active_at_end INTEGER, peak_at_end INTEGER, "
+                    "state TEXT NOT NULL, success INTEGER, error_type TEXT, "
+                    "usage_status TEXT NOT NULL, token_usage TEXT NOT NULL)")
                 self._db.execute("UPDATE requests SET state='indeterminate' WHERE state='pending'")
+                self._db.execute(
+                    "UPDATE upstream_audit SET state='unknown' WHERE state='active'")
+            self._upstream = {
+                "started": 0, "active": 0, "peak": 0, "succeeded": 0, "failed": 0,
+                "unknown": 0, "usage_measured": 0, "usage_unknown": 0,
+                "audit_write_failures": 0,
+            }
+            for state, usage_status, count in self._db.execute(
+                    "SELECT state, usage_status, COUNT(*) FROM upstream_audit "
+                    "GROUP BY state, usage_status"):
+                self._upstream["started"] += count
+                self._upstream[{"success": "succeeded", "error": "failed",
+                                "unknown": "unknown"}[state]] += count
+                self._upstream["usage_" + usage_status] += count
+            self._upstream["peak"] = self._db.execute(
+                "SELECT COALESCE(MAX(peak_at_start),0) FROM upstream_audit").fetchone()[0]
             directory_fd = os.open(self.root, os.O_RDONLY)
             try:
                 os.fsync(directory_fd)
@@ -210,11 +261,65 @@ class PerceptionGateway:
             self._lock_file = None
 
     def health(self) -> dict:
-        return {
-            "schema_version": RPC_SCHEMA, "status": "ready",
-            "identity": dict(self._identity), "max_concurrency": self.max_concurrency,
-            "max_body_bytes": MAX_BODY_BYTES,
-        }
+        """Calls partition into active/succeeded/failed/unknown; usage excludes active.
+
+        Call counters and peak survive restart; audit_write_failures is process-local.
+        Success means client.chat returned, not that subsequent RPC validation passed.
+        """
+        with self._condition:
+            return {
+                "schema_version": RPC_SCHEMA, "status": "ready",
+                "identity": dict(self._identity), "max_concurrency": self.max_concurrency,
+                "max_body_bytes": MAX_BODY_BYTES, "upstream": dict(self._upstream),
+            }
+
+    def _start_upstream(self, request_id, payload_hash):
+        with self._condition:
+            active = self._upstream["active"] + 1
+            peak = max(self._upstream["peak"], active)
+            try:
+                with self._db:
+                    self._db.execute(
+                        "INSERT INTO upstream_audit "
+                        "(request_id,payload_sha256,started_at_ns,active_at_start,"
+                        "peak_at_start,state,usage_status,token_usage) "
+                        "VALUES (?,?,?,?,?,'active','unknown','{}')",
+                        (request_id, payload_hash, time.time_ns(), active, peak))
+            except Exception:
+                self._upstream["audit_write_failures"] += 1
+                raise GatewayError(503, "service_unavailable") from None
+            self._upstream["started"] += 1
+            self._upstream["active"] = active
+            self._upstream["peak"] = peak
+
+    def _finish_upstream(self, request_id, client, *, success, error_type,
+                         ended_at_ns, duration_ns):
+        try:
+            usage = _safe_usage(client.last_usage)
+        except Exception:
+            usage = {}
+        state = "unknown" if success is None else "success" if success else "error"
+        usage_status = "measured" if usage else "unknown"
+        with self._condition:
+            self._upstream["active"] -= 1
+            try:
+                with self._db:
+                    self._db.execute(
+                        "UPDATE upstream_audit SET ended_at_ns=?,duration_ns=?,"
+                        "active_at_end=?,peak_at_end=?,state=?,success=?,error_type=?,"
+                        "usage_status=?,token_usage=? WHERE request_id=?",
+                        (ended_at_ns, duration_ns, self._upstream["active"],
+                         self._upstream["peak"], state, success, error_type,
+                         usage_status, payload_bytes(usage).decode("ascii"), request_id))
+            except Exception:
+                # A failed end receipt leaves only durable start evidence. Never replay.
+                self._upstream["unknown"] += 1
+                self._upstream["usage_unknown"] += 1
+                self._upstream["audit_write_failures"] += 1
+                raise GatewayError(503, "service_unavailable") from None
+            self._upstream[{"success": "succeeded", "error": "failed",
+                            "unknown": "unknown"}[state]] += 1
+            self._upstream["usage_" + usage_status] += 1
 
     def _validate(self, raw: bytes):
         if not 0 < len(raw) <= MAX_BODY_BYTES:
@@ -313,9 +418,27 @@ class PerceptionGateway:
     def _invoke(self, request_id, payload, identity, payload_hash):
         try:
             client = self._client_factory(**self._options)
-            content = client.chat(
-                payload["messages"], **{key: value for key, value in payload.items()
-                                         if key not in {"messages", "model"}})
+            arguments = {key: value for key, value in payload.items()
+                         if key not in {"messages", "model"}}
+        except Exception as error:
+            return self._invoke_error(error)
+        self._start_upstream(request_id, payload_hash)
+        started_ns = time.monotonic_ns()
+        try:
+            content = client.chat(payload["messages"], **arguments)
+        except BaseException as error:
+            self._finish_upstream(
+                request_id, client, success=False if isinstance(error, Exception) else None,
+                error_type=_safe_error_type(error), ended_at_ns=time.time_ns(),
+                duration_ns=time.monotonic_ns() - started_ns)
+            if isinstance(error, Exception):
+                return self._invoke_error(error)
+            raise
+        else:
+            self._finish_upstream(
+                request_id, client, success=True, error_type=None,
+                ended_at_ns=time.time_ns(), duration_ns=time.monotonic_ns() - started_ns)
+        try:
             result = {
                 "schema_version": RPC_SCHEMA, "request_id": request_id,
                 "payload_sha256": payload_hash, "audit_identity": client.audit_identity(
@@ -335,11 +458,15 @@ class PerceptionGateway:
                 raise ValueError("unsafe response")
             return 200, reply
         except Exception as error:
-            # The original client can include raw upstream bodies in exceptions.
-            # Only a fixed code and HTTP status cross this service boundary.
-            if isinstance(error, ServiceUnavailable):
-                return _error_reply(GatewayError(503, "upstream_unavailable"))
-            return _error_reply(GatewayError(502, "upstream_invalid"))
+            return self._invoke_error(error)
+
+    @staticmethod
+    def _invoke_error(error):
+        # The original client can include raw upstream bodies in exceptions.
+        # Only a fixed code and HTTP status cross this service boundary.
+        if isinstance(error, ServiceUnavailable):
+            return _error_reply(GatewayError(503, "upstream_unavailable"))
+        return _error_reply(GatewayError(502, "upstream_invalid"))
 
 
 def make_server(gateway: PerceptionGateway, host="0.0.0.0", port=27035,

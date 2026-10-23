@@ -484,6 +484,15 @@ class FitSetWorkerEvolution:
                 gate_runner._request_governor_root = self.runner.request_governor_root
                 gate_runner._request_category = "gate"
                 gate_runner.evolution_config = None
+                gate_runner.label_metadata = {}
+                if gate_runner.published_inputs is not None:
+                    gate_runner.input_contract_identity = copy.deepcopy(
+                        self.runner.input_contract_identity)
+                    gate_runner.input_contract_identity.pop("offline_metadata", None)
+                gate_runner.seed_skills = []
+                gate_runner.gate_panels = {}
+                gate_runner.revision_client_factory = None
+                gate_runner.gate_client_factory = None
                 gate_runner.skills_for_variant = FrozenSkillProvider([spec], {
                     "snapshot_ref": evaluation_snapshot["snapshot_id"],
                     "manifest_sha256": evaluation_snapshot["manifest_sha256"],
@@ -491,15 +500,25 @@ class FitSetWorkerEvolution:
                 })
                 gate_runner.workers = 1
                 gate_runner.client_factory = self.runner.gate_client_factory(seed, output)
+                binding_seeds = {
+                    variant_id: self.runner.binding_refs[variant_id]["request_identity"]["seed"]
+                    for variant_id in panel_ids
+                } if getattr(self.runner, "published_inputs", None) is not None else {}
                 frozen = {
                     "schema_version": FIT_STREAM_SCHEMA,
-                    "seed": seed, "binding_seed": self.runner.base_cfg.seed,
+                    "seed": seed,
+                    "binding_seed": (
+                        next(iter(set(binding_seeds.values())))
+                        if binding_seeds and len(set(binding_seeds.values())) == 1
+                        else None if binding_seeds else self.runner.base_cfg.seed),
                     "snapshot": evaluation_snapshot,
                     "variant_ids": panel_ids, "spec": spec.model_dump(mode="json"),
                     "run_identity": self.runner.run_identity,
                     "panel_rows_sha256": content_sha256(
                         [self.rows[value] for value in panel_ids]),
                 }
+                if binding_seeds:
+                    frozen["binding_seed_by_variant"] = binding_seeds
                 _write_create_once(output / "gate_identity.json", frozen)
                 arm_runners[(seed, name)] = gate_runner
         schedule = []
