@@ -272,13 +272,14 @@ def test_tampered_freeze_rejected_before_perception(tmp_path, tamper):
     assert not (tmp_path / "output").exists()
 
 
-def test_full_scene_cap_cannot_be_bypassed_by_smaller_batches(tmp_path):
+def test_full_scene_cap_requires_explicit_full_scope(tmp_path, fake_perception):
     case = _frozen(tmp_path, n_questions=9, existing=False)
     with pytest.raises(SceneComputeError, match="scene question cap"):
         compute_scene(case.root, tmp_path / "output", {}, client_factory=_never)
-    with pytest.raises(SceneComputeError, match=r"\[1, 8\]"):
+    assert validate_scene_input(case.root, max_questions_per_scene=77)["n_questions"] == 9
+    with pytest.raises(SceneComputeError, match=r"\[1, 128\]"):
         compute_scene(case.root, tmp_path / "output",
-                      {"max_questions_per_scene": 9}, client_factory=_never)
+                      {"max_questions_per_scene": 129}, client_factory=_never)
 
 
 def test_output_local_bindings_survive_input_cleanup_and_recover_without_models(
@@ -456,6 +457,53 @@ def test_completed_attempt_never_reruns_on_tamper_or_changed_config(
         method["runtime_config"] = {"seed": 1}
     with pytest.raises(SceneComputeError):
         compute_scene(case.root, output, method, client_factory=_never)
+
+
+def test_partial_checkpoint_resumes_without_rebuilding_or_repeating_finished_question(
+        tmp_path, fake_perception, monkeypatch):
+    from skill3d.online import runner
+    from skill3d.reconstruction import metric_evidence as me
+
+    case = _frozen(tmp_path)
+    output = tmp_path / "output"
+    method = {"runtime_config": {}, "min_free_gib": 0, "resume_partial_attempt": True}
+    bind = runner._bind_objects_best_effort
+
+    def interrupt(*args, **kwargs):
+        if args[3].qa_id == "qa-01":
+            raise RuntimeError("planned interruption after one durable draft")
+        return bind(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_bind_objects_best_effort", interrupt)
+    with pytest.raises(RuntimeError, match="planned interruption"):
+        compute_scene(case.root, output, method, client_factory=fake_perception.client_factory)
+    assert (output / "compute_checkpoint.json").is_file()
+    assert not (output / "inventory.json").exists()
+    assert [row[0] for row in fake_perception.calls] == ["qa-00"]
+    monkeypatch.setattr(runner, "_bind_objects_best_effort", bind)
+    monkeypatch.setattr(me, "copy_geometry", _never)
+    result = compute_scene(case.root, output, method,
+                           client_factory=fake_perception.client_factory)
+    assert [row[0] for row in fake_perception.calls] == ["qa-00", "qa-01"]
+    assert result["qa_ids"] == ["qa-00", "qa-01"]
+    assert validate_scene_output(output) == result
+
+
+def test_partial_checkpoint_tamper_rejected_before_next_question(
+        tmp_path, fake_perception, monkeypatch):
+    from skill3d.online import runner
+
+    case = _frozen(tmp_path)
+    output = tmp_path / "output"
+    method = {"runtime_config": {}, "min_free_gib": 0, "resume_partial_attempt": True}
+    monkeypatch.setattr(runner, "_bind_objects_best_effort", lambda *_a, **_k: (
+        (_ for _ in ()).throw(RuntimeError("planned interruption"))))
+    with pytest.raises(RuntimeError):
+        compute_scene(case.root, output, method, client_factory=fake_perception.client_factory)
+    (output / "geometry/base/depth_maps.npy").write_bytes(b"changed")
+    monkeypatch.setattr(runner, "_bind_objects_best_effort", _never)
+    with pytest.raises(SceneComputeError, match="checkpoint changed"):
+        compute_scene(case.root, output, method, client_factory=fake_perception.client_factory)
 
 
 def test_missing_or_incompatible_runtime_is_not_silently_defaulted(tmp_path):

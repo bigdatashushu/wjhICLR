@@ -7,7 +7,8 @@ files. Original video filenames are metadata only; they are never opened.
 ``method_config`` accepts ``runtime_config`` (a public runtime dict or an
 input-relative public YAML file),
 ``metric_enabled`` (default False), ``vggt_checkpoint``, ``moge2_checkpoint``,
-``device`` (default ``cuda:0``), ``max_questions_per_scene`` (at most eight),
+``device`` (default ``cuda:0``), ``max_questions_per_scene`` (default eight;
+explicit full-scene scopes may use up to 128),
 and ``min_free_gib`` (default 80). Checkpoints must already be local; their
 source/model freeze is the caller's responsibility. The default perception
 client uses main's authenticated RPC, not a worker-side Bailian credential.
@@ -28,11 +29,13 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import time
 from typing import Any, Callable
 
 FROZEN_SCENE_SCHEMA = "harness3d-frozen-scene/1"
 SCENE_PREPARATION_SCHEMA = "harness3d-scene-preparation/1"
 MAX_QUESTIONS_PER_SCENE = 8
+MAX_FULL_SCENE_QUESTIONS = 128
 _LABEL_FIELDS = {
     "ground_truth", "answer", "reference_answer", "reference_answers",
     "correct_answer", "labels",
@@ -121,9 +124,10 @@ def _reject_labels(value, path=()) -> None:
             if key in _LABEL_FIELDS:
                 compatibility_field = (
                     len(location) == 5 and location[0] == "questions"
-                    and location[2:] == (
-                        "logical_input_identity", "episode", "ground_truth",
-                    )
+                    and location[2] in {
+                        "logical_input_identity", "metric_logical_input_identity",
+                    }
+                    and location[3:] == ("episode", "ground_truth")
                 )
                 # The only label-shaped input allowed is the saved empty GT.
                 if not compatibility_field or child != "":
@@ -136,8 +140,8 @@ def _reject_labels(value, path=()) -> None:
 
 def _question_cap(method_config: dict) -> int:
     value = method_config.get("max_questions_per_scene", MAX_QUESTIONS_PER_SCENE)
-    if type(value) is not int or not 1 <= value <= MAX_QUESTIONS_PER_SCENE:
-        raise SceneComputeError("max_questions_per_scene must be an integer in [1, 8]")
+    if type(value) is not int or not 1 <= value <= MAX_FULL_SCENE_QUESTIONS:
+        raise SceneComputeError("max_questions_per_scene must be an integer in [1, 128]")
     return value
 
 
@@ -149,6 +153,8 @@ class _FrozenScene:
     receipts: dict[str, dict]
     artifact: Any
     summary: dict
+    metric_artifact: Any = None
+    metric_receipts: dict[str, dict] | None = None
 
 
 def _load_scene(input_root: Path, *, question_cap: int) -> _FrozenScene:
@@ -176,7 +182,7 @@ def _load_scene(input_root: Path, *, question_cap: int) -> _FrozenScene:
         raise SceneComputeError("scene must be frozen with real_labels_available=false")
     scene_id, split = manifest.get("scene_id"), manifest.get("split")
     if (not isinstance(scene_id, str) or not scene_id
-            or split not in {"induction", "inner_validation", "outer_holdout"}):
+            or split not in {"induction", "inner_validation", "outer_holdout", "final_test"}):
         raise SceneComputeError("invalid frozen scene/split")
     qa_ids, questions = manifest.get("qa_ids"), manifest.get("questions")
     if (not isinstance(qa_ids, list) or not qa_ids
@@ -233,7 +239,8 @@ def _load_scene(input_root: Path, *, question_cap: int) -> _FrozenScene:
     shared_metadata = None
     for qa_id, question in zip(qa_ids, questions):
         if (not isinstance(question, dict) or set(question) - {
-                "episode", "source", "video_path", "logical_input_identity"}):
+                "episode", "source", "video_path", "logical_input_identity",
+                "metric_logical_input_identity"}):
             raise SceneComputeError("invalid public frozen question")
         public = question.get("episode")
         if not isinstance(public, dict) or "ground_truth" in public:
@@ -309,6 +316,51 @@ def _load_scene(input_root: Path, *, question_cap: int) -> _FrozenScene:
             receipts[item.episode.qa_id] = receipt
     elif any("logical_input_identity" in question for question in questions):
         raise SceneComputeError("logical identity without existing geometry")
+    metric_artifact, metric_receipts = None, {}
+    metric_source = manifest.get("metric_artifact_source_path")
+    if metric_source is not None:
+        if artifact is None:
+            raise SceneComputeError("metric reuse requires verified base geometry")
+        _reference(metric_source, absolute=True)
+        if metric_source not in files:
+            raise SceneComputeError("missing metric artifact transfer mapping")
+        from skill3d.reconstruction.metric_evidence import validated_receipt
+
+        for item, question in zip(items, questions):
+            logical = question.get("metric_logical_input_identity")
+            if not isinstance(logical, dict) or logical.get("artifact_path") != metric_source:
+                raise SceneComputeError("metric reuse requires every question's logical identity")
+            dependencies = {}
+            for name, record in logical.get("files", {}).items():
+                if record["path"] not in files:
+                    raise SceneComputeError(f"missing metric transfer mapping: {name}")
+                dependencies[name] = files[record["path"]]
+            receipt = create_relocation_receipt(
+                logical_input_identity=logical, destination_root=root,
+                artifact_ref=files[metric_source], dependency_refs=dependencies,
+            )
+            resolver = validate_relocation_receipt(
+                receipt, expected_input_sha256=logical["sha256"], destination_root=root,
+                expected_source_artifact=metric_source,
+            )
+            resolver.recompute_scene_input_identity(
+                episode=item.episode.model_dump(mode="json"), source=item.source,
+                video_path=item.video_path, pixels=item.pixels,
+            )
+            metric_artifact = resolver.resolved_artifact()
+            if metric_artifact.reconstruction_input_identity != artifact.reconstruction_input_identity:
+                raise SceneComputeError("metric geometry has a different frozen source")
+            if not metric_receipts:
+                validated_receipt(metric_artifact)
+                from skill3d.reconstruction.metric_evidence import GEOMETRY_REFS
+                for name in GEOMETRY_REFS:
+                    base_ref, metric_ref = getattr(artifact, name), getattr(metric_artifact, name)
+                    if bool(base_ref) != bool(metric_ref) or (
+                            base_ref and _file_identity(Path(base_ref)) != _file_identity(Path(metric_ref))):
+                        raise SceneComputeError("metric reuse changed the base geometry bytes")
+            metric_receipts[item.episode.qa_id] = receipt
+    elif any("metric_logical_input_identity" in question for question in questions):
+        raise SceneComputeError("metric logical identity without metric geometry")
     summary = {
         "schema": FROZEN_SCENE_SCHEMA, "status": "validated",
         "scene_id": scene_id, "split": split, "qa_ids": qa_ids,
@@ -319,8 +371,10 @@ def _load_scene(input_root: Path, *, question_cap: int) -> _FrozenScene:
         "logical_input_sha256": {q: r["logical_input_identity"]["sha256"]
                                  for q, r in receipts.items()},
         "real_labels_available": False,
+        "metric_geometry_source": "relocated" if metric_artifact is not None else "infer",
     }
-    return _FrozenScene(root, manifest, items, receipts, artifact, summary)
+    return _FrozenScene(root, manifest, items, receipts, artifact, summary,
+                        metric_artifact, metric_receipts)
 
 
 def validate_scene_input(input_root: Path, *, max_questions_per_scene: int = 8) -> dict:
@@ -409,6 +463,70 @@ def _write_artifact(path: Path, artifact) -> None:
     temporary.replace(path)
 
 
+def _timed_scene_call(scene, output, stage, function, *args, **kwargs):
+    row = {"stage": stage, "scene_id": scene.summary["scene_id"], "started_at": time.time()}
+    print(json.dumps({**row, "event": "started"}), flush=True)
+    started = time.monotonic()
+    try:
+        result = function(*args, **kwargs)
+        row["status"] = "complete"
+        return result
+    except Exception as exc:
+        row.update(status="failed", error_type=type(exc).__name__)
+        raise
+    finally:
+        row["elapsed_s"] = time.monotonic() - started
+        path = output / "stage_timings.json"
+        records = _read_json(path)["stages"] if path.exists() else []
+        _write_json(path, {"schema": "harness3d-scene-stage-timings/1", "stages": records + [row]})
+        print(json.dumps({**row, "event": "finished"}), flush=True)
+
+
+def _geometry_checkpoint(output, scene, runtime_identity, method_sha256, artifacts):
+    from skill3d.storage.relocation import artifact_dependency_refs
+
+    values = {}
+    for name, artifact in artifacts.items():
+        path = output / "geometry" / name / "artifact.json"
+        _write_artifact(path, artifact)
+        files = {path.relative_to(output).as_posix(): _file_identity(path)}
+        for ref in artifact_dependency_refs(artifact).values():
+            source = Path(ref)
+            _no_symlinks(source)
+            if not source.is_relative_to(output):
+                raise SceneComputeError("checkpoint geometry is not output-local")
+            files[source.relative_to(output).as_posix()] = _file_identity(source)
+        values[name] = {"artifact": path.relative_to(output).as_posix(), "files": files}
+    _write_json(output / "compute_checkpoint.json", {
+        "schema": "harness3d-scene-compute-checkpoint/1", "validation": scene.summary,
+        "runtime_config": runtime_identity, "method_config_sha256": method_sha256,
+        "geometry": values,
+    })
+
+
+def _recover_geometry_checkpoint(output, scene, runtime_identity, method_sha256):
+    from skill3d.schemas import ReconstructionArtifact
+
+    saved = _read_json(_local_file(output, "compute_checkpoint.json"))
+    if (saved.get("schema") != "harness3d-scene-compute-checkpoint/1"
+            or saved.get("validation") != scene.summary
+            or saved.get("runtime_config") != runtime_identity
+            or saved.get("method_config_sha256") != method_sha256):
+        raise SceneComputeError("partial attempt has different frozen inputs/configuration")
+    recovered = {}
+    for name, row in saved["geometry"].items():
+        if name not in {"base", "metric"} or row["artifact"] != f"geometry/{name}/artifact.json":
+            raise SceneComputeError("invalid geometry checkpoint")
+        for ref, identity in row["files"].items():
+            if _file_identity(_local_file(output, ref)) != identity:
+                raise SceneComputeError("partial geometry checkpoint changed")
+        recovered[name] = ReconstructionArtifact.model_validate_json(
+            _local_file(output, row["artifact"]).read_bytes())
+    if "base" not in recovered:
+        raise SceneComputeError("partial attempt lacks a complete base checkpoint")
+    return recovered
+
+
 def _reject_infrastructure_failures(stats) -> None:
     """Transport outages are retryable task failures, not perception evidence."""
     outage = re.compile(
@@ -441,7 +559,8 @@ def _reject_infrastructure_failures(stats) -> None:
 
 
 def _prepare_variant(scene: _FrozenScene, cfg, output: Path, name: str, artifact,
-                     *, cap: int, min_free_gib: float, client_factory: Callable) -> dict:
+                     *, cap: int, min_free_gib: float, client_factory: Callable,
+                     reuse_factory: Callable | None = None) -> dict:
     from skill3d.evaluation.skill_ablation_v11 import input_identity
     from skill3d.evolution.prepared_bindings_v11 import prepare_shared_bindings_v11
     from skill3d.schemas import ReconstructionArtifact
@@ -475,10 +594,11 @@ def _prepare_variant(scene: _FrozenScene, cfg, output: Path, name: str, artifact
         return ReconstructionArtifact.model_validate_json(Path(artifact_path).read_bytes())
 
     store_root = output / "prepared" / name
-    prepared = prepare_shared_bindings_v11(
+    prepared = _timed_scene_call(scene, output, f"{name}_bindings", prepare_shared_bindings_v11,
         scene.items, artifact_paths=paths, base_cfg=cfg, store_root=store_root,
         client_factory=client_factory, max_questions_per_scene=cap,
         min_free_gib=min_free_gib, identity_factory=identify, artifact_loader=load_artifact,
+        reuse_factory=reuse_factory, outcome_validator=_reject_infrastructure_failures,
     )
     qa_ids, scene_id = scene.summary["qa_ids"], scene.summary["scene_id"]
     if (prepared.get("n_questions") != len(qa_ids) or prepared.get("n_scenes") != 1
@@ -663,14 +783,20 @@ def compute_scene(input_root: Path, output_root: Path, method_config: dict, *,
     method_sha256 = hashlib.sha256(json.dumps(
         method_config, sort_keys=True, separators=(",", ":"), allow_nan=False,
     ).encode()).hexdigest()
+    geometry = {}
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
-        recovered = validate_scene_output(output)
-        previous = _read_json(output / "prepare_manifest.json")
-        if (previous["validation"] != scene.summary
-                or previous.get("runtime_config") != runtime_identity
-                or previous.get("method_config_sha256") != method_sha256):
-            raise SceneComputeError("completed attempt has different frozen inputs/configuration")
-        return recovered
+        if (output / "inventory.json").is_file():
+            recovered = validate_scene_output(output)
+            previous = _read_json(output / "prepare_manifest.json")
+            if (previous["validation"] != scene.summary
+                    or previous.get("runtime_config") != runtime_identity
+                    or previous.get("method_config_sha256") != method_sha256):
+                raise SceneComputeError("completed attempt has different frozen inputs/configuration")
+            return recovered
+        if method_config.get("resume_partial_attempt") is not True:
+            raise SceneComputeError("partial attempts require explicit checkpoint recovery")
+        geometry = _recover_geometry_checkpoint(
+            output, scene, runtime_identity, method_sha256)
     if os.environ.get("SKILL3D_ALLOW_HF_DOWNLOAD"):
         raise SceneComputeError("automatic HF downloads must be disabled for scene preparation")
 
@@ -680,7 +806,8 @@ def compute_scene(input_root: Path, output_root: Path, method_config: dict, *,
     vggt_checkpoint = None if scene.artifact is not None else _checkpoint(
         method_config, "vggt_checkpoint", "SKILL3D_VGGT_CHECKPOINT", VGGT_CHECKPOINT)
     moge_checkpoint = _checkpoint(
-        method_config, "moge2_checkpoint", "SKILL3D_MOGE2_CHECKPOINT") if enabled else None
+        method_config, "moge2_checkpoint", "SKILL3D_MOGE2_CHECKPOINT"
+    ) if enabled and scene.metric_artifact is None else None
     make_client = _checked_client_factory(_default_client_factory(cfg, client_factory), cfg)
     output.mkdir(parents=True, exist_ok=True)
     import shutil
@@ -696,7 +823,10 @@ def compute_scene(input_root: Path, output_root: Path, method_config: dict, *,
         "logical_input_sha256": scene.summary["logical_input_sha256"],
         "original_artifact": None, "original_dependencies": {},
     }
-    if scene.artifact is not None:
+    if "base" in geometry:
+        base = geometry["base"]
+        provenance = _read_json(_local_file(output, "source_provenance.json"))
+    elif scene.artifact is not None:
         if scene.artifact.metric_model not in (None, "none"):
             raise SceneComputeError("existing base geometry must not contain metric augmentation")
         receipt = next(iter(scene.receipts.values()))
@@ -713,32 +843,72 @@ def compute_scene(input_root: Path, output_root: Path, method_config: dict, *,
                     Path(getattr(base, name))) != receipt["dependencies"][name]["identity"]:
                 raise SceneComputeError("base copy differs from verified source geometry")
     else:
-        base = run_vggt(
+        base = _timed_scene_call(scene, output, "vggt_reconstruction", run_vggt,
             first.pixels, first.episode.scene_name, base_dir, checkpoint=vggt_checkpoint,
             frame_set=first.episode.frame_set, compute_quality=True,
         )
     _write_json(output / "source_provenance.json", provenance)
     if base.reconstruction_input_identity != scene.summary["reconstruction_input_identity"]:
         raise SceneComputeError("new geometry changed the frozen reconstruction identity")
+    _geometry_checkpoint(output, scene, runtime_identity, method_sha256, {"base": base, **geometry})
+    reuse_factory = None
+    if scene.manifest.get("generation_reuse_package_ref"):
+        from skill3d.evolution.prepared_generation_reuse_v11 import make_generation_reuse_factory
+
+        package = _read_json(_local_file(scene.root, scene.manifest["generation_reuse_package_ref"]))
+        reuse_factory = make_generation_reuse_factory(scene.items, cfg, scene.root, package)
     variants = {
         "base": _prepare_variant(scene, cfg, output, "base", base,
                                  cap=cap, min_free_gib=float(reserve),
-                                 client_factory=make_client),
+                                 client_factory=make_client, reuse_factory=reuse_factory),
     }
     if enabled:
-        from skill3d.reconstruction.metric_fusion import make_moge2_model
-
         metric_dir = output / "geometry" / "metric"
-        metric = me.copy_geometry(base, metric_dir)
-        model = make_moge2_model(device=method_config.get("device", "cuda:0"),
-                                 checkpoint=moge_checkpoint)
-        metric = me.attach_metric_evidence(
-            metric, first.pixels, first.episode.frame_set, model, metric_dir)
-        del model
+        if "metric" in geometry:
+            metric = geometry["metric"]
+        elif scene.metric_artifact is not None:
+            metric = me.copy_geometry(scene.metric_artifact, metric_dir)
+            data = scene.metric_artifact.model_dump()
+            for name in me.GEOMETRY_REFS:
+                data[name] = getattr(metric, name)
+            data["confidence"] = metric.confidence
+            for name in me.METRIC_REFS:
+                source = getattr(scene.metric_artifact, name)
+                if source:
+                    target = metric_dir / (name + Path(source).suffix)
+                    shutil.copyfile(source, target)
+                    data[name] = str(target)
+            metric = type(metric).model_validate(data)
+            source_receipt = next(iter(scene.metric_receipts.values()))
+            provenance["metric_original_artifact"] = {
+                "source_path": source_receipt["artifact"]["source_path"],
+                **source_receipt["artifact"]["identity"],
+            }
+            provenance["metric_original_dependencies"] = {
+                name: {"source_path": row["source_path"], **row["identity"]}
+                for name, row in source_receipt["dependencies"].items()
+            }
+            _write_json(output / "source_provenance.json", provenance)
+        else:
+            from skill3d.reconstruction.metric_fusion import make_moge2_model
+
+            metric = me.copy_geometry(base, metric_dir)
+            model = make_moge2_model(device=method_config.get("device", "cuda:0"),
+                                     checkpoint=moge_checkpoint)
+            metric = _timed_scene_call(scene, output, "metric_inference", me.attach_metric_evidence,
+                metric, first.pixels, first.episode.frame_set, model, metric_dir)
+            del model
         me.validated_receipt(metric)
+        _geometry_checkpoint(output, scene, runtime_identity, method_sha256,
+                             {"base": base, "metric": metric})
+        from skill3d.evolution.prepared_generation_reuse_v11 import make_local_generation_reuse_factory
+
+        metric_reuse = make_local_generation_reuse_factory(
+            scene.items, cfg, variants["base"]["preparation"],
+            variants["base"]["input_identities"], output / variants["base"]["artifact"])
         variants["metric"] = _prepare_variant(
             scene, cfg, output, "metric", metric, cap=cap, min_free_gib=float(reserve),
-            client_factory=make_client)
+            client_factory=make_client, reuse_factory=metric_reuse)
     manifest = {
         "schema": SCENE_PREPARATION_SCHEMA, "status": "prepared",
         "validation": scene.summary, "runtime_config": runtime_identity,

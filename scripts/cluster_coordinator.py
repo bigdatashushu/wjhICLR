@@ -63,16 +63,53 @@ def safe_extract(archive: Path, destination: Path, max_bytes: int) -> None:
 
 
 class Coordinator:
-    def __init__(self, root: Path, jobs: Path, *, reserve_gib: int = 160):
+    def __init__(self, root: Path, jobs: Path, *, reserve_gib: int = 160,
+                 ready_inputs_only: bool = False):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.queue = SQLiteJobQueue(self.root / "state/jobs.sqlite3")
         self.specs = {row["job_key"]: JobSpec.from_dict(row)
                       for row in json.loads(jobs.read_text())["jobs"]}
-        self.queue.enqueue_many(list(self.specs.values()))
         self.reserve = reserve_gib * 1024 ** 3
         self.publish_slots = threading.BoundedSemaphore(4)
         self.job_locks = {key: threading.Lock() for key in self.specs}
+        if ready_inputs_only:
+            self._admitted = set()
+            self.admit_ready_inputs()
+            threading.Thread(target=self.watch_ready_inputs, daemon=True).start()
+        else:
+            self.queue.enqueue_many(list(self.specs.values()))
+
+    def admit_ready_inputs(self):
+        progress = self.root / "receipts/package_progress.json"
+        if not progress.exists():
+            return
+        receipt = json.loads(progress.read_text())
+        for row in receipt["scenes"].values():
+            key = row["job_key"]
+            if key in self._admitted:
+                continue
+            if key not in self.specs or receipt["identity_hash"] != self.specs[key].identity.identity_hash:
+                raise QueueError("ready input has another frozen identity")
+            path = self.input_path(key)
+            if path.stat().st_size != row["archive_bytes"]:
+                raise QueueError("ready input size changed")
+            if hash_file(path) != (row["archive_sha256"], row["archive_bytes"]):
+                raise QueueError("ready input digest changed")
+            self.queue.enqueue_many([self.specs[key]])
+            self._admitted.add(key)
+
+    def watch_ready_inputs(self):
+        while len(self._admitted) < len(self.specs):
+            try:
+                self.admit_ready_inputs()
+            except Exception as exc:
+                atomic_json(self.root / "receipts/input_admission_failure.json", {
+                    "at": time.time(), "error_type": type(exc).__name__,
+                    "detail": str(exc)[:1000], "admitted_jobs": len(self._admitted),
+                })
+                return
+            time.sleep(2)
 
     def publish(self, lease: Lease, archive: Path, archive_sha: str, size: int) -> dict:
         expected = json.loads(lease.output_metadata_json)
@@ -284,8 +321,11 @@ def main():
     parser.add_argument("--jobs", type=Path, required=True)
     parser.add_argument("--host", required=True)
     parser.add_argument("--port", type=int, default=27033)
+    parser.add_argument("--reserve-gib", type=int, default=160)
+    parser.add_argument("--ready-inputs-only", action="store_true")
     args = parser.parse_args()
-    serve(Coordinator(args.root, args.jobs), args.host, args.port)
+    serve(Coordinator(args.root, args.jobs, reserve_gib=args.reserve_gib,
+                      ready_inputs_only=args.ready_inputs_only), args.host, args.port)
 
 
 if __name__ == "__main__":

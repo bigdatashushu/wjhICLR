@@ -321,9 +321,40 @@ def run_job(client: Client, root: Path, lease: Lease, reserve: int) -> dict:
                     from skill3d.cluster.perception_client import RemoteBailianClient
 
                     method = json.loads(lease.spec.identity.method_config_json)
-                    result = compute_scene(
-                        inputs, output, method,
-                        client_factory=lambda *args, **kwargs: RemoteBailianClient(**kwargs))
+                    while True:
+                        try:
+                            result = compute_scene(
+                                inputs, output, method,
+                                client_factory=lambda *args, **kwargs: RemoteBailianClient(**kwargs))
+                            break
+                        except Exception as exc:
+                            if method.get("pause_on_compute_failure") is not True:
+                                raise
+                            pause = output.parent / "compute_paused.json"
+                            atomic_json(pause, {
+                                "schema": "harness3d-compute-paused/1", "at": time.time(),
+                                "job_key": lease.job_key, "attempt": lease.attempt,
+                                "error_type": type(exc).__name__, "detail": str(exc)[:1500],
+                                "outputs_retained": True, "model_restart": False,
+                            })
+                            print(json.dumps({
+                                "status": "compute_paused", "job_key": lease.job_key,
+                                "error": type(exc).__name__, "receipt": str(pause),
+                            }), flush=True)
+                            resume = output.parent / "compute_resume.json"
+                            while True:
+                                if time.time() >= heartbeat.lease.expires_at:
+                                    raise TransportError("paused compute lost its heartbeat")
+                                if resume.is_file():
+                                    permit = json.loads(resume.read_text())
+                                    if (permit.get("job_key") != lease.job_key
+                                            or permit.get("attempt") != lease.attempt
+                                            or permit.get("pause_sha256") != hash_file(pause)[0]):
+                                        raise ValueError("resume receipt does not match the paused attempt")
+                                    resume.rename(output.parent / (
+                                        "compute_resume_consumed_" + str(time.time_ns()) + ".json"))
+                                    break
+                                time.sleep(5)
                     atomic_json(output / "scene_result.json", result)
                     metadata = checkpoint(root, output, lease)
                 except Exception as exc:
