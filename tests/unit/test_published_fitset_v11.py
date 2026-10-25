@@ -282,6 +282,58 @@ def test_complete_scene_question_cap_is_enforced(tmp_path):
         provider(case.variant)
 
 
+def test_fullqa_manifest_replays_all_questions_with_anchored_cap(tmp_path):
+    case = _published(tmp_path, n_questions=9)
+    source = tmp_path / "fullqa-catalog.json"
+    _write(source, {"schema": "harness3d-published-binding-catalog/1",
+                    "variants": {"base": case.catalog}})
+    case.manifest.update(
+        schema="v11-published-fitset-inputs/2",
+        source_catalog_file=str(source),
+        source_catalog_sha256=file_identity(source)["sha256"],
+        scene_scopes={"scene-one": {
+            "qa_ids": case.frozen.manifest["qa_ids"], "split": "induction",
+            "input_root": str(case.frozen.root),
+            "frozen_scene_sha256": file_identity(case.frozen.root / "scene.json")["sha256"],
+        }},
+    )
+    _rewrite_manifest(case)
+    provider = PublishedFitSetInputProvider(case.manifest_path)
+    for variant in case.variants.values():
+        item = provider(variant)
+        assert item.episode.ground_truth == ""
+        assert provider.prepare_published(variant, item)["prepared"].materialized
+    case.manifest["scene_scopes"]["scene-one"]["qa_ids"].pop()
+    _rewrite_manifest(case)
+    with pytest.raises(ValueError, match="scope"):
+        PublishedFitSetInputProvider(case.manifest_path)
+
+
+def test_fullqa_cannot_rewrite_original_catalog_or_source_split(published, tmp_path):
+    case = published
+    source = tmp_path / "fullqa-catalog.json"
+    _write(source, {"schema": "harness3d-published-binding-catalog/1",
+                    "variants": {"base": case.catalog}})
+    case.manifest.update(
+        schema="v11-published-fitset-inputs/2",
+        source_catalog_file=str(source),
+        source_catalog_sha256=file_identity(source)["sha256"],
+        scene_scopes={"scene-one": {
+            "qa_ids": case.frozen.manifest["qa_ids"], "split": "induction",
+            "input_root": str(case.frozen.root),
+            "frozen_scene_sha256": file_identity(case.frozen.root / "scene.json")["sha256"],
+        }},
+    )
+    _rewrite_manifest(case)
+    provider = PublishedFitSetInputProvider(case.manifest_path)
+    with pytest.raises(ValueError, match="panel/catalog"):
+        provider({**case.variant, "source_split": "inner_validation"})
+    case.manifest["entries"]["qa-00"]["split"] = "inner_validation"
+    _rewrite_manifest(case)
+    with pytest.raises(ValueError, match="catalog entry changed"):
+        PublishedFitSetInputProvider(case.manifest_path)
+
+
 def test_selected_qa_must_exist_in_frozen_scene(published):
     entry = published.manifest["entries"].pop("qa-00")
     entry["qa_id"] = "missing-qa"
