@@ -38,20 +38,39 @@ Titan 的 `fullqa_supervisor.py` 保管派发记录，通过受认证 HTTP 将�
 
 `source_catalog.json` 保存原始已审计目录字节；`source_audit.json` 保存同一轮审计；`published_inputs.json` 保存与其绑定的原引用和实际输入目录；`preflight.json` 成功后说明 32 帧输入与正常 prepared binding loader 实际重放通过。快照不会随着后续预计算自动扩充。
 
+`selected_catalog.json` 同时提供基础版、米制版各 749 题的正常 loader 引用；读取米制版可调用 `cluster_audit.load_catalog_entry(catalog["variants"]["metric"][qa_id])`。在线学习的 input provider 使用基础版。
+
 此快照包含 induction 490 题、inner_validation 259 题，共 13 场景。学习时只选 induction，验证保留 inner_validation 的原分组；最终测试和 outer_holdout 不进入此学习/验证输入 manifest。完整原始目录由操作员保存作为 provenance，不能把它整体交付在线模型。
 
 `PublishedFitSetInputProvider` 的 v2 schema 从已绑定的 `scene_scopes` 推导每场景题数上限，最大 128，并核对原始 catalog 条目。它保持空 ground truth、真实 source split、原 artifact_ref、绑定 manifest 与 relocation receipt。旧 v1 schema 仍限制 induction/base、每场景最多 8 题。
 
-示例仅展示读取，不调用模型：
+在 Titan 使用已绑定的 provider（不需要改动 source_frozen）：
 
 ```python
-from skill3d.evaluation.published_fitset_v11 import PublishedFitSetInputProvider
+import sys
+from pathlib import Path
 
-provider = PublishedFitSetInputProvider(snapshot / "published_inputs.json", max_scenes=1)
+sys.path.insert(0, "/home/wangy/wangjh/harness3d/experiment-snapshots/tools")
+from inspect_fullqa_snapshot import open_provider
+
+snapshot = Path("/home/wangy/wangjh/harness3d/experiment-snapshots/fullqa-audited-20261025-v1")
+provider = open_provider(snapshot)
 entries = provider.entries
 learning = {qa: row for qa, row in entries.items() if row["split"] == "induction"}
 validation = {qa: row for qa, row in entries.items() if row["split"] == "inner_validation"}
 ```
+
+只检查快照或重放指定题目（零模型请求）：
+
+```bash
+LD_PRELOAD=/home/wangy/wangjh/harness3d/precompute-20261022-r01/cpu_sqlite/libsqlite3.so.0 \
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 \
+/home/wangy/wangjh/skill3d-lab/pilot-20261021-01/runtime/skill3d-exp/bin/python \
+/home/wangy/wangjh/harness3d/experiment-snapshots/tools/inspect_fullqa_snapshot.py \
+/home/wangy/wangjh/harness3d/experiment-snapshots/fullqa-audited-20261025-v1
+```
+
+加 `--qa-id 10` 可重读该题的 32 帧与基础版 binding；启动脚本只输出身份与验证信息。题目必须来自快照 entries。该命令不连接在线模型。
 
 进行 A/B 或演化前需另外冻结 panel、父/候选版本、模型、采样参数、seed、请求与 token 预算。默认 gate_size 为 8 个不同场景，此快照只有 4 个 inner_validation 场景，不能当作满足默认晋级 gate 的数据。可先用于诊断和有界验证；扩大正式晋级评测应等待更多已审计验证场景。r04 的 1,154 题属于另一冻结方法身份，单独使用并报告，不能和 fullQA 结果静默混合。
 
