@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -111,6 +114,34 @@ def test_split_is_deterministic_by_seed():
     assert a.split_version == b.split_version
     c, _ = build_split_config(rows, seed=8, final_ratio=0.2)
     assert c.model_dump() != a.model_dump()
+
+
+@pytest.mark.parametrize("final_scene_ids", [None, ["scene-0", "scene-1"]])
+def test_split_is_deterministic_across_python_hash_seeds(final_scene_ids):
+    rows = [
+        {"scene_name": f"scene-{i}", "dataset": "scannet", "question_type": task}
+        for i in range(30)
+        for task in ("object_counting", "object_abs_distance", "object_rel_distance")
+    ]
+    script = """
+import json, sys
+from skill3d.adapters.split_builder import build_split_config
+inputs = json.load(sys.stdin)
+cfg, report = build_split_config(**inputs)
+print(json.dumps([cfg.model_dump(), report.to_dict()], sort_keys=True))
+"""
+    outputs = []
+    for hash_seed in ("0", "2", "42"):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            input=json.dumps({"rows": rows, "seed": 137,
+                              "final_scene_ids": final_scene_ids}),
+            capture_output=True, text=True, check=True, timeout=15,
+            env={**os.environ, "PYTHONHASHSEED": hash_seed,
+                 "PYTHONPATH": str(REPO_ROOT / "src")},
+        )
+        outputs.append(json.loads(result.stdout))
+    assert outputs[0] == outputs[1] == outputs[2]
 
 
 def test_explicit_final_scenes_respected_and_validated():

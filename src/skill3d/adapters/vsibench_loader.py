@@ -7,9 +7,6 @@ final_test 完全隔离（硬约束 9）。
 
 from __future__ import annotations
 
-import hashlib
-import random
-from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Iterable, NamedTuple, Optional, Sequence
 
@@ -24,6 +21,7 @@ from skill3d.schemas.episode import (
 
 from .frame_set import N_FRAMES, FrameSetError, build_frame_set, uniform_frame_ids
 from .frame_set import frame_set_hash as _frame_set_hash
+from .split_builder import SPLIT_RATIOS
 
 __all__ = [
     "N_FRAMES", "SPLIT_RATIOS", "EpisodeUnavailable", "FrameSetError",
@@ -33,14 +31,6 @@ __all__ = [
     "make_split_config", "assert_final_test_isolation", "split_of",
     "build_frame_set", "_frame_set_hash",
 ]
-
-# split 划分起始比例 induction:inner:outer:final（TODO_CALIBRATE，§4 M1 字段 12）
-SPLIT_RATIOS = {
-    "induction": 0.5,
-    "inner_validation": 0.3,
-    "outer_holdout": 0.2,
-    # final_test 为留出集：由调用方显式给出 scene 列表，不参与比例划分
-}
 
 
 class EpisodeUnavailable(Exception):
@@ -275,47 +265,21 @@ def make_split_config(
     seed: int = 0,
     log_ref: str = "",
 ) -> DataSplitConfig:
-    """按 scene_id + question_type 分层切分 induction/inner/outer（硬约束 19）。
+    """使用正式整场景构建器切分 induction/inner/outer（硬约束 19）。
 
-    final_test scene 由调用方显式指定并完全隔离（硬约束 9），
-    本函数断言 final_test scene 不出现在其余任一 split。
+    final_test 由调用方显式指定。多题型场景只分配一次；四层互斥、覆盖与
+    分层代表性共用正式验证。非法或无法分层的输入抛出 SplitBuildError。
+    已保存的 split 配置不重新生成。
     """
-    final_scenes = set(final_test_scene_ids)
+    from .split_builder import build_split_config
 
-    # 按 question_type 分组 scene，保证每个题型在各 split 都有代表（分层）
-    type2scenes: dict[str, set[str]] = defaultdict(set)
-    for r in qa_rows:
-        scene = str(r["scene_name"])
-        if scene in final_scenes:
-            continue  # final_test 完全不参与
-        type2scenes[str(r["question_type"])].add(scene)
-
-    rng = random.Random(seed)
-    induction: set[str] = set()
-    inner: set[str] = set()
-    outer: set[str] = set()
-    for qtype, scenes in type2scenes.items():
-        pool = sorted(scenes)
-        rng.shuffle(pool)
-        n = len(pool)
-        n_ind = int(round(n * SPLIT_RATIOS["induction"]))
-        n_inn = int(round(n * SPLIT_RATIOS["inner_validation"]))
-        induction.update(pool[:n_ind])
-        inner.update(pool[n_ind : n_ind + n_inn])
-        outer.update(pool[n_ind + n_inn :])
-
-    cfg = DataSplitConfig(
-        induction_scene_ids=sorted(induction),
-        inner_validation_scene_ids=sorted(inner),
-        outer_holdout_scene_ids=sorted(outer),
-        final_test_scene_ids=sorted(final_scenes),
-        task_type_stratification=True,
-        split_version=hashlib.sha256(
-            repr((sorted(induction), sorted(inner), sorted(outer), sorted(final_scenes), seed)).encode()
-        ).hexdigest()[:16],
-        contamination_check_log_ref=log_ref,
+    cfg, _ = build_split_config(
+        list(qa_rows),
+        seed=seed,
+        final_scene_ids=final_test_scene_ids,
+        ratios=SPLIT_RATIOS,
+        log_ref=log_ref,
     )
-    assert_final_test_isolation(cfg)
     return cfg
 
 

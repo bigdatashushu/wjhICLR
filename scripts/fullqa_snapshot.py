@@ -148,7 +148,11 @@ def extract(output):
               "scenes": len(scopes), "normal_loader_checked_scenes": checked,
               "model_requests": 0, "solver_ran": False, "scoring_ran": False,
               "label_access": False, "source_catalog_sha256": plan["source_catalog_sha256"]}
-    c.durable(output / "preflight.json", result, immutable=True)
+    preflight = output / "preflight.json"
+    if preflight.exists():
+        # Retain the first timestamp only after all live identity checks succeed.
+        result["at"] = c.read(preflight)["at"]
+    c.durable(preflight, result, immutable=True)
     return result
 
 

@@ -99,6 +99,37 @@ def test_split_stratified_by_task_type():
             assert any(f"scene_{qt}_" in s for s in scenes), f"{qt} 未进入 {key}"
 
 
+def test_public_split_builder_assigns_multi_task_scenes_once():
+    from skill3d.adapters.split_builder import build_split_config
+
+    rows = [
+        {"scene_name": f"scene-{i}", "dataset": "scannet", "question_type": task}
+        for i in range(30)
+        for task in ("object_counting", "object_abs_distance", "object_rel_distance")
+    ]
+    final = ["scene-0", "scene-1"]
+    cfg = vl.make_split_config(iter(rows), final_test_scene_ids=final,
+                               seed=137, log_ref="split-audit.log")
+    splits = [set(getattr(cfg, key)) for key in (
+        "induction_scene_ids", "inner_validation_scene_ids",
+        "outer_holdout_scene_ids", "final_test_scene_ids",
+    )]
+    for i, split in enumerate(splits):
+        assert all(split.isdisjoint(other) for other in splits[i + 1:])
+    assert set.union(*splits) == {row["scene_name"] for row in rows}
+    assert splits[-1] == set(final)
+    expected, _ = build_split_config(rows, final_scene_ids=final,
+                                     seed=137, log_ref="split-audit.log")
+    assert cfg.model_dump() == expected.model_dump()
+
+
+def test_public_split_builder_rejects_unknown_final_scenes():
+    from skill3d.adapters.split_builder import SplitBuildError
+
+    with pytest.raises(SplitBuildError, match="不在 meta"):
+        vl.make_split_config(_fake_rows(), final_test_scene_ids=["unknown"])
+
+
 def test_split_of_and_episode_unavailable(tmp_path):
     """split_of 查询正确；视频缺失 → EpisodeUnavailable 不进 split（§4 M1 字段 9）。"""
     rows = _fake_rows()

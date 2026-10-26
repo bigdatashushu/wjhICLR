@@ -194,8 +194,10 @@ def _stratified_assign(
         raise SplitBuildError("无可用 question_type（分层依据缺失）")
 
     shuffled: dict[str, list[str]] = {}
-    for t, lst in by_type.items():
-        copy = sorted(lst)
+    # SceneInfo.question_types is a set: its iteration order varies across
+    # processes. Consume the seeded RNG in a stable task order as well.
+    for t in sorted(by_type):
+        copy = sorted(by_type[t])
         rng.shuffle(copy)
         shuffled[t] = copy
 
