@@ -10,7 +10,7 @@ from skill3d.evaluation.published_fitset_v11 import (
     PublishedFitSetInputProvider, _require,
 )
 from skill3d.evolution.prepared_binding_derivation_v11 import (
-    PreparedBindingDerivationContext, publish_derived_binding_scene_v11,
+    PreparedBindingDerivationContext, _check_cache, publish_derived_binding_scene_v11,
 )
 from skill3d.routing.task_classifier import canonical_task
 from skill3d.segmentation.prepared_binding_store import (
@@ -40,8 +40,33 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
 
     def __getstate__(self):
         state = super().__getstate__()
-        state["_derived_scenes"] = {}
+        scene_id = state.get("_spawn_replay_scene")
+        if scene_id:
+            _require(set(state["_derived_scenes"]) == {scene_id},
+                     "spawn replay must retain exactly the requested scene")
+            _require(_check_cache(state["_derived_scenes"][scene_id][0]),
+                     "spawn replay requires a validated scene context")
+        else:
+            state["_derived_scenes"] = {}
         return state
+
+    def for_spawned_episode(self, variant):
+        """Carry this parent's validated replay for one episode, never other scenes."""
+        entry = self._entry(variant)
+        scene_id = entry["scene_id"]
+        with self.cache_lock:
+            state = super().__getstate__()
+            state["_derived_scenes"] = {}
+            state["_spawn_replay_scene"] = None
+            if scene_id in self._derived_scenes:
+                replay = self._derived_scenes[scene_id]
+                _require(_check_cache(replay[0]),
+                         "spawn replay requires a validated scene context")
+                state["_derived_scenes"] = {scene_id: replay}
+                state["_spawn_replay_scene"] = scene_id
+            clone = type(self).__new__(type(self))
+            clone.__setstate__(state)
+            return clone
 
     def _derive_scene(self, entry):
         scene_id = entry["scene_id"]

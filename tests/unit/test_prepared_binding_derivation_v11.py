@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import copy
+from collections import OrderedDict
 from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import pickle
 import shutil
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -305,6 +308,116 @@ def _replace_source(case, mutate, *, request_mutate=None):
     source.update(
         reference=reference,
         prepared=load_prepared_binding_reference(reference, scene_input_identity=source["identity"]))
+
+
+def _spawn_provider(case):
+    from skill3d.evaluation.derived_published_fitset_v11 import DerivedPublishedFitSetInputProvider
+    from skill3d.infra.m5_identity import file_identity
+
+    item = case.context.items[0]
+    scene_id = item.episode.scene_name
+    manifest = case.root / "spawn-catalog.json"
+    manifest.write_text("{}")
+    provider = DerivedPublishedFitSetInputProvider.__new__(DerivedPublishedFitSetInputProvider)
+    provider.manifest_path = manifest
+    provider._manifest_identity = {"path": str(manifest), **file_identity(manifest)}
+    provider._entries = {
+        "qa-1": {
+            "qa_id": "qa-1", "scene_id": scene_id, "split": item.episode.split,
+            "variant": "base", "reference": case.context.sources["qa-1"]["reference"],
+        },
+    }
+    provider.cache = OrderedDict()
+    provider._scene_checks = {}
+    provider.cache_lock = threading.RLock()
+    provider._derived_scenes = {
+        scene_id: (case.context, {}, {}),
+        "unused-scene": ("must-not-transfer",),
+    }
+    variant = {
+        "qa_id": "qa-1", "scene_id": scene_id, "split": item.episode.split,
+        "artifact_ref": provider._entries["qa-1"]["reference"]["scene_artifact_ref"],
+    }
+    return provider, variant
+
+
+def test_spawn_copy_reuses_only_validated_requested_scene(case, monkeypatch):
+    bindings = derivation.derive_prepared_binding_scene_v11(case.context)
+    provider, variant = _spawn_provider(case)
+    monkeypatch.setattr(derivation, "_derive", _never)
+    clone = pickle.loads(pickle.dumps(provider.for_spawned_episode(variant)))
+    assert set(clone._derived_scenes) == {variant["scene_id"]}
+    assert not clone.cache and not clone._scene_checks
+    assert set(provider._derived_scenes) == {variant["scene_id"], "unused-scene"}
+    assert not pickle.loads(pickle.dumps(provider))._derived_scenes
+    _validate(case, bindings["qa-1"],
+              binding_derivation_context=clone._derived_scenes[variant["scene_id"]][0])
+
+
+@pytest.mark.parametrize("tamper", ["source_file", "context", "consumer_array"])
+def test_transferred_replay_rejects_changes(case, monkeypatch, tamper):
+    bindings = derivation.derive_prepared_binding_scene_v11(case.context)
+    provider, variant = _spawn_provider(case)
+    clone = pickle.loads(pickle.dumps(provider.for_spawned_episode(variant)))
+    context = clone._derived_scenes[variant["scene_id"]][0]
+    monkeypatch.setattr(derivation, "_derive", _never)
+    if tamper == "source_file":
+        case.path.write_bytes(case.path.read_bytes() + b" ")
+    elif tamper == "context":
+        context.cfg.max_tokens += 1
+    else:
+        case.arrays["depth_maps"].flat[0] += 1
+    with pytest.raises(PreparedBindingStoreError):
+        _validate(case, bindings["qa-1"], binding_derivation_context=context)
+
+
+def test_spawn_cache_miss_remains_lazy_and_cold(case, monkeypatch):
+    provider, variant = _spawn_provider(case)
+    provider._derived_scenes.pop(variant["scene_id"])
+    monkeypatch.setattr(derivation, "_derive", _never)
+    clone = pickle.loads(pickle.dumps(provider.for_spawned_episode(variant)))
+    assert not clone._derived_scenes
+    assert set(provider._derived_scenes) == {"unused-scene"}
+
+
+def test_gate_copy_rebinds_all_input_consumers_without_changing_run(case):
+    from skill3d.evaluation.fitset_v11 import SystemVariantRunner
+    derivation.derive_prepared_binding_scene_v11(case.context)
+    provider, variant = _spawn_provider(case)
+    parent = SimpleNamespace(
+        published_inputs=provider, item_provider=provider,
+        input_receipt_provider=provider.receipt, run_identity="frozen-run",
+        root=case.root / "candidate", base_cfg=case.context.cfg,
+    )
+    clone = SystemVariantRunner._gate_spawn_runner(parent, variant)
+    assert clone is not parent and clone.published_inputs is not provider
+    assert clone.item_provider is clone.published_inputs
+    assert clone.input_receipt_provider.__self__ is clone.published_inputs
+    assert clone.run_identity == parent.run_identity and clone.root == parent.root
+    assert clone.base_cfg is parent.base_cfg
+    assert parent.item_provider is provider
+
+
+def test_failed_spawn_replay_releases_global_episode_permit(tmp_path):
+    import multiprocessing
+    from skill3d.evaluation.fitset_v11 import FitSetError, SystemVariantRunner
+
+    class RejectedProvider:
+        def for_spawned_episode(self, _variant):
+            raise PreparedBindingStoreError("source changed before spawn")
+
+    provider = RejectedProvider()
+    gate = SimpleNamespace(
+        published_inputs=provider, item_provider=provider,
+        _result_path=lambda _variant_id: tmp_path / "absent.json",
+    )
+    runner = SystemVariantRunner.__new__(SystemVariantRunner)
+    permit = multiprocessing.get_context("spawn").BoundedSemaphore(1)
+    runner._episode_semaphore = permit
+    with pytest.raises(FitSetError, match="PreparedBindingStoreError"):
+        runner._run_gate_episodes([(gate, {"variant_id": "frozen-gate"})])
+    assert permit.acquire(block=False)
+    permit.release()
 
 
 def test_whitelist_is_full_exact_reviewed_snapshot():

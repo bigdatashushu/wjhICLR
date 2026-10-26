@@ -2271,6 +2271,20 @@ class SystemVariantRunner:
             raise FitSetError(
                 "fit-set process worker failed: " + "; ".join(errors))
 
+    @staticmethod
+    def _gate_spawn_runner(gate_runner, variant):
+        provider = getattr(gate_runner, "published_inputs", None)
+        factory = getattr(provider, "for_spawned_episode", None)
+        if not callable(factory):
+            return gate_runner
+        _require(gate_runner.item_provider is provider,
+                 "spawn replay requires one shared published input provider")
+        clone = copy.copy(gate_runner)
+        clone.published_inputs = factory(variant)
+        clone.item_provider = clone.published_inputs
+        clone.input_receipt_provider = clone.published_inputs.receipt
+        return clone
+
     def _run_gate_episodes(
         self,
         items: Sequence[tuple[object, Mapping]],
@@ -2309,19 +2323,19 @@ class SystemVariantRunner:
                     acquired = semaphore.acquire(block=False)
                     if acquired:
                         gate_runner, variant = pending[index]
-                        process = context.Process(
-                            target=_gate_episode_worker,
-                            args=(gate_runner, dict(variant), messages),
-                            name=f"fitset-gate-{index:03d}",
-                            daemon=False,
-                        )
                         try:
+                            process = context.Process(
+                                target=_gate_episode_worker,
+                                args=(self._gate_spawn_runner(gate_runner, variant),
+                                      dict(variant), messages),
+                                name=f"fitset-gate-{index:03d}", daemon=False,
+                            )
                             process.start()
                         except BaseException as exc:  # noqa: BLE001
                             semaphore.release()
                             errors.append(
                                 f"{variant['variant_id']}: "
-                                f"{type(exc).__name__}: {exc}")
+                                f"{type(exc).__name__}")
                         else:
                             running[process.pid] = (process, False)
                             index += 1
