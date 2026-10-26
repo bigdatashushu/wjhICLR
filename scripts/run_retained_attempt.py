@@ -55,7 +55,7 @@ def main():
     assert sha((Path(proof["input_root"])/"scene.json").read_bytes())==proof["input_scene_sha256"]
     text=source.decode()
     module=native
-    if gpu in [0,6]:
+    if Path(proof["input_root"]) != CACHE/"jobs"/key/"input":
         local=Path(proof["input_root"]).parent
         for old,new in {
             'archive = staging / "input.tar"':'archive = local / "input.tar"',
