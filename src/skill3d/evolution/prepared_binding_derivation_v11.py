@@ -384,8 +384,15 @@ def _legacy_contract(binding, old_request, target_request):
              "original generation model identity changed")
     _require(not binding.stats.get("binding_error"), "source is a binding error")
     parse = binding.stats.get("object_parse")
-    _require(parse is None or parse.get("status") == "parsed",
-             "source question parse is unavailable")
+    if parse is not None and parse.get("status") == "unavailable":
+        _require(binding.stats.get("status") == "parse_unavailable"
+                 and not binding.objects and not parse.get("objects")
+                 and not binding.stats.get("candidate_receipts")
+                 and not binding.stats.get("detection_receipts"),
+                 "unavailable source parse contains object evidence")
+    else:
+        _require(parse is None or parse.get("status") == "parsed",
+                 "source question parse status is unsupported")
 
 
 def _derive_policy(binding, parameters):

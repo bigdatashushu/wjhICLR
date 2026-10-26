@@ -557,6 +557,36 @@ def test_completed_empty_object_outcome_preserves_sealed_generation(case):
     _validate(case, binding)
 
 
+def test_unavailable_parse_preserves_empty_source_without_new_requests(case):
+    def mutate(binding):
+        binding.objects.clear()
+        binding.materialized = False
+        binding.stats.update(
+            status="parse_unavailable",
+            object_parse={"status": "unavailable", "objects": []},
+            candidate_receipts=[], detection_receipts=[])
+        binding.stats.pop("grounding")
+
+    _replace_source(case, mutate)
+    before = copy.deepcopy(case.context.sources["qa-1"]["prepared"])
+    binding = derivation.derive_prepared_binding_scene_v11(case.context)["qa-1"]
+    assert not binding.objects and not binding.materialized
+    assert binding.stats["status"] == "parse_unavailable"
+    assert binding.stats["object_parse"] == before.stats["object_parse"]
+    assert binding.stats["generation"] == before.stats["generation"]
+    assert binding.stats["actual_model_requests"] == before.stats["actual_model_requests"]
+    assert binding.stats["binding_derivation"]["new_model_requests"] == 0
+    assert binding.stats["binding_derivation"]["quality_assessed"] is False
+    _validate(case, binding)
+
+
+def test_unavailable_parse_cannot_admit_existing_object_evidence(case):
+    _replace_source(case, lambda binding: binding.stats.update(
+        status="parse_unavailable", object_parse={"status": "unavailable", "objects": []}))
+    with pytest.raises(PreparedBindingStoreError, match="contains object evidence"):
+        derivation.derive_prepared_binding_scene_v11(case.context)
+
+
 def test_provider_style_relocation_does_not_need_old_server_paths(case, tmp_path):
     root = tmp_path / "published"
     root.mkdir()
