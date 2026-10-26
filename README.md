@@ -2,6 +2,8 @@
 
 harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感知 VLM 实验系统。Skill3D 是代码基础，不是当前系统名称。在线链统一使用百炼 Qwen3.8-Flash 生成并执行受限程序、解析题目并审核对象语义；离线链按采集、修订、评测、发布四阶段更新完整 Skill。当前实现以[系统架构 v11](系统架构v11.md)为准；本文保留的服务器核查路径和资源状态是历史记录。
 
+专题说明、旧版架构与历史实验报告统一从 [文档索引](docs/README.md) 查阅。
+
 当前 checkout 已删除原 Skill-3D 副本、退役 BA/标定实现、v9/v10 演化与发布链、向量检索和 Memory 平台。历史实现通过对应 Git 提交复现。VSI-Bench 数据读取、split、帧集、VGGT/MoGe-2 重建、SAM2 分割、质量门及已有数据产物保持原实现。
 
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
