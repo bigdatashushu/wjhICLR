@@ -1,7 +1,6 @@
 """Exact initial slots, immutable sources and isolated slot publication."""
 
 import hashlib
-import json
 import shutil
 from pathlib import Path
 
@@ -11,9 +10,9 @@ from skill3d.routing.skill_retriever import retrieve_ex
 from skill3d.schemas import EvidenceProfile, SceneState, SkillCandidateV11
 from skill3d.schemas.evidence import skill_evidence_state
 from skill3d.skills.delivery import plan_delivery
+from skill3d.skills.promote_atomic import read_active_snapshot
 from skill3d.skills.registry import load_active_skills
 from skill3d.skills.v11_library import publish_v11_candidate, validate_v11_snapshot
-from skill3d.skills.tool_baseline import TOOL_SNAPSHOT_ID as STATE_SNAPSHOT_ID
 
 LIBRARY = Path(__file__).resolve().parents[2] / "skill_library"
 
@@ -56,11 +55,11 @@ def test_missing_slot_never_borrows_lower_state():
     assert any(row.reason_code == "evidence_state_unknown" for row in record.candidates)
 
 
-def test_baseline_and_single_slot_publication_preserve_other_23(tmp_path):
+def test_active_snapshot_and_single_slot_publication_preserve_other_23(tmp_path):
     library = tmp_path / "library"
     shutil.copytree(LIBRARY, library)
     skills, _, _ = load_active_skills(library / "snapshots")
-    before = json.loads((library / "snapshots" / f"snapshot_{STATE_SNAPSHOT_ID}.json").read_text())
+    before = read_active_snapshot(library / "snapshots")
     assert len(skills) == 24
     parent = next(s for s in skills if s.skill_id == "S03-g1m0")
     candidate = SkillCandidateV11(

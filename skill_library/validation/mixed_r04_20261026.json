@@ -1,0 +1,298 @@
+{
+  "active_slots": 24,
+  "adopted_candidate_slots": [
+    "object_size_estimation/g1m0",
+    "room_size_estimation/g0m0"
+  ],
+  "historical_entries": 4,
+  "manifest_sha256": "410553a36f8c02bd710d0e1d48204d8ed93843bf5f5bc1e96ae59cf1817c6171",
+  "mixed_snapshot_performance_evaluated": false,
+  "model_requests": 0,
+  "parent_manifest_sha256": "746ea0e5127e6c4ff1adfd2bd751da1e28b8df557e0d5754c73db4ea8beb1461",
+  "reachable_slots": 19,
+  "rollback_ref": "snapshots/snapshot_S0-v11-task-tools.json",
+  "schema_version": "harness3d-manual-slot-selection/1.0",
+  "selection_scope": "r04 eight evaluated slots; two improved candidates, others parent",
+  "slot_selections": {
+    "obj_appearance_order/g0m0": {
+      "content_sha256": "7be0a670d707a1a782281e516c865323044afbaaeadbb1c28eb375823f221fcd",
+      "parent_skill_version": "S07-g0m0@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S07-g0m0@1.0.0"
+    },
+    "obj_appearance_order/g1m0": {
+      "content_sha256": "36893e43415689555f9b2493c9f4601a214a854f437fd56126d50807c3ca13d3",
+      "parent_skill_version": "S07-g1m0@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S07-g1m0@1.0.0"
+    },
+    "obj_appearance_order/g1m1": {
+      "content_sha256": "a990d9ffae2c11893e6a82878ee2a397f962018c967fb3337709b632881b8b89",
+      "parent_skill_version": "S07-g1m1@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S07-g1m1@1.0.0"
+    },
+    "object_abs_distance/g0m0": {
+      "content_sha256": "18173b2ab253ab5dc9937c6672f9a5dc1c44d3801f100cf60dc7b6fde8b6849e",
+      "parent_skill_version": "S02-g0m0@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S02-g0m0@1.0.0"
+    },
+    "object_abs_distance/g1m0": {
+      "content_sha256": "ad381a4a4508950803956cb139e5266f6b4aefa6d159d7bf8a94df9f90e2a604",
+      "parent_skill_version": "S02-g1m0@1.0.1",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S02-g1m0@1.0.1"
+    },
+    "object_abs_distance/g1m1": {
+      "content_sha256": "c2ce08b8120553c3034bb8b024bb4dad9e3f84689999ac4e4026c88b81cf8e80",
+      "parent_skill_version": "S02-g1m1@1.0.1",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S02-g1m1@1.0.1"
+    },
+    "object_counting/g0m0": {
+      "content_sha256": "4960897d12b5fc30895169bcb79820e13f71748ae15ac3fc0b9838ec36b80804",
+      "parent_skill_version": "S01-g0m0@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S01-g0m0@1.0.0"
+    },
+    "object_counting/g1m0": {
+      "content_sha256": "45f3028324d97a7cc53d88cb67a4e5f1b83c62152d169076993ff29888704cd6",
+      "parent_skill_version": "S01-g1m0@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S01-g1m0@1.0.0"
+    },
+    "object_counting/g1m1": {
+      "content_sha256": "3ac357a1672b0e0d33f8c2c861935f995ffb791c895f82be78a5362ea7478103",
+      "parent_skill_version": "S01-g1m1@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S01-g1m1@1.0.0"
+    },
+    "object_rel_direction/g0m0": {
+      "content_sha256": "a98217a42b3e79a137d9cf1494fe30b7e6e37e19cb134a12db799eba78069b14",
+      "parent_skill_version": "S06-g0m0@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S06-g0m0@1.0.0"
+    },
+    "object_rel_direction/g1m0": {
+      "content_sha256": "b174c9f1ef239970d338591d329eabcf09fb74cc04ded544905fe430f4e5e83d",
+      "parent_skill_version": "S06-g1m0@1.0.0",
+      "r04_complete_pairs": 16,
+      "r04_mean_scores": {
+        "candidate": 0.6875,
+        "parent": 0.6875
+      },
+      "reason": "keep_parent_candidate_tied",
+      "selected_role": "parent",
+      "selected_skill_version": "S06-g1m0@1.0.0"
+    },
+    "object_rel_direction/g1m1": {
+      "content_sha256": "e89107c6998e751ae63cf06c49f47f4997219bf6a7c4f06daf2932335daccc7f",
+      "parent_skill_version": "S06-g1m1@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S06-g1m1@1.0.0"
+    },
+    "object_rel_distance/g0m0": {
+      "content_sha256": "a59e169ee5b4c2c156ae53da61af6ca5339c6a3d88860556f84d3c1d4ebe600e",
+      "parent_skill_version": "S03-g0m0@1.0.0",
+      "r04_complete_pairs": 16,
+      "r04_mean_scores": {
+        "candidate": 0.6875,
+        "parent": 0.875
+      },
+      "reason": "keep_parent_candidate_declined",
+      "selected_role": "parent",
+      "selected_skill_version": "S03-g0m0@1.0.0"
+    },
+    "object_rel_distance/g1m0": {
+      "content_sha256": "2e2f6eaa1f1dcb46b32cb92de5a3c42605f8261ea237842100b37bba00212129",
+      "parent_skill_version": "S03-g1m0@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S03-g1m0@1.0.0"
+    },
+    "object_rel_distance/g1m1": {
+      "content_sha256": "1c554c57766e5c423c6d675f01f580aa00c213c98ffc74aaa898f52b6891aa2f",
+      "parent_skill_version": "S03-g1m1@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S03-g1m1@1.0.0"
+    },
+    "object_size_estimation/g0m0": {
+      "content_sha256": "61680fa84389f4d49148e57ab37a0624207f05351c7d5d9129df379c2b917753",
+      "parent_skill_version": "S04-g0m0@1.0.0",
+      "r04_complete_pairs": 16,
+      "r04_mean_scores": {
+        "candidate": 0.71875,
+        "parent": 0.7250000000000001
+      },
+      "reason": "keep_parent_candidate_declined",
+      "selected_role": "parent",
+      "selected_skill_version": "S04-g0m0@1.0.0"
+    },
+    "object_size_estimation/g1m0": {
+      "content_sha256": "da85fa745511c29140787f37cec2a53759500802e2ff5ff0aafd7c27846d999f",
+      "parent_skill_version": "S04-g1m0@1.0.0",
+      "r04_complete_pairs": 16,
+      "r04_mean_scores": {
+        "candidate": 0.8937500000000002,
+        "parent": 0.8187500000000001
+      },
+      "reason": "adopt_candidate",
+      "selected_role": "candidate",
+      "selected_skill_version": "S04-g1m0@1.1.0",
+      "source_candidate_id": "r10-followup-f28c7fc44c178d668d85",
+      "source_diff_sha256": "198a8900664f78e75f80fc0f2fbde12b6413f234da3589a10b939215c6f81e3e",
+      "source_gate_by_seed": {
+        "137": {
+          "candidate_mean": 0.9125,
+          "candidate_program_errors": 2,
+          "conditions": {
+            "errors_nonincreasing": true,
+            "legacy_program_errors_nonincreasing": true,
+            "legal_rate_nondeclining": true,
+            "strict_improvement": true
+          },
+          "parent_mean": 0.8125,
+          "parent_program_errors": 2,
+          "passed": true
+        },
+        "138": {
+          "candidate_mean": 0.875,
+          "candidate_program_errors": 2,
+          "conditions": {
+            "errors_nonincreasing": true,
+            "legacy_program_errors_nonincreasing": true,
+            "legal_rate_nondeclining": true,
+            "strict_improvement": true
+          },
+          "parent_mean": 0.8250000000000001,
+          "parent_program_errors": 3,
+          "passed": true
+        }
+      },
+      "source_publication_snapshot": "S1-S04-g1m0-1.1.0-r10-followup-f28c7fc44c178d668d85"
+    },
+    "object_size_estimation/g1m1": {
+      "content_sha256": "a058af059ae19b5694b63caf34da934e5618d36d6f05821761398322053faced",
+      "parent_skill_version": "S04-g1m1@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S04-g1m1@1.0.0"
+    },
+    "room_size_estimation/g0m0": {
+      "content_sha256": "82a9289a528bc1ba6426cd59e10c20429d47ed7b935c3939c02f9c570a49967e",
+      "parent_skill_version": "S05-g0m0@1.0.0",
+      "r04_complete_pairs": 16,
+      "r04_mean_scores": {
+        "candidate": 0.4875,
+        "parent": 0.4
+      },
+      "reason": "adopt_candidate",
+      "selected_role": "candidate",
+      "selected_skill_version": "S05-g0m0@1.1.0",
+      "source_candidate_id": "r10-followup-85838bb5243f39daea47",
+      "source_diff_sha256": "ddca2a256571a9f1865fc047d732426749aabc04b18535d9342d7853c0b81650",
+      "source_gate_by_seed": {
+        "137": {
+          "candidate_mean": 0.48750000000000004,
+          "candidate_program_errors": 0,
+          "conditions": {
+            "errors_nonincreasing": true,
+            "legacy_program_errors_nonincreasing": true,
+            "legal_rate_nondeclining": true,
+            "strict_improvement": true
+          },
+          "parent_mean": 0.35000000000000003,
+          "parent_program_errors": 0,
+          "passed": true
+        },
+        "138": {
+          "candidate_mean": 0.48749999999999993,
+          "candidate_program_errors": 0,
+          "conditions": {
+            "errors_nonincreasing": true,
+            "legacy_program_errors_nonincreasing": true,
+            "legal_rate_nondeclining": true,
+            "strict_improvement": true
+          },
+          "parent_mean": 0.44999999999999996,
+          "parent_program_errors": 0,
+          "passed": true
+        }
+      },
+      "source_publication_snapshot": "S2-S05-g0m0-1.1.0-r10-followup-85838bb5243f39daea47"
+    },
+    "room_size_estimation/g1m0": {
+      "content_sha256": "968b36b58507f42f35c0c674545a063fbab54e879e33a6d8783ff2ce14a19141",
+      "parent_skill_version": "S05-g1m0@1.0.0",
+      "r04_complete_pairs": 16,
+      "r04_mean_scores": {
+        "candidate": 0.45,
+        "parent": 0.53125
+      },
+      "reason": "keep_parent_candidate_declined",
+      "selected_role": "parent",
+      "selected_skill_version": "S05-g1m0@1.0.0"
+    },
+    "room_size_estimation/g1m1": {
+      "content_sha256": "a8a87aaefb0489a42bd09ebecc3a71844c16a7b26c0914ffcc4429e24dc72f51",
+      "parent_skill_version": "S05-g1m1@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S05-g1m1@1.0.0"
+    },
+    "route_planning/g0m0": {
+      "content_sha256": "76cdbfefe0ed014364f23416bd22624622767be8dedc3dba6988855ff099c222",
+      "parent_skill_version": "S08-g0m0@1.0.0",
+      "r04_complete_pairs": 16,
+      "r04_mean_scores": {
+        "candidate": 0.5625,
+        "parent": 0.5625
+      },
+      "reason": "keep_parent_candidate_tied",
+      "selected_role": "parent",
+      "selected_skill_version": "S08-g0m0@1.0.0"
+    },
+    "route_planning/g1m0": {
+      "content_sha256": "f9c1fda4ce043ac1fb02b685d60564911248ef4169524468e32764f7ed6153f3",
+      "parent_skill_version": "S08-g1m0@1.0.0",
+      "r04_complete_pairs": 16,
+      "r04_mean_scores": {
+        "candidate": 0.5,
+        "parent": 0.5625
+      },
+      "reason": "keep_parent_candidate_declined",
+      "selected_role": "parent",
+      "selected_skill_version": "S08-g1m0@1.0.0"
+    },
+    "route_planning/g1m1": {
+      "content_sha256": "37f7da103fe7b0e6d0a72edd73d0b1e3ae0c764af2d06cd2b04763397047993c",
+      "parent_skill_version": "S08-g1m1@1.0.0",
+      "reason": "outside_r04_selection",
+      "selected_role": "parent",
+      "selected_skill_version": "S08-g1m1@1.0.0"
+    }
+  },
+  "snapshot_after": "mixed-r04-20261026-v1",
+  "snapshot_before": "S0-v11-task-tools",
+  "solver_ran": false,
+  "source_candidate_bundle_id": "r10-f11-authored-review-v1",
+  "source_candidate_manifest_file_sha256": "a226836dc5ea81b655f19ea857176ce8e6a24a7455afc83de725ccff4f24cc79",
+  "source_candidate_manifest_sha256": "452d8dd497275ccc4e2560d0a57487f54ed513246e65081e887bbc1c61c67e1c",
+  "source_method_audit": "passed",
+  "source_run": "r11-contract-repair-20261021-r04",
+  "source_summary_file_sha256": "9a922a7cdc97e3119bb8382b02915e22a1a90c1ceb4085a6264602d612c20351",
+  "source_supplemental_audit": "passed"
+}
