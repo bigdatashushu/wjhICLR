@@ -1,3 +1,14 @@
+> **Harness3D local inference subset.** This vendored copy retains the VGGT model,
+> all inference heads (including tracking), layers, image preprocessing, pose
+> conversion, and unprojection used by Harness3D. Training, legacy COLMAP/VGGSfM
+> dependencies, demos, and their unused helpers have been removed. The upstream
+> documentation below is retained for attribution and background; its training,
+> demo, and COLMAP commands require the full
+> [upstream repository](https://github.com/facebookresearch/vggt).
+> Harness3D runs this model through
+> [vggt_runner.py](../../src/skill3d/reconstruction/vggt_runner.py) and the
+> [reconstruction CLI](../../src/skill3d/reconstruction/run.py).
+
 <div align="center">
 <h1>VGGT: Visual Geometry Grounded Transformer</h1>
 

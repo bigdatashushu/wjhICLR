@@ -366,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
                     n_frames=args.n_frames)
     # 分片并行时**不得**都写 manifest.json（2026-09-22 实测：6 个 shard 互相覆盖，
     # 最终只剩最后一个 shard 的 5 条 job → 整批 24 个 scene 的 provenance 丢失）。
-    # 分片各写自己的 manifest，由调用方（scripts/recon_inner128.sh）合并。
+    # 分片各写自己的 manifest，由调用方按需合并。
     shard_tag = ""
     if args.scene_shard:
         _i, _, _n = args.scene_shard.partition("/")

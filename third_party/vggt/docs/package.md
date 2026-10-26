@@ -1,6 +1,9 @@
 # Alternative Installation Methods
 
-This document explains how to install VGGT as a package using different package managers. 
+This document explains upstream VGGT installation. Harness3D vendors an inference
+subset; the Gradio demo commands below require the full
+[upstream repository](https://github.com/facebookresearch/vggt). Use Harness3D's
+frozen experiment environment for this local copy.
 
 ## Prerequisites
 
@@ -42,4 +45,3 @@ pixi run -e python demo_gradio.py
 ```bash
 uv run --extra demo demo_gradio.py
 ```
-
