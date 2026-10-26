@@ -10,7 +10,7 @@ from skill3d.schemas import AnswerPayload, CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.verifier.geometry_oracle import GeometryIssue
 from skill3d.schemas.tool import FailureCause
 
-EXECUTION_PROTOCOL_VERSION = "solver-v11.12-trusted-observation-recovery"
+EXECUTION_PROTOCOL_VERSION = "solver-v11.13-evidence-boundaries"
 FINALIZATION_SCHEMA_VERSION = "answer-finalization/1.0"
 FINALIZATION_DELIVERY_STRATEGY = "omit_complete_method"
 
@@ -112,7 +112,7 @@ def finalization_program(payload: AnswerPayload):
 
 
 def submission_scope(kernel, trace):
-    """覆盖跨轮有效结果；明确的纯视觉提交可舍弃历史工具依据。
+    """覆盖跨轮有效结果，排除隔离结果；纯视觉提交可舍弃历史工具依据。
 
     当前片段实际产生的结果始终接受检查，不能以 visual_estimate 声明绕过。
     短写答案没有可证实的依赖集合，保守检查全部未撤销成功结果。
@@ -125,6 +125,7 @@ def submission_scope(kernel, trace):
                        and not referenced)
     results = [r for r in kernel.tool_results
                if r.status == "ok" and r.error is None and not r.invalidated_by
+               and r.result_id not in kernel.unresolved_result_ids
                and (
                    (r.result_id in current)
                    or (r.result_id in referenced)
@@ -134,7 +135,7 @@ def submission_scope(kernel, trace):
 
 
 def invalid_reference_issues(kernel) -> list[GeometryIssue]:
-    """显式引用必须存在、成功且未撤销，不因 mixed 声明而放宽。"""
+    """显式引用必须存在、成功且未撤销或隔离，不因 mixed 声明而放宽。"""
     payload = kernel.answer_slot.payload
     if payload is None:
         return []
@@ -149,10 +150,13 @@ def invalid_reference_issues(kernel) -> list[GeometryIssue]:
             check, reason = "invalidated_reference", "This answer explicitly references an invalidated tool result"
         elif result.status != "ok" or result.error is not None:
             check, reason = "failed_reference", "This answer references a failed tool result"
+        elif rid in kernel.unresolved_result_ids:
+            check, reason = "unresolved_reference", "This answer explicitly references an unresolved tool result"
         else:
             continue
         issues.append(GeometryIssue(
             check=check, tool=result.tool if result else "", result_id=rid, reason=reason,
+            invalidate_result=check != "unresolved_reference",
             failure_cause=FailureCause(
                 code=check, scope="local_result", result_ids=[rid],
                 object_ids=list(result.object_dependencies) if result else [],

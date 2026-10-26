@@ -51,6 +51,10 @@ FIT_FEEDBACK_SCHEMA = "v11-fit-set-slot-feedback/3.0"
 FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v4-case-repair"
 
 
+class RevisionOperationalError(RuntimeError):
+    """Stop an incomplete or untrustworthy revision without rejecting a method."""
+
+
 def _write_create_once(path: Path, value: object) -> None:
     data = canonical_json_bytes(value) + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -609,14 +613,14 @@ class FitSetSlotReviser:
         if exchange_path.is_file():
             exchange = json.loads(exchange_path.read_text(encoding="utf-8"))
             if exchange.get("request") != request:
-                raise FitSetError(
+                raise RevisionOperationalError(
                     f"{slot_name}: revision request changed on resume")
             if exchange.get("service_error"):
-                raise FitSetError(f"{slot_name}: recorded revision service failure")
+                raise RevisionOperationalError(f"{slot_name}: recorded revision service failure")
             return exchange
         intent_path = slot_root / f"request_intent_{attempt:02d}.json"
         if intent_path.exists():
-            raise FitSetError(
+            raise RevisionOperationalError(
                 f"{slot_name}: revision request has no completion receipt; ambiguous request is not retried")
         _write_create_once(intent_path, {
             "request": request, "started_at": datetime.now(timezone.utc).isoformat()})
@@ -631,12 +635,16 @@ class FitSetSlotReviser:
             )
         except Exception as exc:
             # Only a host-owned type crosses this boundary; never echo provider text.
-            _write_create_once(exchange_path, {
-                "schema_version": FIT_REVISION_SCHEMA, "request": request,
-                "service_error": True, "exception_type": type(exc).__name__,
-                "elapsed_s": time.perf_counter() - started,
-            })
-            raise FitSetError(f"{slot_name}: revision request failed") from exc
+            try:
+                _write_create_once(exchange_path, {
+                    "schema_version": FIT_REVISION_SCHEMA, "request": request,
+                    "service_error": True, "exception_type": type(exc).__name__,
+                    "elapsed_s": time.perf_counter() - started,
+                })
+            except Exception:
+                raise RevisionOperationalError(
+                    f"{slot_name}: revision failure receipt unavailable") from None
+            raise RevisionOperationalError(f"{slot_name}: revision request failed") from None
         exchange = {
             "schema_version": FIT_REVISION_SCHEMA,
             "slot_key": slot_name,
@@ -698,7 +706,7 @@ class FitSetSlotReviser:
                     or receipt.get("contract_sha256") != ExecutionContract(self.method_context_max_chars).sha256
                     or receipt.get("feedback_sha256") != content_sha256(feedback)
                     or receipt.get("evidence_sha256") != evidence_sha):
-                raise FitSetError(f"{slot_name}: frozen revision identity changed")
+                raise RevisionOperationalError(f"{slot_name}: frozen revision identity changed")
             if receipt.get("action") == "no_change":
                 return None
             text = skill_path.read_text(encoding="utf-8")
@@ -714,7 +722,7 @@ class FitSetSlotReviser:
                 or candidate.content_sha256 != receipt.get("content_sha256")
                 or candidate_sample_copy_leaks(text, cases)
             ):
-                raise FitSetError(
+                raise RevisionOperationalError(
                     f"{slot_name}: frozen candidate no longer validates")
             return candidate
         static_feedback: list[dict] = []
@@ -826,6 +834,7 @@ __all__ = [
     "FIT_FEEDBACK_SCHEMA",
     "FIT_REVISION_SCHEMA",
     "FitSetSlotReviser",
+    "RevisionOperationalError",
     "build_method_feedback",
     "load_active_parent_slots",
 ]

@@ -17,8 +17,9 @@ from PIL import Image, ImageDraw
 from skill3d.infra.m5_identity import content_sha256
 from skill3d.synthesis.request_context import request_phase
 
-VISUAL_REVIEW_VERSION = "m5-mask-observation-qwen38-v1"
+VISUAL_REVIEW_VERSION = "m5-mask-observation-qwen38-v2-observation-identity"
 RELATION_REVIEW_VERSION = "m5-mask-relation-qwen38-v4-examples"
+VISUAL_ADMISSION_POLICY = "visual-quality-and-relation"
 JPEG_QUALITY = 95
 RELATION_MAX_TOKENS = 2048
 VISUAL_PROMPT = """The three images show one candidate region:
@@ -125,6 +126,17 @@ def validate_relation_response(raw: str, expected_ids) -> dict[str, str]:
     return result
 
 
+def visual_quality_passes(observation) -> bool:
+    return bool(
+        isinstance(observation, dict)
+        and isinstance(observation.get("observed_object"), str)
+        and observation["observed_object"]
+        and observation["observed_object"] not in {"other", "unknown"}
+        and observation.get("visibility") in {"clear", "partial"}
+        and observation.get("mask_purity") == "clean"
+        and observation.get("mask_completeness") in {"whole", "major_part"})
+
+
 def _crop_bounds(box, width: int, height: int, margin: float = 0.20):
     x0, y0, x1, y1 = map(float, box)
     dx, dy = (x1 - x0) * margin, (y1 - y0) * margin
@@ -188,6 +200,8 @@ def observe_candidate(candidate, frame, mask, client, *, seed, min_pixels,
     candidate_id = str(candidate["candidate_id"])
     receipt = {
         "version": VISUAL_REVIEW_VERSION,
+        "provider": "bailian",
+        "policy": VISUAL_ADMISSION_POLICY,
         "candidate_id": candidate_id,
         "status": "unavailable",
     }
@@ -222,6 +236,8 @@ def observe_candidate(candidate, frame, mask, client, *, seed, min_pixels,
                 response_format={"type": "json_object"}, enable_thinking=False)
         receipt["raw_response"] = raw
         receipt["observation"] = validate_visual_response(raw)
+        receipt["observation_sha256"] = content_sha256(receipt["observation"])
+        receipt["model_identity_sha256"] = content_sha256(request_identity["model"])
         receipt["usage"] = _usage(client)
         receipt["response_identity"] = _response_identity(client)
         receipt["status"] = "observed"

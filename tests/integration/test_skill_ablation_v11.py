@@ -15,6 +15,7 @@ from skill3d.evaluation import skill_ablation_v11 as ab
 from skill3d.evolution.prepared_bindings_v11 import (
     prepare_shared_bindings_v11,
 )
+from skill3d.infra.m5_identity import content_sha256
 from skill3d.online.runner import OnlineRunConfig, PreparedObjectBinding
 from skill3d.reconstruction_gate.quality_metrics import compute_quality
 from skill3d.schemas import (
@@ -27,6 +28,34 @@ from skill3d.schemas import (
 from skill3d.segmentation import sam2_tracker
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _semantic_provenance(candidate_id, category):
+    observation = {
+        "observed_object": category, "alternate_object": "none",
+        "visibility": "clear", "mask_purity": "clean", "mask_completeness": "whole",
+    }
+    request_identity = {
+        "candidate_id": candidate_id,
+        "model": {"provider": "bailian", "model": "synthetic-m5-semantic",
+                  "model_revision": "fixture-v1", "fixture": True},
+    }
+    relation_request_identity = {
+        "pairs": [{"id": candidate_id, "observed_object": observation["observed_object"],
+                   "target_category": category}],
+        "model": request_identity["model"],
+    }
+    return {
+        "candidate_id": candidate_id, "category": category,
+        "semantic_provider": "bailian", "semantic_policy": "visual-quality-and-relation",
+        "semantic_observation": observation,
+        "semantic_observation_sha256": content_sha256(observation),
+        "semantic_request_identity": request_identity,
+        "semantic_visual_request_sha256": content_sha256(request_identity),
+        "semantic_model_identity_sha256": content_sha256(request_identity["model"]),
+        "semantic_relation": "match",
+        "semantic_relation_request_sha256": content_sha256(relation_request_identity),
+    }
 
 
 def test_failed_perception_is_stored_and_replayed_without_repeating_model_work(panel, tmp_path, monkeypatch):
@@ -165,13 +194,11 @@ def panel(tmp_path, monkeypatch, request):
             obj.question_roles = [{"category": obj.category_name,
                                    "role": "reference" if index == 1 else "candidate",
                                    "source_text": obj.category_name}]
-            obj.binding_provenance = [{
-                "semantic_relation": "match",
-                "semantic_visual_request_sha256": "a" * 64,
-                "semantic_relation_request_sha256": "b" * 64,
-            }]
+            obj.binding_provenance = [
+                _semantic_provenance(obj.candidate_ids[0], obj.category_name)]
             obj.binding_validation = validate_binding(
                 obj, generation_sha256=generation["sha256"])
+            assert obj.binding_validation.status == "validated", obj.binding_validation.errors
         grounding = refresh_coverage({
             "version": M5_BINDING_VERSION, "attempted": True,
             "requirements": [{"name": o.category_name, "scan_complete": True,
@@ -405,13 +432,10 @@ def test_paired_preparation_audits_cross_question_mask_conflicts_before_hashing(
                 "candidate_ids": [qa_id], "question_roles": [{
                     "category": categories[qa_id], "role": "target",
                     "source_text": categories[qa_id]}],
-                "binding_provenance": [{
-                    "semantic_relation": "match",
-                    "semantic_visual_request_sha256": "a" * 64,
-                    "semantic_relation_request_sha256": "b" * 64,
-                }]})
+                "binding_provenance": [_semantic_provenance(qa_id, categories[qa_id])]})
         obj = obj.model_copy(update={
             "binding_validation": validate_binding(obj, generation_sha256=generation["sha256"])})
+        assert obj.binding_validation.status == "validated", obj.binding_validation.errors
         grounding = refresh_coverage({
             "version": M5_BINDING_VERSION, "attempted": True,
             "requirements": [{"name": categories[qa_id], "scan_complete": True,
@@ -946,11 +970,11 @@ def test_cli_runs_real_runner_with_injected_transport(panel, tmp_path, monkeypat
         "--output-dir", str(output)]) == 0
     manifest = json.loads((output / "manifest.json").read_text())
     assert manifest["common_config"]["seed"] == 137
-    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_13_en"
+    assert manifest["common_config"]["prompt_template_version"] == "program_synth_v11_14_en"
     assert manifest["common_config"]["execution_protocol_version"] == (
-        "solver-v11.12-trusted-observation-recovery")
+        "solver-v11.13-evidence-boundaries")
     assert manifest["common_config"]["tool_docs_version"] == (
-        "tool-docs-v11.12-complete-ranking")
+        "tool-docs-v11.13-evidence-dependencies")
     assert manifest["snapshot"]["snapshot_id"] == "S0-v11-task-tools"
 
 

@@ -9,8 +9,41 @@ import numpy as np
 from skill3d.infra.m5_identity import file_identity, content_sha256
 from skill3d.schemas.reconstruction import BindingValidation
 
-BINDING_VALIDATION_VERSION = "m5-binding-validation-v2-semantic-review"
+BINDING_VALIDATION_VERSION = "m5-binding-validation-v3-sealed-semantics"
+SEMANTIC_IDENTITY_VERSION = "m5-binding-semantic-identity-v1"
+SEMANTIC_IDENTITY_KEY = "binding_semantics"
 NUMERIC_TOLERANCE = 1e-6
+
+
+def _semantic_identity(obj):
+    # Stored beside array identities, so saved receipts bind outputs as well as inputs.
+    return {
+        "version": SEMANTIC_IDENTITY_VERSION,
+        "sha256": content_sha256({
+            "version": SEMANTIC_IDENTITY_VERSION,
+            "obj_id": obj.obj_id, "track_id": obj.track_id,
+            "category_name": obj.category_name, "source_label": obj.source_label,
+            "grounding_status": obj.grounding_status,
+            "candidate_ids": obj.candidate_ids, "question_roles": obj.question_roles,
+            "binding_provenance": obj.binding_provenance,
+        }),
+    }
+
+
+def _semantic_policy_passes(row):
+    allowed = {
+        "bailian": {"visual-quality-and-relation"},
+        "intern-decision-local": {"visual-quality-and-relation"},
+        "intern-decision-binary-local": {"category-only", "frozen-quality"},
+    }
+    policy = row.get("semantic_policy")
+    provider = row.get("semantic_provider")
+    admission = row.get("semantic_admission", {})
+    return bool(
+        isinstance(provider, str) and isinstance(policy, str)
+        and isinstance(admission, dict)
+        and policy in allowed.get(provider, set())
+        and (not admission or admission.get("policy") == policy))
 
 
 def validate_binding(obj, *, depth_maps=None, n_frames=None,
@@ -66,29 +99,57 @@ def validate_binding(obj, *, depth_maps=None, n_frames=None,
     checks["semantic_review"] = bool(
         obj.grounding_status != "question_driven"
         or (obj.binding_provenance and all(
-            row.get("semantic_relation") == "match"
+            isinstance(row, dict) and row.get("semantic_relation") == "match"
             and row.get("semantic_visual_request_sha256")
             and row.get("semantic_relation_request_sha256")
             for row in obj.binding_provenance)))
+    try:
+        files[SEMANTIC_IDENTITY_KEY] = _semantic_identity(obj)
+        checks["semantic_policy"] = bool(
+            obj.grounding_status != "question_driven"
+            or (obj.binding_provenance and all(
+                _semantic_policy_passes(row) for row in obj.binding_provenance)))
+        checks["candidate_provenance"] = bool(
+            obj.grounding_status != "question_driven"
+            or ([row.get("candidate_id") for row in obj.binding_provenance]
+                == obj.candidate_ids and all(
+                    row.get("category") == obj.category_name
+                    for row in obj.binding_provenance)))
+        for row in obj.binding_provenance or []:
+            if row.get("semantic_provider") == "bailian":
+                from .mask_semantic_review import visual_quality_passes
+                observation = row.get("semantic_observation")
+                identity = row.get("semantic_request_identity") or {}
+                checks["qwen_observation_integrity"] = bool(
+                    visual_quality_passes(observation)
+                    and row.get("semantic_observation_sha256") == content_sha256(observation)
+                    and identity.get("candidate_id") == row.get("candidate_id")
+                    and row.get("semantic_visual_request_sha256") == content_sha256(identity)
+                    and row.get("semantic_model_identity_sha256") == content_sha256(identity.get("model")))
+                if not checks["qwen_observation_integrity"]:
+                    break
+    except (ValueError, TypeError, KeyError, AttributeError):
+        checks["semantic_identity"] = False
     for row in obj.binding_provenance or []:
         if row.get("semantic_provider") == "intern-decision-local":
             from .intern_decision_protocol import PROTOCOL_SHA256
+            from .mask_semantic_review import visual_quality_passes
             observation = row.get("semantic_observation") or {}
             identity = row.get("semantic_request_identity") or {}
-            checks["intern_observation_integrity"] = bool(
-                observation.get("observed_object") not in {None, "other", "unknown"}
-                and observation.get("visibility") in {"clear", "partial"}
-                and observation.get("mask_purity") == "clean"
-                and observation.get("mask_completeness") in {"whole", "major_part"}
-                and row.get("semantic_observation_sha256") == content_sha256(observation)
-                and identity.get("protocol_sha256") == PROTOCOL_SHA256
-                and row.get("semantic_model_identity_sha256") == content_sha256(identity.get("model")))
+            try:
+                checks["intern_observation_integrity"] = bool(
+                    visual_quality_passes(observation)
+                    and row.get("semantic_observation_sha256") == content_sha256(observation)
+                    and identity.get("protocol_sha256") == PROTOCOL_SHA256
+                    and row.get("semantic_model_identity_sha256") == content_sha256(identity.get("model")))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                checks["intern_observation_integrity"] = False
             if not checks["intern_observation_integrity"]:
                 break
     for row in obj.binding_provenance or []:
         if row.get("semantic_provider") == "intern-decision-binary-local":
             from .intern_binary_review import PROTOCOL_SHA256 as binary_protocol_sha, quality_passes, validate_threshold
-            if row.get("semantic_admission", {}).get("policy") == "category-only":
+            if row.get("semantic_policy") == "category-only":
                 from .intern_binary_review import validate_category_receipt
                 try:
                     checks["intern_binary_integrity"] = validate_category_receipt(row, obj.category_name)
@@ -97,6 +158,9 @@ def validate_binding(obj, *, depth_maps=None, n_frames=None,
                 if not checks["intern_binary_integrity"]:
                     break
                 continue
+            if row.get("semantic_policy") != "frozen-quality":
+                checks["intern_binary_integrity"] = False
+                break
             observation = row.get("semantic_observation") or {}
             identity = row.get("semantic_request_identity") or {}
             binary = row.get("semantic_binary_review") or {}
@@ -125,7 +189,7 @@ def validate_binding(obj, *, depth_maps=None, n_frames=None,
                     and frozen["entry"]["image_sha256"] == [im["sha256"] for im in identity["images"]]
                     and all(frozen["entry"]["observation"].get(k) == observation[k]
                             for k in ("visibility", "mask_purity", "mask_completeness")))
-            except (ValueError, TypeError, KeyError):
+            except (ValueError, TypeError, KeyError, AttributeError):
                 checks["intern_binary_integrity"] = False
             if not checks["intern_binary_integrity"]:
                 break
@@ -149,7 +213,8 @@ def binding_is_usable(obj, *, strict=False):
     if obj.binding_flags:
         return False
     if obj.grounding_status != "question_driven":
-        return not strict
+        return (not strict and not obj.binding_validation and not any(
+            "semantic_visual_request_sha256" in row for row in obj.binding_provenance))
     try:
         return validate_binding(obj, check_receipt=True).status == "validated"
     except (OSError, ValueError, TypeError):

@@ -36,6 +36,11 @@ Titan 的 `fullqa_supervisor.py` 保管派发记录，通过受认证 HTTP 将�
 /home/wangy/wangjh/harness3d/experiment-snapshots/fullqa-audited-20261025-v1/
 ```
 
+新建快照时，`scripts/fullqa_snapshot.py` 在创建输出目录前读取 checkout 中的
+`src/skill3d/evaluation/published_fitset_v11.py`，并核对逐场景审计回执。
+发布身份引用真实 provider 源码路径；缺失源码会在任何快照文件写入前拒绝。
+该修复不改写上述已发布快照。
+
 `source_catalog.json` 保存原始已审计目录字节；`source_audit.json` 保存同一轮审计；`published_inputs.json` 保存与其绑定的原引用和实际输入目录；`preflight.json` 成功后说明 32 帧输入与正常 prepared binding loader 实际重放通过。快照不会随着后续预计算自动扩充。
 
 `selected_catalog.json` 同时提供基础版、米制版各 749 题的正常 loader 引用；读取米制版可调用 `cluster_audit.load_catalog_entry(catalog["variants"]["metric"][qa_id])`。在线学习的 input provider 使用基础版。

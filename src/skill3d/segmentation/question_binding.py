@@ -16,13 +16,15 @@ from skill3d.infra.m5_identity import (
 )
 from skill3d.schemas.reconstruction import ObjectRecord
 from skill3d.synthesis.request_context import request_phase
-from .binding_validation import binding_is_usable, validate_binding
+from .binding_validation import (
+    BINDING_VALIDATION_VERSION, binding_is_usable, validate_binding,
+)
 from . import mask_semantic_review as msr
 from . import open_vocab_detector as ovd
 
-M5_BINDING_VERSION = "m5-question-binding-v3-grouped-review"
+M5_BINDING_VERSION = "m5-question-binding-v4-sealed-semantics"
 PARSER_VERSION = "m5-question-objects-v3-qwen38-json-mode"
-CACHE_VERSION = "m5-question-cache-v3-grouped-review"
+CACHE_VERSION = "m5-question-cache-v4-sealed-semantics"
 MAX_OBJECTS = 16
 PARAMETERS = {
     "parser_version": PARSER_VERSION, "max_objects": MAX_OBJECTS,
@@ -35,6 +37,7 @@ PARAMETERS = {
     "segmentation_mode": "sam2_image_per_frame",
     "semantic_visual_version": msr.VISUAL_REVIEW_VERSION,
     "semantic_relation_version": msr.RELATION_REVIEW_VERSION,
+    "binding_validation_version": BINDING_VALIDATION_VERSION,
     "semantic_min_pixels": 65536, "semantic_max_pixels": 1048576,
     "semantic_relation_batch_size": 32,
     "frame_scan": "all_readable_in_order",
@@ -413,11 +416,13 @@ def _select_review_observations(observations, *, depth, c2w, intrinsics, task):
 def refresh_coverage(grounding, objects):
     """Report category scan/candidate facts without certifying question referents."""
     body = dict(grounding)
+    evaluated = [(obj, binding_is_usable(obj)) for obj in objects]
     requirements = []
     for prior in body.get("requirements", []):
         row = dict(prior)
-        matched = [o for o in objects if o.category_name == row["name"]]
-        usable = [o for o in matched if binding_is_usable(o)]
+        matched = [o for o, _ in evaluated if o.category_name == row["name"]]
+        usable = [o for o, passed in evaluated
+                  if o.category_name == row["name"] and passed]
         blocking = [failure for failure in row.get("binding_failures", [])
                     if failure.get("blocking", True)]
         row["matched_object_ids"] = [o.obj_id for o in matched]
@@ -431,7 +436,7 @@ def refresh_coverage(grounding, objects):
         requirements=requirements, unresolved_names=unresolved,
         candidate_scan_complete=bool(requirements) and not unresolved,
         status="candidates_available" if requirements and not unresolved
-        else "unavailable", n_new=sum(binding_is_usable(o) for o in objects))
+        else "unavailable", n_new=sum(passed for _, passed in evaluated))
     body.pop("all_present", None)
     body.pop("miss", None)
     return body
@@ -841,10 +846,11 @@ def bind_question_objects(
             evidence_ok = (visual.get("admission") == admission_identity("category-only")
                            and quality == {} and not visual.get("frozen_quality"))
         else:
-            evidence_ok = ((binary_mode or quality.get("observed_object") not in {None, "other", "unknown"})
-                          and quality.get("visibility") in {"clear", "partial"}
-                          and quality.get("mask_purity") == "clean"
-                          and quality.get("mask_completeness") in {"whole", "major_part"})
+            if binary_mode:
+                from .intern_binary_review import quality_passes
+                evidence_ok = quality_passes(quality)
+            else:
+                evidence_ok = msr.visual_quality_passes(quality)
         semantic_ok = (
             relation.get("status") == "reviewed"
             and relation.get("relation") == "match"
@@ -880,7 +886,9 @@ def bind_question_objects(
                 **candidate,
                 "semantic_visual_request_sha256": visual["request_sha256"],
                 "semantic_observation": quality,
-                "semantic_provider": visual.get("provider", "bailian"),
+                "semantic_provider": visual.get("provider", ""),
+                "semantic_policy": visual.get(
+                    "policy", stats["semantic_review"]["admission_policy"]),
                 "semantic_binary_review": visual.get("binary_review", {}),
                 "semantic_binary_review_sha256": visual.get("binary_review_sha256", ""),
                 "semantic_frozen_quality": visual.get("frozen_quality", {}),
@@ -992,5 +1000,5 @@ def bind_question_objects(
         _save_envelope(cache, key, {"objects": rows, "stats": stats})
     return objects, stats, [
         f"M5 本题 {len(categories)} 类×{len(readable)} 帧全扫描；"
-        f"{len(selected)} 候选→{sum(binding_is_usable(o) for o in objects)} 可用实例；"
+        f"{len(selected)} 候选→{stats['grounding']['n_new']} 可用实例；"
         f"未解决={stats['grounding']['unresolved_names']}"]

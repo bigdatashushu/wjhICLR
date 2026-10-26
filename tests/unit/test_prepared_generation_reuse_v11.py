@@ -128,15 +128,37 @@ def case(tmp_path, monkeypatch):
         mask, points = root / (qa_id + "-mask.npy"), root / (qa_id + "-points.npy")
         np.save(mask, np.ones((32, 3, 4), dtype=np.uint8))
         np.save(points, np.ones((4, 3), dtype=np.float32))
+        candidate_id = "candidate-" + qa_id
+        observation = {
+            "observed_object": "chair", "alternate_object": "none",
+            "visibility": "clear", "mask_purity": "clean", "mask_completeness": "whole",
+        }
+        request_identity = {
+            "candidate_id": candidate_id,
+            "model": {"provider": "bailian", "model": "synthetic-m5-semantic",
+                      "model_revision": "fixture-v1", "fixture": True},
+        }
+        relation_request_identity = {
+            "pairs": [{"id": candidate_id, "observed_object": observation["observed_object"],
+                       "target_category": "chair"}],
+            "model": request_identity["model"],
+        }
         obj = ObjectRecord(
             obj_id=qa_id + "-chair", category_name="chair", grounding_status="question_driven",
             mask_per_frame=str(mask), pointcloud_world=str(points),
             centroid_world=[1, 1, 1], bbox=[1, 1, 1, 1, 1, 1],
             visible_frames=list(range(32)), mask_support_ratio=1,
-            track_id="track-" + qa_id, candidate_ids=["candidate-" + qa_id],
+            track_id="track-" + qa_id, candidate_ids=[candidate_id],
             question_roles=[{"role": "candidate"}], binding_provenance=[{
-                "semantic_relation": "match", "semantic_visual_request_sha256": "v" * 64,
-                "semantic_relation_request_sha256": "r" * 64,
+                "candidate_id": candidate_id, "category": "chair",
+                "semantic_provider": "bailian", "semantic_policy": "visual-quality-and-relation",
+                "semantic_observation": observation,
+                "semantic_observation_sha256": content_sha256(observation),
+                "semantic_request_identity": request_identity,
+                "semantic_visual_request_sha256": content_sha256(request_identity),
+                "semantic_model_identity_sha256": content_sha256(request_identity["model"]),
+                "semantic_relation": "match",
+                "semantic_relation_request_sha256": content_sha256(relation_request_identity),
             }],
         )
         obj.binding_validation = validate_binding(

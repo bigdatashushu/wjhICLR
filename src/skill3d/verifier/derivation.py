@@ -392,6 +392,15 @@ def replay_derivation(
             code="canonical_unit_mismatch",
             reason=f"Question type {question_type} requires unit={expected_unit}; got {payload.unit}",
         ))
+    if any(issue.code == "payload_contract" for issue in issues):
+        return DerivationReplayResult(
+            passed=False,
+            performed=False,
+            op=payload.derivation_op(),
+            expected_value=payload.value,
+            expected_unit=payload.unit,
+            issues=issues,
+        )
     derivation = payload.derivation
     referenced = (set(payload.used_result_ids) | set(payload.derivation_inputs())
                   | set(evidence_result_ids))
@@ -479,7 +488,7 @@ def replay_derivation(
         )
 
     op = str(derivation.get("op") or "")
-    input_ids = [str(value) for value in derivation.get("input_result_ids") or []]
+    input_ids = payload.derivation_inputs()
     result_by_id: dict[str, ToolResult] = {}
     duplicate_ids: set[str] = set()
     for result in results:

@@ -479,6 +479,14 @@ def cascade_invalidate(kernel, premise: str, *,
                         (getattr(r, "invalidated_by", None) or []) + [premise]))})
             except (ValueError, AttributeError):  # pragma: no cover - 防御
                 pass
+    # Shared-premise withdrawal uses the same explicit result-reference closure.
+    dependent_ids = invalidate_results(kernel, ids, reason=premise)
+    ids.extend(rid for rid in dependent_ids if rid not in ids)
+    for r in getattr(kernel, "tool_results", []) or []:
+        if r.result_id in dependent_ids:
+            name = str(getattr(r, "source_tool", "") or getattr(r, "tool", ""))
+            if name and name not in tools:
+                tools.append(name)
     return ids, tools
 
 

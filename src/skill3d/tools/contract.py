@@ -408,6 +408,7 @@ def authorize_tool_call(
     local_facts: Optional[dict[str, bool]] = None,
     gate_passed: Optional[bool] = None,
     model_call: bool = True,
+    consumed_dependency_refs: Iterable[str] = (),
 ) -> "AuthorizationDecision":
     """§6.4：**唯一**的授权判定函数，产出结构化决策（允许与否 + 原因码）。
 
@@ -422,6 +423,17 @@ def authorize_tool_call(
     from skill3d.schemas.authorization import AuthorizationDecision, gate_result_payload
 
     spec = effective_tool_spec(spec, args)
+    # Optional outputs add requirements only after execution reports consumption.
+    consumed = set(consumed_dependency_refs)
+    if consumed:
+        spec = spec.model_copy(update={
+            "requires_artifacts": sorted(set(spec.requires_artifacts) | (
+                consumed & KNOWN_ARTIFACTS)),
+            "requires_evidence": sorted(set(spec.requires_evidence) | (
+                consumed & set(CAPABILITIES))),
+            "requires_local_facts": sorted(set(spec.requires_local_facts) | (
+                consumed & {"world_frame"})),
+        })
     gate_payload, gate_applicable = gate_result_payload(gate)
     metric_required = ARTIFACT_SCALE in set(
         getattr(spec, "requires_artifacts", None) or []) or (

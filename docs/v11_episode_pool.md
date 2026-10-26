@@ -10,6 +10,8 @@
 - 第 12 条新经验触发既有 reviser、双 seed parent/candidate A/B、严格准入、原子发布和正常加载验证。完成后才能派发该 lineage 的下一批。
 - 协调器串行处理修订和发布。此时暂停新的在线题目派发，已启动题目继续完成，gate episode 使用共享 episode permit 并行执行。因此这版不承诺所有阶段都持续占满 32 路。
 - 在线 executor 不接收 owner、label metadata、revision factory 或 gate factory。原有 online label isolation 和 prepared-binding 检查继续生效。
+- 完整案例与诊断模式将公开输入采集开关单独冻结进 run identity。executor 保存实际问题、
+  选项、原始图像及输入 hash，同时移除演化配置和离线 metadata 身份；gate 副本关闭采集。
 
 此改动保留 fit-set 入口已有的槽位格式；没有为并发新增 Skill slots。
 
@@ -34,6 +36,12 @@
 完成结果不重新执行。乱序完成的结果在缺失的早先题目完成后按冻结顺序入库。其他 lineage 推进共享 owner snapshot 时，未完成派发仍绑定原来的 snapshot，且必须证明方法 hash 未变。
 
 已有 incomplete trace 或无完成记录的模型请求沿用既有 fail-closed 规则。失败和中断后停止新派发并排空当前进程，保留 `scheduler_receipts/` 历史；`episode_pool_receipt.json` 仅作为最新摘要。
+
+修订请求只有 intent、已记录服务失败或保存身份改变时，传播 `RevisionOperationalError`
+停止运行，保留当前批次和 campaign；不写 rejected、清空触发计数或自动重放。
+CLI 仅输出安全错误类别及槽位，提供商异常正文不进入日志。正常静态拒绝与 no_change
+继续作为已完成的方法决定。新增采集字段和源码身份要求另建运行目录，不能改旧 manifest
+后继续旧运行。
 
 ## 使用
 

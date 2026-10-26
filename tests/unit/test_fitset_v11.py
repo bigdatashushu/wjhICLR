@@ -205,7 +205,9 @@ def test_variant_binding_index_supports_qa_fallback_and_variant_override(
         "/g1m1/artifact.json")
 
 
-def test_empty_m4_binding_migration_is_explicit_and_replayable(tmp_path):
+def test_empty_m4_binding_migration_is_explicit_and_replayable(tmp_path, monkeypatch):
+    from skill3d.evaluation.fitset_v11 import FitSetError
+    from skill3d.infra import m5_identity
     from skill3d.infra.m5_identity import (
         content_sha256 as m5_content_sha256,
         file_identity as m5_file_identity,
@@ -213,10 +215,13 @@ def test_empty_m4_binding_migration_is_explicit_and_replayable(tmp_path):
     )
     from skill3d.online.runner import PreparedObjectBinding
     from skill3d.segmentation import prepared_binding_store, question_binding
+    from skill3d.segmentation.frozen_source_compatibility import REVIEWED_SOURCE_PAIRS
     from skill3d.segmentation.prepared_binding_store import PreparedBindingStore
 
     code_root = Path(question_binding.__file__).resolve().parents[1]
     current_sources = source_identity(code_root)
+    current_sources["segmentation/question_binding.py"] = copy.deepcopy(
+        REVIEWED_SOURCE_PAIRS["segmentation/question_binding.py"][1])
     parent_sources = copy.deepcopy(current_sources)
     parent_sources["segmentation/question_binding.py"] = {
         "sha256": (
@@ -268,6 +273,16 @@ def test_empty_m4_binding_migration_is_explicit_and_replayable(tmp_path):
         "binding_manifest_sha256": parent["manifest_sha256"],
     }
     output = tmp_path / "migration"
+    # The new M5 checkout is outside this historical migration's exact allowlist.
+    with pytest.raises(FitSetError, match="outside the reviewed migration diff"):
+        migrate_empty_m4_bindings(
+            panel={"proposal_sha256": "p" * 64, "panel_file_sha256": "f" * 64},
+            variants=[variant], source_manifest_path=source_manifest,
+            output_dir=tmp_path / "current-source-rejected", min_free_gib=0,
+        )
+    # Retain the old adapter's positive coverage using its reviewed source identity.
+    monkeypatch.setattr(
+        m5_identity, "source_identity", lambda _root: copy.deepcopy(current_sources))
     manifest = migrate_empty_m4_bindings(
         panel={
             "proposal_sha256": "p" * 64,

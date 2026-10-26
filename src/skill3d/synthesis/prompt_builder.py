@@ -19,7 +19,7 @@ from skill3d.schemas.answer import (
 from skill3d.skills.delivery import SkillDeliveryPlan, plan_delivery
 from skill3d.synthesis.execution_contract import ExecutionContract
 
-PROMPT_TEMPLATE_VERSION = "program_synth_v11_13_en"
+PROMPT_TEMPLATE_VERSION = "program_synth_v11_14_en"
 FINALIZATION_PROMPT_VERSION = "finalization_v11_4_en"
 
 
@@ -51,7 +51,7 @@ with `return ReturnAnswer(AnswerPayload(...))`.
 - `return YieldObservations([result_id, ...], "reason")` ends this segment and sends the named results' actual values into the next request. The framework controls the round and retry budgets.
 - `ReadObservation(result_id, fields=None, offset=0, limit=8)` reads a bounded page of an existing valid result without rerunning tools. Then YieldObservations to receive the page in the next request. Use next_cursor for missing candidates. print is diagnostic only.
 - If evidence calls finish successfully without a control action, the host may return only their current valid observations. This never submits a variable, print output, or prose as an answer. A caught tool failure rejects the cell's submission in every phase.
-- Reason only from images actually received and valid tool observations. Invalidated results must not support the answer.
+- Reason only from images actually received and valid tool observations. Failed, unresolved, and invalidated results must not support the answer.
 - Answer whenever readable images are available. Insufficient evidence permits a visual estimate with an honest basis declaration; `ReturnAnswer("abstain")` is not a valid answer.
 - Missing tools, failed calls, and invalid results do not mean zero. Do not invent geometry, scale, observations, or result_id values.
 - Call only the currently listed tools and allowed unit modes. Task-specific interface restrictions apply at execution too; a name in historical examples is not permission to call it.

@@ -40,6 +40,7 @@ from skill3d.evaluation.fitset_v11 import (
     migrate_empty_m4_bindings,
     select_panel_variants,
 )
+from skill3d.evolution.fitset_revision_v11 import RevisionOperationalError
 from skill3d.online.config import (
     active_vision_from,
     load_config,
@@ -825,7 +826,7 @@ def main(argv=None) -> int:
                 and args.max_requests < 1):
             raise FitSetError("episode_pool requires an explicit --max-requests budget")
         return int(args.handler(args))
-    except (FitSetError, FileNotFoundError, ValueError, KeyError) as exc:
+    except (FitSetError, RevisionOperationalError, FileNotFoundError, ValueError, KeyError) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 

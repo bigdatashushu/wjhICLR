@@ -21,7 +21,7 @@ from typing import Optional
 from . import Spec
 from .evidence import UNAVAILABLE_REASON_CODES  # re-exported compatibility vocabulary
 
-DECISION_VERSION = "tool-authorization-v11.8-task-tools"
+DECISION_VERSION = "tool-authorization-v11.9-actual-dependencies"
 
 # 拒绝原因码 = 既有四类契约错误码 + 作用域/对象级拒绝
 DENIAL_REASON_CODES = frozenset({

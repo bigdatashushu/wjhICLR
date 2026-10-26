@@ -22,8 +22,8 @@ def test_current_protocol_identity_is_fixed_and_not_cli_selectable():
     }
     assert PromptBuilder().template_version == PROMPT_TEMPLATE_VERSION
     versions = current_version_fields()
-    assert versions["template_version"] == "program_synth_v11_13_en"
-    assert versions["execution_protocol_version"] == "solver-v11.12-trusted-observation-recovery"
+    assert versions["template_version"] == "program_synth_v11_14_en"
+    assert versions["execution_protocol_version"] == "solver-v11.13-evidence-boundaries"
     assert versions["tool_docs_version"] == TOOL_DOCS_VERSION
 
 
@@ -104,7 +104,7 @@ def test_public_task_semantics_do_not_include_solving_recipes(question_type, mea
     assert meaning in text
     assert "ReturnAnswer" in text and "YieldObservations" in text
     assert "Multiply by 100 to convert meters to centimeters" in text
-    assert "Invalidated results must not support the answer" in text
+    assert "Failed, unresolved, and invalidated results must not support the answer" in text
     assert "## Reference method" not in text
     assert "Coordinate frame: world" not in text
     assert not re.search(r"[\u4e00-\u9fff]", text)

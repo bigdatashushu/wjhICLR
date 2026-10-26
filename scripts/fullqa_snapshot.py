@@ -13,9 +13,13 @@ import time
 
 import fullqa_custody as c
 
+_PROVIDER_FILE = (Path(__file__).resolve().parents[1] / "src" / "skill3d" /
+                  "evaluation" / "published_fitset_v11.py")
+
 
 def freeze(root, output):
     c.require(not output.exists(), "snapshot_destination_exists")
+    provider_sha256 = c.digest(_PROVIDER_FILE.read_bytes())
     raw = (root / "deliverables/prepared_catalog.json").read_bytes()
     catalog = __import__("json").loads(raw)
     audit = c.read(root / "audits/summary.json")
@@ -25,14 +29,7 @@ def freeze(root, output):
     selected = {q: e for q, e in catalog["variants"]["base"].items()
                 if e["split"] in {"induction", "inner_validation"}}
     c.require(bool(selected), "no_usable_published_questions")
-    output.mkdir(mode=0o700, parents=True)
     catalog_path = output / "source_catalog.json"
-    with catalog_path.open("xb") as stream:
-        stream.write(raw)
-        stream.flush()
-        os.fsync(stream.fileno())
-    catalog_path.chmod(0o400)
-    c.durable(output / "source_audit.json", audit, immutable=True)
     jobs = c.read(root / "coordinator_jobs.json")["jobs"]
     scopes = {s["job_key"].split("/")[-2]:
               s["identity"]["manifest"]["scenes"][s["job_key"].split("/")[-2]]
@@ -51,11 +48,18 @@ def freeze(root, output):
         archive = root / "inputs/jobs" / (hashed + ".tar")
         scene_info[scene] = {"archive": str(archive), "key": key, "scope": scopes[scene],
                             "output_root": str(output / "inputs" / hashed)}
+    output.mkdir(mode=0o700, parents=True)
+    with catalog_path.open("xb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+    catalog_path.chmod(0o400)
+    c.durable(output / "source_audit.json", audit, immutable=True)
     c.durable(output / "extraction_plan.json",
         {"schema": "harness3d-fullqa-snapshot-extraction/1", "source_catalog_file": str(catalog_path),
          "source_catalog_sha256": c.digest(raw), "entries": selected, "scenes": scene_info,
-         "provider_file": str(Path(__file__).parent / "published_fitset_v11.py"),
-         "provider_sha256": c.digest((Path(__file__).parent / "published_fitset_v11.py").read_bytes()),
+         "provider_file": str(_PROVIDER_FILE),
+         "provider_sha256": provider_sha256,
          "at": time.time(), "model_requests": 0, "label_access": False}, immutable=True)
     return {"status": "snapshot_frozen", "path": str(output),
             "questions": dict(Counter(e["split"] for e in selected.values())),

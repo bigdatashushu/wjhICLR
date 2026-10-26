@@ -30,6 +30,7 @@ from .contract import (
     ARTIFACT_OBJECTS,
     ARTIFACT_POSES,
     ARTIFACT_SCALE,
+    ConfidenceGateError,
     DomainValueError,
     route_aware_available,
 )
@@ -131,6 +132,8 @@ class SceneHandle:
         self._metric_scale = metric_scale
         self._objects = {o.obj_id: o for o in (objects or [])}
         self._consumed_object_ids: list[str] = []
+        self._resolved_object_ids: list[str] = []
+        self._consumed_dependency_refs: list[str] = []
         # 硬约束 23：objects **产物是否已产出**与"产物里有没有对象"是两件事。
         # - M5 未跑/失败 → 产物不存在 → `objects` 不可用 → Tool 抛 ArtifactUnavailableError；
         # - M5 跑过但一个对象都没绑到 → 产物存在且为空 → `exists_in_scene` 返回 False。
@@ -419,6 +422,53 @@ class SceneHandle:
         if object_id not in self._consumed_object_ids:
             self._consumed_object_ids.append(object_id)
 
+    def _record_dependency(self, ref: str) -> None:
+        if ref not in self._consumed_dependency_refs:
+            self._consumed_dependency_refs.append(ref)
+
+    def _require_object_binding(self, obj: ObjectRecord, tool: str) -> None:
+        conflicts = [
+            flag for flag in (obj.binding_flags or [])
+            if flag.get("code") == "semantic_label_mask_conflict"
+        ]
+        if conflicts:
+            audit_ids = sorted({
+                str(flag.get("audit_sha256") or "") for flag in conflicts
+                if flag.get("audit_sha256")
+            })
+            raise ConfidenceGateError(
+                tool,
+                f"Object {obj.obj_id} ({obj.category_name}) failed binding integrity: "
+                "semantic_label_mask_conflict. Geometry derived from this object is "
+                f"blocked; use the frozen images instead. audit_sha256={audit_ids}",
+                args={"object_id": obj.obj_id, "binding_flags": conflicts},
+                failure_cause=FailureCause(
+                    code="semantic_label_mask_conflict", scope="local_object",
+                    object_ids=[obj.obj_id], audit_ids=audit_ids))
+        if not self.binding_usable(obj.obj_id):
+            raise ConfidenceGateError(
+                tool, f"Object {obj.obj_id} has no usable verified M5 binding; "
+                "use the frozen images.",
+                args={"object_id": obj.obj_id},
+                failure_cause=FailureCause(code="object_binding_unavailable",
+                    scope="local_object", object_ids=[obj.obj_id]))
+
+    def _validated_centroid(self, obj: ObjectRecord, tool: str) -> np.ndarray:
+        c = np.asarray(obj.centroid_world, dtype=np.float64)
+        if c.shape != (3,):
+            raise DomainValueError(
+                tool, f"Object {obj.obj_id} has an invalid centroid shape: {obj.centroid_world}",
+                args={"obj_id": obj.obj_id},
+                failure_cause=FailureCause(code="invalid_centroid",
+                    scope="local_object", object_ids=[obj.obj_id]))
+        if not np.all(np.isfinite(c)):
+            raise DomainValueError(
+                tool, f"Object {obj.obj_id} centroid contains NaN/Inf: {obj.centroid_world}",
+                args={"obj_id": obj.obj_id},
+                failure_cause=FailureCause(code="invalid_centroid",
+                    scope="local_object", object_ids=[obj.obj_id]))
+        return c
+
     def list_objects(self) -> list[str]:
         return sorted(self._objects.keys())
 
@@ -560,11 +610,18 @@ class SceneHandle:
             raise KeyError("No world point map was provided; cannot build the connectivity graph")
         from skill3d.tools.connectivity import build_connectivity_graph
 
+        objects = []
+        for obj in self._objects.values():
+            if obj.obj_id not in self._resolved_object_ids:
+                self._resolved_object_ids.append(obj.obj_id)
+            self._require_object_binding(obj, "connectivity_graph")
+            centroid = self._validated_centroid(obj, "connectivity_graph")
+            self._record_object_dependency(obj.obj_id)
+            objects.append((obj.obj_id, centroid))
         return build_connectivity_graph(
             point_map=np.asarray(pm, dtype=np.float64).reshape(-1, 3),
             up=up,
-            objects=[(o.obj_id, np.asarray(o.centroid_world, dtype=np.float64))
-                     for o in self._objects.values()],
+            objects=objects,
             start=self.camera_center(0),
         )
 

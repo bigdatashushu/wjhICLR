@@ -383,6 +383,7 @@ def test_changed_observation_does_not_trip_failed_ast_guard(tmp_path, episode_it
 
 def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
         tmp_path, episode_item, monkeypatch):
+    from skill3d.infra.m5_identity import content_sha256
     import skill3d.online.runner as runner
     from skill3d.schemas import ObjectRecord
     from skill3d.segmentation.binding_validation import validate_binding
@@ -396,6 +397,20 @@ def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
     mask_path, points_path = tmp_path / "good_mask.npy", tmp_path / "good_points.npy"
     np.save(mask_path, np.ones((len(episode_item.pixels), 1, 1), dtype=np.uint8))
     np.save(points_path, np.array([[1., 0., 0.]]))
+    observation = {
+        "observed_object": objs[0].category_name, "alternate_object": "none",
+        "visibility": "clear", "mask_purity": "clean", "mask_completeness": "whole",
+    }
+    request_identity = {
+        "candidate_id": "good",
+        "model": {"provider": "bailian", "model": "synthetic-m5-semantic",
+                  "model_revision": "fixture-v1", "fixture": True},
+    }
+    relation_request_identity = {
+        "pairs": [{"id": "good", "observed_object": observation["observed_object"],
+                   "target_category": objs[0].category_name}],
+        "model": request_identity["model"],
+    }
     objs[0] = objs[0].model_copy(update={
         "grounding_status": "question_driven", "mask_per_frame": str(mask_path),
         "pointcloud_world": str(points_path), "visible_frames": list(range(len(episode_item.pixels))),
@@ -403,12 +418,20 @@ def test_object_binding_failure_preserves_other_measurement_and_shared_scale(
         "candidate_ids": ["good"], "question_roles": [{"category": "chair", "role": "target",
                                                        "source_text": "chair"}],
         "binding_provenance": [{
+            "candidate_id": "good", "category": objs[0].category_name,
+            "semantic_provider": "bailian", "semantic_policy": "visual-quality-and-relation",
+            "semantic_observation": observation,
+            "semantic_observation_sha256": content_sha256(observation),
+            "semantic_request_identity": request_identity,
+            "semantic_visual_request_sha256": content_sha256(request_identity),
+            "semantic_model_identity_sha256": content_sha256(request_identity["model"]),
             "semantic_relation": "match",
-            "semantic_visual_request_sha256": "a" * 64,
-            "semantic_relation_request_sha256": "b" * 64,
+            "semantic_relation_request_sha256": content_sha256(relation_request_identity),
         }]})
     objs[0] = objs[0].model_copy(update={
-        "binding_validation": validate_binding(objs[0], generation_sha256="f" * 64)})
+        "binding_validation": validate_binding(objs[0], generation_sha256=content_sha256({
+            "fixture": True, "candidate_ids": objs[0].candidate_ids}))})
+    assert objs[0].binding_validation.status == "validated", objs[0].binding_validation.errors
     monkeypatch.setattr(runner, "_bind_objects_best_effort", lambda *a, **k: (
         objs, {"grounding": {"attempted": True, "status": "partial",
                             "requirements": [{"name": "chair", "scan_complete": True,

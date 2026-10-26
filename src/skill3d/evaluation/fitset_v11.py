@@ -1283,6 +1283,10 @@ class SystemVariantRunner:
         self.min_free_gib = float(min_free_gib)
         self.workers = int(workers)
         self.evolution_config = evolution_config
+        # Public-input capture survives removal of coordinator-only evolution data.
+        self.capture_offline_case_input = (
+            evolution_config is not None
+            and evolution_config.learning_input_mode != "aggregate_v1")
         self.label_metadata = copy.deepcopy(dict(label_metadata or {}))
         self.revision_client_factory = revision_client_factory
         self.gate_client_factory = gate_client_factory
@@ -1423,7 +1427,15 @@ class SystemVariantRunner:
             self.skill_owners if self.scheduler == "episode_pool" else self.workers,
         )
 
+    def _freeze_public_input_capture(self) -> None:
+        # Allow setup to finish before freezing identity, not after dispatch.
+        if not self.run_identity:
+            self.capture_offline_case_input = (
+                self.evolution_config is not None
+                and self.evolution_config.learning_input_mode != "aggregate_v1")
+
     def _manifest(self) -> dict:
+        self._freeze_public_input_capture()
         identities = []
         for row in self.variants:
             skills, identity = self.skills_for_variant(row)
@@ -1513,6 +1525,7 @@ class SystemVariantRunner:
                 "evolution_config": (
                     _json_value(asdict(self.evolution_config))
                     if self.evolution_config is not None else None),
+                "capture_offline_case_input": self.capture_offline_case_input,
                 "offline_case_input_schema": "v11-fit-set-offline-input/1.0",
             },
         }
@@ -1899,6 +1912,7 @@ class SystemVariantRunner:
         with _Timeout(1):
             pass
 
+        self._freeze_public_input_capture()
         prepared_run = self._prepare_one(variant)
         variant_id = prepared_run["variant_id"]
         item = prepared_run["item"]
@@ -1912,10 +1926,7 @@ class SystemVariantRunner:
         trace_dir = variant_root / "trace"
         _require(not trace_dir.exists(),
                  f"{variant_id}: incomplete trace exists without a result")
-        rich_input = (
-            self.evolution_config is not None
-            and self.evolution_config.learning_input_mode != "aggregate_v1")
-        if rich_input:
+        if self.capture_offline_case_input:
             self._freeze_offline_case_input(variant, item)
         cfg = replace(
             copy.deepcopy(runtime_base_cfg),
@@ -1982,7 +1993,7 @@ class SystemVariantRunner:
             elapsed_s=elapsed,
             skill_identity=skill_identity,
         )
-        if rich_input:
+        if self.capture_offline_case_input:
             row["offline_input_sha256"] = file_identity(
                 variant_root / "offline_input.json")["sha256"]
         _write_create_once(self._result_path(variant_id), row)

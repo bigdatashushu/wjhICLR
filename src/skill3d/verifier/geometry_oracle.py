@@ -65,6 +65,7 @@ _OBJECT_GEOMETRY_ARGS: dict[str, tuple[str, ...]] = {
     "object_surface_distance": ("obj_a", "obj_b"),
     "relative_direction_of": ("observer_id", "facing_at_id", "target_id"),
     "count_objects": ("category_name",),
+    "connectivity_graph": (),
 }
 
 # 合法手性取值（与 `reconstruction_gate/world_frame.py` 同一词汇表）
@@ -242,6 +243,32 @@ def _binding_unavailable(handle, obj) -> bool:
     return _has_binding_conflict(obj) or not handle.binding_usable(obj.obj_id)
 
 
+def _connectivity_object_ids(result) -> Optional[list[str]]:
+    try:
+        payload = json.loads(result.value)
+    except (ValueError, TypeError, RecursionError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("nodes"), list):
+        return None
+    nodes = payload["nodes"]
+    if any(not isinstance(node, str) for node in nodes):
+        return None
+    if payload.get("start_node") not in (None, "start"):
+        return None
+    if payload.get("start_node") is not None:
+        if not nodes or nodes[0] != payload["start_node"]:
+            return None
+        nodes = nodes[1:]
+    return nodes
+
+
+def _binding_object_ids(result) -> list[str]:
+    ids = list(result.object_dependencies)
+    if result.tool == "connectivity_graph":
+        ids.extend(_connectivity_object_ids(result) or [])
+    return list(dict.fromkeys(ids))
+
+
 def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -> bool:
     """复核实际使用对象的技术有效性；不判断其是否为题目所指实例。"""
     if not hasattr(handle, "object_records"):
@@ -250,9 +277,6 @@ def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -
         obj.obj_id for obj in handle.object_records()
         if _binding_unavailable(handle, obj)
     }
-    if not conflict_ids and not handle.require_question_binding:
-        return True
-
     def argument_conflicts(value) -> bool:
         values = value if isinstance(value, (list, tuple)) else [value]
         for item in values:
@@ -281,6 +305,13 @@ def check_binding_integrity(trace: ProgramExecutionTrace, handle: SceneHandle) -
     for result in trace.results:
         if (result.status != "ok" or result.error is not None
                 or result.tool not in _OBJECT_GEOMETRY_ARGS):
+            continue
+        if result.tool == "connectivity_graph":
+            node_ids = _connectivity_object_ids(result)
+            if node_ids is None or any(not handle.binding_usable(oid) for oid in node_ids):
+                return False
+            if conflict_ids.intersection(_binding_object_ids(result)):
+                return False
             continue
         if (result.tool == "count_objects"
                 and handle.require_question_binding
@@ -388,6 +419,7 @@ def geometry_verify(
     for result in trace.results:
         if result.status != "ok" or result.error is not None or result.invalidated_by:
             continue
+        object_ids = _binding_object_ids(result)
         single = trace.model_copy(update={"results": [result]})
         is_reproject = result.tool == "reproject"
         applicable = {
@@ -419,7 +451,7 @@ def geometry_verify(
             detail = details[check]
             detail["applicable_result_ids"].append(result.result_id)
             detail["tools"].append(result.tool)
-            detail["object_ids"].extend(result.object_dependencies)
+            detail["object_ids"].extend(object_ids)
             reason = ""
             if check == "binding_integrity" and not hasattr(handle, "object_records"):
                 reason = "object_records_unavailable"
@@ -451,7 +483,7 @@ def geometry_verify(
             conflicted = [
                 obj for obj in handle.object_records()
                 if _binding_unavailable(handle, obj)
-                and obj.obj_id in result.object_dependencies
+                and obj.obj_id in object_ids
             ] if check == "binding_integrity" else []
             cause = FailureCause(
                 code=check, scope="shared_evidence" if premise else

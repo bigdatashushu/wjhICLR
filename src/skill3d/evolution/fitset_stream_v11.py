@@ -536,6 +536,7 @@ class FitSetWorkerEvolution:
                 gate_runner._request_governor_root = self.runner.request_governor_root
                 gate_runner._request_category = "gate"
                 gate_runner.evolution_config = None
+                gate_runner.capture_offline_case_input = False
                 gate_runner.label_metadata = {}
                 if gate_runner.published_inputs is not None:
                     gate_runner.input_contract_identity = copy.deepcopy(

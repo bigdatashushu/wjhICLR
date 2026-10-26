@@ -153,6 +153,8 @@ def _execute_locked(runner, pending, accept):
     executor_runner = copy.copy(runner)
     executor_runner.evolution_config = None
     executor_runner.label_metadata = {}
+    executor_runner.input_contract_identity = copy.deepcopy(runner.input_contract_identity)
+    executor_runner.input_contract_identity.pop("offline_metadata", None)
     executor_runner.seed_skills = []
     executor_runner.gate_panels = {}
     executor_runner.revision_client_factory = None

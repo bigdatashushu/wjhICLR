@@ -408,12 +408,20 @@ def test_cache_rejects_legacy_version_and_escaped_references(harness):
 ])
 def test_experimental_provider_runs_m5_and_gates_geometry(harness,monkeypatch,label,purity,complete,visibility,accepted):
     from skill3d.segmentation import intern_decision_client as local
+    from skill3d.infra.m5_identity import content_sha256
+    from skill3d.segmentation.intern_decision_protocol import PROTOCOL_SHA256, PROTOCOL_VERSION
     class Visual:
         def observe_candidate(self,candidate,*args,**kwargs):
-            return {'version':'experimental','provider':'test-experimental','status':'observed',
-                'request_sent':True,'request_sha256':'a'*64,'observation':{
+            observation = {
                 'observed_object':label,'mask_purity':purity,'mask_completeness':complete,
-                'visibility':visibility}}
+                'visibility':visibility}
+            model = {'model':'internlm/Intern-Decision-4B','revision':'synthetic'}
+            identity = {'protocol_sha256':PROTOCOL_SHA256,'model':model}
+            return {'version':PROTOCOL_VERSION,'provider':'intern-decision-local','status':'observed',
+                'policy':'visual-quality-and-relation','request_sent':True,
+                'request_sha256':content_sha256(identity),'observation':observation,
+                'observation_sha256':content_sha256(observation),'request_identity':identity,
+                'model_identity_sha256':content_sha256(model)}
     monkeypatch.setattr(local,'make_review_client',lambda config:Visual())
     objects,stats,_=qb.bind_question_objects(**harness.args,
         semantic_review_config={'provider':'intern-decision','relation':'frozen-rules'})
@@ -534,8 +542,11 @@ def reviewed_frozen_binding(harness, monkeypatch):
     current = source_identity(Path(qb.__file__).resolve().parents[1])
     frozen = copy.deepcopy(current)
     for name, (old, new) in REVIEWED_SOURCE_PAIRS.items():
-        assert current[name] == new
+        # Exercise the historical adapter with its exact reviewed identities.
+        # The live checkout has a new M5 contract and is tested separately below.
+        current[name] = copy.deepcopy(new)
         frozen[name] = copy.deepcopy(old)
+    monkeypatch.setattr(qb, "source_identity", lambda _root: copy.deepcopy(current))
     original = qb.inventory_generation_identity
 
     def frozen_generation(**kwargs):
@@ -556,6 +567,16 @@ def reviewed_frozen_binding(harness, monkeypatch):
         scene_identity=args["scene_identity"], seed=137,
     )
     return binding, validation, current
+
+
+def test_reviewed_replay_does_not_authorize_current_m5_source(
+        reviewed_frozen_binding, monkeypatch):
+    from skill3d.infra.m5_identity import source_identity
+    from skill3d.segmentation.frozen_source_compatibility import R10_TRANSPORT_REVIEW
+    binding, args, _ = reviewed_frozen_binding
+    monkeypatch.setattr(qb, "source_identity", source_identity)
+    with pytest.raises(ValueError, match="unreviewed frozen M5 implementation"):
+        qb.validate_prepared_binding(binding, **args, source_compatibility=R10_TRANSPORT_REVIEW)
 
 
 def test_reviewed_replay_preserves_generation_and_object_receipts(reviewed_frozen_binding):

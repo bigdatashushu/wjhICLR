@@ -12,7 +12,7 @@ import re
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE, derivation_contract
 from skill3d.schemas.tool_response import TOOL_RESPONSE_VERSION, TOOL_RESPONSE_FIELDS
 
-CONTRACT_VERSION = "execution-contract/5.0"
+CONTRACT_VERSION = "execution-contract/5.1"
 
 _RULES = (
     "Ordinary requests output exactly one Python fenced code block and no outside explanation.",
@@ -40,6 +40,9 @@ _RULES = (
     "Relative-distance geometry must use a complete relative_distance_rank covering all current options; "
     "missing or unmeasurable options remain unresolved, never infinity or absent.",
     "Scene geometry does not imply valid object binding or collection coverage. Normalized coordinates do not supply metric scale.",
+    "Geometry results depend on every object actually consumed. A connectivity graph requires usable "
+    "bindings for every object node. Optional metric coordinates also depend on current metric scale; "
+    "withdrawing that scale invalidates the old result, while a new normalized-only call remains legal.",
 )
 
 

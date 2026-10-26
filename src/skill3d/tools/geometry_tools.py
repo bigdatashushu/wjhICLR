@@ -58,7 +58,7 @@ BINDING_INTEGRITY_TOOLS = frozenset({
     "camera_object_distance", "surface_distance_between_objects",
     "relative_distance_rank", "object_distance_m", "object_surface_distance",
     "relative_direction_of",
-    "count_objects",
+    "count_objects", "connectivity_graph",
 })
 
 
@@ -133,31 +133,7 @@ def _get_object(handle: SceneHandle, object_id: str, tool: str, *, consume=True)
     handle._resolved_object_ids = list(dict.fromkeys(
         [*getattr(handle, "_resolved_object_ids", []), obj.obj_id]))
     if tool in BINDING_INTEGRITY_TOOLS:
-        conflicts = [
-            flag for flag in (obj.binding_flags or [])
-            if flag.get("code") == "semantic_label_mask_conflict"
-        ]
-        if conflicts:
-            audit_ids = sorted({
-                str(flag.get("audit_sha256") or "") for flag in conflicts
-                if flag.get("audit_sha256")
-            })
-            raise ConfidenceGateError(
-                tool,
-                f"Object {obj.obj_id} ({obj.category_name}) failed binding integrity: "
-                "semantic_label_mask_conflict. Geometry derived from this object is "
-                f"blocked; use the frozen images instead. audit_sha256={audit_ids}",
-                args={"object_id": obj.obj_id, "binding_flags": conflicts},
-                failure_cause=FailureCause(
-                    code="semantic_label_mask_conflict", scope="local_object",
-                    object_ids=[obj.obj_id], audit_ids=audit_ids))
-        if not handle.binding_usable(obj.obj_id):
-            raise ConfidenceGateError(
-                tool, f"Object {obj.obj_id} has no usable verified M5 binding; "
-                "use the frozen images.",
-                args={"object_id": obj.obj_id},
-                failure_cause=FailureCause(code="object_binding_unavailable",
-                    scope="local_object", object_ids=[obj.obj_id]))
+        handle._require_object_binding(obj, tool)
         if consume:
             handle._record_object_dependency(obj.obj_id)
     return obj
@@ -376,20 +352,13 @@ def count_objects(handle: SceneHandle, category_name: str) -> dict:
 def object_centroid(handle: SceneHandle, obj_id: str) -> dict:
     """对象质心（§9.3）：归一化单位必给，米制值仅尺度可用时附上。"""
     obj = _get_object(handle, obj_id, "object_centroid")
-    c = np.asarray(obj.centroid_world, dtype=np.float64)
-    if c.shape != (3,):
-        raise DomainValueError("object_centroid",
-                               f"Object {obj_id} has an invalid centroid shape: {obj.centroid_world}",
-                               args={"obj_id": obj_id},
-                               failure_cause=_object_failure("invalid_centroid", obj.obj_id))
-    if not np.all(np.isfinite(c)):
-        raise DomainValueError("object_centroid",
-                               f"Object {obj_id} centroid contains NaN/Inf: {obj.centroid_world}",
-                               args={"obj_id": obj_id},
-                               failure_cause=_object_failure("invalid_centroid", obj.obj_id))
+    c = handle._validated_centroid(obj, "object_centroid")
     scale = _metric_scale_if_authorized(handle)
     metric = (None if scale is None
               else [float(x) * float(scale) for x in c])
+    if metric is not None:
+        handle._record_dependency(EV_METRIC)
+        handle._record_dependency("scale")
     # 质心不依赖世界轴约定；实际元数据有效时才附带它。
     up, handedness = None, None
     if handle.world_frame_usable:

@@ -1,6 +1,6 @@
 """Current neutral Tool interface descriptions; no task-specific recipes."""
 
-TOOL_DOCS_VERSION = "tool-docs-v11.12-complete-ranking"
+TOOL_DOCS_VERSION = "tool-docs-v11.13-evidence-dependencies"
 
 
 DESCRIPTIONS = {
@@ -54,7 +54,9 @@ DESCRIPTIONS = {
         "centroid_metric (3D coordinates in meters, or None without metric authorization), "
         "category_name, track_id, world_up_used (world-space unit up vector), and handedness_used "
         "(right/left). The last two fields are None when the local world convention is missing or "
-        "orientation metadata is invalid; the centroid remains usable."),
+        "orientation metadata is invalid; the centroid remains usable. A nonempty centroid_metric "
+        "depends on the current metric scale. If scale is withdrawn, the old result is invalidated; "
+        "a new authorized call may return normalized coordinates with centroid_metric=None."),
     "object_3d_extent": (
         "Return dict: extent_normalized (per-axis lengths [dx,dy,dz] in normalized units), "
         "extent_metric (per-axis lengths [dx,dy,dz] in meters), n_valid_points, and degradation_flags. "
@@ -130,6 +132,8 @@ DESCRIPTIONS = {
         "traversable_matrix, start_node, and grid diagnostics. The graph is a geometric approximation. "
         "scene_span_normalized is a point-cloud span statistic in normalized units; "
         "it does not calibrate metric scale. No floor/free-cell mask or room area is returned. "
+        "Every object node requires a usable binding and finite centroid, and is recorded as a "
+        "dependency of this result. Invalid object nodes cause an error rather than silent omission. "
         "Raise an error without a point cloud or world up vector."),
     "exists_in_scene": (
         "Resolve an object ID or category and return bool. False means the currently loaded object "

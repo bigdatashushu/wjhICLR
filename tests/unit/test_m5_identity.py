@@ -470,6 +470,10 @@ def test_final_scope_uses_only_verified_question_binding_denominators(tmp_path):
 
     final = [ObjectRecord(obj_id="old", category_name="chair", track_id="old")]
     for i in range(3):
+        observation = {"observed_object": "chair", "alternate_object": "none",
+                       "visibility": "clear", "mask_purity": "clean",
+                       "mask_completeness": "whole"}
+        request_identity = {"candidate_id": f"c{i}", "model": {"name": "synthetic"}}
         obj = st.bind_masks_to_world(
             [{0: np.ones((2, 2), bool)}], np.ones((2, 2, 2)),
             np.repeat(np.eye(4)[None], 2, axis=0), np.eye(3),
@@ -479,9 +483,16 @@ def test_final_scope_uses_only_verified_question_binding_denominators(tmp_path):
                 "question_roles": [{"category": "chair", "role": "target",
                                     "source_text": "chair"}],
                 "binding_provenance": [{
+                    "candidate_id": f"c{i}", "category": "chair",
+                    "semantic_provider": "bailian",
+                    "semantic_policy": "visual-quality-and-relation",
                     "semantic_relation": "match",
-                    "semantic_visual_request_sha256": "a" * 64,
+                    "semantic_visual_request_sha256": identity.content_sha256(request_identity),
                     "semantic_relation_request_sha256": "b" * 64,
+                    "semantic_observation": observation,
+                    "semantic_observation_sha256": identity.content_sha256(observation),
+                    "semantic_request_identity": request_identity,
+                    "semantic_model_identity_sha256": identity.content_sha256(request_identity["model"]),
                 }]})
         obj = obj.model_copy(update={
             "binding_validation": validate_binding(obj, generation_sha256="e" * 64)})

@@ -55,7 +55,7 @@ from skill3d.tools.task_policy import MODEL_TOOLS, TOOL_TASK_POLICY_VERSION
 # v9 §9.2/§9.4：工具面新增 `inspect_frames` / `detect_objects`（主动图像与补检）。
 # 工具面变了就升版本 —— prompt 里列出的 Tool 集合与 trace 的 tool_face_version
 # 必须对得上，否则"这次跑的是哪套工具面"无法回答。
-TOOL_FACE_VERSION: str = "tool-face-v11.11-complete-ranking"
+TOOL_FACE_VERSION: str = "tool-face-v11.12-runtime-dependencies"
 
 
 class ToolNotFoundError(KeyError):
@@ -363,8 +363,8 @@ class ToolRegistry:
         digest = hashlib.sha256(
             f"{request_key(name, args)}:{scene.state_digest()}".encode()
         ).hexdigest()
-        decision = authorize_tool_call(
-            name, entry.spec, scope=scope, profile=profile,
+        authorization_context = dict(
+            scope=scope, profile=profile,
             available_artifacts=available,
             gate=scene.metric_evidence_gate_result,
             supported_metric_tasks=entry.spec.supported_metric_tasks,
@@ -372,6 +372,7 @@ class ToolRegistry:
             question_type=scene.question_type, args=args,
             local_facts=scene.local_facts, gate_passed=scene.metric_gate_passed,
             model_call=model_call)
+        decision = authorize_tool_call(name, entry.spec, **authorization_context)
         receipt = ToolAuthorizationReceipt(
             episode_id=episode_id, tool_id=name, argument_digest=digest,
             evidence_version=str(getattr(profile, "profile_version", "") or ""),
@@ -439,8 +440,23 @@ class ToolRegistry:
         missing: list[str] = []
         scene._consumed_object_ids = []
         scene._resolved_object_ids = []
+        scene._consumed_dependency_refs = []
         try:
             value = fn(scene, **args)
+            if scene._consumed_dependency_refs:
+                actual = authorize_tool_call(
+                    name, entry.spec, **authorization_context,
+                    consumed_dependency_refs=scene._consumed_dependency_refs)
+                receipt = receipt.model_copy(update={
+                    "dependency_refs": list(actual.dependency_refs),
+                    "metric_gate_result": dict(actual.metric_gate_result),
+                    "allowed": bool(actual.allowed),
+                    "reason_codes": list(actual.reason_codes),
+                })
+                if not actual.allowed:
+                    raise ArtifactUnavailableError(
+                        name, actual.missing_refs, route=scene.scene_route,
+                        available=available, args=args)
         except ToolContractError as exc:  # 确定性契约异常 → 进失败归因（§4 M6 字段 9）
             value, error, error_code = None, f"{type(exc).__name__}: {exc}", exc.error_code
             missing = list(exc.missing)
