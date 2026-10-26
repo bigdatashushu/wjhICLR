@@ -166,6 +166,8 @@ def test_symlink_retarget_invalidates_cached_digest(tmp_path, monkeypatch):
 def test_file_hash_cache_reuses_reads_and_detects_same_size_edit(tmp_path, monkeypatch):
     path = tmp_path / "weights.bin"
     path.write_bytes(b"original")
+    # Advancing a mocked clock does not advance the filesystem's ctime tick.
+    identity.time.sleep(identity.FILE_HASH_SETTLE_NS / 1_000_000_000 + 0.01)
     future = identity.time.time_ns() + 3_000_000_000
     monkeypatch.setattr(identity.time, "time_ns", lambda: future)
     identity._file_digest.cache_clear()
@@ -173,8 +175,10 @@ def test_file_hash_cache_reuses_reads_and_detects_same_size_edit(tmp_path, monke
     assert identity.file_identity(path) == first
     assert identity._file_digest.cache_info().hits == 1
     previous_mtime = path.stat().st_mtime_ns
+    previous_ctime = path.stat().st_ctime_ns
     path.write_bytes(b"modified")
     identity.os.utime(path, ns=(previous_mtime, previous_mtime))
+    assert path.stat().st_ctime_ns != previous_ctime
     future = path.stat().st_ctime_ns + 3_000_000_000
     changed = identity.file_identity(path)
     assert changed != first
