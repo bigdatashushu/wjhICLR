@@ -103,6 +103,48 @@ def _read_anchored(path: str | Path, sha256: str) -> tuple[dict, dict]:
     return value, identity
 
 
+def _json_fingerprint(value) -> tuple:
+    """Compare loaded JSON without serialization or mutable snapshot aliases."""
+    kind = type(value)
+    if kind is dict:
+        _require(all(type(name) is str for name in value),
+                 "cached frozen JSON keys changed")
+        return (kind, tuple((name, _json_fingerprint(value[name]))
+                            for name in sorted(value)))
+    if kind is list:
+        return (kind, tuple(_json_fingerprint(child) for child in value))
+    if kind is float:
+        return (kind, value.hex())
+    _require(kind in (str, int, bool, type(None)),
+             "cached frozen JSON structure changed")
+    return (kind, value)
+
+
+def _scene_file_closure(loaded) -> tuple:
+    files = {}
+
+    def add(target, identity=None):
+        if identity is None:
+            files.setdefault(target, None)
+            return
+        expected = (identity["sha256"], identity["size"])
+        _require(files.get(target) in (None, expected),
+                 "conflicting frozen file integrity anchors")
+        files[target] = expected
+
+    for target in loaded.manifest["files"].values():
+        add(target)
+    for target, identity in (loaded.manifest.get("file_identities") or {}).items():
+        add(target, identity)
+    for frame in loaded.manifest["frames"]:
+        add(loaded.manifest["files"][frame["source_path"]],
+            {"sha256": frame["png_sha256"], "size": frame["size"]})
+    for receipt in loaded.receipts.values():
+        for record in (receipt["artifact"], *receipt["dependencies"].values()):
+            add(record["target_ref"], record["identity"])
+    return tuple(files.items())
+
+
 class PublishedFitSetInputProvider:
     """Decode at most ``max_scenes`` frozen scenes, without metadata or labels.
 
@@ -215,6 +257,7 @@ class PublishedFitSetInputProvider:
         }
         self.max_scenes = max_scenes
         self.cache: OrderedDict[tuple[str, str], object] = OrderedDict()
+        self._scene_checks = {}
         self.cache_lock = threading.RLock()
 
     @property
@@ -228,12 +271,14 @@ class PublishedFitSetInputProvider:
     def __getstate__(self) -> dict:
         state = dict(self.__dict__)
         state["cache"] = OrderedDict()
+        state["_scene_checks"] = {}
         state.pop("cache_lock", None)
         return state
 
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         self.cache = OrderedDict()
+        self._scene_checks = {}
         self.cache_lock = threading.RLock()
 
     def _entry(self, variant: Mapping) -> dict:
@@ -254,7 +299,7 @@ class PublishedFitSetInputProvider:
         return entry
 
     def _scene(self, entry: dict):
-        from skill3d.storage.relocation import validate_relocation_receipt
+        from skill3d.infra.m5_identity import file_identity
 
         root = Path(entry["input_root"])
         key = (str(root), entry["frozen_scene_sha256"])
@@ -269,35 +314,32 @@ class PublishedFitSetInputProvider:
                              and loaded.manifest["split"] == scope["split"],
                              "fullQA frozen scene question/split scope changed")
                 _file(root / "scene.json", entry["frozen_scene_sha256"])
+                # The normal cold loader validates every receipt and its anchors.
+                self._scene_checks[key] = (
+                    loaded, loaded.root, _json_fingerprint(loaded.manifest),
+                    _json_fingerprint(loaded.receipts), _scene_file_closure(loaded),
+                )
                 self.cache[key] = loaded
                 while len(self.cache) > self.max_scenes:
-                    self.cache.popitem(last=False)
+                    evicted, _ = self.cache.popitem(last=False)
+                    self._scene_checks.pop(evicted, None)
             else:
-                loaded = self.cache.pop(key)
-                self.cache[key] = loaded
-                # Cached RGB must not hide changes to the extracted archive.
-                for target in loaded.manifest["files"].values():
-                    scene_compute._local_file(loaded.root, target)
-                for target, expected in (
-                    loaded.manifest.get("file_identities") or {}
-                ).items():
-                    actual = _file(scene_compute._local_file(loaded.root, target))
-                    _require({k: actual[k] for k in ("sha256", "size")} == expected,
-                             "frozen transferred file integrity changed")
-                for frame in loaded.manifest["frames"]:
-                    target = loaded.manifest["files"][frame["source_path"]]
-                    identity = _file(
-                        scene_compute._local_file(loaded.root, target),
-                        frame["png_sha256"],
-                    )
-                    _require(identity["size"] == frame["size"],
-                             "frozen PNG size changed")
-                for receipt in loaded.receipts.values():
-                    validate_relocation_receipt(
-                        receipt,
-                        expected_input_sha256=receipt["logical_input_identity"]["sha256"],
-                        destination_root=loaded.root,
-                    )
+                loaded = self.cache[key]
+                trusted, checked_root, manifest, receipts, files = self._scene_checks[key]
+                _require(loaded is trusted and loaded.root == checked_root
+                         and scene_compute._root(root) == checked_root,
+                         "cached frozen scene root changed")
+                _require(_json_fingerprint(loaded.manifest) == manifest
+                         and _json_fingerprint(loaded.receipts) == receipts,
+                         "cached frozen scene structure/receipt changed")
+                # Trust only unchanged cold-validated structures, not receipt hashes.
+                for target, expected in files:
+                    path = scene_compute._local_file(checked_root, target)
+                    if expected is not None:
+                        actual = file_identity(path)
+                        _require((actual["sha256"], actual["size"]) == expected,
+                                 "frozen transferred file integrity changed")
+                self.cache.move_to_end(key)
             return loaded
 
     def _validate_item(self, variant: Mapping, entry: dict, item: EpisodeItem) -> None:

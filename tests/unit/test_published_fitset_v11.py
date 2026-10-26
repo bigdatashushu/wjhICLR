@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import pickle
 import shutil
@@ -257,9 +259,13 @@ def test_uses_normal_scene_loader_and_clears_cache_when_pickled(published, monke
     assert calls == [(published.frozen.root, 8)]
     restored = pickle.loads(pickle.dumps(provider))
     assert not restored.cache
+    assert not restored._scene_checks
+    assert not provider.__getstate__()["_scene_checks"]
     assert len(provider.cache) == 1
+    assert len(provider._scene_checks) == 1
     assert restored(published.variant).episode.ground_truth == ""
     assert len(calls) == 2 and len(restored.cache) == 1
+    assert len(restored._scene_checks) == 1
 
 
 def test_scene_cache_is_bounded(tmp_path):
@@ -269,10 +275,184 @@ def test_scene_cache_is_bounded(tmp_path):
     first, second = _published(first_root), _published(second_root)
     # Cache keys depend on extracted roots, not only the scene name.
     provider = PublishedFitSetInputProvider(first.manifest_path, max_scenes=1)
-    provider._scene(first.manifest["entries"]["qa-00"])
+    first_scene = provider._scene(first.manifest["entries"]["qa-00"])
     provider._scene(second.manifest["entries"]["qa-00"])
     assert len(provider.cache) == 1
     assert next(iter(provider.cache))[0] == str(second.frozen.root)
+    assert set(provider._scene_checks) == set(provider.cache)
+    first_scene.receipts["qa-01"]["receipt_sha256"] = "0" * 64
+    assert provider._scene(first.manifest["entries"]["qa-00"]) is not first_scene
+    assert len(provider._scene_checks) == 1
+    assert set(provider._scene_checks) == set(provider.cache)
+
+
+@pytest.mark.parametrize("n_questions", [2, 9])
+def test_warm_scene_checks_physical_closure_without_receipt_revalidation(
+    tmp_path, monkeypatch, n_questions,
+):
+    from skill3d.infra import m5_identity
+    from skill3d.storage import relocation
+
+    case = _published(tmp_path, n_questions=n_questions)
+    if n_questions > 8:
+        source = tmp_path / "fullqa-catalog.json"
+        _write(source, {"schema": "harness3d-published-binding-catalog/1",
+                        "variants": {"base": case.catalog}})
+        case.manifest.update(
+            schema="v11-published-fitset-inputs/2",
+            source_catalog_file=str(source),
+            source_catalog_sha256=file_identity(source)["sha256"],
+            scene_scopes={"scene-one": {
+                "qa_ids": case.frozen.manifest["qa_ids"], "split": "induction",
+                "input_root": str(case.frozen.root),
+                "frozen_scene_sha256": file_identity(case.frozen.root / "scene.json")["sha256"],
+            }},
+        )
+        _rewrite_manifest(case)
+    provider = PublishedFitSetInputProvider(case.manifest_path)
+    loaded = provider._scene(case.manifest["entries"]["qa-00"])
+    assert len(loaded.receipts) == n_questions
+    paths = []
+    identify = m5_identity.file_identity
+
+    def identify_spy(path):
+        paths.append(Path(path))
+        return identify(path)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("unchanged warm scene must not serialize/validate receipts")
+
+    monkeypatch.setattr(m5_identity, "file_identity", identify_spy)
+    monkeypatch.setattr(m5_identity, "canonical_bytes", forbidden)
+    monkeypatch.setattr(relocation, "read_relocation_receipt", forbidden)
+    monkeypatch.setattr(relocation, "validate_relocation_receipt", forbidden)
+    for entry in case.manifest["entries"].values():
+        assert provider._scene(entry) is loaded
+    expected_paths = {
+        loaded.root / "scene.json",
+        *(loaded.root / target for target in loaded.manifest["files"].values()),
+    }
+    assert Counter(paths) == Counter({path: n_questions for path in expected_paths})
+
+
+@pytest.mark.parametrize("operation", ["call", "receipt", "prepare"])
+@pytest.mark.parametrize("mutation", [
+    "metadata", "logical_rehash", "dependency", "receipt_hash", "remove_qa",
+    "numeric_type", "signed_zero", "label",
+])
+def test_nonselected_loaded_receipt_mutation_rejected_on_warm_scene(
+    published, operation, mutation,
+):
+    provider = PublishedFitSetInputProvider(published.manifest_path)
+    item = provider(published.variant)
+    loaded = next(iter(provider.cache.values()))
+    receipt = loaded.receipts["qa-01"]
+    logical = receipt["logical_input_identity"]
+    if mutation in {"metadata", "logical_rehash"}:
+        logical["episode"]["question"] = "nonselected substitution"
+        if mutation == "logical_rehash":
+            logical["sha256"] = content_sha256(
+                {k: v for k, v in logical.items() if k != "sha256"})
+            _rehash_receipt(receipt)
+    elif mutation == "dependency":
+        receipt["dependencies"]["depth_maps"]["target_ref"] = "data/substitute.npy"
+        _rehash_receipt(receipt)
+    elif mutation == "receipt_hash":
+        receipt["receipt_sha256"] = "0" * 64
+    elif mutation == "remove_qa":
+        del loaded.receipts["qa-01"]
+    elif mutation in {"numeric_type", "signed_zero"}:
+        logical["episode"]["frame_set"]["timestamps"][0] = (
+            0 if mutation == "numeric_type" else -0.0)
+    elif mutation == "label":
+        logical["episode"]["ground_truth"] = "hidden"
+    with pytest.raises(ValueError, match="structure/receipt changed"):
+        if operation == "call":
+            provider(published.variant)
+        elif operation == "receipt":
+            provider.receipt(published.variant, item)
+        else:
+            provider.prepare_published(published.variant, item)
+
+
+@pytest.mark.parametrize("mutation", ["file_map", "anchor", "nonselected_question"])
+def test_loaded_manifest_mutation_cannot_change_warm_integrity_closure(published, mutation):
+    provider = PublishedFitSetInputProvider(published.manifest_path)
+    provider(published.variant)
+    loaded = next(iter(provider.cache.values()))
+    if mutation == "file_map":
+        loaded.manifest["files"].clear()
+    elif mutation == "anchor":
+        loaded.manifest["frames"][0]["png_sha256"] = "0" * 64
+    else:
+        loaded.manifest["questions"][1]["episode"]["answer"] = "hidden"
+    with pytest.raises(ValueError, match="structure/receipt changed"):
+        provider(published.variant)
+
+
+@pytest.mark.parametrize("mutation", [
+    "same_size_restored_mtime", "inode_replacement", "symlink", "missing",
+])
+def test_nonselected_receipt_only_file_corruption_rejected_on_warm_scene(
+    published, monkeypatch, mutation,
+):
+    from skill3d.infra import m5_identity
+    from skill3d.storage import relocation
+
+    load = scene_compute._load_scene
+    target = "data/nonselected/depth_maps.npy"
+    path = published.frozen.root / target
+
+    def load_with_nonselected_target(root, *, question_cap):
+        loaded = load(root, question_cap=question_cap)
+        receipt = loaded.receipts["qa-01"]
+        record = receipt["dependencies"]["depth_maps"]
+        path.parent.mkdir()
+        shutil.copyfile(root / record["target_ref"], path)
+        record["target_ref"] = target
+        _rehash_receipt(receipt)
+        relocation.validate_relocation_receipt(
+            receipt, expected_input_sha256=receipt["logical_input_identity"]["sha256"],
+            destination_root=root,
+        )
+        return loaded
+
+    # Exercise hash reuse, including its ctime/inode invalidation, on recent files.
+    monkeypatch.setattr(m5_identity, "FILE_HASH_SETTLE_NS", 0)
+    monkeypatch.setattr(scene_compute, "_load_scene", load_with_nonselected_target)
+    provider = PublishedFitSetInputProvider(published.manifest_path)
+    provider(published.variant)
+    loaded = next(iter(provider.cache.values()))
+    assert target not in loaded.manifest["files"].values()
+    assert target not in {
+        row["target_ref"] for row in loaded.receipts["qa-00"]["dependencies"].values()
+    }
+    stamp = path.stat()
+    raw = path.read_bytes()
+    changed = raw[:-1] + bytes([raw[-1] ^ 1])
+    if mutation == "same_size_restored_mtime":
+        path.write_bytes(changed)
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        assert path.stat().st_size == stamp.st_size
+        assert path.stat().st_mtime_ns == stamp.st_mtime_ns
+        assert path.stat().st_ino == stamp.st_ino
+    elif mutation == "inode_replacement":
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(changed)
+        os.utime(replacement, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        replacement.replace(path)
+        assert path.stat().st_size == stamp.st_size
+        assert path.stat().st_mtime_ns == stamp.st_mtime_ns
+        assert path.stat().st_ino != stamp.st_ino
+    elif mutation == "symlink":
+        replacement = path.with_suffix(".copy")
+        replacement.write_bytes(raw)
+        path.unlink()
+        path.symlink_to(replacement)
+    else:
+        path.unlink()
+    with pytest.raises((ValueError, OSError)):
+        provider(published.variant)
 
 
 def test_complete_scene_question_cap_is_enforced(tmp_path):

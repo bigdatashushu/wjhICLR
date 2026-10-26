@@ -108,13 +108,9 @@ def _digest(value: object) -> str:
 
 
 def _file_identity(path: Path) -> dict:
-    digest = hashlib.sha256()
-    size = 0
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            digest.update(block)
-            size += len(block)
-    return {"sha256": digest.hexdigest(), "size": size}
+    from skill3d.infra.m5_identity import file_identity
+
+    return file_identity(path)
 
 
 def _reject_labels(value, path=()) -> None:
