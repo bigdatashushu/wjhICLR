@@ -9,7 +9,7 @@ from typing import Literal, Optional
 from pydantic import Field, field_validator, model_serializer, model_validator
 
 from . import Spec
-from .data_access import DataAccessRecord
+from .data_access import DataAccessRecord, validate_learning_authorization
 from .skill import SkillCandidateV11
 from .evidence import SkillEvidenceState, skill_evidence_state
 
@@ -37,7 +37,8 @@ class V11ExperienceCase(Spec):
     evidence_state: SkillEvidenceState
     question_text: str
     options: list[str] = Field(default_factory=list)
-    source_split: Literal["induction"]
+    source_split: Literal["induction", "inner_validation"]
+    learning_authorization: dict = Field(default_factory=dict)
     split: Literal["learning"]
     label_access: Literal[True]
     outcome: Literal["success", "failure"]
@@ -97,6 +98,19 @@ class V11ExperienceCase(Spec):
     def _delivery_body_matches_hash(self):
         from .evidence import EvidenceProfile
 
+        if self.learning_authorization:
+            validate_learning_authorization(self.learning_authorization, [self.qa_id])
+            access = ((self.rounds[0].get("experience_provenance") or {}).get(
+                "offline_label_access_record") if self.rounds else None)
+            if not access:
+                raise ValueError("authorized learning case requires its actual label access")
+            access = DataAccessRecord.model_validate(access)
+            if (access.split != self.source_split or access.n_items != 1
+                    or access.learning_authorization != self.learning_authorization
+                    or not access.at or not access.input_manifest_sha256):
+                raise ValueError("case learning authorization/label access mismatch")
+        elif self.source_split != "induction":
+            raise ValueError("non-induction case requires explicit learning authorization")
         for states in (self.initial_evidence_states, self.evidence_states):
             EvidenceProfile.model_validate(states)
         if skill_evidence_state(self.initial_evidence_states) != self.evidence_state:
@@ -141,11 +155,15 @@ class V11ExperienceBundle(Spec):
     parent_content_sha256: str
     question_type: str
     evidence_state: SkillEvidenceState
-    source_split: Literal["induction"]
+    source_split: Literal["induction", "inner_validation"] | list[
+        Literal["induction", "inner_validation"]
+    ]
+    learning_authorization: dict = Field(default_factory=dict)
     split: Literal["learning"]
     label_access: Literal[True]
     source_run_ref: str
     label_access_record: DataAccessRecord
+    label_access_records: list[DataAccessRecord] = Field(default_factory=list)
     cases: list[V11ExperienceCase]
 
     @field_validator(
@@ -174,28 +192,50 @@ class V11ExperienceBundle(Spec):
         case_ids = [case.case_id for case in self.cases]
         if len(set(case_ids)) != len(case_ids):
             raise ValueError("经验包 case_id 重复")
+        sources = sorted({case.source_split for case in self.cases})
+        expected_source = sources[0] if len(sources) == 1 else sources
+        if self.source_split != expected_source:
+            raise ValueError("bundle source_split must preserve actual case sources")
+        if self.learning_authorization:
+            validate_learning_authorization(
+                self.learning_authorization, [case.qa_id for case in self.cases])
+        elif any(case.learning_authorization for case in self.cases) or sources != ["induction"]:
+            raise ValueError("experiment bundle requires explicit learning authorization")
         access = self.label_access_record
-        if (
-            access.split != "induction"
-            or access.purpose != "skill_induction"
-            or access.component_role != "inducer"
-            or access.label_access is not True
-            or access.n_items != len(self.cases)
-            or not access.at
-            or not access.input_manifest_sha256
-        ):
-            raise ValueError("经验包缺少与 cases 一致的真实 induction 标签访问记录")
+        accesses = self.label_access_records or [access]
+        if access != accesses[0] or sorted(row.split for row in accesses) != sources:
+            raise ValueError("bundle label access must cover every real source split")
+        for row in accesses:
+            cases = [case for case in self.cases if case.source_split == row.split]
+            if (
+                row.purpose != "skill_induction" or row.component_role != "inducer"
+                or not row.label_access or row.n_items != len(cases)
+                or not row.at or not row.input_manifest_sha256
+            ):
+                raise ValueError("经验包缺少与 cases 一致的真实 induction 标签访问记录")
+            if self.learning_authorization:
+                validate_learning_authorization(row.learning_authorization, [
+                    case.qa_id for case in cases])
+                if any(row.learning_authorization[key] != self.learning_authorization[key]
+                       for key in self.learning_authorization if key != "qa_ids"):
+                    raise ValueError("bundle label access authorization identity mismatch")
+            elif row.learning_authorization:
+                raise ValueError("experiment label access requires bundle learning authorization")
         for case in self.cases:
             if case.question_type != self.question_type:
                 raise ValueError("经验 case 与经验包 question_type 不一致")
             if case.evidence_state != self.evidence_state:
                 raise ValueError("经验 case 与经验包 evidence_state 不一致")
             if (
-                case.source_split != self.source_split
-                or case.split != self.split
+                case.split != self.split
                 or case.label_access != self.label_access
             ):
                 raise ValueError("经验 case 与经验包 split/label_access 不一致")
+            if self.learning_authorization:
+                validate_learning_authorization(case.learning_authorization, [case.qa_id])
+                if any(case.learning_authorization[key] != self.learning_authorization[key]
+                       for key in self.learning_authorization if key != "qa_ids"):
+                    raise ValueError("case/bundle learning authorization identity mismatch")
             if case.delivered_skill_version != self.parent_skill_version:
                 raise ValueError("经验 case 未实际交付目标父版本")
             if case.delivered_content_sha256 != self.parent_content_sha256:

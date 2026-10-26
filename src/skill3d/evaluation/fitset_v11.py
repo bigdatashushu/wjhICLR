@@ -45,6 +45,9 @@ from skill3d.infra.experiment_startup import current_code_identity
 from skill3d.routing.task_classifier import TASK_TYPES, canonical_task
 from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
+from skill3d.schemas.data_access import (
+    learning_authorization_for, normalize_experiment_split,
+)
 from skill3d.schemas.evidence import SKILL_EVIDENCE_STATES
 from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
 from skill3d.schemas.skill import parse_skill_markdown
@@ -1243,6 +1246,7 @@ class SystemVariantRunner:
         request_governor_config=None,
         published_inputs=None,
         gate_variants: Sequence[Mapping] | None = None,
+        experiment_split: dict | None = None,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -1283,6 +1287,28 @@ class SystemVariantRunner:
         self.min_free_gib = float(min_free_gib)
         self.workers = int(workers)
         self.evolution_config = evolution_config
+        try:
+            self.experiment_split = (
+                normalize_experiment_split(experiment_split)
+                if experiment_split is not None else None)
+        except ValueError as exc:
+            raise FitSetError(str(exc)) from exc
+        _require(self.experiment_split is None or phase == "final_system" or (
+            evolution_config is not None and evolution_config.gate_mode == "qa_disjoint"),
+            "experiment_split requires opt-in qa_disjoint evolution")
+        if self.experiment_split is not None and phase == "final_system":
+            _require(
+                self.experiment_split.get("execution_role") == "validation"
+                and evolution_config is None and not self.gate_variant_rows,
+                "final_system overlay requires execution_role=validation without gate/evolution")
+            _require(all(
+                self.experiment_split["qa_roles"].get(row["qa_id"]) == "validation"
+                and row.get("split") in {"induction", "inner_validation"}
+                and row.get("source_split", row.get("split")) == row.get("split")
+                and all(row.get(field, "validation") == "validation"
+                        for field in ("experiment_role", "experiment_split"))
+                for row in self.variants),
+                "final_system requires mapped validation QA and unchanged source split")
         # Public-input capture survives removal of coordinator-only evolution data.
         self.capture_offline_case_input = (
             evolution_config is not None
@@ -1301,6 +1327,7 @@ class SystemVariantRunner:
         self._episode_semaphore = None
         self.seed_skills = []
         self.gate_panels = {}
+        self.gate_deferred_reasons = {}
         self.run_identity = ""
         self.evolution_finished = False
         _require(
@@ -1344,8 +1371,27 @@ class SystemVariantRunner:
             learning_mode = self.evolution_config.learning_input_mode
             gate_mode = self.evolution_config.gate_mode
             legacy = learning_mode == "aggregate_v1" and gate_mode == "same_question"
-            _require(gate_mode in {"same_question", "scene_disjoint"},
+            _require(gate_mode in {"same_question", "scene_disjoint", "qa_disjoint"},
                      "unknown gate mode")
+            _require(gate_mode != "qa_disjoint" or self.experiment_split is not None,
+                     "qa_disjoint requires explicit experiment_split")
+            if gate_mode == "qa_disjoint":
+                learning_qa = {row["qa_id"] for row in self.variants}
+                gate_qa = {row["qa_id"] for row in self.gate_variant_rows.values()}
+                _require(not learning_qa & gate_qa,
+                         "gate QA overlaps learning QA across frozen variants")
+                for row in self.variant_rows.values():
+                    variant_id = row["variant_id"]
+                    expected_role = (
+                        "validation" if variant_id in self.gate_variant_rows else "learning")
+                    _require(self.experiment_split["qa_roles"].get(row["qa_id"]) == expected_role,
+                             f"{variant_id}: QA role is not authorized {expected_role}")
+                    _require(all(row.get(field, expected_role) == expected_role
+                                 for field in ("experiment_role", "experiment_split")),
+                             f"{variant_id}: declared QA role differs from frozen role map")
+                    _require(row.get("split") in {"induction", "inner_validation"}
+                             and row.get("source_split", row["split"]) == row["split"],
+                             f"{variant_id}: source_split must preserve the source catalog")
             _require(learning_mode in {
                 "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1",
             }, "unknown learning input mode")
@@ -1364,24 +1410,33 @@ class SystemVariantRunner:
                          and label.get("question_type") == row["question_type"],
                          f"{variant_id}: label metadata identity changed")
                 if variant_id not in self.gate_variant_rows:
-                    _require(legacy or row.get("split") == "induction",
+                    _require(legacy or gate_mode == "qa_disjoint" or row.get("split") == "induction",
                              f"{variant_id}: rich/disjoint learning requires induction-only variants")
                     by_slot.setdefault(key, []).append(row)
             gate_by_slot: dict[str, list[dict]] = {}
-            if gate_mode == "scene_disjoint":
-                _require(bool(self.gate_variant_rows),
+            if gate_mode in {"scene_disjoint", "qa_disjoint"}:
+                _require(gate_mode == "qa_disjoint" or bool(self.gate_variant_rows),
                          "scene_disjoint requires supplied held-out gate variants")
                 learning_scenes = {row["scene_id"] for row in self.variants}
                 for row in self.gate_variant_rows.values():
                     variant_id = row["variant_id"]
                     _require(row.get("split") in {"induction", "inner_validation"},
                              f"{variant_id}: gate requires held-out induction or inner_validation")
-                    _require(row["scene_id"] not in learning_scenes,
+                    _require(gate_mode == "qa_disjoint" or row["scene_id"] not in learning_scenes,
                              f"{variant_id}: gate scene overlaps learning scenes")
                     _require(variant_id in self.binding_refs,
                              f"{variant_id}: gate prepared binding reference is missing")
                     gate_by_slot.setdefault(row["slot_key"], []).append(row)
             for key, rows in by_slot.items():
+                if gate_mode == "qa_disjoint":
+                    gate_rows = gate_by_slot.get(key, ())
+                    self.gate_panels[key] = [row["variant_id"] for row in gate_rows]
+                    n_qa = len({row["qa_id"] for row in gate_rows})
+                    if n_qa < self.evolution_config.gate_size:
+                        self.gate_deferred_reasons[key] = (
+                            f"qa_disjoint admission deferred: {n_qa} validation QA; "
+                            f"gate_size={self.evolution_config.gate_size}; parent retained")
+                    continue
                 selected = []
                 scenes = set()
                 gate_rows = gate_by_slot.get(key, ()) if gate_mode == "scene_disjoint" else rows
@@ -1394,6 +1449,18 @@ class SystemVariantRunner:
                 _require(legacy or len(selected) == self.evolution_config.gate_size,
                          f"{key}: incomplete frozen gate_size; distinct scenes required")
                 self.gate_panels[key] = selected
+
+    def learning_authorization(self, variant: Mapping) -> dict:
+        if self.experiment_split is None:
+            return {}
+        variant_id = variant.get("variant_id")
+        _require(variant_id not in self.gate_variant_rows
+                 and self.variant_rows.get(variant_id) == dict(variant),
+                 "validation or unfrozen variant cannot enter learning ingest")
+        try:
+            return learning_authorization_for(self.experiment_split, [variant["qa_id"]])
+        except ValueError as exc:
+            raise FitSetError(str(exc)) from exc
 
     def __getstate__(self) -> dict:
         # Spawned workers receive the live permit as an explicit process
@@ -1538,6 +1605,12 @@ class SystemVariantRunner:
             })
         if self.request_governor_config is not None:
             body["request_policy"] = asdict(self.request_governor_config)
+        if self.experiment_split is not None:
+            body["experiment_split"] = copy.deepcopy(self.experiment_split)
+            body["experiment_split_sha256"] = self.experiment_split["identity_sha256"]
+            if body["evolution"] is not None:
+                body["evolution"]["gate_deferred_reasons"] = dict(self.gate_deferred_reasons)
+                body["evolution"]["gate_selection_policy"] = "all_validation_variants_per_slot"
         return {**body, "identity_sha256": content_sha256(body)}
 
     def initialize(self, *, resume: bool) -> dict:
@@ -1731,6 +1804,9 @@ class SystemVariantRunner:
         )
         artifact_relocation = None
         transport_receipt = None
+        derived_reference = None
+        derived_migration_receipt = None
+        binding_derivation_context = None
         if self.published_inputs is not None:
             from skill3d.schemas.evidence import skill_evidence_state
             published = self.published_inputs.prepare_published(variant, item)
@@ -1741,6 +1817,9 @@ class SystemVariantRunner:
             prepared = published["prepared"]
             artifact_relocation = published["artifact_relocation"]
             transport_receipt = published["transport_receipt"]
+            derived_reference = published.get("derived_reference")
+            derived_migration_receipt = published.get("derived_migration_receipt")
+            binding_derivation_context = published.get("binding_derivation_context")
             _require(reference == self.binding_refs.get(variant_id),
                      f"{variant_id}: published binding reference changed")
             quality_artifact = runner._prepare_m4_quality(
@@ -1765,7 +1844,7 @@ class SystemVariantRunner:
         _require(state == variant["evidence_state"],
                  f"{variant_id}: runtime evidence state changed to {state}")
         frozen_parameters = dict(
-            (reference.get("request_identity") or {}).get("parameters") or {})
+            ((derived_reference or reference).get("request_identity") or {}).get("parameters") or {})
         frozen_review = copy.deepcopy(
             frozen_parameters.get("experimental_semantic_review"))
         runtime_base_cfg = replace(
@@ -1812,6 +1891,7 @@ class SystemVariantRunner:
             parameters=runtime_parameters,
             source_compatibility=(
                 runtime_base_cfg.prepared_binding_source_compatibility),
+            binding_derivation_context=binding_derivation_context,
         )
         compatibility_receipt = None
         if runtime_base_cfg.prepared_binding_source_compatibility is not None:
@@ -1848,6 +1928,10 @@ class SystemVariantRunner:
         }
         if transport_receipt is not None:
             plan["published_transport"] = transport_receipt
+        if derived_reference is not None:
+            plan["derived_binding_reference"] = copy.deepcopy(derived_reference)
+            plan["derived_binding_migration"] = copy.deepcopy(derived_migration_receipt)
+            plan["binding_derivation_sha256"] = prepared.stats["binding_derivation"]["sha256"]
         if not preflight:
             _write_create_once(variant_root / "plan.json", plan)
         return {
@@ -1859,6 +1943,7 @@ class SystemVariantRunner:
             "identity": identity,
             "reference": reference,
             "prepared": prepared,
+            "binding_derivation_context": binding_derivation_context,
             "runtime_base_cfg": runtime_base_cfg,
             "skills": skills,
             "skill_identity": skill_identity,
@@ -1916,6 +2001,10 @@ class SystemVariantRunner:
         prepared_run = self._prepare_one(variant)
         variant_id = prepared_run["variant_id"]
         item = prepared_run["item"]
+        if getattr(self, "_qa_disjoint_gate", False):
+            _require(not self.capture_offline_case_input and not self.label_metadata
+                     and not item.episode.ground_truth,
+                     "qa_disjoint gate executor requires label-free public input")
         artifact_path = prepared_run["artifact_path"]
         state = prepared_run["state"]
         prepared = prepared_run["prepared"]
@@ -1971,6 +2060,9 @@ class SystemVariantRunner:
             **({"artifact_relocations": {
                 item.episode.qa_id: prepared_run["artifact_relocation"]}}
                if prepared_run["artifact_relocation"] is not None else {}),
+            **({"binding_derivation_contexts": {
+                item.episode.qa_id: prepared_run["binding_derivation_context"]}}
+               if prepared_run.get("binding_derivation_context") is not None else {}),
         )
         elapsed = time.perf_counter() - started
         _require(len(outcomes) == 1,

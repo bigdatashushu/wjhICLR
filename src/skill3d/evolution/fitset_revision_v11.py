@@ -459,6 +459,7 @@ class FitSetSlotReviser:
         max_attempts: int = 3,
         max_tokens: int = 8192,
         method_context_max_chars: int = DEFAULT_METHOD_CONTEXT_MAX_CHARS,
+        experiment_split: dict | None = None,
     ) -> None:
         self.root = Path(output_root).resolve()
         self.panel = panel
@@ -471,6 +472,18 @@ class FitSetSlotReviser:
         self.max_attempts = int(max_attempts)
         self.max_tokens = int(max_tokens)
         self.method_context_max_chars = int(method_context_max_chars)
+        from skill3d.schemas.data_access import (
+            learning_authorization_for, normalize_experiment_split,
+        )
+
+        self.experiment_split = (
+            normalize_experiment_split(experiment_split) if experiment_split is not None else None)
+        if self.experiment_split is not None:
+            for row in self.variants:
+                learning_authorization_for(self.experiment_split, [row["qa_id"]])
+                if any(row.get(field, "learning") != "learning"
+                       for field in ("experiment_role", "experiment_split")):
+                    raise FitSetError("Validation role cannot enter reviser")
         if self.max_attempts <= 0 or self.max_tokens <= 0:
             raise FitSetError("revision attempts and token budget must be positive")
 
@@ -519,6 +532,8 @@ class FitSetSlotReviser:
             "reference_answer_visible_to_online_accumulation": False,
             "raw_sample_content_visible_to_offline_reviser": False,
         }
+        if self.experiment_split is not None:
+            body["experiment_split"] = self.experiment_split
         return {**body, "identity_sha256": content_sha256(body)}
 
     def _prompt(
@@ -552,7 +567,7 @@ class FitSetSlotReviser:
             "or inferred GT 3D fact. The aggregate feedback contains no such "
             "content. A wrong score alone does not prove a binding or referent "
             "failure. Improve decision rules, checks, tool use, and fallbacks "
-            "only when supported by the supplied process facts or original induction evidence. Do not invent "
+            "only when supported by the supplied process facts or original authorized learning evidence. Do not invent "
             "tools or alter framework, model, prompt, scoring, or permissions.\n\n"
             f"{ExecutionContract(self.method_context_max_chars).render()}\n\n"
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
@@ -562,10 +577,10 @@ class FitSetSlotReviser:
             f"{json.dumps(feedback, ensure_ascii=False, sort_keys=True)}\n"
             "Static feedback from prior formatting attempts:\n"
             f"{json.dumps(list(static_feedback), ensure_ascii=False)}\n"
-            f"{revision_contract_text()}\n"
+            f"{revision_contract_text(experiment_split=self.experiment_split)}\n"
             + (
-                "Complete authorized induction cases and source-linked diagnosis:\n"
-                f"{render_case_evidence(experience, diagnosis=diagnosis)}\n"
+                "Complete authorized learning cases and source-linked diagnosis:\n"
+                f"{render_case_evidence(experience, diagnosis=diagnosis, experiment_split=self.experiment_split)}\n"
                 if experience is not None else ""
             )
             + "Previous candidate repair context (full safe text, hash and line positions):\n"
@@ -692,7 +707,8 @@ class FitSetSlotReviser:
         if leakage_scan_text(parent.skill_md + json.dumps(feedback), forbidden_sample_ids=forbidden_ids):
             raise FitSetError("offline control text leakage scan failed")
         if experience is not None:
-            render_case_evidence(experience, diagnosis=diagnosis)
+            render_case_evidence(
+                experience, diagnosis=diagnosis, experiment_split=self.experiment_split)
             if (experience.parent_content_sha256 != parent.content_sha256
                     or experience.question_type != parent.question_type
                     or experience.evidence_state != parent.evidence_state):

@@ -445,9 +445,24 @@ def refresh_coverage(grounding, objects):
 def validate_prepared_binding(binding, *, frames, depth, c2w, intrinsics, point_conf,
                               depth_conf, point_map, inputs, scene_identity,
                               seed=None, model_weights_sha256="", parameters=None,
-                              source_compatibility=None):
+                              source_compatibility=None, binding_derivation_context=None):
     """Frozen preparation may be consumed without requiring a live detector."""
     stats = binding.stats
+    if "binding_derivation" in stats:
+        if source_compatibility is not None:
+            raise ValueError("binding derivation cannot use source compatibility")
+        from skill3d.evolution.prepared_binding_derivation_v11 import (
+            validate_derived_prepared_binding,
+        )
+        validate_derived_prepared_binding(
+            binding, context=binding_derivation_context, frames=frames,
+            depth=depth, c2w=c2w, intrinsics=intrinsics, point_conf=point_conf,
+            depth_conf=depth_conf, point_map=point_map, inputs=inputs,
+            scene_identity=scene_identity, seed=seed,
+            model_weights_sha256=model_weights_sha256, parameters=parameters)
+        return
+    if binding_derivation_context is not None:
+        raise ValueError("binding derivation context requires a derivation receipt")
     generation = stats.get("generation") or {}
     identity = generation.get("identity") or {}
     expected_geometry = {name: array_identity(value) for name, value in (

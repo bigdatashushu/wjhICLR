@@ -1182,6 +1182,7 @@ def run_episode(
     input_error: Optional[InputErrorRecord] = None,
     artifact_relocation: ValidatedRelocation | None = None,
     original_item: EpisodeItem | None = None,
+    binding_derivation_context=None,
 ) -> EpisodeOutcome:
     """跑完一条在线链 episode。
 
@@ -1449,6 +1450,7 @@ def run_episode(
                               else cfg.prepared_binding_seed),
                         model_weights_sha256="",
                         source_compatibility=cfg.prepared_binding_source_compatibility,
+                        binding_derivation_context=binding_derivation_context,
                         parameters=binding_parameters(
                             semantic_min_pixels=cfg.semantic_min_pixels,
                             semantic_max_pixels=cfg.semantic_max_pixels,
@@ -3539,6 +3541,7 @@ def run_split(
     llm=None,
     prepared_bindings: Optional[Mapping[str, PreparedObjectBinding]] = None,
     artifact_relocations: Mapping[str, ValidatedRelocation] | None = None,
+    binding_derivation_contexts: Mapping[str, object] | None = None,
 ) -> tuple[list[EpisodeOutcome], EvaluationRun]:
     """Run EpisodeItems and aggregate outcomes.
 
@@ -3571,6 +3574,12 @@ def run_split(
         store.claim_run(run_id)
         store = store.bind(run_id=run_id)
     prepared = dict(prepared_bindings or {})
+    derivations = dict(binding_derivation_contexts or {})
+    if derivations and (
+        set(derivations) != {it.episode.qa_id for it in items}
+        or not set(derivations) <= set(prepared)
+    ):
+        raise ValueError("binding derivation contexts must cover exactly the prepared run QA")
     unknown_prepared = set(prepared) - {
         it.episode.qa_id for it in items
     }
@@ -3594,6 +3603,7 @@ def run_split(
             input_error=getattr(it, "input_error", None),
             artifact_relocation=relocations.get(it.episode.qa_id),
             original_item=it if relocations else None,
+            binding_derivation_context=derivations.get(it.episode.qa_id),
         )
         for it in items
     ]

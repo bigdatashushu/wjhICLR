@@ -50,6 +50,9 @@ from skill3d.schemas import (
     V11ExperienceCase, V11ExperienceBundle, DataAccessRecord,
 )
 from skill3d.schemas.evidence import skill_evidence_state
+from skill3d.schemas.data_access import (
+    learning_authorization_for, validate_learning_authorization,
+)
 from pydantic import Field, model_validator
 from skill3d.skills.promote_atomic import read_snapshot
 from skill3d.skills.v11_library import (
@@ -95,8 +98,10 @@ class FitSetEvolutionConfig:
         if self.learning_input_mode not in {
                 "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"}:
             raise ValueError("unknown learning input mode")
-        if self.gate_mode not in {"same_question", "scene_disjoint"}:
+        if self.gate_mode not in {"same_question", "scene_disjoint", "qa_disjoint"}:
             raise ValueError("unknown gate mode")
+        if self.gate_mode == "qa_disjoint" and self.gate_seeds != (137, 138):
+            raise ValueError("qa_disjoint requires frozen dual seeds 137/138")
         if min(self.diagnosis_max_cases, self.diagnosis_max_input_chars,
                self.diagnosis_max_images, self.diagnosis_max_output_tokens) < 1:
             raise ValueError("diagnosis budgets must be positive")
@@ -112,6 +117,7 @@ class FitSetExperienceCase(Spec):
     evidence_state: Literal["g0m0", "g1m0", "g1m1"]
     source_split: Literal["induction", "inner_validation", "outer_holdout"]
     experiment_role: Literal["fit_set_learning"] = "fit_set_learning"
+    learning_authorization: dict = Field(default_factory=dict)
     delivered_skill_version: str
     delivered_content_sha256: str
     delivered_skill_md: str
@@ -128,6 +134,8 @@ class FitSetExperienceCase(Spec):
 
     @model_validator(mode="after")
     def _validate_identity(self):
+        if self.learning_authorization:
+            validate_learning_authorization(self.learning_authorization, [self.qa_id])
         if hashlib.sha256(self.delivered_skill_md.encode()).hexdigest() != (
                 self.delivered_content_sha256):
             raise ValueError("fit-set case delivery hash 改变")
@@ -147,6 +155,7 @@ class FitSetExperienceCase(Spec):
                 "qa_id", "scene_id", "question_type", "evidence_state", "source_split",
                 "delivered_skill_version", "delivered_content_sha256", "delivered_skill_md",
                 "score", "outcome", "trace_ref", "initial_evidence_states", "evidence_history",
+                "learning_authorization",
             ):
                 if getattr(self, field) != getattr(self.full_case, field):
                     raise ValueError(f"fit-set buffer/canonical case {field} mismatch")
@@ -285,8 +294,19 @@ def initialize_worker_library(
 
 def collect_fitset_case(variant: Mapping, outcome: Mapping,
                         parent: SkillSpecV11, label: Mapping,
-                        trace_ref: str) -> FitSetExperienceCase:
+                        trace_ref: str, *, experiment_split: Mapping | None = None,
+                        ) -> FitSetExperienceCase:
     """只从完成轨迹形成 learning case，不把框架故障归为方法经验。"""
+    authorization = (
+        learning_authorization_for(experiment_split, [variant["qa_id"]])
+        if experiment_split is not None else {})
+    if authorization:
+        _require(all(variant.get(field, "learning") == "learning"
+                     for field in ("experiment_role", "experiment_split")),
+                 "Validation role cannot enter learning case construction")
+        _require(variant.get("split") in {"induction", "inner_validation"}
+                 and variant.get("source_split", variant["split"]) == variant["split"],
+                 "Authorized learning must preserve the real source_split")
     key = f"{parent.skill_id}@{parent.version}"
     _require(outcome.get("delivered_skill_versions") == [key],
              "实际 Skill delivery 与槽位 parent 不一致")
@@ -328,6 +348,7 @@ def collect_fitset_case(variant: Mapping, outcome: Mapping,
         qa_id=variant["qa_id"], scene_id=variant["scene_id"],
         question_type=parent.question_type, evidence_state=parent.evidence_state,
         source_split=variant["split"],
+        learning_authorization=authorization,
         outcome="success" if score == 1 else "failure",
         delivered_skill_version=key, delivered_content_sha256=parent.content_sha256,
         delivered_skill_md=parent.skill_md, initial_evidence_states=initial,
@@ -422,6 +443,7 @@ class FitSetWorkerEvolution:
         }
 
     def ingest_result(self, variant, row):
+        authorization = self.runner.learning_authorization(variant)
         outcome_path = (self.runner.root / "variants"
                         / _variant_key(variant["variant_id"]) / "outcome.json")
         outcome = json.loads(outcome_path.read_text())
@@ -433,7 +455,9 @@ class FitSetWorkerEvolution:
                           variant["question_type"], variant["evidence_state"]))
         accessed_at = datetime.now(timezone.utc).isoformat()
         label = self.runner.label_metadata[variant["qa_id"]]
-        case = collect_fitset_case(variant, outcome, parent, label, str(outcome_path))
+        case = collect_fitset_case(
+            variant, outcome, parent, label, str(outcome_path),
+            experiment_split=self.runner.experiment_split)
         if self.config.learning_input_mode != "aggregate_v1":
             from skill3d.evolution.case_records_v11 import case_from_fitset_outcome
 
@@ -443,7 +467,8 @@ class FitSetWorkerEvolution:
                 full_case = V11ExperienceCase.model_validate_json(canonical_path.read_bytes())
                 _require(full_case.delivered_content_sha256 == parent.content_sha256
                          and full_case.qa_id == variant["qa_id"]
-                         and full_case.trace_ref == str(outcome_path),
+                         and full_case.trace_ref == str(outcome_path)
+                         and full_case.learning_authorization == authorization,
                          "canonical learning case identity changed")
             else:
                 full_case = case_from_fitset_outcome(
@@ -451,6 +476,7 @@ class FitSetWorkerEvolution:
                     trace_ref=str(outcome_path), question_text=source["question_text"],
                     options=source["options"], frame_set_hash=source["frame_set_hash"],
                     image_refs=source["image_refs"],
+                    experiment_split=self.runner.experiment_split,
                 )
                 _write_create_once(canonical_path, full_case.model_dump(mode="json"))
             case = FitSetExperienceCase.model_validate({
@@ -468,6 +494,8 @@ class FitSetWorkerEvolution:
                 "reference_answer_sha256": hashlib.sha256(
                     label["reference_answer"].encode()).hexdigest(),
         }
+        if authorization:
+            access["learning_authorization"] = authorization
         if access_path.exists():
             prior = json.loads(access_path.read_text())
             access["accessed_at"] = prior["accessed_at"]
@@ -501,7 +529,21 @@ class FitSetWorkerEvolution:
 
     def _gate(self, request, parent, candidate, attempt_root):
         panel_ids = self.runner.gate_panels[request.slot_key]
-        if len(panel_ids) < self.config.gate_size:
+        if self.config.gate_mode == "qa_disjoint":
+            learning_qa = {row["qa_id"] for row in self.runner.variants}
+            _require(not learning_qa & {self.rows[value]["qa_id"] for value in panel_ids},
+                     "gate QA overlaps learning QA")
+            _require(all(
+                self.runner.experiment_split["qa_roles"].get(self.rows[value]["qa_id"])
+                == "validation" for value in panel_ids),
+                "gate contains non-validation QA")
+            expected = [row["variant_id"] for row in self.runner.gate_variant_rows.values()
+                        if row["slot_key"] == request.slot_key]
+            _require(panel_ids == expected, "qa_disjoint must use all validation variants")
+        panel_size = (
+            len({self.rows[value]["qa_id"] for value in panel_ids})
+            if self.config.gate_mode == "qa_disjoint" else len(panel_ids))
+        if panel_size < self.config.gate_size:
             body = {
                 "passed": False, "conditions": {"gate_size": False},
                 "reason": "槽位题量不足冻结 gate_size", "arms": [],
@@ -536,9 +578,12 @@ class FitSetWorkerEvolution:
                 gate_runner._request_governor_root = self.runner.request_governor_root
                 gate_runner._request_category = "gate"
                 gate_runner.evolution_config = None
+                gate_runner._qa_disjoint_gate = self.config.gate_mode == "qa_disjoint"
                 gate_runner.capture_offline_case_input = False
                 gate_runner.label_metadata = {}
-                if gate_runner.published_inputs is not None:
+                gate_runner.experiment_split = None
+                gate_runner.gate_deferred_reasons = {}
+                if gate_runner.published_inputs is not None or gate_runner._qa_disjoint_gate:
                     gate_runner.input_contract_identity = copy.deepcopy(
                         self.runner.input_contract_identity)
                     gate_runner.input_contract_identity.pop("offline_metadata", None)
@@ -721,6 +766,25 @@ class FitSetWorkerEvolution:
         if result_path.exists():
             return StreamingAttemptResult(**json.loads(result_path.read_text()))
         parent = self._parent_for(request)
+        if self.config.gate_mode == "qa_disjoint":
+            for case in request.cases:
+                validate_learning_authorization(
+                    case.learning_authorization, [case.qa_id], self.runner.experiment_split)
+            reason = self.runner.gate_deferred_reasons.get(request.slot_key)
+            if reason:
+                # Admission is deferred, not the learning stream's batch window.
+                result = StreamingAttemptResult(
+                    outcome="no_change", campaign_id=token, reason=reason)
+                _write_create_once(root / "gate_deferred.json", {
+                    "admission_status": "deferred", "learning_continues": True,
+                    "reason": reason, "gate_size": self.config.gate_size,
+                    "panel_ids": self.runner.gate_panels[request.slot_key],
+                    "run_identity": self.runner.run_identity,
+                    "parent_hash": parent.content_sha256,
+                    "case_ids": [case.case_id for case in request.cases],
+                })
+                _write_create_once(result_path, asdict(result))
+                return result
         feedback = sanitized_slot_feedback(request.cases)
         _write_create_once(root / "feedback.json", feedback)
         _write_create_once(root / "request.json", {
@@ -802,6 +866,7 @@ class FitSetWorkerEvolution:
             max_attempts=schedule["revision_attempt_budget"],
             max_tokens=self.config.max_tokens,
             method_context_max_chars=self.runner.base_cfg.retrieval_policy.method_context_max_chars,
+            experiment_split=self.runner.experiment_split,
         )
         _require(not leakage_scan_text(
             json.dumps(feedback), forbidden_sample_ids=forbidden),
@@ -819,23 +884,38 @@ class FitSetWorkerEvolution:
                          == [case.case_id for case in full_cases],
                          "canonical experience changed during resume")
             else:
-                access = DataAccessRecord(
-                    record_id=f"fit-label-access-{token}",
-                    at=datetime.now(timezone.utc).isoformat(), split="induction",
-                    purpose="skill_induction", component_role="inducer",
-                    run_id=token, n_items=len(full_cases), label_access=True,
-                    input_manifest_sha256=content_sha256(
-                        [case.model_dump(mode="json") for case in full_cases]),
-                    source_refs=[case.trace_ref for case in full_cases],
-                    notes=["Question-level induction labels only; no GT 3D access"],
-                )
+                accesses = []
+                for source in sorted({case.source_split for case in full_cases}):
+                    source_cases = [case for case in full_cases if case.source_split == source]
+                    accesses.append(DataAccessRecord(
+                        record_id=f"fit-label-access-{token}-{source}",
+                        at=datetime.now(timezone.utc).isoformat(), split=source,
+                        purpose="skill_induction", component_role="inducer",
+                        run_id=token, n_items=len(source_cases), label_access=True,
+                        input_manifest_sha256=content_sha256(
+                            [case.model_dump(mode="json") for case in source_cases]),
+                        source_refs=[case.trace_ref for case in source_cases],
+                        notes=["Authorized learning question labels only; no GT 3D access"],
+                        learning_authorization=(
+                            learning_authorization_for(self.runner.experiment_split, [
+                                case.qa_id for case in source_cases])
+                            if self.runner.experiment_split is not None else {}),
+                    ))
+                sources = [access.split for access in accesses]
                 experience = V11ExperienceBundle(
                     campaign_id=token, parent_snapshot_id=request.parent_snapshot_id,
                     parent_skill_version=request.parent_skill_version,
                     parent_content_sha256=parent.content_sha256,
                     question_type=parent.question_type, evidence_state=parent.evidence_state,
-                    source_split="induction", split="learning", label_access=True,
-                    source_run_ref=str(root), label_access_record=access, cases=full_cases,
+                    source_split=sources[0] if len(sources) == 1 else sources,
+                    split="learning", label_access=True,
+                    learning_authorization=(
+                        learning_authorization_for(self.runner.experiment_split, [
+                            case.qa_id for case in full_cases])
+                        if self.runner.experiment_split is not None else {}),
+                    source_run_ref=str(root), label_access_record=accesses[0],
+                    label_access_records=accesses if self.runner.experiment_split is not None else [],
+                    cases=full_cases,
                 )
                 _write_create_once(bundle_path, experience.model_dump(mode="json"))
             if self.config.learning_input_mode.startswith("diagnosis"):

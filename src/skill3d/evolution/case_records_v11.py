@@ -12,6 +12,7 @@ from typing import Any
 from skill3d.evaluation.mra import parse_numeric_answer
 from skill3d.routing.task_classifier import canonical_task
 from skill3d.schemas import DataAccessRecord, SkillSpecV11, V11ExperienceCase, utcnow_iso
+from skill3d.schemas.data_access import learning_authorization_for
 from skill3d.schemas.evidence import EvidenceProfile, skill_evidence_state
 
 
@@ -343,15 +344,30 @@ def case_from_fitset_outcome(
     *, variant: Mapping, outcome: Any, parent: SkillSpecV11, label: Mapping,
     trace_ref: str, question_text: str, options: Sequence[str],
     frame_set_hash: str = "", image_refs: Sequence[Mapping] = (),
+    experiment_split: Mapping | None = None,
 ) -> V11ExperienceCase:
     """Admit one induction outcome offline; no I/O or online label access.
 
     The first round's experience_provenance carries the question-level offline
     DataAccessRecord. Raw round facts and their online label flags stay unchanged.
     """
-    _require(variant.get("split") == "induction"
-             and variant.get("source_split", "induction") == "induction",
-             "Fit-set learning accepts induction only")
+    source_split = variant.get("split")
+    authorization = {}
+    if experiment_split is not None:
+        try:
+            authorization = learning_authorization_for(experiment_split, [variant.get("qa_id")])
+        except ValueError as exc:
+            raise V11ExperienceBuildError(str(exc)) from exc
+        _require(all(variant.get(field, "learning") == "learning"
+                     for field in ("experiment_role", "experiment_split")),
+                 "Validation role cannot enter learning case construction")
+        _require(source_split in {"induction", "inner_validation"}
+                 and variant.get("source_split", source_split) == source_split,
+                 "Authorized learning must preserve the real source_split")
+    else:
+        _require(source_split == "induction"
+                 and variant.get("source_split", "induction") == "induction",
+                 "Fit-set learning accepts induction only")
     _require(bool(str(trace_ref).strip()) and bool(str(question_text).strip()),
              "trace_ref and original question_text are required")
     recorded = _mapping(outcome)
@@ -372,7 +388,7 @@ def case_from_fitset_outcome(
                  "Outcome canonical task mismatch")
     for field in ("split", "source_split"):
         if field in recorded:
-            _require(recorded[field] == "induction", "Outcome is not induction")
+            _require(recorded[field] == source_split, "Outcome source split mismatch")
     rows = _validate_fitset_trace(recorded, parent)
     initial = deepcopy(recorded.get("initial_evidence_states") or {})
     history = deepcopy(recorded.get("evidence_history") or [])
@@ -467,14 +483,15 @@ def case_from_fitset_outcome(
     })
     access = DataAccessRecord(
         record_id=f"label-access-{identity[:20]}", at=utcnow_iso(),
-        split="induction", purpose="skill_induction", component_role="inducer",
+        split=source_split, purpose="skill_induction", component_role="inducer",
         run_id=str(variant["variant_id"]), n_items=1, label_access=True,
         input_manifest_sha256=_sha256({
             "qa_id": qa_id, "scene_id": scene_id, "question_type": parent.question_type,
             "options": list(options), "reference_answer": reference,
         }),
         source_refs=[trace_ref, f"offline-question-label:{qa_id}"],
-        notes=["Only this induction question's label was read offline; no GT 3D access"],
+        notes=["Only this authorized learning question's label was read offline; no GT 3D access"],
+        learning_authorization=authorization,
     )
     rounds[0]["experience_provenance"]["offline_label_access_record"] = access.model_dump(mode="json")
     observations = collect_case_tool_observations(recorded, recorded.get("program_trace"))
@@ -484,7 +501,8 @@ def case_from_fitset_outcome(
         case_id=f"case-{identity[:20]}", qa_id=qa_id, scene_id=scene_id,
         question_type=parent.question_type, evidence_state=parent.evidence_state,
         question_text=question_text, options=list(options),
-        source_split="induction", split="learning", label_access=True,
+        source_split=source_split, split="learning", label_access=True,
+        learning_authorization=authorization,
         outcome="success" if score == 1 else "failure",
         episode_status=recorded["episode_status"],
         delivered_skill_version=key, delivered_content_sha256=parent.content_sha256,

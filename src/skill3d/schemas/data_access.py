@@ -27,7 +27,12 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
+import json
+import re
+from typing import Mapping, Sequence
 
 from pydantic import model_validator
 
@@ -44,6 +49,85 @@ ACCESS_PURPOSES = ("skill_induction", "candidate_admission_panel", "learning_run
 
 # 拒收原因码（§14.1 硬隔离；当前只有一类：不属于本次读取允许的学习划分）
 REFUSAL_REASON_CODES = frozenset({"not_in_learning_split"})
+
+EXPERIMENT_QA_ROLE_SCHEMA = "harness3d-experiment-qa-roles/1.0"
+
+
+def _identity_sha256(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def normalize_experiment_split(value: Mapping) -> dict:
+    """Freeze a QA-role overlay without changing any catalog split."""
+    body = deepcopy(dict(value))
+    claimed = body.pop("identity_sha256", None)
+    roles_hash = body.pop("qa_roles_sha256", None)
+    body.setdefault("schema_version", EXPERIMENT_QA_ROLE_SCHEMA)
+    if body["schema_version"] != EXPERIMENT_QA_ROLE_SCHEMA:
+        raise ValueError("unknown experiment QA role schema")
+    if not isinstance(body.get("protocol"), str) or not body["protocol"].strip():
+        raise ValueError("experiment_split requires an explicit protocol")
+    roles = body.get("qa_roles")
+    if not isinstance(roles, dict) or not roles or any(
+        not isinstance(key, str) or not key.strip()
+        or role not in {"learning", "validation"} for key, role in roles.items()
+    ):
+        raise ValueError("qa_roles must map nonempty QA IDs to learning/validation")
+    manifest = body.get("manifest_identity")
+    if not isinstance(manifest, dict) or not any(
+        re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(key, "")))
+        for key in ("sha256", "identity_sha256")
+    ):
+        raise ValueError("experiment_split requires a hashed manifest_identity")
+    actual_roles = _identity_sha256(roles)
+    if roles_hash is not None and roles_hash != actual_roles:
+        raise ValueError("experiment QA role map hash changed")
+    body["qa_roles_sha256"] = actual_roles
+    actual = _identity_sha256(body)
+    if claimed is not None and claimed != actual:
+        raise ValueError("experiment_split identity hash changed")
+    return {**body, "identity_sha256": actual}
+
+
+def learning_authorization_for(experiment_split: Mapping, qa_ids: Sequence[str]) -> dict:
+    overlay = normalize_experiment_split(experiment_split)
+    ids = sorted(set(qa_ids))
+    if not ids or any(overlay["qa_roles"].get(qa) != "learning" for qa in ids):
+        raise ValueError("validation or unmapped QA cannot enter learning")
+    return {
+        "gate_mode": "qa_disjoint", "experiment_role": "learning", "qa_ids": ids,
+        "protocol": overlay["protocol"], "manifest_identity": overlay["manifest_identity"],
+        "qa_roles_sha256": overlay["qa_roles_sha256"],
+        "experiment_split_sha256": overlay["identity_sha256"],
+    }
+
+
+def validate_learning_authorization(
+    authorization: Mapping, qa_ids: Sequence[str], experiment_split: Mapping | None = None,
+) -> None:
+    """Check the scoped receipt; consumers also bind it to the frozen overlay."""
+    ids = sorted(set(qa_ids))
+    if (
+        not ids or authorization.get("qa_ids") != ids
+        or authorization.get("gate_mode") != "qa_disjoint"
+        or authorization.get("experiment_role") != "learning"
+        or not authorization.get("protocol")
+        or not isinstance(authorization.get("manifest_identity"), dict)
+        or any(not re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(key, "")))
+               for key in ("qa_roles_sha256", "experiment_split_sha256"))
+    ):
+        raise ValueError("missing or invalid explicit learning authorization")
+    manifest = authorization["manifest_identity"]
+    if not any(re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(key, "")))
+               for key in ("sha256", "identity_sha256")):
+        raise ValueError("learning authorization lacks manifest identity")
+    if experiment_split is not None and dict(authorization) != learning_authorization_for(
+        experiment_split, ids,
+    ):
+        raise ValueError("learning authorization differs from frozen QA role map")
 
 
 def utcnow_iso() -> str:
@@ -75,6 +159,7 @@ class DataAccessRecord(Spec):
     # 实际读取的路径/glob（生产入口传入，不猜）
     source_refs: list[str] = []
     notes: list[str] = []
+    learning_authorization: dict = {}
 
     @model_validator(mode="after")
     def _check(self) -> "DataAccessRecord":
@@ -87,7 +172,16 @@ class DataAccessRecord(Spec):
             raise ValueError(
                 f"未登记的用途: {self.purpose!r}（可选 {ACCESS_PURPOSES}）")
         # §14.1：只有学习划分的标签可以记 label_access
-        if self.label_access and self.split != "induction":
+        if self.learning_authorization:
+            validate_learning_authorization(
+                self.learning_authorization, self.learning_authorization.get("qa_ids", []))
+            if (self.split not in {"induction", "inner_validation"}
+                    or self.component_role != "inducer"
+                    or self.purpose != "skill_induction"
+                    or not self.label_access
+                    or len(self.learning_authorization["qa_ids"]) != self.n_items):
+                raise ValueError("invalid experiment learning label access")
+        if self.label_access and self.split != "induction" and not self.learning_authorization:
             raise ValueError(
                 "label_access=True 只对学习划分（induction）成立（§14.1）")
         if self.refused:
@@ -106,5 +200,9 @@ __all__ = [
     "DATA_SPLITS",
     "REFUSAL_REASON_CODES",
     "DataAccessRecord",
+    "EXPERIMENT_QA_ROLE_SCHEMA",
+    "learning_authorization_for",
+    "normalize_experiment_split",
+    "validate_learning_authorization",
     "utcnow_iso",
 ]

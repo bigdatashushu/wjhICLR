@@ -228,7 +228,9 @@ class PreparedBindingStore:
         scene_artifact: str | Path,
         scene_input_identity: Mapping,
         binding: PreparedObjectBinding,
+        scene_migration_receipt: Mapping | str | Path | None = None,
     ) -> dict:
+        """Publish locally, or keep a fully receipted original logical scene ref."""
         key = self.key_for(request_identity)
         target = self.entry_path(key)
         self.staging.mkdir(parents=True, exist_ok=True)
@@ -274,11 +276,28 @@ class PreparedBindingStore:
                 raise PreparedBindingStoreError(
                     "scene input identity differs from binding request"
                 )
+            scene_ref = str(scene_path)
+            if scene_migration_receipt is not None:
+                try:
+                    resolver = validate_relocation_receipt(
+                        scene_migration_receipt,
+                        expected_input_sha256=input_sha256,
+                        expected_artifact_identity=file_identity(scene_path),
+                        expected_source_artifact=scene_input_identity["artifact_path"],
+                    )
+                    resolver.validate_input_identity(scene_input_identity)
+                    if resolver.artifact_path != scene_path:
+                        raise RelocationError("publication scene is not the receipted artifact")
+                    scene_ref = str(scene_input_identity["artifact_path"])
+                except (RelocationError, KeyError) as exc:
+                    raise PreparedBindingStoreError(
+                        f"prepared binding publication relocation rejected: {exc}"
+                    ) from exc
             manifest_body = {
                 "schema_version": STORE_SCHEMA_VERSION,
                 "key": key,
                 "request_identity": dict(request_identity),
-                "scene_artifact_ref": str(scene_path),
+                "scene_artifact_ref": scene_ref,
                 "scene_artifact_json": file_identity(scene_path),
                 "scene_input_identity_sha256": input_sha256,
                 "binding_generation_sha256": str(

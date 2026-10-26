@@ -342,9 +342,11 @@ def test_fit_bundle_freezes_exact_slots_and_preserves_other_parents(tmp_path):
     candidates = {}
     for index, slot in enumerate(selected, start=1):
         parent = parents[slot]
+        parent_parts = [int(part) for part in parent.version.split(".")]
+        candidate_version = f"{parent_parts[0]}.{parent_parts[1] + 1}.0"
         candidates[slot] = SkillSpecV11(
             skill_id=parent.skill_id,
-            version="1.1.0",
+            version=candidate_version,
             question_type=parent.question_type,
             evidence_state=parent.evidence_state,
             skill_md=(
