@@ -239,7 +239,9 @@ def _inventory(root: Path) -> list[dict]:
             raise IntegrityError("archive source must contain only files/directories")
         if len(members) > _MAX_MEMBERS:
             raise IntegrityError("too many archive members")
-    return members
+    # Path orders components; the wire protocol orders whole POSIX strings.
+    # A sibling ``buffer.lock`` sorts before ``buffer/stream.json`` on the wire.
+    return sorted(members, key=lambda member: member["path"])
 
 
 @dataclass(frozen=True)
@@ -565,6 +567,33 @@ class _LimitedWriter:
         return self.stream.fileno()
 
 
+class _ArchiveWriter:
+    """Internal compressor only: a fully reserved file and a strict byte cap."""
+
+    def __init__(self, reservation, stream):
+        self.reservation, self.stream = reservation, stream
+        self.written = 0
+
+    def write(self, data):
+        if self.reservation.closed:
+            raise StorageError("archive reservation is closed")
+        if self.written + len(data) > self.reservation.bytes:
+            raise QuotaExceeded("archive exceeds its compression reservation")
+        if self.reservation.cache.disk_usage(self.reservation.cache.root).free < (
+            self.reservation.cache.min_free_bytes
+        ):
+            raise QuotaExceeded("archive crosses the free-space floor")
+        count = self.stream.write(data)
+        self.written += count
+        return count
+
+    def flush(self):
+        return self.stream.flush()
+
+    def tell(self):
+        return self.written
+
+
 class Reservation:
     """A cross-process byte reservation and crash-recoverable staging tree."""
 
@@ -594,6 +623,36 @@ class Reservation:
             stream.flush()
             os.fsync(stream.fileno())
 
+    @contextmanager
+    def _archive_stream(self):
+        """Reserve the entire worst-case archive before trusted compression.
+
+        Preallocation counts the whole envelope immediately, avoiding repeated
+        whole-cache walks for each small gzip block. The generic writer remains
+        responsible for arbitrary producers; this stream is private to archiving.
+        """
+        with self.cache._locked() as state:
+            self._check(state)
+            self.cache._fits(state, 0)
+            fd = os.open(self.path / "archive.tar.gz",
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb", buffering=0) as stream:
+            allocate = getattr(os, "posix_fallocate", None)
+            if allocate is not None and self.bytes:
+                allocate(stream.fileno(), 0, self.bytes)
+            else:
+                stream.truncate(self.bytes)
+            writer = _ArchiveWriter(self, stream)
+            yield writer
+            stream.truncate(writer.written)
+            stream.flush()
+            os.fsync(stream.fileno())
+            with self.cache._locked() as state:
+                self._check(state)
+                if _tree_bytes(self.path) > self.charged_bytes:
+                    raise QuotaExceeded("archive allocated more than its envelope")
+                self.cache._fits(state, 0)
+
     def write_bytes(self, relative: str, data: bytes):
         with self.open(relative) as stream:
             for start in range(0, len(data), _BLOCK):
@@ -602,8 +661,10 @@ class Reservation:
     def commit(
         self, key: str, *, kind: str = "input", payload: str = "payload",
         slots: tuple[str, ...] = (), validator: Callable[[Path], object] | None = None,
+        workspace_bytes: int | None = None,
     ) -> Path:
-        return self.cache._publish(self, key, kind, payload, slots, validator)
+        return self.cache._publish(self, key, kind, payload, slots, validator,
+                                   workspace_bytes)
 
     def close(self):
         if self.closed:
@@ -633,11 +694,41 @@ class Reservation:
         self.close()
 
 
+@dataclass
+class WorkspaceLease:
+    """Trusted mutable IO budget, valid during an exclusive workspace lease."""
+
+    cache: HotCache
+    key: str
+    path: Path
+    bytes: int
+    charged_bytes: int
+    active: bool = True
+
+    def check_growth(self, *, logical_bytes: int = 0, allocation_bytes: int = 0):
+        logical_bytes, allocation_bytes = _count(logical_bytes), _count(allocation_bytes)
+        if not self.active:
+            raise StorageError("workspace lease is closed")
+        with self.cache._locked() as state:
+            row = state["entries"].get(self.key)
+            if row is None or row["kind"] != "workspace" or not row["ready"]:
+                raise StorageError("workspace is not published")
+            if _tree_bytes(self.path, logical=True) + logical_bytes > self.bytes or (
+                _tree_bytes(self.path) + allocation_bytes > self.charged_bytes
+            ):
+                raise QuotaExceeded("workspace write exceeds its persistent growth envelope")
+            self.cache._fits(state, 0)
+            if self.cache.disk_usage(self.cache.root).free < (
+                self.cache.min_free_bytes + allocation_bytes
+            ):
+                raise QuotaExceeded("workspace write crosses filesystem free-space floor")
+
+
 class HotCache:
     """One quota for inputs, results, compression/download temp and checkpoints."""
 
-    _SLOTS = {"current", "next", "latest", "best"}
-    _KINDS = {"input", "result", "checkpoint"}
+    _SLOTS = {"current", "next", "latest", "best", "global", "state"}
+    _KINDS = {"input", "result", "checkpoint", "workspace"}
 
     def __init__(
         self, root: str | Path, *, quota_bytes: int = DEFAULT_QUOTA_BYTES,
@@ -693,8 +784,13 @@ class HotCache:
         return self.root / "locks" / ("e-" + _digest(_name(key)))
 
     def _unwritten(self, state: dict) -> int:
-        return sum(max(0, r["charged_bytes"] - _tree_bytes(self.root / "work" / token))
-                   for token, r in state["reservations"].items())
+        scratch = sum(max(0, r["charged_bytes"] - _tree_bytes(self.root / "work" / token))
+                      for token, r in state["reservations"].items())
+        workspaces = sum(
+            max(0, row["workspace_charged_bytes"] - _tree_bytes(self._entry_path(key)))
+            for key, row in state["entries"].items()
+            if row["kind"] == "workspace" and row["ready"])
+        return scratch + workspaces
 
     def _fits(self, state: dict, additional: int):
         unwritten = self._unwritten(state)
@@ -710,6 +806,8 @@ class HotCache:
         return key in state["slots"].values()
 
     def _deletable(self, state: dict, key: str, row: dict) -> bool:
+        if row["kind"] == "workspace":
+            return False
         if self._pinned(state, key) or not row["ready"]:
             return False
         if row["kind"] == "input":
@@ -718,6 +816,8 @@ class HotCache:
 
     def _delete(self, state: dict, key: str):
         row = state["entries"][key]
+        if row["kind"] == "workspace":
+            raise StorageError("mutable workspaces cannot be deleted by cache collection")
         if row["kind"] != "input" or row["archive"] is not None:
             data = _manifest(row["archive"])
             _check_ack(row["ack"], data)
@@ -789,17 +889,25 @@ class HotCache:
                     shutil.rmtree(path)
                 raise
 
-    def _publish(self, reservation, key, kind, payload, slots, validator):
+    def _publish(self, reservation, key, kind, payload, slots, validator,
+                 workspace_bytes=None):
         _name(key)
         if kind not in self._KINDS:
             raise StorageError("unknown cache entry kind")
-        compatible = {"input": {"current", "next"}, "result": set(),
-                      "checkpoint": {"latest", "best"}}
+        if workspace_bytes is not None:
+            if kind != "workspace" or _count(workspace_bytes) > reservation.bytes:
+                raise StorageError("workspace ceiling must already be reserved")
+        elif kind == "workspace":
+            workspace_bytes = reservation.bytes
+        compatible = {"input": {"current", "next", "global"}, "result": {"state"},
+                      "checkpoint": {"latest", "best"}, "workspace": {"state"}}
         if any(slot not in compatible[kind] for slot in slots):
             raise StorageError("slot is incompatible with entry kind")
         source = reservation.path / _ref(payload)
         if not source.is_dir() or source.is_symlink():
             raise IntegrityError("published payload must be a directory")
+        if kind == "workspace" and _tree_bytes(source, logical=True) > workspace_bytes:
+            raise QuotaExceeded("initial state exceeds the workspace ceiling")
         if validator is not None:
             validator(source)
         _fsync_tree(source)
@@ -817,6 +925,9 @@ class HotCache:
                 "archive": None, "archive_ready": False, "ack": None,
                 "staging": reservation.token + "/" + payload,
             }
+            if kind == "workspace":
+                row["workspace_bytes"] = workspace_bytes
+                row["workspace_charged_bytes"] = reservation.charged_bytes
             state["entries"][key] = row
             for slot in slots:
                 state["slots"][slot] = key
@@ -826,6 +937,8 @@ class HotCache:
             _fsync_dir(reservation.path)
             row["ready"] = True
             row.pop("staging")
+            if kind == "workspace":
+                state["reservations"][reservation.token]["charged_bytes"] = 0
             self._save(state)
         reservation.close()
         return self._entry_path(key)
@@ -836,13 +949,106 @@ class HotCache:
         output_bytes: int = 0, allocation_bytes: int | None = None,
         slots: tuple[str, ...] = (),
         validator: Callable[[Path], object] | None = None,
+        workspace_bytes: int | None = None,
     ) -> Path:
         """Invoke a real producer; its payload goes under reservation.path/payload."""
+        if workspace_bytes is not None:
+            if kind != "workspace":
+                raise StorageError("only workspaces have a mutable ceiling")
+            output_bytes = max(_count(output_bytes), _count(workspace_bytes))
         with self.reserve(download_bytes=download_bytes, extract_bytes=extract_bytes,
                           output_bytes=output_bytes, allocation_bytes=allocation_bytes) as reservation:
             (reservation.path / "payload").mkdir()
             producer(reservation)
-            return reservation.commit(key, kind=kind, slots=slots, validator=validator)
+            return reservation.commit(key, kind=kind, slots=slots, validator=validator,
+                                      workspace_bytes=workspace_bytes)
+
+    def new_workspace(
+        self, key: str, producer: Callable[[Reservation], object], *,
+        initial_bytes: int, growth_bytes: int = 0, allocation_bytes: int | None = None,
+        validator: Callable[[Path], object] | None = None,
+    ) -> Path:
+        """Admit initial state and future growth before invoking trusted seed IO."""
+        return self.populate(
+            key, producer, kind="workspace", output_bytes=_count(initial_bytes),
+            workspace_bytes=_count(initial_bytes) + _count(growth_bytes),
+            allocation_bytes=allocation_bytes, validator=validator)
+
+    def adopt_workspace(
+        self, key: str, *, growth_bytes: int = 0,
+        workspace_bytes: int | None = None, allocation_bytes: int | None = None,
+    ) -> Path:
+        """Promote an unarchived staged result in place after growth admission."""
+        _count(growth_bytes)
+        if workspace_bytes is not None:
+            _count(workspace_bytes)
+        if allocation_bytes is not None:
+            _count(allocation_bytes)
+        with self.lease(key, exclusive=True) as path:
+            with self._locked() as state:
+                row = state["entries"][key]
+                if row["kind"] not in {"result", "workspace"} or row["archive"] is not None:
+                    raise StorageError("only an unarchived result/workspace can be adopted")
+                logical, physical = _tree_bytes(path, logical=True), _tree_bytes(path)
+                if workspace_bytes is not None and workspace_bytes < logical + growth_bytes:
+                    raise QuotaExceeded("workspace ceiling cannot cover state and requested growth")
+                limit = logical + growth_bytes if workspace_bytes is None else workspace_bytes
+                if allocation_bytes is not None and allocation_bytes < max(physical, limit):
+                    raise QuotaExceeded("workspace allocation ceiling is too small")
+                charged = _rounded(max(physical, limit, allocation_bytes or 0),
+                                   _allocation_unit(path)) + _HEADROOM
+                previous = max(0, row.get("workspace_charged_bytes", physical) - physical)
+                limit = max(limit, row.get("workspace_bytes", 0))
+                charged = max(charged, row.get("workspace_charged_bytes", 0))
+                self._make_space(state, max(0, charged - physical - previous))
+                row["kind"] = "workspace"
+                row["workspace_bytes"], row["workspace_charged_bytes"] = limit, charged
+                self._fits(state, 0)
+                self._save(state)
+            return path
+
+    @contextmanager
+    def workspace_lease(
+        self, key: str, *, growth_bytes: int | None = None,
+        allocation_bytes: int | None = None,
+    ) -> Iterator[WorkspaceLease]:
+        """Persist peak growth before mutation; crashes retain bytes and budget."""
+        if growth_bytes is not None:
+            _count(growth_bytes)
+        if allocation_bytes is not None:
+            _count(allocation_bytes)
+            if growth_bytes is None:
+                raise StorageError("allocation estimate requires a logical growth estimate")
+        with self.lease(key, exclusive=True) as path:
+            with self._locked() as state:
+                row = state["entries"][key]
+                if row["kind"] != "workspace":
+                    raise StorageError("mutable lease requires a workspace")
+                if growth_bytes is not None:
+                    physical = _tree_bytes(path)
+                    allocated = growth_bytes if allocation_bytes is None else allocation_bytes
+                    charged = max(
+                        row["workspace_charged_bytes"],
+                        physical + _rounded(max(growth_bytes, allocated),
+                                            _allocation_unit(path)) + _HEADROOM)
+                    previous = max(0, row["workspace_charged_bytes"] - physical)
+                    self._make_space(state, max(0, charged - physical - previous))
+                    row["workspace_bytes"] = max(
+                        row["workspace_bytes"], _tree_bytes(path, logical=True) + growth_bytes)
+                    row["workspace_charged_bytes"] = charged
+                    self._fits(state, 0)
+                    self._save(state)
+                budget = WorkspaceLease(self, key, path, row["workspace_bytes"],
+                                        row["workspace_charged_bytes"])
+            try:
+                budget.check_growth()
+                yield budget
+            finally:
+                try:
+                    _fsync_tree(path)
+                    budget.check_growth()
+                finally:
+                    budget.active = False
 
     @contextmanager
     def lease(self, key: str, *, exclusive: bool = False) -> Iterator[Path]:
@@ -876,8 +1082,11 @@ class HotCache:
                 state["slots"].pop(slot, None)
             else:
                 row = state["entries"].get(key)
-                expected = "input" if slot in {"current", "next"} else "checkpoint"
-                if row is None or not row["ready"] or row["kind"] != expected:
+                expected = (
+                    "input" if slot in {"current", "next", "global"}
+                    else "result" if slot == "state" else "checkpoint")
+                if row is None or not row["ready"] or not (
+                    row["kind"] == expected or slot == "state" and row["kind"] == "workspace"):
                     raise StorageError("slot requires a published compatible entry")
                 state["slots"][slot] = key
             self._save(state)
@@ -916,7 +1125,7 @@ class HotCache:
             if compression_bytes is not None:
                 budget = _count(compression_bytes)
             with self.reserve(compression_bytes=budget) as reservation:
-                with reservation.open("archive.tar.gz") as raw:
+                with reservation._archive_stream() as raw:
                     with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as zipped:
                         with tarfile.open(fileobj=zipped, mode="w|", format=tarfile.USTAR_FORMAT) as tar:
                             for member in members:
@@ -1070,6 +1279,10 @@ class HotCache:
                             _fsync_dir(final.parent)
                             row["ready"] = True
                             row.pop("staging")
+                            if row["kind"] == "workspace":
+                                reservation = state["reservations"].get(staging.split("/")[0])
+                                if reservation is not None:
+                                    reservation["charged_bytes"] = 0
                         else:
                             # No published bytes exist; never treat this as a
                             # completed result or call a producer to reconstruct it.

@@ -214,9 +214,11 @@ def _execute_locked(runner, pending, accept):
                             skill.model_dump(mode="json") for skill in skills]),
                         "run_identity": runner.run_identity,
                     }
-                    _write_create_once(
-                        dispatch_path, frozen,
-                    )
+                    if prior is None:
+                        _write_create_once(dispatch_path, frozen)
+                    else:
+                        _require(content_sha256(prior) == content_sha256(frozen),
+                                 "unfinished dispatch identity changed")
                     inflight[row["variant_id"]] = row
                     jobs.put((dict(row), skills, identity))
                     events.append({"kind": "dispatched", **frozen, "at": time.time()})

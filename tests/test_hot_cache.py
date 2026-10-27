@@ -144,6 +144,18 @@ class HotCacheTests(unittest.TestCase):
             self.assertEqual((r.path / "too-large.bin").stat().st_size, 0)
         self.assertEqual(self.cache.stats()["reservations"], 0)
 
+    def test_archive_orders_directory_children_and_dotted_siblings_on_wire(self):
+        def produce(reservation):
+            reservation.write_bytes("payload/worker/buffer/stream.json", b"state")
+            reservation.write_bytes("payload/worker/buffer.lock", b"lock")
+        self.cache.populate("state-delta", produce, kind="checkpoint", output_bytes=9)
+        package = self.package("state-delta")
+        refs = [member["path"] for member in package.manifest["members"]]
+        self.assertEqual(refs, sorted(refs))
+        self.assertLess(refs.index("worker/buffer.lock"), refs.index("worker/buffer/stream.json"))
+        ack = self.receiver.receive(package.path, package.manifest)
+        self.assertEqual(ack.identity.sha256, package.manifest["sha256"])
+
     def test_shared_quota_denies_second_reservation(self):
         with self.cache.reserve(output_bytes=3 * MiB):
             with self.assertRaises(QuotaExceeded):
@@ -582,6 +594,17 @@ class HotCacheTests(unittest.TestCase):
         self.package("b", shard="b")
         acks = self.cache.transfer_pending(self.receiver, delete_acked=True)
         self.assertEqual(len(acks), 2)
+        self.assertEqual(self.cache.stats()["entries"], [])
+
+    def test_compression_does_not_scan_the_whole_cache_for_every_gzip_block(self):
+        import skill3d.storage.hot_cache as module
+        self.put(data=os.urandom(MiB))
+        with patch.object(module, "_tree_bytes", wraps=module._tree_bytes) as walks:
+            package = self.package()
+        self.assertLess(walks.call_count, 100)
+        self.assertEqual(package.path.stat().st_size, package.manifest["archive_bytes"])
+        ack = self.cache.transfer_one("result", self.receiver, delete_acked=True)
+        self.assertIsNotNone(ack)
         self.assertEqual(self.cache.stats()["entries"], [])
 
 

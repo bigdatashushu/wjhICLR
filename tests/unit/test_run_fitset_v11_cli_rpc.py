@@ -277,7 +277,7 @@ def test_missing_rpc_configuration_fails_without_reading_upstream_key_or_health(
 
 @pytest.mark.parametrize("extra,message", [
     (["--perception-capacity", "0"], "capacity must be frozen"),
-    (["--perception-capacity", "9"], "capacity must be frozen"),
+    (["--perception-capacity", "65"], "capacity must be frozen"),
     (["--perception-capacity", "-1"], "capacity must be frozen"),
     (["--request-concurrency", "9"], "exceeds frozen"),
     (["--request-concurrency", "0"], "exceeds frozen"),

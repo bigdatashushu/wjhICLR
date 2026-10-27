@@ -351,9 +351,11 @@ class _RevisionClientFactory:
 class _GateClientFactory:
     config: dict
     perception_endpoint: str = ""
+    framework_state_io: object = None
 
     def __call__(self, seed: int, output: Path):
-        return _SeededClientFactory(self.config, seed, output, self.perception_endpoint)
+        return _SeededClientFactory(self.config, seed, output, self.perception_endpoint,
+                                    self.framework_state_io)
 
 
 @dataclass(frozen=True)
@@ -362,6 +364,9 @@ class _SeededClientFactory:
     seed: int
     output: Path
     perception_endpoint: str = ""
+    framework_state_io: object = None
+    perception_capacity: int = 0
+    deferred_admission: bool = False
 
     def __call__(self, variant_id: str):
         from skill3d.evaluation.fitset_v11 import _variant_key
@@ -370,10 +375,62 @@ class _SeededClientFactory:
         client = _RevisionClientFactory(
             self.config, online_model_from(self.config).max_tokens,
             self.perception_endpoint)()
+        if self.deferred_admission:
+            _admit_solver_client(client, self.perception_endpoint, self.perception_capacity)
         return SeededGateClient(
             client, self.seed,
             self.output / "request_seeds" / (_variant_key(variant_id) + ".json"),
+            framework_state_io=self.framework_state_io,
         )
+
+    def resume_after_cached_prefix(self, variant_id: str, *, calls):
+        from skill3d.evaluation.cached_episode_recovery_v11 import (
+            RecoveryStop, resumed_seeded_gate_client,
+        )
+        from skill3d.evaluation.fitset_v11 import _variant_key
+
+        audit_path = self.output / "request_seeds" / (_variant_key(variant_id) + ".json")
+        index = len(calls) + 1
+        if (not calls or any(call.seed_record["request_seed"] != self.seed for call in calls)
+                or any(path.exists() or path.is_symlink() for path in (
+                    audit_path.with_name(f"{audit_path.stem}-{index:03d}.json"),
+                    audit_path.with_name(f"{audit_path.stem}-response-{index:03d}.json")))):
+            raise RecoveryStop("continuation_seed_already_exists_or_changed")
+        client = _RevisionClientFactory(
+            self.config, online_model_from(self.config).max_tokens,
+            self.perception_endpoint)()
+        _admit_solver_client(client, self.perception_endpoint, self.perception_capacity)
+        return resumed_seeded_gate_client(
+            client, seed=self.seed, audit_path=audit_path, calls=calls,
+            framework_state_io=self.framework_state_io)
+
+
+def _admit_solver_client(client, endpoint, capacity):
+    if not client.configured:
+        raise FitSetError("solver transport is not configured")
+    if endpoint:
+        import urllib.request
+        from skill3d.cluster.perception_client import RPC_SCHEMA, json_object
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(endpoint.rstrip("/") + "/health", timeout=10) as response:
+                health = json_object(response.read(65537))
+        except Exception:
+            raise FitSetError("RPC gateway health unavailable") from None
+        if (health.get("schema_version") != RPC_SCHEMA or health.get("status") != "ready"
+                or health.get("identity") != client.audit_identity()
+                or health.get("max_concurrency") != capacity):
+            raise FitSetError("RPC gateway identity or capacity differs from frozen run")
+
+def _cached_prefix_admission_deferred(args):
+    if getattr(args, "cached_prefix_recovery", None):
+        return True
+    sidecar = getattr(args, "deployment_continuation", None)
+    if not sidecar:
+        return False
+    value = json.loads(Path(sidecar).read_bytes())
+    return any(Path(ref).name == "cached_prefix_resume.json"
+               for ref in value["preserved_files"])
 
 
 def _active_skill_provider(library_root: Path):
@@ -469,11 +526,37 @@ def _run_system(args) -> int:
             and (args.learning_input_mode != "aggregate_v1" or args.gate_mode == "scene_disjoint")
             and any(row["split"] != "induction" for row in variants)):
         raise FitSetError("rich/disjoint learning requires induction-only variants")
+    hot_runtime = None
+    if getattr(args, "transport_closure", ""):
+        from skill3d.storage.scene_runtime import SceneHotRuntime
+        if not args.published_inputs or not all((
+            args.transport_cache_root, args.transport_endpoint, args.transport_token_file,
+        )):
+            raise FitSetError("scene transport requires published inputs and complete storage locators")
+        hot_runtime = SceneHotRuntime(
+            closure_path=args.transport_closure, cache_root=args.transport_cache_root,
+            endpoint=args.transport_endpoint, token_file=args.transport_token_file)
+    framework_state_io = None
+    if getattr(args, "state_workspace_key", ""):
+        from skill3d.storage.framework_state_io import FrameworkStateIO
+        from skill3d.storage.state_workspace import StateWorkspace
+        if hot_runtime is None or not args.state_archive_job:
+            raise FitSetError("state workspace requires scene transport and --state-archive-job")
+        if args.state_workspace_key != hot_runtime.closure["shards"].get("state", {}).get("key"):
+            raise FitSetError("state workspace key differs from frozen transport state")
+        workspace = StateWorkspace(
+            hot_runtime.cache(), args.state_workspace_key, bounded=True,
+            lock_timeout_s=args.state_lock_timeout,
+            transfer=hot_runtime.archive_transfer)
+        framework_state_io = FrameworkStateIO(
+            workspace, job=args.state_archive_job, attempt=args.state_archive_attempt,
+            max_file_bytes=args.state_max_file_bytes)
     published_inputs = None
     if args.published_inputs:
         from skill3d.evaluation.published_fitset_v11 import PublishedFitSetInputProvider
         published_inputs = PublishedFitSetInputProvider(
-            args.published_inputs, max_scenes=args.scene_cache_size)
+            args.published_inputs, max_scenes=args.scene_cache_size,
+            **({"transport_locator": hot_runtime.locator} if hot_runtime else {}))
         if args.bindings or args.direct_run_root or args.video_root or args.video_fallback_root:
             raise FitSetError("published inputs cannot be mixed with legacy input locators")
         if (args.phase == "accumulation" and experiment_split is None
@@ -525,7 +608,13 @@ def _run_system(args) -> int:
             raise FitSetError("diagnosis token budget must be 1..frozen RPC model max_tokens")
     elif args.perception_capacity:
         raise FitSetError("--perception-capacity requires --perception-endpoint")
-    if not args.preflight_only:
+    if getattr(args, "cached_prefix_recovery", None) and (
+            not args.resume or not args.deployment_continuation
+            or args.preflight_only):
+        raise FitSetError("cached-prefix recovery requires resume/deployment, not preflight")
+    deferred_admission = _cached_prefix_admission_deferred(args)
+    if (not args.preflight_only and not getattr(args, "initialize_only", False)
+            and not deferred_admission):
         client = _RevisionClientFactory(
             client_config, model.max_tokens, args.perception_endpoint)()
         if not client.configured:
@@ -557,7 +646,12 @@ def _run_system(args) -> int:
         )
         published_inputs = DerivedPublishedFitSetInputProvider(
             args.published_inputs, derivation_root=args.derived_binding_root,
-            binding_cfg=_base_config(raw), max_scenes=args.scene_cache_size)
+            binding_cfg=_base_config(raw), max_scenes=args.scene_cache_size,
+            **({"transport_locator": hot_runtime.locator,
+                "derived_replay": hot_runtime.closure["derived_replay"]} if hot_runtime else {}))
+    if hot_runtime:
+        from skill3d.storage.scene_runtime import SceneHotInputProvider
+        published_inputs = SceneHotInputProvider(published_inputs, hot_runtime)
     fallback_roots = (
         list(args.video_fallback_root)
         if args.video_fallback_root
@@ -609,6 +703,10 @@ def _run_system(args) -> int:
         base_cfg=_base_config(raw),
         phase=args.phase,
         published_inputs=published_inputs,
+        **({"deployment_continuation": args.deployment_continuation}
+           if getattr(args, "deployment_continuation", None) else {}),
+        **({"cached_prefix_recovery": args.cached_prefix_recovery}
+           if getattr(args, "cached_prefix_recovery", None) else {}),
         **({"experiment_split": experiment_split} if experiment_split is not None else {}),
         skills_for_variant=skill_provider,
         min_free_gib=args.min_free_gib,
@@ -618,7 +716,8 @@ def _run_system(args) -> int:
         request_governor_config=(
             _request_policy(args) if args.max_requests else None),
         client_factory=_SeededClientFactory(
-            client_config, args.seed, Path(args.output_dir), args.perception_endpoint),
+            client_config, args.seed, Path(args.output_dir), args.perception_endpoint,
+            framework_state_io, args.perception_capacity, deferred_admission),
         episode_concurrency=(
             args.episode_concurrency if args.episode_concurrency else None),
         evolution_config=(
@@ -645,12 +744,45 @@ def _run_system(args) -> int:
         ),
         revision_client_factory=_RevisionClientFactory(
             client_config, args.revision_max_tokens, args.perception_endpoint),
-        gate_client_factory=_GateClientFactory(client_config, args.perception_endpoint),
+        gate_client_factory=_GateClientFactory(
+            client_config, args.perception_endpoint, framework_state_io),
+        framework_state_io=framework_state_io,
     )
     if args.request_governor_root:
         if not args.max_requests:
             raise FitSetError("--request-governor-root requires --max-requests")
         runner._request_governor_root = Path(args.request_governor_root).resolve()
+    if framework_state_io is not None and args.max_requests:
+        framework_state_io.validate_root(runner.request_governor_root)
+    if framework_state_io is not None and not getattr(args, "initialize_only", False):
+        destinations = [runner.root / "summary.json"]
+        if args.preflight_only:
+            destinations.extend((runner.root / "preflight", runner.root / "preflight_summary.json"))
+        else:
+            destinations.extend(runner.root / name for name in (
+                "variants", "results", "request_seeds"))
+            if args.phase == "accumulation":
+                destinations.append(runner.root / "workers")
+            if getattr(args, "cached_prefix_recovery", None):
+                destinations.append(runner.root / "solver_recoveries")
+            elif getattr(args, "deployment_continuation", None):
+                # Auto-pinned specs are loaded by initialize, after this scope check.
+                destinations.append(runner.root / "solver_recoveries")
+        if args.scheduler == "episode_pool":
+            destinations.extend(runner.root / name for name in (
+                "episode_pool.lock", "episode_pool_receipt.json", "scheduler_receipts"))
+        if args.max_requests:
+            destinations.append(runner.request_governor_root)
+        framework_state_io.validate_destinations(destinations)
+    if getattr(args, "initialize_only", False):
+        manifest = runner.initialize(resume=args.resume)
+        print(json.dumps({
+            "status": "paused_initialized", "run_identity": runner.run_identity,
+            "deployment_identity": runner.deployment_identity,
+            "completed_variants": len(runner.completed()), "model_requests_initiated": 0,
+            "manifest_identity_sha256": manifest["identity_sha256"],
+        }, sort_keys=True))
+        return 0
     action = runner.preflight if args.preflight_only else runner.run
     summary = action(
         resume=args.resume,
@@ -800,6 +932,22 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--derived-binding-root", default="",
                      help="explicit separate store for audited v3-to-current M5 derivation")
     run.add_argument("--metadata", required=True)
+    run.add_argument("--transport-closure", default="")
+    run.add_argument("--transport-cache-root", default="")
+    run.add_argument("--transport-endpoint", default="")
+    run.add_argument("--transport-token-file", default="")
+    run.add_argument("--state-workspace-key", default="",
+                     help="opt-in existing adopted state workspace; never adopts or expands quota")
+    run.add_argument("--state-archive-job", default="",
+                     help="trusted saved checkpoint archive job identity")
+    run.add_argument("--state-archive-attempt", type=int, default=0)
+    run.add_argument("--state-max-file-bytes", type=int, default=64 * 1024 * 1024)
+    run.add_argument("--state-lock-timeout", type=float, default=120.0)
+    run.add_argument("--deployment-continuation", default=None)
+    run.add_argument("--cached-prefix-recovery", default=None,
+                     help="owner-only deployment-sealed spec for one interrupted solver prefix")
+    run.add_argument("--initialize-only", action="store_true",
+                     help="validate preserved run identity without dispatching requests or preflight")
     run.add_argument("--direct-run-root", default="")
     run.add_argument("--video-root")
     run.add_argument("--video-fallback-root", action="append", default=[])
@@ -909,6 +1057,13 @@ def main(argv=None) -> int:
     except (FitSetError, RevisionOperationalError, FileNotFoundError, ValueError, KeyError) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+    except BaseException as exc:
+        if args.command == "run-system" and getattr(args, "state_workspace_key", ""):
+            from skill3d.storage.framework_state_io import FrameworkStorageRefused
+            if isinstance(exc, FrameworkStorageRefused):
+                print("FrameworkStorageRefused: storage paused; no automatic retry", file=sys.stderr)
+                return 75
+        raise
 
 
 if __name__ == "__main__":

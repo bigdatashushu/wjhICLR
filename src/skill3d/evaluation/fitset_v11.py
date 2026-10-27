@@ -10,7 +10,7 @@ for physical slots that are not revised by the selected panel.
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, replace
 import copy
 import hashlib
@@ -1218,6 +1218,12 @@ def audit_fitset_pilot(
 class SystemVariantRunner:
     """Run one frozen system input per isolated, resumable variant directory."""
 
+    # Older serialized runners predate the optional storage adapter.
+    framework_state_io = None
+    cached_prefix_recovery = None
+    _cached_prefix_spec = None
+    _continuation = None
+
     def __init__(
         self,
         *,
@@ -1247,10 +1253,16 @@ class SystemVariantRunner:
         published_inputs=None,
         gate_variants: Sequence[Mapping] | None = None,
         experiment_split: dict | None = None,
+        deployment_continuation: str | Path | None = None,
+        framework_state_io=None,
+        cached_prefix_recovery: str | Path | None = None,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
         self.root = Path(output_root).resolve()
+        self.framework_state_io = framework_state_io
+        if framework_state_io is not None:
+            framework_state_io.validate_root(self.root)
         self.panel = panel
         self.panel_name = panel_name
         self.variants = [dict(row) for row in variants]
@@ -1273,6 +1285,11 @@ class SystemVariantRunner:
         self.variants = [self.variant_rows[row["variant_id"]] for row in self.variants]
         self.item_provider = item_provider
         self.published_inputs = published_inputs
+        self.deployment_continuation = deployment_continuation
+        self._continuation = None
+        self.cached_prefix_recovery = cached_prefix_recovery
+        self._cached_prefix_spec = None
+        self.deployment_identity = None
         self.input_receipt_provider = input_receipt_provider
         self.input_contract_identity = copy.deepcopy(
             dict(input_contract_identity))
@@ -1473,6 +1490,9 @@ class SystemVariantRunner:
     def __setstate__(self, state: Mapping) -> None:
         self.__dict__.update(state)
         self.__dict__.setdefault("_episode_semaphore", None)
+        self.__dict__.setdefault("cached_prefix_recovery", None)
+        self.__dict__.setdefault("_cached_prefix_spec", None)
+        self.__dict__.setdefault("_continuation", None)
 
     @property
     def execution_scheduler(self) -> str:
@@ -1619,18 +1639,133 @@ class SystemVariantRunner:
         if self.root.exists():
             _require(resume, "system output exists; use resume for the same run")
             _require(path.is_file(), "existing system output lacks manifest")
-            _require(
-                json.loads(path.read_text(encoding="utf-8")) == manifest,
-                "system run manifest changed during resume",
-            )
+            if self.deployment_continuation is None:
+                _require(
+                    json.loads(path.read_text(encoding="utf-8")) == manifest,
+                    "system run manifest changed during resume",
+                )
+            else:
+                from skill3d.evolution.deployment_continuation_v11 import DeploymentContinuation
+                from skill3d.evolution.fitset_revision_v11 import FIT_REVISION_PROMPT_VERSION
+
+                continuation = DeploymentContinuation(self.deployment_continuation)
+                _require(continuation.path.parent
+                         == self.root / "deployments" / continuation.deployment_id,
+                         "continuation sidecar location changed")
+                governor_root = continuation.request_governor_root
+                _require(not hasattr(self, "_request_governor_root")
+                         or self._request_governor_root == governor_root,
+                         "continuation runtime request ledger locator changed")
+                manifest = continuation.validate(
+                    system_root=self.root, current_manifest=manifest,
+                    revision_protocol=FIT_REVISION_PROMPT_VERSION)
+                self._continuation = continuation
+                self.deployment_identity = continuation.identity_sha256
+                self._request_governor_root = governor_root
         else:
-            self.root.mkdir(parents=True)
-            _write_create_once(path, manifest)
+            _require(self.deployment_continuation is None,
+                     "continuation requires an existing original system run")
+            if self.framework_state_io is None:
+                self.root.mkdir(parents=True)
+            else:
+                self.framework_state_io.mkdir(self.root)
+            self._write_create_once(path, manifest)
         self.run_identity = manifest["identity_sha256"]
+        if self.cached_prefix_recovery is None and self._continuation is not None:
+            pinned = [ref for ref in self._continuation.value["preserved_files"]
+                      if Path(ref).name == "cached_prefix_resume.json"]
+            _require(len(pinned) <= 1, "deployment has ambiguous cached-prefix specs")
+            if pinned:
+                self.cached_prefix_recovery = self.root / pinned[0]
+        if self.cached_prefix_recovery is not None:
+            from skill3d.evaluation.cached_episode_recovery_v11 import CachedPrefixRecoverySpec
+            self._cached_prefix_spec = CachedPrefixRecoverySpec(
+                self.cached_prefix_recovery, continuation=self._continuation,
+                system_root=self.root, run_identity=self.run_identity)
+            _require(self._cached_prefix_spec.variant_id in self.variant_rows,
+                     "cached-prefix variant is outside the frozen panel")
+            _require(self.request_governor_config is not None,
+                     "cached-prefix continuation requires the original request governor")
         return manifest
 
+    def _write_create_once(self, path, value):
+        if self.framework_state_io is None:
+            return _write_create_once(path, value)
+        return self.framework_state_io.write_json_once(path, value)
+
+    def _write_json_atomic(self, path, value):
+        if self.framework_state_io is None:
+            return _write_json_atomic(path, value)
+        return self.framework_state_io.write_json(path, value)
+
+    def _request_governor(self):
+        if self.framework_state_io is not None:
+            self.framework_state_io.validate_root(self.request_governor_root)
+            return self.framework_state_io.request_governor(
+                self.request_governor_root, self.request_governor_config)
+        from skill3d.synthesis.request_governor import RequestGovernor
+        return RequestGovernor(self.request_governor_root, self.request_governor_config)
+
+    def logical_path(self, path: str | Path) -> str:
+        if self._continuation is not None:
+            return self._continuation.logical_path(path)
+        logical = getattr(self.published_inputs, "logical_path", None)
+        return str(logical(path)) if callable(logical) else str(path)
+
+    def logical_file(self, path: str | Path, expected_hash: str) -> Path:
+        if self._continuation is not None:
+            physical = self._continuation.physical_path(path)
+        else:
+            locate = getattr(self.published_inputs, "logical_file", None)
+            physical = Path(locate(path, expected_hash)) if callable(locate) else Path(path)
+        _require(physical.is_file() and file_identity(physical)["sha256"] == expected_hash,
+                 "logical file content changed")
+        return physical
+
+    def _input_episode_lease(self, variant: Mapping):
+        lease = getattr(self.published_inputs, "episode_lease", None)
+        return lease(variant) if callable(lease) else nullcontext()
+
     def _result_path(self, variant_id: str) -> Path:
+        spec = self._cached_prefix_spec
+        if spec is not None and variant_id == spec.variant_id:
+            spec.completed_result()
+            return spec.output_root / "result.json"
         return self.root / "results" / f"{_variant_key(variant_id)}.json"
+
+    def _publish_recovery_offline_outcome(self) -> None:
+        spec = self._cached_prefix_spec
+        _require(spec is not None and spec.completed_result() is not None,
+                 "canonical recovery outcome requires verified execution completion")
+        path = spec.original_trace_dir.parent / "outcome.json"
+        source = spec.output_root / "outcome.json"
+        if path.exists():
+            _require(path.read_bytes() == source.read_bytes(),
+                     "canonical recovery outcome changed")
+        else:
+            # A new offline alias only; never overwrite the interrupted trace/files.
+            raw = source.read_bytes()
+            if self.framework_state_io is None:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(raw)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            else:
+                self.framework_state_io.write_bytes(path, raw, exclusive=True)
+
+    def _validate_cached_prefix_selection(self, wanted, max_variants, completed) -> bool:
+        spec = self._cached_prefix_spec
+        if spec is None:
+            return False
+        ready = spec.completed_result()
+        if ready is None:
+            _require(set(wanted) == {spec.variant_id} and max_variants in (0, 1),
+                     "cached-prefix run requires only the explicit bound variant")
+            return True
+        _require(completed.get(spec.variant_id) == ready,
+                 "completed cached-prefix result was not exposed")
+        return False
 
     def _validate_gate_inputs(self) -> None:
         if not self.gate_variant_rows:
@@ -1638,6 +1773,10 @@ class SystemVariantRunner:
         # Validate every held-out input before any learning request, even when
         # --max-variants restricts execution to a smaller learning subset.
         def validate(variant):
+            with self._input_episode_lease(variant):
+                return validate_leased(variant)
+
+        def validate_leased(variant):
             values = self._prepare_one(variant, preflight=True)
             _require(values["state"] == variant["evidence_state"],
                      f"{variant['variant_id']}: gate runtime evidence state changed")
@@ -1647,7 +1786,7 @@ class SystemVariantRunner:
                 _require(not variant.get(field)
                          or variant[field] == values["reference"][reference_field],
                          f"{variant['variant_id']}: frozen gate binding identity changed")
-            _write_create_once(
+            self._write_create_once(
                 self.root / "gate_preflight" / f"{_variant_key(variant['variant_id'])}.json",
                 {
                     "variant": variant,
@@ -1671,6 +1810,9 @@ class SystemVariantRunner:
         from PIL import Image
 
         variant_root = self.root / "variants" / _variant_key(str(variant["variant_id"]))
+        if (variant_root / "offline_input.json").exists():
+            self.offline_case_input(variant)
+            return
         fs = item.episode.frame_set
         _require(fs is not None and len(fs.frame_ids) == len(item.pixels) == 32,
                  "offline case requires the frozen 32-frame public input")
@@ -1683,22 +1825,26 @@ class SystemVariantRunner:
             image.save(buffer, format="PNG")
             data = buffer.getvalue()
             path = variant_root / "offline_images" / f"{index:02d}.png"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                with path.open("xb") as stream:
-                    stream.write(data)
-            except FileExistsError:
-                _require(path.read_bytes() == data, f"immutable offline image changed: {path}")
+            if self.framework_state_io is not None:
+                self.framework_state_io.write_bytes_once(path, data)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    with path.open("xb") as stream:
+                        stream.write(data)
+                except FileExistsError:
+                    _require(path.read_bytes() == data, f"immutable offline image changed: {path}")
             digest = hashlib.sha256(data).hexdigest()
             image_refs.append({
-                "path": str(path), "file_sha256": digest, "content_sha256": digest,
+                "path": self.logical_path(path),
+                "file_sha256": digest, "content_sha256": digest,
                 "image_id": f"{variant['variant_id']}:frame:{fs.frame_ids[index]}",
                 "kind": "frame", "frame_id": fs.frame_ids[index],
                 "source_frame_index": fs.source_frame_indices[index],
                 "source_hw": [image.height, image.width],
                 "frame_set_hash": fs.frame_set_hash,
             })
-        _write_create_once(variant_root / "offline_input.json", {
+        self._write_create_once(variant_root / "offline_input.json", {
             "schema_version": "v11-fit-set-offline-input/1.0",
             "variant_id": variant["variant_id"],
             "variant_sha256": content_sha256(variant),
@@ -1734,20 +1880,30 @@ class SystemVariantRunner:
         _require(isinstance(value["image_refs"], list) and len(value["image_refs"]) == 32,
                  f"{variant['variant_id']}: incomplete frozen offline image refs")
         for ref in value["image_refs"]:
-            _require(set(ref) == {
+            fields = {
                 "path", "file_sha256", "content_sha256", "image_id", "kind",
                 "frame_id", "source_frame_index", "source_hw", "frame_set_hash",
-            } and ref["frame_set_hash"] == value["frame_set_hash"],
+            }
+            _require(set(ref) == fields and ref["frame_set_hash"] == value["frame_set_hash"],
                      f"{variant['variant_id']}: offline image provenance changed")
-            image_path = Path(ref["path"])
-            _require(image_path.parent == path.parent / "offline_images"
-                     and image_path.is_file()
-                     and file_identity(image_path)["sha256"] == ref["file_sha256"]
-                     == ref["content_sha256"],
+            logical = Path(ref["path"])
+            _require(logical.is_absolute() and ".." not in logical.parts
+                     and str(logical) == ref["path"]
+                     and logical.parent == Path(self.logical_path(path.parent)) / "offline_images",
+                     f"{variant['variant_id']}: offline image logical parent changed")
+            image_path = self.logical_file(logical, ref["file_sha256"])
+            _require(image_path.resolve().parent == (path.parent / "offline_images").resolve()
+                     and ref["file_sha256"] == ref["content_sha256"],
                      f"{variant['variant_id']}: frozen offline image changed")
         return value
 
     def _require_storage_reserve(self, variant_id: str) -> None:
+        if self.framework_state_io is not None:
+            # Keep the frozen min_free_gib identity. Physical hot-cache mode
+            # enforces its shared quota and persisted filesystem floor instead.
+            with self.framework_state_io.section():
+                pass
+            return
         free_gib = shutil.disk_usage(self.root).free / (1024 ** 3)
         _require(
             free_gib >= self.min_free_gib,
@@ -1768,6 +1924,14 @@ class SystemVariantRunner:
         expected = {row["variant_id"] for row in self.variants}
         _require(set(rows) <= expected,
                  "system results contain variants outside the frozen panel")
+        spec = self._cached_prefix_spec
+        if spec is not None:
+            _require(spec.variant_id not in rows,
+                     "cached-prefix target already has an original result")
+            spec.verify_original(ledger_path=self.request_governor_root / "state.json")
+            result = spec.completed_result()
+            if result is not None:
+                rows[spec.variant_id] = result
         return rows
 
     def _prepare_one(self, variant: Mapping, *, preflight: bool = False) -> dict:
@@ -1945,7 +2109,7 @@ class SystemVariantRunner:
             plan["derived_binding_migration"] = copy.deepcopy(derived_migration_receipt)
             plan["binding_derivation_sha256"] = prepared.stats["binding_derivation"]["sha256"]
         if not preflight:
-            _write_create_once(variant_root / "plan.json", plan)
+            self._write_create_once(variant_root / "plan.json", plan)
         return {
             "variant_id": variant_id,
             "item": item,
@@ -1983,16 +2147,16 @@ class SystemVariantRunner:
             semaphore.release()
 
     def _run_one(self, variant: Mapping) -> dict:
-        with self._episode_permit():
+        with self._episode_permit(), self._input_episode_lease(variant):
             return self._run_one_locked(variant)
 
     def _govern_client(self, client, category: str, context: Mapping):
         if self.request_governor_config is None:
             return client
         _require(client is not None, "governed runs require an explicit model client")
-        from skill3d.synthesis.request_governor import GovernedClient, RequestGovernor
+        from skill3d.synthesis.request_governor import GovernedClient
         return GovernedClient(
-            client, RequestGovernor(self.request_governor_root, self.request_governor_config),
+            client, self._request_governor(),
             category=category, context=context,
         )
 
@@ -2010,7 +2174,15 @@ class SystemVariantRunner:
             pass
 
         self._freeze_public_input_capture()
-        prepared_run = self._prepare_one(variant)
+        spec = self._cached_prefix_spec
+        _require(self.cached_prefix_recovery is None or spec is not None,
+                 "cached-prefix hook requires initialized deployment binding")
+        if spec is not None:
+            if variant["variant_id"] != spec.variant_id:
+                _require(spec.completed_result() is not None,
+                         "cached-prefix hook cannot execute another variant before completion")
+                spec = None
+        prepared_run = self._prepare_one(variant, preflight=True) if spec else self._prepare_one(variant)
         variant_id = prepared_run["variant_id"]
         item = prepared_run["item"]
         if getattr(self, "_qa_disjoint_gate", False):
@@ -2025,50 +2197,111 @@ class SystemVariantRunner:
         skill_identity = prepared_run["skill_identity"]
         variant_root = prepared_run["variant_root"]
         trace_dir = variant_root / "trace"
-        _require(not trace_dir.exists(),
-                 f"{variant_id}: incomplete trace exists without a result")
-        if self.capture_offline_case_input:
+        if spec is None:
+            _require(not trace_dir.exists(),
+                     f"{variant_id}: incomplete trace exists without a result")
+        else:
+            _require(trace_dir == spec.original_trace_dir
+                     and self.logical_path(trace_dir) == spec.value["original_trace_dir"],
+                     "cached-prefix original logical trace changed")
+            _require(not (variant_root / "outcome.json").exists(),
+                     "cached-prefix original outcome already exists")
+        if self.capture_offline_case_input and spec is None:
             self._freeze_offline_case_input(variant, item)
+        shared_plan = {key: value for key, value in prepared_run["plan"].items()
+                       if key != "skill_identity"}
+        actual_context = {
+            "run_identity": self.run_identity,
+            "shared_input_sha256": content_sha256(shared_plan),
+            "skill_identity": skill_identity,
+            "skill_content_sha256": [skill.content_sha256 for skill in skills],
+            "solver_config_sha256": content_sha256(_json_value(asdict(runtime_base_cfg))),
+            "concurrency_limit": self.episode_concurrency,
+            "scheduler": self.execution_scheduler,
+        }
+        logical_trace = self.logical_path(trace_dir) if spec else str(trace_dir)
+        output_root = spec.output_root if spec else variant_root
         cfg = replace(
             copy.deepcopy(runtime_base_cfg),
             skills=[skill.model_copy(deep=True) for skill in skills],
             active_snapshot_ref=str(skill_identity["snapshot_ref"]),
             active_snapshot_manifest_sha256=str(
                 skill_identity["manifest_sha256"]),
-            trace_dir=str(trace_dir),
-            work_dir=str(variant_root / "work"),
-            recon_dir=str(variant_root / "recon"),
+            trace_dir=logical_trace,
+            work_dir=str(output_root / "work"),
+            recon_dir=str(output_root / "recon"),
             reuse_artifact=str(artifact_path),
             evaluation_binding=None,
         )
-        llm = (
-            self.client_factory(variant_id)
-            if self.client_factory is not None
-            else None
-        )
-        llm = self._govern_client(
-            llm, getattr(self, "_request_category", "solver"),
-            {"variant_id": variant_id, "run_identity": self.run_identity},
-        )
+        if spec is None:
+            llm = self.client_factory(variant_id) if self.client_factory is not None else None
+            llm = self._govern_client(
+                llm, getattr(self, "_request_category", "solver"),
+                {"variant_id": variant_id, "run_identity": self.run_identity})
+        else:
+            from skill3d.evaluation.cached_episode_recovery_v11 import (
+                CachedPrefixResumeClient, open_cached_episode_recovery,
+            )
+            resumed_dispatch = {
+                "variant_id": variant_id, "slot_key": variant["slot_key"],
+                "skill_identity": skill_identity,
+                "skills_sha256": content_sha256([
+                    skill.model_dump(mode="json") for skill in skills]),
+                "run_identity": self.run_identity,
+            }
+            ledger_path = self.request_governor_root / "state.json"
+            spec.verify_original(
+                ledger_path=ledger_path, prepared_plan=prepared_run["plan"],
+                resumed_dispatch=resumed_dispatch, resumed_context=actual_context)
+            _require(callable(getattr(self.client_factory, "resume_after_cached_prefix", None)),
+                     "cached-prefix requires a lazy seeded continuation factory")
+            recovery_parent = output_root.parent
+            if self.framework_state_io is None:
+                recovery_parent.mkdir(mode=0o700, exist_ok=True)
+            else:
+                self.framework_state_io.mkdir(recovery_parent)
+            section = (self.framework_state_io.section()
+                       if self.framework_state_io is not None else nullcontext())
+            with section:
+                cached = open_cached_episode_recovery(
+                    frozen_dispatch=spec.value["frozen_dispatch"],
+                    resumed_dispatch=resumed_dispatch,
+                    frozen_context=spec.value["frozen_context"], resumed_context=actual_context,
+                    skills=[skill.model_dump(mode="json") for skill in skills],
+                    model_identity=spec.value["model_identity"], calls=spec.calls,
+                    original_trace_dir=trace_dir, continuation_root=output_root,
+                    cache_path=spec.cache_path, framework_state_io=self.framework_state_io)
+            trace_dir = cached.continuation_trace_dir
+
+            def lazy_delegate():
+                client = self.client_factory.resume_after_cached_prefix(
+                    variant_id, calls=spec.calls)
+                _require(content_sha256(client.audit_identity(
+                    seed=spec.value["model_identity"]["seed"]))
+                    == content_sha256(spec.value["model_identity"]),
+                    "cached-prefix normal model identity changed")
+                return self._govern_client(
+                    client, "solver",
+                    {"variant_id": variant_id, "run_identity": self.run_identity})
+
+            llm = CachedPrefixResumeClient(
+                cached, spec=spec, delegate_factory=lazy_delegate, ledger_path=ledger_path)
         set_context = getattr(llm, "set_audit_context", None)
         if callable(set_context):
-            shared_plan = {key: value for key, value in prepared_run["plan"].items()
-                           if key != "skill_identity"}
-            set_context({
-                "run_identity": self.run_identity,
-                "shared_input_sha256": content_sha256(shared_plan),
-                "skill_identity": skill_identity,
-                "skill_content_sha256": [skill.content_sha256 for skill in skills],
-                "solver_config_sha256": content_sha256(_json_value(asdict(runtime_base_cfg))),
-                "concurrency_limit": self.episode_concurrency,
-                "scheduler": self.execution_scheduler,
-            })
+            set_context(actual_context)
+        trace_options = {}
+        if self.framework_state_io is not None:
+            trace_options["trace_store"] = self.framework_state_io.trace_store(trace_dir)
+        elif spec is not None:
+            from skill3d.trace.store import TraceStore
+            trace_options["trace_store"] = TraceStore(trace_dir)
         started = time.perf_counter()
         outcomes, evaluation_run = runner.run_split(
             [item],
             cfg,
             llm=llm,
             prepared_bindings={item.episode.qa_id: prepared},
+            **trace_options,
             **({"artifact_relocations": {
                 item.episode.qa_id: prepared_run["artifact_relocation"]}}
                if prepared_run["artifact_relocation"] is not None else {}),
@@ -2077,17 +2310,19 @@ class SystemVariantRunner:
                if prepared_run.get("binding_derivation_context") is not None else {}),
         )
         elapsed = time.perf_counter() - started
+        if spec is not None:
+            llm.require_execution_continued()
         _require(len(outcomes) == 1,
                  f"{variant_id}: system runner returned multiple outcomes")
         outcome = outcomes[0]
         _require(outcome.initial_skill_selection.get("evidence_state") == state,
                  f"{variant_id}: selected Skill state changed")
-        _write_create_once(
-            variant_root / "outcome.json",
+        self._write_create_once(
+            output_root / "outcome.json",
             _json_value(asdict(outcome)),
         )
-        _write_create_once(
-            variant_root / "evaluation_run.json",
+        self._write_create_once(
+            output_root / "evaluation_run.json",
             evaluation_run.model_dump(mode="json"),
         )
         row = _system_result_row(
@@ -2100,7 +2335,15 @@ class SystemVariantRunner:
         if self.capture_offline_case_input:
             row["offline_input_sha256"] = file_identity(
                 variant_root / "offline_input.json")["sha256"]
-        _write_create_once(self._result_path(variant_id), row)
+        result_path = output_root / "result.json" if spec else self._result_path(variant_id)
+        self._write_create_once(result_path, row)
+        if spec is not None:
+            llm.finish_execution(files={
+                "result.json": result_path, "outcome.json": output_root / "outcome.json",
+                "evaluation_run.json": output_root / "evaluation_run.json",
+                "recovery_receipt.json": output_root / "recovery_receipt.json",
+            })
+            self._publish_recovery_offline_outcome()
         if any(
             (record.get("execution_diagnostics") or {}).get("error_message")
             == "cell timeout requires a main-thread SIGALRM runtime"
@@ -2110,6 +2353,14 @@ class SystemVariantRunner:
         return row
 
     def _run_shard(self, index, owned, pending, stop_event, accept):
+        if self.framework_state_io is not None:
+            try:
+                return self._run_shard_body(index, owned, pending, stop_event, accept)
+            finally:
+                self.framework_state_io.finish()
+        return self._run_shard_body(index, owned, pending, stop_event, accept)
+
+    def _run_shard_body(self, index, owned, pending, stop_event, accept):
         evolution = None
         if self.evolution_config is not None:
             from skill3d.evolution.fitset_stream_v11 import FitSetWorkerEvolution
@@ -2163,7 +2414,22 @@ class SystemVariantRunner:
         pending: Sequence[Mapping],
         accept: Callable[[dict], None],
     ) -> None:
+        if (self._cached_prefix_spec is not None
+                and self._cached_prefix_spec.completed_result() is None):
+            _require(len(pending) <= 1 and all(
+                row["variant_id"] == self._cached_prefix_spec.variant_id for row in pending),
+                "cached-prefix execution must be isolated to its bound variant")
+            # No evolution recovery or gate admission can precede prefix validation.
+            context = multiprocessing.get_context("spawn")
+            self._episode_semaphore = context.BoundedSemaphore(
+                self.episode_concurrency or self.workers)
+            for variant in pending:
+                accept(self._run_one(variant))
+            return
         if self.scheduler == "episode_pool":
+            if self.framework_state_io is not None:
+                self.framework_state_io.execute_episode_pool(self, pending, accept)
+                return
             from skill3d.evaluation.episode_pool_v11 import execute_episode_pool
             execute_episode_pool(self, pending, accept)
             return
@@ -2390,6 +2656,10 @@ class SystemVariantRunner:
                 running[pid] = (process, True)
 
     def _preflight_one(self, variant: Mapping) -> dict:
+        with self._input_episode_lease(variant):
+            return self._preflight_one_leased(variant)
+
+    def _preflight_one_leased(self, variant: Mapping) -> dict:
         values = self._prepare_one(variant, preflight=True)
         binding = values["prepared"]
         receipt = {
@@ -2411,7 +2681,7 @@ class SystemVariantRunner:
         }
         if values["plan"].get("published_transport") is not None:
             receipt["published_transport"] = values["plan"]["published_transport"]
-        _write_create_once(
+        self._write_create_once(
             self.root / "preflight"
             / f"{_variant_key(values['variant_id'])}.json",
             receipt,
@@ -2425,6 +2695,8 @@ class SystemVariantRunner:
         max_variants: int = 0,
         variant_ids: Sequence[str] = (),
     ) -> dict:
+        _require(self.cached_prefix_recovery is None,
+                 "cached-prefix recovery is not a preflight operation")
         manifest = self.initialize(resume=resume)
         self._validate_gate_inputs()
         wanted = set(variant_ids)
@@ -2471,7 +2743,7 @@ class SystemVariantRunner:
             "scheduler": PREFLIGHT_SCHEDULER,
             "updated_at": time.time(),
         }
-        _write_json_atomic(self.root / "preflight_summary.json", summary)
+        self._write_json_atomic(self.root / "preflight_summary.json", summary)
         return summary
 
     def run(
@@ -2481,10 +2753,25 @@ class SystemVariantRunner:
         max_variants: int = 0,
         variant_ids: Sequence[str] = (),
     ) -> dict:
+        if self.framework_state_io is not None:
+            try:
+                return self._run_body(
+                    resume=resume, max_variants=max_variants, variant_ids=variant_ids)
+            finally:
+                self.framework_state_io.finish()
+        return self._run_body(
+            resume=resume, max_variants=max_variants, variant_ids=variant_ids)
+
+    def _run_body(
+        self, *, resume: bool, max_variants: int = 0, variant_ids: Sequence[str] = (),
+    ) -> dict:
         manifest = self.initialize(resume=resume)
-        self._validate_gate_inputs()
         completed = self.completed()
         wanted = set(variant_ids)
+        if not self._validate_cached_prefix_selection(wanted, max_variants, completed):
+            if self._cached_prefix_spec is not None:
+                self._publish_recovery_offline_outcome()
+            self._validate_gate_inputs()
         known = {row["variant_id"] for row in self.variants}
         _require(not (wanted - known),
                  f"requested variants are outside the panel: {sorted(wanted - known)}")
@@ -2499,6 +2786,10 @@ class SystemVariantRunner:
         def accept(result: dict) -> None:
             completed[result["variant_id"]] = result
             self._write_summary(manifest, completed)
+            if self.framework_state_io is not None and self.evolution_config is None and (
+                len(completed) % 12 == 0
+            ):
+                self.framework_state_io.after_batch()
 
         try:
             self._execute_process_pending(pending, accept)
@@ -2507,7 +2798,10 @@ class SystemVariantRunner:
             self._write_summary(manifest, completed)
             raise
         self.evolution_finished = True
-        return self._write_summary(manifest, self.completed())
+        summary = self._write_summary(manifest, self.completed())
+        if self.framework_state_io is not None:
+            self.framework_state_io.after_batch()
+        return summary
 
     def _write_summary(self, manifest: Mapping, completed: Mapping[str, dict]) -> dict:
         counts: dict[str, int] = {}
@@ -2535,10 +2829,20 @@ class SystemVariantRunner:
             "updated_at": time.time(),
         }
         if self.request_governor_config is not None:
-            from skill3d.synthesis.request_governor import RequestGovernor
-            summary["requests"] = RequestGovernor(
-                self.request_governor_root, self.request_governor_config).summary()
-        _write_json_atomic(self.root / "summary.json", summary)
+            summary["requests"] = self._request_governor().summary()
+            if self._cached_prefix_spec is not None:
+                from skill3d.evaluation.cached_episode_recovery_v11 import recovery_accounting
+                spec = self._cached_prefix_spec
+                ledger = spec.verify_original(
+                    ledger_path=self.request_governor_root / "state.json")
+                overlay = recovery_accounting(ledger, [spec.custody])
+                summary["response_recovery"] = overlay
+                usage = summary["requests"]["usage"]
+                summary["requests"]["usage_with_recovered_responses"] = {
+                    key: usage.get(key, 0) + overlay["recovered_usage"].get(key, 0)
+                    for key in usage.keys() | overlay["recovered_usage"].keys()
+                }
+        self._write_json_atomic(self.root / "summary.json", summary)
         return summary
 
 
