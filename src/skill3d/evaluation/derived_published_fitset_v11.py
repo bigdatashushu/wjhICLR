@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import replace
 from pathlib import Path
+import threading
 
 from skill3d.evaluation.published_fitset_v11 import (
     PublishedFitSetInputProvider, _require,
@@ -26,6 +27,7 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
         self.derivation_root = Path(derivation_root).expanduser().absolute()
         self.binding_cfg = copy.deepcopy(binding_cfg)
         self._derived_scenes = {}
+        self._derivation_locks = {}
         _require(bool(self.scene_scopes), "derivation requires bounded fullQA scene scopes")
         _require(all(
             self.derivation_root != Path(entry["reference"]["store_root"])
@@ -40,6 +42,7 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
 
     def __getstate__(self):
         state = super().__getstate__()
+        state.pop("_derivation_locks", None)
         scene_id = state.get("_spawn_replay_scene")
         if scene_id:
             _require(set(state["_derived_scenes"]) == {scene_id},
@@ -49,6 +52,10 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
         else:
             state["_derived_scenes"] = {}
         return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._derivation_locks = {}
 
     def for_spawned_episode(self, variant):
         """Carry this parent's validated replay for one episode, never other scenes."""
@@ -128,14 +135,27 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
             )
         return context, references, migrations
 
+    def _derived_scene(self, entry):
+        scene_id = entry["scene_id"]
+        with self.cache_lock:
+            if scene_id in self._derived_scenes:
+                return self._derived_scenes[scene_id]
+            lock = self._derivation_locks.setdefault(scene_id, threading.Lock())
+        # A scene publishes once, while independent scenes may derive together.
+        # Never retain the shared input-cache lock across expensive derivation.
+        with lock:
+            with self.cache_lock:
+                if scene_id in self._derived_scenes:
+                    return self._derived_scenes[scene_id]
+            replay = self._derive_scene(entry)
+            with self.cache_lock:
+                self._derived_scenes[scene_id] = replay
+            return replay
+
     def prepare_published(self, variant, item):
         transport = self._transport(variant, item)
         entry, resolver = transport["entry"], transport["resolver"]
-        scene_id = entry["scene_id"]
-        with self.cache_lock:
-            if scene_id not in self._derived_scenes:
-                self._derived_scenes[scene_id] = self._derive_scene(entry)
-            context, references, migrations = self._derived_scenes[scene_id]
+        context, references, migrations = self._derived_scene(entry)
         reference = references[entry["qa_id"]]
         prepared = load_prepared_binding_reference(
             reference, scene_input_identity=transport["identity"],
