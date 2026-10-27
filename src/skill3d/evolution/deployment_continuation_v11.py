@@ -198,7 +198,7 @@ class DeploymentContinuation:
         return changes
 
     def validate(self, *, system_root: Path, current_manifest: Mapping,
-                 revision_protocol: str) -> dict:
+                 revision_protocol: str, framework_state_io=None) -> dict:
         _require(self.path.read_bytes() == self.raw, "immutable continuation sidecar changed")
         _require(system_root == self.physical_root, "continuation system locator changed")
         original_data = (system_root / "manifest.json").read_bytes()
@@ -291,7 +291,10 @@ class DeploymentContinuation:
                 _require(live == archived, "continuation initial external ledger changed")
             else:
                 self._validate_ledger(archived, live)
-        _write_create_once(marker, activation)
+        if framework_state_io is None:
+            _write_create_once(marker, activation)
+        else:
+            framework_state_io.write_json_once(marker, activation)
         return original
 
     @staticmethod

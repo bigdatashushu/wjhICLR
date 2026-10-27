@@ -652,3 +652,21 @@ def test_spawned_gate_provider_keeps_the_optional_lease(tmp_path):
     with clone._input_episode_lease(variant):
         pass
     assert calls == [variant["variant_id"]]
+
+
+def test_activation_uses_admitted_framework_writer(tmp_path, monkeypatch):
+    from skill3d.evolution import deployment_continuation_v11 as module
+    staged = stage(tmp_path)
+    seal(staged)
+    calls = []
+
+    class AdmittedWriter:
+        def write_json_once(self, path, value):
+            calls.append(path)
+            _write_create_once(path, value)
+
+    staged.runner.framework_state_io = AdmittedWriter()
+    monkeypatch.setattr(module, "_write_create_once", lambda *_args: pytest.fail(
+        "activation bypassed the admitted framework writer"))
+    assert staged.runner.initialize(resume=True) == staged.original
+    assert calls == [staged.sidecar.parent / "activated.json"]

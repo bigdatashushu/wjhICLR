@@ -1658,7 +1658,9 @@ class SystemVariantRunner:
                          "continuation runtime request ledger locator changed")
                 manifest = continuation.validate(
                     system_root=self.root, current_manifest=manifest,
-                    revision_protocol=FIT_REVISION_PROMPT_VERSION)
+                    revision_protocol=FIT_REVISION_PROMPT_VERSION,
+                    **({"framework_state_io": self.framework_state_io}
+                       if self.framework_state_io is not None else {}))
                 self._continuation = continuation
                 self.deployment_identity = continuation.identity_sha256
                 self._request_governor_root = governor_root
