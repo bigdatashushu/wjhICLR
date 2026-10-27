@@ -1152,7 +1152,8 @@ class FitSetWorkerEvolution:
         return result
 
 
-def freeze_fitset_stream(system_root: str | Path, output_dir: str | Path) -> dict:
+def freeze_fitset_stream(system_root: str | Path, output_dir: str | Path,
+                        *, framework_state_io=None, system_runner=None) -> dict:
     """合并唯一 owner 的最后发布版本；不产生额外终版修订。"""
     from skill3d.evaluation.fitset_v11 import (
         build_fit_skill_bundle,
@@ -1236,8 +1237,17 @@ def freeze_fitset_stream(system_root: str | Path, output_dir: str | Path) -> dic
              "freeze 槽位 owner 重复")
     result_paths = list((root / "results").glob("*.json"))
     ids = {json.loads(path.read_text())["variant_id"] for path in result_paths}
+    result_count = len(result_paths)
+    if system_runner is not None:
+        _require(system_runner.root == root
+                 and system_runner.run_identity == manifest["identity_sha256"],
+                 "freeze recovery runner identity changed")
+        completed = system_runner.completed()
+        _require(ids <= set(completed), "freeze ordinary results changed")
+        ids = set(completed)
+        result_count = len(completed)
     _require(ids == set(manifest["variant_ids"])
-             and len(ids) == len(result_paths)
+             and len(ids) == result_count
              and summary["completed_variants"] == len(ids),
              "freeze 分母/结果文件不一致")
     return build_fit_skill_bundle(
@@ -1250,4 +1260,6 @@ def freeze_fitset_stream(system_root: str | Path, output_dir: str | Path) -> dic
             "workers": receipts, "selected_slots": sorted(selected),
             "no_additional_revision": True,
         },
+        **({"framework_state_io": framework_state_io}
+           if framework_state_io is not None else {}),
     )

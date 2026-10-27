@@ -59,9 +59,12 @@ class FrameworkStateIO:
         if not 0 < max_workspace_bytes <= MAX_WORKSPACE_BYTES:
             raise StorageError("framework workspace ceiling must be at most 10 GB")
         self._workspace = workspace
+        workspace.atomic_writes = True
         self.job, self.attempt = job, attempt
         self.max_file_bytes = max_file_bytes
         self.max_workspace_bytes = max_workspace_bytes
+        self._cold_fetch = None
+        self._cold_history = None
         with workspace.cache._locked() as state:
             row = state["entries"].get(workspace.key)
             if row is None or row["kind"] != "workspace" or not row["ready"]:
@@ -89,7 +92,7 @@ class FrameworkStateIO:
     def __getstate__(self):
         state = {key: value for key, value in self.__dict__.items()
                  if key not in {"_workspace", "_local", "_executor", "_future",
-                                "_background_lock"}}
+                                "_background_lock", "_cold_history"}}
         workspace = self._workspace
         cache = workspace.cache
         state["_workspace_config"] = {
@@ -97,6 +100,7 @@ class FrameworkStateIO:
             "min_free_bytes": cache.min_free_bytes, "disk_usage": cache.disk_usage,
             "key": workspace.key, "transfer": workspace.transfer,
             "lock_timeout_s": workspace.lock_timeout_s,
+            "atomic_writes": True,
         }
         return state
 
@@ -108,6 +112,9 @@ class FrameworkStateIO:
         self.__dict__.update(state)
         self._workspace = StateWorkspace(cache, bounded=True, **config)
         self._reset_process()
+        self._cold_history = None
+        if self._cold_fetch is not None:
+            self.enable_cold_history(self._cold_fetch)
 
     def _process(self):
         if self._pid != os.getpid():
@@ -221,6 +228,97 @@ class FrameworkStateIO:
     def trace_store(self, root):
         return WorkspaceTraceStore(self, root)
 
+    def enable_cold_history(self, fetch_member):
+        from skill3d.storage.cold_history import ColdHistory
+        self._cold_fetch = fetch_member
+        self._cold_history = ColdHistory(self._workspace, fetch_member)
+
+    def cold_reference(self, path, *, records=None):
+        if self._cold_history is None:
+            return None
+        path = Path(path)
+        if not path.is_absolute() or ".." in path.parts:
+            raise IntegrityError("cold reads require absolute lexical paths")
+        try:
+            ref = path.relative_to(self.root).as_posix()
+        except ValueError:
+            return None
+        if records is None:
+            with self.section() as io:
+                records = self._cold_history.records(budget=io._budget)
+        return records.get(ref)
+
+    def read_history_bytes(self, path):
+        path = Path(path)
+        if self._cold_history is None:
+            return path.read_bytes()
+        if not path.is_absolute() or ".." in path.parts:
+            raise IntegrityError("history reads require an absolute lexical path")
+        ref = path.relative_to(self.root).as_posix()
+        with self._cold_history.lease((ref,)):
+            record = self.cold_reference(path)
+            if record is None:
+                return path.read_bytes()
+            return self._cold_history.read_bytes(record.ref)
+
+    def _archive_completed_history(self):
+        """Retire only immutable completed episodes and finalized gate campaigns."""
+        from skill3d.storage.cold_history import MAX_COLD_ARCHIVE_RECORDS
+        from skill3d.storage.hot_cache import _digest
+        history = self._cold_history
+        if history is None:
+            return
+        with self._workspace._write_lease() as budget:
+            document = history._load(budget)
+        # Resume saved identities before any generic output collection.
+        for key, archive in document["archives"].items():
+            if archive["ack"] is None or any(
+                    (self.root / ref).exists() for ref in archive["files"]):
+                history.collect(tuple(archive["files"]),
+                                ArchiveRoute(**archive["route"]), key)
+        with self._workspace._write_lease() as budget:
+            existing = history.records(budget=budget)
+        selected = []
+        def add(path):
+            if path.is_file() and not path.is_symlink():
+                ref = path.relative_to(self.root).as_posix()
+                if ref not in existing:
+                    selected.append((ref, path.stat().st_size))
+        for phase in ("initial_validation", "accumulation", "final_validation"):
+            base = self.root / phase
+            for result in (base / "results").glob("*.json"):
+                variant = base / "variants" / result.stem
+                for directory in ("trace", "offline_images"):
+                    for path in (variant / directory).rglob("*"):
+                        add(path)
+                if phase != "accumulation":
+                    add(variant / "outcome.json")
+            if phase == "accumulation":
+                for worker in (base / "workers").glob("*"):
+                    for campaign in (worker / "campaigns").glob("*"):
+                        if not (campaign / "result.json").is_file():
+                            continue
+                        add(campaign / "experience_bundle.json")
+                        # result.json is written after gate scoring/publication;
+                        # later recovery returns it before reopening gate episodes.
+                        for path in (campaign / "gate").rglob("*"):
+                            if "trace" in path.parts or path.name == "outcome.json":
+                                add(path)
+        selected = sorted(set(selected))
+        batches, current, size = [], [], 0
+        for ref, amount in selected:
+            if current and (size + amount > 128 * 1024 * 1024
+                            or len(current) >= MAX_COLD_ARCHIVE_RECORDS):
+                batches.append(current)
+                current, size = [], 0
+            current.append(ref)
+            size += amount
+        if current:
+            batches.append(current)
+        for refs in batches:
+            key = "history-" + _digest([self.job, refs])[:32]
+            history.collect(refs, ArchiveRoute(self.job, key, self.attempt), key)
+
     def request_governor(self, root, config):
         return WorkspaceRequestGovernor(self, root, config)
 
@@ -315,6 +413,7 @@ class FrameworkStateIO:
             # One saved-identity transport at a time across all owners. This is
             # not the workspace lease and does not block episode writers.
             with _flock(lock):
+                self._archive_completed_history()
                 workspace.archive_pending()
                 token = uuid.uuid4().hex
                 workspace.checkpoint(
@@ -425,6 +524,10 @@ class WorkspaceRequestGovernor(RequestGovernor):
                 permit.close()
                 raise
             self._permits.stream = permit
+            if active._budget.atomic_writes:
+                permit = _AccountedPermit(
+                    permit, active._budget, self.root / f"slot-{slot:03d}.lock")
+                self._permits.stream = permit
         return slot, permit
 
     @contextmanager
@@ -441,3 +544,33 @@ class WorkspaceRequestGovernor(RequestGovernor):
             if permit is not None:
                 permit.close()
                 self._permits.stream = None
+
+
+class _AccountedPermit:
+    """Track and fsync the original numeric governor permit in its short IO lease."""
+
+    def __init__(self, stream, budget, path):
+        self._stream, self._budget, self._path = stream, budget, path
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    def truncate(self, *args):
+        with self._budget._accounted((self._path,)):
+            return self._stream.truncate(*args)
+
+    def write(self, data):
+        info = os.fstat(self._stream.fileno())
+        unit = _allocation_unit(self._budget.path)
+        allocated = max(info.st_size, getattr(info, "st_blocks", 0) * 512)
+        growth = max(0, _rounded(info.st_size + len(data), unit) - allocated)
+        with self._budget._accounted(
+                (self._path,), logical_bytes=len(data), allocation_bytes=growth):
+            written = self._stream.write(data)
+            self._stream.flush()
+            os.fsync(self._stream.fileno())
+            return written
+
+    def flush(self):
+        self._stream.flush()
+        os.fsync(self._stream.fileno())

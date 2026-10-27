@@ -159,10 +159,23 @@ def _copy_delta_file(cache, target, source, size, sha256):
 
 
 class _Writer:
-    def __init__(self, budget, stream):
+    def __init__(self, budget, stream, *, path=None):
         self._budget, self._stream = budget, stream
+        self._path = path
 
     def write(self, data):
+        if self._budget.atomic_writes:
+            with self._budget._io_lock:
+                info = os.fstat(self._stream.fileno())
+                size = memoryview(data).nbytes
+                unit = _allocation_unit(self._budget.path)
+                charged = max(_rounded(info.st_size, unit),
+                              getattr(info, "st_blocks", 0) * 512)
+                growth = max(0, _rounded(info.st_size + size, unit) - charged)
+                with self._budget._accounted(
+                    (self._path,), logical_bytes=size, allocation_bytes=growth,
+                ):
+                    return self._stream.write(data)
         info = os.fstat(self._stream.fileno())
         charged = max(info.st_size, getattr(info, "st_blocks", 0) * 512)
         growth = max(0, _rounded(info.st_size + len(data),
@@ -182,6 +195,8 @@ class WorkspaceIO:
 
     Peak growth includes old files plus replacement temporaries. Existing
     baseline files are writable only under explicitly declared mutable roots.
+    An atomic_writes lease trusts exclusively this capability; raw filesystem
+    mutation is outside that contract and still checked at lease boundaries.
     """
 
     def __init__(self, budget, *, baseline=None, mutable_roots=(), internal=False,
@@ -218,6 +233,10 @@ class WorkspaceIO:
     def open(self, relative, mode="wb"):
         if mode not in {"wb", "xb"}:
             raise StorageError("workspace writes support atomic wb/xb only")
+        if self._budget.atomic_writes:
+            with self._open_atomic(relative, mode) as stream:
+                yield stream
+            return
         self._budget.check_growth()
         path = self._path(relative, write=True)
         if mode == "xb" and path.exists():
@@ -247,6 +266,76 @@ class WorkspaceIO:
             temp.unlink(missing_ok=True)
             _fsync_dir(temp_dir)
 
+    def _missing_directories(self, *paths):
+        missing = set()
+        for path in paths:
+            while not path.exists():
+                missing.add(path)
+                path = path.parent
+        return missing
+
+    def _sync_parents(self, *paths):
+        for path in paths:
+            while not path.exists():
+                path = path.parent
+            _sync_ancestors(path, self._budget.path)
+
+    @contextmanager
+    def _open_atomic(self, relative, mode):
+        self._budget.check_growth()
+        path = self._path(relative, write=True)
+        if mode == "xb" and path.exists():
+            raise FileExistsError(path)
+        temp_dir = WorkspaceIO(self._budget, internal=True)._path(_META + "/tmp")
+        temp = temp_dir / (uuid.uuid4().hex + ".tmp")
+        missing = self._missing_directories(path.parent, temp_dir)
+        changed_dirs = {directory.parent for directory in missing} | {temp_dir}
+        unit = _allocation_unit(self._budget.path)
+        # Admit directory entries and a temporary inode separately from payload.
+        allocation = unit * (len(missing) + len(changed_dirs) + 1)
+        fd = None
+        registered = False
+        try:
+            with self._budget._accounted(
+                (*missing, path.parent, temp), allocation_bytes=allocation,
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                self._budget._atomic_temporaries.add(temp)
+                self._budget._writers += 1
+                registered = True
+            with os.fdopen(fd, "wb", buffering=0) as stream:
+                fd = None
+                yield _Writer(self._budget, stream, path=temp)
+                info = os.fstat(stream.fileno())
+                charged = max(info.st_size, getattr(info, "st_blocks", 0) * 512)
+                growth = max(0, _rounded(info.st_size, unit) - charged)
+                with self._budget._accounted((temp,)):
+                    if self._budget.cache.disk_usage(self._budget.cache.root).free < (
+                        self._budget.cache.min_free_bytes + growth
+                    ):
+                        raise QuotaExceeded("workspace fsync crosses filesystem free-space floor")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            with self._budget._accounted((temp, path), allocation_bytes=2 * unit):
+                if mode == "xb" and path.exists():
+                    raise FileExistsError(path)
+                os.replace(temp, path)
+        finally:
+            try:
+                if fd is not None:
+                    os.close(fd)
+                # Abort cleanup must work even after actual IO exceeded admission.
+                with self._budget._accounted((temp,), admit=False):
+                    temp.unlink(missing_ok=True)
+                self._sync_parents(path.parent, temp_dir)
+            finally:
+                if registered:
+                    with self._budget._io_lock:
+                        self._budget._atomic_temporaries.discard(temp)
+                        self._budget._writers -= 1
+
     def write_bytes(self, relative, data):
         with self.open(relative) as stream:
             for start in range(0, len(data), _BLOCK):
@@ -260,12 +349,30 @@ class WorkspaceIO:
     def unlink(self, relative):
         self._budget.check_growth()
         path = self._path(relative, write=True)
+        if self._budget.atomic_writes:
+            with self._budget._accounted((path,)):
+                path.unlink()
+            _sync_ancestors(path.parent, self._budget.path)
+            return
         path.unlink()
         _fsync_dir(path.parent)
 
     def mkdir(self, relative):
         self._budget.check_growth()
         path = self._path(relative, write=True)
+        if self._budget.atomic_writes:
+            missing = self._missing_directories(path)
+            changed_dirs = {directory.parent for directory in missing}
+            allocation = _allocation_unit(self._budget.path) * (
+                len(missing) + len(changed_dirs))
+            try:
+                with self._budget._accounted(
+                    (*missing, path), allocation_bytes=allocation,
+                ):
+                    path.mkdir(parents=True, exist_ok=True)
+            finally:
+                self._sync_parents(path)
+            return
         missing = 0
         parent = path
         while not parent.exists():
@@ -280,6 +387,11 @@ class WorkspaceIO:
     def rmdir(self, relative):
         self._budget.check_growth()
         path = self._path(relative, write=True)
+        if self._budget.atomic_writes:
+            with self._budget._accounted((path,)):
+                path.rmdir()
+            _sync_ancestors(path.parent, self._budget.path)
+            return
         path.rmdir()
         _fsync_dir(path.parent)
 
@@ -288,12 +400,16 @@ class StateWorkspace:
     """Adopt a staged state in place; archive bounded deltas asynchronously."""
 
     def __init__(self, cache: HotCache, key: str, *, identity=None, transfer=None,
-                 checkpoint_validator=None, bounded=False, lock_timeout_s=120.0):
+                 checkpoint_validator=None, bounded=False, lock_timeout_s=120.0,
+                 atomic_writes=False):
         _name(key)
         self.cache, self.key = cache, key
         self.identity, self.transfer = identity, transfer
         self.checkpoint_validator = checkpoint_validator
         self.bounded = bool(bounded)
+        self.atomic_writes = bool(atomic_writes)
+        if self.atomic_writes and not self.bounded:
+            raise StorageError("atomic workspace IO requires fixed-ceiling bounded mode")
         self.lock_timeout_s = float(lock_timeout_s)
         if not 0 < self.lock_timeout_s < float("inf"):
             raise StorageError("workspace lock timeout must be finite and positive")
@@ -304,12 +420,13 @@ class StateWorkspace:
         if not self.bounded:
             with self.cache.workspace_lease(
                 self.key, growth_bytes=growth_bytes, allocation_bytes=allocation_bytes,
+                atomic_writes=self.atomic_writes,
             ) as budget:
                 yield budget
             return
         deadline = time.monotonic() + self.lock_timeout_s
         while True:
-            lease = self.cache.workspace_lease(self.key)
+            lease = self.cache.workspace_lease(self.key, atomic_writes=self.atomic_writes)
             try:
                 budget = lease.__enter__()
                 break
@@ -447,6 +564,11 @@ class StateWorkspace:
         return route
 
     def _delta(self, source, baseline, roots):
+        from skill3d.storage.cold_history import COLD_HISTORY_PATH, validate_cold_index
+        cold_path = source / COLD_HISTORY_PATH
+        cold_document = _read_json(cold_path) if cold_path.exists() else None
+        cold = (validate_cold_index(cold_document, workspace_key=self.key)
+                if cold_document is not None else {})
         files, directories, present = {}, [], set()
         for relative, path, info in _members(source):
             present.add(relative)
@@ -459,7 +581,11 @@ class StateWorkspace:
                     files[relative] = identity
             elif info.st_size != baseline.files[relative]["size"]:
                 raise IntegrityError("immutable baseline file size changed")
-        deleted_files = sorted(set(baseline.files) - present)
+        missing = set(baseline.files) - present
+        for ref in missing.intersection(cold):
+            if cold[ref].identity != dict(baseline.files[ref]):
+                raise IntegrityError("cold baseline reference changed")
+        deleted_files = sorted(missing - set(cold))
         deleted_dirs = sorted(set(baseline.directories) - present)
         if any(not _mutable(ref, roots) for ref in (*deleted_files, *deleted_dirs)):
             raise IntegrityError("immutable baseline member disappeared")
@@ -469,6 +595,7 @@ class StateWorkspace:
             "baseline_members_sha256": baseline.members_sha256,
             "files": files, "directories": directories,
             "deleted_files": deleted_files, "deleted_directories": deleted_dirs,
+            **({"cold_history": cold_document} if cold_document is not None else {}),
         }
 
     def _publish(self, key, kind, producer, *, estimated_bytes, allocation_bytes,
@@ -567,6 +694,14 @@ class StateWorkspace:
             or data.get("baseline_members_sha256") != baseline.members_sha256
         ):
             raise IntegrityError("delta checkpoint baseline identity mismatch")
+        if "cold_history" in data:
+            from skill3d.storage.cold_history import validate_cold_index
+            cold = validate_cold_index(data["cold_history"])
+            for ref, record in cold.items():
+                if ref in baseline.files and record.identity != dict(baseline.files[ref]):
+                    raise IntegrityError("checkpoint cold baseline reference changed")
+            if set(cold).intersection(data["deleted_files"]):
+                raise IntegrityError("checkpoint deleted a durable cold reference")
         expected_files = {_DELTA}
         expected_dirs = set()
         for relative, row in data["files"].items():

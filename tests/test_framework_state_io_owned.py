@@ -60,6 +60,9 @@ def _ack(_path, manifest):
         ArchiveIdentity(manifest["job"], manifest["shard"], manifest["attempt"],
                         manifest["sha256"]), manifest["manifest_sha256"])
 
+def _fetch_forbidden(_ack, _ref, _writer):
+    raise AssertionError("synthetic restore is not requested in this test")
+
 
 def _spawn_write(io, connection):
     try:
@@ -660,6 +663,71 @@ class FrameworkStateIOChecks(unittest.TestCase):
             calls.append("dispatch")
         self.assertFalse(calls)
         self.assertEqual(self._journal()["mutable_roots"], journal["mutable_roots"])
+
+    def test_completed_history_retains_active_episodes_and_restores_exact_ack_bytes(self):
+        from skill3d.storage.hot_cache import ArchiveReceiver
+        receiver = ArchiveReceiver(self.base / "receiver", disk_usage=_disk_usage)
+        self.workspace.transfer = receiver.receive
+        def fetch(ack, ref, writer):
+            writer.write((receiver.published_path(ack.identity) / ref).read_bytes())
+        self.io.enable_cold_history(fetch)
+        base = self.io.root / "accumulation"
+        retired = {
+            base / "variants/done/trace/topic.jsonl": b"synthetic finished trace\n",
+            base / "variants/done/offline_images/00.png": b"synthetic frozen image",
+            base / "workers/00/campaigns/finished/gate/0/parent/variants/g/outcome.json":
+                b'{"synthetic":"finished gate"}',
+        }
+        protected = {
+            base / "variants/active/trace/topic.jsonl": b"synthetic active trace\n",
+            base / "variants/done/outcome.json": b'{"synthetic":"learning evidence"}',
+            base / "workers/00/campaigns/active/gate/0/parent/variants/g/outcome.json":
+                b'{"synthetic":"active gate"}',
+        }
+        for path, raw in {**retired, **protected}.items():
+            self.io.write_bytes(path, raw)
+        self.io.write_json(base / "results/done.json", {"synthetic": True})
+        self.io.write_json(base / "workers/00/campaigns/finished/result.json",
+                           {"synthetic": True})
+        envelope = self._envelope()
+        self.io._archive_completed_history()
+        for path, raw in retired.items():
+            self.assertFalse(path.exists())
+            self.assertEqual(self.io.read_history_bytes(path), raw)
+            self.assertEqual(self.io.cold_reference(path).sha256,
+                             hashlib.sha256(raw).hexdigest())
+        for path, raw in protected.items():
+            self.assertEqual(path.read_bytes(), raw)
+        self.assertEqual(self._envelope(), envelope)
+        self.io._archive_completed_history()
+        self.assertEqual(len(self.io._cold_history.records()), len(retired))
+
+    def test_checkpoint_carries_cold_baseline_custody_instead_of_deletion(self):
+        from skill3d.storage.hot_cache import ArchiveReceiver
+        receiver = ArchiveReceiver(self.base / "receiver", disk_usage=_disk_usage)
+        self.workspace.transfer = receiver.receive
+        self.io.enable_cold_history(_fetch_forbidden)
+        self.io._cold_history.collect(("seed.bin",), ArchiveRoute(
+            "synthetic-job", "immutable-cold-seed", 1), "immutable-cold-seed")
+        self.assertFalse((self.io.root / "seed.bin").exists())
+        path = self.workspace.checkpoint(
+            "cold-checkpoint", route=ArchiveRoute("synthetic-job", "cold-checkpoint", 1))
+        with self.workspace._write_lease() as budget:
+            journal = self.workspace._journal(budget)
+            baseline = self.workspace._baseline(budget, journal)
+        delta = self.workspace.validate_checkpoint(path, baseline)
+        self.assertNotIn("seed.bin", delta["deleted_files"])
+        self.assertIn("cold_history", delta)
+        record = self.io.cold_reference(self.io.root / "seed.bin")
+        self.assertEqual(record.identity, dict(baseline.files["seed.bin"]))
+
+    def test_cold_transport_reconstructs_with_spawned_framework_io(self):
+        self.io.enable_cold_history(_fetch_forbidden)
+        cloned = pickle.loads(pickle.dumps(self.io))
+        self.assertTrue(cloned._workspace.atomic_writes)
+        self.assertIsNotNone(cloned._cold_history)
+        self.assertIs(cloned._cold_fetch, _fetch_forbidden)
+        self.assertEqual(cloned._cold_history.records(), {})
 
 
 if __name__ == "__main__":

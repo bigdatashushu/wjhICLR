@@ -929,6 +929,7 @@ def build_fit_skill_bundle(
     candidates: Mapping[tuple[str, str], SkillSpecV11],
     active_parents: Mapping[tuple[str, str], SkillSpecV11],
     source_run_identity: Mapping,
+    framework_state_io=None,
 ) -> dict:
     """Freeze exact-slot candidates and unchanged active parents."""
     root = Path(output_dir).resolve()
@@ -944,7 +945,10 @@ def build_fit_skill_bundle(
         == len(candidates),
         "each revised slot must have an independent SKILL.md body",
     )
-    root.mkdir(parents=True)
+    if framework_state_io is None:
+        root.mkdir(parents=True)
+    else:
+        framework_state_io.mkdir(root)
     slot_rows = {}
     for question_type, evidence_state in ALL_FIT_SLOTS:
         slot = (question_type, evidence_state)
@@ -972,8 +976,11 @@ def build_fit_skill_bundle(
                  f"{key}: frozen Skill exceeds service limit")
         relative = Path("skills") / question_type / evidence_state / "SKILL.md"
         destination = root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(spec.skill_md, encoding="utf-8")
+        if framework_state_io is None:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(spec.skill_md, encoding="utf-8")
+        else:
+            framework_state_io.write_text_once(destination, spec.skill_md)
         if slot in candidates:
             role = "revised_candidate"
         elif slot in set(UNREACHABLE_FIT_SLOTS):
@@ -1013,7 +1020,10 @@ def build_fit_skill_bundle(
         "slots": slot_rows,
     }
     manifest = {**body, "manifest_sha256": content_sha256(body)}
-    _write_create_once(root / "manifest.json", manifest)
+    if framework_state_io is None:
+        _write_create_once(root / "manifest.json", manifest)
+    else:
+        framework_state_io.write_json_once(root / "manifest.json", manifest)
     load_fit_skill_bundle(root / "manifest.json")
     return manifest
 
@@ -1860,6 +1870,14 @@ class SystemVariantRunner:
 
     def offline_case_input(self, variant: Mapping) -> dict:
         """Read the public input frozen during execution; never recover labels."""
+        if self.framework_state_io is not None:
+            with self.framework_state_io.section() as io:
+                history = self.framework_state_io._cold_history
+                records = history.records(budget=io._budget) if history is not None else {}
+                return self._offline_case_input_body(variant, cold_records=records)
+        return self._offline_case_input_body(variant)
+
+    def _offline_case_input_body(self, variant: Mapping, *, cold_records=None) -> dict:
         path = (self.root / "variants" / _variant_key(str(variant["variant_id"]))
                 / "offline_input.json")
         _require(path.is_file(), f"{variant['variant_id']}: offline_input.json is missing")
@@ -1893,6 +1911,15 @@ class SystemVariantRunner:
                      and str(logical) == ref["path"]
                      and logical.parent == Path(self.logical_path(path.parent)) / "offline_images",
                      f"{variant['variant_id']}: offline image logical parent changed")
+            if cold_records and self._continuation is not None:
+                physical = self._continuation.physical_path(logical)
+                cold = self.framework_state_io.cold_reference(physical, records=cold_records)
+                if cold is not None and not physical.exists():
+                    _require(not physical.is_symlink()
+                             and physical.parent == path.parent / "offline_images"
+                             and cold.sha256 == ref["file_sha256"] == ref["content_sha256"],
+                             f"{variant['variant_id']}: frozen cold image changed")
+                    continue
             image_path = self.logical_file(logical, ref["file_sha256"])
             _require(image_path.resolve().parent == (path.parent / "offline_images").resolve()
                      and ref["file_sha256"] == ref["content_sha256"],
@@ -2152,6 +2179,31 @@ class SystemVariantRunner:
         with self._episode_permit(), self._input_episode_lease(variant):
             return self._run_one_locked(variant)
 
+    def _cached_prefix_execution_runner(self, variant: Mapping):
+        """Load the interrupted worker's exact Skill without advancing its stream."""
+        spec = self._cached_prefix_spec
+        if spec is None or self.evolution_config is None:
+            return self
+        from skill3d.evolution.fitset_stream_v11 import FrozenSkillProvider, _active
+        manifest = json.loads((self.root / "manifest.json").read_bytes())
+        owner = manifest["execution"]["slot_ownership"][variant["slot_key"]]
+        parents, snapshot = _active(self.root / "workers" / f"{owner:02d}" / "library")
+        skill = parents[(variant["question_type"], variant["evidence_state"])]
+        identity = {
+            "mode": "fitset_slot_stream",
+            "snapshot_ref": snapshot["snapshot_id"],
+            "manifest_sha256": snapshot["manifest_sha256"],
+            "slot_key": skill.slot_key,
+        }
+        dispatch = spec.value["frozen_dispatch"]
+        _require(identity == dispatch["skill_identity"]
+                 and content_sha256([skill.model_dump(mode="json")])
+                 == dispatch["skills_sha256"],
+                 "cached-prefix worker Skill differs from original dispatch")
+        worker = copy.copy(self)
+        worker.skills_for_variant = FrozenSkillProvider([skill], identity)
+        return worker
+
     def _govern_client(self, client, category: str, context: Mapping):
         if self.request_governor_config is None:
             return client
@@ -2184,7 +2236,8 @@ class SystemVariantRunner:
                 _require(spec.completed_result() is not None,
                          "cached-prefix hook cannot execute another variant before completion")
                 spec = None
-        prepared_run = self._prepare_one(variant, preflight=True) if spec else self._prepare_one(variant)
+        prepared_run = (self._cached_prefix_execution_runner(variant)._prepare_one(
+            variant, preflight=True) if spec else self._prepare_one(variant))
         variant_id = prepared_run["variant_id"]
         item = prepared_run["item"]
         if getattr(self, "_qa_disjoint_gate", False):

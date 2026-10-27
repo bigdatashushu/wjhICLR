@@ -649,3 +649,45 @@ def test_verified_canonical_offline_copy_cannot_change_under_later_normal_run(pa
             runner.completed()
     finally:
         canonical.write_bytes(raw)
+
+
+@pytest.mark.parametrize("tamper", [None, "snapshot", "skill"])
+def test_cached_prefix_uses_original_worker_skill_without_advancing_evolution(
+        package, monkeypatch, tamper):
+    runner = make_runner(package, monkeypatch)
+    runner.evolution_config = object()
+    skill = SkillSpecV11.model_validate(package.helper.skills[0])
+    identity = {
+        "mode": "fitset_slot_stream", "snapshot_ref": "synthetic-worker-snapshot",
+        "manifest_sha256": "a" * 64, "slot_key": skill.slot_key,
+    }
+    runner._cached_prefix_spec = SimpleNamespace(value={"frozen_dispatch": {
+        "skill_identity": identity,
+        "skills_sha256": evidence_sha256([skill.model_dump(mode="json")]),
+    }})
+    write(package.root / "manifest.json", {"execution": {
+        "slot_ownership": {package.variant["slot_key"]: 2}}})
+    snapshot = {"snapshot_id": identity["snapshot_ref"],
+                "manifest_sha256": identity["manifest_sha256"]}
+    if tamper == "snapshot":
+        snapshot["snapshot_id"] = "synthetic-other-snapshot"
+    if tamper == "skill":
+        skill = skill.model_copy(update={"skill_md": skill.skill_md + "Changed.\n"})
+    visited = []
+    def active(path):
+        visited.append(path)
+        return {(skill.question_type, skill.evidence_state): skill}, snapshot
+    monkeypatch.setattr("skill3d.evolution.fitset_stream_v11._active", active)
+    original_provider = object()
+    runner.skills_for_variant = original_provider
+    if tamper:
+        with pytest.raises(fitset.FitSetError, match="original dispatch"):
+            runner._cached_prefix_execution_runner(package.variant)
+    else:
+        worker = runner._cached_prefix_execution_runner(package.variant)
+        skills, actual_identity = worker.skills_for_variant(package.variant)
+        assert actual_identity == identity and skills == [skill]
+        assert worker is not runner and worker.client_factory is runner.client_factory
+    assert runner.skills_for_variant is original_provider
+    assert visited == [package.root / "workers/02/library"]
+    assert not package.constructed and not package.normal_calls

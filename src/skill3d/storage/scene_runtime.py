@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 import tarfile
 import time
+import urllib.parse
 import urllib.request
 
 from skill3d.infra.m5_identity import file_identity
@@ -211,6 +212,12 @@ class SceneHotRuntime:
                 "Content-Length": str(manifest["archive_bytes"]),
             }) as response:
                 return json.load(response)
+
+    def fetch_cold_member(self, ack, member_key, writer):
+        ref = urllib.parse.quote(member_key, safe="")
+        with self._request("/archive-member/" + ack.manifest_sha256 + "/" + ref) as response:
+            for block in iter(lambda: response.read(1024 * 1024), b""):
+                writer.write(block)
 
     def publish_output(self, key, producer, *, estimated_bytes, job, shard,
                        attempt, checkpoint=False, latest=False, best=False):

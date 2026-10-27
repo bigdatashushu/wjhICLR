@@ -229,9 +229,21 @@ class DeploymentContinuation:
         if activated:
             _require(json.loads(marker.read_bytes()) == activation,
                      "continuation activation identity changed")
+        cold_records = {}
+        history = getattr(framework_state_io, "_cold_history", None)
+        if history is not None:
+            with framework_state_io.section() as io:
+                cold_records = history.records(budget=io._budget)
         for ref, expected in files.items():
-            live = _checked_file(system_root, ref).read_bytes()
             archive_ref = expected["archive_ref"]
+            candidate = system_root / ref
+            if archive_ref is None and cold_records and not candidate.exists():
+                cold = framework_state_io.cold_reference(candidate, records=cold_records)
+                if cold is not None:
+                    _require(cold.identity == expected["identity"],
+                             f"continuation cold file identity changed: {ref}")
+                    continue
+            live = _checked_file(system_root, ref).read_bytes()
             if re.fullmatch(r"workers/[0-9]+/buffer/stream.json", ref):
                 _require(archive_ref == f"raw_state/{ref}",
                          "continuation requires original stream bytes")

@@ -13,7 +13,7 @@ trusted receiver/transport. A digest received from an untrusted peer is not an A
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import fcntl
 import gzip
 import hashlib
@@ -696,7 +696,11 @@ class Reservation:
 
 @dataclass
 class WorkspaceLease:
-    """Trusted mutable IO budget, valid during an exclusive workspace lease."""
+    """Trusted mutable IO budget, valid during an exclusive workspace lease.
+
+    atomic_writes is a fixed-envelope contract: only WorkspaceIO may mutate the
+    tree. Its touched-path accounting replaces scans, not quota admission.
+    """
 
     cache: HotCache
     key: str
@@ -704,17 +708,45 @@ class WorkspaceLease:
     bytes: int
     charged_bytes: int
     active: bool = True
+    atomic_writes: bool = False
+    _logical_bytes: int | None = field(default=None, init=False, repr=False)
+    _allocated_bytes: int | None = field(default=None, init=False, repr=False)
+    _io_lock: object = field(default_factory=threading.RLock, init=False, repr=False)
+    _accounting_ok: bool = field(default=True, init=False, repr=False)
+    _writers: int = field(default=0, init=False, repr=False)
+    _atomic_temporaries: set = field(default_factory=set, init=False, repr=False)
 
     def check_growth(self, *, logical_bytes: int = 0, allocation_bytes: int = 0):
         logical_bytes, allocation_bytes = _count(logical_bytes), _count(allocation_bytes)
+        if not self.atomic_writes:
+            return self._check_full(logical_bytes, allocation_bytes)
+        with self._io_lock:
+            if not self.active:
+                raise StorageError("workspace lease is closed")
+            if not self._accounting_ok or self._logical_bytes is None:
+                raise IntegrityError("atomic workspace accounting is unavailable")
+            if self._logical_bytes + logical_bytes > self.bytes or (
+                self._allocated_bytes + allocation_bytes > self.charged_bytes
+            ):
+                raise QuotaExceeded("workspace write exceeds its persistent growth envelope")
+            # The global quota already charges the fixed ceiling. Other cache
+            # operations retain their own admission; check actual free space here.
+            if self.cache.disk_usage(self.cache.root).free < (
+                self.cache.min_free_bytes + allocation_bytes
+            ):
+                raise QuotaExceeded("workspace write crosses filesystem free-space floor")
+
+    def _check_full(self, logical_bytes=0, allocation_bytes=0):
         if not self.active:
             raise StorageError("workspace lease is closed")
         with self.cache._locked() as state:
             row = state["entries"].get(self.key)
             if row is None or row["kind"] != "workspace" or not row["ready"]:
                 raise StorageError("workspace is not published")
-            if _tree_bytes(self.path, logical=True) + logical_bytes > self.bytes or (
-                _tree_bytes(self.path) + allocation_bytes > self.charged_bytes
+            logical = _tree_bytes(self.path, logical=True)
+            allocated = _tree_bytes(self.path)
+            if logical + logical_bytes > self.bytes or (
+                allocated + allocation_bytes > self.charged_bytes
             ):
                 raise QuotaExceeded("workspace write exceeds its persistent growth envelope")
             self.cache._fits(state, 0)
@@ -722,6 +754,58 @@ class WorkspaceLease:
                 self.cache.min_free_bytes + allocation_bytes
             ):
                 raise QuotaExceeded("workspace write crosses filesystem free-space floor")
+            self._logical_bytes, self._allocated_bytes = logical, allocated
+
+    @contextmanager
+    def _accounted(self, paths, *, logical_bytes=0, allocation_bytes=0, admit=True):
+        """Private WorkspaceIO hook; account actual changes even on failed IO."""
+        if not self.atomic_writes:
+            raise StorageError("incremental accounting requires atomic workspace IO")
+        with self._io_lock:
+            touched = set()
+            for path in paths:
+                path.relative_to(self.path)
+                while True:
+                    touched.add(path)
+                    if path == self.path:
+                        break
+                    path = path.parent
+
+            def counts():
+                logical = allocated = 0
+                for path in sorted(touched, key=lambda p: len(p.parts)):
+                    try:
+                        info = path.lstat()
+                    except FileNotFoundError:
+                        continue
+                    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                        raise IntegrityError("workspace IO forbids links and special files")
+                    if stat.S_ISREG(info.st_mode):
+                        logical += info.st_size
+                    charged = _charged(info)
+                    if path in self._atomic_temporaries:
+                        # Dirty file extents can be allocated only at fsync.
+                        charged = max(charged, _rounded(info.st_size,
+                                                       _allocation_unit(self.path)))
+                    allocated += charged
+                return logical, allocated
+
+            before = counts()
+            if admit:
+                self.check_growth(logical_bytes=logical_bytes,
+                                  allocation_bytes=allocation_bytes)
+            try:
+                yield
+            finally:
+                try:
+                    after = counts()
+                    self._logical_bytes += after[0] - before[0]
+                    self._allocated_bytes += after[1] - before[1]
+                except BaseException:
+                    self._accounting_ok = False
+                    raise
+                if admit:
+                    self.check_growth()
 
 
 class HotCache:
@@ -1010,9 +1094,16 @@ class HotCache:
     @contextmanager
     def workspace_lease(
         self, key: str, *, growth_bytes: int | None = None,
-        allocation_bytes: int | None = None,
+        allocation_bytes: int | None = None, atomic_writes: bool = False,
     ) -> Iterator[WorkspaceLease]:
-        """Persist peak growth before mutation; crashes retain bytes and budget."""
+        """Persist peak growth before mutation; crashes retain bytes and budget.
+
+        atomic_writes opts into WorkspaceIO-only writes within an already
+        reserved fixed ceiling. Raw writers must retain the default scan/fsync
+        path. Boundary scans still reject links, special files and over-quota IO.
+        """
+        if atomic_writes and (growth_bytes is not None or allocation_bytes is not None):
+            raise StorageError("atomic workspace IO requires an already reserved fixed envelope")
         if growth_bytes is not None:
             _count(growth_bytes)
         if allocation_bytes is not None:
@@ -1039,14 +1130,23 @@ class HotCache:
                     self._fits(state, 0)
                     self._save(state)
                 budget = WorkspaceLease(self, key, path, row["workspace_bytes"],
-                                        row["workspace_charged_bytes"])
+                                        row["workspace_charged_bytes"],
+                                        atomic_writes=atomic_writes)
             try:
-                budget.check_growth()
+                if atomic_writes:
+                    budget._check_full()
+                else:
+                    budget.check_growth()
                 yield budget
             finally:
                 try:
-                    _fsync_tree(path)
-                    budget.check_growth()
+                    if not atomic_writes:
+                        _fsync_tree(path)
+                        budget.check_growth()
+                    else:
+                        budget._check_full()
+                    if atomic_writes and budget._writers:
+                        raise StorageError("atomic writers must finish before lease release")
                 finally:
                     budget.active = False
 
