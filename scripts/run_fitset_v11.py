@@ -509,8 +509,8 @@ def _run_system(args) -> int:
     if args.perception_endpoint:
         from skill3d.cluster.perception_client import gateway_endpoint
         gateway_endpoint(args.perception_endpoint)
-        if not 1 <= args.perception_capacity <= 8:
-            raise FitSetError("RPC gateway capacity must be frozen between 1 and 8")
+        if not 1 <= args.perception_capacity <= 64:
+            raise FitSetError("RPC gateway capacity must be frozen between 1 and 64")
         request_concurrency = (
             args.request_concurrency or args.workers
             if args.max_requests else max(args.workers, args.episode_concurrency)

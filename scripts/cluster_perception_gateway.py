@@ -173,8 +173,8 @@ class PerceptionGateway:
 
     def __init__(self, config: dict, root: Path, *, max_concurrency: int = 8,
                  client_factory=BailianClient):
-        if type(max_concurrency) is not int or not 1 <= max_concurrency <= 8:
-            raise ValueError("max_concurrency must be between 1 and 8")
+        if type(max_concurrency) is not int or not 1 <= max_concurrency <= 64:
+            raise ValueError("max_concurrency must be between 1 and 64")
         self.token = bearer_token()
         self._options = client_options(config)
         self._client_factory = client_factory
