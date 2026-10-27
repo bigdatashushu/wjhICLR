@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import pickle
+import threading
 
 import numpy as np
 import pytest
@@ -184,8 +185,35 @@ def test_all_gate_inputs_are_prepared_before_any_learning_execution(build, monke
     assert len(receipts) == 2 and not list((runner.root / "results").glob("*.json"))
 
 
-def test_missing_or_wrong_runtime_gate_evidence_stops_before_learning_requests(build, monkeypatch):
-    runner = build()
+def test_parallel_gate_preparation_finishes_every_input_before_learning(build, monkeypatch):
+    runner = build(workers=2)
+    barrier = threading.Barrier(2)
+    prepared = set()
+    learning_started = []
+
+    def prepare(row, *, preflight):
+        assert preflight and row["variant_id"] in runner.gate_variant_rows
+        barrier.wait(timeout=3)
+        prepared.add(row["variant_id"])
+        return {
+            "identity": {"sha256": "f" * 64}, "state": row["evidence_state"],
+            "reference": runner.binding_refs[row["variant_id"]],
+        }
+
+    def execute(pending, _accept):
+        assert prepared == set(runner.gate_variant_rows)
+        assert len(list((runner.root / "gate_preflight").glob("*.json"))) == 2
+        learning_started.extend(row["variant_id"] for row in pending)
+
+    monkeypatch.setattr(runner, "_prepare_one", prepare)
+    monkeypatch.setattr(runner, "_execute_process_pending", execute)
+    runner.run(resume=False, max_variants=1)
+    assert learning_started == ["learn-1@g0m0"]
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_missing_or_wrong_runtime_gate_evidence_stops_before_learning_requests(build, monkeypatch, workers):
+    runner = build(workers=workers)
     monkeypatch.setattr(runner, "_execute_process_pending", _forbidden)
 
     def fail(*_args, **_kwargs):

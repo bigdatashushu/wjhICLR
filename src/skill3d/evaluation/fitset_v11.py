@@ -1637,7 +1637,7 @@ class SystemVariantRunner:
             return
         # Validate every held-out input before any learning request, even when
         # --max-variants restricts execution to a smaller learning subset.
-        for variant in self.gate_variant_rows.values():
+        def validate(variant):
             values = self._prepare_one(variant, preflight=True)
             _require(values["state"] == variant["evidence_state"],
                      f"{variant['variant_id']}: gate runtime evidence state changed")
@@ -1658,6 +1658,14 @@ class SystemVariantRunner:
                     "model_requests": 0,
                 },
             )
+            return {"variant_id": variant["variant_id"]}
+
+        if self.workers == 1:
+            for variant in self.gate_variant_rows.values():
+                validate(variant)
+        else:
+            self._execute_preflight_pending(
+                list(self.gate_variant_rows.values()), validate, lambda _: None)
 
     def _freeze_offline_case_input(self, variant: Mapping, item: EpisodeItem) -> None:
         from PIL import Image
