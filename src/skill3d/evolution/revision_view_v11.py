@@ -1,0 +1,278 @@
+"""Source-linked revision view of decisions and observations, not audit logs.
+
+Original bundles stay immutable. Full programs, all recorded observation pages,
+error/recovery facts and supervision survive. Image bookkeeping is grouped;
+unused candidate catalogs and unread detection arrays are explicitly summarized.
+"""
+import ast
+from collections import Counter
+from copy import deepcopy
+import json
+import re
+
+from skill3d.evolution.evidence_graph_v11 import evidence_sha256
+
+VIEW_SCHEMA = "revision-decision-view/1.0"
+_CASE_FIELDS = (
+    "case_id", "qa_id", "scene_id", "question_type", "evidence_state",
+    "question_text", "options", "source_split", "split", "label_access",
+    "learning_authorization", "episode_status", "initial_evidence_states",
+    "evidence_states", "selected_object_ids", "model_answer", "reference_answer",
+    "score", "outcome", "failure_categories", "error_direction", "frame_set_hash",
+    "trace_ref", "delivered_skill_version", "delivered_content_sha256",
+)
+_ROUND_FIELDS = (
+    "index", "trigger", "synthesis_source", "program_source", "executed",
+    "error_code", "runtime_error_code", "submission_accepted", "tool_calls",
+    "observed_result_ids", "used_result_ids", "invalidated_result_ids",
+    "selected_object_ids", "verification_result_ids", "recovery_observation_ids",
+    "service_errors", "finalization", "observation_adapter",
+)
+_RESULT_FIELDS = (
+    "result_id", "tool", "source_tool", "source", "args", "status",
+    "error", "error_code", "failure_cause", "failure_guidance", "invalidated_by",
+    "degraded_evidence", "available_artifacts", "missing_artifacts",
+    "resolved_object_ids", "object_dependencies", "result_dependencies",
+    "evidence_version",
+)
+_STATIC_FEEDBACK_PREFIXES = (
+    "Still-valid observations (", "No valid prior observations are available;",
+    "These are raw data values,", "For omitted candidates/fields use ReadObservation(",
+    "Required action this round:", "Call only currently documented tools.",
+    "First define answer in code from the question and valid",
+    "For an answer genuinely based entirely on original imag",
+    "For combined visual and valid tool evidence,",
+    "Invalidated results and rejected answers cannot serve a",
+)
+
+
+def _fields(row, fields):
+    return {key: deepcopy(row[key]) for key in fields if key in row}
+
+
+def _feedback(text, read_index):
+    """Keep actual feedback; remove only exact redundant page JSON/control text."""
+    kept = []
+    delivered_reads = []
+    delivered_summaries = []
+    skip_page = False
+    for line in (text or "").splitlines():
+        if line.startswith(_STATIC_FEEDBACK_PREFIXES):
+            continue
+        if line == "Requested observation pages (raw data, original references):":
+            skip_page = True
+            continue
+        if skip_page:
+            skip_page = False
+            try:
+                pages = json.loads(line)
+            except ValueError:
+                kept.extend(["Requested observation pages (raw data, original references):", line])
+            else:
+                if isinstance(pages, list) and all(isinstance(page, dict) for page in pages):
+                    for page in pages:
+                        digest = evidence_sha256(page)
+                        if digest in read_index:
+                            delivered_reads.append({"recorded_read_ref": read_index[digest]})
+                        else:
+                            delivered_reads.append({"original_delivered_page": deepcopy(page)})
+                else:
+                    kept.extend(["Requested observation pages (raw data, original references):", line])
+            continue
+        if line.startswith("- ") and " [result_id=" in line:
+            delivered_summaries.append({"header": line, "summary_lines": []})
+            continue
+        if delivered_summaries and line.startswith((
+                "  data/raw payload=", "  summary view of raw list payload=", "Summary omissions:")):
+            delivered_summaries[-1]["summary_lines"].append(line)
+            continue
+        kept.append(line)
+    if skip_page:
+        kept.append("Requested observation pages (raw data, original references):")
+    return "\n".join(kept).strip(), delivered_reads, delivered_summaries
+
+
+def _image_groups(ledger):
+    groups = {}
+    for image in (ledger or {}).get("images", []):
+        common = _fields(image, (
+            "kind", "produced_by", "produced_round", "result_id",
+            "delivered_rounds", "observed_rounds", "unobserved_reason",
+            "source_hw", "sent_hw", "scale", "transform_version",
+        ))
+        key = json.dumps(common, sort_keys=True)
+        group = groups.setdefault(key, {**common, "frames": []})
+        frame = image.get("source_frame_id", image.get("source_frame_index"))
+        if image.get("kind") not in {"original", "original_frame", "frame"}:
+            frame = {**_fields(image, ("source_frame_id", "source_frame_index")),
+                     **_fields(image, ("image_id", "box_xyxy"))}
+        elif image.get("source_frame_index") not in (None, frame):
+            frame = _fields(image, ("source_frame_id", "source_frame_index"))
+        group["frames"].append(frame)
+    return list(groups.values())
+
+def _reads_raw_detection_array(program):
+    """Retain full detection arrays when recorded code may consume raw data."""
+    try:
+        tree = ast.parse(program or "")
+    except SyntaxError:
+        return True
+    fields = {"data", "payload", "value", "detections"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in fields:
+            return True
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+            if node.slice.value in fields:
+                return True
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Constant):
+                if node.args[0].value in fields:
+                    return True
+    return False
+
+
+def decision_case_view(case):
+    view = _fields(case, _CASE_FIELDS)
+    view["source_case_sha256"] = evidence_sha256(case)
+    if not case.get("rounds") and "program_source" in case:
+        view["program_source"] = case["program_source"]
+    view["initial_images"] = _image_groups(case.get("image_observations"))
+    history = []
+    for state in case.get("evidence_history", []):
+        facts = _fields(state, (
+            "trigger", "evidence_states", "evidence_version", "available_artifacts",
+            "local_facts", "question_tool_scope", "state_reasons",
+        ))
+        candidates = state.get("candidates") or []
+        facts["candidate_catalog"] = {
+            "count": len(candidates),
+            "categories": dict(Counter(str(c.get("category_name", "")) for c in candidates)),
+            "binding_statuses": dict(Counter(str(c.get("grounding_status", "")) for c in candidates)),
+            "detail_status": "unused catalog summarized; source retained",
+        }
+        history.append(facts)
+    view["evidence_history"] = history
+    selected = set(case.get("selected_object_ids") or [])
+    for row in case.get("rounds", []):
+        selected.update(row.get("selected_object_ids") or [])
+        for result in row.get("results", []):
+            selected.update(result.get("resolved_object_ids") or [])
+            selected.update(result.get("object_dependencies") or [])
+    view["selected_candidates"] = [
+        deepcopy(c) for c in case.get("candidate_objects", []) if c.get("obj_id") in selected]
+    rounds = []
+    read_index = {
+        evidence_sha256(read): [position, offset]
+        for position, row in enumerate(case.get("rounds", []))
+        for offset, read in enumerate(row.get("observation_reads") or [])
+    }
+    for position, original in enumerate(case.get("rounds", [])):
+        row = _fields(original, _ROUND_FIELDS)
+        row["source_ref"] = original.get("experience_provenance", {}).get(
+            "source_ref", f"{case.get('trace_ref', '')}#/rounds/{position}")
+        response = original.get("response_text") or ""
+        program = original.get("program_source") or ""
+        if program and program in response:
+            response = response.replace(program, "[complete program_source retained]")
+        response = re.sub(r"```(?:python|py)?\s*\[complete program_source retained\]\s*```",
+                          "[complete program_source retained]", response)
+        if response.strip() not in {"", "[complete program_source retained]"}:
+            row["response_outside_program"] = response
+        diagnostics = _fields(original.get("execution_diagnostics") or {}, (
+            "answer_untrusted", "error_line", "error_message", "error_source_line",
+            "error_type", "stdout", "traceback_text",
+        ))
+        if diagnostics:
+            row["execution_diagnostics"] = diagnostics
+        reads = original.get("observation_reads") or []
+        row["observation_reads"] = [
+            _fields(read, (
+                "result_id", "source_tool", "data", "data_path", "source_item_paths",
+                "returned_range", "total_count", "coverage_complete", "next_cursor",
+                "fields_omitted", "unknown_fields_omitted_count", "evidence_version",
+            )) for read in reads]
+        results = []
+        for result in original.get("results", []):
+            record = _fields(result, _RESULT_FIELDS)
+            record["authorization"] = _fields(result.get("authorization") or {}, (
+                "allowed", "reason_codes", "question_tool_scope", "scene_route",
+                "metric_gate_result", "invalidated_by", "dependency_refs",
+            ))
+            payload = result.get("payload")
+            if payload is None and isinstance(result.get("value"), str):
+                try:
+                    payload = json.loads(result["value"])
+                except ValueError:
+                    pass
+                else:
+                    record["source_value_encoding"] = "original JSON values; whitespace omitted"
+            if isinstance(payload, dict) and (
+                result.get("source_tool") or result.get("tool")) == "detect_objects" and (
+                    not _reads_raw_detection_array(program)):
+                record["payload"] = {
+                    key: deepcopy(value) for key, value in payload.items()
+                    if key not in {"detections", "detector_endpoint_hash"}
+                }
+                record["detection_array"] = {
+                    "count": len(payload.get("detections") or []),
+                    "detail_status": "original read pages and delivered summaries retained below",
+                }
+            elif isinstance(payload, list) and (
+                    result.get("source_tool") or result.get("tool")) == "list_objects":
+                record["payload"] = [_fields(obj, (
+                    "obj_id", "category_name", "visible_frames", "track_id",
+                    "grounding_status", "binding_flags", "binding_validation",
+                    "bbox", "det_conf", "det_conf_source", "mask_support_ratio",
+                    "mask_available", "mask_source_present", "duplicate_suspect",
+                    "question_roles", "centroid_world",
+                )) if isinstance(obj, dict) else deepcopy(obj) for obj in payload]
+                record["payload_projection"] = "object values retained; storage/provenance references omitted"
+            elif payload is not None:
+                record["payload"] = deepcopy(payload)
+            else:
+                record["value"] = deepcopy(result.get("value"))
+            results.append(record)
+        row["results"] = results
+        feedback, delivered_reads, delivered_summaries = _feedback(
+            original.get("feedback"), read_index)
+        if feedback:
+            row["feedback"] = feedback
+        if delivered_reads:
+            row["delivered_observation_pages"] = delivered_reads
+        if delivered_summaries:
+            row["delivered_tool_summaries"] = delivered_summaries
+        verification = original.get("geometry_verify")
+        if isinstance(verification, dict):
+            row["geometry_verify"] = _fields(verification, (
+                "passed", "world_frame_available", "metric_evidence_authorized",
+                "checks", "check_status", "issues", "violations", "notes",
+            ))
+        progress = original.get("progress")
+        if isinstance(progress, dict):
+            row["progress"] = {key: deepcopy(value) for key, value in progress.items()
+                               if not key.endswith(("hash", "sha256", "fingerprint"))}
+        rounds.append(row)
+    view["rounds"] = rounds
+    view["projection"] = {
+        "schema": VIEW_SCHEMA,
+        "retained": "all programs, rounds, read pages, delivered feedback facts, supervision and validity",
+        "summarized": ["image bookkeeping", "unused candidate catalogs", "unread detection arrays"],
+        "omitted": ["duplicate responses/results", "repeated framework text", "generation/audit metadata"],
+        "raw_record_retained": True,
+    }
+    return view
+
+
+def decision_bundle_view(bundle):
+    common = _fields(bundle, (
+        "schema_version", "campaign_id", "parent_skill_version", "parent_content_sha256",
+        "parent_snapshot_id", "question_type", "evidence_state", "source_split", "split",
+        "label_access", "learning_authorization", "source_run_ref",
+    ))
+    accesses = bundle.get("label_access_records") or [bundle.get("label_access_record")]
+    common["label_access_summary"] = [
+        _fields(record, ("split", "purpose", "component_role", "n_items", "label_access",
+                         "input_manifest_sha256", "learning_authorization"))
+        for record in accesses if isinstance(record, dict)
+    ]
+    return {**common, "cases": [decision_case_view(c) for c in bundle["cases"]]}

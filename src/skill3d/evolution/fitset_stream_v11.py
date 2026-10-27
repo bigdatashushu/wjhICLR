@@ -28,6 +28,7 @@ from skill3d.evaluation.gate_process_metrics import (
 )
 from skill3d.evolution.fitset_revision_v11 import (
     FitSetSlotReviser,
+    RevisionInputBudgetExhausted,
     load_active_parent_slots,
 )
 from skill3d.evolution.leakage import leakage_scan_text
@@ -74,6 +75,8 @@ class FitSetEvolutionConfig:
     gate_seeds: tuple[int, ...] = (137, 138)
     max_revision_attempts: int = 3
     max_tokens: int = 8192
+    revision_input_max_bytes: int = 128000
+    revision_input_max_chars: int = 72000
     scheduling_mode: Literal["batch_v1", "novel_failure_v1"] = "novel_failure_v1"
     max_revision_requests_per_slot: int = 18
     max_gate_candidates_per_slot: int = 6
@@ -95,6 +98,8 @@ class FitSetEvolutionConfig:
             raise ValueError("unknown revision scheduling mode")
         if min(self.max_revision_requests_per_slot, self.max_gate_candidates_per_slot) < 1:
             raise ValueError("per-slot revision/gate limits must be positive")
+        if self.revision_input_max_bytes < 4096 or self.revision_input_max_chars < 4096:
+            raise ValueError("revision input byte budget must be at least 4096")
         if self.learning_input_mode not in {
                 "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"}:
             raise ValueError("unknown learning input mode")
@@ -867,6 +872,11 @@ class FitSetWorkerEvolution:
             max_tokens=self.config.max_tokens,
             method_context_max_chars=self.runner.base_cfg.retrieval_policy.method_context_max_chars,
             experiment_split=self.runner.experiment_split,
+            input_max_bytes=self.config.revision_input_max_bytes,
+            input_max_chars=self.config.revision_input_max_chars,
+            evidence_request_budget=max(0, schedule["remaining_revision_requests"]
+                                        - schedule["revision_attempt_budget"]
+                                        - int(self.config.learning_input_mode.startswith("diagnosis"))),
         )
         _require(not leakage_scan_text(
             json.dumps(feedback), forbidden_sample_ids=forbidden),
@@ -948,6 +958,17 @@ class FitSetWorkerEvolution:
                 slot=(request.question_type, request.evidence_state),
                 parent=parent, feedback=feedback, forbidden_ids=forbidden,
                 experience=experience, diagnosis=diagnosis)
+        except RevisionInputBudgetExhausted as exc:
+            _write_create_once(root / "input_budget_refusal.json", {
+                "schema": "revision-input-budget-refusal/1",
+                "source_bundle_sha256": exc.source_sha256,
+                "needed_batches": exc.needed, "available_counted_requests": exc.available,
+                "model_requests_initiated": 0, "method_assessed": False,
+                "parent_preserved": True, "canonical_cases_retained": True,
+            })
+            result = StreamingAttemptResult(
+                outcome="no_change", campaign_id=token,
+                reason="revision_input_request_budget_exhausted")
         except FitSetError as exc:
             result = StreamingAttemptResult(
                 outcome="rejected", campaign_id=token, reason=str(exc))

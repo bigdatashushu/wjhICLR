@@ -61,10 +61,18 @@ class FullEvidenceClient:
                 "unknowns": ["The cause cannot be established from the recorded program."],
             })
         text = messages[-1]["content"]
-        assert "How many chairs are visible" in text
-        assert '"reference_answer": "2"' in text
-        assert '"program_source": "ReturnAnswer()"' in text
-        assert "experience_provenance" in text
+        from skill3d.evolution.evidence_graph_v11 import decode_evidence_graph
+        view = next(value for value in (
+            decode_evidence_graph(json.loads(line)) for line in text.splitlines()
+            if line.startswith('{"records":'))
+            if isinstance(value, dict) and "case_components" in value)
+        cases = [row["complete_case"] for row in view["case_components"]]
+        assert cases
+        assert all(case["question_text"].startswith("How many chairs are visible")
+                   and case["reference_answer"] == "2"
+                   and case["rounds"][-1]["program_source"] == "ReturnAnswer()"
+                   and case["rounds"][0]["source_ref"]
+                   for case in cases)
         return json.dumps({
             "action": "no_change", "modification_reason": "No supported method change."})
 
@@ -239,7 +247,11 @@ def test_complete_induction_cases_and_diagnosis_reach_reviser_and_resume(tmp_pat
     assert len(bundle["cases"]) == 12
     assert bundle["cases"][0]["rounds"][0]["experience_provenance"]["source_ref"]
     assert json.loads((campaign.parent / "result.json").read_text())["outcome"] == "no_change"
-    assert len(list(campaign.parent.glob("revision/slots/*/*/request_intent_*.json"))) == 1
+    delivery = json.loads(next(campaign.parent.glob(
+        "revision/slots/*/*/evidence_delivery_plan.json")).read_text())
+    assert len(list(campaign.parent.glob("revision/slots/*/*/request_intent_*.json"))) == len(
+        delivery["batches"])
+    assert len(list(campaign.parent.glob("revision/slots/*/*/request_intent_0*.json"))) == 1
     assert len(list(campaign.parent.glob("diagnosis/*/request_intent.json"))) == int(mode == "diagnosis_v1")
     assert not (campaign.parent / "gate").exists()
     buffer = next((runner.root / "workers").glob("*/buffer/stream.json"))

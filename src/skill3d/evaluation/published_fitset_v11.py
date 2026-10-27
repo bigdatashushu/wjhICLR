@@ -154,14 +154,29 @@ class PublishedFitSetInputProvider:
     binding and returns a runtime artifact and validated relocation capability.
     Public ``entries`` omit only the catalog's unlabelled binding diagnostics;
     the original catalog entry hashes and full manifest file remain anchored.
+    ``transport_locator`` accepts an approved ``PublishedTransportLocator`` or
+    its descriptor. Physical lookups are separate from every catalog locator;
+    the manifest itself may also be an exact pinned file mapping.
     """
 
-    def __init__(self, manifest_path: str | Path, max_scenes: int = 2) -> None:
+    def __init__(
+        self, manifest_path: str | Path, max_scenes: int = 2, *,
+        transport_locator=None,
+    ) -> None:
         from skill3d.infra.m5_identity import content_sha256
+        from skill3d.storage.published_transport import PublishedTransportLocator
 
         _require(type(max_scenes) is int and max_scenes > 0,
                  "scene cache size must be a positive integer")
-        self.manifest_path = Path(manifest_path).expanduser().absolute()
+        self.transport_locator = (
+            PublishedTransportLocator(transport_locator)
+            if isinstance(transport_locator, Mapping) else transport_locator
+        )
+        _require(self.transport_locator is None or isinstance(
+            self.transport_locator, PublishedTransportLocator),
+            "transport_locator requires an approved physical transport descriptor")
+        self.manifest_path = self._physical_file(
+            Path(manifest_path).expanduser().absolute(), None)
         self._manifest_identity = _file(self.manifest_path)
         manifest, _ = _read_anchored(
             self.manifest_path, self._manifest_identity["sha256"])
@@ -178,7 +193,9 @@ class PublishedFitSetInputProvider:
         source_catalog = None
         if self.schema == FULLQA_INPUT_SCHEMA:
             source_catalog, _ = _read_anchored(
-                manifest["source_catalog_file"], manifest["source_catalog_sha256"])
+                self._physical_file(
+                    manifest["source_catalog_file"], manifest["source_catalog_sha256"]),
+                manifest["source_catalog_sha256"])
             _require(source_catalog.get("schema") == "harness3d-published-binding-catalog/1",
                      "fullQA source catalog schema changed")
             scopes = manifest.get("scene_scopes")
@@ -298,10 +315,66 @@ class PublishedFitSetInputProvider:
         )
         return entry
 
+    def _physical_file(self, source: str | Path, sha256: str | None) -> Path:
+        from skill3d.storage.relocation import RelocationError
+
+        try:
+            return (self.transport_locator.file(source, sha256)
+                    if self.transport_locator is not None else Path(source))
+        except RelocationError as exc:
+            raise PublishedFitSetInputError(f"published physical file rejected: {exc}") from exc
+
+    def _physical_root(self, source: str | Path) -> Path:
+        from skill3d.storage.relocation import RelocationError
+
+        try:
+            return (self.transport_locator.root(source)
+                    if self.transport_locator is not None else Path(source))
+        except RelocationError as exc:
+            raise PublishedFitSetInputError(f"published physical root rejected: {exc}") from exc
+
+    def _rebase_migration(self, store, key, migration, identity, source_root):
+        """Validate the old receipt against a new full, binding-anchored receipt."""
+        from skill3d.infra.m5_identity import content_sha256
+        from skill3d.storage.relocation import RelocationError, read_relocation_receipt
+
+        try:
+            original = read_relocation_receipt(
+                self._physical_file(migration, None)
+                if isinstance(migration, (str, Path)) else migration)
+            _require(original.get("destination_root") == source_root,
+                     "original migration destination changed")
+            root = self._physical_root(source_root)
+            records = {"artifact": original["artifact"], **original["dependencies"]}
+            refs = {}
+            for name, record in records.items():
+                path = self.transport_locator.member(
+                    source_root, record["target_ref"], record["identity"])
+                refs[name] = path.relative_to(root).as_posix()
+            fresh = store.create_migration_receipt(
+                key, scene_input_identity=identity, destination_root=root,
+                scene_artifact_ref=refs.pop("artifact"), dependency_refs=refs)
+            # Location alone may differ. Replay all original record fields,
+            # including the full logical identity and immutable manifest anchor.
+            replay = copy.deepcopy(fresh)
+            replay["destination_root"] = source_root
+            replay["artifact"]["target_ref"] = original["artifact"]["target_ref"]
+            for name in replay["dependencies"]:
+                replay["dependencies"][name]["target_ref"] = (
+                    original["dependencies"][name]["target_ref"])
+
+            replay["receipt_sha256"] = content_sha256({
+                k: v for k, v in replay.items() if k != "receipt_sha256"})
+            _require(replay == original,
+                     "original migration full identity/member/binding anchor changed")
+            return fresh, root
+        except (RelocationError, KeyError, TypeError, ValueError) as exc:
+            raise PublishedFitSetInputError(f"published migration relocation rejected: {exc}") from exc
+
     def _scene(self, entry: dict):
         from skill3d.infra.m5_identity import file_identity
 
-        root = Path(entry["input_root"])
+        root = self._physical_root(entry["input_root"])
         key = (str(root), entry["frozen_scene_sha256"])
         with self.cache_lock:
             _file(root / "scene.json", entry["frozen_scene_sha256"])
@@ -373,8 +446,11 @@ class PublishedFitSetInputProvider:
             and fs.readable_frame_ids == fs.frame_ids and len(item.pixels) == 32,
             "published input requires exactly 32 readable frames",
         )
-        _require(with_pixel_identity(fs, item.pixels).pixel_sha256 == fs.pixel_sha256,
-                 "published frozen RGB pixel identity changed")
+        try:
+            actual_pixels = with_pixel_identity(fs, item.pixels).pixel_sha256
+        except ValueError as exc:
+            raise PublishedFitSetInputError("published frozen RGB pixel identity changed") from exc
+        _require(actual_pixels == fs.pixel_sha256, "published frozen RGB pixel identity changed")
 
     def __call__(self, variant: Mapping) -> EpisodeItem:
         entry = self._entry(variant)
@@ -396,28 +472,40 @@ class PublishedFitSetInputProvider:
         entry = self._entry(variant)
         self._validate_item(variant, entry, item)
         identity, identity_file = _read_anchored(
-            entry["scene_input_identity_file"],
+            self._physical_file(entry["scene_input_identity_file"],
+                                entry["scene_input_identity_file_sha256"]),
             entry["scene_input_identity_file_sha256"],
         )
         validation, migration_file = _read_anchored(
-            entry["migration_receipt_file"], entry["migration_receipt_file_sha256"])
+            self._physical_file(entry["migration_receipt_file"],
+                                entry["migration_receipt_file_sha256"]),
+            entry["migration_receipt_file_sha256"])
         try:
             migration = validation["variants"][entry["variant"]]["migration_receipts"][
                 entry["qa_id"]]
         except (KeyError, TypeError) as exc:
             raise PublishedFitSetInputError("catalog migration receipt is missing") from exc
         reference = entry["reference"]
-        store = PreparedBindingStore(reference["store_root"])
+        store_root = self._physical_root(reference["store_root"])
+        store = PreparedBindingStore(store_root)
         _require(identity.get("artifact_path") == reference["scene_artifact_ref"]
                  and identity.get("sha256") == reference["scene_input_identity_sha256"],
                  "catalog logical scene identity changed")
         try:
-            _require(reference == store.reference(reference["key"]),
-                     "original catalog binding reference/manifest changed")
+            store.validate_reference(reference)
+            original_migration = copy.deepcopy(migration)
+            destination = Path(entry["publication_root"])
+            artifact_path = Path(entry["scene_artifact"])
+            if self.transport_locator is not None:
+                _require(artifact_path == destination / migration["artifact"]["target_ref"],
+                         "catalog published artifact location changed")
+                migration, destination = self._rebase_migration(
+                    store, reference["key"], migration, identity, entry["publication_root"])
+                artifact_path = destination / migration["artifact"]["target_ref"]
             resolver = store.validate_migration_receipt(
                 reference["key"], migration,
-                scene_artifact=entry["scene_artifact"], scene_input_identity=identity,
-                destination_root=entry["publication_root"],
+                scene_artifact=str(artifact_path), scene_input_identity=identity,
+                destination_root=str(destination),
             )
         except PreparedBindingStoreError as exc:
             raise PublishedFitSetInputError(f"published binding replay rejected: {exc}") from exc
@@ -438,11 +526,12 @@ class PublishedFitSetInputProvider:
             "source_catalog_sha256": self._input_contract_identity["source_catalog_sha256"],
             "catalog_entry_sha256": content_sha256(original_catalog),
             "frozen_scene": _file(
-                Path(entry["input_root"]) / "scene.json", entry["frozen_scene_sha256"]),
+                self._physical_root(entry["input_root"]) / "scene.json",
+                entry["frozen_scene_sha256"]),
             "scene_input_identity_file": identity_file,
             "migration_receipt_file": migration_file,
             "scene_input_identity_sha256": identity["sha256"],
-            "migration_receipt_sha256": migration["receipt_sha256"],
+            "migration_receipt_sha256": original_migration["receipt_sha256"],
             "publication_receipt_sha256": entry["publication_receipt_sha256"],
             "original_scene_artifact_ref": reference["scene_artifact_ref"],
             "binding_key": reference["key"],
@@ -458,11 +547,19 @@ class PublishedFitSetInputProvider:
                 name: entry[name] for name in sorted(_PROVENANCE_FIELDS & set(entry))
             },
         }
+        if self.transport_locator is not None:
+            receipt["physical_transport"] = {
+                "descriptor_sha256": self.transport_locator.descriptor_sha256,
+                "store_root": str(store_root), "geometry_root": str(destination),
+                "migration_receipt_sha256": migration["receipt_sha256"],
+            }
         receipt["receipt_sha256"] = content_sha256(receipt)
         json.dumps(receipt, allow_nan=False)
         return {
             "entry": entry, "identity": identity, "migration": migration,
             "resolver": resolver, "receipt": receipt,
+            "original_migration": original_migration,
+            "store_root": store_root, "destination_root": destination,
         }
 
     def receipt(self, variant: Mapping, item: EpisodeItem) -> dict:
@@ -487,8 +584,10 @@ class PublishedFitSetInputProvider:
             prepared = load_prepared_binding_reference(
                 entry["reference"], scene_input_identity=transport["identity"],
                 migration_receipt=transport["migration"],
-                scene_artifact=entry["scene_artifact"],
-                migration_destination_root=entry["publication_root"],
+                scene_artifact=str(resolver.artifact_path),
+                migration_destination_root=str(transport["destination_root"]),
+                physical_store_root=(transport["store_root"]
+                                     if self.transport_locator is not None else None),
             )
         except PreparedBindingStoreError as exc:
             raise PublishedFitSetInputError(f"published binding replay rejected: {exc}") from exc

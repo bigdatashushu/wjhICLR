@@ -27,6 +27,10 @@ from skill3d.evaluation.fitset_v11 import (
 )
 from skill3d.evolution.campaign_v11 import _unknown_tool_calls
 from skill3d.evolution.leakage import leakage_scan_text
+from skill3d.evolution.evidence_graph_v11 import (
+    GRAPH_INSTRUCTIONS, canonical_text, encode_evidence_graph, evidence_sha256,
+)
+from skill3d.evolution.revision_view_v11 import decision_bundle_view, VIEW_SCHEMA
 from skill3d.evolution.revision_input_v11 import (
     RepairContextError, build_repair_context, candidate_sample_copy_leaks,
     render_case_evidence, revision_contract_text,
@@ -44,15 +48,27 @@ from skill3d.skills.registry import (
 )
 from skill3d.tools.contract import KNOWN_ARTIFACTS
 from skill3d.synthesis.execution_contract import ExecutionContract, review_method_contract
-from skill3d.synthesis.request_audit import describe_request
+from skill3d.synthesis.request_audit import describe_request, payload_bytes
 
 FIT_REVISION_SCHEMA = "v11-fit-set-slot-revision/4.0"
 FIT_FEEDBACK_SCHEMA = "v11-fit-set-slot-feedback/3.0"
-FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v4-case-repair"
+FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v6-decision-view"
+DEFAULT_REVISION_INPUT_MAX_BYTES = 128000
+DEFAULT_REVISION_INPUT_MAX_CHARS = 72000
 
 
 class RevisionOperationalError(RuntimeError):
     """Stop an incomplete or untrustworthy revision without rejecting a method."""
+
+class RevisionInputBudgetExhausted(RevisionOperationalError):
+    """A complete known input needs more calls than the remaining frozen budget."""
+
+    def __init__(self, *, needed, available, source_sha256):
+        self.needed = int(needed)
+        self.available = int(available)
+        self.source_sha256 = source_sha256
+        super().__init__(
+            f"complete evidence needs {needed} batches but only {available} counted requests are available")
 
 
 def _write_create_once(path: Path, value: object) -> None:
@@ -61,6 +77,7 @@ def _write_create_once(path: Path, value: object) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         temporary.write_bytes(data)
+        temporary.chmod(0o600)
         try:
             os.link(temporary, path)
         except FileExistsError:
@@ -460,6 +477,9 @@ class FitSetSlotReviser:
         max_tokens: int = 8192,
         method_context_max_chars: int = DEFAULT_METHOD_CONTEXT_MAX_CHARS,
         experiment_split: dict | None = None,
+        input_max_bytes: int = DEFAULT_REVISION_INPUT_MAX_BYTES,
+        input_max_chars: int = DEFAULT_REVISION_INPUT_MAX_CHARS,
+        evidence_request_budget: int = 0,
     ) -> None:
         self.root = Path(output_root).resolve()
         self.panel = panel
@@ -472,6 +492,12 @@ class FitSetSlotReviser:
         self.max_attempts = int(max_attempts)
         self.max_tokens = int(max_tokens)
         self.method_context_max_chars = int(method_context_max_chars)
+        self.input_max_bytes = int(input_max_bytes)
+        self.input_max_chars = int(input_max_chars)
+        self.evidence_request_budget = int(evidence_request_budget)
+        if (self.input_max_bytes < 4096 or self.input_max_chars < 4096
+                or self.evidence_request_budget < 0):
+            raise FitSetError("revision input/batch budgets are invalid")
         from skill3d.schemas.data_access import (
             learning_authorization_for, normalize_experiment_split,
         )
@@ -517,6 +543,9 @@ class FitSetSlotReviser:
             "max_attempts": self.max_attempts,
             "max_tokens": self.max_tokens,
             "method_context_max_chars": self.method_context_max_chars,
+            "input_max_bytes": self.input_max_bytes,
+            "input_max_chars": self.input_max_chars,
+            "evidence_request_budget": self.evidence_request_budget,
             "grouping_key": ["question_type", "evidence_state"],
             "selected_slot_count": len(selected_slots),
             "selected_slots": [fit_slot_key(*slot) for slot in selected_slots],
@@ -545,7 +574,13 @@ class FitSetSlotReviser:
         experience=None,
         diagnosis=None,
         repair_context=None,
+        evidence_text=None,
+        batch_context=None,
     ) -> str:
+        catalog = json.loads(_tool_docs(parent.question_type, parent.evidence_state).split(
+            "\nStructured interface catalog:\n", 1)[1])
+        tool_text = GRAPH_INSTRUCTIONS + canonical_text(encode_evidence_graph(catalog))
+        feedback_text = canonical_text(encode_evidence_graph(dict(feedback)))
         return (
             "Revise one reusable method for a visual-spatial coding agent.\n"
             f"Protocol: {FIT_REVISION_PROMPT_VERSION}.\n"
@@ -572,17 +607,32 @@ class FitSetSlotReviser:
             f"{ExecutionContract(self.method_context_max_chars).render()}\n\n"
             f"Parent complete SKILL.md:\n{parent.skill_md}\n"
             "Authorized Tool interfaces for this exact slot:\n"
-            f"{_tool_docs(parent.question_type, parent.evidence_state)}\n"
+            "This is the slot's capability upper bound; actual calls require current "
+            "artifact, local-fact and object checks. Hypothetical world_frame is not guaranteed.\n"
+            f"{tool_text}\n"
             "Sanitized aggregate feedback for this exact slot:\n"
-            f"{json.dumps(feedback, ensure_ascii=False, sort_keys=True)}\n"
+            f"{feedback_text}\n"
             "Static feedback from prior formatting attempts:\n"
             f"{json.dumps(list(static_feedback), ensure_ascii=False)}\n"
             f"{revision_contract_text(experiment_split=self.experiment_split)}\n"
             + (
-                "Complete authorized learning cases and source-linked diagnosis:\n"
-                f"{render_case_evidence(experience, diagnosis=diagnosis, experiment_split=self.experiment_split)}\n"
-                if experience is not None else ""
+                "Source-linked authorized learning decision view (projection disclosed in each case):\n"
+                f"{evidence_text if evidence_text is not None else render_case_evidence(experience, diagnosis=diagnosis, experiment_split=self.experiment_split, compact=True)}\n"
+                if experience is not None or evidence_text is not None else ""
             )
+            + ("Explicit sequential evidence coverage and working candidate:\n"
+               + canonical_text({key: value for key, value in batch_context.items()
+                                 if key != "working_skill_md"}) + "\n"
+               + "Working candidate complete SKILL.md:\n"
+               + batch_context.get("working_skill_md", "") + "\n"
+               "Every batch contains original decision facts and disclosed case projections. "
+               "Earlier batches were delivered in separate counted calls; they are not in this request. "
+               "Incorporate this batch into the supplied working candidate, preserving "
+               "prior supported rules. Return revise with the complete final working "
+               "method relative to the original parent, or no_change to retain that "
+               "working candidate. No intermediate method is published or evaluated. "
+               "Only the final combined candidate goes to the existing A/B gate.\n"
+               if batch_context is not None else "")
             + "Previous candidate repair context (full safe text, hash and line positions):\n"
             + json.dumps(repair_context, ensure_ascii=False, sort_keys=True) + "\n"
         )
@@ -593,10 +643,12 @@ class FitSetSlotReviser:
         slot: tuple[str, str],
         attempt: int,
         prompt: str,
+        phase: str = "candidate",
     ) -> dict:
         slot_name = fit_slot_key(*slot)
         slot_root = self.root / "slots" / slot[0] / slot[1]
-        exchange_path = slot_root / f"attempt_{attempt:02d}.json"
+        suffix = f"{attempt:02d}" if phase == "candidate" else f"evidence_{attempt:02d}"
+        exchange_path = slot_root / f"attempt_{suffix}.json"
         request = {
             "prompt_version": FIT_REVISION_PROMPT_VERSION,
             "prompt_sha256": hashlib.sha256(
@@ -625,6 +677,18 @@ class FitSetSlotReviser:
         request["model_request_identity"] = describe_request(
             payload, model_identity=identity_fn(seed=request["seed"]) if callable(identity_fn) else {},
             wire_encoding_known=callable(build_payload))
+        wire_bytes = len(payload_bytes(payload))
+        message_chars = sum(len(message["content"]) for message in request["messages"])
+        if wire_bytes > self.input_max_bytes or message_chars > self.input_max_chars:
+            raise RevisionOperationalError(
+                f"{slot_name}: complete request exceeds revision input byte budget")
+        request["input_budget"] = {
+            "wire_utf8_bytes": wire_bytes, "max_bytes": self.input_max_bytes,
+            "message_chars": message_chars, "max_chars": self.input_max_chars,
+            "wire_encoding_known": callable(build_payload),
+            "token_count": None, "token_count_status": "not_measured",
+            "output_max_tokens": self.max_tokens, "phase": phase,
+        }
         if exchange_path.is_file():
             exchange = json.loads(exchange_path.read_text(encoding="utf-8"))
             if exchange.get("request") != request:
@@ -633,7 +697,7 @@ class FitSetSlotReviser:
             if exchange.get("service_error"):
                 raise RevisionOperationalError(f"{slot_name}: recorded revision service failure")
             return exchange
-        intent_path = slot_root / f"request_intent_{attempt:02d}.json"
+        intent_path = slot_root / f"request_intent_{suffix}.json"
         if intent_path.exists():
             raise RevisionOperationalError(
                 f"{slot_name}: revision request has no completion receipt; ambiguous request is not retried")
@@ -683,6 +747,129 @@ class FitSetSlotReviser:
         _write_create_once(exchange_path, exchange)
         return exchange
 
+    def _evidence_batches(self, *, parent, feedback, experience, diagnosis):
+        """Plan every retained decision fact before any charged request."""
+        raw_source = experience.model_dump(mode="json")
+        source_hash = evidence_sha256(raw_source)
+        source = decision_bundle_view(raw_source)
+        common = {key: value for key, value in source.items() if key != "cases"}
+
+        def text(rows):
+            return GRAPH_INSTRUCTIONS + canonical_text(encode_evidence_graph({
+                "bundle_metadata": common, "case_components": rows,
+                "source_bundle_sha256": source_hash,
+                "view_schema": VIEW_SCHEMA,
+                "diagnosis": diagnosis,
+            }))
+
+        def fits(rows):
+            prompt = self._prompt(
+                parent=parent, feedback=feedback, static_feedback=[],
+                evidence_text=text(rows),
+                batch_context={"working_skill_md": "\n" * self.method_context_max_chars,
+                               "coverage": "reserved" * 128},
+            )
+            # Reserve a full method with escaped newlines; check the actual
+            # assembled candidate/repair request again before every admission.
+            payload = {"messages": [{"role": "system", "content":
+                        "You are an offline Skill method reviser. Output strict JSON only."},
+                       {"role": "user", "content": prompt}],
+                       "max_tokens": self.max_tokens, "seed": 138,
+                       "temperature": 0.0, "enable_thinking": False}
+            build = getattr(self.client, "build_payload", None)
+            if callable(build):
+                payload = build(payload["messages"], **{
+                    key: payload[key] for key in
+                    ("max_tokens", "seed", "temperature", "enable_thinking")})
+            return (len(payload_bytes(payload)) + 2048 <= self.input_max_bytes
+                    and sum(len(message["content"]) for message in payload["messages"])
+                    + 1024 <= self.input_max_chars)
+
+        units = []
+        for index, case in enumerate(source["cases"]):
+            anchor = {"case_index": index, "case_id": case["case_id"],
+                      "source_case_sha256": case["source_case_sha256"],
+                      "view_case_sha256": evidence_sha256(case)}
+            whole = {**anchor, "complete_case": case}
+            if fits([whole]):
+                units.append(whole)
+                continue
+            # Carry the question, supervision and initial conditions with every
+            # complete round. A round's program/read values are never truncated.
+            case_rounds = case.get("rounds") or []
+            if not case_rounds:
+                raise RevisionOperationalError(
+                    "one complete case component exceeds the revision input budget")
+            header = {key: value for key, value in case.items() if key != "rounds"}
+            for position, row in enumerate(case_rounds):
+                unit = {
+                    **anchor, "complete_case": {**header, "rounds": [row]},
+                    "round_range": [position, position + 1],
+                    "total_rounds": len(case_rounds), "case_part": True,
+                }
+                if not fits([unit]):
+                    raise RevisionOperationalError(
+                        "one complete case round exceeds the revision input budget")
+                units.append(unit)
+        batches = []
+        pending = []
+        for unit in units:
+            if pending and not fits([*pending, unit]):
+                batches.append(pending)
+                pending = []
+            pending.append(unit)
+        if pending:
+            batches.append(pending)
+        if len(batches) - 1 > self.evidence_request_budget:
+            raise RevisionInputBudgetExhausted(
+                needed=len(batches), available=self.evidence_request_budget + 1,
+                source_sha256=source_hash)
+        # Reconstruct independently before persisting the coverage claim.
+        rebuilt = [{} for _ in source["cases"]]
+        for batch in batches:
+            for row in batch:
+                target = rebuilt[row["case_index"]]
+                if row.get("case_part"):
+                    part = row["complete_case"]
+                    for key, value in part.items():
+                        if key != "rounds":
+                            if key in target and target[key] != value:
+                                raise RevisionOperationalError("case header changed across batches")
+                            target[key] = value
+                    array = target.setdefault("rounds", [])
+                    if row["round_range"][0] != len(array):
+                        raise RevisionOperationalError("case round order changed")
+                    array.extend(part["rounds"])
+                elif "complete_case" in row:
+                    target.update(row["complete_case"])
+                else:
+                    path = row["component"]["path"]
+                    if len(path) == 1:
+                        target[path[0]] = row["component"]["value"]
+                    else:
+                        array = target.setdefault(path[0], [])
+                        if path[1] != len(array):
+                            raise RevisionOperationalError("case component order changed")
+                        array.append(row["component"]["value"])
+        if rebuilt != source["cases"]:
+            raise RevisionOperationalError("case batching lost original evidence")
+        return [text(batch) for batch in batches], {
+            "schema": "revision-evidence-delivery-plan/1",
+            "source_bundle_sha256": source_hash,
+            "case_count": len(rebuilt), "batches": [
+                {"index": index, "content_sha256": hashlib.sha256(text(batch).encode()).hexdigest(),
+                 "case_indices": sorted({row["case_index"] for row in batch}),
+                 "units": len(batch)}
+                for index, batch in enumerate(batches)],
+            "view_schema": VIEW_SCHEMA, "raw_record_retained": True,
+            "all_original_fields_delivered": False,
+            "all_retained_values_reconstructed": True,
+            "input_max_bytes": self.input_max_bytes, "input_max_chars": self.input_max_chars,
+            "evidence_request_budget": self.evidence_request_budget,
+            "candidate_attempt_budget": self.max_attempts,
+            "token_count_status": "not_measured",
+        }
+
     def _revise_slot(
         self,
         *,
@@ -700,6 +887,13 @@ class FitSetSlotReviser:
         evidence_sha = content_sha256({
             "experience": experience.model_dump(mode="json") if experience is not None else None,
             "diagnosis": diagnosis,
+        })
+        protocol_sha = content_sha256({
+            "prompt_version": FIT_REVISION_PROMPT_VERSION,
+            "input_max_bytes": self.input_max_bytes,
+            "input_max_chars": self.input_max_chars,
+            "evidence_request_budget": self.evidence_request_budget,
+            "max_attempts": self.max_attempts, "max_tokens": self.max_tokens,
         })
         cases = experience.cases if experience is not None else []
         # Trusted method and aggregate control text must be sample-free. Full
@@ -721,8 +915,14 @@ class FitSetSlotReviser:
                     or receipt.get("parent_content_sha256") != parent.content_sha256
                     or receipt.get("contract_sha256") != ExecutionContract(self.method_context_max_chars).sha256
                     or receipt.get("feedback_sha256") != content_sha256(feedback)
-                    or receipt.get("evidence_sha256") != evidence_sha):
+                    or receipt.get("evidence_sha256") != evidence_sha
+                    or receipt.get("revision_protocol_sha256") != protocol_sha):
                 raise RevisionOperationalError(f"{slot_name}: frozen revision identity changed")
+            if experience is not None:
+                plan_path = slot_root / "evidence_delivery_plan.json"
+                if (not plan_path.is_file() or receipt.get("evidence_delivery_plan_sha256")
+                        != content_sha256(json.loads(plan_path.read_bytes()))):
+                    raise RevisionOperationalError(f"{slot_name}: frozen evidence coverage changed")
             if receipt.get("action") == "no_change":
                 return None
             text = skill_path.read_text(encoding="utf-8")
@@ -743,12 +943,65 @@ class FitSetSlotReviser:
             return candidate
         static_feedback: list[dict] = []
         repair_context = None
+        evidence_text = None
+        batch_context = None
+        working_value = None
+        working_exchange_sha = None
+        if experience is not None:
+            batches, delivery_plan = self._evidence_batches(
+                parent=parent, feedback=feedback, experience=experience, diagnosis=diagnosis)
+            _write_create_once(slot_root / "evidence_delivery_plan.json", delivery_plan)
+            working = parent.skill_md
+            for index, batch in enumerate(batches[:-1]):
+                context = {"plan_sha256": content_sha256(delivery_plan),
+                           "batch_index": index, "batch_count": len(batches),
+                           "completed_batch_indices": list(range(index)),
+                           "working_skill_md": working,
+                           "all_evidence_delivered": False}
+                prompt = self._prompt(
+                    parent=parent, feedback=feedback, static_feedback=[],
+                    evidence_text=batch, batch_context=context)
+                exchange = self._request(
+                    slot=slot, attempt=index + 1, phase="evidence", prompt=prompt)
+                try:
+                    if str((exchange.get("generation") or {}).get("finish_reason", "")).casefold() == "length":
+                        raise FitSetError("intermediate response was truncated")
+                    value = _parse_response(exchange["response_text"])
+                    if value["action"] == "revise":
+                        candidate, problems = _static_validate(
+                            parent=parent, candidate_text=value["full_skill_md"],
+                            forbidden_sample_ids=forbidden_ids,
+                            method_context_max_chars=self.method_context_max_chars)
+                        problems.extend(_declaration_problems(value, parent, feedback))
+                        if problems or candidate is None or candidate_sample_copy_leaks(
+                                value["full_skill_md"], cases):
+                            raise FitSetError("intermediate candidate failed static validation")
+                        working = candidate.skill_md
+                        working_value = value
+                        working_exchange_sha = content_sha256(exchange)
+                except FitSetError:
+                    raise RevisionOperationalError(
+                        "recorded intermediate evidence revision is invalid; no automatic retry") from None
+                _write_create_once(slot_root / f"evidence_coverage_{index + 1:02d}.json", {
+                    "plan_sha256": content_sha256(delivery_plan),
+                    "batch_index": index, "exchange_sha256": content_sha256(exchange),
+                    "working_skill_sha256": hashlib.sha256(working.encode()).hexdigest(),
+                    "published": False,
+                })
+            evidence_text = batches[-1]
+            batch_context = {
+                "plan_sha256": content_sha256(delivery_plan),
+                "batch_index": len(batches) - 1, "batch_count": len(batches),
+                "completed_batch_indices": list(range(len(batches) - 1)),
+                "working_skill_md": working, "all_evidence_delivered_after_this_request": True,
+            }
         for attempt in range(1, self.max_attempts + 1):
             prompt = self._prompt(
                 parent=parent,
                 feedback=feedback,
                 static_feedback=static_feedback,
                 experience=experience, diagnosis=diagnosis, repair_context=repair_context,
+                evidence_text=evidence_text, batch_context=batch_context,
             )
             # Scan the complete request, including the parent and retry feedback.
             if experience is None and leakage_scan_text(prompt, forbidden_sample_ids=forbidden_ids):
@@ -763,6 +1016,13 @@ class FitSetSlotReviser:
                 if str((exchange.get("generation") or {}).get("finish_reason", "")).casefold() == "length":
                     raise FitSetError("offline revision response was truncated")
                 value = _parse_response(exchange["response_text"])
+                final_batch_action = value["action"]
+                candidate_origin_exchange_sha = content_sha256(exchange)
+                if value["action"] == "no_change" and working_value is not None:
+                    # The final stage explicitly keeps the previously recorded
+                    # working method. Preserve its actual model declaration.
+                    value = working_value
+                    candidate_origin_exchange_sha = working_exchange_sha
                 if value["action"] == "no_change":
                     body = {
                         "schema_version": FIT_REVISION_SCHEMA, "action": "no_change",
@@ -772,6 +1032,9 @@ class FitSetSlotReviser:
                         "contract_sha256": ExecutionContract(self.method_context_max_chars).sha256,
                         "feedback_sha256": content_sha256(feedback),
                         "evidence_sha256": evidence_sha,
+                        "revision_protocol_sha256": protocol_sha,
+                        "evidence_delivery_plan_sha256": (
+                            batch_context["plan_sha256"] if batch_context is not None else None),
                         "modification_reason": value["modification_reason"],
                         "exchange_sha256": content_sha256(exchange),
                     }
@@ -820,12 +1083,17 @@ class FitSetSlotReviser:
                     "contract_sha256": ExecutionContract(self.method_context_max_chars).sha256,
                     "feedback_sha256": content_sha256(feedback),
                     "evidence_sha256": evidence_sha,
+                    "revision_protocol_sha256": protocol_sha,
                     "modification_reason": value["modification_reason"],
                     "change_declaration": {
                         key: value.get(key) for key in (
                             "change_hypothesis", "changed_sections",
                             "expected_process_effect", "evidence_signature_refs")},
                     "exchange_sha256": content_sha256(exchange),
+                    "candidate_origin_exchange_sha256": candidate_origin_exchange_sha,
+                    "final_batch_action": final_batch_action,
+                    "evidence_delivery_plan_sha256": (
+                        batch_context["plan_sha256"] if batch_context is not None else None),
                 }
                 _write_create_once(final_path, {**body, "identity_sha256": content_sha256(body)})
                 return candidate

@@ -8,6 +8,9 @@ import re
 from typing import Mapping, Sequence
 
 from skill3d.evolution.leakage import leakage_scan_text
+from skill3d.evolution.evidence_graph_v11 import (
+    GRAPH_INSTRUCTIONS, canonical_text, encode_evidence_graph,
+)
 
 
 class RepairContextError(ValueError):
@@ -69,6 +72,7 @@ def revision_contract_text(*, experiment_split: Mapping | None = None) -> str:
 
 def render_case_evidence(
     experience, diagnosis: Mapping | None = None, *, experiment_split: Mapping | None = None,
+    compact: bool = False,
 ) -> str:
     evidence = (
         experience.model_dump(mode="json")
@@ -97,7 +101,9 @@ def render_case_evidence(
     if evidence.get("schema_version", "skill-experience-bundle-v11/6.0") != (
             "skill-experience-bundle-v11/6.0"):
         raise ValueError("legacy experience bundles are read-only")
-    text = json.dumps(evidence, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    text = (GRAPH_INSTRUCTIONS + canonical_text(encode_evidence_graph(evidence))
+            if compact else
+            json.dumps(evidence, ensure_ascii=False, sort_keys=True, allow_nan=False))
     if diagnosis is not None:
         text += (
             "\nSource-linked offline diagnosis (hypotheses are not proven causes):\n"

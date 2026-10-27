@@ -365,6 +365,33 @@ class PreparedBindingStore:
             "manifest_sha256": manifest["manifest_sha256"],
         }
 
+    def validate_reference(self, reference: Mapping) -> dict:
+        """Check every original reference field, without rewriting its store root."""
+        from skill3d.storage.relocation import _ref
+
+        try:
+            _ref(reference["store_root"], absolute=True)
+            key = str(reference["key"])
+            expected = self.reference(key)
+            expected["store_root"] = reference["store_root"]
+            if reference.get("manifest_sha256") != expected["manifest_sha256"]:
+                raise PreparedBindingStoreError("prepared binding reference manifest changed")
+            if any(reference.get(name) != expected[name] for name in (
+                "scene_artifact_ref", "scene_input_identity_sha256",
+            )):
+                raise PreparedBindingStoreError("prepared binding reference scene identity changed")
+            if dict(reference) != expected:
+                raise PreparedBindingStoreError(
+                    "prepared binding original reference changed"
+                )
+            manifest = self.manifest(key)
+            self._migration_binding_identity(key, manifest)
+            return manifest
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PreparedBindingStoreError(
+                f"prepared binding original reference rejected: {exc}"
+            ) from exc
+
     def _migration_binding_identity(self, key: str, manifest: Mapping) -> dict:
         if (
             self.key_for(manifest["request_identity"]) != key
@@ -564,22 +591,26 @@ def load_prepared_binding_reference(
     migration_receipt: Mapping | str | Path | None = None,
     scene_artifact: str | Path | None = None,
     migration_destination_root: str | Path | None = None,
+    physical_store_root: str | Path | None = None,
 ) -> PreparedObjectBinding:
-    """Replay a serialized store reference with full request and scene checks."""
-    store = PreparedBindingStore(reference["store_root"])
-    manifest = store.manifest(str(reference["key"]))
-    if reference.get("manifest_sha256") != manifest.get("manifest_sha256"):
-        raise PreparedBindingStoreError(
-            "prepared binding reference manifest changed"
-        )
-    if migration_receipt is not None and (
-        reference.get("scene_artifact_ref") != manifest.get("scene_artifact_ref")
-        or reference.get("scene_input_identity_sha256")
-        != manifest.get("scene_input_identity_sha256")
-    ):
-        raise PreparedBindingStoreError(
-            "prepared binding reference scene identity changed"
-        )
+    """Replay an original reference; an override requires full scene relocation."""
+    if physical_store_root is not None:
+        from skill3d.storage.relocation import _root
+
+        if migration_receipt is None:
+            raise PreparedBindingStoreError(
+                "physical store override requires a full migration receipt"
+            )
+        try:
+            physical_store_root = _root(physical_store_root)
+        except RelocationError as exc:
+            raise PreparedBindingStoreError(
+                f"prepared binding physical store rejected: {exc}"
+            ) from exc
+    store = PreparedBindingStore(
+        physical_store_root if physical_store_root is not None else reference["store_root"]
+    )
+    store.validate_reference(reference)
     return store.load(
         str(reference["key"]),
         expected_request_identity=reference["request_identity"],
