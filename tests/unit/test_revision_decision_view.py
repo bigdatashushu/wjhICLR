@@ -53,6 +53,20 @@ def test_unmatched_delivered_page_is_kept_instead_of_discarded():
     assert view["rounds"][1]["delivered_observation_pages"][0][
         "original_delivered_page"] == changed
 
+def test_initial_candidate_values_survive_without_asserting_model_observation():
+    case, _ = case_with_reads()
+    case["evidence_history"] = [{"candidates": [{
+        "obj_id": "synthetic-object", "category_name": "chair",
+        "centroid_world": [1.123456789, 2, 3], "visible_frames": [2, 19],
+        "grounding_status": "unbound", "pointcloud_world": "/synthetic/storage.npy",
+    }]}]
+    view = decision_case_view(case)
+    facts = view["initial_candidate_facts"]
+    assert facts["objects"][0]["centroid_world"] == [1.123456789, 2, 3]
+    assert facts["objects"][0]["visible_frames"] == [2, 19]
+    assert "pointcloud_world" not in facts["objects"][0]
+    assert "not asserted" in facts["delivery_status"]
+
 
 def test_inline_raw_detection_consumption_keeps_every_original_detection_value():
     case, _ = case_with_reads()

@@ -152,6 +152,16 @@ def decision_case_view(case):
         }
         history.append(facts)
     view["evidence_history"] = history
+    initial_catalog = (case.get("evidence_history") or [{}])[0].get("candidates") or []
+    if initial_catalog:
+        view["initial_candidate_facts"] = {
+            "delivery_status": "initial runtime catalog; model delivery is not asserted",
+            "objects": [_fields(obj, (
+                "obj_id", "category_name", "visible_frames", "bbox", "centroid_world",
+                "det_conf", "mask_support_ratio", "grounding_status", "binding_flags",
+                "binding_validation", "question_roles", "duplicate_suspect",
+            )) for obj in initial_catalog],
+        }
     selected = set(case.get("selected_object_ids") or [])
     for row in case.get("rounds", []):
         selected.update(row.get("selected_object_ids") or [])
