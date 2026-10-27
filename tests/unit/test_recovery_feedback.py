@@ -113,6 +113,20 @@ def test_summary_rejects_budget_below_minimum():
         summarize_payload([], max_chars=127)
 
 
+def test_sorted_summary_exposes_original_list_paths_for_derivation():
+    payload = [
+        {"obj_id": "chair-10", "category_name": "chair", "visible_frames": [3, 7]},
+        {"obj_id": "chair-2", "category_name": "chair", "visible_frames": [1, 4]},
+    ]
+    summary = json.loads(summarize_payload(payload, tool="list_objects"))
+    assert summary["source_item_paths"] == [[1], [0]]
+    for row, path in zip(summary["objects"], summary["source_item_paths"]):
+        assert payload[path[0]]["obj_id"] == row["obj_id"]
+    feedback = observation_feedback([ValidatedObservation("r1", "list_objects", payload)])
+    assert "summary view of raw list payload=" in feedback
+    assert "raw data root is a list" in feedback
+
+
 @pytest.mark.parametrize("error_type", ["NameError", "UnboundLocalError"])
 def test_name_errors_are_deterministic_but_timeouts_keep_retry(error_type):
     from skill3d.online.recovery import deterministic_cell_failure

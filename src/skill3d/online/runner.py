@@ -220,8 +220,10 @@ class OnlineRunConfig:
     max_solver_rounds: Optional[int] = None
     max_retries_per_operation: Optional[int] = None
     finalization_rounds: Optional[int] = None
-    # 仅评测失败后追加一次干净视觉请求，不占原 solver 轮数；induction 硬禁用。
+    # 仅评测失败后追加一次干净视觉请求，不占原 solver 轮数。
     eval_visual_fallback: bool = False
+    # QA 分区角色与原始数据 split 分开；学习禁用，验证可覆盖 induction 来源。
+    evaluation_execution_role: Optional[str] = None
     # Content-addressed provenance for the active skill snapshot. The human
     # readable ref remains separate so pointer movement cannot hide lineage.
     active_snapshot_manifest_sha256: str = ""
@@ -240,6 +242,8 @@ class OnlineRunConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"real", "mock_light"}:
             raise ValueError("mode 只支持 real 或 mock_light")
+        if self.evaluation_execution_role not in {None, "learning", "validation"}:
+            raise ValueError("evaluation_execution_role must be learning, validation or None")
         if (self.prepared_binding_seed is not None
                 and type(self.prepared_binding_seed) is not int):
             raise ValueError("prepared_binding_seed must be an int or None")
@@ -1585,7 +1589,9 @@ def run_episode(
     answer: Optional[str] = kernel.answer_slot.answer if kernel is not None else None
     visual_payload = None
     if (cfg.eval_visual_fallback and cfg.mode == "real"
-            and episode.split in EVAL_VISUAL_SPLITS
+            and (cfg.evaluation_execution_role == "validation"
+                 or (cfg.evaluation_execution_role is None
+                     and episode.split in EVAL_VISUAL_SPLITS))
             and outcome.final_state == "run_error" and outcome.agent_rounds > 0
             and answer is None):
         original = {

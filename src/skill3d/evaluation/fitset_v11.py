@@ -1850,6 +1850,10 @@ class SystemVariantRunner:
         runtime_base_cfg = replace(
             copy.deepcopy(self.base_cfg),
             semantic_review_config=frozen_review,
+            evaluation_execution_role=(
+                "validation" if getattr(self, "_qa_disjoint_gate", False)
+                or (self.experiment_split or {}).get("execution_role") == "validation"
+                else "learning" if self.experiment_split else None),
         )
         if self.published_inputs is not None:
             binding_seed = reference["request_identity"]["seed"]
