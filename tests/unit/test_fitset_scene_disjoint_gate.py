@@ -327,7 +327,8 @@ def test_offline_input_freezes_public_question_and_real_rgb_without_labels(build
     assert LABEL.encode() not in pickle.dumps(value)
     runner._freeze_offline_case_input(row, item)
     Path(value["image_refs"][0]["path"]).write_bytes(b"changed")
-    with pytest.raises(fitset.FitSetError, match="offline image changed"):
+    # Either the transport or the offline reader can detect the same mutation.
+    with pytest.raises(fitset.FitSetError, match="(offline image|logical file content) changed"):
         runner.offline_case_input(row)
 
 

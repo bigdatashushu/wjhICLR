@@ -7,8 +7,9 @@ transport, experiment, or background worker is started by this module.
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
+import errno
 import hashlib
 import io
 import os
@@ -412,7 +413,8 @@ class StateWorkspace:
 
     def __init__(self, cache: HotCache, key: str, *, identity=None, transfer=None,
                  checkpoint_validator=None, bounded=False, lock_timeout_s=120.0,
-                 atomic_writes=False, incremental_leases=False):
+                 atomic_writes=False, incremental_leases=False,
+                 reuse_checkpoint_files=False):
         _name(key)
         self.cache, self.key = cache, key
         self.identity, self.transfer = identity, transfer
@@ -420,6 +422,7 @@ class StateWorkspace:
         self.bounded = bool(bounded)
         self.atomic_writes = bool(atomic_writes)
         self.incremental_leases = bool(incremental_leases)
+        self.reuse_checkpoint_files = bool(reuse_checkpoint_files)
         self._baseline_cache = None
         if self.atomic_writes and not self.bounded:
             raise StorageError("atomic workspace IO requires fixed-ceiling bounded mode")
@@ -623,6 +626,72 @@ class StateWorkspace:
             **({"cold_history": cold_document} if cold_document is not None else {}),
         }
 
+    @contextmanager
+    def _previous_checkpoint(self, journal):
+        """Lease only this workspace's immutable latest snapshot for reuse.
+
+        Linking two immutable checkpoints preserves a standalone payload and
+        archive. Live workspace files are never linked, so numeric permits and
+        other in-place writers cannot change a previously published checkpoint.
+        Quota admission still charges each complete logical/allocated payload.
+        """
+        if not (self.reuse_checkpoint_files and self.atomic_writes
+                and self.incremental_leases and self.bounded):
+            yield None
+            return
+        with self.cache._locked() as state:
+            key = state["slots"].get("latest")
+            output = journal["outputs"].get(key)
+            row = state["entries"].get(key)
+            usable = output and output["kind"] == "checkpoint" and row and (
+                row["kind"] == "checkpoint" and row["ready"] and not row.get("deleting"))
+        if not usable:
+            yield None
+            return
+        with ExitStack() as held:
+            try:
+                path = held.enter_context(self.cache.lease(key, touch=False))
+            except EntryBusy:
+                yield None
+                return
+            except StorageError as exc:
+                if type(exc) is StorageError and not self.cache.contains(key):
+                    yield None
+                    return
+                raise
+            descriptor = _read_json(path / _DELTA)
+            if descriptor.get("baseline_archive_sha256") != journal["baseline_archive_sha256"] or (
+                descriptor.get("baseline_members_sha256") != journal["baseline_members_sha256"]
+            ):
+                raise IntegrityError("previous checkpoint baseline identity changed")
+            yield path, descriptor
+
+    def _link_checkpoint_file(self, previous, relative, identity, target):
+        """Reuse verified immutable bytes; final checkpoint validation is strict."""
+        if previous is None or previous[1].get("files", {}).get(relative) != identity:
+            return False
+        source = previous[0] / relative
+        info = source.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size != identity["size"]:
+            raise IntegrityError("previous checkpoint member changed")
+        missing, parent = 0, target.parent
+        while not parent.exists():
+            missing += 1
+            parent = parent.parent
+        unit = _allocation_unit(self.cache.root)
+        if self.cache.disk_usage(self.cache.root).free < (
+            self.cache.min_free_bytes + (missing + 1) * unit
+        ):
+            raise QuotaExceeded("checkpoint link crosses filesystem free-space floor")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, target, follow_symlinks=False)
+        except OSError as exc:
+            if exc.errno in {errno.EXDEV, errno.EOPNOTSUPP, errno.EPERM}:
+                return False
+            raise
+        return True
+
     def _publish(self, key, kind, producer, *, estimated_bytes, allocation_bytes,
                  route, latest, best):
         _name(key)
@@ -658,8 +727,11 @@ class StateWorkspace:
                 if allocation_bytes is None:
                     allocation_bytes = required_allocation
             # Admit workspace journal peak AND immutable output before production.
-            with self.cache.reserve(output_bytes=estimated_bytes,
-                                    allocation_bytes=allocation_bytes) as reservation:
+            previous_context = (
+                self._previous_checkpoint(journal) if delta is not None else nullcontext(None))
+            with previous_context as previous, self.cache.reserve(
+                output_bytes=estimated_bytes, allocation_bytes=allocation_bytes
+            ) as reservation:
                 if required_allocation is not None and required_allocation > reservation.charged_bytes:
                     raise QuotaExceeded("delta allocation estimate is too small; pause before copying")
                 journal["outputs"][key] = {"kind": kind, "route": route.as_dict(), "ack": None}
@@ -675,10 +747,12 @@ class StateWorkspace:
                             raise QuotaExceeded("delta allocation crosses filesystem free-space floor")
                         (reservation.path / "payload" / relative).mkdir(parents=True, exist_ok=True)
                     for relative, row in delta["files"].items():
+                        target = reservation.path / "payload" / relative
+                        if self._link_checkpoint_file(previous, relative, row, target):
+                            continue
                         with (budget.path / relative).open("rb") as src:
                             _copy_delta_file(
-                                self.cache, reservation.path / "payload" / relative,
-                                src, row["size"], row["sha256"])
+                                self.cache, target, src, row["size"], row["sha256"])
                     descriptor = _json_bytes(delta)
                     _copy_delta_file(
                         self.cache, reservation.path / "payload" / _DELTA,

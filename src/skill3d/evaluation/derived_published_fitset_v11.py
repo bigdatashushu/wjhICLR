@@ -94,15 +94,35 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
         super().__setstate__(state)
         self._derivation_locks = {}
 
+    def _spawn_transport_sources(self, scene_id):
+        files, roots, trees = super()._spawn_transport_sources(scene_id)
+        _require(self._approved_derived_replay is not None,
+                 "verified derived replay requires existing published outputs")
+        approved = self._approved_derived_replay["scenes"][scene_id]
+        for qa_id, reference in approved["references"].items():
+            roots.add(reference["store_root"])
+            key = reference["key"]
+            trees.add(str(Path(reference["store_root"]) / "entries" / key[:2] / key))
+            self._add_spawn_migration_files(
+                files, approved["migration_receipts"][qa_id],
+                self._entries[qa_id]["publication_root"])
+        return files, roots, trees
+
     def for_spawned_episode(self, variant):
-        """Carry this parent's validated replay for one episode, never other scenes."""
+        """Scope verified inputs; keep the strict validated-context spawn unchanged."""
         entry = self._entry(variant)
         scene_id = entry["scene_id"]
         with self.cache_lock:
-            state = super().__getstate__()
+            state = self._spawn_state(entry)
             state["_derived_scenes"] = {}
             state["_spawn_replay_scene"] = None
-            if scene_id in self._derived_scenes:
+            if self._reuse_verified_publications:
+                approved = self._approved_derived_replay
+                state["_approved_derived_replay"] = {
+                    "schema_version": approved["schema_version"],
+                    "scenes": {scene_id: copy.deepcopy(approved["scenes"][scene_id])},
+                }
+            elif scene_id in self._derived_scenes:
                 replay = self._derived_scenes[scene_id]
                 _require(_check_cache(replay[0]),
                          "spawn replay requires a validated scene context")

@@ -180,6 +180,10 @@ class PublishedFitSetInputProvider:
             "transport_locator requires an approved physical transport descriptor")
         self.manifest_path = self._physical_file(
             Path(manifest_path).expanduser().absolute(), None)
+        self._manifest_transport_sources = (
+            self.transport_locator.sources_for_file(self.manifest_path)
+            if self.transport_locator is not None else ()
+        )
         self._manifest_identity = _file(self.manifest_path)
         manifest, _ = _read_anchored(
             self.manifest_path, self._manifest_identity["sha256"])
@@ -193,6 +197,7 @@ class PublishedFitSetInputProvider:
         _require(isinstance(entries, dict) and bool(entries),
                  "published inputs require entries keyed by qa_id")
         self.scene_scopes = {}
+        self._source_catalog_file = manifest.get("source_catalog_file")
         source_catalog = None
         if self.schema == FULLQA_INPUT_SCHEMA:
             source_catalog, _ = _read_anchored(
@@ -267,6 +272,10 @@ class PublishedFitSetInputProvider:
             public_entries[qa_id] = _public_entry(entry)
         _public_json({**manifest, "entries": public_entries})
         self._entries = copy.deepcopy(entries)
+        scene_qa_ids = {}
+        for qa_id, entry in self._entries.items():
+            scene_qa_ids.setdefault(entry["scene_id"], []).append(qa_id)
+        self._scene_qa_ids = {scene: tuple(ids) for scene, ids in scene_qa_ids.items()}
         self._input_contract_identity = {
             "schema": self.schema,
             "manifest": copy.deepcopy(self._manifest_identity),
@@ -279,6 +288,7 @@ class PublishedFitSetInputProvider:
         self.cache: OrderedDict[tuple[str, str], object] = OrderedDict()
         self._publication_files = OrderedDict()
         self._scene_checks = {}
+        self._scene_transport_scopes = {}
         self.cache_lock = threading.RLock()
 
     @property
@@ -298,6 +308,7 @@ class PublishedFitSetInputProvider:
         state["cache"] = OrderedDict()
         state["_publication_files"] = OrderedDict()
         state["_scene_checks"] = {}
+        state["_scene_transport_scopes"] = {}
         state.pop("cache_lock", None)
         return state
 
@@ -306,7 +317,69 @@ class PublishedFitSetInputProvider:
         self.cache = OrderedDict()
         self._publication_files = OrderedDict()
         self._scene_checks = {}
+        self._scene_transport_scopes = {}
         self.cache_lock = threading.RLock()
+
+    def _add_spawn_migration_files(self, files, migration, source_root):
+        if isinstance(migration, (str, Path)):
+            files.add(str(migration))
+            migration, _ = self._publication_file(migration, None)
+        for record in (migration["artifact"], *migration["dependencies"].values()):
+            files.add(str(Path(source_root) / record["target_ref"]))
+
+    def _spawn_transport_sources(self, scene_id):
+        files = set(self._manifest_transport_sources)
+        if self._source_catalog_file is not None:
+            files.add(self._source_catalog_file)
+        roots, trees = set(), set()
+        for qa_id in self._scene_qa_ids[scene_id]:
+            entry = self._entries[qa_id]
+            files.update((entry["scene_input_identity_file"],
+                          entry["migration_receipt_file"], entry["scene_artifact"]))
+            reference = entry["reference"]
+            roots.update((entry["input_root"], entry["publication_root"],
+                          reference["store_root"]))
+            trees.add(entry["input_root"])
+            key = reference["key"]
+            trees.add(str(Path(reference["store_root"]) / "entries" / key[:2] / key))
+            validation, _ = self._publication_file(
+                entry["migration_receipt_file"], entry["migration_receipt_file_sha256"])
+            try:
+                migration = validation["variants"][entry["variant"]]["migration_receipts"][qa_id]
+                self._add_spawn_migration_files(files, migration, entry["publication_root"])
+            except (KeyError, TypeError) as exc:
+                raise PublishedFitSetInputError("catalog migration receipt is missing") from exc
+        return files, roots, trees
+
+    def _spawn_state(self, entry):
+        state = PublishedFitSetInputProvider.__getstate__(self)
+        if self._reuse_verified_publications:
+            scene_id = entry["scene_id"]
+            ids = self._scene_qa_ids[scene_id]
+            scope = self.scene_scopes.get(scene_id)
+            _require(scope is None or set(ids) == set(scope["qa_ids"]),
+                     "spawn replay requires the complete original scene QA group")
+            state["_entries"] = copy.deepcopy({qa: self._entries[qa] for qa in ids})
+            state["scene_scopes"] = (
+                {scene_id: copy.deepcopy(scope)} if scope is not None else {})
+            state["_scene_qa_ids"] = {scene_id: ids}
+            # Keep global manifest/catalog/entry hashes, not hashes of the subset.
+            state["_spawn_input_scene"] = scene_id
+            if scene_id not in self._scene_transport_scopes:
+                files, roots, trees = self._spawn_transport_sources(scene_id)
+                state_locator = self.transport_locator.for_sources(
+                    files=files, roots=roots, trees=trees)
+                self._scene_transport_scopes[scene_id] = state_locator
+            state["transport_locator"] = self._scene_transport_scopes[scene_id]
+        return state
+
+    def for_spawned_episode(self, variant):
+        """Cold clone; verified mode retains exactly the complete current scene."""
+        entry = self._entry(variant)
+        with self.cache_lock:
+            clone = type(self).__new__(type(self))
+            clone.__setstate__(self._spawn_state(entry))
+            return clone
 
     def reuse_verified_publications(self):
         """Use production/transport verification for this immutable input store.

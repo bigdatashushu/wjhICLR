@@ -61,6 +61,7 @@ class FrameworkStateIO:
         self._workspace = workspace
         workspace.atomic_writes = True
         workspace.incremental_leases = True
+        workspace.reuse_checkpoint_files = True
         self.job, self.attempt = job, attempt
         self.max_file_bytes = max_file_bytes
         self.max_workspace_bytes = max_workspace_bytes
@@ -89,22 +90,41 @@ class FrameworkStateIO:
         self._executor = None
         self._future = None
         self._background_lock = threading.Lock()
+        self._governors = {}
+        self._governor_lock = threading.Lock()
 
     def __getstate__(self):
         state = {key: value for key, value in self.__dict__.items()
                  if key not in {"_workspace", "_local", "_executor", "_future",
-                                "_background_lock", "_cold_history"}}
+                                "_background_lock", "_cold_history",
+                                "_governors", "_governor_lock"}}
         workspace = self._workspace
         cache = workspace.cache
+        state["_cold_fetch"] = self._compact_transport_callback(self._cold_fetch)
         state["_workspace_config"] = {
             "root": cache.root, "quota_bytes": cache.quota_bytes,
             "min_free_bytes": cache.min_free_bytes, "disk_usage": cache.disk_usage,
-            "key": workspace.key, "transfer": workspace.transfer,
+            "key": workspace.key, "transfer": self._compact_transport_callback(workspace.transfer),
             "lock_timeout_s": workspace.lock_timeout_s,
             "atomic_writes": True,
             "incremental_leases": True,
+            "reuse_checkpoint_files": True,
         }
         return state
+
+    @staticmethod
+    def _compact_transport_callback(callback):
+        """Transport callbacks cannot pull a full scene runtime into a child."""
+        name = getattr(callback, "__name__", None)
+        owner = getattr(callback, "__self__", None)
+        if name in {"archive_transfer", "fetch_cold_member"}:
+            from skill3d.storage.scene_runtime import SceneHotRuntime
+            if type(owner) is SceneHotRuntime and not any(
+                method in owner.__dict__ for method in (
+                    "_request", "archive_transfer", "fetch_cold_member", "archive_transport")
+            ):
+                return getattr(owner.archive_transport(), name)
+        return callback
 
     def __setstate__(self, state):
         config = dict(state.pop("_workspace_config"))
@@ -322,7 +342,12 @@ class FrameworkStateIO:
             history.collect(refs, ArchiveRoute(self.job, key, self.attempt), key)
 
     def request_governor(self, root, config):
-        return WorkspaceRequestGovernor(self, root, config)
+        self._process()
+        key = (Path(root).resolve(), config)
+        with self._governor_lock:
+            if key not in self._governors:
+                self._governors[key] = WorkspaceRequestGovernor(self, key[0], config)
+            return self._governors[key]
 
     def adapt_reviser(self, reviser):
         from skill3d.evolution.fitset_revision_v11 import FitSetSlotReviser
@@ -536,6 +561,8 @@ class WorkspaceRequestGovernor(RequestGovernor):
     def request(self, category, context):
         original = _function_copy(inspect.unwrap(RequestGovernor.request),
                                   {"_atomic": self._atomic})
+        previous = getattr(self._permits, "stream", None)
+        self._permits.stream = None
         try:
             with contextmanager(original)(self, category, context) as receipt:
                 yield receipt
@@ -543,9 +570,11 @@ class WorkspaceRequestGovernor(RequestGovernor):
             # The legacy generator has not yet entered its finally when
             # initial ledger admission fails. Release that permit as well.
             permit = getattr(self._permits, "stream", None)
-            if permit is not None:
-                permit.close()
-                self._permits.stream = None
+            try:
+                if permit is not None:
+                    permit.close()
+            finally:
+                self._permits.stream = previous
 
 
 class _AccountedPermit:

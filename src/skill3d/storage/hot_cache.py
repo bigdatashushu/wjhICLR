@@ -1255,9 +1255,32 @@ class HotCache:
         finally:
             os.close(fd)
 
+    def entry_status(self, key: str) -> dict | None:
+        """Return published metadata without scanning, touching or retaining bytes.
+
+        This snapshot is not a lease or an integrity audit. A subsequent pin or
+        lease revalidates publication under the metadata lock before admission.
+        """
+        _name(key)
+        with self._locked() as state:
+            row = state["entries"].get(key)
+            if row is None or not row["ready"] or row.get("deleting"):
+                return None
+            return {"kind": row["kind"], "ready": True, "last_used": row["last_used"]}
+
+    def contains(self, key: str) -> bool:
+        """Whether published metadata exists now; does not retain the entry."""
+        return self.entry_status(key) is not None
+
     @contextmanager
-    def lease(self, key: str, *, exclusive: bool = False) -> Iterator[Path]:
-        """Hold an OS lease; elapsed time/TTL can never revoke an active holder."""
+    def lease(
+        self, key: str, *, exclusive: bool = False, touch: bool = True,
+    ) -> Iterator[Path]:
+        """Hold an OS lease; elapsed time/TTL can never revoke an active holder.
+
+        ``touch=False`` skips the LRU update and global state save, not the
+        publication check, OS lock or raw-workspace accounting invalidation.
+        """
         with self._locked() as state:
             row = state["entries"].get(key)
             if row is None or not row["ready"] or row.get("deleting"):
@@ -1273,8 +1296,9 @@ class HotCache:
                     accounting = self.root / "locks" / ("w-" + _digest(key) + ".json")
                     accounting.unlink(missing_ok=True)
                     _fsync_dir(accounting.parent)
-                row["last_used"] = time.time_ns()
-                self._save(state)
+                if touch:
+                    row["last_used"] = time.time_ns()
+                    self._save(state)
             except BaseException:
                 os.close(fd)
                 raise
@@ -1288,15 +1312,19 @@ class HotCache:
             raise StorageError("unknown retained slot")
         with self._locked() as state:
             if key is None:
+                if slot not in state["slots"]:
+                    return
                 state["slots"].pop(slot, None)
             else:
                 row = state["entries"].get(key)
                 expected = (
                     "input" if slot in {"current", "next", "global"}
                     else "result" if slot == "state" else "checkpoint")
-                if row is None or not row["ready"] or not (
+                if row is None or not row["ready"] or row.get("deleting") or not (
                     row["kind"] == expected or slot == "state" and row["kind"] == "workspace"):
                     raise StorageError("slot requires a published compatible entry")
+                if state["slots"].get(slot) == key:
+                    return
                 state["slots"][slot] = key
             self._save(state)
 

@@ -12,8 +12,10 @@ from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import tarfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -73,6 +75,7 @@ class SceneHotRuntime:
         self.locator = PublishedTransportLocator(self.closure["descriptor"])
         self.scenes = tuple(sorted(
             key for key in self.closure["shards"] if key not in {"global", "state"}))
+        self._reset_cache_handle()
         cache = self.cache()
         for spec in self.closure["shards"].values():
             prefix = cache._entry_path(spec["key"])
@@ -82,7 +85,53 @@ class SceneHotRuntime:
                     raise IntegrityError("scene transport destination differs from cache layout")
 
     def cache(self):
-        return HotCache(self.cache_root)
+        if getattr(self, "_cache_pid", None) != os.getpid():
+            self._reset_cache_handle()
+        with self._cache_lock:
+            if self._cache_handle is None:
+                self._cache_handle = HotCache(self.cache_root)
+            return self._cache_handle
+
+    def _reset_cache_handle(self):
+        self._cache_pid = os.getpid()
+        self._cache_handle = None
+        self._cache_lock = threading.RLock()
+
+    def __getstate__(self):
+        return {key: value for key, value in self.__dict__.items()
+                if key not in {"_cache_pid", "_cache_handle", "_cache_lock"}}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._reset_cache_handle()
+
+    def archive_transport(self):
+        """Byte-only callbacks need no scene catalog or input descriptor."""
+        return SceneArchiveTransport(self.endpoint, self.token_file)
+
+    def for_spawned_scene(self, scene, *, locator, derived_replay=None):
+        """Retain original anchors and exactly the selected scene's capabilities."""
+        if scene not in self.scenes or not getattr(locator, "_scoped", False) or (
+            locator.descriptor_sha256 != self.locator.descriptor_sha256
+        ):
+            raise IntegrityError("spawn runtime requires an approved scene transport scope")
+        state = self.__getstate__()
+        closure = {
+            "schema_version": self.closure["schema_version"],
+            "original_published_manifest": self.closure["original_published_manifest"],
+            "shards": {
+                name: self.closure["shards"][name]
+                for name in ("global", "state", scene)
+                if name in self.closure["shards"]
+            },
+        }
+        if derived_replay is not None:
+            closure["derived_replay"] = derived_replay
+        state["closure"], state["locator"] = closure, locator
+        state["scenes"], state["_spawn_input_scene"] = (scene,), scene
+        clone = type(self).__new__(type(self))
+        clone.__setstate__(state)
+        return clone
 
     def _request(self, path, body=None, headers=None):
         headers = dict(headers or {})
@@ -102,7 +151,11 @@ class SceneHotRuntime:
 
     def _populate(self, cache, scene, *, slot=None):
         spec = self.closure["shards"][scene]
-        if spec["key"] in cache.stats()["entries"]:
+        if not cache.contains(spec["key"]):
+            # Cached handles still reconcile a crashed producer before a cold
+            # admission. Ready scenes keep the scan-free metadata path.
+            cache.recover()
+        if cache.contains(spec["key"]):
             if slot is not None:
                 cache.pin(slot, spec["key"])
             return
@@ -162,9 +215,10 @@ class SceneHotRuntime:
                             # Adopted workspaces are never evictable. Holding SH
                             # for an episode would deadlock its short EX writes.
                             if not adopted:
-                                held.enter_context(cache.lease(key))
+                                held.enter_context(cache.lease(key, touch=False))
                     self._populate(cache, scene, slot="current")
-                    path = held.enter_context(cache.lease(self.closure["shards"][scene]["key"]))
+                    path = held.enter_context(cache.lease(
+                        self.closure["shards"][scene]["key"], touch=False))
                 break
             except QuotaExceeded:
                 held.close()
@@ -224,6 +278,7 @@ class SceneHotRuntime:
                        attempt, checkpoint=False, latest=False, best=False):
         """Reserve before production; results stay local until a matching ACK."""
         cache = self.cache()
+        cache.recover()
         path = cache.populate(key, producer, output_bytes=estimated_bytes,
                               kind="checkpoint" if checkpoint else "result")
         if latest or best:
@@ -239,7 +294,25 @@ class SceneHotRuntime:
 
     def archive_pending(self):
         """Retry persisted transport identities only, retaining latest and best."""
-        return self.cache().transfer_pending(self.archive_transfer, delete_acked=True)
+        cache = self.cache()
+        cache.recover()
+        return cache.transfer_pending(self.archive_transfer, delete_acked=True)
+
+
+class SceneArchiveTransport:
+    """Picklable transport configuration without input or scene state.
+
+    The callbacks execute the exact runtime transport implementation. Only the
+    endpoint and token-file locator are carried; credential bytes are never read
+    or serialized here.
+    """
+
+    def __init__(self, endpoint, token_file):
+        self.endpoint, self.token_file = endpoint, Path(token_file)
+
+    _request = SceneHotRuntime._request
+    archive_transfer = SceneHotRuntime.archive_transfer
+    fetch_cold_member = SceneHotRuntime.fetch_cold_member
 
 
 class SceneHotInputProvider:
@@ -265,7 +338,12 @@ class SceneHotInputProvider:
         identity = deepcopy(self.provider.input_contract_identity)
         record = identity["manifest"]
         origin = self.runtime.closure["original_published_manifest"]
-        if origin not in self.runtime.closure["descriptor"]["files"]:
+        descriptor = self.runtime.closure.get("descriptor")
+        if (descriptor is not None and origin not in descriptor["files"]) or (
+            descriptor is None and (
+                not getattr(self.runtime.locator, "_scoped", False)
+                or origin not in self.runtime.locator._explicit_file_sources)
+        ):
             raise IntegrityError("input manifest lacks an explicit physical identity")
         actual = self.runtime.locator.verified_file(origin, record["sha256"])
         if str(actual) != record["path"]:
@@ -317,16 +395,25 @@ class SceneHotInputProvider:
             yield
 
     def for_spawned_episode(self, variant):
-        return type(self)(self.provider.for_spawned_episode(variant), self.runtime)
+        provider = self.provider.for_spawned_episode(variant)
+        runtime = self.runtime
+        if isinstance(runtime, SceneHotRuntime) and getattr(
+            provider, "_reuse_verified_publications", False
+        ):
+            runtime = runtime.for_spawned_scene(
+                str(variant["scene_id"]), locator=provider.transport_locator,
+                derived_replay=getattr(provider, "_approved_derived_replay", None))
+        return type(self)(provider, runtime)
 
     def logical_file(self, path, expected_sha256=None):
+        if getattr(self.provider, "_reuse_verified_publications", False):
+            return self.runtime.locator.verified_file(path, expected_sha256)
         return self.runtime.locator.file(path, expected_sha256)
 
     def logical_path(self, path):
         physical = str(Path(path).absolute())
-        matches = [old for old, row in self.runtime.closure["descriptor"]["files"].items()
-                   if row["path"] == physical]
-        if len(matches) != 1:
+        matches = self.runtime.locator.explicit_sources_for_file(physical)
+        if len(matches) != 1 or self.runtime.locator.has_ambiguous_explicit_source(physical):
             raise IntegrityError("path has no unique declared logical origin")
         return Path(matches[0])
 
