@@ -12,7 +12,7 @@ import re
 
 from skill3d.evolution.evidence_graph_v11 import evidence_sha256
 
-VIEW_SCHEMA = "revision-decision-view/1.0"
+VIEW_SCHEMA = "revision-decision-view/1.1"
 _CASE_FIELDS = (
     "case_id", "qa_id", "scene_id", "question_type", "evidence_state",
     "question_text", "options", "source_split", "split", "label_access",
@@ -169,7 +169,8 @@ def decision_case_view(case):
             selected.update(result.get("resolved_object_ids") or [])
             selected.update(result.get("object_dependencies") or [])
     view["selected_candidates"] = [
-        deepcopy(c) for c in case.get("candidate_objects", []) if c.get("obj_id") in selected]
+        {key: deepcopy(value) for key, value in c.items() if key != "binding_provenance"}
+        for c in case.get("candidate_objects", []) if c.get("obj_id") in selected]
     rounds = []
     read_index = {
         evidence_sha256(read): [position, offset]
@@ -267,7 +268,8 @@ def decision_case_view(case):
         "schema": VIEW_SCHEMA,
         "retained": "all programs, rounds, read pages, delivered feedback facts, supervision and validity",
         "summarized": ["image bookkeeping", "unused candidate catalogs", "unread detection arrays"],
-        "omitted": ["duplicate responses/results", "repeated framework text", "generation/audit metadata"],
+        "omitted": ["duplicate responses/results", "repeated framework text", "generation/audit metadata",
+                    "selected_candidates.binding_provenance"],
         "raw_record_retained": True,
     }
     return view

@@ -193,6 +193,13 @@ class FitSetStreamingBuffer(StreamingEvolutionRunner):
     def _decode_case(self, data: bytes) -> FitSetExperienceCase:
         return FitSetExperienceCase.model_validate_json(data)
 
+    def _load_cases(self, slot) -> tuple[FitSetExperienceCase, ...]:
+        """Use the latest slot/parent batch; retain all stored refs for audit."""
+        return tuple(
+            self._decode_case((self.root / ref).read_bytes())
+            for ref in slot.case_refs[-self.config.batch_size:]
+        )
+
 
 @dataclass
 class FrozenSkillProvider:

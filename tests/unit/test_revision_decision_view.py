@@ -53,6 +53,30 @@ def test_unmatched_delivered_page_is_kept_instead_of_discarded():
     assert view["rounds"][1]["delivered_observation_pages"][0][
         "original_delivered_page"] == changed
 
+
+def test_selected_and_dependency_candidates_omit_only_binding_provenance():
+    case, _ = case_with_reads()
+    case["selected_object_ids"] = ["synthetic-selected"]
+    case["rounds"][0]["results"] = [{
+        "tool": "synthetic-tool", "object_dependencies": ["synthetic-dependency"]}]
+    case["candidate_objects"] = [{
+        "obj_id": obj_id, "grounding_status": "bound",
+        "binding_validation": {"valid": True}, "binding_flags": [],
+        "centroid_world": [1.123456789, 2, 3], "visible_frames": [2, 19],
+        "binding_provenance": [{"semantic_request_identity": {"synthetic": "metadata"}}],
+    } for obj_id in ("synthetic-selected", "synthetic-dependency", "synthetic-unused")]
+    before = deepcopy(case)
+    view = decision_case_view(case)
+    assert case == before
+    assert view["selected_candidates"] == [
+        {key: value for key, value in obj.items() if key != "binding_provenance"}
+        for obj in before["candidate_objects"][:2]]
+    assert "selected_candidates.binding_provenance" in view["projection"]["omitted"]
+    assert view["projection"]["raw_record_retained"]
+    view["selected_candidates"][0]["binding_validation"]["valid"] = False
+    assert case == before
+
+
 def test_initial_candidate_values_survive_without_asserting_model_observation():
     case, _ = case_with_reads()
     case["evidence_history"] = [{"candidates": [{

@@ -81,6 +81,49 @@ def full_evidence_factory():
     return FullEvidenceClient()
 
 
+def test_deferred_backlog_resume_uses_latest_twelve_in_ingestion_order(tmp_path):
+    from skill3d.evolution.fitset_stream_v11 import FitSetStreamingBuffer
+    from skill3d.evolution.streaming_v11 import StreamingAttemptResult, StreamingEvolutionConfig
+    from test_v11_streaming_evolution import _case
+
+    root = tmp_path / "buffer"
+    config = StreamingEvolutionConfig(batch_size=12)
+    buffer = FitSetStreamingBuffer(root, stream_id="latest-twelve", config=config)
+    requests = []
+
+    def receive(request):
+        requests.append(request)
+        return StreamingAttemptResult(
+            outcome="deferred" if len(requests) == 1 else "rejected",
+            campaign_id=f"synthetic-{len(requests)}", reason="synthetic gate outcome")
+
+    cases = []
+    for index in range(18):
+        canonical = _case(index)
+        fields = (
+            "case_id", "qa_id", "scene_id", "question_type", "evidence_state", "source_split",
+            "delivered_skill_version", "delivered_content_sha256", "delivered_skill_md",
+            "score", "outcome", "failure_categories", "trace_ref", "initial_evidence_states",
+            "evidence_history",
+        )
+        case = FitSetExperienceCase(
+            **{field: getattr(canonical, field) for field in fields},
+            trace_sha256="a" * 64)
+        cases.append(case)
+        buffer.ingest(case, parent_snapshot_id="synthetic-parent", attempt=receive)
+    assert len(requests) == 1
+    assert requests[0].cases == tuple(cases[:12])
+    resumed = FitSetStreamingBuffer(root, stream_id="latest-twelve", config=config)
+    result = resumed.retry_deferred("object_rel_distance/g1m0", attempt=receive)
+    assert result.outcome == "rejected"
+    assert requests[1].cases == tuple(cases[6:18])
+    state = json.loads((root / "stream.json").read_text())
+    slot = state["slots"]["object_rel_distance/g1m0"]
+    assert len(slot["case_refs"]) == len(state["seen_case_ids"]) == 18
+    assert slot["new_since_attempt"] == 0 and not slot["deferred_reason"]
+    assert resumed.attempt_ready("object_rel_distance/g1m0", attempt=receive) is None
+
+
 class AnswerClient:
     def chat(self, _messages, **kwargs):
         return str(kwargs["seed"])
@@ -270,13 +313,43 @@ def test_new_complete_cases_trigger_again_even_when_aggregate_signature_does_not
         tmp_path, n=25, learning_input_mode="full_cases_v1",
         revision_client_factory=full_evidence_factory)
     runner.evolution_config = replace(runner.evolution_config, scheduling_mode="novel_failure_v1")
-    assert runner.run(resume=False)["completed_variants"] == 25
+    assert runner.run(resume=False, max_variants=12)["completed_variants"] == 12
+    resumed = make_runner(
+        tmp_path, n=25, learning_input_mode="full_cases_v1",
+        revision_client_factory=full_evidence_factory)
+    resumed.evolution_config = replace(
+        resumed.evolution_config, scheduling_mode="novel_failure_v1")
+    assert resumed.run(resume=True)["completed_variants"] == 25
     schedules = list((runner.root / "workers").glob("*/campaigns/*/schedule.json"))
     assert len(schedules) == 2
+    stream_path = next((runner.root / "workers").glob("*/buffer/stream.json"))
+    stream = json.loads(stream_path.read_text())
+    stored_cases = [
+        json.loads((stream_path.parent / ref).read_text())
+        for ref in stream["slots"]["object_counting/g0m0"]["case_refs"]]
+    canonical_ids = {case["case_id"]: case["full_case"]["case_id"] for case in stored_cases}
+    windows = []
     for path in schedules:
         schedule = json.loads(path.read_text())
         assert schedule["scheduled"] and schedule["mode"] == "batch_v1"
         assert schedule["requested_mode"] == "novel_failure_v1"
+        bundle = json.loads((path.parent / "experience_bundle.json").read_text())
+        request = json.loads((path.parent / "request.json").read_text())
+        feedback = json.loads((path.parent / "feedback.json").read_text())
+        assert len(bundle["cases"]) == 12
+        assert [canonical_ids[value] for value in request["case_ids"]] == [
+            case["case_id"] for case in bundle["cases"]]
+        assert feedback["n_cases"] == 12
+        windows.append([case["qa_id"] for case in bundle["cases"]])
+    assert sorted(windows) == [
+        [f"fit-{i:03d}" for i in range(start, start + 12)] for start in (0, 12)]
+    assert len(stream["slots"]["object_counting/g0m0"]["case_refs"]) == 25
+    assert stream["slots"]["object_counting/g0m0"]["new_since_attempt"] == 1
+    for attempt in stream["attempts"]:
+        receipt = json.loads((stream_path.parent / attempt["path"]).read_text())
+        assert len(receipt["request"]["cases"]) == 12
+    assert resumed.run(resume=True)["completed_variants"] == 25
+    assert len(list((runner.root / "workers").glob("*/campaigns/*/schedule.json"))) == 2
 
 
 @pytest.mark.parametrize("mode", ["diagnosis_v1", "diagnosis_multimodal_v1"])

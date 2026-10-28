@@ -196,7 +196,7 @@ def test_sparse_learning_does_not_tail_revise(tmp_path):
     assert len(state["slots"]["object_counting/g0m0"]["case_refs"]) == 11
 
 
-def test_full_case_revision_accumulates_both_source_splits_without_aggregation(tmp_path, monkeypatch):
+def test_full_case_revision_windows_both_source_splits_without_aggregation(tmp_path, monkeypatch):
     learning = [row(f"learn-{i}", split=(
         "induction" if i % 2 == 0 else "inner_validation")) for i in range(25)]
     runner = build(tmp_path, learning=learning)
@@ -216,10 +216,10 @@ def test_full_case_revision_accumulates_both_source_splits_without_aggregation(t
 
     monkeypatch.setattr(FitSetSlotReviser, "_revise_slot", receive)
     assert runner.run(resume=False)["completed_variants"] == 25
-    assert observed == [12, 24]
+    assert observed == [12, 12]
     paths = list(runner.root.glob("workers/00/campaigns/*/experience_bundle.json"))
     assert len(paths) == 2
-    assert sorted(len(json.loads(path.read_text())["cases"]) for path in paths) == [12, 24]
+    assert sorted(len(json.loads(path.read_text())["cases"]) for path in paths) == [12, 12]
 
 
 def test_final_system_accepts_both_source_splits_without_overlay_or_evolution(tmp_path):
