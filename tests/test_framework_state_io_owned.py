@@ -162,6 +162,23 @@ class FrameworkStateIOChecks(unittest.TestCase):
         with self.workspace._write_lease() as budget:
             return self.workspace._journal(budget)
 
+    def test_reviser_status_stays_inside_declared_scheduler_receipts(self):
+        from skill3d.evaluation.reviser_pool_v11 import OwnerReviserPool
+        self.io.mutable_roots = ("accumulation/scheduler_receipts",)
+        pool = object.__new__(OwnerReviserPool)
+        pool.runner = SimpleNamespace(
+            root=self.io.root / "accumulation", run_identity="synthetic",
+            _write_json_atomic=self.io.write_json)
+        pool.cap, pool.peak = 4, 2
+        pool.busy = {0: ("recover", []), 3: ("ingest", [(None, None)])}
+        pool.processes = [SimpleNamespace(pid=123), SimpleNamespace(pid=456)]
+        pool._status()
+        path = pool.runner.root / "scheduler_receipts/reviser_pool_status.json"
+        value = json.loads(path.read_bytes())
+        self.assertEqual(value["reviser_concurrency"], 4)
+        self.assertEqual(value["peak_active_owner_transactions"], 2)
+        self.assertFalse((pool.runner.root / "reviser_pool_status.json").exists())
+
     def test_fixed_envelope_and_declared_roots(self):
         before = self._envelope()
         self.io.write_json(self.io.root / "accumulation" / "summary.json", {"n": 1})

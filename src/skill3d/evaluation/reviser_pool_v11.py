@@ -92,7 +92,8 @@ class OwnerReviserPool:
         return index, rows
 
     def _status(self):
-        self.runner._write_json_atomic(self.runner.root / "reviser_pool_status.json", {
+        self.runner._write_json_atomic(
+            self.runner.root / "scheduler_receipts/reviser_pool_status.json", {
             "reviser_concurrency": self.cap,
             "executor_pids": [process.pid for process in self.processes],
             "active_owner_transactions": {
