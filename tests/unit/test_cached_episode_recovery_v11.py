@@ -217,6 +217,50 @@ class CachedEpisodeRecoveryTests(unittest.TestCase):
         self.assertFalse(client.configured)
         self.assertEqual(self.database.read_bytes(), self.cache_bytes)
 
+    def test_completed_prefix_replays_without_usage_or_reservation_duplication(self):
+        calls = self.calls[:2]
+        state = {**deepcopy(self.state), "requests": [
+            deepcopy(call.governor_record) for call in calls]}
+        original_state = deepcopy(state)
+        receipt = self.open(calls=calls).recover_original_responses()
+        self.assertEqual(receipt["recovered_started_request_ids"], [])
+        view = recovery_accounting(state, [receipt])
+        self.assertEqual(view["reserved_requests"], 2)
+        self.assertEqual(view["completed_requests"], 2)
+        self.assertEqual(view["recovered_requests"], 0)
+        self.assertEqual(view["recovered_usage"], {})
+        self.assertEqual(view["new_requests"], 0)
+        self.assertEqual(state, original_state)
+        self.assertEqual(self.database.read_bytes(), self.cache_bytes)
+
+    def test_completed_prefix_requires_response_record(self):
+        call = self.calls[0]
+        approval = {**call.approval, "response_record_sha256": evidence_sha256(None)}
+        with self.assertRaisesRegex(RecoveryStop, "seed_response_missing"):
+            self.open(calls=[replace(call, response_record=None, approval=approval)])
+
+    def test_completed_last_call_requires_matching_governor_usage(self):
+        call = self.calls[0]
+        governor = {**call.governor_record, "usage": {"total_tokens": 13}}
+        approval = {**call.approval, "governor_record_sha256": evidence_sha256(governor)}
+        with self.assertRaisesRegex(RecoveryStop, "governor_usage_mismatch"):
+            self.open(calls=[replace(call, governor_record=governor, approval=approval)])
+
+    def test_error_last_call_cannot_be_recovered_as_completed_prefix(self):
+        call = self.calls[0]
+        governor = {**call.governor_record, "status": "error"}
+        approval = {**call.approval, "governor_record_sha256": evidence_sha256(governor)}
+        with self.assertRaisesRegex(RecoveryStop, "governor_status_mismatch"):
+            self.open(calls=[replace(call, governor_record=governor, approval=approval)])
+
+    def test_empty_replay_receipt_does_not_authorize_zero_settlement(self):
+        receipt = self.open(calls=self.calls[:2]).recover_original_responses()
+        receipt["replayed_calls"] = []
+        receipt["identity_sha256"] = evidence_sha256({
+            k:v for k,v in receipt.items() if k != "identity_sha256"})
+        with self.assertRaisesRegex(RecoveryStop, "receipt_settlement_mismatch"):
+            recovery_accounting(self.state, [receipt])
+
     def test_original_response_custody_rejects_changed_last_reply_without_settlement(self):
         client = self.open()
         with sqlite3.connect(self.database) as db:

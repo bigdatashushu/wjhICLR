@@ -121,7 +121,8 @@ class ReviewedSolverCall:
     identity_sha256, response_identity and usage. gateway_cache additionally
     requires reply_sha256; round_trace requires trace_ref and record_sha256.
     A completed call requires its original SeededGateClient response record;
-    the last, started call may lack it, but still needs reviewed source evidence.
+    the last call may instead be started and lack that record, but still needs
+    reviewed source evidence. A completed prefix may precede unfinished execution.
     """
 
     seed_record: Mapping
@@ -522,8 +523,10 @@ def open_cached_episode_recovery(
                      "governor_call_mismatch")
             ids.add(governor["request_id"])
             previous_id = governor["request_id"]
-            expected_status = "started" if index == len(calls) else "completed"
-            _require(governor["status"] == expected_status, "governor_status_mismatch")
+            expected_status = governor["status"]
+            _require(expected_status == "completed" or (
+                index == len(calls) and expected_status == "started"),
+                "governor_status_mismatch")
             response = call.response_record
             _require(response is not None or expected_status == "started",
                      "seed_response_missing")
@@ -638,7 +641,10 @@ def recovery_accounting(governor_state: Mapping, receipts: Sequence[Mapping]) ->
                                      "invalid_recovered_usage")
                             added_usage[key] = added_usage.get(key, 0) + value
             _require(_equal(settled, receipt["recovered_started_request_ids"])
-                     and bool(settled), "receipt_settlement_mismatch")
+                     and bool(receipt["replayed_calls"])
+                     and all(replay["original_status"] in {"completed", "started"}
+                             for replay in receipt["replayed_calls"]),
+                     "receipt_settlement_mismatch")
         return {
             "reserved_requests": len(rows), "recovered_requests": len(recovered),
             "completed_requests": sum(r["status"] == "completed" for r in rows.values()),
