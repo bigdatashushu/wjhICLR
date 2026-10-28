@@ -50,6 +50,54 @@ def test_same_contract_hash_is_rendered_online_and_offline(tmp_path):
     assert "8000" in offline and "no_change" in offline
 
 
+def test_first_batch_reuses_parent_text_but_later_batch_carries_changed_working_method(tmp_path):
+    parent = load_active_parent_slots(LIBRARY)[0][("object_counting", "g0m0")]
+    obj = _reviser(tmp_path, None)
+    first = obj._prompt(parent=parent, feedback={}, static_feedback=[],
+                        batch_context={"working_skill_md": parent.skill_md})
+    assert first.count(parent.skill_md) == 1
+    assert "Same as Parent complete SKILL.md above." in first
+    changed = parent.skill_md.rstrip() + "\n\nSynthetic changed rule.\n"
+    later = obj._prompt(parent=parent, feedback={}, static_feedback=[],
+                        batch_context={"working_skill_md": changed})
+    assert "Working candidate complete SKILL.md:\n" + changed in later
+    assert "Same as Parent complete SKILL.md above." not in later
+    assert first.count("Return one JSON object with action=") == 1
+
+
+def test_compact_feedback_preserves_all_process_values_and_signature_refs():
+    from copy import deepcopy
+    from skill3d.evolution.revision_view_v11 import compact_slot_feedback
+    from skill3d.evolution.process_feedback import ProcessFacts
+
+    process = ProcessFacts().model_dump(mode="json")
+    modified = deepcopy(process)
+    modified["execution"]["model_rounds"] = 3
+    modified["error_chain"] = [{"round_index": 2, "event_type": "runtime_error"}]
+    feedback = {
+        "n_cases": 12, "mean_score": 0.25, "score_bands": {"full_score": 3, "no_answer": 9},
+        "signatures": [
+            {"n": 3, "signature_ref": "a" * 64, "process": process},
+            {"n": 9, "signature_ref": "b" * 64, "process": modified}]}
+    before = deepcopy(feedback)
+    packed = compact_slot_feedback(feedback)
+
+    def overlay(base, delta):
+        merged = deepcopy(base)
+        for key, child in delta.items():
+            merged[key] = (overlay(merged[key], child)
+                           if isinstance(child, dict) and isinstance(merged.get(key), dict)
+                           else child)
+        return merged
+
+    for original, row in zip(feedback["signatures"], packed["signatures"]):
+        assert overlay(packed["shared_process"], row["process"]) == original["process"]
+        assert row["signature_ref"] == original["signature_ref"]
+        assert row["n"] == original["n"]
+    assert packed["mean_score"] == 0.25 and packed["n_cases"] == 12
+    assert feedback == before
+
+
 def _reviser(tmp_path, client):
     return FitSetSlotReviser(
         output_root=tmp_path, panel={}, panel_name="fixture", variants=[],

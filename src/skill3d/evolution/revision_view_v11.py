@@ -12,7 +12,13 @@ import re
 
 from skill3d.evolution.evidence_graph_v11 import evidence_sha256
 
-VIEW_SCHEMA = "revision-decision-view/1.1"
+VIEW_SCHEMA = "revision-decision-view/1.2"
+_CANDIDATE_FIELDS = (
+    "obj_id", "category_name", "source_label", "track_id", "visible_frames",
+    "bbox", "centroid_world", "det_conf", "det_conf_source", "mask_support_ratio",
+    "mask_available", "mask_source_present", "grounding_status", "binding_flags",
+    "binding_validation", "question_roles", "duplicate_suspect",
+)
 _CASE_FIELDS = (
     "case_id", "qa_id", "scene_id", "question_type", "evidence_state",
     "question_text", "options", "source_split", "split", "label_access",
@@ -48,6 +54,60 @@ _STATIC_FEEDBACK_PREFIXES = (
 
 def _fields(row, fields):
     return {key: deepcopy(row[key]) for key in fields if key in row}
+
+
+def _candidate_facts(candidate):
+    facts = _fields(candidate, _CANDIDATE_FIELDS)
+    validation = facts.get("binding_validation")
+    if isinstance(validation, dict):
+        facts["binding_validation"] = {
+            key: value for key, value in validation.items()
+            if key not in {"files", "generation_sha256"}}
+    # A recorded reference is not proof that the file exists or is usable.
+    refs = {name: bool(candidate[name]) for name in (
+        "mask_per_frame", "pointcloud_world", "pointconf_world") if name in candidate}
+    if refs:
+        facts["artifact_reference_present"] = refs
+    return facts
+
+
+def _referenced_candidates(case, catalog):
+    """Conservative recorded-ID matching; never infer referents from labels."""
+    known = {obj["obj_id"] for obj in catalog
+             if isinstance(obj.get("obj_id"), str) and obj["obj_id"]}
+    if not known:
+        return set()
+    pattern = re.compile(
+        r"(?<![\w-])(?:" + "|".join(re.escape(key) for key in sorted(known, key=len, reverse=True))
+        + r")(?![\w-])")
+    found = set()
+
+    def scan(value):
+        if isinstance(value, str):
+            found.update(pattern.findall(value))
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                if key in known:
+                    found.add(key)
+                scan(child)
+        elif isinstance(value, list):
+            for child in value:
+                scan(child)
+
+    scan(case.get("selected_object_ids"))
+    scan(case.get("program_source"))
+    for row in case.get("rounds", []):
+        for key in ("selected_object_ids", "program_source", "response_text",
+                    "feedback", "observation_reads"):
+            scan(row.get(key))
+        for result in row.get("results", []):
+            for key in ("args", "resolved_object_ids", "object_dependencies"):
+                scan(result.get(key))
+            # A program may consume a returned payload without a later read page.
+            if _reads_raw_detection_array(row.get("program_source")):
+                scan(result.get("payload"))
+                scan(result.get("value"))
+    return found
 
 
 def _feedback(text, read_index):
@@ -153,14 +213,17 @@ def decision_case_view(case):
         history.append(facts)
     view["evidence_history"] = history
     initial_catalog = (case.get("evidence_history") or [{}])[0].get("candidates") or []
+    referenced = _referenced_candidates(
+        case, [*initial_catalog, *(case.get("candidate_objects") or [])])
     if initial_catalog:
         view["initial_candidate_facts"] = {
             "delivery_status": "initial runtime catalog; model delivery is not asserted",
-            "objects": [_fields(obj, (
-                "obj_id", "category_name", "visible_frames", "bbox", "centroid_world",
-                "det_conf", "mask_support_ratio", "grounding_status", "binding_flags",
-                "binding_validation", "question_roles", "duplicate_suspect",
-            )) for obj in initial_catalog],
+            "retention_basis": "recorded object IDs in programs, arguments, reads, feedback or dependencies",
+            "catalog_count": len(initial_catalog),
+            "omitted_count": sum(obj.get("obj_id") not in referenced for obj in initial_catalog),
+            "categories": dict(Counter(str(obj.get("category_name", "")) for obj in initial_catalog)),
+            "objects": [_candidate_facts(obj) for obj in initial_catalog
+                        if obj.get("obj_id") in referenced],
         }
     selected = set(case.get("selected_object_ids") or [])
     for row in case.get("rounds", []):
@@ -169,7 +232,7 @@ def decision_case_view(case):
             selected.update(result.get("resolved_object_ids") or [])
             selected.update(result.get("object_dependencies") or [])
     view["selected_candidates"] = [
-        {key: deepcopy(value) for key, value in c.items() if key != "binding_provenance"}
+        _candidate_facts(c)
         for c in case.get("candidate_objects", []) if c.get("obj_id") in selected]
     rounds = []
     read_index = {
@@ -269,7 +332,8 @@ def decision_case_view(case):
         "retained": "all programs, rounds, read pages, delivered feedback facts, supervision and validity",
         "summarized": ["image bookkeeping", "unused candidate catalogs", "unread detection arrays"],
         "omitted": ["duplicate responses/results", "repeated framework text", "generation/audit metadata",
-                    "selected_candidates.binding_provenance"],
+                    "selected_candidates.binding_provenance",
+                    "unreferenced initial candidate details", "candidate storage paths and audit file identities"],
         "raw_record_retained": True,
     }
     return view
@@ -288,3 +352,171 @@ def decision_bundle_view(bundle):
         for record in accesses if isinstance(record, dict)
     ]
     return {**common, "cases": [decision_case_view(c) for c in bundle["cases"]]}
+
+
+def pack_case_components(rows, source_cases):
+    """Share headers within this request; carry any cross-round read references."""
+    contexts, components = {}, []
+    for row in rows:
+        key = str(row["case_index"])
+        case = row["complete_case"]
+        context = {
+            **_fields(row, ("case_index", "case_id", "source_case_sha256", "view_case_sha256")),
+            "case_header": {name: value for name, value in case.items() if name != "rounds"},
+        }
+        if key not in contexts:
+            contexts[key] = {**context, "referenced_reads": {}}
+        elif any(contexts[key][name] != value for name, value in context.items()):
+            raise ValueError("case context changed within request")
+        for round_row in case.get("rounds", []):
+            for page in round_row.get("delivered_observation_pages", []):
+                ref = page.get("recorded_read_ref")
+                if ref is not None:
+                    original = source_cases[row["case_index"]]["rounds"][ref[0]][
+                        "observation_reads"][ref[1]]
+                    contexts[key]["referenced_reads"][f"{ref[0]}:{ref[1]}"] = original
+        components.append({
+            "case_context_ref": key, "rounds": case.get("rounds", []),
+            **_fields(row, ("round_range", "total_rounds", "case_part", "round_fragment")),
+        })
+    return {"case_contexts": contexts, "case_components": components}
+
+
+def unpack_case_components(value):
+    """Expand request-local case references for independent coverage checking."""
+    rows = []
+    for component in value["case_components"]:
+        context = value["case_contexts"][component["case_context_ref"]]
+        rows.append({
+            **_fields(context, ("case_index", "case_id", "source_case_sha256", "view_case_sha256")),
+            **_fields(component, ("round_range", "total_rounds", "case_part", "round_fragment")),
+            "complete_case": {**context["case_header"], "rounds": component["rounds"]},
+        })
+    return rows
+
+
+def _at_path(value, path):
+    for key in path:
+        value = value[key]
+    return value
+
+
+def _set_path(value, path, replacement):
+    _at_path(value, path[:-1])[path[-1]] = replacement
+
+
+def split_round_components(row, fits):
+    """Split one result/read array, keeping the full program and other facts."""
+    original = row["complete_case"]["rounds"][0]
+    arrays = []
+
+    def visit(value, path):
+        if isinstance(value, list):
+            if len(value) > 1:
+                arrays.append((len(json.dumps(value, ensure_ascii=False)), path, value))
+            for index, child in enumerate(value):
+                visit(child, [*path, index])
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                visit(child, [*path, key])
+
+    for field in ("results", "observation_reads"):
+        if field in original:
+            visit(original[field], [field])
+    for _, path, values in sorted(arrays, key=lambda item: item[0], reverse=True):
+        size = (len(values) + 1) // 2
+        while True:
+            pieces = []
+            for start in range(0, len(values), size):
+                piece = deepcopy(row)
+                end = min(start + size, len(values))
+                _set_path(piece["complete_case"]["rounds"][0], path, values[start:end])
+                piece["round_fragment"] = {
+                    "path": path, "start": start, "end": end, "total": len(values)}
+                if not fits([piece]):
+                    break
+                pieces.append(piece)
+            else:
+                return pieces
+            if size == 1:
+                break
+            size = (size + 1) // 2
+    raise ValueError("one complete program/context or indivisible result exceeds revision input budget")
+
+
+def reassemble_round_components(rows):
+    """Check contiguous array coverage and identical surrounding facts."""
+    combined = []
+    active, template, fragment_path, total = None, None, None, None
+    for row in rows:
+        fragment = row.get("round_fragment")
+        if fragment is None:
+            if active is not None:
+                raise ValueError("round fragment sequence is incomplete")
+            combined.append(row)
+            continue
+        path = fragment["path"]
+        values = _at_path(row["complete_case"]["rounds"][0], path)
+        if not isinstance(values, list) or not values or len(values) != fragment["end"] - fragment["start"]:
+            raise ValueError("round fragment array length changed")
+        clean = deepcopy(row)
+        clean.pop("round_fragment")
+        _set_path(clean["complete_case"]["rounds"][0], path, [])
+        if active is None:
+            if fragment["start"] != 0:
+                raise ValueError("round fragment first slice is missing")
+            template, active = clean, deepcopy(clean)
+            fragment_path, total = path, fragment["total"]
+        if clean != template or path != fragment_path or fragment["total"] != total:
+            raise ValueError("round fragment context changed")
+        output = _at_path(active["complete_case"]["rounds"][0], path)
+        if fragment["start"] != len(output) or fragment["end"] > total:
+            raise ValueError("round fragment order or coverage changed")
+        output.extend(values)
+        if len(output) == total:
+            combined.append(active)
+            active = None
+    if active is not None:
+        raise ValueError("round fragment sequence is incomplete")
+    return combined
+
+
+def compact_slot_feedback(feedback):
+    """Factor invariant process fields without dropping unknowns, zeros or errors."""
+    value = deepcopy(dict(feedback))
+    signatures = value.get("signatures") or []
+    if not signatures or not all(isinstance(row.get("process"), dict) for row in signatures):
+        return value
+
+    def common_dict(items):
+        common = {}
+        for key in items[0]:
+            if not all(key in item for item in items):
+                continue
+            values = [item[key] for item in items]
+            if all(child == values[0] for child in values[1:]):
+                common[key] = values[0]
+            elif all(isinstance(child, dict) for child in values):
+                nested = common_dict(values)
+                if nested:
+                    common[key] = nested
+        return common
+
+    def difference(item, shared):
+        result = {}
+        for key, child in item.items():
+            if key not in shared:
+                result[key] = child
+            elif child != shared[key]:
+                result[key] = difference(child, shared[key])
+        return result
+
+    shared = common_dict([row["process"] for row in signatures])
+    value["shared_process"] = shared
+    value["process_encoding"] = (
+        "Recursively overlay each signature.process on shared_process; arrays replace as a whole. "
+        "No field is omitted: null stays unknown, zero/false stay recorded values. "
+        "signature_ref and identity_sha256 refer to the original expanded feedback.")
+    for row in signatures:
+        row["process"] = difference(row["process"], shared)
+    return value

@@ -62,11 +62,12 @@ class FullEvidenceClient:
             })
         text = messages[-1]["content"]
         from skill3d.evolution.evidence_graph_v11 import decode_evidence_graph
+        from skill3d.evolution.revision_view_v11 import unpack_case_components
         view = next(value for value in (
             decode_evidence_graph(json.loads(line)) for line in text.splitlines()
             if line.startswith('{"records":'))
             if isinstance(value, dict) and "case_components" in value)
-        cases = [row["complete_case"] for row in view["case_components"]]
+        cases = [row["complete_case"] for row in unpack_case_components(view)]
         assert cases
         assert all(case["question_text"].startswith("How many chairs are visible")
                    and case["reference_answer"] == "2"

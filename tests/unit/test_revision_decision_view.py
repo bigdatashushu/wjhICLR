@@ -79,6 +79,7 @@ def test_selected_and_dependency_candidates_omit_only_binding_provenance():
 
 def test_initial_candidate_values_survive_without_asserting_model_observation():
     case, _ = case_with_reads()
+    case["rounds"][0]["program_source"] += "\nobject_id = 'synthetic-object'\n"
     case["evidence_history"] = [{"candidates": [{
         "obj_id": "synthetic-object", "category_name": "chair",
         "centroid_world": [1.123456789, 2, 3], "visible_frames": [2, 19],
@@ -90,6 +91,53 @@ def test_initial_candidate_values_survive_without_asserting_model_observation():
     assert facts["objects"][0]["visible_frames"] == [2, 19]
     assert "pointcloud_world" not in facts["objects"][0]
     assert "not asserted" in facts["delivery_status"]
+
+
+def test_catalog_filters_by_recorded_ids_and_retains_unused_counts():
+    case, _ = case_with_reads()
+    names = ["program-object", "argument-object", "read-object", "feedback-object",
+             "dependency-object", "unused-object", "program-object-extra"]
+    objects = [{
+        "obj_id": name, "category_name": "chair", "centroid_world": [1.123456789, 2, 3],
+        "binding_validation": {
+            "status": "suspect", "checks": {"mask": False}, "errors": ["mask_missing"],
+            "generation_sha256": "a" * 64, "files": {"mask": {"path": "/synthetic/mask.npy"}}},
+        "pointcloud_world": "/synthetic/cloud.npy", "mask_per_frame": "",
+        "candidate_ids": ["synthetic-redundant-id"],
+    } for name in names]
+    case["evidence_history"] = [{"candidates": objects}]
+    case["candidate_objects"] = objects
+    case["rounds"][0].update(
+        program_source="object_id = 'program-object'",
+        results=[{"args": {"object_id": "argument-object"},
+                  "object_dependencies": ["dependency-object"]}],
+        observation_reads=[{"data": [{"obj_id": "read-object"}]}])
+    case["rounds"][1]["feedback"] = 'Delivered object: {"obj_id": "feedback-object"}'
+    before = deepcopy(case)
+    view = decision_case_view(case)
+    facts = view["initial_candidate_facts"]
+    assert [obj["obj_id"] for obj in facts["objects"]] == names[:5]
+    assert facts["catalog_count"] == 7 and facts["omitted_count"] == 2
+    assert facts["categories"] == {"chair": 7}
+    for obj in [*facts["objects"], *view["selected_candidates"]]:
+        assert obj["centroid_world"] == [1.123456789, 2, 3]
+        assert obj["binding_validation"] == {
+            "status": "suspect", "checks": {"mask": False}, "errors": ["mask_missing"]}
+        assert obj["artifact_reference_present"] == {
+            "mask_per_frame": False, "pointcloud_world": True}
+        assert not {"candidate_ids", "pointcloud_world", "mask_per_frame"} & set(obj)
+    assert case == before
+
+
+def test_inline_object_payload_consumption_retains_matching_catalog_candidates():
+    case, _ = case_with_reads()
+    case["evidence_history"] = [{"candidates": [
+        {"obj_id": "inline-object"}, {"obj_id": "unused-object"}]}]
+    case["rounds"][0].update(
+        program_source="r = tools.list_objects(ctx)\nrows = r['data']",
+        results=[{"payload": [{"obj_id": "inline-object"}]}])
+    assert [obj["obj_id"] for obj in decision_case_view(case)[
+        "initial_candidate_facts"]["objects"]] == ["inline-object"]
 
 
 def test_inline_raw_detection_consumption_keeps_every_original_detection_value():
