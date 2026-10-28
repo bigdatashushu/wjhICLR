@@ -56,7 +56,7 @@ from skill3d.synthesis.request_audit import describe_request, payload_bytes
 
 FIT_REVISION_SCHEMA = "v11-fit-set-slot-revision/4.0"
 FIT_FEEDBACK_SCHEMA = "v11-fit-set-slot-feedback/3.0"
-FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v9-structured-stdout-owner-pool"
+FIT_REVISION_PROMPT_VERSION = "fit-set-slot-revision-v10-stdout-values-owner-pool"
 DEFAULT_REVISION_INPUT_MAX_BYTES = 128000
 DEFAULT_REVISION_INPUT_MAX_CHARS = 72000
 

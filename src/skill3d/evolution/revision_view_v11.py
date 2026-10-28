@@ -87,9 +87,21 @@ def _stdout_view(text):
             isinstance(obj, dict) and isinstance(obj.get("obj_id"), str)
             and obj["obj_id"] for obj in objects):
         return text
+    metadata = {
+        "binding_provenance", "semantic_request_identity", "candidate_ids",
+        "mask_per_frame", "pointcloud_world", "pointconf_world",
+    }
+    data = []
+    for obj in objects:
+        facts = _candidate_facts(obj)
+        # Unknown printed attributes may be useful measurements. Omit only
+        # the explicit audit/storage fields, not arbitrary object values.
+        facts.update({key: deepcopy(value) for key, value in obj.items()
+                      if key not in _CANDIDATE_FIELDS and key not in metadata})
+        data.append(facts)
     return {
         "encoding": "literal_object_list_projection",
-        "data": [_candidate_facts(obj) for obj in objects],
+        "data": data,
         "source_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
         "source_text_chars": len(text),
         "projection": "object decision values retained; storage/provenance metadata omitted",

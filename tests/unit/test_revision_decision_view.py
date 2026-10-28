@@ -36,6 +36,7 @@ def test_literal_stdout_projection_preserves_numbers_errors_and_reassembles():
     objects = [{
         "obj_id": f"synthetic-object-{index}", "category_name": "chair",
         "centroid_world": [1.12345678901234, 0.0, -2.5],
+        "synthetic_unknown_measurement": 9.8765432101234,
         "det_conf": 0.987654321, "binding_flags": ["mask_missing"],
         "binding_validation": {"valid": False, "errors": ["mask_missing"],
                                "generation_sha256": "a" * 64},
@@ -55,6 +56,8 @@ def test_literal_stdout_projection_preserves_numbers_errors_and_reassembles():
     assert stdout["source_text_sha256"] == hashlib.sha256(text.encode()).hexdigest()
     assert stdout["data"][0]["centroid_world"] == objects[0]["centroid_world"]
     assert stdout["data"][0]["det_conf"] == objects[0]["det_conf"]
+    assert stdout["data"][0]["synthetic_unknown_measurement"] == objects[0][
+        "synthetic_unknown_measurement"]
     assert stdout["data"][0]["binding_validation"] == {
         "valid": False, "errors": ["mask_missing"]}
     assert all(diagnostics[key] == value for key, value in before["rounds"][0][
