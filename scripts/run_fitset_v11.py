@@ -713,6 +713,7 @@ def _run_system(args) -> int:
         workers=args.workers,
         scheduler=args.scheduler,
         skill_owners=args.skill_owners,
+        reviser_concurrency=getattr(args, "reviser_concurrency", 1),
         request_governor_config=(
             _request_policy(args) if args.max_requests else None),
         client_factory=_SeededClientFactory(
@@ -958,6 +959,8 @@ def build_parser() -> argparse.ArgumentParser:
                      default="slot_shards")
     run.add_argument("--skill-owners", type=int, default=4,
                      help="fixed Skill library owners, independent of episode executors")
+    run.add_argument("--reviser-concurrency", type=int, default=1,
+                     help="independent owner revision processes; 1 preserves serial scheduling")
     run.add_argument("--max-requests", type=int, default=0,
                      help="shared solver/diagnosis/reviser/gate request budget; required for episode_pool")
     run.add_argument("--request-concurrency", type=int, default=0)

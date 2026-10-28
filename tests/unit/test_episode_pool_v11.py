@@ -4,6 +4,7 @@ import json
 import os
 import threading
 import time
+from dataclasses import dataclass
 
 import pytest
 
@@ -15,7 +16,14 @@ from test_fitset_stream_v11 import ProbeRunner, make_runner
 class ConcurrentProbeRunner(ProbeRunner):
     def _run_one(self, variant):
         with self._episode_permit():
-            return self._probe_one(variant)
+            started = time.time()
+            result = self._probe_one(variant)
+            interval_root = getattr(self, "_global_interval_root", None)
+            if interval_root is not None:
+                key = _variant_key(str(self.root) + "/" + variant["variant_id"])
+                _write_create_once(interval_root / f"{key}.json", {
+                    "started": started, "ended": time.time()})
+            return result
 
     def _probe_one(self, variant):
         assert threading.current_thread() is threading.main_thread()
@@ -163,3 +171,111 @@ def test_bounded_resume_can_fill_one_gap_before_buffered_results(tmp_path):
     stream = json.loads(stream_path.read_text())
     assert stream["slots"]["object_counting/g0m0"]["new_since_attempt"] == 4
     assert all(runner.completed()[key] == row for key, row in before.items())
+
+
+@dataclass
+class ParallelRevisionClient:
+    root: object
+
+    def chat(self, messages, **kwargs):
+        from test_fitset_stream_v11 import RevisionClient
+        assert threading.current_thread() is threading.main_thread()
+        marker = self.root / "reviser_calls" / f"{os.getpid()}.json"
+        if not marker.exists():
+            _write_create_once(marker, {"started": time.time(), "pid": os.getpid()})
+        deadline = time.monotonic() + 40
+        while len(list(marker.parent.glob("*.json"))) < 2:
+            assert time.monotonic() < deadline, "independent revisers never overlapped"
+            time.sleep(0.05)
+        return RevisionClient().chat(messages, **kwargs)
+
+
+@dataclass
+class ParallelRevisionFactory:
+    root: object
+
+    def __call__(self):
+        return ParallelRevisionClient(self.root)
+
+
+def test_parallel_owners_overlap_and_preserve_publication_and_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "1")
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    runner = pool_runner(tmp_path, 16)
+    runner.reviser_concurrency = 2
+    runner._global_interval_root = runner.root / "global_episode_intervals"
+    runner.revision_client_factory = ParallelRevisionFactory(runner.root)
+    assert runner.run(resume=False)["completed_variants"] == 39
+    assert len(list((runner.root / "reviser_calls").glob("*.json"))) == 2
+    receipt = json.loads((runner.root / "episode_pool_receipt.json").read_text())
+    assert receipt["peak_active_reviser_owners"] == 2
+    assert receipt["reviser_executor_count"] == 2
+    intervals = [json.loads(path.read_text()) for path in runner._global_interval_root.glob("*.json")]
+    assert len(intervals) == 39 + 3 * 8 * 2 * 2
+    events = sorted(
+        [(row["started"], 1) for row in intervals] + [(row["ended"], -1) for row in intervals])
+    active_episodes = peak_episodes = 0
+    for _, delta in events:
+        active_episodes += delta
+        peak_episodes = max(peak_episodes, active_episodes)
+    assert peak_episodes <= 16
+    active = set()
+    for event in receipt["events"]:
+        if event["kind"] == "reviser_started":
+            assert event["owner"] not in active
+            active.add(event["owner"])
+        elif event["kind"] == "reviser_done":
+            active.remove(event["owner"])
+    assert not active
+    for task in ["object_counting", "object_abs_distance", "object_size_estimation"]:
+        rows = sorted([row for row in runner.completed().values()
+                       if row["question_type"] == task], key=lambda row: row["qa_id"])
+        assert all(row["initial_skill_selection"]["skill_version"].endswith("@1.0.0")
+                   for row in rows[:12])
+        assert rows[12]["initial_skill_selection"]["skill_version"].endswith("@1.1.0")
+    before = runner.completed()
+    resumed = pool_runner(tmp_path, 16)
+    resumed.reviser_concurrency = 2
+    resumed.revision_client_factory = ParallelRevisionFactory(resumed.root)
+    assert resumed.run(resume=True)["status"] == "complete"
+    assert resumed.completed() == before
+    assert freeze_fitset_stream(runner.root, tmp_path / "parallel-bundle")["revised_slot_count"] == 3
+
+
+def test_parallel_reviser_failure_drains_and_keeps_completed_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "1")
+    runner = pool_runner(tmp_path, 16)
+    runner.reviser_concurrency = 2
+    runner.__class__ = InterruptedPoolRunner
+    with pytest.raises(KeyboardInterrupt):
+        runner.run(resume=False)
+    before = runner.completed()
+    resumed = pool_runner(tmp_path, 16)
+    resumed.reviser_concurrency = 2
+    assert resumed.run(resume=True)["status"] == "complete"
+    assert all(resumed.completed()[key] == row for key, row in before.items())
+
+
+class FailingRevisionClient:
+    def chat(self, *args, **kwargs):
+        raise RuntimeError("synthetic provider body must stay private")
+
+
+def failing_revision_factory():
+    return FailingRevisionClient()
+
+
+def test_owner_service_error_stops_dispatch_and_retains_immutable_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "1")
+    runner = pool_runner(tmp_path, 16)
+    runner.reviser_concurrency = 2
+    runner.revision_client_factory = failing_revision_factory
+    with pytest.raises(FitSetError, match="reviser owner"):
+        runner.run(resume=False)
+    assert runner.completed()
+    receipt = json.loads((runner.root / "episode_pool_receipt.json").read_text())
+    assert receipt["status"] == "failed"
+    assert any(row["kind"] == "reviser_error" for row in receipt["events"])
+    assert "provider body" not in json.dumps(receipt)
+    assert not any(row["initial_skill_selection"]["skill_version"].endswith("@1.1.0")
+                   for row in runner.completed().values())

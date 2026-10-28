@@ -1230,6 +1230,7 @@ class SystemVariantRunner:
 
     # Older serialized runners predate the optional storage adapter.
     framework_state_io = None
+    reviser_concurrency = 1
     cached_prefix_recovery = None
     _cached_prefix_spec = None
     _continuation = None
@@ -1259,6 +1260,7 @@ class SystemVariantRunner:
         episode_concurrency: int | None = None,
         scheduler: str = "slot_shards",
         skill_owners: int = 4,
+        reviser_concurrency: int = 1,
         request_governor_config=None,
         published_inputs=None,
         gate_variants: Sequence[Mapping] | None = None,
@@ -1345,6 +1347,7 @@ class SystemVariantRunner:
         self.gate_client_factory = gate_client_factory
         self.scheduler = scheduler
         self.skill_owners = int(skill_owners)
+        self.reviser_concurrency = int(reviser_concurrency)
         self.request_governor_config = request_governor_config
         self.episode_concurrency = (
             None if episode_concurrency is None else int(episode_concurrency))
@@ -1366,6 +1369,11 @@ class SystemVariantRunner:
         _require(1 <= self.workers <= (32 if scheduler == "episode_pool" else 16),
                  "workers must be 1..16 for slot_shards or 1..32 for episode_pool")
         _require(1 <= self.skill_owners <= 19, "skill_owners must be 1..19")
+        _require(1 <= self.reviser_concurrency <= self.skill_owners,
+                 "reviser_concurrency must be 1..skill_owners")
+        _require(self.reviser_concurrency == 1 or (
+            scheduler == "episode_pool" and evolution_config is not None),
+            "parallel revisers require episode_pool evolution")
         _require(
             self.episode_concurrency is None
             or 1 <= self.episode_concurrency <= 128,
@@ -1500,6 +1508,7 @@ class SystemVariantRunner:
     def __setstate__(self, state: Mapping) -> None:
         self.__dict__.update(state)
         self.__dict__.setdefault("_episode_semaphore", None)
+        self.__dict__.setdefault("reviser_concurrency", 1)
         self.__dict__.setdefault("cached_prefix_recovery", None)
         self.__dict__.setdefault("_cached_prefix_spec", None)
         self.__dict__.setdefault("_continuation", None)
@@ -1633,6 +1642,8 @@ class SystemVariantRunner:
                 "lineage_ingest_order": "scene_id_then_variant_id",
                 "learning_window_policy": "remaining_cases_before_revision_boundary",
             })
+            if self.reviser_concurrency > 1:
+                body["execution"]["reviser_concurrency"] = self.reviser_concurrency
         if self.request_governor_config is not None:
             body["request_policy"] = asdict(self.request_governor_config)
         if self.experiment_split is not None:

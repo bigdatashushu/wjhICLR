@@ -7,12 +7,13 @@ unused candidate catalogs and unread detection arrays are explicitly summarized.
 import ast
 from collections import Counter
 from copy import deepcopy
+import hashlib
 import json
 import re
 
 from skill3d.evolution.evidence_graph_v11 import evidence_sha256
 
-VIEW_SCHEMA = "revision-decision-view/1.2"
+VIEW_SCHEMA = "revision-decision-view/1.3"
 _CANDIDATE_FIELDS = (
     "obj_id", "category_name", "source_label", "track_id", "visible_frames",
     "bbox", "centroid_world", "det_conf", "det_conf_source", "mask_support_ratio",
@@ -69,6 +70,31 @@ def _candidate_facts(candidate):
     if refs:
         facts["artifact_reference_present"] = refs
     return facts
+
+
+def _stdout_view(text):
+    """Project only literal object lists; keep all other printed text verbatim."""
+    if not isinstance(text, str) or not (1 <= len(text) <= 8_000_000):
+        return text
+    stripped = text.strip()
+    if not (stripped.startswith("[") and stripped.endswith("]")):
+        return text
+    try:
+        objects = ast.literal_eval(stripped)
+    except (ValueError, SyntaxError, RecursionError, MemoryError):
+        return text
+    if not isinstance(objects, list) or not objects or not all(
+            isinstance(obj, dict) and isinstance(obj.get("obj_id"), str)
+            and obj["obj_id"] for obj in objects):
+        return text
+    return {
+        "encoding": "literal_object_list_projection",
+        "data": [_candidate_facts(obj) for obj in objects],
+        "source_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "source_text_chars": len(text),
+        "projection": "object decision values retained; storage/provenance metadata omitted",
+        "raw_record_retained": True,
+    }
 
 
 def _referenced_candidates(case, catalog):
@@ -256,6 +282,8 @@ def decision_case_view(case):
             "answer_untrusted", "error_line", "error_message", "error_source_line",
             "error_type", "stdout", "traceback_text",
         ))
+        if "stdout" in diagnostics:
+            diagnostics["stdout"] = _stdout_view(diagnostics["stdout"])
         if diagnostics:
             row["execution_diagnostics"] = diagnostics
         reads = original.get("observation_reads") or []
@@ -420,7 +448,7 @@ def split_round_components(row, fits):
             for key, child in value.items():
                 visit(child, [*path, key])
 
-    for field in ("results", "observation_reads"):
+    for field in ("results", "observation_reads", "execution_diagnostics"):
         if field in original:
             visit(original[field], [field])
     for _, path, values in sorted(arrays, key=lambda item: item[0], reverse=True):

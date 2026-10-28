@@ -147,6 +147,20 @@ class DeploymentContinuation:
         changes = []
 
         def revision_change(old, new, fields, *, old_present=True):
+            if fields == ["execution", "reviser_concurrency"]:
+                owners = current.get("execution", {}).get("skill_owners")
+                _require(type(owners) is int and 1 <= owners <= 19
+                         and type(new) is int and 1 <= new <= owners
+                         and current["execution"].get("scheduler")
+                         == original["execution"].get("scheduler")
+                         == "coordinator_owned_episode_spawn_pool_v1"
+                         and current.get("evolution") is not None,
+                         "unbounded reviser concurrency configuration")
+                changes.append({
+                    "fields": fields, "kind": "reviser_concurrency",
+                    "old_present": old_present, "old": old, "new": new,
+                })
+                return True
             allowed = (len(fields) == 3 and fields[:2] in (
                 ["evolution", "config"], ["request_input_config", "evolution_config"])
                 and fields[2] in _REVISION_INPUT_LIMITS)

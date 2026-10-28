@@ -1,6 +1,10 @@
 from copy import deepcopy
+import hashlib
+import json
 
-from skill3d.evolution.revision_view_v11 import decision_case_view
+from skill3d.evolution.revision_view_v11 import (
+    decision_case_view, split_round_components, reassemble_round_components,
+)
 
 
 def case_with_reads():
@@ -25,6 +29,54 @@ def case_with_reads():
         ],
     }
     return case, read
+
+
+def test_literal_stdout_projection_preserves_numbers_errors_and_reassembles():
+    case, _ = case_with_reads()
+    objects = [{
+        "obj_id": f"synthetic-object-{index}", "category_name": "chair",
+        "centroid_world": [1.12345678901234, 0.0, -2.5],
+        "det_conf": 0.987654321, "binding_flags": ["mask_missing"],
+        "binding_validation": {"valid": False, "errors": ["mask_missing"],
+                               "generation_sha256": "a" * 64},
+        "binding_provenance": [{"synthetic": "repeated-metadata" * 500}],
+    } for index in range(20)]
+    text = repr(objects) + "\n"
+    case["rounds"] = [{
+        "index": 1, "program_source": "print(objects)\n",
+        "execution_diagnostics": {
+            "stdout": text, "error_type": "ValueError", "error_message": "synthetic error",
+            "error_line": 2, "traceback_text": "synthetic traceback"},
+    }]
+    before = deepcopy(case)
+    view = decision_case_view(case)
+    diagnostics = view["rounds"][0]["execution_diagnostics"]
+    stdout = diagnostics["stdout"]
+    assert stdout["source_text_sha256"] == hashlib.sha256(text.encode()).hexdigest()
+    assert stdout["data"][0]["centroid_world"] == objects[0]["centroid_world"]
+    assert stdout["data"][0]["det_conf"] == objects[0]["det_conf"]
+    assert stdout["data"][0]["binding_validation"] == {
+        "valid": False, "errors": ["mask_missing"]}
+    assert all(diagnostics[key] == value for key, value in before["rounds"][0][
+        "execution_diagnostics"].items() if key != "stdout")
+    row = {"case_index": 0, "complete_case": view}
+    parts = split_round_components(row, lambda rows: len(json.dumps(rows)) < 4000)
+    assert len(parts) > 1
+    assert reassemble_round_components(parts) == [row]
+    assert case == before
+
+
+def test_nonobject_or_executable_stdout_stays_verbatim(tmp_path):
+    case, _ = case_with_reads()
+    marker = tmp_path / "must-not-exist"
+    for text in (
+            "distance=0.123456789\nstatus=False\n",
+            "[1.123456789, 0, False, None]\n",
+            "[{'obj_id': 'a'}, 1]\n",
+            f"[__import__('pathlib').Path({str(marker)!r}).touch()]\n"):
+        case["rounds"][0]["execution_diagnostics"] = {"stdout": text}
+        assert decision_case_view(case)["rounds"][0]["execution_diagnostics"]["stdout"] == text
+    assert not marker.exists()
 
 
 def test_full_code_numbers_and_observation_delivery_chronology_survive_projection():

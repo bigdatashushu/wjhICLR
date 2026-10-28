@@ -107,6 +107,42 @@ def seal(staged):
     return value
 
 
+@pytest.mark.parametrize("concurrency", [1, 4])
+def test_explicit_continuation_allows_only_bounded_owner_concurrency(tmp_path, concurrency):
+    staged = stage(tmp_path)
+    execution = {"skill_owners": 4, "workers": 16,
+                 "scheduler": "coordinator_owned_episode_spawn_pool_v1"}
+    staged.original = signed({
+        **{key: value for key, value in staged.original.items() if key != "identity_sha256"},
+        "execution": execution})
+    write_json(staged.root / "manifest.json", staged.original)
+    staged.current = signed({
+        **{key: value for key, value in staged.current.items() if key != "identity_sha256"},
+        "execution": {**execution, "reviser_concurrency": concurrency}})
+    receipt = seal(staged)
+    assert [row for row in receipt["allowed_changes"] if row["kind"] == "reviser_concurrency"] == [{
+        "fields": ["execution", "reviser_concurrency"], "kind": "reviser_concurrency",
+        "old_present": False, "old": None, "new": concurrency}]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("reviser_concurrency", 0), ("reviser_concurrency", 5),
+    ("reviser_concurrency", True), ("workers", 32)])
+def test_continuation_does_not_relax_other_execution_fields(tmp_path, field, value):
+    staged = stage(tmp_path)
+    execution = {"skill_owners": 4, "workers": 16,
+                 "scheduler": "coordinator_owned_episode_spawn_pool_v1"}
+    staged.original = signed({
+        **{key: child for key, child in staged.original.items() if key != "identity_sha256"},
+        "execution": execution})
+    write_json(staged.root / "manifest.json", staged.original)
+    staged.current = signed({
+        **{key: child for key, child in staged.current.items() if key != "identity_sha256"},
+        "execution": {**execution, field: value}})
+    with pytest.raises(FitSetError):
+        seal(staged)
+
+
 def test_explicit_sidecar_preserves_raw_state_and_original_lineage(tmp_path):
     staged = stage(tmp_path)
     before = {path: path.read_bytes() for path in staged.root.rglob("*") if path.is_file()}
