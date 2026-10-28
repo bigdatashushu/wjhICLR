@@ -447,6 +447,12 @@ def validate_prepared_binding(binding, *, frames, depth, c2w, intrinsics, point_
                               seed=None, model_weights_sha256="", parameters=None,
                               source_compatibility=None, binding_derivation_context=None):
     """Frozen preparation may be consumed without requiring a live detector."""
+    from skill3d.evaluation.verified_publication_v11 import ProducerVerifiedBindingContext
+    if isinstance(binding_derivation_context, ProducerVerifiedBindingContext):
+        binding_derivation_context.validate(
+            binding, inputs=inputs, scene_identity=scene_identity, seed=seed,
+            parameters=parameters, model_weights_sha256=model_weights_sha256)
+        return
     stats = binding.stats
     if "binding_derivation" in stats:
         if source_compatibility is not None:

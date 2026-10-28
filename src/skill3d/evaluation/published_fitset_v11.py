@@ -159,6 +159,8 @@ class PublishedFitSetInputProvider:
     the manifest itself may also be an exact pinned file mapping.
     """
 
+    _reuse_verified_publications = False
+
     def __init__(
         self, manifest_path: str | Path, max_scenes: int = 2, *,
         transport_locator=None,
@@ -166,6 +168,7 @@ class PublishedFitSetInputProvider:
         from skill3d.infra.m5_identity import content_sha256
         from skill3d.storage.published_transport import PublishedTransportLocator
 
+        self._reuse_verified_publications = False
         _require(type(max_scenes) is int and max_scenes > 0,
                  "scene cache size must be a positive integer")
         self.transport_locator = (
@@ -274,6 +277,7 @@ class PublishedFitSetInputProvider:
         }
         self.max_scenes = max_scenes
         self.cache: OrderedDict[tuple[str, str], object] = OrderedDict()
+        self._publication_files = OrderedDict()
         self._scene_checks = {}
         self.cache_lock = threading.RLock()
 
@@ -285,9 +289,14 @@ class PublishedFitSetInputProvider:
     def input_contract_identity(self) -> dict:
         return copy.deepcopy(self._input_contract_identity)
 
+    def public_entry(self, variant):
+        """Project one catalog entry without copying the entire QA catalog."""
+        return _public_entry(self._entry(variant))
+
     def __getstate__(self) -> dict:
         state = dict(self.__dict__)
         state["cache"] = OrderedDict()
+        state["_publication_files"] = OrderedDict()
         state["_scene_checks"] = {}
         state.pop("cache_lock", None)
         return state
@@ -295,12 +304,48 @@ class PublishedFitSetInputProvider:
     def __setstate__(self, state: dict) -> None:
         self.__dict__.update(state)
         self.cache = OrderedDict()
+        self._publication_files = OrderedDict()
         self._scene_checks = {}
         self.cache_lock = threading.RLock()
 
+    def reuse_verified_publications(self):
+        """Use production/transport verification for this immutable input store.
+
+        Only an approved exact physical descriptor can enable this path. The
+        runtime holds the scene lease through solving; it verifies downloads.
+        """
+        _require(self.transport_locator is not None,
+                 "verified replay requires an approved physical transport descriptor")
+        if not self._reuse_verified_publications:
+            self.cache.clear()
+            self._scene_checks.clear()
+        self._reuse_verified_publications = True
+
+    def _publication_file(self, path, sha256):
+        if not self._reuse_verified_publications:
+            return _read_anchored(self._physical_file(path, sha256), sha256)
+        physical = self._physical_file(path, sha256)
+        key = (str(physical), sha256)
+        with self.cache_lock:
+            if key not in self._publication_files:
+                self._publication_files[key] = (
+                    scene_compute._read_json(physical),
+                    {"path": str(physical), "sha256": sha256, "size": physical.stat().st_size})
+                while len(self._publication_files) > 2 * self.max_scenes + 2:
+                    self._publication_files.popitem(last=False)
+            self._publication_files.move_to_end(key)
+            return self._publication_files[key]
+
+    def _publication_identity(self, path, sha256):
+        physical = self._physical_file(path, sha256)
+        if not self._reuse_verified_publications:
+            return _file(physical, sha256)
+        return {"path": str(physical), "sha256": sha256, "size": physical.stat().st_size}
+
     def _entry(self, variant: Mapping) -> dict:
-        _require(_file(self.manifest_path) == self._manifest_identity,
-                 "published input manifest integrity changed")
+        if not self._reuse_verified_publications:
+            _require(_file(self.manifest_path) == self._manifest_identity,
+                     "published input manifest integrity changed")
         qa_id = variant.get("qa_id")
         entry = self._entries.get(qa_id)
         _require(entry is not None, f"{qa_id}: published catalog entry is missing")
@@ -319,7 +364,10 @@ class PublishedFitSetInputProvider:
         from skill3d.storage.relocation import RelocationError
 
         try:
-            return (self.transport_locator.file(source, sha256)
+            lookup = (self.transport_locator.verified_file
+                      if self._reuse_verified_publications else self.transport_locator.file
+                      ) if self.transport_locator is not None else None
+            return (lookup(source, sha256)
                     if self.transport_locator is not None else Path(source))
         except RelocationError as exc:
             raise PublishedFitSetInputError(f"published physical file rejected: {exc}") from exc
@@ -328,7 +376,10 @@ class PublishedFitSetInputProvider:
         from skill3d.storage.relocation import RelocationError
 
         try:
-            return (self.transport_locator.root(source)
+            lookup = (self.transport_locator.verified_root
+                      if self._reuse_verified_publications else self.transport_locator.root
+                      ) if self.transport_locator is not None else None
+            return (lookup(source)
                     if self.transport_locator is not None else Path(source))
         except RelocationError as exc:
             raise PublishedFitSetInputError(f"published physical root rejected: {exc}") from exc
@@ -339,18 +390,35 @@ class PublishedFitSetInputProvider:
         from skill3d.storage.relocation import RelocationError, read_relocation_receipt
 
         try:
-            original = read_relocation_receipt(
-                self._physical_file(migration, None)
-                if isinstance(migration, (str, Path)) else migration)
+            if self._reuse_verified_publications:
+                original = (scene_compute._read_json(self._physical_file(migration, None))
+                            if isinstance(migration, (str, Path))
+                            else copy.deepcopy(migration))
+            else:
+                original = read_relocation_receipt(
+                    self._physical_file(migration, None)
+                    if isinstance(migration, (str, Path)) else migration)
             _require(original.get("destination_root") == source_root,
                      "original migration destination changed")
             root = self._physical_root(source_root)
             records = {"artifact": original["artifact"], **original["dependencies"]}
             refs = {}
             for name, record in records.items():
-                path = self.transport_locator.member(
+                lookup = (self.transport_locator.verified_member
+                          if self._reuse_verified_publications
+                          else self.transport_locator.member)
+                path = lookup(
                     source_root, record["target_ref"], record["identity"])
                 refs[name] = path.relative_to(root).as_posix()
+            if self._reuse_verified_publications:
+                fresh = copy.deepcopy(original)
+                fresh["destination_root"] = str(root)
+                fresh["artifact"]["target_ref"] = refs.pop("artifact")
+                for name, ref in refs.items():
+                    fresh["dependencies"][name]["target_ref"] = ref
+                fresh["receipt_sha256"] = content_sha256({
+                    k: v for k, v in fresh.items() if k != "receipt_sha256"})
+                return fresh, root
             fresh = store.create_migration_receipt(
                 key, scene_input_identity=identity, destination_root=root,
                 scene_artifact_ref=refs.pop("artifact"), dependency_refs=refs)
@@ -377,6 +445,21 @@ class PublishedFitSetInputProvider:
         root = self._physical_root(entry["input_root"])
         key = (str(root), entry["frozen_scene_sha256"])
         with self.cache_lock:
+            if self._reuse_verified_publications:
+                if key not in self.cache:
+                    from skill3d.evaluation.verified_publication_v11 import load_verified_scene
+                    scope = self.scene_scopes.get(entry["scene_id"])
+                    loaded = load_verified_scene(
+                        root, question_cap=len(scope["qa_ids"]) if scope is not None else 8)
+                    if scope is not None:
+                        _require(loaded.manifest["qa_ids"] == scope["qa_ids"]
+                                 and loaded.manifest["split"] == scope["split"],
+                                 "fullQA frozen scene question/split scope changed")
+                    self.cache[key] = loaded
+                    while len(self.cache) > self.max_scenes:
+                        self.cache.popitem(last=False)
+                self.cache.move_to_end(key)
+                return self.cache[key]
             _file(root / "scene.json", entry["frozen_scene_sha256"])
             if key not in self.cache:
                 scope = self.scene_scopes.get(entry["scene_id"])
@@ -446,11 +529,12 @@ class PublishedFitSetInputProvider:
             and fs.readable_frame_ids == fs.frame_ids and len(item.pixels) == 32,
             "published input requires exactly 32 readable frames",
         )
-        try:
-            actual_pixels = with_pixel_identity(fs, item.pixels).pixel_sha256
-        except ValueError as exc:
-            raise PublishedFitSetInputError("published frozen RGB pixel identity changed") from exc
-        _require(actual_pixels == fs.pixel_sha256, "published frozen RGB pixel identity changed")
+        if not self._reuse_verified_publications:
+            try:
+                actual_pixels = with_pixel_identity(fs, item.pixels).pixel_sha256
+            except ValueError as exc:
+                raise PublishedFitSetInputError("published frozen RGB pixel identity changed") from exc
+            _require(actual_pixels == fs.pixel_sha256, "published frozen RGB pixel identity changed")
 
     def __call__(self, variant: Mapping) -> EpisodeItem:
         entry = self._entry(variant)
@@ -463,6 +547,12 @@ class PublishedFitSetInputProvider:
         self._validate_item(variant, entry, item)
         return item
 
+    def frozen_frame_bytes(self, variant):
+        """Reuse the original PNG encoding already decoded for this scene."""
+        if not self._reuse_verified_publications:
+            return None
+        return self._scene(self._entry(variant)).png_bytes
+
     def _transport(self, variant: Mapping, item: EpisodeItem) -> dict:
         from skill3d.infra.m5_identity import content_sha256
         from skill3d.segmentation.prepared_binding_store import (
@@ -471,15 +561,19 @@ class PublishedFitSetInputProvider:
 
         entry = self._entry(variant)
         self._validate_item(variant, entry, item)
-        identity, identity_file = _read_anchored(
-            self._physical_file(entry["scene_input_identity_file"],
-                                entry["scene_input_identity_file_sha256"]),
+        identity, identity_file = self._publication_file(
+            entry["scene_input_identity_file"],
             entry["scene_input_identity_file_sha256"],
         )
-        validation, migration_file = _read_anchored(
-            self._physical_file(entry["migration_receipt_file"],
-                                entry["migration_receipt_file_sha256"]),
+        if self._reuse_verified_publications:
+            # Shared parsed publication JSON stays private; episode consumers
+            # receive their own logical identity and receipt records.
+            identity, identity_file = copy.deepcopy(identity), copy.deepcopy(identity_file)
+        validation, migration_file = self._publication_file(
+            entry["migration_receipt_file"],
             entry["migration_receipt_file_sha256"])
+        if self._reuse_verified_publications:
+            migration_file = copy.deepcopy(migration_file)
         try:
             migration = validation["variants"][entry["variant"]]["migration_receipts"][
                 entry["qa_id"]]
@@ -492,7 +586,8 @@ class PublishedFitSetInputProvider:
                  and identity.get("sha256") == reference["scene_input_identity_sha256"],
                  "catalog logical scene identity changed")
         try:
-            store.validate_reference(reference)
+            if not self._reuse_verified_publications:
+                store.validate_reference(reference)
             original_migration = copy.deepcopy(migration)
             destination = Path(entry["publication_root"])
             artifact_path = Path(entry["scene_artifact"])
@@ -502,18 +597,23 @@ class PublishedFitSetInputProvider:
                 migration, destination = self._rebase_migration(
                     store, reference["key"], migration, identity, entry["publication_root"])
                 artifact_path = destination / migration["artifact"]["target_ref"]
-            resolver = store.validate_migration_receipt(
-                reference["key"], migration,
-                scene_artifact=str(artifact_path), scene_input_identity=identity,
-                destination_root=str(destination),
-            )
+            if self._reuse_verified_publications:
+                from skill3d.storage.relocation import ProducerVerifiedRelocation
+                resolver = ProducerVerifiedRelocation(migration)
+            else:
+                resolver = store.validate_migration_receipt(
+                    reference["key"], migration,
+                    scene_artifact=str(artifact_path), scene_input_identity=identity,
+                    destination_root=str(destination),
+                )
         except PreparedBindingStoreError as exc:
             raise PublishedFitSetInputError(f"published binding replay rejected: {exc}") from exc
-        actual = resolver.recompute_scene_input_identity(
-            episode=item.episode.model_dump(mode="json"), pixels=item.pixels,
-            source=item.source, video_path=item.video_path,
-        )
-        _require(actual == identity, "published logical input identity changed")
+        if not self._reuse_verified_publications:
+            actual = resolver.recompute_scene_input_identity(
+                episode=item.episode.model_dump(mode="json"), pixels=item.pixels,
+                source=item.source, video_path=item.video_path,
+            )
+            _require(actual == identity, "published logical input identity changed")
         fs = item.episode.frame_set
         original_catalog = {k: v for k, v in entry.items()
                             if k not in _INPUT_FIELDS | _PROVENANCE_FIELDS}
@@ -525,9 +625,12 @@ class PublishedFitSetInputProvider:
             "input_manifest": copy.deepcopy(self._manifest_identity),
             "source_catalog_sha256": self._input_contract_identity["source_catalog_sha256"],
             "catalog_entry_sha256": content_sha256(original_catalog),
-            "frozen_scene": _file(
-                self._physical_root(entry["input_root"]) / "scene.json",
-                entry["frozen_scene_sha256"]),
+            "frozen_scene": (
+                self._publication_identity(
+                    Path(entry["input_root"]) / "scene.json", entry["frozen_scene_sha256"])
+                if self._reuse_verified_publications else _file(
+                    self._physical_root(entry["input_root"]) / "scene.json",
+                    entry["frozen_scene_sha256"])),
             "scene_input_identity_file": identity_file,
             "migration_receipt_file": migration_file,
             "scene_input_identity_sha256": identity["sha256"],
@@ -581,17 +684,22 @@ class PublishedFitSetInputProvider:
         transport = self._transport(variant, item)
         entry, resolver = transport["entry"], transport["resolver"]
         try:
-            prepared = load_prepared_binding_reference(
-                entry["reference"], scene_input_identity=transport["identity"],
-                migration_receipt=transport["migration"],
-                scene_artifact=str(resolver.artifact_path),
-                migration_destination_root=str(transport["destination_root"]),
-                physical_store_root=(transport["store_root"]
-                                     if self.transport_locator is not None else None),
-            )
+            if self._reuse_verified_publications:
+                from skill3d.segmentation.prepared_binding_store import PreparedBindingStore
+                prepared = PreparedBindingStore(transport["store_root"]).load_verified(
+                    entry["reference"]["key"])
+            else:
+                prepared = load_prepared_binding_reference(
+                    entry["reference"], scene_input_identity=transport["identity"],
+                    migration_receipt=transport["migration"],
+                    scene_artifact=str(resolver.artifact_path),
+                    migration_destination_root=str(transport["destination_root"]),
+                    physical_store_root=(transport["store_root"]
+                                         if self.transport_locator is not None else None),
+                )
         except PreparedBindingStoreError as exc:
             raise PublishedFitSetInputError(f"published binding replay rejected: {exc}") from exc
-        return {
+        result = {
             "artifact_path": resolver.artifact_path,
             "artifact": resolver.resolved_artifact(),
             "identity": transport["identity"],
@@ -600,6 +708,11 @@ class PublishedFitSetInputProvider:
             "artifact_relocation": resolver,
             "transport_receipt": transport["receipt"],
         }
+        if self._reuse_verified_publications:
+            from skill3d.evaluation.verified_publication_v11 import ProducerVerifiedBindingContext
+            result["binding_derivation_context"] = ProducerVerifiedBindingContext(
+                prepared, copy.deepcopy(entry["reference"]["request_identity"]))
+        return result
 
 
 __all__ = [

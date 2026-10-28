@@ -1433,18 +1433,25 @@ def run_episode(
                     art, pixels, None, episode, cfg, m5_llm)
             else:
                 from copy import deepcopy
+                from skill3d.evaluation.verified_publication_v11 import (
+                    ProducerVerifiedBindingContext,
+                )
 
-                binding = deepcopy(prepared_binding)
+                verified_binding = isinstance(
+                    binding_derivation_context, ProducerVerifiedBindingContext)
+                binding = prepared_binding if verified_binding else deepcopy(prepared_binding)
                 if cfg.mode == "real":
                     from skill3d.segmentation.question_binding import (
                         binding_parameters, question_input, validate_prepared_binding,
                     )
                     validate_prepared_binding(
-                        binding, frames=pixels, depth=_load_npy(art.depth_maps),
-                        c2w=_load_npy(art.c2w_list), intrinsics=_load_npy(art.intrinsics),
-                        point_conf=_load_npy(art.depth_conf),
-                        depth_conf=_load_npy(art.depth_conf),
-                        point_map=_load_npy(art.point_map),
+                        binding, frames=pixels,
+                        depth=None if verified_binding else _load_npy(art.depth_maps),
+                        c2w=None if verified_binding else _load_npy(art.c2w_list),
+                        intrinsics=None if verified_binding else _load_npy(art.intrinsics),
+                        point_conf=None if verified_binding else _load_npy(art.depth_conf),
+                        depth_conf=None if verified_binding else _load_npy(art.depth_conf),
+                        point_map=None if verified_binding else _load_npy(art.point_map),
                         inputs=question_input(episode.question,
                             canonical_task(episode.question_type), episode.options),
                         scene_identity=str(
@@ -1460,6 +1467,8 @@ def run_episode(
                             semantic_max_pixels=cfg.semantic_max_pixels,
                             semantic_relation_batch_size=cfg.semantic_relation_batch_size,
                             semantic_review_config=cfg.semantic_review_config))
+                if verified_binding:
+                    binding = deepcopy(binding)
                 m5_objects, m5_stats = binding.objects, binding.stats
                 m5_notes, m5_materialized = binding.notes, binding.materialized
             prepared_measurements = (

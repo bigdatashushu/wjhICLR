@@ -56,10 +56,21 @@ class PublishedTransportLocator:
                         if Path(_ref(name)).is_absolute():
                             raise RelocationError("physical root members must be root-relative")
                         _check_file_identity(identity)
+        self._descriptor_sha256 = content_sha256(self._descriptor)
+        self._verified_files = {}
+        for source, row in self._descriptor["roots"].items():
+            for name, identity in row["members"].items():
+                old = str(Path(source) / name)
+                candidate = {"path": str(Path(row["path"]) / name), "identity": identity}
+                previous = self._verified_files.get(old)
+                if previous is not None and previous != candidate:
+                    raise RelocationError("conflicting exact verified member mappings")
+                self._verified_files[old] = candidate
+        self._verified_files.update(self._descriptor["files"])
 
     @property
     def descriptor_sha256(self) -> str:
-        return content_sha256(self._descriptor)
+        return self._descriptor_sha256
 
     def file(self, source: str | Path, expected_sha256: str | None = None) -> Path:
         source = _ref(str(source), absolute=True)
@@ -111,6 +122,44 @@ class PublishedTransportLocator:
             path = _target(root, name)
         if _identity(path) != dict(identity):
             raise RelocationError("physical member differs from source receipt")
+        return path
+
+    def verified_file(self, source, expected_sha256=None):
+        """Resolve producer/transport-verified immutable bytes without rehashing."""
+        source = _ref(str(source), absolute=True)
+        row = self._verified_files.get(source)
+        if row is None:
+            raise RelocationError("verified replay requires an explicit file mapping")
+        if expected_sha256 is not None and row["identity"]["sha256"] != expected_sha256:
+            raise RelocationError("verified file differs from its publication anchor")
+        path = Path(row["path"])
+        _no_symlinks(path)
+        if not path.is_file():
+            raise RelocationError("verified publication file is missing")
+        return path
+
+    def verified_root(self, source):
+        """Resolve an exact approved root without scanning all of its members."""
+        source = _ref(str(source), absolute=True)
+        row = self._descriptor["roots"].get(source)
+        if row is None:
+            raise RelocationError("verified replay requires an explicit root mapping")
+        return _root(row["path"])
+
+    def verified_member(self, source_root, name, identity):
+        source_root = _ref(str(source_root), absolute=True)
+        name = _ref(name)
+        if Path(name).is_absolute():
+            raise RelocationError("physical member must be root-relative")
+        row = self._descriptor["roots"].get(source_root)
+        if row is None or row["members"].get(name) != dict(identity):
+            raise RelocationError("verified member differs from its publication anchor")
+        root = self.verified_root(source_root)
+        source = str(Path(source_root) / name)
+        path = (self.verified_file(source, identity["sha256"])
+                if source in self._descriptor["files"] else _target(root, name))
+        if not path.is_relative_to(root):
+            raise RelocationError("verified member escapes its approved root")
         return path
 
 

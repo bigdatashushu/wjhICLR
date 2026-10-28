@@ -544,6 +544,15 @@ class PreparedBindingStore:
             raise PreparedBindingStoreError(
                 "prepared binding payload identity changed"
             )
+        return self.load_verified(key)
+
+    def load_verified(self, key: str) -> PreparedObjectBinding:
+        """Decode a producer-verified immutable payload, without a second audit.
+
+        This is a trusted framework entry point. Consumers must supply the
+        original catalog/reference through their approved publication provider.
+        """
+        entry = self.entry_path(key)
         try:
             data = json.loads(
                 (entry / "payload" / "binding.json").read_text(

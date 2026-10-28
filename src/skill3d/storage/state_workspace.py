@@ -278,7 +278,14 @@ class WorkspaceIO:
         for path in paths:
             while not path.exists():
                 path = path.parent
+            self._sync(path)
+
+    def _sync(self, path):
+        try:
             _sync_ancestors(path, self._budget.path)
+        except BaseException:
+            self._budget._durability_ok = False
+            raise
 
     @contextmanager
     def _open_atomic(self, relative, mode):
@@ -316,8 +323,12 @@ class WorkspaceIO:
                         self._budget.cache.min_free_bytes + growth
                     ):
                         raise QuotaExceeded("workspace fsync crosses filesystem free-space floor")
-                    stream.flush()
-                    os.fsync(stream.fileno())
+                    try:
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    except BaseException:
+                        self._budget._durability_ok = False
+                        raise
             with self._budget._accounted((temp, path), allocation_bytes=2 * unit):
                 if mode == "xb" and path.exists():
                     raise FileExistsError(path)
@@ -352,7 +363,7 @@ class WorkspaceIO:
         if self._budget.atomic_writes:
             with self._budget._accounted((path,)):
                 path.unlink()
-            _sync_ancestors(path.parent, self._budget.path)
+            self._sync(path.parent)
             return
         path.unlink()
         _fsync_dir(path.parent)
@@ -390,7 +401,7 @@ class WorkspaceIO:
         if self._budget.atomic_writes:
             with self._budget._accounted((path,)):
                 path.rmdir()
-            _sync_ancestors(path.parent, self._budget.path)
+            self._sync(path.parent)
             return
         path.rmdir()
         _fsync_dir(path.parent)
@@ -401,13 +412,15 @@ class StateWorkspace:
 
     def __init__(self, cache: HotCache, key: str, *, identity=None, transfer=None,
                  checkpoint_validator=None, bounded=False, lock_timeout_s=120.0,
-                 atomic_writes=False):
+                 atomic_writes=False, incremental_leases=False):
         _name(key)
         self.cache, self.key = cache, key
         self.identity, self.transfer = identity, transfer
         self.checkpoint_validator = checkpoint_validator
         self.bounded = bool(bounded)
         self.atomic_writes = bool(atomic_writes)
+        self.incremental_leases = bool(incremental_leases)
+        self._baseline_cache = None
         if self.atomic_writes and not self.bounded:
             raise StorageError("atomic workspace IO requires fixed-ceiling bounded mode")
         self.lock_timeout_s = float(lock_timeout_s)
@@ -421,12 +434,15 @@ class StateWorkspace:
             with self.cache.workspace_lease(
                 self.key, growth_bytes=growth_bytes, allocation_bytes=allocation_bytes,
                 atomic_writes=self.atomic_writes,
+                incremental=self.incremental_leases,
             ) as budget:
                 yield budget
             return
         deadline = time.monotonic() + self.lock_timeout_s
         while True:
-            lease = self.cache.workspace_lease(self.key, atomic_writes=self.atomic_writes)
+            lease = self.cache.workspace_lease(
+                self.key, atomic_writes=self.atomic_writes,
+                incremental=self.incremental_leases)
             try:
                 budget = lease.__enter__()
                 break
@@ -499,12 +515,21 @@ class StateWorkspace:
         return value
 
     def _baseline(self, budget, journal):
-        value = _read_json(budget.path / _BASELINE)
+        path = budget.path / _BASELINE
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise IntegrityError("baseline must be a regular file")
+        stamp = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+                 journal["baseline_archive_sha256"], journal["baseline_members_sha256"])
+        if self._baseline_cache is not None and self._baseline_cache[0] == stamp:
+            return self._baseline_cache[1]
+        value = _read_json(path)
         baseline = BaselineAnchor(**value)
         if baseline.sha256 != journal["baseline_archive_sha256"] or (
             baseline.members_sha256 != journal["baseline_members_sha256"]
         ):
             raise IntegrityError("persisted baseline identity changed")
+        self._baseline_cache = (stamp, baseline)
         return baseline
 
     def _save_journal(self, budget, value):

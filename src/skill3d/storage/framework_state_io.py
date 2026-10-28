@@ -60,6 +60,7 @@ class FrameworkStateIO:
             raise StorageError("framework workspace ceiling must be at most 10 GB")
         self._workspace = workspace
         workspace.atomic_writes = True
+        workspace.incremental_leases = True
         self.job, self.attempt = job, attempt
         self.max_file_bytes = max_file_bytes
         self.max_workspace_bytes = max_workspace_bytes
@@ -101,6 +102,7 @@ class FrameworkStateIO:
             "key": workspace.key, "transfer": workspace.transfer,
             "lock_timeout_s": workspace.lock_timeout_s,
             "atomic_writes": True,
+            "incremental_leases": True,
         }
         return state
 

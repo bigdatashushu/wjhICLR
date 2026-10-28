@@ -713,6 +713,7 @@ class WorkspaceLease:
     _allocated_bytes: int | None = field(default=None, init=False, repr=False)
     _io_lock: object = field(default_factory=threading.RLock, init=False, repr=False)
     _accounting_ok: bool = field(default=True, init=False, repr=False)
+    _durability_ok: bool = field(default=True, init=False, repr=False)
     _writers: int = field(default=0, init=False, repr=False)
     _atomic_temporaries: set = field(default_factory=set, init=False, repr=False)
 
@@ -874,7 +875,16 @@ class HotCache:
             max(0, row["workspace_charged_bytes"] - _tree_bytes(self._entry_path(key)))
             for key, row in state["entries"].items()
             if row["kind"] == "workspace" and row["ready"])
-        return scratch + workspaces
+        accounting = 0
+        for key, row in state["entries"].items():
+            if row.get("accounting_charged_bytes"):
+                record = self.root / "locks" / ("w-" + _digest(key) + ".json")
+                try:
+                    actual = _charged(record.lstat())
+                except FileNotFoundError:
+                    actual = 0
+                accounting += max(0, row["accounting_charged_bytes"] - actual)
+        return scratch + workspaces + accounting
 
     def _fits(self, state: dict, additional: int):
         unwritten = self._unwritten(state)
@@ -1095,6 +1105,7 @@ class HotCache:
     def workspace_lease(
         self, key: str, *, growth_bytes: int | None = None,
         allocation_bytes: int | None = None, atomic_writes: bool = False,
+        incremental: bool = False,
     ) -> Iterator[WorkspaceLease]:
         """Persist peak growth before mutation; crashes retain bytes and budget.
 
@@ -1104,6 +1115,12 @@ class HotCache:
         """
         if atomic_writes and (growth_bytes is not None or allocation_bytes is not None):
             raise StorageError("atomic workspace IO requires an already reserved fixed envelope")
+        if incremental:
+            if not atomic_writes:
+                raise StorageError("persistent accounting requires atomic workspace IO")
+            with self._incremental_workspace_lease(key) as budget:
+                yield budget
+            return
         if growth_bytes is not None:
             _count(growth_bytes)
         if allocation_bytes is not None:
@@ -1151,6 +1168,94 @@ class HotCache:
                     budget.active = False
 
     @contextmanager
+    def _incremental_workspace_lease(self, key):
+        """Fixed-ceiling framework writers share durable touched-path counters.
+
+        All mutations must use WorkspaceIO. A dirty record means the previous
+        owner crashed, so the next owner reconciles the tree before admission.
+        Raw/external workspace leases invalidate this record. Neither a clean
+        acquisition nor its release scans the workspace or updates LRU state.
+        """
+        _name(key)
+        path = self._entry_path(key)
+        record_path = self.root / "locks" / ("w-" + _digest(key) + ".json")
+        fd = os.open(self._lease_path(key), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise EntryBusy("entry has an incompatible active lease") from exc
+            with self._locked() as state:
+                row = state["entries"].get(key)
+                if row is None or not row["ready"] or row["kind"] != "workspace":
+                    raise StorageError("mutable lease requires a published workspace")
+                info = path.lstat()
+                if not stat.S_ISDIR(info.st_mode):
+                    raise IntegrityError("workspace root must be a real directory")
+                anchor = {
+                    "schema_version": "h3d-workspace-accounting-v1", "key": key,
+                    "root_device": info.st_dev, "root_inode": info.st_ino,
+                    "bytes": row["workspace_bytes"],
+                    "charged_bytes": row["workspace_charged_bytes"],
+                }
+                budget = WorkspaceLease(
+                    self, key, path, anchor["bytes"], anchor["charged_bytes"],
+                    atomic_writes=True)
+            saved = _read_json(record_path) if record_path.exists() else {}
+            if saved.get("clean") is True and all(
+                    saved.get(name) == value for name, value in anchor.items()):
+                budget._logical_bytes = _count(saved["logical_bytes"])
+                budget._allocated_bytes = _count(saved["allocated_bytes"])
+                budget.check_growth()
+            else:
+                budget._check_full()
+                # A previous owner may have lost directory/file durability.
+                # Reconcile both bytes and fsync before declaring this clean.
+                _fsync_tree(path)
+                budget._check_full()
+
+            def persist(clean):
+                document = {
+                    **anchor, "clean": clean,
+                    "logical_bytes": budget._logical_bytes,
+                    "allocated_bytes": budget._allocated_bytes,
+                }
+                unit = _allocation_unit(self.root)
+                size = _rounded(len(_json_bytes(document)), unit)
+                required = 2 * size + 4 * unit
+                # Short metadata serialization also prevents a global scanner
+                # from observing a temporary that is concurrently renamed.
+                with self._locked() as state:
+                    row = state["entries"][key]
+                    previous = row.get("accounting_charged_bytes", 0)
+                    if required > previous:
+                        self._make_space(state, required - previous)
+                        row["accounting_charged_bytes"] = required
+                        self._fits(state, 0)
+                        self._save(state)
+                    if self.disk_usage(self.root).free < self.min_free_bytes + size + unit:
+                        raise QuotaExceeded("cannot persist workspace accounting above free-space floor")
+                    _atomic_json(record_path, document)
+
+            # fsync the dirty intent before giving out a mutation capability.
+            persist(False)
+            completed = False
+            try:
+                yield budget
+                completed = True
+            finally:
+                try:
+                    if budget._writers or not budget._accounting_ok:
+                        raise IntegrityError("workspace accounting did not finish")
+                    budget.check_growth()
+                    if completed and budget._durability_ok:
+                        persist(True)
+                finally:
+                    budget.active = False
+        finally:
+            os.close(fd)
+
+    @contextmanager
     def lease(self, key: str, *, exclusive: bool = False) -> Iterator[Path]:
         """Hold an OS lease; elapsed time/TTL can never revoke an active holder."""
         with self._locked() as state:
@@ -1163,8 +1268,12 @@ class HotCache:
             except BlockingIOError as exc:
                 os.close(fd)
                 raise EntryBusy("entry has an incompatible active lease") from exc
-            row["last_used"] = time.time_ns()
             try:
+                if exclusive and row["kind"] == "workspace":
+                    accounting = self.root / "locks" / ("w-" + _digest(key) + ".json")
+                    accounting.unlink(missing_ok=True)
+                    _fsync_dir(accounting.parent)
+                row["last_used"] = time.time_ns()
                 self._save(state)
             except BaseException:
                 os.close(fd)

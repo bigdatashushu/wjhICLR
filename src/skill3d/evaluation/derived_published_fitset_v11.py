@@ -332,6 +332,32 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
     def prepare_published(self, variant, item):
         transport = self._transport(variant, item)
         entry, resolver = transport["entry"], transport["resolver"]
+        if self._reuse_verified_publications:
+            _require(self._approved_derived_replay is not None,
+                     "verified derived replay requires existing published outputs")
+            from skill3d.evaluation.verified_publication_v11 import ProducerVerifiedBindingContext
+            from skill3d.storage.relocation import ProducerVerifiedRelocation
+            approved = self._approved_derived_replay["scenes"][entry["scene_id"]]
+            reference = approved["references"][entry["qa_id"]]
+            store = PreparedBindingStore(self._physical_root(reference["store_root"]))
+            migration, _ = self._rebase_migration(
+                store, reference["key"], approved["migration_receipts"][entry["qa_id"]],
+                transport["identity"], entry["publication_root"])
+            resolver = ProducerVerifiedRelocation(migration)
+            prepared = store.load_verified(reference["key"])
+            context = ProducerVerifiedBindingContext(
+                prepared, copy.deepcopy(reference["request_identity"]))
+            return {
+                "artifact_path": resolver.artifact_path,
+                "artifact": resolver.resolved_artifact(),
+                "identity": transport["identity"],
+                "reference": copy.deepcopy(entry["reference"]),
+                "derived_reference": copy.deepcopy(reference),
+                "derived_migration_receipt": copy.deepcopy(migration),
+                "binding_derivation_context": context,
+                "prepared": prepared, "artifact_relocation": resolver,
+                "transport_receipt": transport["receipt"],
+            }
         context, references, migrations = self._derived_scene(entry)
         replaying = getattr(self, "_approved_derived_replay", None) is not None
         if replaying:

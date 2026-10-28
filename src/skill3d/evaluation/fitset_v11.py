@@ -1828,17 +1828,22 @@ class SystemVariantRunner:
         fs = item.episode.frame_set
         _require(fs is not None and len(fs.frame_ids) == len(item.pixels) == 32,
                  "offline case requires the frozen 32-frame public input")
+        frame_bytes = getattr(self.published_inputs, "frozen_frame_bytes", lambda _: None)(variant)
+        pending_images = []
         image_refs = []
         for index, pixels in enumerate(item.pixels):
             _require(pixels.dtype == np.uint8 and pixels.ndim == 3 and pixels.shape[2] == 3,
                      "offline case requires original RGB uint8 frames")
-            image = Image.fromarray(pixels)
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            data = buffer.getvalue()
+            if frame_bytes is None:
+                image = Image.fromarray(pixels)
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                data = buffer.getvalue()
+            else:
+                data = frame_bytes[index]
             path = variant_root / "offline_images" / f"{index:02d}.png"
             if self.framework_state_io is not None:
-                self.framework_state_io.write_bytes_once(path, data)
+                pending_images.append((path, data))
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -1853,9 +1858,15 @@ class SystemVariantRunner:
                 "image_id": f"{variant['variant_id']}:frame:{fs.frame_ids[index]}",
                 "kind": "frame", "frame_id": fs.frame_ids[index],
                 "source_frame_index": fs.source_frame_indices[index],
-                "source_hw": [image.height, image.width],
+                "source_hw": list(pixels.shape[:2]),
                 "frame_set_hash": fs.frame_set_hash,
             })
+        if self.framework_state_io is not None:
+            # Encoding/reading happens above, outside EX. One short admitted IO
+            # section replaces 32 acquisitions and durable accounting updates.
+            with self.framework_state_io.section():
+                for path, data in pending_images:
+                    self.framework_state_io.write_bytes_once(path, data)
         self._write_create_once(variant_root / "offline_input.json", {
             "schema_version": "v11-fit-set-offline-input/1.0",
             "variant_id": variant["variant_id"],
@@ -2071,15 +2082,17 @@ class SystemVariantRunner:
         )
         _require(runtime_parameters == frozen_parameters,
                  f"{variant_id}: sealed M5 parameters no longer replay")
+        from skill3d.evaluation.verified_publication_v11 import ProducerVerifiedBindingContext
+        verified_binding = isinstance(binding_derivation_context, ProducerVerifiedBindingContext)
         validate_prepared_binding(
             prepared,
             frames=item.pixels,
-            depth=runner._load_npy(artifact.depth_maps),
-            c2w=runner._load_npy(artifact.c2w_list),
-            intrinsics=runner._load_npy(artifact.intrinsics),
-            point_conf=runner._load_npy(artifact.depth_conf),
-            depth_conf=runner._load_npy(artifact.depth_conf),
-            point_map=runner._load_npy(artifact.point_map),
+            depth=None if verified_binding else runner._load_npy(artifact.depth_maps),
+            c2w=None if verified_binding else runner._load_npy(artifact.c2w_list),
+            intrinsics=None if verified_binding else runner._load_npy(artifact.intrinsics),
+            point_conf=None if verified_binding else runner._load_npy(artifact.depth_conf),
+            depth_conf=None if verified_binding else runner._load_npy(artifact.depth_conf),
+            point_map=None if verified_binding else runner._load_npy(artifact.point_map),
             inputs=question_input(
                 item.episode.question,
                 canonical_task(item.episode.question_type),

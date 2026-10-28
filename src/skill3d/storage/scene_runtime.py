@@ -136,7 +136,8 @@ class SceneHotRuntime:
             spec["key"], produce, kind="result" if scene == "state" else "input",
             extract_bytes=spec["bytes"], allocation_bytes=spec["allocation_bytes"],
             slots=(slot,) if slot is not None else (),
-            validator=lambda path: self.validate(path, spec),
+            # Every member was size/hash checked during its single incoming
+            # pass, and `seen` proves the full closure. Do not reread the shard.
         )
 
     @contextmanager
@@ -247,6 +248,9 @@ class SceneHotInputProvider:
     def __init__(self, provider, runtime):
         self.provider = provider
         self.runtime = runtime
+        reuse = getattr(provider, "reuse_verified_publications", None)
+        if reuse is not None:
+            reuse()
 
     def __getattr__(self, name):
         if name in {"provider", "runtime"}:
@@ -263,7 +267,7 @@ class SceneHotInputProvider:
         origin = self.runtime.closure["original_published_manifest"]
         if origin not in self.runtime.closure["descriptor"]["files"]:
             raise IntegrityError("input manifest lacks an explicit physical identity")
-        actual = self.runtime.locator.file(origin, record["sha256"])
+        actual = self.runtime.locator.verified_file(origin, record["sha256"])
         if str(actual) != record["path"]:
             raise IntegrityError("input contract manifest differs from approved locator")
         record["path"] = origin
@@ -281,7 +285,7 @@ class SceneHotInputProvider:
         }
         for field, origin in paths.items():
             record = logical[field]
-            actual = self.runtime.locator.file(origin, record["sha256"])
+            actual = self.runtime.locator.verified_file(origin, record["sha256"])
             if str(actual) != record["path"]:
                 raise IntegrityError("receipt physical file differs from approved locator")
             record["path"] = origin
@@ -292,13 +296,13 @@ class SceneHotInputProvider:
 
     def receipt(self, variant, item):
         receipt = self.provider.receipt(variant, item)
-        return self._logical_receipt(receipt, self.provider.entries[str(variant["qa_id"])])
+        return self._logical_receipt(receipt, self.provider.public_entry(variant))
 
     def prepare_published(self, variant, item):
         prepared = self.provider.prepare_published(variant, item)
         prepared["physical_transport_receipt"] = deepcopy(prepared["transport_receipt"])
         prepared["transport_receipt"] = self._logical_receipt(
-            prepared["transport_receipt"], self.provider.entries[str(variant["qa_id"])])
+            prepared["transport_receipt"], self.provider.public_entry(variant))
         if "derived_migration_receipt" in prepared:
             prepared["physical_derived_migration_receipt"] = deepcopy(
                 prepared["derived_migration_receipt"])
