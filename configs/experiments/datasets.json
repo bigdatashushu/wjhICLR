@@ -1,0 +1,17 @@
+{
+  "schema": "harness3d-dataset-registry/1",
+  "datasets": {
+    "vsi-bench": {
+      "aliases": ["vsibench", "vsi"],
+      "description": "VSI-Bench, using audited published v11 inputs",
+      "profile": "prepared.json",
+      "data_root": "data/vsi-bench"
+    },
+    "revsi": {
+      "aliases": ["re-vsi"],
+      "description": "ReVSI converted to the same prepared v11 input protocol",
+      "profile": "prepared.json",
+      "data_root": "data/revsi"
+    }
+  }
+}
