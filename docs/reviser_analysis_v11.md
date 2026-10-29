@@ -14,6 +14,8 @@ stdout 投影识别带标签的对象、列表和 tuple，保留前后文字、�
 
 `TrajectoryAnalyst.analyze(...)` 返回内存中的来源绑定分析。每个实际输入 case 必须有一条记录，轮次由主机绑定；分析文本仍需通过长度、标识符与样本复制检查。主机先扣除所有案例与轮次的 JSON 结构开销，再给出各文本字段的长度额度。首次投递全部批次后，对格式拒绝的批次逐个重放一次；未解决的批次仍阻止候选进入 Gate。投递和解决分别记账，服务或身份异常立即停止，不重试。`synthesis_evidence(...)` 将完整分析集合交给 `AnchoredSlotReviser`，后者由主机实施精确原文替换并执行静态检查。只有全部批次解决且产生静态有效候选，才允许进入 Gate。
 
+`allocate_analysis_chars(...)` 保持每个 campaign 的 42000 字符总分析上限及单批 12000 字符上限，先预留每批真实案例和轮次的结构，再按实际案例记录数分配剩余正文额度。含多个案例的批次得到相应更多额度。分配结果在预检中逐批封存，并按投递证据哈希绑定；它不改变原轨迹、字段投递或 Gate 判据。
+
 ## 独立运行
 
 以下参数均需指向现场已核验的目录。`SOURCE_ROOT` 是本版本源码，`FROZEN_ROOT` 与 `STATE_ROOT` 是冻结运行和原生状态目录，`CAMPAIGN_INDEX` 是保留 campaign 索引。`TRIAL_ROOT` 与 `GATE_ROOT` 必须在冻结资产目录之外。
@@ -29,6 +31,8 @@ python "$SOURCE_ROOT/scripts/run_analysis_successor_v11.py" preflight \
 ```
 
 只有 `preflight.json` 的 `status` 为 `ready`，且源码、输入、模型与剩余额度一致，才将 action 改为 `run`。预检根据实际批数 B 预留 `2B+3` 次请求；多 campaign 的总额为实际预留之和。Reviser 固定 seed 137、temperature 0、8192 输出 tokens、关闭 thinking、128000 输入字节和 72000 字符上限，transport retries 为 0。
+
+针对已观察到的失败槽位，可用 `--slots object_abs_distance/g1m0` 从原先固定代表组中选择子集；该参数不重新挑选 campaign，也不减少该 campaign 的完整 12 条学习轨迹。子集结果按实际分母报告。
 
 修订完成且 `revision_final.json` 含静态有效候选后，先通过原生工作区 preparer 建立独立 Gate 工作区，再执行：
 

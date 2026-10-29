@@ -6,7 +6,7 @@ from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 import pytest
 
 from skill3d.evolution.trajectory_analysis_v11 import (
-    ANALYSIS_PROTOCOL, TrajectoryAnalyst, analysis_field_budget,
+    ANALYSIS_PROTOCOL, TrajectoryAnalyst, allocate_analysis_chars, analysis_field_budget,
     compact_batch, plan_analysis_evidence, project_printed_objects, validate_analysis,
 )
 from skill3d.evolution.revision_edits_v11 import EditProtocolError, RevisionBudget, digest
@@ -192,6 +192,34 @@ def test_field_budget_reserves_host_rounds_and_every_case():
         forbidden_ids=set(), max_chars=3500)["records"]) == 8
     with pytest.raises(RevisionOperationalError, match="insufficient prose"):
         analysis_field_budget(refs, 100)
+
+
+def test_dense_batch_gets_prose_per_case_without_increasing_total_budget(tmp_path):
+    refs = [{0: {0}}] * 26 + [{0: {0}, 1: {1}}] + [{1: {1}}] * 5
+    limits = allocate_analysis_chars(refs)
+    assert sum(limits) == 42000 and max(limits) <= 12000
+    dense_limit = analysis_field_budget(refs[26], limits[26])
+    assert dense_limit > analysis_field_budget(refs[26], 42000 // len(refs))
+    assert abs(dense_limit - analysis_field_budget(refs[0], limits[0])) <= 1
+    value = analysis()
+    value["records"] = [
+        {"case_index": index,
+         **{key: "x" * dense_limit for key in (
+             "observed_facts", "failure_hypothesis", "supported_skill_change", "uncertainty")}}
+        for index in refs[26]]
+    assert len(validate_analysis(value, expected_cases=refs[26],
+        batch_sha256="batch", cases=[], forbidden_ids=set(), max_chars=limits[26])["records"]) == 2
+    capped = allocate_analysis_chars([{0: {0}}, {i: {0} for i in range(8)}])
+    assert capped == [12000, 12000]
+    with pytest.raises(RevisionOperationalError, match="schemas exceed"):
+        allocate_analysis_chars(refs, total_chars=100)
+    analyst = TrajectoryAnalyst(output_root=tmp_path, client=None,
+        budget=RevisionBudget(max_requests=2, repair_reserve=0),
+        method_context_max_chars=12000, expected_model="qwen3.8-flash")
+    analyst.analysis_batch_chars = {digest("dense"): limits[26]}
+    assert analyst._analysis_limit("dense") == limits[26]
+    with pytest.raises(RevisionOperationalError, match="budget identity mismatch"):
+        analyst._analysis_limit("changed")
 
 
 @pytest.mark.parametrize("replay_valid", [True, False])

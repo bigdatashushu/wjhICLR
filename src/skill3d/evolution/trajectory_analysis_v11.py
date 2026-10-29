@@ -241,13 +241,55 @@ def batch_case_rounds(text: str) -> dict[int, set[int]]:
     return result
 
 
-def analysis_field_budget(expected_cases: Mapping[int, set[int]], max_chars: int) -> int:
-    """Reserve JSON and host-bound references before allocating prose fields."""
-    rows = [
+def _analysis_schema(expected_cases: Mapping[int, set[int]]) -> list[dict]:
+    return [
         {"case_index": index, "round_indices": sorted(rounds),
          **{key: "" for key in (
              "observed_facts", "failure_hypothesis", "supported_skill_change", "uncertainty")}}
         for index, rounds in sorted(expected_cases.items())]
+
+
+def allocate_analysis_chars(batch_refs: Sequence[Mapping[int, set[int]]], *,
+                            total_chars: int = 42000, max_batch_chars: int = 12000) -> list[int]:
+    """Reserve each schema, then share the same prose pool across case records."""
+    if not batch_refs or any(not refs for refs in batch_refs):
+        raise RevisionOperationalError("analysis budget needs nonempty batch references")
+    overheads = [
+        len(json.dumps(_analysis_schema(refs), ensure_ascii=False, sort_keys=True))
+        for refs in batch_refs]
+    if max(overheads) >= max_batch_chars or sum(overheads) >= total_chars:
+        raise RevisionOperationalError("analysis schemas exceed aggregate budget")
+    limits = list(overheads)
+    weights = [len(refs) for refs in batch_refs]
+    remaining = min(total_chars, max_batch_chars * len(limits)) - sum(limits)
+    active = set(range(len(limits)))
+    while remaining and active:
+        weight_sum = sum(weights[i] for i in active)
+        capped = [
+            i for i in sorted(active)
+            if remaining * weights[i] >= (max_batch_chars - limits[i]) * weight_sum]
+        if capped:
+            for i in capped:
+                remaining -= max_batch_chars - limits[i]
+                limits[i] = max_batch_chars
+                active.remove(i)
+            continue
+        additions = {i: remaining * weights[i] // weight_sum for i in active}
+        residue = remaining - sum(additions.values())
+        order = sorted(active, key=lambda i: (-(remaining * weights[i] % weight_sum), i))
+        for i in order[:residue]:
+            additions[i] += 1
+        for i, amount in additions.items():
+            limits[i] += amount
+        remaining = 0
+    for refs, limit in zip(batch_refs, limits):
+        analysis_field_budget(refs, limit)
+    return limits
+
+
+def analysis_field_budget(expected_cases: Mapping[int, set[int]], max_chars: int) -> int:
+    """Reserve JSON and host-bound references before allocating prose fields."""
+    rows = _analysis_schema(expected_cases)
     overhead = len(json.dumps(rows, ensure_ascii=False, sort_keys=True))
     allowance = (max_chars - overhead) // max(1, 4 * len(rows))
     if allowance < 16:
@@ -297,10 +339,20 @@ def validate_analysis(value, *, expected_cases: Mapping[int, set[int]], batch_sh
 class TrajectoryAnalyst(AnchoredSlotReviser):
     """Read all evidence batches without modifying the Skill between batches."""
 
+    def _analysis_limit(self, evidence):
+        budgets = getattr(self, "analysis_batch_chars", None)
+        if budgets is None:
+            return getattr(self, "analysis_chars", 18000)
+        try:
+            return budgets[digest(evidence)]
+        except KeyError:
+            raise RevisionOperationalError("analysis batch budget identity mismatch") from None
+
     def _prompt(self, *, parent, working, feedback, evidence, coverage, repair=None):
         refs = batch_case_rounds(evidence) if evidence else {}
+        limit = self._analysis_limit(evidence)
         field_budget = analysis_field_budget(
-            refs, getattr(self, "analysis_chars", 18000)) if refs else 1400
+            refs, limit) if refs else 1400
         catalog = _tool_docs(parent.question_type, parent.evidence_state)
         return (
             f"Offline learning-trajectory analysis. Protocol {ANALYSIS_PROTOCOL}. Strict JSON.\n"
@@ -328,7 +380,7 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
             f"Keep each of the four text fields within {field_budget} characters. "
             "Use an empty string where a field has no supported content; all four fields "
             "must be strings, never arrays, objects or null. "
-            f"Keep the total records JSON within {getattr(self, 'analysis_chars', 18000)} characters. "
+            f"Keep the total records JSON within {limit} characters. "
             "Omit round_indices from the response. The host binds each record to all rounds "
             "actually supplied for that case in this request. Analyze all supplied rounds; "
             "fragments retain original indices. "
@@ -370,7 +422,7 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
                 normalized = validate_analysis(
                     value, expected_cases=refs, batch_sha256=digest(batch),
                     cases=cases, forbidden_ids=forbidden_ids,
-                    max_chars=getattr(self, "analysis_chars", 18000))
+                    max_chars=self._analysis_limit(batch))
                 analyses[index] = normalized
                 pending.pop(index, None)
                 row = {"batch": index, "phase": phase, "request": self.requests,
@@ -396,7 +448,7 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
                     "code": str(exc), "instruction": guidance.get(
                         str(exc), "Regenerate valid JSON with the exact supplied references."),
                     "max_chars_per_text_field": analysis_field_budget(
-                        refs, getattr(self, "analysis_chars", 18000))}
+                        refs, self._analysis_limit(batch))}
             checks.append(row)
             _write_create_once(self.root / f"coverage_request_{self.requests:02d}.json", {
                 "batch_sha256": digest(batch), "phase": phase,

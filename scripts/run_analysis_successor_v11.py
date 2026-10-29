@@ -41,19 +41,26 @@ def source_identity(args):
 def selections(args, helper):
     if args.selection == "pilot":
         by_id = {row["campaign_id"]: row for row in tools.catalog_specs(args, helper)}
-        return [by_id[name] for name in PILOT]
-    raw = tools.read(args.campaign_index)["campaigns"]
-    by_slot = {}
-    for row in raw:
-        by_slot.setdefault(row["slot_key"], []).append(row)
-    selected = []
-    for slot, rows in sorted(by_slot.items()):
-        rows = sorted(rows, key=lambda row: (
-            row["refusal_facts"].get("needed_batches",
-                row["refusal_facts"].get("completed_batch_count", 0) + 1), row["campaign_id"]))
-        selected.append(rows[(len(rows)-1)//2]["campaign_id"])
-    by_id = {row["campaign_id"]: row for row in tools.catalog_specs(args, helper)}
-    return [by_id[name] for name in selected]
+        selected = [by_id[name] for name in PILOT]
+    else:
+        raw = tools.read(args.campaign_index)["campaigns"]
+        by_slot = {}
+        for row in raw:
+            by_slot.setdefault(row["slot_key"], []).append(row)
+        names = []
+        for slot, rows in sorted(by_slot.items()):
+            rows = sorted(rows, key=lambda row: (
+                row["refusal_facts"].get("needed_batches",
+                    row["refusal_facts"].get("completed_batch_count", 0) + 1), row["campaign_id"]))
+            names.append(rows[(len(rows)-1)//2]["campaign_id"])
+        by_id = {row["campaign_id"]: row for row in tools.catalog_specs(args, helper)}
+        selected = [by_id[name] for name in names]
+    slots = getattr(args, "slots", None)
+    if slots:
+        if len(slots) != len(set(slots)) or set(slots) - {r["slot_key"] for r in selected}:
+            raise RuntimeError("requested slots are not unique members of the fixed selection")
+        selected = [r for r in selected if r["slot_key"] in slots]
+    return selected
 
 
 def compact_feedback(feedback):
@@ -105,7 +112,10 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
         native, analyst=analyst, parent=parent, feedback=feedback,
         experience=experience, on_fragment_refusal=planning_refusal)
     compact = [analysis.compact_batch(batch) for batch in batches]
-    analyst.analysis_chars = min(12000, 42000 // len(batches))
+    caps = analysis.allocate_analysis_chars(
+        [analysis.batch_case_rounds(batch) for batch, _ in compact])
+    analyst.analysis_batch_chars = {
+        analysis.digest(batch): cap for (batch, _), cap in zip(compact, caps)}
     checked = [analyst._check_size(analyst._prompt(parent=parent, working=parent.skill_md,
                     feedback=feedback, evidence=batch, coverage={})) for batch, _ in compact]
     metadata = {
@@ -114,7 +124,9 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
         "parent_sha256": parent.content_sha256,
         "native_plan": plan, "projection_receipts": [r for _,r in compact],
         "analysis_request_sizes": checked, "batch_count": len(batches),
-        "analysis_chars_per_batch": analyst.analysis_chars,
+        "analysis_chars_per_batch": caps,
+        "analysis_budget_policy": "schema-reserved-prose-per-case/1",
+        "total_analysis_chars": sum(caps),
         "analysis_request_cap": 2 * len(batches), "revision_request_cap": 3,
         "total_request_cap": 2 * len(batches) + 3,
     }
@@ -143,6 +155,7 @@ def preflight(args):
         "protected_inputs":before, "model_identity":client.audit_identity(seed=137),
         "model_requests":0, "total_reviser_request_cap":cap,
         "gate_request_cap":args.gate_request_cap, "selection":args.selection,
+        "selection_slots": getattr(args, "slots", None),
         "gate_feedback_visible_to_reviser":False, "publication_authorized":False})
     return {"status":"ready", "model_requests":0, "reviser_cap":cap,
             "cohort":[{"slot":r["slot_key"],"campaign":r["campaign_id"],
@@ -181,7 +194,11 @@ def run(args):
             budget=budget_type(max_requests=selection["analysis_request_cap"],repair_reserve=0),
             method_context_max_chars=config["base"].retrieval_policy.method_context_max_chars,
             expected_model="qwen3.8-flash")
-        analyst.analysis_chars = selection["analysis_chars_per_batch"]
+        caps = selection["analysis_chars_per_batch"]
+        if len(caps) != len(batches):
+            raise RuntimeError("analysis batch budget count changed")
+        analyst.analysis_batch_chars = {
+            analysis.digest(batch): cap for batch, cap in zip(batches, caps)}
         try:
             summaries = analyst.analyze(parent=parent,feedback=feedback,batches=batches,
                 cases=experience.cases,forbidden_ids=forbidden)
@@ -235,6 +252,7 @@ def main():
     for name in ("frozen-root","state-root","source-root","output","campaign-index"):
         p.add_argument("--"+name,type=Path,required=True)
     p.add_argument("--selection",choices=("pilot","cohort"),default="pilot")
+    p.add_argument("--slots", nargs="+")
     p.add_argument("--reviser-request-cap",type=int,default=1536)
     p.add_argument("--gate-request-cap",type=int,default=4096)
     args=p.parse_args()
