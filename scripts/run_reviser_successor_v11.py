@@ -88,10 +88,29 @@ def setup(args):
     return helper, config, client, history, editor.AnchoredSlotReviser, editor.RevisionBudget
 
 
+def learning_bytes(history, path):
+    """Use the native verified disk lease for members above its read cap."""
+    cold = getattr(history, "_cold_history", None)
+    if cold is None:
+        return history.read_history_bytes(path)
+    record = history.cold_reference(path)
+    if record is None or record.size <= cold.max_read_bytes:
+        return history.read_history_bytes(path)
+    if record.size > 256 * 1024 * 1024:
+        raise RuntimeError("learning bundle exceeds independent host memory allowance")
+    with cold.materialize(record.ref) as materialized:
+        with Path(materialized).open("rb") as stream:
+            raw = stream.read(record.size + 1)
+        if (len(raw) != record.size
+                or hashlib.sha256(raw).hexdigest() != record.sha256):
+            raise RuntimeError("materialized learning bundle identity changed")
+        return raw
+
+
 def inputs(args, helper, history, selection):
     from skill3d.schemas import SkillSpecV11, V11ExperienceBundle
     _, paths = helper.campaign_inputs(args.state_root, selection)
-    raw = history.read_history_bytes(paths["experience"])
+    raw = learning_bytes(history, paths["experience"])
     experience = V11ExperienceBundle.model_validate_json(raw)
     request = read(paths["request"])
     parent = SkillSpecV11.model_validate(request["parent"])
