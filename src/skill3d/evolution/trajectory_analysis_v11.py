@@ -58,14 +58,14 @@ def project_printed_objects(text: str) -> tuple[object, dict]:
                 value = ast.literal_eval(line[start:end].strip())
             except (ValueError, SyntaxError, RecursionError, MemoryError):
                 continue
-            candidates = value if isinstance(value, list) else [value]
+            candidates = value if isinstance(value, (list, tuple)) else [value]
             if not candidates or not all(
                     isinstance(obj, dict) and isinstance(obj.get("obj_id"), str)
                     and obj["obj_id"] for obj in candidates):
                 continue
             projected = [object_view(obj) for obj in candidates]
-            lines.append({"prefix": line[:start],
-                          "object_values": projected if isinstance(value, list) else projected[0],
+            lines.append({"prefix": line[:start], "literal_type": type(value).__name__,
+                          "object_values": projected if isinstance(value, (list, tuple)) else projected[0],
                           "suffix": line[end:]})
             count += 1
             objects += len(candidates)

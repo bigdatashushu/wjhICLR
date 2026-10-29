@@ -102,3 +102,9 @@ def test_labeled_stdout_objects_drop_only_native_audit_fields(monkeypatch):
     # An unknown printed value is neither normalized nor evaluated.
     ambiguous = "object = {'obj_id': 'a', 'value': calculate()}\n"
     assert project_printed_objects(ambiguous)[0] == ambiguous
+    pair = "pair " + repr(obj) + ", " + repr(obj) + " distance 2.7\n"
+    value, receipt = project_printed_objects(pair)
+    assert receipt["projected_objects"] == 2
+    assert value["lines"][0]["literal_type"] == "tuple"
+    assert value["lines"][0]["object_values"] == [kept, kept]
+    assert value["lines"][0]["suffix"] == " distance 2.7\n"
