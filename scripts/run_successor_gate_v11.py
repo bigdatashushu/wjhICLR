@@ -215,8 +215,10 @@ def setup(args):
     coordinator.deployment_continuation = coordinator._continuation = None
     coordinator.cached_prefix_recovery = coordinator._cached_prefix_spec = None
     coordinator._request_governor_root = args.output / "request_governor"
+    request_cap = min(ready["gate_request_cap"],
+                      getattr(args, "request_cap", None) or ready["gate_request_cap"])
     coordinator.request_governor_config = RequestGovernorConfig(
-        max_requests=ready["gate_request_cap"], max_inflight=1, requests_per_second=0.0)
+        max_requests=request_cap, max_inflight=1, requests_per_second=0.0)
     coordinator._episode_semaphore = None
     coordinator.workers = coordinator.episode_concurrency = 1
     coordinator.run_identity = content_sha256({
@@ -246,7 +248,7 @@ def preflight(args):
     plans, outputs = {}, []
 
     def collect(coordinator, episodes):
-        if len(plans) + len(episodes) > revision_ready["gate_request_cap"]:
+        if len(plans) + len(episodes) > runner.request_governor_config.max_requests:
             raise GateAbort("gate_minimum_request_budget")
         pairs = {}
         for arm, variant in episodes:
@@ -294,7 +296,7 @@ def preflight(args):
         "model_identity": revision_ready["model_identity"],
         "solver_config": {key: val for key, val in asdict(runner.base_cfg).items()
                           if key in {"seed", "temperature", "max_tokens", "max_rounds"}},
-        "request_cap": revision_ready["gate_request_cap"], "per_episode_request_cap": 64,
+        "request_cap": runner.request_governor_config.max_requests, "per_episode_request_cap": 64,
         "max_inflight": 1, "transport_retries": 0,
         "executor": "frozen_native_SystemVariantRunner_without_original_receipt_writer",
         "validation_labels_hidden_during_execution": True, "published": False,
@@ -314,6 +316,8 @@ def run(args):
     service = __import__("storage_scaleup_service_ops").facade()
     service.load_service_environment()
     tools, runner, worker, candidates, revision_ready = setup(args)
+    if runner.request_governor_config.max_requests != ready["request_cap"]:
+        raise GateAbort("gate_request_allowance_changed")
     if (args.output / "startup.json").exists():
         raise GateAbort("gate_existing_startup_no_automatic_resume")
     runner.framework_state_io.write_json_once(
@@ -374,7 +378,10 @@ def main():
     parser.add_argument("action", choices=("preflight", "run"))
     for name in ("frozen-root", "state-root", "revision-root", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--request-cap", type=int)
     args = parser.parse_args()
+    if args.request_cap is not None and args.request_cap <= 0:
+        raise SystemExit("remaining Gate allowance must be positive")
     if args.output.is_relative_to(args.frozen_root) or args.output.is_relative_to(args.state_root):
         raise SystemExit("Gate must be outside frozen assets")
     try:

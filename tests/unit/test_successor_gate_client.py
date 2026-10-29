@@ -83,7 +83,8 @@ def test_complete_zero_request_preflight_seals_workspace_binding(tmp_path, monke
         def write_json_once(self, path, value):
             Path(path).write_text(json.dumps(value))
 
-    runner = SimpleNamespace(base_cfg=SolverConfig(), framework_state_io=Writer())
+    runner = SimpleNamespace(base_cfg=SolverConfig(), framework_state_io=Writer(),
+                             request_governor_config=SimpleNamespace(max_requests=40))
 
     class Arm:
         label_metadata = {}
@@ -125,6 +126,7 @@ def test_complete_zero_request_preflight_seals_workspace_binding(tmp_path, monke
     receipt = json.loads((tmp_path / "preflight.json").read_text())
     assert result["model_requests"] == 0 and result["planned_episodes"] == 2
     assert receipt["framework_workspace_binding"] == binding
+    assert receipt["request_cap"] == 40
     assert receipt["validation_labels_hidden_during_execution"]
     assert receipt["admission_policy_source_identity"] == gate.identity(gate.ADMISSION_POLICY_PATH)
 
