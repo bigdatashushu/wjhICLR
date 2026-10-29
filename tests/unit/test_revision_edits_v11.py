@@ -118,6 +118,49 @@ def test_repeated_unapplied_edit_stops_before_spending_all_repairs(tmp_path):
     assert json.loads((tmp_path / "final.json").read_text())["status"] == "static_rejected"
 
 
+def test_distinct_invalid_anchors_are_not_reported_as_duplicate(tmp_path):
+    p = parent()
+    outputs = iter([
+        proposal(p.skill_md, "first nonexistent source", "new rule"),
+        proposal(p.skill_md, "second nonexistent source", "new rule"),
+        {"protocol": PROTOCOL, "base_sha256": digest(p.skill_md), "action": "no_change",
+         "modification_reason": "The current method remains adequate."},
+    ])
+    client = Client(lambda _: json.dumps(next(outputs)))
+    reviser = AnchoredSlotReviser(output_root=tmp_path, client=client,
+               budget=RevisionBudget(), method_context_max_chars=8000, expected_model="test-model")
+    assert reviser.run(parent=p, feedback={}, batches=["facts"], delivery_plan={},
+                       forbidden_ids=set(), cases=[]) is None
+    final = json.loads((tmp_path / "final.json").read_text())
+    assert client.calls == 3 and final["status"] == "no_change"
+    assert not any(check.get("duplicate") for check in final["checks"])
+
+
+def test_static_repair_keeps_host_error_code_and_numeric_location(tmp_path, monkeypatch):
+    from skill3d.evolution import revision_edits_v11 as module
+    p = parent()
+    before = p.skill_md.splitlines()[-1]
+    response = proposal(p.skill_md, before, before + " Preserve supported observations.")
+    received = []
+
+    def respond(messages):
+        received.append(messages[-1]["content"])
+        if len(received) == 1:
+            return json.dumps(response)
+        return json.dumps({"protocol": PROTOCOL, "base_sha256": digest(p.skill_md),
+                           "action": "no_change", "modification_reason": "Keep the valid parent."})
+
+    monkeypatch.setattr(module, "_static_validate", lambda **kw:
+        (None, ["execution_contract_conflict: line=7; rule=forbidden_io"]))
+    client = Client(respond)
+    reviser = AnchoredSlotReviser(output_root=tmp_path, client=client,
+               budget=RevisionBudget(), method_context_max_chars=8000, expected_model="test-model")
+    reviser.run(parent=p, feedback={}, batches=["facts"], delivery_plan={},
+                forbidden_ids=set(), cases=[])
+    assert '"code": "execution_contract_conflict"' in received[1]
+    assert '"line": 7' in received[1] and '"rule": "forbidden_io"' in received[1]
+
+
 def test_response_identity_failure_is_operational_and_never_repaired(tmp_path):
     p = parent()
     client = Client(lambda _: "{}")

@@ -13,7 +13,7 @@ import re
 from typing import Mapping, Sequence
 
 from skill3d.evolution.fitset_revision_v11 import (
-    RevisionOperationalError, _static_validate, _tool_docs, _write_create_once,
+    RevisionOperationalError, _safe_static_feedback, _static_validate, _tool_docs, _write_create_once,
     _write_text_create_once,
 )
 from skill3d.evolution.revision_input_v11 import (
@@ -312,6 +312,8 @@ class AnchoredSlotReviser:
                 candidate_text = working
                 edit_audit = []
                 problems = []
+                feedback_errors = []
+                value = None
                 try:
                     value = self._request(prompt, batch_index=index)
                     candidate_text, edit_audit = apply_edits(working, value)
@@ -322,10 +324,12 @@ class AnchoredSlotReviser:
                     candidate, static_problems = _static_validate(
                         parent=parent, candidate_text=candidate_text,
                         forbidden_sample_ids=forbidden_ids, method_context_max_chars=self.method_limit)
-                    problems = sorted({problem.split(":")[0] if re.match(r"^[a-z_]+:", problem)
-                                       else "static_method_invalid" for problem in static_problems})
+                    feedback_errors = _safe_static_feedback(
+                        static_problems, candidate=candidate, max_chars=self.method_limit)
+                    problems = sorted({row["code"] for row in feedback_errors})
                     if candidate_sample_copy_leaks(candidate_text, cases):
                         problems.append("sample_content_copy")
+                        feedback_errors.append({"code": "sample_content_copy"})
                     if not problems and candidate is not None:
                         working = candidate.skill_md
                         last_candidate = candidate
@@ -335,7 +339,15 @@ class AnchoredSlotReviser:
                         break
                 except EditProtocolError as exc:
                     problems = [str(exc)]
-                rejection = digest(json.dumps({"text": candidate_text, "codes": problems}, sort_keys=True))
+                    feedback_errors = [{"code": str(exc)}]
+                # An unapplied protocol failure must be compared by its edit
+                # proposal, not by the unchanged working source alone.
+                unapplied = (
+                    {key: value.get(key) for key in ("protocol", "base_sha256", "action", "edits")}
+                    if value is not None and candidate_text == working else None)
+                rejection = digest(json.dumps({
+                    "text": candidate_text, "unapplied_edits": unapplied, "codes": problems,
+                }, sort_keys=True))
                 duplicate = rejection in seen_rejections
                 checks.append({"request": self.requests, "batch": index, "status": "rejected",
                                "codes": problems, "duplicate": duplicate})
@@ -348,7 +360,7 @@ class AnchoredSlotReviser:
                     return None
                 repairs_used += 1
                 repair = build_repair_context(candidate_text,
-                    [{"code": code} for code in problems], cases=cases, forbidden_ids=forbidden_ids)
+                    feedback_errors, cases=cases, forbidden_ids=forbidden_ids)
                 repair["working_base_sha256"] = digest(working)
             _write_create_once(self.root / f"coverage_{index:02d}.json", {
                 "batch_sha256": digest(batch), "working_sha256": digest(working),
