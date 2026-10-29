@@ -208,7 +208,8 @@ def run(args):
                          "all_evidence_delivered":analysis_final["all_evidence_delivered"],
                          "all_batches_resolved":False}
             else:
-                evidence = analysis.synthesis_evidence(summaries)
+                evidence = analysis.synthesis_evidence(
+                    summaries, question_type=parent.question_type)
                 editor = editor_type(output_root=root/"revision",client=client,
                     budget=budget_type(max_requests=3,repair_reserve=2),
                     method_context_max_chars=config["base"].retrieval_policy.method_context_max_chars,
