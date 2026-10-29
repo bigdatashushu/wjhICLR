@@ -6,10 +6,11 @@ from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 import pytest
 
 from skill3d.evolution.trajectory_analysis_v11 import (
-    ANALYSIS_PROTOCOL, compact_batch, plan_analysis_evidence,
-    project_printed_objects, validate_analysis,
+    ANALYSIS_PROTOCOL, TrajectoryAnalyst, analysis_field_budget,
+    compact_batch, plan_analysis_evidence, project_printed_objects, validate_analysis,
 )
-from skill3d.evolution.revision_edits_v11 import EditProtocolError
+from skill3d.evolution.revision_edits_v11 import EditProtocolError, RevisionBudget, digest
+from skill3d.evolution.fitset_revision_v11 import RevisionOperationalError
 
 
 def analysis():
@@ -174,3 +175,80 @@ def test_planner_hooks_are_isolated_from_native_instance_and_module(monkeypatch)
             on_fragment_refusal=lambda row, error: refusals.append(error))
     assert refusals == [{"code": "field_refusal", "facts": {"template_chars": 17}}]
     assert vars(native) == saved
+
+
+def test_field_budget_reserves_host_rounds_and_every_case():
+    refs = {i: set(range(15)) for i in range(8)}
+    limit = analysis_field_budget(refs, 3500)
+    value = analysis()
+    value["records"] = []
+    for index, rounds in refs.items():
+        value["records"].append({
+            "case_index": index, "round_indices": sorted(rounds),
+            **{key: "x" * limit for key in (
+                "observed_facts", "failure_hypothesis", "supported_skill_change", "uncertainty")}})
+    assert len(validate_analysis(
+        value, expected_cases=refs, batch_sha256="batch", cases=[],
+        forbidden_ids=set(), max_chars=3500)["records"]) == 8
+    with pytest.raises(RevisionOperationalError, match="insufficient prose"):
+        analysis_field_budget(refs, 100)
+
+
+@pytest.mark.parametrize("replay_valid", [True, False])
+def test_analysis_delivers_all_before_replay_and_requires_every_resolution(
+        tmp_path, monkeypatch, replay_valid):
+    import skill3d.evolution.trajectory_analysis_v11 as module
+    monkeypatch.setattr(module, "batch_case_rounds", lambda batch: {0: {0, 1}})
+    analyst = TrajectoryAnalyst(output_root=tmp_path, client=None,
+        budget=RevisionBudget(max_requests=4, repair_reserve=0),
+        method_context_max_chars=12000, expected_model="qwen3.8-flash")
+    analyst._prompt = lambda **kwargs: kwargs["evidence"]
+    calls = []
+
+    def request(prompt, *, batch_index):
+        analyst.requests += 1
+        calls.append(batch_index)
+        if batch_index == 0 and (len(calls) == 1 or not replay_valid):
+            raise EditProtocolError("analysis_text_budget")
+        value = analysis()
+        value["batch_sha256"] = digest(prompt)
+        return value
+
+    analyst._request = request
+    summaries = analyst.analyze(parent=SimpleNamespace(skill_md="parent"),
+        feedback={}, batches=["first", "second"], cases=[], forbidden_ids=set())
+    assert calls == [0, 1, 0]
+    final = json.loads((tmp_path / "analysis_final.json").read_text())
+    assert final["all_evidence_delivered"] and final["delivered_batch_indices"] == [0, 1]
+    assert final["all_batches_resolved"] == replay_valid
+    assert (summaries is not None) == replay_valid
+    if replay_valid:
+        assert [a["batch_sha256"] for a in summaries] == [digest("first"), digest("second")]
+    else:
+        assert final["unresolved_batch_indices"] == [0]
+    assert "observed_facts" not in (tmp_path / "analysis_final.json").read_text()
+
+
+def test_analysis_operational_stop_never_replays_or_invents_delivery(tmp_path, monkeypatch):
+    import skill3d.evolution.trajectory_analysis_v11 as module
+    monkeypatch.setattr(module, "batch_case_rounds", lambda batch: {0: {0, 1}})
+    analyst = TrajectoryAnalyst(output_root=tmp_path, client=None,
+        budget=RevisionBudget(max_requests=4, repair_reserve=0),
+        method_context_max_chars=12000, expected_model="qwen3.8-flash")
+    analyst._prompt = lambda **kwargs: kwargs["evidence"]
+    calls = []
+
+    def request(prompt, *, batch_index):
+        analyst.requests += 1
+        calls.append(batch_index)
+        if batch_index == 0:
+            raise EditProtocolError("analysis_text_budget")
+        raise RevisionOperationalError("service stopped")
+
+    analyst._request = request
+    with pytest.raises(RevisionOperationalError, match="service stopped"):
+        analyst.analyze(parent=SimpleNamespace(skill_md="parent"), feedback={},
+                        batches=["first", "second"], cases=[], forbidden_ids=set())
+    assert calls == [0, 1]
+    assert not (tmp_path / "analysis_final.json").exists()
+    assert not (tmp_path / "coverage_request_02.json").exists()

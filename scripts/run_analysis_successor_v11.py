@@ -186,7 +186,9 @@ def run(args):
             summaries = analyst.analyze(parent=parent,feedback=feedback,batches=batches,
                 cases=experience.cases,forbidden_ids=forbidden)
             if summaries is None:
-                final = {"status":"analysis_rejected","all_evidence_delivered":False,
+                analysis_final = tools.read(root/"analysis/analysis_final.json")
+                final = {"status":"analysis_rejected",
+                         "all_evidence_delivered":analysis_final["all_evidence_delivered"],
                          "all_batches_resolved":False}
             else:
                 evidence = analysis.synthesis_evidence(summaries)

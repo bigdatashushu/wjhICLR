@@ -241,6 +241,21 @@ def batch_case_rounds(text: str) -> dict[int, set[int]]:
     return result
 
 
+def analysis_field_budget(expected_cases: Mapping[int, set[int]], max_chars: int) -> int:
+    """Reserve JSON and host-bound references before allocating prose fields."""
+    rows = [
+        {"case_index": index, "round_indices": sorted(rounds),
+         **{key: "" for key in (
+             "observed_facts", "failure_hypothesis", "supported_skill_change", "uncertainty")}}
+        for index, rounds in sorted(expected_cases.items())]
+    overhead = len(json.dumps(rows, ensure_ascii=False, sort_keys=True))
+    allowance = (max_chars - overhead) // max(1, 4 * len(rows))
+    if allowance < 16:
+        raise RevisionOperationalError("analysis schema leaves insufficient prose budget")
+    # Reserve escaping and punctuation overhead; the final aggregate check stays.
+    return min(1400, max(16, allowance * 4 // 5))
+
+
 def validate_analysis(value, *, expected_cases: Mapping[int, set[int]], batch_sha256: str,
                       cases: Sequence, forbidden_ids: set[str], max_chars: int = 18000) -> dict:
     if value.get("protocol") != ANALYSIS_PROTOCOL or value.get("batch_sha256") != batch_sha256:
@@ -284,6 +299,8 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
 
     def _prompt(self, *, parent, working, feedback, evidence, coverage, repair=None):
         refs = batch_case_rounds(evidence) if evidence else {}
+        field_budget = analysis_field_budget(
+            refs, getattr(self, "analysis_chars", 18000)) if refs else 1400
         catalog = _tool_docs(parent.question_type, parent.evidence_state)
         return (
             f"Offline learning-trajectory analysis. Protocol {ANALYSIS_PROTOCOL}. Strict JSON.\n"
@@ -308,7 +325,9 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
             "Exactly one record per supplied case_index, including cases without a proposed change. "
             "Each record has case_index, "
             "observed_facts, failure_hypothesis, supported_skill_change, uncertainty. "
-            "Keep each text field within 1400 characters. "
+            f"Keep each of the four text fields within {field_budget} characters. "
+            "Use an empty string where a field has no supported content; all four fields "
+            "must be strings, never arrays, objects or null. "
             f"Keep the total records JSON within {getattr(self, 'analysis_chars', 18000)} characters. "
             "Omit round_indices from the response. The host binds each record to all rounds "
             "actually supplied for that case in this request. Analyze all supplied rounds; "
@@ -338,45 +357,68 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
         )
 
     def analyze(self, *, parent, feedback, batches, cases, forbidden_ids):
-        analyses, checks = [], []
-        for index, batch in enumerate(batches):
-            repair = None
-            for attempt in range(2):
-                try:
-                    value = self._request(self._prompt(parent=parent, working=parent.skill_md,
-                        feedback=feedback, evidence=batch, coverage={}, repair=repair),
-                        batch_index=index)
-                    normalized = validate_analysis(value, expected_cases=batch_case_rounds(batch),
-                        batch_sha256=digest(batch), cases=cases, forbidden_ids=forbidden_ids,
-                        max_chars=getattr(self, "analysis_chars", 18000))
-                    analyses.append(normalized)
-                    checks.append({"batch": index, "request": self.requests, "status": "analyzed",
-                        "analysis_sha256": digest(json.dumps(normalized, sort_keys=True)),
-                        "case_count": len(normalized["records"])})
-                    break
-                except EditProtocolError as exc:
-                    checks.append({"batch": index, "request": self.requests, "status": "rejected",
-                                   "code": str(exc)})
-                    guidance = {
-                        "analysis_text_budget": "Shorten all four text fields; retain every source reference.",
-                        "analysis_answer_assignment": "Describe program output handling without assignment syntax or answer values.",
-                        "analysis_sample_identifier": "Remove identifiers and refer only to the supplied numeric case_index and round_indices.",
-                        "analysis_sample_copy": "Replace copied question, option or reference-answer wording with abstract process observations.",
-                        "analysis_round_reference_invalid": "Omit round_indices; the host attaches the exact input rounds to each case record.",
-                    }
-                    repair = {"code": str(exc), "instruction": guidance.get(
-                        str(exc), "Regenerate valid JSON with the exact supplied references.")}
-            else:
-                _write_create_once(self.root / "analysis_final.json", {
-                    "status": "analysis_rejected", "checks": checks,
-                    "all_evidence_delivered": False, "model_requests": self.requests})
-                return None
-            _write_create_once(self.root / f"analysis_{index:02d}.json", checks[-1])
+        analyses, checks, pending, delivered = {}, [], {}, set()
+
+        def exchange(index, phase, repair=None):
+            batch = batches[index]
+            refs = batch_case_rounds(batch)
+            try:
+                value = self._request(self._prompt(
+                    parent=parent, working=parent.skill_md, feedback=feedback,
+                    evidence=batch, coverage={}, repair=repair), batch_index=index)
+                delivered.add(index)
+                normalized = validate_analysis(
+                    value, expected_cases=refs, batch_sha256=digest(batch),
+                    cases=cases, forbidden_ids=forbidden_ids,
+                    max_chars=getattr(self, "analysis_chars", 18000))
+                analyses[index] = normalized
+                pending.pop(index, None)
+                row = {"batch": index, "phase": phase, "request": self.requests,
+                       "status": "analyzed",
+                       "analysis_sha256": digest(json.dumps(normalized, sort_keys=True)),
+                       "case_count": len(normalized["records"])}
+                _write_create_once(self.root / f"analysis_{index:02d}.json", row)
+            except EditProtocolError as exc:
+                # A malformed response still received the complete evidence.
+                # Service and identity errors escape without creating coverage.
+                delivered.add(index)
+                row = {"batch": index, "phase": phase, "request": self.requests,
+                       "status": "rejected", "code": str(exc)}
+                guidance = {
+                    "analysis_text_budget": "Shorten every prose field to its supplied per-field limit; retain every case reference.",
+                    "analysis_text_invalid": "Provide all four text fields as strings within the supplied limit; use empty strings for unsupported content.",
+                    "analysis_answer_assignment": "Describe program output handling without assignment syntax or answer values.",
+                    "analysis_sample_identifier": "Remove identifiers and refer only to the supplied numeric case_index.",
+                    "analysis_sample_copy": "Replace copied question, option or reference-answer wording with abstract process observations.",
+                    "analysis_round_reference_invalid": "Omit round_indices; the host attaches the exact input rounds to each case record.",
+                }
+                pending[index] = {
+                    "code": str(exc), "instruction": guidance.get(
+                        str(exc), "Regenerate valid JSON with the exact supplied references."),
+                    "max_chars_per_text_field": analysis_field_budget(
+                        refs, getattr(self, "analysis_chars", 18000))}
+            checks.append(row)
+            _write_create_once(self.root / f"coverage_request_{self.requests:02d}.json", {
+                "batch_sha256": digest(batch), "phase": phase,
+                "delivered_batch_indices": sorted(delivered),
+                "resolved_batch_indices": sorted(analyses),
+                "unresolved_batch_indices": sorted(pending)})
+
+        if self.budget.max_requests < 2 * len(batches):
+            raise RevisionOperationalError("analysis needs complete delivery and replay reserve")
+        for index in range(len(batches)):
+            exchange(index, "delivery")
+        for index in list(pending):
+            exchange(index, "deferred_replay", pending[index])
         _write_create_once(self.root / "analysis_final.json", {
-            "status": "analysis_complete", "checks": checks,
-            "all_evidence_delivered": True, "model_requests": self.requests,
+            "status": "analysis_rejected" if pending else "analysis_complete", "checks": checks,
+            "all_evidence_delivered": len(delivered) == len(batches),
+            "all_batches_resolved": not pending, "model_requests": self.requests,
+            "delivered_batch_indices": sorted(delivered),
+            "resolved_batch_indices": sorted(analyses),
+            "unresolved_batch_indices": sorted(pending),
             "analysis_count": len(analyses), "analysis_text_persisted": False})
-        return analyses
+        return None if pending else [analyses[index] for index in range(len(batches))]
 
 
 def synthesis_evidence(analyses: Sequence[Mapping]) -> str:
