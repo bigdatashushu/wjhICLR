@@ -41,6 +41,18 @@ def test_duplicate_cases_and_question_copy_never_become_analysis():
         validate_analysis(value,**{**kwargs,"cases":[{"question_text":question}]})
 
 
+def test_repair_codes_distinguish_size_answer_syntax_and_identifiers():
+    kwargs=dict(expected_cases={0:{0,1}},batch_sha256="batch",cases=[],forbidden_ids=set())
+    with pytest.raises(EditProtocolError,match="text_budget"):
+        validate_analysis(analysis(),**kwargs,max_chars=10)
+    value=analysis(); value["records"][0]["observed_facts"]="The code emitted answer = 3."
+    with pytest.raises(EditProtocolError,match="answer_assignment"):
+        validate_analysis(value,**kwargs)
+    value=analysis(); value["records"][0]["observed_facts"]="The program repeated work on sample_abcdef."
+    with pytest.raises(EditProtocolError,match="sample_identifier"):
+        validate_analysis(value,**kwargs)
+
+
 def test_projection_retains_values_code_and_authorization_semantics(monkeypatch):
     graph=ModuleType("skill3d.evolution.evidence_graph_v11")
     graph.canonical_text=lambda v:json.dumps(v,sort_keys=True,separators=(",",":"))

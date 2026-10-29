@@ -124,9 +124,15 @@ def validate_analysis(value, *, expected_cases: Mapping[int, set[int]], batch_sh
             item[key] = text
         normalized.append(item)
     text = json.dumps(normalized, ensure_ascii=False, sort_keys=True)
-    if (len(text) > max_chars or leakage_scan_text(text, forbidden_sample_ids=forbidden_ids)
-            or candidate_sample_copy_leaks(text, cases)):
-        raise EditProtocolError("analysis_budget_or_sample_copy")
+    if len(text) > max_chars:
+        raise EditProtocolError("analysis_text_budget")
+    leaks = leakage_scan_text(text, forbidden_sample_ids=forbidden_ids)
+    if any(hit.startswith("answer_pattern:") for hit in leaks):
+        raise EditProtocolError("analysis_answer_assignment")
+    if leaks:
+        raise EditProtocolError("analysis_sample_identifier")
+    if candidate_sample_copy_leaks(text, cases):
+        raise EditProtocolError("analysis_sample_copy")
     return {"protocol": ANALYSIS_PROTOCOL, "batch_sha256": batch_sha256,
             "records": sorted(normalized, key=lambda row: row["case_index"])}
 
@@ -156,7 +162,10 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
             "List every supplied round index once in round_indices; fragments retain original indices. "
             "Use short English text. Do not copy questions, options, answers, "
             "QA/scene/sample identifiers or source file paths. Case indices are local numeric "
-            "source references. A fragmented round is incomplete: retain that uncertainty.\n"
+            "source references. Describe answer handling in prose: do not quote an answer "
+            "assignment or key-value syntax, even when discussing program behavior. "
+            "Never transcribe a question, choice or reference-answer phrase. "
+            "A fragmented round is incomplete: retain that uncertainty.\n"
             f"Slot: {parent.slot_key}\n"
             f"{ExecutionContract(self.method_limit).render()}\n"
             f"Authorized interfaces:\n{catalog}\n"
@@ -189,7 +198,14 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
                 except EditProtocolError as exc:
                     checks.append({"batch": index, "request": self.requests, "status": "rejected",
                                    "code": str(exc)})
-                    repair = {"code": str(exc)}
+                    guidance = {
+                        "analysis_text_budget": "Shorten all four text fields; retain every source reference.",
+                        "analysis_answer_assignment": "Describe program output handling without assignment syntax or answer values.",
+                        "analysis_sample_identifier": "Remove identifiers and refer only to the supplied numeric case_index and round_indices.",
+                        "analysis_sample_copy": "Replace copied question, option or reference-answer wording with abstract process observations.",
+                    }
+                    repair = {"code": str(exc), "instruction": guidance.get(
+                        str(exc), "Regenerate valid JSON with the exact supplied references.")}
             else:
                 _write_create_once(self.root / "analysis_final.json", {
                     "status": "analysis_rejected", "checks": checks,
