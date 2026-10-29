@@ -92,6 +92,15 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
     original = native._evidence_batches.__func__
     namespace = dict(original.__globals__)
     splitter = namespace["split_round_components"]
+    native_view = namespace["decision_bundle_view"]
+    stdout_receipts = []
+
+    def projected_view(raw):
+        projected, receipt = analysis.project_decision_stdout(native_view(raw))
+        stdout_receipts.append(receipt)
+        return projected
+
+    namespace["decision_bundle_view"] = projected_view
 
     def inspected_split(row, fits):
         try:
@@ -114,6 +123,7 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
         original.__name__, original.__defaults__, original.__closure__), native)
     batches, plan = native._evidence_batches(parent=parent, feedback=feedback,
                                            experience=experience, diagnosis=None)
+    plan["stdout_projection"] = stdout_receipts[0]
     compact = [analysis.compact_batch(batch) for batch in batches]
     analyst.analysis_chars = min(12000, 42000 // len(batches))
     checked = [analyst._check_size(analyst._prompt(parent=parent, working=parent.skill_md,

@@ -6,7 +6,7 @@ from types import ModuleType
 import pytest
 
 from skill3d.evolution.trajectory_analysis_v11 import (
-    ANALYSIS_PROTOCOL, compact_batch, validate_analysis,
+    ANALYSIS_PROTOCOL, compact_batch, project_printed_objects, validate_analysis,
 )
 from skill3d.evolution.revision_edits_v11 import EditProtocolError
 
@@ -80,3 +80,25 @@ def test_projection_retains_values_code_and_authorization_semantics(monkeypatch)
     assert rebuilt["case_contexts"]["0"]["case_header"]["source_split"]=="validation"
     assert rebuilt["case_contexts"]["0"]["case_header"]["learning_authorization"]=={"authorized":True}
     assert "source_ref" not in kept and receipt["all_retained_decision_values_preserved"]
+
+
+def test_labeled_stdout_objects_drop_only_native_audit_fields(monkeypatch):
+    native = ModuleType("skill3d.evolution.revision_view_v11")
+    native._candidate_facts = lambda obj: {
+        key: obj[key] for key in ("obj_id", "bbox") if key in obj}
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+    obj = {"obj_id": "a", "bbox": [0, 0, 10, 10], "distance": 2.7,
+           "allowed": False, "binding_provenance": {"audit": "x" * 1000},
+           "mask_per_frame": {"0": "/storage/a"}}
+    text = "objects " + repr([obj, obj]) + "\n" + repr(obj) + "\nunknown = None\n"
+    value, receipt = project_printed_objects(text)
+    assert receipt == {"projected_lines": 2, "projected_objects": 3}
+    kept = value["lines"][0]["object_values"][0]
+    assert kept == {"obj_id": "a", "bbox": [0, 0, 10, 10], "distance": 2.7,
+                    "allowed": False}
+    assert value["lines"][0]["prefix"] == "objects "
+    assert value["lines"][0]["suffix"] == "\n"
+    assert value["lines"][2] == {"verbatim": "unknown = None\n"}
+    # An unknown printed value is neither normalized nor evaluated.
+    ambiguous = "object = {'obj_id': 'a', 'value': calculate()}\n"
+    assert project_printed_objects(ambiguous)[0] == ambiguous

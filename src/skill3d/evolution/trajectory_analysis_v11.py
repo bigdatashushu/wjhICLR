@@ -6,6 +6,7 @@ No analysis text is written to request receipts or returned to the online solver
 """
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 from dataclasses import asdict
 import json
@@ -23,6 +24,83 @@ from skill3d.synthesis.execution_contract import ExecutionContract
 
 ANALYSIS_PROTOCOL = "v11-source-linked-trajectory-analysis/1"
 VIEW_PROTOCOL = "v11-audit-metadata-separated-view/1"
+
+
+def project_printed_objects(text: str) -> tuple[object, dict]:
+    """Project object literals in stdout without changing surrounding text.
+
+    A print can contain one object or a list, preceded by a label and followed
+    by additional facts. Only native object audit/storage fields are removed.
+    Unparsed or ambiguous lines remain verbatim.
+    """
+    from skill3d.evolution.revision_view_v11 import _candidate_facts
+    metadata = {"binding_provenance", "semantic_request_identity", "candidate_ids",
+                "mask_per_frame", "pointcloud_world", "pointconf_world"}
+    if not isinstance(text, str) or len(text) > 8_000_000:
+        return text, {"projected_lines": 0, "projected_objects": 0}
+    lines, count, objects = [], 0, 0
+
+    def object_view(obj):
+        facts = _candidate_facts(obj)
+        facts.update({key: deepcopy(value) for key, value in obj.items()
+                      if key not in metadata and key not in facts
+                      and key != "binding_validation"})
+        return facts
+
+    for line in text.splitlines(keepends=True):
+        spans = [(0, len(line.rstrip("\r\n")))]
+        for opening, closing in (("[", "]"), ("{", "}")):
+            start, end = line.find(opening), line.rfind(closing)
+            if start >= 0 and end > start:
+                spans.append((start, end + 1))
+        for start, end in dict.fromkeys(spans):
+            try:
+                value = ast.literal_eval(line[start:end].strip())
+            except (ValueError, SyntaxError, RecursionError, MemoryError):
+                continue
+            candidates = value if isinstance(value, list) else [value]
+            if not candidates or not all(
+                    isinstance(obj, dict) and isinstance(obj.get("obj_id"), str)
+                    and obj["obj_id"] for obj in candidates):
+                continue
+            projected = [object_view(obj) for obj in candidates]
+            lines.append({"prefix": line[:start],
+                          "object_values": projected if isinstance(value, list) else projected[0],
+                          "suffix": line[end:]})
+            count += 1
+            objects += len(candidates)
+            break
+        else:
+            lines.append({"verbatim": line})
+    if count == 0:
+        return text, {"projected_lines": 0, "projected_objects": 0}
+    result = {"encoding": "ordered_stdout_object_literals",
+              "lines": lines, "raw_record_retained": True,
+              "projection": "object decision values retained; native audit/storage metadata omitted"}
+    return result, {"projected_lines": count, "projected_objects": objects}
+
+
+def project_decision_stdout(view: Mapping) -> tuple[dict, dict]:
+    """Apply the same object projection to labeled and repeated print output."""
+    result = deepcopy(view)
+    source_chars = projected_chars = lines = objects = 0
+    for case in result["cases"]:
+        for row in case.get("rounds", []):
+            diagnostics = row.get("execution_diagnostics") or {}
+            stdout = diagnostics.get("stdout")
+            if not isinstance(stdout, str):
+                continue
+            projected, receipt = project_printed_objects(stdout)
+            if receipt["projected_lines"]:
+                source_chars += len(json.dumps(stdout, ensure_ascii=False))
+                projected_chars += len(json.dumps(projected, ensure_ascii=False))
+                lines += receipt["projected_lines"]
+                objects += receipt["projected_objects"]
+                diagnostics["stdout"] = projected
+    return result, {"schema": "v11-stdout-object-audit-projection/1",
+                    "projected_lines": lines, "projected_objects": objects,
+                    "source_chars": source_chars, "projected_chars": projected_chars,
+                    "raw_record_retained": True}
 
 
 def compact_batch(text: str) -> tuple[str, dict]:
