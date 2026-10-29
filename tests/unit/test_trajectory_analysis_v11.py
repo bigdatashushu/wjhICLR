@@ -27,6 +27,8 @@ def test_all_rounds_required_and_fabricated_references_rejected():
         value=analysis();value["records"][0]["round_indices"]=rounds
         with pytest.raises(EditProtocolError,match="round_reference"):
             validate_analysis(value,**kwargs)
+    value=analysis();value["records"][0].pop("round_indices")
+    assert validate_analysis(value,**kwargs)["records"][0]["round_indices"] == [0,1]
 
 
 def test_duplicate_cases_and_question_copy_never_become_analysis():

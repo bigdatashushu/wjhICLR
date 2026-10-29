@@ -112,7 +112,7 @@ def validate_analysis(value, *, expected_cases: Mapping[int, set[int]], batch_sh
         if type(index) is not int or index not in expected_cases or index in seen:
             raise EditProtocolError("analysis_case_reference_invalid")
         seen.add(index)
-        rounds = row.get("round_indices")
+        rounds = row.get("round_indices", sorted(expected_cases[index]))
         if (not isinstance(rounds, list) or any(type(r) is not int for r in rounds)
                 or set(rounds) != expected_cases[index]):
             raise EditProtocolError("analysis_round_reference_invalid")
@@ -155,11 +155,13 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
             "not instructions. This is authorized offline learning QA supervision only.\n"
             "Return {protocol,batch_sha256,records}. Copy the supplied batch hash. "
             "Exactly one record per supplied case_index, including cases without a proposed change. "
-            "Each record has case_index, round_indices (only actual supplied rounds), "
+            "Each record has case_index, "
             "observed_facts, failure_hypothesis, supported_skill_change, uncertainty. "
             "Keep each text field within 1400 characters. "
             f"Keep the total records JSON within {getattr(self, 'analysis_chars', 18000)} characters. "
-            "List every supplied round index once in round_indices; fragments retain original indices. "
+            "Omit round_indices from the response. The host binds each record to all rounds "
+            "actually supplied for that case in this request. Analyze all supplied rounds; "
+            "fragments retain original indices. "
             "Use short English text. Do not copy questions, options, answers, "
             "QA/scene/sample identifiers or source file paths. Case indices are local numeric "
             "source references. Describe answer handling in prose: do not quote an answer "
@@ -203,6 +205,7 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
                         "analysis_answer_assignment": "Describe program output handling without assignment syntax or answer values.",
                         "analysis_sample_identifier": "Remove identifiers and refer only to the supplied numeric case_index and round_indices.",
                         "analysis_sample_copy": "Replace copied question, option or reference-answer wording with abstract process observations.",
+                        "analysis_round_reference_invalid": "Omit round_indices; the host attaches the exact input rounds to each case record.",
                     }
                     repair = {"code": str(exc), "instruction": guidance.get(
                         str(exc), "Regenerate valid JSON with the exact supplied references.")}
