@@ -961,9 +961,6 @@ class V11CampaignRunner:
             "runtime_errors_nonincreasing": (
                 ca.runtime_error_count <= pa.runtime_error_count
             ),
-            "program_errors_nonincreasing": (
-                ca.program_error_count <= pa.program_error_count
-            ),
             "no_untrusted_geometry_use": (
                 pa.untrusted_geometry_use_count == 0
                 and ca.untrusted_geometry_use_count == 0

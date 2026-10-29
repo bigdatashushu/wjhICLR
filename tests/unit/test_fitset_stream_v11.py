@@ -147,6 +147,13 @@ class ProbeRunner(SystemVariantRunner):
                 "program_source": "ReturnAnswer()", "results": [], "error_code": "",
             }],
         }
+        candidate_error = getattr(self, "candidate_error_code", None)
+        if self.evolution_config is None and "FITREV" in spec.skill_md and candidate_error:
+            outcome["rounds"][0]["index"] = 1
+            outcome["rounds"].insert(0, {
+                "index": 0, "synthesis_source": "online_model_ok",
+                "executed": False, "results": [], "error_code": candidate_error,
+            })
         variant_root = self.root / "variants" / _variant_key(variant["variant_id"])
         _write_create_once(variant_root / "plan.json", {
             "variant": dict(variant), "skill_identity": identity,

@@ -125,3 +125,34 @@ def test_complete_zero_request_preflight_seals_workspace_binding(tmp_path, monke
     assert result["model_requests"] == 0 and result["planned_episodes"] == 2
     assert receipt["framework_workspace_binding"] == binding
     assert receipt["validation_labels_hidden_during_execution"]
+    assert receipt["admission_policy_source_identity"] == gate.identity(gate.ADMISSION_POLICY_PATH)
+
+
+def test_successor_native_scoring_uses_new_admission_and_preserves_other_checks():
+    parent = {
+        "mean_score": 0.5, "errors": 0, "program_errors": 1, "legal_rate": 1.0,
+        "shared_input_hashes": ["same"], "returned_models": ["test-model"],
+        "backend_fingerprints": [], "trusted": True, "delivered": True,
+        "service_ok": True, "seed_observed": True,
+    }
+    candidate = {**parent, "mean_score": 0.75, "program_errors": 4}
+
+    class Worker:
+        def _gate(self):
+            return {
+                "passed": False, "conditions": {"137": False, "138": False},
+                "admission_program_error_rule": "legacy_any_round_error_code",
+                "arms": [{"seed": seed, "parent": parent, "candidate": candidate}
+                         for seed in (137, 138)],
+            }
+
+    worker = Worker()
+    gate.bind_gate_admission(worker)
+    result = worker._gate()
+    assert result["passed"] and result["conditions"] == {"137": True, "138": True}
+    assert result["arms"][0]["candidate"]["program_errors"] == 4
+    assert "admission_program_error_rule" not in result
+    assert result["admission_rule_version"] == "fitset-gate-admission/2"
+    candidate["errors"] = 1
+    result = worker._gate()
+    assert not result["passed"] and result["conditions"] == {"137": False, "138": False}

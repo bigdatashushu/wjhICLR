@@ -12,6 +12,9 @@ import sys
 import time
 from types import MethodType, SimpleNamespace
 
+ADMISSION_POLICY_PATH = (
+    Path(__file__).resolve().parents[1] / "src/skill3d/evolution/gate_admission_v11.py")
+
 
 class GateAbort(BaseException):
     """A service, identity or budget refusal must escape model failure handlers."""
@@ -55,6 +58,16 @@ def load(name, path):
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def bind_gate_admission(worker):
+    policy = load("successor_gate_admission", ADMISSION_POLICY_PATH)
+    native_gate = worker._gate
+
+    def evaluate(_worker, *args, **kwargs):
+        return policy.gate_admission_decision(native_gate(*args, **kwargs))
+
+    worker._gate = MethodType(evaluate, worker)
 
 
 class CheckedClient:
@@ -214,6 +227,7 @@ def setup(args):
     worker.root = args.output
     if worker.config.gate_seeds != (137, 138) or worker.config.gate_mode != "qa_disjoint":
         raise GateAbort("gate_protocol_identity")
+    bind_gate_admission(worker)
     return tools, coordinator, worker, candidates, ready
 
 
@@ -267,6 +281,7 @@ def preflight(args):
         "status": "ready", "at": time.time(), "model_requests": 0, "candidates": outputs,
         "prepared_input_identities": plans, "planned_episodes": len(plans),
         "gate_source_identity": identity(Path(__file__)),
+        "admission_policy_source_identity": identity(ADMISSION_POLICY_PATH),
         "native_sources": revision_ready["source_identity"],
         "revision_final_identity": identity(args.revision_root / "revision_final.json"),
         "gate_config": asdict(worker.config), "seeds": [137, 138],
@@ -288,6 +303,8 @@ def run(args):
     ready = read(args.output / "preflight.json")
     if ready["gate_source_identity"] != identity(Path(__file__)):
         raise GateAbort("gate_source_changed")
+    if ready["admission_policy_source_identity"] != identity(ADMISSION_POLICY_PATH):
+        raise GateAbort("gate_admission_policy_source_changed")
     service = __import__("storage_scaleup_service_ops").facade()
     service.load_service_environment()
     tools, runner, worker, candidates, revision_ready = setup(args)

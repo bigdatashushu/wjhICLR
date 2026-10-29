@@ -84,6 +84,7 @@ class _Callbacks:
         *,
         candidate_score: float = 0.75,
         candidate_runtime_errors: int = 1,
+        candidate_program_errors: int | None = None,
         candidate_legal_answer_rate: float = 1.0,
         post_body=None,
         revision_values=None,
@@ -92,6 +93,7 @@ class _Callbacks:
     ):
         self.candidate_score = candidate_score
         self.candidate_runtime_errors = candidate_runtime_errors
+        self.candidate_program_errors = candidate_program_errors
         self.candidate_legal_answer_rate = candidate_legal_answer_rate
         self.post_body = post_body
         self.revision_values = list(revision_values or [])
@@ -263,7 +265,9 @@ class _Callbacks:
                 n_scored=self.n_pairs,
                 mean_score=self.candidate_score,
                 runtime_error_count=self.candidate_runtime_errors,
-                program_error_count=self.candidate_runtime_errors,
+                program_error_count=(
+                    self.candidate_runtime_errors if self.candidate_program_errors is None
+                    else self.candidate_program_errors),
                 untrusted_geometry_use_count=0,
                 legal_answer_rate=self.candidate_legal_answer_rate,
             ),
@@ -447,6 +451,20 @@ def test_v11_campaign_promotes_strict_improvement_and_verifies_new_learning(tmp_
         ).read_text(encoding="utf-8")
     )
     assert len(revision["experience_sha256"]) == 64
+
+
+def test_v11_campaign_program_error_increase_is_descriptive_not_admission(tmp_path):
+    _activate_parent(tmp_path / "library")
+    callbacks = _Callbacks(candidate_program_errors=4)
+
+    result = _runner(tmp_path, callbacks).run()
+
+    assert result.status == "promoted"
+    decision = json.loads(
+        (tmp_path / "runs/campaign-one/receipts/decision.json").read_text())
+    assert "program_errors_nonincreasing" not in decision["conditions"]
+    assert decision["conditions"]["runtime_errors_nonincreasing"]
+    assert callbacks.calls["post"] == 1
 
 
 def test_v11_campaign_retries_static_failure_with_feedback(tmp_path):

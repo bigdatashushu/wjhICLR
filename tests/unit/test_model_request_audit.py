@@ -9,7 +9,7 @@ from skill3d.evolution.fitset_stream_v11 import SeededGateClient
 from skill3d.synthesis.bailian_client import BailianClient
 from skill3d.synthesis.request_audit import describe_request
 from test_bailian_client import Response
-from test_fitset_stream_v11 import make_runner
+from test_fitset_stream_v11 import ProbeRunner, make_runner
 
 
 def test_effective_wire_identity_includes_clamp_seed_pixels_and_backend(monkeypatch, tmp_path):
@@ -81,7 +81,7 @@ def test_missing_fingerprint_stays_unknown_and_failed_request_is_recorded(monkey
     assert response["response_identity"] == {} and raw.last_response_identity == {}
 
 
-def test_gate_balances_submission_order_and_preserves_legacy_metrics(tmp_path):
+def test_gate_balances_submission_order_and_records_diagnostic_metrics(tmp_path):
     runner = make_runner(tmp_path)
     runner.run(resume=False)
     path = next((runner.root / "workers").glob("*/campaigns/*/gate_schedule.json"))
@@ -89,13 +89,29 @@ def test_gate_balances_submission_order_and_preserves_legacy_metrics(tmp_path):
     assert [row["arm"] for row in schedule[:4]] == ["parent", "candidate", "candidate", "parent"]
     assert [row["arm"] for row in schedule[16:18]] == ["candidate", "parent"]
     decision = json.loads((path.parent / "decision.json").read_text())
-    assert decision["admission_program_error_rule"] == "legacy_any_round_error_code"
+    assert decision["admission_rule_version"] == "fitset-gate-admission/2"
+    assert decision["program_error_metric_rule"] == "any_round_error_code_episode_count"
+    assert "admission_program_error_rule" not in decision
     assert decision["passed"]
     for arm in decision["arms"]:
         for name in ("parent", "candidate"):
             metrics = arm[name]["process_metrics"]
             assert metrics["request_count"] == 8
             assert metrics["token_totals_complete"] is False
+
+
+def test_gate_program_error_increase_keeps_metrics_and_allows_both_seeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(ProbeRunner, "candidate_error_code", "tool_argument_error", raising=False)
+    runner = make_runner(tmp_path)
+    runner.run(resume=False)
+    path = next((runner.root / "workers").glob("*/campaigns/*/decision.json"))
+    decision = json.loads(path.read_text())
+    assert decision["passed"] and decision["conditions"] == {"137": True, "138": True}
+    for arm in decision["arms"]:
+        assert arm["candidate"]["mean_score"] > arm["parent"]["mean_score"]
+        assert arm["candidate"]["program_errors"] > arm["parent"]["program_errors"]
+        assert arm["candidate"]["errors"] == arm["parent"]["errors"] == 0
+        assert arm["candidate"]["process_metrics"]["error_events"]["tool_argument_error"] == 8
 
 
 def test_insufficient_gate_retains_hashed_decision_without_model_requests(tmp_path):

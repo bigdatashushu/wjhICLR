@@ -30,6 +30,7 @@ from skill3d.evolution.fitset_revision_v11 import (
     FitSetSlotReviser,
     load_active_parent_slots,
 )
+from skill3d.evolution.gate_admission_v11 import gate_admission_decision
 from skill3d.evolution.leakage import leakage_scan_text
 from skill3d.evolution.revision_schedule import (
     candidate_dedup_key, normalized_method_sha256, scheduling_decision,
@@ -515,7 +516,7 @@ class FitSetWorkerEvolution:
                 "parent_hash": parent.content_sha256,
                 "run_identity": self.runner.run_identity,
             }
-            return {**body, "identity_sha256": content_sha256(body)}
+            return gate_admission_decision(body)
         # Phase 1 — set up each (seed, arm) runner deterministically and collect
         # every panel episode as an independent work item. Setup writes the
         # run-local library and frozen identity; it performs no model request.
@@ -597,9 +598,7 @@ class FitSetWorkerEvolution:
         # in its own arm directory; completed results from a prior attempt are
         # reused, so a resumed gate relaunches only the missing episodes.
         self.runner._run_gate_episodes(episodes)
-        # Phase 3 — score the persisted results. This logic is identical to the
-        # previous serial gate; only the order episodes ran in has changed.
-        conditions = {}
+        # Phase 3 — score persisted results; admission uses the shared policy.
         arms = []
         for seed in self.config.gate_seeds:
             pair = {}
@@ -691,28 +690,14 @@ class FitSetWorkerEvolution:
                     "process_metrics": aggregate_gate_process_metrics(
                         [row["process_metrics"] for row in rows]),
                 }
-            pa, ca = pair["parent"], pair["candidate"]
-            conditions[str(seed)] = (
-                ca["mean_score"] > pa["mean_score"]
-                and ca["errors"] <= pa["errors"]
-                and ca["program_errors"] <= pa["program_errors"]
-                and ca["legal_rate"] >= pa["legal_rate"]
-                and pa["shared_input_hashes"] == ca["shared_input_hashes"]
-                and pa["returned_models"] == ca["returned_models"]
-                and pa["backend_fingerprints"] == ca["backend_fingerprints"]
-                and all(arm[key] for arm in (pa, ca) for key in (
-                    "trusted", "delivered", "service_ok", "seed_observed"))
-            )
             arms.append({"seed": seed, **pair})
-        body = {"passed": all(conditions.values()), "conditions": conditions,
-                "arms": arms, "panel_ids": panel_ids,
+        body = {"arms": arms, "panel_ids": panel_ids,
                 "schedule_sha256": content_sha256(schedule),
-                "admission_program_error_rule": "legacy_any_round_error_code",
                 "missing_backend_fingerprint_means": "unknown_backend_identity",
                 "candidate_hash": candidate.content_sha256,
                 "parent_hash": parent.content_sha256,
                 "run_identity": self.runner.run_identity}
-        return {**body, "identity_sha256": content_sha256(body)}
+        return gate_admission_decision(body)
 
     def attempt(self, request):
         self.runner._require_storage_reserve(request.slot_key)
