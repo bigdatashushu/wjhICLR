@@ -6,6 +6,12 @@ import json
 SCHEMA = "revision-multiple-field-fragments/1"
 
 
+class FragmentRefusal(ValueError):
+    def __init__(self, code, facts):
+        super().__init__(code)
+        self.facts = facts
+
+
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True,
                       separators=(",", ":"), allow_nan=False)
@@ -64,12 +70,13 @@ def split_fields(row, fits):
 
     visit(row["complete_case"], ["complete_case"])
     template, selected = deepcopy(row), []
+    source_sha = sha(row)
 
     def piece(field_index, start, end):
         path, value = selected[field_index]
         result = deepcopy(template)
         result["round_fragment"] = {
-            "schema": SCHEMA, "source_unit_sha256": sha(row),
+            "schema": SCHEMA, "source_unit_sha256": source_sha,
             "fields": [{"path": p, "kind": type(v).__name__, "total": len(v)}
                        for p, v in selected],
             "field_index": field_index, "start": start, "end": end,
@@ -92,7 +99,15 @@ def split_fields(row, fits):
                               if not isinstance(field, str) else [0])):
             break
     else:
-        raise ValueError("complete program/context or atomic field exceeds multi-field input budget")
+        raise FragmentRefusal("multi_field_atomic_refusal", {
+            "fields": [{"path": path, "kind": type(value).__name__,
+                        "source_chars": len(canonical(value)), "total": len(value)}
+                       for path, value in selected],
+            "template_chars": len(canonical(template)),
+            "one_item_checks": [
+                {"field_index": i, "chars": len(canonical(piece(i, 0, 1))),
+                 "fits": fits([piece(i, 0, 1)])}
+                for i in range(len(selected))]})
 
     pieces = []
     for i, (_, value) in enumerate(selected):
