@@ -34,6 +34,12 @@ def read(path):
     return json.loads(Path(path).read_text())
 
 
+def campaign_root(args, selection):
+    # Each source identity owns new arm libraries even when a zero-request
+    # preparation previously stopped in the same admitted workspace.
+    return args.output / "campaigns" / identity(Path(__file__))["sha256"][:20] / selection["campaign_id"]
+
+
 def seal(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -224,7 +230,8 @@ def preflight(args):
             raise GateAbort("gate_minimum_request_budget")
         pairs = {}
         for arm, variant in episodes:
-            prepared = arm._prepare_one(variant, preflight=True)
+            with arm._input_episode_lease(variant):
+                prepared = arm._prepare_one(variant, preflight=True)
             if (prepared["item"].episode.ground_truth or arm.label_metadata
                     or arm.capture_offline_case_input):
                 raise GateAbort("gate_validation_labels_visible")
@@ -243,7 +250,7 @@ def preflight(args):
     for selection, parent, candidate in candidates:
         request = SimpleNamespace(slot_key=parent.slot_key,
                                   question_type=parent.question_type, evidence_state=parent.evidence_state)
-        root = args.output / "campaigns" / selection["campaign_id"]
+        root = campaign_root(args, selection)
         try:
             result = worker._gate(request, parent, candidate, root)
         except PreparationComplete:
@@ -322,7 +329,7 @@ def run(args):
                 continue
             request = SimpleNamespace(slot_key=parent.slot_key, question_type=parent.question_type,
                                       evidence_state=parent.evidence_state)
-            root = args.output / "campaigns" / selection["campaign_id"]
+            root = campaign_root(args, selection)
             decision = worker._gate(request, parent, candidate, root)
             runner.framework_state_io.write_json_once(root / "decision.json", decision)
             results.append({"campaign_id": selection["campaign_id"], "slot_key": parent.slot_key,
