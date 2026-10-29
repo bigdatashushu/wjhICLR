@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import sys
 import time
-from types import FunctionType, MethodType
 
 script_dir = Path(__file__).resolve().parent
 # Keep frozen run_fitset_v11 and operators ahead of this full checkout.
@@ -88,55 +87,23 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
         expected_model="qwen3.8-flash")
     native, _ = helper.make_reviser(args.state_root, {**selection, "paths": paths},
                                    args.output / "unused-native", client, config)
-    native._prompt = lambda **kwargs: analyst._prompt(parent=kwargs["parent"],
-        working=parent.skill_md, feedback=feedback, evidence=kwargs.get("evidence_text", ""),
-        coverage={}, repair=kwargs.get("repair_context"))
-    native.evidence_request_budget = 128
-    original = native._evidence_batches.__func__
-    namespace = dict(original.__globals__)
-    splitter = namespace["split_round_components"]
-    from skill3d.evolution.trajectory_fragments_v11 import split_fields, reassemble_fields
-    native_reassemble = namespace["reassemble_round_components"]
-    namespace["reassemble_round_components"] = lambda rows: reassemble_fields(rows, native_reassemble)
-    native_view = namespace["decision_bundle_view"]
-    stdout_receipts = []
 
-    def projected_view(raw):
-        projected, receipt = analysis.project_decision_stdout(native_view(raw))
-        stdout_receipts.append(receipt)
-        return projected
+    def planning_refusal(row, error):
+        complete = row["complete_case"]
+        round_ = complete["rounds"][0]
+        tools.seal(args.output / selection["campaign_id"] / "planning_refusal.json", {
+            "status": "indivisible_input", "slot": parent.slot_key, "model_requests": 0,
+            "case_index": row["case_index"], "round_index": round_.get("index"),
+            "multi_field_refusal": error["code"], "multi_field_facts": error["facts"],
+            "round_field_chars": {k: len(json.dumps(v, ensure_ascii=False))
+                                  for k, v in round_.items()},
+            "header_field_chars": {k: len(json.dumps(v, ensure_ascii=False))
+                                   for k, v in complete.items() if k != "rounds"},
+        })
 
-    namespace["decision_bundle_view"] = projected_view
-
-    def inspected_split(row, fits):
-        try:
-            return splitter(row, fits)
-        except ValueError:
-            try:
-                return split_fields(row, fits)
-            except ValueError as error:
-                field_error = str(error)
-                field_facts = getattr(error, "facts", None)
-            complete = row["complete_case"]
-            round_ = complete["rounds"][0]
-            tools.seal(args.output / selection["campaign_id"] / "planning_refusal.json", {
-                "status": "indivisible_input", "slot": parent.slot_key, "model_requests": 0,
-                "case_index": row["case_index"], "round_index": round_.get("index"),
-                "multi_field_refusal": field_error,
-                "multi_field_facts": field_facts,
-                "round_field_chars": {k: len(json.dumps(v, ensure_ascii=False))
-                                      for k, v in round_.items()},
-                "header_field_chars": {k: len(json.dumps(v, ensure_ascii=False))
-                                       for k, v in complete.items() if k != "rounds"},
-            })
-            raise
-
-    namespace["split_round_components"] = inspected_split
-    native._evidence_batches = MethodType(FunctionType(original.__code__, namespace,
-        original.__name__, original.__defaults__, original.__closure__), native)
-    batches, plan = native._evidence_batches(parent=parent, feedback=feedback,
-                                           experience=experience, diagnosis=None)
-    plan["stdout_projection"] = stdout_receipts[0]
+    batches, plan = analysis.plan_analysis_evidence(
+        native, analyst=analyst, parent=parent, feedback=feedback,
+        experience=experience, on_fragment_refusal=planning_refusal)
     compact = [analysis.compact_batch(batch) for batch in batches]
     analyst.analysis_chars = min(12000, 42000 // len(batches))
     checked = [analyst._check_size(analyst._prompt(parent=parent, working=parent.skill_md,

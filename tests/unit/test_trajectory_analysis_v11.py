@@ -1,12 +1,13 @@
 """Analysis coverage, copy protection and isolated evidence projection."""
 import json
 import sys
-from types import ModuleType
+from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 
 import pytest
 
 from skill3d.evolution.trajectory_analysis_v11 import (
-    ANALYSIS_PROTOCOL, compact_batch, project_printed_objects, validate_analysis,
+    ANALYSIS_PROTOCOL, compact_batch, plan_analysis_evidence,
+    project_printed_objects, validate_analysis,
 )
 from skill3d.evolution.revision_edits_v11 import EditProtocolError
 
@@ -116,3 +117,60 @@ def test_labeled_stdout_objects_drop_only_native_audit_fields(monkeypatch):
     assert receipt["projected_objects"] == 1
     assert value["lines"][0]["object_values"] == {
         key: child for key, child in detection.items() if key != "semantic_request_identity"}
+
+
+def _planner_body(self, *, parent, feedback, experience, diagnosis):
+    view = decision_bundle_view(experience)
+    rows = split_round_components(view["cases"][0], lambda rows: True)
+    rebuilt = reassemble_round_components(rows)
+    prompt = self._prompt(parent=parent, evidence_text="full evidence")
+    return [prompt], {"rebuilt": rebuilt, "request_budget": self.evidence_request_budget}
+
+
+def test_planner_hooks_are_isolated_from_native_instance_and_module(monkeypatch):
+    import skill3d.evolution.trajectory_fragments_v11 as fragments
+    view = {"cases": [{"rounds": [{"index": 0}]}]}
+    namespace = {
+        "decision_bundle_view": lambda raw: raw,
+        "split_round_components": lambda row, fits: [row],
+        "reassemble_round_components": lambda rows: rows,
+    }
+    originals = dict(namespace)
+    native = SimpleNamespace(_prompt=lambda **kwargs: "native prompt",
+                             evidence_request_budget=18)
+    function = FunctionType(_planner_body.__code__, namespace)
+    native._evidence_batches = MethodType(function, native)
+    saved = dict(vars(native))
+    analyst = SimpleNamespace(_prompt=lambda **kwargs: "analysis " + kwargs["evidence"])
+    batches, plan = plan_analysis_evidence(
+        native, analyst=analyst, parent=SimpleNamespace(skill_md="parent"),
+        feedback={}, experience=view)
+    assert batches == ["analysis full evidence"]
+    assert plan["rebuilt"] == view["cases"]
+    assert plan["stdout_projection"]["raw_record_retained"]
+    assert plan["request_budget"] == 128
+    assert vars(native) == saved and function.__globals__ == originals
+    assert view == {"cases": [{"rounds": [{"index": 0}]}]}
+
+    def refuses(row, fits):
+        raise ValueError("native array refusal")
+
+    function.__globals__["split_round_components"] = refuses
+    monkeypatch.setattr(fragments, "split_fields", lambda row, fits: [row])
+    assert plan_analysis_evidence(
+        native, analyst=analyst, parent=SimpleNamespace(skill_md="parent"),
+        feedback={}, experience=view)[1]["rebuilt"] == view["cases"]
+    assert function.__globals__["split_round_components"] is refuses
+
+    def field_refusal(row, fits):
+        raise fragments.FragmentRefusal("field_refusal", {"template_chars": 17})
+
+    monkeypatch.setattr(fragments, "split_fields", field_refusal)
+    refusals = []
+    with pytest.raises(fragments.FragmentRefusal, match="field_refusal"):
+        plan_analysis_evidence(
+            native, analyst=analyst, parent=SimpleNamespace(skill_md="parent"),
+            feedback={}, experience=view,
+            on_fragment_refusal=lambda row, error: refusals.append(error))
+    assert refusals == [{"code": "field_refusal", "facts": {"template_chars": 17}}]
+    assert vars(native) == saved

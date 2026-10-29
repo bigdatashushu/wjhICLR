@@ -7,9 +7,10 @@ No analysis text is written to request receipts or returned to the online solver
 from __future__ import annotations
 
 import ast
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import asdict
 import json
+from types import FunctionType, MethodType
 from typing import Mapping, Sequence
 
 from skill3d.evolution.revision_edits_v11 import (
@@ -110,6 +111,60 @@ def project_decision_stdout(view: Mapping) -> tuple[dict, dict]:
                     "projected_lines": lines, "projected_objects": objects,
                     "source_chars": source_chars, "projected_chars": projected_chars,
                     "raw_record_retained": True}
+
+
+def plan_analysis_evidence(native, *, analyst, parent, feedback, experience,
+                           on_fragment_refusal=None):
+    """Use a frozen native planner with instance-local analysis hooks.
+
+    Native graph encoding and reconstruction remain authoritative. The planner
+    copy owns the prompt, stdout projection and typed-fragment fallback; neither
+    the native instance nor its module globals are modified.
+    """
+    from skill3d.evolution.trajectory_fragments_v11 import split_fields, reassemble_fields
+    planner = copy(native)
+    planner._prompt = lambda **kwargs: analyst._prompt(
+        parent=kwargs["parent"], working=parent.skill_md, feedback=feedback,
+        evidence=kwargs.get("evidence_text", ""), coverage={},
+        repair=kwargs.get("repair_context"))
+    planner.evidence_request_budget = 128
+    original = native._evidence_batches.__func__
+    namespace = dict(original.__globals__)
+    splitter = namespace["split_round_components"]
+    native_reassemble = namespace["reassemble_round_components"]
+    native_view = namespace["decision_bundle_view"]
+    stdout_receipts = []
+
+    def projected_view(raw):
+        projected, receipt = project_decision_stdout(native_view(raw))
+        stdout_receipts.append(receipt)
+        return projected
+
+    def inspected_split(row, fits):
+        try:
+            return splitter(row, fits)
+        except ValueError:
+            try:
+                return split_fields(row, fits)
+            except ValueError as error:
+                if on_fragment_refusal is not None:
+                    on_fragment_refusal(row, {
+                        "code": str(error), "facts": getattr(error, "facts", None)})
+                raise
+
+    namespace.update(
+        decision_bundle_view=projected_view,
+        split_round_components=inspected_split,
+        reassemble_round_components=lambda rows: reassemble_fields(rows, native_reassemble))
+    planner._evidence_batches = MethodType(FunctionType(
+        original.__code__, namespace, original.__name__,
+        original.__defaults__, original.__closure__), planner)
+    batches, plan = planner._evidence_batches(
+        parent=parent, feedback=feedback, experience=experience, diagnosis=None)
+    if len(stdout_receipts) != 1:
+        raise RevisionOperationalError("native decision view projection denominator changed")
+    plan["stdout_projection"] = stdout_receipts[0]
+    return batches, plan
 
 
 def compact_batch(text: str) -> tuple[str, dict]:
