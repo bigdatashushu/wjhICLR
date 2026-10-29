@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import sys
 import time
+from types import FunctionType, MethodType
 
 script_dir = Path(__file__).resolve().parent
 # Keep frozen run_fitset_v11 and operators ahead of this full checkout.
@@ -88,6 +89,29 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
         working=parent.skill_md, feedback=feedback, evidence=kwargs.get("evidence_text", ""),
         coverage={}, repair=kwargs.get("repair_context"))
     native.evidence_request_budget = 128
+    original = native._evidence_batches.__func__
+    namespace = dict(original.__globals__)
+    splitter = namespace["split_round_components"]
+
+    def inspected_split(row, fits):
+        try:
+            return splitter(row, fits)
+        except ValueError:
+            complete = row["complete_case"]
+            round_ = complete["rounds"][0]
+            tools.seal(args.output / selection["campaign_id"] / "planning_refusal.json", {
+                "status": "indivisible_input", "slot": parent.slot_key, "model_requests": 0,
+                "case_index": row["case_index"], "round_index": round_.get("index"),
+                "round_field_chars": {k: len(json.dumps(v, ensure_ascii=False))
+                                      for k, v in round_.items()},
+                "header_field_chars": {k: len(json.dumps(v, ensure_ascii=False))
+                                       for k, v in complete.items() if k != "rounds"},
+            })
+            raise
+
+    namespace["split_round_components"] = inspected_split
+    native._evidence_batches = MethodType(FunctionType(original.__code__, namespace,
+        original.__name__, original.__defaults__, original.__closure__), native)
     batches, plan = native._evidence_batches(parent=parent, feedback=feedback,
                                            experience=experience, diagnosis=None)
     compact = [analysis.compact_batch(batch) for batch in batches]
@@ -112,8 +136,13 @@ def preflight(args):
     helper, config, client, history, _, _, analysis = setup(args)
     rows = []
     for selection in selections(args, helper):
+        tools.seal(args.output / "planning" / (selection["campaign_id"] + ".started.json"),
+                   {"slot": selection["slot_key"], "at": time.time(), "model_requests": 0})
         row, *_ = prepare_one(args, helper, config, history, client, analysis, selection)
         rows.append(row)
+        tools.seal(args.output / "planning" / (selection["campaign_id"] + ".ready.json"),
+                   {"slot": selection["slot_key"], "batch_count": row["batch_count"],
+                    "at": time.time(), "model_requests": 0})
     cap = sum(r["total_request_cap"] for r in rows)
     if cap > args.reviser_request_cap:
         raise RuntimeError("prepared analysis cohort exceeds shared revision allowance")
