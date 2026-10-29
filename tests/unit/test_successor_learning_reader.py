@@ -3,7 +3,8 @@ from contextlib import contextmanager
 import hashlib
 import importlib.util
 from pathlib import Path
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -13,7 +14,10 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def test_large_member_uses_native_materialization_and_rejects_changed_bytes(tmp_path):
+def test_large_member_uses_native_materialization_and_rejects_changed_bytes(tmp_path, monkeypatch):
+    psutil = ModuleType("psutil")
+    psutil.virtual_memory = lambda: SimpleNamespace(available=32 * 1024 ** 3)
+    monkeypatch.setitem(sys.modules, "psutil", psutil)
     payload = b"frozen learning bytes"
     path = tmp_path / "member.json"
     path.write_bytes(payload)
@@ -33,6 +37,10 @@ def test_large_member_uses_native_materialization_and_rejects_changed_bytes(tmp_
     path.write_bytes(b"changed bytes")
     with pytest.raises(RuntimeError, match="identity changed"):
         module.learning_bytes(history, path)
-    record.size = 257 * 1024 * 1024
+    record.size = 513 * 1024 * 1024
     with pytest.raises(RuntimeError, match="memory allowance"):
+        module.learning_bytes(history, path)
+    record.size = 300 * 1024 * 1024
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=1024 ** 3))
+    with pytest.raises(RuntimeError, match="headroom"):
         module.learning_bytes(history, path)

@@ -96,8 +96,12 @@ def learning_bytes(history, path):
     record = history.cold_reference(path)
     if record is None or record.size <= cold.max_read_bytes:
         return history.read_history_bytes(path)
-    if record.size > 256 * 1024 * 1024:
+    if record.size > 512 * 1024 * 1024:
         raise RuntimeError("learning bundle exceeds independent host memory allowance")
+    import psutil
+    # The raw JSON, schema objects and projected copy coexist briefly.
+    if psutil.virtual_memory().available < 10 * record.size + 4 * 1024 ** 3:
+        raise RuntimeError("learning bundle exceeds observed host memory headroom")
     with cold.materialize(record.ref) as materialized:
         with Path(materialized).open("rb") as stream:
             raw = stream.read(record.size + 1)
