@@ -26,6 +26,8 @@ def setup(args):
     helper, config, client, history, editor_type, budget_type = tools.setup(args)
     analysis = tools.load_module("skill3d.evolution.trajectory_analysis_v11",
         args.source_root / "src/skill3d/evolution/trajectory_analysis_v11.py")
+    tools.load_module("skill3d.evolution.trajectory_fragments_v11",
+        args.source_root / "src/skill3d/evolution/trajectory_fragments_v11.py")
     return helper, config, client, history, editor_type, budget_type, analysis
 
 
@@ -33,7 +35,8 @@ def source_identity(args):
     return {**tools.source_identity(args), **{
         str(p): tools.identity(p) for p in (
             Path(__file__), args.source_root / "scripts/run_reviser_successor_v11.py",
-            args.source_root / "src/skill3d/evolution/trajectory_analysis_v11.py")}}
+            args.source_root / "src/skill3d/evolution/trajectory_analysis_v11.py",
+            args.source_root / "src/skill3d/evolution/trajectory_fragments_v11.py")}}
 
 
 def selections(args, helper):
@@ -92,6 +95,9 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
     original = native._evidence_batches.__func__
     namespace = dict(original.__globals__)
     splitter = namespace["split_round_components"]
+    from skill3d.evolution.trajectory_fragments_v11 import split_fields, reassemble_fields
+    native_reassemble = namespace["reassemble_round_components"]
+    namespace["reassemble_round_components"] = lambda rows: reassemble_fields(rows, native_reassemble)
     native_view = namespace["decision_bundle_view"]
     stdout_receipts = []
 
@@ -106,6 +112,10 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
         try:
             return splitter(row, fits)
         except ValueError:
+            try:
+                return split_fields(row, fits)
+            except ValueError:
+                pass
             complete = row["complete_case"]
             round_ = complete["rounds"][0]
             tools.seal(args.output / selection["campaign_id"] / "planning_refusal.json", {
