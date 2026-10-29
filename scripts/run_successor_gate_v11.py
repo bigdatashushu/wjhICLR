@@ -12,7 +12,7 @@ import sys
 import time
 from types import MethodType, SimpleNamespace
 
-# This checkout supplies the Gate wrapper and admission policy only.
+# This checkout supplies the Gate wrapper, admission policy and scoped guard.
 _script_dir = Path(__file__).resolve().parent
 sys.path[:] = [p for p in sys.path if Path(p).resolve() != _script_dir]
 
@@ -141,7 +141,7 @@ class CheckedFactory:
 def setup(args):
     from skill3d.evaluation.fitset_v11 import SystemVariantRunner, content_sha256
     from skill3d.evolution.fitset_stream_v11 import FitSetWorkerEvolution
-    from skill3d.evolution.fitset_revision_v11 import _static_validate
+    from skill3d.evolution.fitset_revision_v11 import _static_validate as native_static_validate
     from skill3d.schemas import SkillSpecV11
     from skill3d.storage.framework_state_io import FrameworkStateIO
     from skill3d.storage.hot_cache import HotCache
@@ -149,6 +149,9 @@ def setup(args):
     from skill3d.synthesis.request_governor import RequestGovernorConfig
     import freeze_runner_binding_ops
 
+    guard = load("successor_gate_scoped_guard",
+                 args.revision_root.parent / "source/src/skill3d/evolution/revision_guard_v11.py")
+    _static_validate = guard.scoped_static_validator(native_static_validate)
     revision = read(args.revision_root / "revision_final.json")
     ready = read(args.revision_root / "preflight.json")
     if not revision["protected_inputs_unchanged"] or revision["status"] != "revision_complete":

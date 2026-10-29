@@ -57,6 +57,7 @@ def protected(state, frozen):
 def source_identity(args):
     native = args.frozen_root / "runtime-parallel-reviser-v11-20261028"
     paths = [Path(__file__), args.source_root / "src/skill3d/evolution/revision_edits_v11.py",
+             args.source_root / "src/skill3d/evolution/revision_guard_v11.py",
              native / "code_identity.json"]
     paths.extend(p for p in (native / "source").rglob("*")
                  if p.is_file() and p.suffix in {".py", ".yaml", ".toml"})
@@ -69,8 +70,10 @@ def source_identity(args):
 
 
 def setup(args):
-    # Load this one scientific module explicitly. A full Git checkout must not
-    # shadow unrelated, read-only native runtime dependencies.
+    # Bind the scoped guard and editor explicitly, without replacing native
+    # leakage/validation modules or other frozen runtime dependencies.
+    load_module("skill3d.evolution.revision_guard_v11",
+                args.source_root / "src/skill3d/evolution/revision_guard_v11.py")
     editor = load_module("skill3d.evolution.revision_edits_v11",
                          args.source_root / "src/skill3d/evolution/revision_edits_v11.py")
     helper = load_module("successor_native_readonly_helper",

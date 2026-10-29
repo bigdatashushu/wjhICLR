@@ -13,9 +13,11 @@ import re
 from typing import Mapping, Sequence
 
 from skill3d.evolution.fitset_revision_v11 import (
-    RevisionOperationalError, _safe_static_feedback, _static_validate, _tool_docs, _write_create_once,
+    RevisionOperationalError, _safe_static_feedback, _static_validate as _native_static_validate,
+    _tool_docs, _write_create_once,
     _write_text_create_once,
 )
+from skill3d.evolution.revision_guard_v11 import scoped_static_validator
 from skill3d.evolution.revision_input_v11 import (
     build_repair_context, candidate_sample_copy_leaks,
 )
@@ -23,6 +25,7 @@ from skill3d.synthesis.execution_contract import ExecutionContract
 from skill3d.synthesis.request_audit import describe_request, payload_bytes
 
 PROTOCOL = "v11-anchored-revision-edits/1"
+_static_validate = scoped_static_validator(_native_static_validate)
 
 
 def digest(text: str) -> str:

@@ -20,7 +20,7 @@ from skill3d.evolution.fitset_revision_v11 import (
     RevisionOperationalError, _tool_docs, _write_create_once,
 )
 from skill3d.evolution.revision_input_v11 import candidate_sample_copy_leaks
-from skill3d.evolution.leakage import leakage_scan_text
+from skill3d.evolution.revision_guard_v11 import leakage_scan_text
 from skill3d.synthesis.execution_contract import ExecutionContract
 
 ANALYSIS_PROTOCOL = "v11-source-linked-trajectory-analysis/1"
