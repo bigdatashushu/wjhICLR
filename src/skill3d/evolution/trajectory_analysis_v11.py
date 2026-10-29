@@ -35,11 +35,33 @@ def task_semantics(question_type: str) -> str:
         "or strengthening an observation into a certified bound. "
     )
     specific = {
+        "object_counting": (
+            "The count is of distinct physical instances, including separate instances "
+            "visible together. Similar appearance or overlapping boxes across views "
+            "alone does not establish identity. Retain the parent's multiple-cue "
+            "reappearance matching and search for missed instances; a duplicate check "
+            "does not replace either step. Apply a new exclusion only to the instances "
+            "for which the recorded observations support that exclusion. "
+        ),
         "object_abs_distance": (
             "Nearest object separation is a direct boundary/surface distance, not a "
             "route through landmarks; summing path segments changes the estimand. "
             "Normalized surface proxies do not provide meters or certified bounds "
             "on physical distance without the missing scale and surface assumptions. "
+        ),
+        "object_rel_direction": (
+            "Retain the specified observer, heading and target when comparing direction "
+            "options. Keep evidence in its original coordinate frame; image-plane "
+            "overlap cannot substitute for the observer's ground-plane orientation. "
+            "A new visual check must retain the parent's supported multi-view checks "
+            "and object-binding preconditions. "
+        ),
+        "object_rel_distance": (
+            "An incomplete set of candidate bindings does not make all available "
+            "geometry unavailable. Compare each option to the same reference under "
+            "the same documented distance definition, retain usable authorized "
+            "comparisons, and mark only the unsupported comparisons as unresolved. "
+            "Keep the parent's original-view checks for missing candidates. "
         ),
         "obj_appearance_order": (
             "The earliest observed visible frame is an upper bound on true first "
