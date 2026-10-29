@@ -6,7 +6,7 @@ import pytest
 
 from skill3d.evolution.revision_edits_v11 import (
     PROTOCOL, AnchoredSlotReviser, EditProtocolError, RevisionBudget,
-    apply_edits, digest, section_menu, tail_decision,
+    apply_edits, digest, section_menu, source_anchors, tail_decision,
 )
 from skill3d.evolution.fitset_revision_v11 import RevisionOperationalError
 from skill3d.skills.registry import load_active_skills
@@ -31,7 +31,8 @@ def test_fenced_headings_duplicate_titles_and_whole_body_selector():
 
 @pytest.mark.parametrize("code,mutate", [
     ("declared_change_not_present", lambda p: p["edits"][0].update(after="alpha")),
-    ("edit_anchor_not_unique", lambda p: p["edits"][0].update(before="missing")),
+    ("edit_anchor_not_found", lambda p: p["edits"][0].update(before="missing")),
+    ("invalid_edit_protocol", lambda p: p.update(protocol={})),
     ("edit_base_identity_mismatch", lambda p: p.update(base_sha256="0" * 64)),
     ("unknown_section_id", lambda p: p["edits"][0].update(section_id=10)),
 ])
@@ -48,6 +49,52 @@ def test_overlapping_source_edits_are_rejected():
     p["edits"].append({"section_id": 0, "before": "beta", "after": "gamma"})
     with pytest.raises(EditProtocolError, match="overlapping_edits"):
         apply_edits(text, p)
+
+
+def test_catalog_selector_targets_one_duplicate_sentence_and_preserves_other_bytes():
+    text = "---\nname: sample\n---\n# Method\nKeep evidence. Keep evidence.\n"
+    anchors = source_anchors(text)
+    assert len(anchors) == 2 and anchors[0]["source"] == anchors[1]["source"]
+    selected = anchors[1]
+    p = proposal(text, "unused", "Inspect the original frames.")
+    p["edits"] = [{"section_id": selected["section_id"], "anchor_id": selected["anchor_id"],
+                  "after": "Inspect the original frames."}]
+    candidate, audit = apply_edits(text, p)
+    assert candidate == text[:selected["start"]] + p["edits"][0]["after"] + text[selected["end"]:]
+    assert candidate.count("Keep evidence.") == 1
+    assert audit[0]["source_start"] == selected["start"]
+
+
+def test_catalog_excludes_yaml_headings_and_fenced_code():
+    text = "---\nname: fixed\n---\n# Method\nUse images.\n```python\n# Rule\nunsafe()\n```\nKeep facts.\n"
+    assert [a["source"] for a in source_anchors(text)] == ["Use images.", "Keep facts."]
+
+
+@pytest.mark.parametrize("mutation,code", [
+    (lambda p: p["edits"][0].update(anchor_id=True), "unknown_anchor_id"),
+    (lambda p: p["edits"][0].update(section_id=0), "anchor_section_mismatch"),
+    (lambda p: p["edits"][0].update(before="Keep evidence."), "invalid_edit_anchor_selector"),
+    (lambda p: p.update(base_sha256=digest("# Method\nChanged source.\n")),
+     "edit_base_identity_mismatch"),
+])
+def test_catalog_selector_rejects_ambiguous_schema_or_changed_base(mutation, code):
+    text = "# Method\nKeep evidence.\n"
+    p = proposal(text, "unused", "Inspect the original frames.")
+    p["edits"] = [{"section_id": 1, "anchor_id": 0, "after": "Inspect the original frames."}]
+    mutation(p)
+    with pytest.raises(EditProtocolError, match=code):
+        apply_edits(text, p)
+
+
+def test_catalog_and_substring_edits_share_overlap_checks_and_legacy_support():
+    text = "# Method\nKeep evidence. Inspect frames.\n"
+    p = proposal(text, "Keep evidence.", "Keep supported evidence.")
+    p["edits"].append({"section_id": 1, "anchor_id": 0, "after": "Retain evidence."})
+    with pytest.raises(EditProtocolError, match="overlapping_edits"):
+        apply_edits(text, p)
+    p["edits"].pop()
+    p["protocol"] = "v11-anchored-revision-edits/1"
+    assert apply_edits(text, p)[0] == "# Method\nKeep supported evidence. Inspect frames.\n"
 
 
 def test_complete_evidence_reserves_repairs_and_tail_requires_drain_and_budget():
@@ -109,6 +156,29 @@ def test_unique_edit_produces_full_static_candidate_and_content_free_request_rec
     request = json.loads((tmp_path / "request_01.json").read_text())
     intent = json.loads((tmp_path / "request_intent_01.json").read_text())
     assert "messages" not in intent and "response_text" not in request
+    assert client.calls == 1
+
+
+def test_catalog_selection_produces_a_static_candidate_without_echoing_before(tmp_path):
+    p = parent()
+    anchor = source_anchors(p.skill_md)[-1]
+    response = proposal(p.skill_md, "unused", anchor["source"] + " Preserve supported observations.")
+    response["edits"] = [{"section_id": anchor["section_id"], "anchor_id": anchor["anchor_id"],
+                         "after": anchor["source"] + " Preserve supported observations."}]
+    prompts = []
+
+    def respond(messages):
+        prompts.append(messages[-1]["content"])
+        return json.dumps(response)
+
+    client = Client(respond)
+    reviser = AnchoredSlotReviser(output_root=tmp_path, client=client,
+               budget=RevisionBudget(), method_context_max_chars=8000, expected_model="test-model")
+    candidate = reviser.run(parent=p, feedback={}, batches=["authorized learning facts"],
+                            delivery_plan={}, forbidden_ids=set(), cases=[])
+    assert candidate and "Source sentence catalog:" in prompts[0]
+    assert candidate.skill_md == (p.skill_md[:anchor["start"]] + response["edits"][0]["after"]
+                                 + p.skill_md[anchor["end"]:])
     assert client.calls == 1
 
 

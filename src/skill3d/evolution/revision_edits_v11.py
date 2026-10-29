@@ -24,7 +24,8 @@ from skill3d.evolution.revision_input_v11 import (
 from skill3d.synthesis.execution_contract import ExecutionContract
 from skill3d.synthesis.request_audit import describe_request, payload_bytes
 
-PROTOCOL = "v11-anchored-revision-edits/1"
+PROTOCOL = "v11-anchored-revision-edits/2"
+LEGACY_PROTOCOL = "v11-anchored-revision-edits/1"
 _static_validate = scoped_static_validator(_native_static_validate)
 
 
@@ -69,8 +70,57 @@ def section_menu(text: str) -> list[dict]:
             for row in section_spans(text)]
 
 
+def source_anchors(text: str) -> list[dict]:
+    """Bind selectable sentences to exact source positions, excluding YAML/fences."""
+    sections = section_spans(text)
+    anchors, offset, fence = [], 0, None
+    frontmatter = text.startswith("---\n") or text.startswith("---\r\n")
+    for line in text.splitlines(keepends=True):
+        start = offset
+        offset += len(line)
+        if frontmatter:
+            if start and line.strip() == "---":
+                frontmatter = False
+            continue
+        marker = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if marker:
+            token = marker.group(1)
+            if fence is None:
+                fence = (token[0], len(token))
+            elif token[0] == fence[0] and len(token) >= fence[1]:
+                fence = None
+            continue
+        if fence is not None or not line.strip() or re.match(r"^\s*#{1,6}\s+", line):
+            continue
+        section = next((row for row in reversed(sections)
+                        if row["start"] <= start < row["end"]), sections[0])
+        # Sentence boundaries affect only selectable ranges. Source bytes and
+        # intervening whitespace are never rewritten by the catalog.
+        cuts = list(re.finditer(r"[.!?][ \t]+(?=[A-Z])", line))
+        left = 0
+        intervals = []
+        for cut in cuts:
+            intervals.append((left, cut.start() + 1))
+            left = cut.end()
+        intervals.append((left, len(line)))
+        for left, right in intervals:
+            part = line[left:right]
+            if not part.strip():
+                continue
+            begin = start + left + len(part) - len(part.lstrip())
+            end = start + right - (len(part) - len(part.rstrip()))
+            anchors.append({"anchor_id": len(anchors), "section_id": section["section_id"],
+                            "start": begin, "end": end, "source": text[begin:end]})
+    return anchors
+
+
+def anchor_menu(text: str) -> list[dict]:
+    return [{key: row[key] for key in ("anchor_id", "section_id", "source")}
+            for row in source_anchors(text)]
+
+
 def apply_edits(text: str, value: Mapping) -> tuple[str, list[dict]]:
-    if value.get("protocol") != PROTOCOL:
+    if value.get("protocol") not in (PROTOCOL, LEGACY_PROTOCOL):
         raise EditProtocolError("invalid_edit_protocol")
     if value.get("base_sha256") != digest(text):
         raise EditProtocolError("edit_base_identity_mismatch")
@@ -89,6 +139,7 @@ def apply_edits(text: str, value: Mapping) -> tuple[str, list[dict]]:
     if not isinstance(edits, list) or not 1 <= len(edits) <= 8:
         raise EditProtocolError("invalid_edit_count")
     spans = section_spans(text)
+    anchors = source_anchors(text)
     replacements = []
     for edit in edits:
         if not isinstance(edit, dict):
@@ -96,17 +147,35 @@ def apply_edits(text: str, value: Mapping) -> tuple[str, list[dict]]:
         section_id = edit.get("section_id")
         if type(section_id) is not int or not 0 <= section_id < len(spans):
             raise EditProtocolError("unknown_section_id")
-        before, after = edit.get("before"), edit.get("after")
-        if not isinstance(before, str) or not before or not isinstance(after, str):
+        after = edit.get("after")
+        if not isinstance(after, str):
             raise EditProtocolError("invalid_edit_anchor")
+        if "anchor_id" in edit:
+            if value["protocol"] != PROTOCOL or "before" in edit:
+                raise EditProtocolError("invalid_edit_anchor_selector")
+            anchor_id = edit["anchor_id"]
+            if type(anchor_id) is not int or not 0 <= anchor_id < len(anchors):
+                raise EditProtocolError("unknown_anchor_id")
+            anchor = anchors[anchor_id]
+            if anchor["section_id"] != section_id:
+                raise EditProtocolError("anchor_section_mismatch")
+            before = anchor["source"]
+            start, end = anchor["start"], anchor["end"]
+        else:
+            before = edit.get("before")
+            if not isinstance(before, str) or not before:
+                raise EditProtocolError("invalid_edit_anchor")
+            span = spans[section_id]
+            section = text[span["start"]:span["end"]]
+            occurrences = section.count(before)
+            if occurrences == 0:
+                raise EditProtocolError("edit_anchor_not_found")
+            if occurrences != 1:
+                raise EditProtocolError("edit_anchor_not_unique")
+            start = span["start"] + section.index(before)
+            end = start + len(before)
         if before == after or before.strip() == after.strip():
             raise EditProtocolError("declared_change_not_present")
-        span = spans[section_id]
-        section = text[span["start"]:span["end"]]
-        if section.count(before) != 1:
-            raise EditProtocolError("edit_anchor_not_unique")
-        start = span["start"] + section.index(before)
-        end = start + len(before)
         if any(start < old_end and old_start < end for old_start, old_end, _, _ in replacements):
             raise EditProtocolError("overlapping_edits")
         replacements.append((start, end, after, {
@@ -187,8 +256,12 @@ class AnchoredSlotReviser:
             f"Offline exact-slot method revision. Protocol {PROTOCOL}. English prose only.\n"
             "Return one strict JSON object: protocol, base_sha256, action, modification_reason. "
             "For revise add change_hypothesis, expected_process_effect, edits. Each edit has "
-            "integer section_id, before (a nonempty exact unique source substring), after "
-            "(its actual replacement). All edits refer to the same supplied working source. "
+            "integer section_id, integer anchor_id from the supplied source sentence catalog, "
+            "and after (the actual replacement of that exact source sentence). "
+            "Copy the two selector numbers; the host resolves the source positions. "
+            "Do not include before when using anchor_id. The exact-substring before form is "
+            "also supported, but its source must exist exactly once in the chosen section. "
+            "All edits refer to the same supplied working source. "
             "Use at most 8 nonoverlapping edits. A reason alone never changes a method. "
             "Copy the supplied base_sha256 exactly; do not compute a new hash. "
             "no_change omits edits and preserves the working method. "
@@ -211,10 +284,13 @@ class AnchoredSlotReviser:
             f"Evidence coverage:\n{json.dumps(coverage, sort_keys=True)}\n"
             f"Working base_sha256: {digest(working)}\n"
             f"Section selectors:\n{json.dumps(section_menu(working), ensure_ascii=False)}\n"
+            f"Source sentence catalog:\n{json.dumps(anchor_menu(working), ensure_ascii=False)}\n"
             f"Working complete SKILL.md:\n{working}\n"
             f"Authorized learning evidence batch:\n{evidence}\n"
             + (f"Static repair context:\n{json.dumps(repair, ensure_ascii=False)}\n"
                "Fix the recorded problem with a matching edit or return no_change. "
+               "For an absent or ambiguous before anchor, select the matching anchor_id "
+               "and section_id from the current source sentence catalog. "
                "The rejected draft has not replaced the working source.\n" if repair else "")
         )
 
