@@ -114,13 +114,14 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
         except ValueError:
             try:
                 return split_fields(row, fits)
-            except ValueError:
-                pass
+            except ValueError as error:
+                field_error = str(error)
             complete = row["complete_case"]
             round_ = complete["rounds"][0]
             tools.seal(args.output / selection["campaign_id"] / "planning_refusal.json", {
                 "status": "indivisible_input", "slot": parent.slot_key, "model_requests": 0,
                 "case_index": row["case_index"], "round_index": round_.get("index"),
+                "multi_field_refusal": field_error,
                 "round_field_chars": {k: len(json.dumps(v, ensure_ascii=False))
                                       for k, v in round_.items()},
                 "header_field_chars": {k: len(json.dumps(v, ensure_ascii=False))

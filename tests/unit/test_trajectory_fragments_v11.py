@@ -54,3 +54,16 @@ def test_oversized_program_refuses_instead_of_truncating():
     row["complete_case"]["rounds"][0]["program_source"] = "x" * 10000
     with pytest.raises(ValueError):
         split_fields(row, lambda rows: len(canonical(rows)) < 3000)
+
+
+def test_large_nested_string_splits_inside_diagnostics_and_retains_error_facts():
+    row = sample()
+    row["complete_case"]["rounds"][0]["execution_diagnostics"] = {
+        "stdout": "unparsed output '中文'\n" * 1200,
+        "error_type": "TypeError", "answer_untrusted": False, "error_line": None}
+    pieces = split_fields(row, lambda rows: len(canonical(rows)) < 3000)
+    assert restore_fields(pieces) == row
+    assert any(field["path"][-1] == "stdout"
+               for field in pieces[0]["round_fragment"]["fields"])
+    assert all(piece["complete_case"]["rounds"][0]["execution_diagnostics"]["error_type"]
+               == "TypeError" for piece in pieces)
