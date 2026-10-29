@@ -12,6 +12,10 @@ import sys
 import time
 from types import MethodType, SimpleNamespace
 
+# This checkout supplies the Gate wrapper and admission policy only.
+_script_dir = Path(__file__).resolve().parent
+sys.path[:] = [p for p in sys.path if Path(p).resolve() != _script_dir]
+
 ADMISSION_POLICY_PATH = (
     Path(__file__).resolve().parents[1] / "src/skill3d/evolution/gate_admission_v11.py")
 
