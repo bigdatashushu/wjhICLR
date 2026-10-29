@@ -110,7 +110,8 @@ def test_complete_zero_request_preflight_seals_workspace_binding(tmp_path, monke
     spec = SimpleNamespace(slot_key="object_counting/g0m0", question_type="object_counting",
                            evidence_state="g0m0", content_sha256="0" * 64)
     candidate = SimpleNamespace(content_sha256="1" * 64)
-    revision_ready = {"protected_inputs": {}, "source_identity": {}, "model_identity": {"model": "test-model"}}
+    revision_ready = {"protected_inputs": {}, "source_identity": {}, "gate_request_cap": 512,
+                      "model_identity": {"model": "test-model"}}
     monkeypatch.setattr(gate, "setup", lambda args: (
         SimpleNamespace(protected=lambda *args: {}), runner, Worker(),
         [({"campaign_id": "test-campaign"}, spec, candidate)], revision_ready))

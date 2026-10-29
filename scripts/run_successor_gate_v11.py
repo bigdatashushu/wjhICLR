@@ -164,7 +164,9 @@ def setup(args):
         selection = next(item for item in ready["selected"]
                          if item["campaign_id"] == row["source_campaign"])
         parent = SkillSpecV11.model_validate(read(selection["input_refs"]["request"])["parent"])
-        path = args.revision_root / row["source_kind"] / "SKILL.md"
+        if not row["all_evidence_delivered"] or not row.get("all_batches_resolved", True):
+            raise GateAbort("gate_candidate_evidence_unresolved")
+        path = args.revision_root / row.get("candidate_ref", row["source_kind"] + "/SKILL.md")
         candidate, errors = _static_validate(
             parent=parent, candidate_text=path.read_text(),
             forbidden_sample_ids={str(v) for item in config["panel"]["system_variants"]
@@ -210,7 +212,7 @@ def setup(args):
     coordinator.cached_prefix_recovery = coordinator._cached_prefix_spec = None
     coordinator._request_governor_root = args.output / "request_governor"
     coordinator.request_governor_config = RequestGovernorConfig(
-        max_requests=512, max_inflight=1, requests_per_second=0.0)
+        max_requests=ready["gate_request_cap"], max_inflight=1, requests_per_second=0.0)
     coordinator._episode_semaphore = None
     coordinator.workers = coordinator.episode_concurrency = 1
     coordinator.run_identity = content_sha256({
@@ -240,7 +242,7 @@ def preflight(args):
     plans, outputs = {}, []
 
     def collect(coordinator, episodes):
-        if len(episodes) > 512:
+        if len(plans) + len(episodes) > revision_ready["gate_request_cap"]:
             raise GateAbort("gate_minimum_request_budget")
         pairs = {}
         for arm, variant in episodes:
@@ -288,7 +290,7 @@ def preflight(args):
         "model_identity": revision_ready["model_identity"],
         "solver_config": {key: val for key, val in asdict(runner.base_cfg).items()
                           if key in {"seed", "temperature", "max_tokens", "max_rounds"}},
-        "request_cap": 512, "per_episode_request_cap": 64,
+        "request_cap": revision_ready["gate_request_cap"], "per_episode_request_cap": 64,
         "max_inflight": 1, "transport_retries": 0,
         "executor": "frozen_native_SystemVariantRunner_without_original_receipt_writer",
         "validation_labels_hidden_during_execution": True, "published": False,

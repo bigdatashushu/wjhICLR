@@ -194,3 +194,62 @@ def test_actual_wire_identity_failure_stops_before_consuming_or_repairing_reply(
     assert client.calls == 1
     assert not (tmp_path / "final.json").exists()
     assert not list(tmp_path.glob("validation_*.json"))
+
+
+def deferred_budget(n):
+    return RevisionBudget(max_requests=2 * n + 2, repair_reserve=n + 2, deferred_repair=True)
+
+
+def no_change(text):
+    return {"protocol": PROTOCOL, "base_sha256": digest(text), "action": "no_change",
+            "modification_reason": "Keep the supported working method."}
+
+
+def test_deferred_replay_delivers_later_evidence_and_uses_newest_working_method(tmp_path):
+    p = parent()
+    before = p.skill_md.splitlines()[-1]
+    after = before + " Preserve supported observations."
+    working = apply_edits(p.skill_md, proposal(p.skill_md, before, after))[0]
+    outputs = iter([proposal(p.skill_md, "missing", "replacement"),
+                    proposal(p.skill_md, before, after), no_change(working)])
+    received = []
+
+    def respond(messages):
+        received.append(messages[-1]["content"])
+        return json.dumps(next(outputs))
+
+    client = Client(respond)
+    editor = AnchoredSlotReviser(output_root=tmp_path, client=client, budget=deferred_budget(2),
+                                method_context_max_chars=8000, expected_model="test-model")
+    candidate = editor.run(parent=p, feedback={}, batches=["first facts", "later facts"],
+                          delivery_plan={}, forbidden_ids=set(), cases=[])
+    assert candidate and candidate.skill_md == working
+    final = json.loads((tmp_path / "final.json").read_text())
+    assert final["all_evidence_delivered"] and final["all_batches_resolved"]
+    assert [(row["batch"], row["phase"]) for row in final["checks"]] == [
+        (0, "delivery"), (1, "delivery"), (0, "deferred_replay")]
+    assert "first facts" in received[2] and working in received[2]
+    assert "later facts" in received[1] and client.calls == 3
+
+
+def test_unresolved_batch_blocks_valid_earlier_candidate_after_all_delivery(tmp_path):
+    p = parent()
+    before = p.skill_md.splitlines()[-1]
+    after = before + " Preserve supported observations."
+    working = apply_edits(p.skill_md, proposal(p.skill_md, before, after))[0]
+    outputs = iter([proposal(p.skill_md, before, after)] +
+                   [proposal(working, "missing", "replacement")] * 4)
+    client = Client(lambda _: json.dumps(next(outputs)))
+    editor = AnchoredSlotReviser(output_root=tmp_path, client=client, budget=deferred_budget(2),
+                                method_context_max_chars=8000, expected_model="test-model")
+    assert editor.run(parent=p, feedback={}, batches=["first", "second"], delivery_plan={},
+                      forbidden_ids=set(), cases=[]) is None
+    final = json.loads((tmp_path / "final.json").read_text())
+    assert final["all_evidence_delivered"] and not final["all_batches_resolved"]
+    assert final["unresolved_batch_indices"] == [1]
+    assert client.calls == 5 and not (tmp_path / "SKILL.md").exists()
+
+
+def test_deferred_mode_requires_full_replay_and_final_repair_reservation():
+    assert not RevisionBudget(max_requests=6, repair_reserve=2, deferred_repair=True).plan(2)["admitted"]
+    assert deferred_budget(2).plan(2)["admitted"]
