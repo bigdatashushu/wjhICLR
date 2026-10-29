@@ -278,7 +278,7 @@ def preflight(args):
         "executor": "frozen_native_SystemVariantRunner_without_original_receipt_writer",
         "validation_labels_hidden_during_execution": True, "published": False,
     }
-    value["framework_workspace_binding"] = descriptor
+    value["framework_workspace_binding"] = read(args.output / "framework_io_binding.json")
     runner.framework_state_io.write_json_once(args.output / "preflight.json", value)
     return {key: value[key] for key in ("status", "model_requests", "candidates", "planned_episodes")}
 

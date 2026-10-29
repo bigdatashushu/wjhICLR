@@ -1,6 +1,10 @@
 """Gate service and effective-wire failures must stop, with fixed error codes."""
 import importlib.util
+import json
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,3 +64,64 @@ def test_gate_rejects_returned_model_change():
     checked = gate.CheckedClient(Changed(), "test-model", 137)
     with pytest.raises(gate.GateClientError, match="gate_response_or_wire_identity"):
         checked.chat([], seed=137)
+
+
+def test_complete_zero_request_preflight_seals_workspace_binding(tmp_path, monkeypatch):
+    @dataclass
+    class Config:
+        gate_seeds: tuple = (137, 138)
+        gate_mode: str = "qa_disjoint"
+
+    @dataclass
+    class SolverConfig:
+        seed: int = 137
+        temperature: float = 0.0
+        max_tokens: int = 256
+        max_rounds: int = 4
+
+    class Writer:
+        def write_json_once(self, path, value):
+            Path(path).write_text(json.dumps(value))
+
+    runner = SimpleNamespace(base_cfg=SolverConfig(), framework_state_io=Writer())
+
+    class Arm:
+        label_metadata = {}
+        capture_offline_case_input = False
+
+        def __init__(self, name):
+            self.root = tmp_path / "campaigns/test/gate/137" / name
+
+        def _input_episode_lease(self, variant):
+            return nullcontext()
+
+        def _prepare_one(self, variant, *, preflight=False):
+            assert preflight
+            return {"item": SimpleNamespace(episode=SimpleNamespace(ground_truth=None)),
+                    "plan": {"frozen_public_input": "same"}}
+
+    class Worker:
+        config = Config()
+
+        def _gate(self, request, parent, candidate, root):
+            runner._run_gate_episodes(
+                [(Arm(name), {"variant_id": "test-variant"}) for name in ("parent", "candidate")])
+
+    spec = SimpleNamespace(slot_key="object_counting/g0m0", question_type="object_counting",
+                           evidence_state="g0m0", content_sha256="0" * 64)
+    candidate = SimpleNamespace(content_sha256="1" * 64)
+    revision_ready = {"protected_inputs": {}, "source_identity": {}, "model_identity": {"model": "test-model"}}
+    monkeypatch.setattr(gate, "setup", lambda args: (
+        SimpleNamespace(protected=lambda *args: {}), runner, Worker(),
+        [({"campaign_id": "test-campaign"}, spec, candidate)], revision_ready))
+    binding = {"cache_root": "test-cache", "workspace_bytes": 2_000_000_000}
+    (tmp_path / "framework_io_binding.json").write_text(json.dumps(binding))
+    revision = tmp_path / "revision"
+    revision.mkdir()
+    (revision / "revision_final.json").write_text("{}")
+    args = SimpleNamespace(output=tmp_path, revision_root=revision, state_root=tmp_path, frozen_root=tmp_path)
+    result = gate.preflight(args)
+    receipt = json.loads((tmp_path / "preflight.json").read_text())
+    assert result["model_requests"] == 0 and result["planned_episodes"] == 2
+    assert receipt["framework_workspace_binding"] == binding
+    assert receipt["validation_labels_hidden_during_execution"]
