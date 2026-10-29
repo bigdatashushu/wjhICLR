@@ -114,10 +114,71 @@ def learning_bytes(history, path):
         return raw
 
 
+def isolated_learning_bytes(history, path, cache_root):
+    """Fetch one verified member outside the shared HotCache reservation pool."""
+    cold = getattr(history, "_cold_history", None)
+    if cold is None:
+        return learning_bytes(history, path)
+    record = history.cold_reference(path)
+    if record is None:
+        return learning_bytes(history, path)
+    import fcntl
+    import os
+    import psutil
+    import tempfile
+    from skill3d.storage.cold_history import _MemberWriter
+
+    if record.size > 512 * 1024 * 1024:
+        raise RuntimeError("learning bundle exceeds independent host memory allowance")
+    if psutil.virtual_memory().available < 10 * record.size + 4 * 1024 ** 3:
+        raise RuntimeError("learning bundle exceeds observed host memory headroom")
+    cache_root = Path(cache_root)
+    cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if cache_root.is_symlink() or not cache_root.is_dir():
+        raise RuntimeError("isolated learning cache root changed")
+    descriptor = os.open(cache_root / ".reader.lock",
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if list(cache_root.glob("member-*")):
+            raise RuntimeError("unfinished isolated learning read requires inspection")
+        if psutil.disk_usage(cache_root).free < 25_000_000_000 + record.size + 4 * 1024 ** 2:
+            raise RuntimeError("isolated learning read exceeds free-space floor")
+        # The native reference lease and transport bind the original cold archive.
+        # Only its transient physical destination changes; no original cache entry
+        # or reservation is edited.
+        with cold.lease((record.ref,)):
+            current = cold.validate_reference(record.ref)
+            expected = (record.ref, record.size, record.sha256)
+            if (current.ref, current.size, current.sha256) != expected:
+                raise RuntimeError("learning reference changed before isolated read")
+            with tempfile.TemporaryDirectory(prefix="member-", dir=cache_root) as temporary:
+                member = Path(temporary) / "verified-member"
+                with member.open("xb") as stream:
+                    member.chmod(0o600)
+                    writer = _MemberWriter(stream, record.size, record.sha256)
+                    try:
+                        cold.fetch_member(record.ack, record.member_key, writer)
+                        writer.finish()
+                    finally:
+                        writer._active = False
+                raw = member.read_bytes()
+                if (len(raw) != record.size
+                        or hashlib.sha256(raw).hexdigest() != record.sha256):
+                    raise RuntimeError("isolated learning bundle identity changed")
+                current = cold.validate_reference(record.ref)
+                if (current.ref, current.size, current.sha256) != expected:
+                    raise RuntimeError("learning reference changed during isolated read")
+                return raw
+
+
 def inputs(args, helper, history, selection):
     from skill3d.schemas import SkillSpecV11, V11ExperienceBundle
     _, paths = helper.campaign_inputs(args.state_root, selection)
-    raw = learning_bytes(history, paths["experience"])
+    cache_key = hashlib.sha256(str(args.output.parent).encode()).hexdigest()[:24]
+    raw = isolated_learning_bytes(
+        history, paths["experience"],
+        Path("/var/tmp") / ("harness3d-learning-" + cache_key))
     experience = V11ExperienceBundle.model_validate_json(raw)
     request = read(paths["request"])
     parent = SkillSpecV11.model_validate(request["parent"])

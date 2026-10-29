@@ -20,6 +20,8 @@ stdout 投影识别带标签的对象、列表和 tuple，保留前后文字、�
 
 分析与候选校验通过 `revision_guard_v11` 修正普通词 `sampled` 和 `questioned` 的词法误报。只有通用 ID 正则的全部匹配都是这两个普通词时，才去掉该通用匹配；逐字禁用 ID、其他 ID 样式及答案赋值仍拒绝。如果真实禁用 ID 本身是 `sampled`，也不会获准。静态校验使用独立函数命名空间绑定该守卫，原生 leakage 模块、原生校验函数全局状态和 admission v2 均不修改。守卫源码进入预检身份，已有封存运行继续使用原版本。
 
+`run_reviser_successor_v11.isolated_learning_bytes(...)` 为学习 bundle 使用独立 NVMe 临时目录。原生 cold-reference 租约、索引验证、受信任成员传输及长度/SHA 检查继续生效；临时目的路径不占用原 HotCache 的预留池。每个 successor 的目录由输出路径哈希确定，进程锁限制同时只有一个成员，单成员最多 512 MiB，保留 25 GB 空间下限及内存余量检查。读取结束或传输失败即删除临时成员；崩溃遗留成员阻止新读取并要求检查，不自动删除或重试。新入口在预检和执行阶段均使用此读取方式，实际输入身份仍按原始字节封存。
+
 ## 独立运行
 
 以下参数均需指向现场已核验的目录。`SOURCE_ROOT` 是本版本源码，`FROZEN_ROOT` 与 `STATE_ROOT` 是冻结运行和原生状态目录，`CAMPAIGN_INDEX` 是保留 campaign 索引。`TRIAL_ROOT` 与 `GATE_ROOT` 必须在冻结资产目录之外。
