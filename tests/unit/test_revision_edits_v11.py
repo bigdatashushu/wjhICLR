@@ -10,6 +10,7 @@ from skill3d.evolution.revision_edits_v11 import (
 )
 from skill3d.evolution.fitset_revision_v11 import RevisionOperationalError
 from skill3d.skills.registry import load_active_skills
+from skill3d.synthesis.request_audit import describe_request
 
 
 def proposal(text, before, after, section_id=0):
@@ -80,6 +81,10 @@ class Client:
 
     def chat(self, messages, **kwargs):
         self.calls += 1
+        self.last_request_identity = describe_request(
+            self.build_payload(messages, **kwargs),
+            model_identity=self.audit_identity(seed=kwargs["seed"]),
+            wire_encoding_known=True)
         return self.respond(messages)
 
 
@@ -171,3 +176,21 @@ def test_response_identity_failure_is_operational_and_never_repaired(tmp_path):
         reviser.run(parent=p, feedback={}, batches=["facts"], delivery_plan={},
                     forbidden_ids=set(), cases=[])
     assert client.calls == 1 and not (tmp_path / "final.json").exists()
+
+
+def test_actual_wire_identity_failure_stops_before_consuming_or_repairing_reply(tmp_path):
+    p = parent()
+
+    def changed_wire(_):
+        client.last_request_identity["wire_payload_sha256"] = "0" * 64
+        return "{}"
+
+    client = Client(changed_wire)
+    reviser = AnchoredSlotReviser(output_root=tmp_path, client=client,
+               budget=RevisionBudget(), method_context_max_chars=8000, expected_model="test-model")
+    with pytest.raises(RevisionOperationalError, match="actual revision request identity"):
+        reviser.run(parent=p, feedback={}, batches=["facts"], delivery_plan={},
+                    forbidden_ids=set(), cases=[])
+    assert client.calls == 1
+    assert not (tmp_path / "final.json").exists()
+    assert not list(tmp_path.glob("validation_*.json"))

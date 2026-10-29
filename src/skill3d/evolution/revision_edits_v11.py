@@ -281,6 +281,10 @@ class AnchoredSlotReviser:
             "actual_request_identity": getattr(self.client, "last_request_identity", {})})
         if response_identity.get("model") != self.expected_model:
             raise RevisionOperationalError("response model identity changed")
+        actual_request = getattr(self.client, "last_request_identity", {}) or {}
+        if (digest(json.dumps(actual_request, sort_keys=True))
+                != digest(json.dumps(request_identity, sort_keys=True))):
+            raise RevisionOperationalError("actual revision request identity changed")
         if (getattr(self.client, "last_generation", {}) or {}).get("finish_reason") == "length":
             raise EditProtocolError("truncated_edit_response")
         try:
