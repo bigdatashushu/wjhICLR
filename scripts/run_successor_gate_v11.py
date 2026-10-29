@@ -83,8 +83,9 @@ class CheckedClient:
 
 
 class CheckedFactory:
-    def __init__(self, config, endpoint, model):
+    def __init__(self, config, endpoint, model, framework_state_io):
         self.config, self.endpoint, self.model = config, endpoint, model
+        self.framework_state_io = framework_state_io
 
     def __call__(self, seed, output):
         from run_fitset_v11 import _RevisionClientFactory
@@ -109,7 +110,8 @@ class CheckedFactory:
                 raise GateAbort("gate_service_unconfigured")
             return FailClosedSeededClient(
                 CheckedClient(raw, self.model, seed), seed,
-                output / "request_seeds" / (_variant_key(variant_id) + ".json"))
+                output / "request_seeds" / (_variant_key(variant_id) + ".json"),
+                framework_state_io=self.framework_state_io)
         return make
 
 
@@ -118,6 +120,9 @@ def setup(args):
     from skill3d.evolution.fitset_stream_v11 import FitSetWorkerEvolution
     from skill3d.evolution.fitset_revision_v11 import _static_validate
     from skill3d.schemas import SkillSpecV11
+    from skill3d.storage.framework_state_io import FrameworkStateIO
+    from skill3d.storage.hot_cache import HotCache
+    from skill3d.storage.state_workspace import StateWorkspace
     from skill3d.synthesis.request_governor import RequestGovernorConfig
     import freeze_runner_binding_ops
 
@@ -152,6 +157,17 @@ def setup(args):
     if not candidates:
         raise GateAbort("gate_has_no_static_candidate")
 
+    descriptor = read(args.output / "framework_io_binding.json")
+    cache = HotCache(Path(descriptor["cache_root"]),
+                     quota_bytes=descriptor["quota_bytes"],
+                     min_free_bytes=descriptor["min_free_bytes"])
+    workspace = StateWorkspace(cache, descriptor["key"], bounded=True)
+    gate_io = FrameworkStateIO(
+        workspace, job="reviser-successor-gate-20261029",
+        max_workspace_bytes=descriptor["workspace_bytes"])
+    if gate_io.root != args.output or cache.min_free_bytes != io._workspace.cache.min_free_bytes:
+        raise GateAbort("gate_workspace_identity_or_storage_floor")
+
     class IsolatedRunner(SystemVariantRunner):
         def _write_create_once(self, path, value):
             if not Path(path).is_relative_to(args.output):
@@ -170,7 +186,7 @@ def setup(args):
     coordinator = IsolatedRunner.__new__(IsolatedRunner)
     coordinator.__dict__ = copy.copy(vars(native))
     coordinator.root = args.output
-    coordinator.framework_state_io = None
+    coordinator.framework_state_io = gate_io
     coordinator.deployment_continuation = coordinator._continuation = None
     coordinator.cached_prefix_recovery = coordinator._cached_prefix_spec = None
     coordinator._request_governor_root = args.output / "request_governor"
@@ -185,7 +201,7 @@ def setup(args):
         "gate_source": identity(Path(__file__)),
     })
     coordinator.gate_client_factory = CheckedFactory(
-        config["settings"], config["transport"]["endpoint"], ready["model_identity"]["model"])
+        config["settings"], config["transport"]["endpoint"], ready["model_identity"]["model"], gate_io)
     worker = FitSetWorkerEvolution.__new__(FitSetWorkerEvolution)
     worker.runner, worker.config = coordinator, native.evolution_config
     worker.rows = native.gate_variant_rows
@@ -255,7 +271,8 @@ def preflight(args):
         "executor": "frozen_native_SystemVariantRunner_without_original_receipt_writer",
         "validation_labels_hidden_during_execution": True, "published": False,
     }
-    seal(args.output / "preflight.json", value)
+    value["framework_workspace_binding"] = descriptor
+    runner.framework_state_io.write_json_once(args.output / "preflight.json", value)
     return {key: value[key] for key in ("status", "model_requests", "candidates", "planned_episodes")}
 
 
@@ -264,10 +281,13 @@ def run(args):
     ready = read(args.output / "preflight.json")
     if ready["gate_source_identity"] != identity(Path(__file__)):
         raise GateAbort("gate_source_changed")
-    seal(args.output / "startup.json", {"at": time.time(), "preflight": identity(args.output / "preflight.json")})
     service = __import__("storage_scaleup_service_ops").facade()
     service.load_service_environment()
     tools, runner, worker, candidates, revision_ready = setup(args)
+    if (args.output / "startup.json").exists():
+        raise GateAbort("gate_existing_startup_no_automatic_resume")
+    runner.framework_state_io.write_json_once(
+        args.output / "startup.json", {"at": time.time(), "preflight": identity(args.output / "preflight.json")})
     if ready["revision_final_identity"] != identity(args.revision_root / "revision_final.json"):
         raise GateAbort("gate_revision_changed")
     for path, expected in ready["native_sources"].items():
@@ -276,7 +296,7 @@ def run(args):
     if tools.protected(args.state_root, args.frozen_root) != revision_ready["protected_inputs"]:
         raise GateAbort("gate_original_assets_changed")
     runner._prepared_identity = ready["prepared_input_identities"]
-    governor = RequestGovernor(runner.request_governor_root, runner.request_governor_config)
+    governor = runner._request_governor()
 
     def execute(coordinator, episodes):
         for arm, variant in episodes:
@@ -288,7 +308,8 @@ def run(args):
             result = arm._run_one(variant)
             if result.get("service_errors"):
                 raise GateAbort("gate_episode_service_failure")
-            seal(arm.root / "progress" / (hashlib.sha256(key.encode()).hexdigest() + ".json"), {
+            runner.framework_state_io.write_json_once(
+                arm.root / "progress" / (hashlib.sha256(key.encode()).hexdigest() + ".json"), {
                 "status": result["status"], "requests": result.get("model_request_count"),
                 "at": time.time(), "gate_request_summary": governor.summary()})
 
@@ -303,7 +324,7 @@ def run(args):
                                       evidence_state=parent.evidence_state)
             root = args.output / "campaigns" / selection["campaign_id"]
             decision = worker._gate(request, parent, candidate, root)
-            seal(root / "decision.json", decision)
+            runner.framework_state_io.write_json_once(root / "decision.json", decision)
             results.append({"campaign_id": selection["campaign_id"], "slot_key": parent.slot_key,
                             "decision": decision})
     except BaseException as exc:
@@ -314,7 +335,7 @@ def run(args):
     final = {"status": "stopped_on_operational_failure" if failure else "gate_complete",
              "results": results, "failure": failure, "request_governor": governor.summary(),
              "protected_inputs_unchanged": unchanged, "published": False, "at": time.time()}
-    seal(args.output / "final.json", final)
+    runner.framework_state_io.write_json_once(args.output / "final.json", final)
     return final
 
 
