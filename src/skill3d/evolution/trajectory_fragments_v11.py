@@ -54,7 +54,7 @@ def split_fields(row, fits):
                       path == ["complete_case", "rounds", 0] or path[-1] == "rounds")
         protected_page_list = path[-1] == "delivered_observation_pages"
         atomic_children_fit = (not isinstance(value, (list, dict)) or all(
-            len(canonical(child)) <= 8192 for child in
+            len(canonical(child)) <= 16384 for child in
             (value.values() if isinstance(value, dict) else value)))
         if (not structural and not protected_page_list and size >= 2048
                 and isinstance(value, (list, dict, str)) and len(value) > 1

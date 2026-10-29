@@ -67,3 +67,11 @@ def test_large_nested_string_splits_inside_diagnostics_and_retains_error_facts()
                for field in pieces[0]["round_fragment"]["fields"])
     assert all(piece["complete_case"]["rounds"][0]["execution_diagnostics"]["error_type"]
                == "TypeError" for piece in pieces)
+
+
+def test_medium_array_items_can_be_fragments_without_repeating_all_small_fields():
+    row = sample()
+    row["complete_case"]["rounds"][0]["results"] = [
+        {"payload": "a" * 9000}, *({"payload": "b" * 800} for _ in range(20))]
+    pieces = split_fields(row, lambda rows: len(canonical(rows)) < 18000)
+    assert restore_fields(pieces) == row
