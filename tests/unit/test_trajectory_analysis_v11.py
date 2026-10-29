@@ -108,3 +108,11 @@ def test_labeled_stdout_objects_drop_only_native_audit_fields(monkeypatch):
     assert value["lines"][0]["literal_type"] == "tuple"
     assert value["lines"][0]["object_values"] == [kept, kept]
     assert value["lines"][0]["suffix"] == " distance 2.7\n"
+    detection = {"candidate_id": "det_a", "bbox": [1, 2, 3, 4], "score": 0.9,
+                 "semantic_admission": False, "semantic_relation": {"same_object": None},
+                 "semantic_request_identity": {"audit": "x" * 1000},
+                 "semantic_binary_response": "actual recorded review"}
+    value, receipt = project_printed_objects("raw " + repr(detection) + " tail\n")
+    assert receipt["projected_objects"] == 1
+    assert value["lines"][0]["object_values"] == {
+        key: child for key, child in detection.items() if key != "semantic_request_identity"}

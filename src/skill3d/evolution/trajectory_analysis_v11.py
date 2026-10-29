@@ -36,11 +36,18 @@ def project_printed_objects(text: str) -> tuple[object, dict]:
     from skill3d.evolution.revision_view_v11 import _candidate_facts
     metadata = {"binding_provenance", "semantic_request_identity", "candidate_ids",
                 "mask_per_frame", "pointcloud_world", "pointconf_world"}
+    detection_audit = {"semantic_request_identity", "request_sha256",
+                       "semantic_binary_response_sha256", "semantic_binary_review_sha256",
+                       "semantic_model_identity_sha256", "semantic_observation_sha256",
+                       "semantic_relation_request_sha256", "semantic_visual_request_sha256"}
     if not isinstance(text, str) or len(text) > 8_000_000:
         return text, {"projected_lines": 0, "projected_objects": 0}
     lines, count, objects = [], 0, 0
 
     def object_view(obj):
+        if "obj_id" not in obj:
+            return {key: deepcopy(value) for key, value in obj.items()
+                    if key not in detection_audit}
         facts = _candidate_facts(obj)
         facts.update({key: deepcopy(value) for key, value in obj.items()
                       if key not in metadata and key not in facts
@@ -60,8 +67,10 @@ def project_printed_objects(text: str) -> tuple[object, dict]:
                 continue
             candidates = value if isinstance(value, (list, tuple)) else [value]
             if not candidates or not all(
-                    isinstance(obj, dict) and isinstance(obj.get("obj_id"), str)
-                    and obj["obj_id"] for obj in candidates):
+                    isinstance(obj, dict) and (
+                        isinstance(obj.get("obj_id"), str) and obj["obj_id"]
+                        or isinstance(obj.get("candidate_id"), str) and obj["candidate_id"]
+                        and "bbox" in obj) for obj in candidates):
                 continue
             projected = [object_view(obj) for obj in candidates]
             lines.append({"prefix": line[:start], "literal_type": type(value).__name__,
