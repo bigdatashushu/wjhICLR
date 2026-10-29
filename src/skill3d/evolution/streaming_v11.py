@@ -74,10 +74,13 @@ def _write_create_once(path: Path, data: bytes) -> None:
 class StreamingEvolutionConfig:
     batch_size: int = 12
     tail_for_unattempted_slots: bool = True
+    minimum_tail_cases: int = 1
 
     def __post_init__(self) -> None:
         if int(self.batch_size) <= 0:
             raise ValueError("batch_size must be a positive integer")
+        if not 1 <= int(self.minimum_tail_cases) <= int(self.batch_size):
+            raise ValueError("minimum_tail_cases must be within the batch size")
 
 
 @dataclass(frozen=True)
@@ -343,6 +346,8 @@ class StreamingEvolutionRunner:
         if slot is None or not slot.case_refs:
             return None
         if slot.attempted_ever or not self.config.tail_for_unattempted_slots:
+            return None
+        if len(slot.case_refs) < self.config.minimum_tail_cases:
             return None
         return self._attempt(slot, trigger="tail", callback=attempt)
 

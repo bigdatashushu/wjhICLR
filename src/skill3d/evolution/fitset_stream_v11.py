@@ -80,6 +80,8 @@ class FitSetEvolutionConfig:
     diagnosis_max_input_chars: int = 64000
     diagnosis_max_images: int = 8
     diagnosis_max_output_tokens: int = 4096
+    tail_for_unattempted_slots: bool = False
+    minimum_tail_cases: int = 4
 
     def __post_init__(self):
         if self.batch_size != 12:
@@ -100,6 +102,8 @@ class FitSetEvolutionConfig:
         if min(self.diagnosis_max_cases, self.diagnosis_max_input_chars,
                self.diagnosis_max_images, self.diagnosis_max_output_tokens) < 1:
             raise ValueError("diagnosis budgets must be positive")
+        if not 1 <= self.minimum_tail_cases < self.batch_size:
+            raise ValueError("minimum_tail_cases must be below the batch threshold")
 
 
 class FitSetExperienceCase(Spec):
@@ -404,7 +408,9 @@ class FitSetWorkerEvolution:
             self.root / "buffer",
             stream_id=f"fit-worker-{worker_index:02d}-{runner.run_identity[:12]}",
             config=StreamingEvolutionConfig(
-                batch_size=self.config.batch_size, tail_for_unattempted_slots=False),
+                batch_size=self.config.batch_size,
+                tail_for_unattempted_slots=self.config.tail_for_unattempted_slots,
+                minimum_tail_cases=self.config.minimum_tail_cases),
         )
         self.rows = {row["variant_id"]: row for row in runner.variants}
         self.rows.update(getattr(runner, "gate_variant_rows", {}))

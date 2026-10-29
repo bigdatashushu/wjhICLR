@@ -199,6 +199,26 @@ def test_tail_attempt_only_runs_for_never_attempted_slot(tmp_path):
     ) is None
 
 
+def test_tail_waits_for_configured_minimum_and_runs_once(tmp_path):
+    runner = StreamingEvolutionRunner(
+        tmp_path, stream_id="minimum-tail",
+        config=StreamingEvolutionConfig(batch_size=12, minimum_tail_cases=4),
+    )
+    requests = []
+
+    def reject(request):
+        requests.append(request)
+        return StreamingAttemptResult(outcome="rejected", campaign_id="minimum-tail")
+
+    for index in range(3):
+        runner.ingest(_case(index), parent_snapshot_id="snapshot-parent")
+    assert runner.flush_tail("object_rel_distance/g1m0", attempt=reject) is None
+    runner.ingest(_case(3), parent_snapshot_id="snapshot-parent")
+    assert runner.flush_tail("object_rel_distance/g1m0", attempt=reject).outcome == "rejected"
+    assert runner.flush_tail("object_rel_distance/g1m0", attempt=reject) is None
+    assert len(requests) == 1
+
+
 def test_deferred_slot_accumulates_until_explicit_retry(tmp_path):
     runner = StreamingEvolutionRunner(
         tmp_path,
