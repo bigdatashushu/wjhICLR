@@ -11,6 +11,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cache-root", type=Path, required=True)
     parser.add_argument("--archive-root", type=Path, required=True)
+    parser.add_argument("--key", default="reviser-successor-gate-20261029")
     args = parser.parse_args()
     from skill3d.storage.hot_cache import HotCache
     from skill3d.storage.state_workspace import StateWorkspace
@@ -19,7 +20,7 @@ def main():
     args.archive_root.mkdir(mode=0o700, parents=True, exist_ok=False)
     descriptor = {
         "cache_root": str(args.cache_root),
-        "key": "reviser-successor-gate-20261029",
+        "key": args.key,
         "quota_bytes": 4_000_000_000,
         "min_free_bytes": 25_000_000_000,
         "workspace_bytes": 2_000_000_000,

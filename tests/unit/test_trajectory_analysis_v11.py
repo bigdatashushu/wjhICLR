@@ -1,0 +1,282 @@
+"""Analysis coverage, copy protection and isolated evidence projection."""
+import json
+import sys
+from types import FunctionType, MethodType, ModuleType, SimpleNamespace
+
+import pytest
+
+from skill3d.evolution.trajectory_analysis_v11 import (
+    ANALYSIS_PROTOCOL, TrajectoryAnalyst, allocate_analysis_chars, analysis_field_budget,
+    compact_batch, plan_analysis_evidence, project_printed_objects, validate_analysis,
+)
+from skill3d.evolution.revision_edits_v11 import EditProtocolError, RevisionBudget, digest
+from skill3d.evolution.fitset_revision_v11 import RevisionOperationalError
+
+
+def analysis():
+    return {"protocol":ANALYSIS_PROTOCOL,"batch_sha256":"batch",
+            "records":[{"case_index":0,"round_indices":[0,1],
+                "observed_facts":"The program retried after a missing argument.",
+                "failure_hypothesis":"An unchecked argument may explain the exception.",
+                "supported_skill_change":"Check required arguments before calling a tool.",
+                "uncertainty":"This does not establish a perception failure."}]}
+
+
+def test_all_rounds_required_and_fabricated_references_rejected():
+    kwargs=dict(expected_cases={0:{0,1}},batch_sha256="batch",cases=[],forbidden_ids=set())
+    assert validate_analysis(analysis(),**kwargs)["records"][0]["round_indices"] == [0,1]
+    for rounds in ([0],[0,1,2]):
+        value=analysis();value["records"][0]["round_indices"]=rounds
+        with pytest.raises(EditProtocolError,match="round_reference"):
+            validate_analysis(value,**kwargs)
+    value=analysis();value["records"][0].pop("round_indices")
+    assert validate_analysis(value,**kwargs)["records"][0]["round_indices"] == [0,1]
+
+
+def test_duplicate_cases_and_question_copy_never_become_analysis():
+    kwargs=dict(expected_cases={0:{0,1}},batch_sha256="batch",cases=[],forbidden_ids=set())
+    value=analysis();value["records"]*=2
+    with pytest.raises(EditProtocolError,match="case_coverage"):
+        validate_analysis(value,**kwargs)
+    value=analysis()
+    question="Which objects have the greatest distance from the doorway?"
+    value["records"][0]["observed_facts"]=question
+    with pytest.raises(EditProtocolError,match="sample_copy"):
+        validate_analysis(value,**{**kwargs,"cases":[{"question_text":question}]})
+
+
+def test_repair_codes_distinguish_size_answer_syntax_and_identifiers():
+    kwargs=dict(expected_cases={0:{0,1}},batch_sha256="batch",cases=[],forbidden_ids=set())
+    with pytest.raises(EditProtocolError,match="text_budget"):
+        validate_analysis(analysis(),**kwargs,max_chars=10)
+    value=analysis(); value["records"][0]["observed_facts"]="The code emitted answer = 3."
+    with pytest.raises(EditProtocolError,match="answer_assignment"):
+        validate_analysis(value,**kwargs)
+    value=analysis(); value["records"][0]["observed_facts"]="The program repeated work on sample_abcdef."
+    with pytest.raises(EditProtocolError,match="sample_identifier"):
+        validate_analysis(value,**kwargs)
+
+
+def test_projection_retains_values_code_and_authorization_semantics(monkeypatch):
+    graph=ModuleType("skill3d.evolution.evidence_graph_v11")
+    graph.canonical_text=lambda v:json.dumps(v,sort_keys=True,separators=(",",":"))
+    graph.decode_evidence_graph=lambda v:v["value"]
+    graph.encode_evidence_graph=lambda v:{"value":v}
+    monkeypatch.setitem(sys.modules,graph.__name__,graph)
+    row={"index":0,"program_source":"answer = measured_value",
+         "results":[{"payload":{"distance":2.7,"unit":"m"},"authorization":{"allowed":False}}],
+         "observation_reads":[{"data":{"distance":2.7},"coverage_complete":False}],
+         "source_ref":"/audit/file"}
+    value={"source_bundle_sha256":"source","bundle_metadata":{"source_split":"validation",
+           "label_access":True},"case_contexts":{"0":{"case_index":0,"source_case_sha256":"hash",
+           "case_header":{"source_split":"validation","learning_authorization":{
+               "authorized":True,"manifest_identity":{"path":"/host"}}}}},
+           "case_components":[{"case_context_ref":"0","rounds":[row]}]}
+    text="Graph instructions\n"+graph.canonical_text(graph.encode_evidence_graph(value))
+    result,receipt=compact_batch(text)
+    rebuilt=graph.decode_evidence_graph(json.loads(result.split("\n",1)[1]))
+    kept=rebuilt["case_components"][0]["rounds"][0]
+    assert kept["results"]==row["results"]
+    assert kept["observation_reads"]==row["observation_reads"]
+    assert kept["program_source"]==row["program_source"]
+    assert rebuilt["case_contexts"]["0"]["case_header"]["source_split"]=="validation"
+    assert rebuilt["case_contexts"]["0"]["case_header"]["learning_authorization"]=={"authorized":True}
+    assert "source_ref" not in kept and receipt["all_retained_decision_values_preserved"]
+
+
+def test_labeled_stdout_objects_drop_only_native_audit_fields(monkeypatch):
+    native = ModuleType("skill3d.evolution.revision_view_v11")
+    native._candidate_facts = lambda obj: {
+        key: obj[key] for key in ("obj_id", "bbox") if key in obj}
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+    obj = {"obj_id": "a", "bbox": [0, 0, 10, 10], "distance": 2.7,
+           "allowed": False, "binding_provenance": {"audit": "x" * 1000},
+           "mask_per_frame": {"0": "/storage/a"}}
+    text = "objects " + repr([obj, obj]) + "\n" + repr(obj) + "\nunknown = None\n"
+    value, receipt = project_printed_objects(text)
+    assert receipt == {"projected_lines": 2, "projected_objects": 3}
+    kept = value["lines"][0]["object_values"][0]
+    assert kept == {"obj_id": "a", "bbox": [0, 0, 10, 10], "distance": 2.7,
+                    "allowed": False}
+    assert value["lines"][0]["prefix"] == "objects "
+    assert value["lines"][0]["suffix"] == "\n"
+    assert value["lines"][2] == {"verbatim": "unknown = None\n"}
+    # An unknown printed value is neither normalized nor evaluated.
+    ambiguous = "object = {'obj_id': 'a', 'value': calculate()}\n"
+    assert project_printed_objects(ambiguous)[0] == ambiguous
+    pair = "pair " + repr(obj) + ", " + repr(obj) + " distance 2.7\n"
+    value, receipt = project_printed_objects(pair)
+    assert receipt["projected_objects"] == 2
+    assert value["lines"][0]["literal_type"] == "tuple"
+    assert value["lines"][0]["object_values"] == [kept, kept]
+    assert value["lines"][0]["suffix"] == " distance 2.7\n"
+    detection = {"candidate_id": "det_a", "bbox": [1, 2, 3, 4], "score": 0.9,
+                 "semantic_admission": False, "semantic_relation": {"same_object": None},
+                 "semantic_request_identity": {"audit": "x" * 1000},
+                 "semantic_binary_response": "actual recorded review"}
+    value, receipt = project_printed_objects("raw " + repr(detection) + " tail\n")
+    assert receipt["projected_objects"] == 1
+    assert value["lines"][0]["object_values"] == {
+        key: child for key, child in detection.items() if key != "semantic_request_identity"}
+
+
+def _planner_body(self, *, parent, feedback, experience, diagnosis):
+    view = decision_bundle_view(experience)
+    rows = split_round_components(view["cases"][0], lambda rows: True)
+    rebuilt = reassemble_round_components(rows)
+    prompt = self._prompt(parent=parent, evidence_text="full evidence")
+    return [prompt], {"rebuilt": rebuilt, "request_budget": self.evidence_request_budget}
+
+
+def test_planner_hooks_are_isolated_from_native_instance_and_module(monkeypatch):
+    import skill3d.evolution.trajectory_fragments_v11 as fragments
+    view = {"cases": [{"rounds": [{"index": 0}]}]}
+    namespace = {
+        "decision_bundle_view": lambda raw: raw,
+        "split_round_components": lambda row, fits: [row],
+        "reassemble_round_components": lambda rows: rows,
+    }
+    originals = dict(namespace)
+    native = SimpleNamespace(_prompt=lambda **kwargs: "native prompt",
+                             evidence_request_budget=18)
+    function = FunctionType(_planner_body.__code__, namespace)
+    native._evidence_batches = MethodType(function, native)
+    saved = dict(vars(native))
+    analyst = SimpleNamespace(_prompt=lambda **kwargs: "analysis " + kwargs["evidence"])
+    batches, plan = plan_analysis_evidence(
+        native, analyst=analyst, parent=SimpleNamespace(skill_md="parent"),
+        feedback={}, experience=view)
+    assert batches == ["analysis full evidence"]
+    assert plan["rebuilt"] == view["cases"]
+    assert plan["stdout_projection"]["raw_record_retained"]
+    assert plan["request_budget"] == 128
+    assert vars(native) == saved and function.__globals__ == originals
+    assert view == {"cases": [{"rounds": [{"index": 0}]}]}
+
+    def refuses(row, fits):
+        raise ValueError("native array refusal")
+
+    function.__globals__["split_round_components"] = refuses
+    monkeypatch.setattr(fragments, "split_fields", lambda row, fits: [row])
+    assert plan_analysis_evidence(
+        native, analyst=analyst, parent=SimpleNamespace(skill_md="parent"),
+        feedback={}, experience=view)[1]["rebuilt"] == view["cases"]
+    assert function.__globals__["split_round_components"] is refuses
+
+    def field_refusal(row, fits):
+        raise fragments.FragmentRefusal("field_refusal", {"template_chars": 17})
+
+    monkeypatch.setattr(fragments, "split_fields", field_refusal)
+    refusals = []
+    with pytest.raises(fragments.FragmentRefusal, match="field_refusal"):
+        plan_analysis_evidence(
+            native, analyst=analyst, parent=SimpleNamespace(skill_md="parent"),
+            feedback={}, experience=view,
+            on_fragment_refusal=lambda row, error: refusals.append(error))
+    assert refusals == [{"code": "field_refusal", "facts": {"template_chars": 17}}]
+    assert vars(native) == saved
+
+
+def test_field_budget_reserves_host_rounds_and_every_case():
+    refs = {i: set(range(15)) for i in range(8)}
+    limit = analysis_field_budget(refs, 3500)
+    value = analysis()
+    value["records"] = []
+    for index, rounds in refs.items():
+        value["records"].append({
+            "case_index": index, "round_indices": sorted(rounds),
+            **{key: "x" * limit for key in (
+                "observed_facts", "failure_hypothesis", "supported_skill_change", "uncertainty")}})
+    assert len(validate_analysis(
+        value, expected_cases=refs, batch_sha256="batch", cases=[],
+        forbidden_ids=set(), max_chars=3500)["records"]) == 8
+    with pytest.raises(RevisionOperationalError, match="insufficient prose"):
+        analysis_field_budget(refs, 100)
+
+
+def test_dense_batch_gets_prose_per_case_without_increasing_total_budget(tmp_path):
+    refs = [{0: {0}}] * 26 + [{0: {0}, 1: {1}}] + [{1: {1}}] * 5
+    limits = allocate_analysis_chars(refs)
+    assert sum(limits) == 42000 and max(limits) <= 12000
+    dense_limit = analysis_field_budget(refs[26], limits[26])
+    assert dense_limit > analysis_field_budget(refs[26], 42000 // len(refs))
+    assert abs(dense_limit - analysis_field_budget(refs[0], limits[0])) <= 1
+    value = analysis()
+    value["records"] = [
+        {"case_index": index,
+         **{key: "x" * dense_limit for key in (
+             "observed_facts", "failure_hypothesis", "supported_skill_change", "uncertainty")}}
+        for index in refs[26]]
+    assert len(validate_analysis(value, expected_cases=refs[26],
+        batch_sha256="batch", cases=[], forbidden_ids=set(), max_chars=limits[26])["records"]) == 2
+    capped = allocate_analysis_chars([{0: {0}}, {i: {0} for i in range(8)}])
+    assert capped == [12000, 12000]
+    with pytest.raises(RevisionOperationalError, match="schemas exceed"):
+        allocate_analysis_chars(refs, total_chars=100)
+    analyst = TrajectoryAnalyst(output_root=tmp_path, client=None,
+        budget=RevisionBudget(max_requests=2, repair_reserve=0),
+        method_context_max_chars=12000, expected_model="qwen3.8-flash")
+    analyst.analysis_batch_chars = {digest("dense"): limits[26]}
+    assert analyst._analysis_limit("dense") == limits[26]
+    with pytest.raises(RevisionOperationalError, match="budget identity mismatch"):
+        analyst._analysis_limit("changed")
+
+
+@pytest.mark.parametrize("replay_valid", [True, False])
+def test_analysis_delivers_all_before_replay_and_requires_every_resolution(
+        tmp_path, monkeypatch, replay_valid):
+    import skill3d.evolution.trajectory_analysis_v11 as module
+    monkeypatch.setattr(module, "batch_case_rounds", lambda batch: {0: {0, 1}})
+    analyst = TrajectoryAnalyst(output_root=tmp_path, client=None,
+        budget=RevisionBudget(max_requests=4, repair_reserve=0),
+        method_context_max_chars=12000, expected_model="qwen3.8-flash")
+    analyst._prompt = lambda **kwargs: kwargs["evidence"]
+    calls = []
+
+    def request(prompt, *, batch_index):
+        analyst.requests += 1
+        calls.append(batch_index)
+        if batch_index == 0 and (len(calls) == 1 or not replay_valid):
+            raise EditProtocolError("analysis_text_budget")
+        value = analysis()
+        value["batch_sha256"] = digest(prompt)
+        return value
+
+    analyst._request = request
+    summaries = analyst.analyze(parent=SimpleNamespace(skill_md="parent"),
+        feedback={}, batches=["first", "second"], cases=[], forbidden_ids=set())
+    assert calls == [0, 1, 0]
+    final = json.loads((tmp_path / "analysis_final.json").read_text())
+    assert final["all_evidence_delivered"] and final["delivered_batch_indices"] == [0, 1]
+    assert final["all_batches_resolved"] == replay_valid
+    assert (summaries is not None) == replay_valid
+    if replay_valid:
+        assert [a["batch_sha256"] for a in summaries] == [digest("first"), digest("second")]
+    else:
+        assert final["unresolved_batch_indices"] == [0]
+    assert "observed_facts" not in (tmp_path / "analysis_final.json").read_text()
+
+
+def test_analysis_operational_stop_never_replays_or_invents_delivery(tmp_path, monkeypatch):
+    import skill3d.evolution.trajectory_analysis_v11 as module
+    monkeypatch.setattr(module, "batch_case_rounds", lambda batch: {0: {0, 1}})
+    analyst = TrajectoryAnalyst(output_root=tmp_path, client=None,
+        budget=RevisionBudget(max_requests=4, repair_reserve=0),
+        method_context_max_chars=12000, expected_model="qwen3.8-flash")
+    analyst._prompt = lambda **kwargs: kwargs["evidence"]
+    calls = []
+
+    def request(prompt, *, batch_index):
+        analyst.requests += 1
+        calls.append(batch_index)
+        if batch_index == 0:
+            raise EditProtocolError("analysis_text_budget")
+        raise RevisionOperationalError("service stopped")
+
+    analyst._request = request
+    with pytest.raises(RevisionOperationalError, match="service stopped"):
+        analyst.analyze(parent=SimpleNamespace(skill_md="parent"), feedback={},
+                        batches=["first", "second"], cases=[], forbidden_ids=set())
+    assert calls == [0, 1]
+    assert not (tmp_path / "analysis_final.json").exists()
+    assert not (tmp_path / "coverage_request_02.json").exists()

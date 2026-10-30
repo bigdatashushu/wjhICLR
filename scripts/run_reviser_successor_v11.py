@@ -57,20 +57,25 @@ def protected(state, frozen):
 def source_identity(args):
     native = args.frozen_root / "runtime-parallel-reviser-v11-20261028"
     paths = [Path(__file__), args.source_root / "src/skill3d/evolution/revision_edits_v11.py",
+             args.source_root / "src/skill3d/evolution/revision_guard_v11.py",
              native / "code_identity.json"]
     paths.extend(p for p in (native / "source").rglob("*")
                  if p.is_file() and p.suffix in {".py", ".yaml", ".toml"})
     # Native operators are part of the imported runtime, even when no Git checkout
     # contains them. Hash their identities without exporting their contents.
     paths.extend((args.frozen_root / "ops").glob("*.py"))
+    if args.campaign_index is not None:
+        paths.append(args.campaign_index)
     return {str(path): identity(path) for path in sorted(set(paths))}
 
 
 def setup(args):
-    # Add only the task's new editor module to the native package search path.
-    import skill3d.evolution
-    skill3d.evolution.__path__.insert(0, str(args.source_root / "src/skill3d/evolution"))
-    from skill3d.evolution.revision_edits_v11 import AnchoredSlotReviser, RevisionBudget
+    # Bind the scoped guard and editor explicitly, without replacing native
+    # leakage/validation modules or other frozen runtime dependencies.
+    load_module("skill3d.evolution.revision_guard_v11",
+                args.source_root / "src/skill3d/evolution/revision_guard_v11.py")
+    editor = load_module("skill3d.evolution.revision_edits_v11",
+                         args.source_root / "src/skill3d/evolution/revision_edits_v11.py")
     helper = load_module("successor_native_readonly_helper",
                          args.frozen_root / "ops/posthoc_reviser_rescue_v5_ops.py")
     if helper.state_root() != args.state_root:
@@ -79,14 +84,101 @@ def setup(args):
     client = config["factory_type"](config["settings"], config["evolution"]["max_tokens"],
                                    config["transport"]["endpoint"])()
     client.transport_retries = 0
+    if (client.audit_identity(seed=137).get("model") != "qwen3.8-flash"
+            or config["evolution"]["max_tokens"] != 8192):
+        raise RuntimeError("controlled reviser model or output budget changed")
     history = helper.history_reader(args.state_root)
-    return helper, config, client, history, AnchoredSlotReviser, RevisionBudget
+    return helper, config, client, history, editor.AnchoredSlotReviser, editor.RevisionBudget
+
+
+def learning_bytes(history, path):
+    """Use the native verified disk lease for members above its read cap."""
+    cold = getattr(history, "_cold_history", None)
+    if cold is None:
+        return history.read_history_bytes(path)
+    record = history.cold_reference(path)
+    if record is None or record.size <= cold.max_read_bytes:
+        return history.read_history_bytes(path)
+    if record.size > 512 * 1024 * 1024:
+        raise RuntimeError("learning bundle exceeds independent host memory allowance")
+    import psutil
+    # The raw JSON, schema objects and projected copy coexist briefly.
+    if psutil.virtual_memory().available < 10 * record.size + 4 * 1024 ** 3:
+        raise RuntimeError("learning bundle exceeds observed host memory headroom")
+    with cold.materialize(record.ref) as materialized:
+        with Path(materialized).open("rb") as stream:
+            raw = stream.read(record.size + 1)
+        if (len(raw) != record.size
+                or hashlib.sha256(raw).hexdigest() != record.sha256):
+            raise RuntimeError("materialized learning bundle identity changed")
+        return raw
+
+
+def isolated_learning_bytes(history, path, cache_root):
+    """Fetch one verified member outside the shared HotCache reservation pool."""
+    cold = getattr(history, "_cold_history", None)
+    if cold is None:
+        return learning_bytes(history, path)
+    record = history.cold_reference(path)
+    if record is None:
+        return learning_bytes(history, path)
+    import fcntl
+    import os
+    import psutil
+    import tempfile
+    from skill3d.storage.cold_history import _MemberWriter
+
+    if record.size > 512 * 1024 * 1024:
+        raise RuntimeError("learning bundle exceeds independent host memory allowance")
+    if psutil.virtual_memory().available < 10 * record.size + 4 * 1024 ** 3:
+        raise RuntimeError("learning bundle exceeds observed host memory headroom")
+    cache_root = Path(cache_root)
+    cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if cache_root.is_symlink() or not cache_root.is_dir():
+        raise RuntimeError("isolated learning cache root changed")
+    descriptor = os.open(cache_root / ".reader.lock",
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if list(cache_root.glob("member-*")):
+            raise RuntimeError("unfinished isolated learning read requires inspection")
+        if psutil.disk_usage(cache_root).free < 25_000_000_000 + record.size + 4 * 1024 ** 2:
+            raise RuntimeError("isolated learning read exceeds free-space floor")
+        # The native reference lease and transport bind the original cold archive.
+        # Only its transient physical destination changes; no original cache entry
+        # or reservation is edited.
+        with cold.lease((record.ref,)):
+            current = cold.validate_reference(record.ref)
+            expected = (record.ref, record.size, record.sha256)
+            if (current.ref, current.size, current.sha256) != expected:
+                raise RuntimeError("learning reference changed before isolated read")
+            with tempfile.TemporaryDirectory(prefix="member-", dir=cache_root) as temporary:
+                member = Path(temporary) / "verified-member"
+                with member.open("xb") as stream:
+                    member.chmod(0o600)
+                    writer = _MemberWriter(stream, record.size, record.sha256)
+                    try:
+                        cold.fetch_member(record.ack, record.member_key, writer)
+                        writer.finish()
+                    finally:
+                        writer._active = False
+                raw = member.read_bytes()
+                if (len(raw) != record.size
+                        or hashlib.sha256(raw).hexdigest() != record.sha256):
+                    raise RuntimeError("isolated learning bundle identity changed")
+                current = cold.validate_reference(record.ref)
+                if (current.ref, current.size, current.sha256) != expected:
+                    raise RuntimeError("learning reference changed during isolated read")
+                return raw
 
 
 def inputs(args, helper, history, selection):
     from skill3d.schemas import SkillSpecV11, V11ExperienceBundle
     _, paths = helper.campaign_inputs(args.state_root, selection)
-    raw = history.read_history_bytes(paths["experience"])
+    cache_key = hashlib.sha256(str(args.output.parent).encode()).hexdigest()[:24]
+    raw = isolated_learning_bytes(
+        history, paths["experience"],
+        Path("/var/tmp") / ("harness3d-learning-" + cache_key))
     experience = V11ExperienceBundle.model_validate_json(raw)
     request = read(paths["request"])
     parent = SkillSpecV11.model_validate(request["parent"])
@@ -95,7 +187,7 @@ def inputs(args, helper, history, selection):
         if name == "experience" else identity(path) for name, path in paths.items()}
 
 
-def plan_batches(native, editor, *, parent, feedback, experience):
+def plan_batches(native, editor, *, parent, feedback, experience, counting_limit=None):
     """Measure the successor prompt, retaining native reconstruction checks."""
     def successor_prompt(**kwargs):
         context = kwargs.get("batch_context") or {}
@@ -106,9 +198,37 @@ def plan_batches(native, editor, *, parent, feedback, experience):
             repair=kwargs.get("repair_context"),
         )
     native._prompt = successor_prompt
-    native.evidence_request_budget = editor.budget.max_requests - editor.budget.repair_reserve - 1
+    native.evidence_request_budget = (editor.budget.max_requests - editor.budget.repair_reserve - 1
+                                     if counting_limit is None else counting_limit)
     return native._evidence_batches(parent=parent, feedback=feedback,
                                     experience=experience, diagnosis=None)
+
+
+def catalog_specs(args, helper):
+    if args.campaign_index is None:
+        return list(helper.SELECTION)
+    catalog = read(args.campaign_index)
+    if catalog.get("schema") != "harness3d-retained-refusal-campaign-index/1":
+        raise RuntimeError("retained campaign index schema mismatch")
+    return [{
+        "kind": "input_budget" if row["kind"] == "input_budget_refusal" else "static_repair",
+        "worker": row["worker"], "campaign_id": row["campaign_id"],
+        "slot_key": row["slot_key"], "expected_refusal": row["reason"],
+    } for row in catalog["campaigns"]]
+
+
+def representative_selection(catalog):
+    """Choose a median-size campaign per slot before observing any new outcome."""
+    groups = {}
+    for row in catalog:
+        groups.setdefault(row["slot_key"], []).append(row)
+    selected = []
+    for slot, rows in sorted(groups.items()):
+        rows = sorted(rows, key=lambda row: (
+            row["editor_preflight"]["budget"]["batch_count"], row["campaign_id"]))
+        selected.append(rows[(len(rows) - 1) // 2])
+    return sorted(selected, key=lambda row: (
+        row["editor_preflight"]["budget"]["batch_count"], row["slot_key"]))
 
 
 def preflight(args):
@@ -116,33 +236,47 @@ def preflight(args):
     helper, config, client, history, reviser_type, budget_type = setup(args)
     budget = budget_type(max_requests=12, repair_reserve=2,
                         max_tokens=config["evolution"]["max_tokens"])
-    selected = []
-    for selection in helper.SELECTION:
+    catalog = []
+    for selection in catalog_specs(args, helper):
         paths, experience, parent, feedback, identities = inputs(args, helper, history, selection)
         native, _ = helper.make_reviser(args.state_root, {**selection, "paths": paths},
                                        args.output / "unused_native_output", client, config)
         # Use the native planner only. Its revision execution/repair is not called.
-        editor = reviser_type(output_root=args.output / selection["kind"],
-                    client=client, budget=budget,
+        editor = reviser_type(output_root=args.output / selection["campaign_id"],
+                    client=client, budget=(budget if args.campaign_index is None else
+                        budget_type(max_requests=args.max_campaign_batches + 1, repair_reserve=0)),
                     method_context_max_chars=config["base"].retrieval_policy.method_context_max_chars,
                     expected_model=client.audit_identity()["model"])
         batches, plan = plan_batches(native, editor, parent=parent, feedback=feedback,
-                                    experience=experience)
+                                    experience=experience,
+                                    counting_limit=args.max_campaign_batches if args.campaign_index else None)
+        if args.campaign_index is not None:
+            editor.budget = budget_type(max_requests=2 * len(batches) + 2,
+                repair_reserve=len(batches) + 2, deferred_repair=True,
+                max_tokens=config["evolution"]["max_tokens"])
         checked = editor.preflight(parent=parent, feedback=feedback, batches=batches, delivery_plan=plan)
-        selected.append({**selection, "input_identities": identities,
+        catalog.append({**selection, "input_identities": identities,
                          "input_refs": {name: str(path) for name, path in paths.items()},
                          "editor_preflight": checked, "delivery_plan": plan})
+    selected = representative_selection(catalog) if args.campaign_index is not None else catalog
+    total_cap = sum(row["editor_preflight"]["budget"]["max_requests"] for row in selected)
+    if total_cap > args.total_request_cap:
+        raise RuntimeError("representative complete-evidence cohort exceeds total request cap")
     if protected(args.state_root, args.frozen_root) != before:
         raise RuntimeError("protected assets changed during read-only preparation")
     seal(args.output / "preflight.json", {
         "status": "ready", "at": time.time(), "selected": selected,
+        "catalog": catalog, "selection_policy": "median_batches_per_slot" if args.campaign_index else "legacy_two",
+        "reach_target": 0.8, "representative_campaign_count": len(selected),
+        "representative_slot_count": len({row["slot_key"] for row in selected}),
         "protected_inputs": before, "source_identity": source_identity(args),
         "model_identity": client.audit_identity(seed=budget.seed),
         "budget": asdict(budget), "transport_retries": 0,
         "model_requests": 0, "gate_seeds": [137, 138],
-        "gate_request_cap": 512, "total_reviser_request_cap": 24,
+        "gate_request_cap": args.gate_request_cap, "total_reviser_request_cap": total_cap,
         "publication_authorized": False, "gate_feedback_visible_to_reviser": False})
-    return {"status": "ready", "model_requests": 0, "selected": [
+    return {"status": "ready", "model_requests": 0, "catalog_count": len(catalog),
+            "total_reviser_request_cap": total_cap, "selected": [
         {"campaign": item["campaign_id"],
          "batches": item["editor_preflight"]["budget"]["batch_count"],
          "max_wire_bytes": max(row["wire_bytes"] for row in item["editor_preflight"]["request_sizes"])}
@@ -165,7 +299,8 @@ def run(args):
     if not raw_client.configured:
         raise RuntimeError("authorized service environment unavailable")
     governor = RequestGovernor(args.output / "request_governor",
-                  RequestGovernorConfig(max_requests=24, max_inflight=1, requests_per_second=0.0))
+                  RequestGovernorConfig(max_requests=ready["total_reviser_request_cap"],
+                                        max_inflight=1, requests_per_second=0.0))
     results = []
     stopped = False
     for selection in ready["selected"]:
@@ -177,12 +312,14 @@ def run(args):
         client = GovernedClient(raw_client, governor, category="reviser", context={
                   "slot_key": selection["slot_key"], "campaign_id": selection["campaign_id"],
                   "run_identity": identity(args.output / "preflight.json")["sha256"]})
-        editor = reviser_type(output_root=args.output / selection["kind"], client=client,
-                    budget=budget_type(**ready["budget"]),
+        editor = reviser_type(output_root=args.output / selection["campaign_id"], client=client,
+                    budget=budget_type(**{key: selection["editor_preflight"]["budget"][key]
+                        for key in asdict(budget_type())}),
                     method_context_max_chars=config["base"].retrieval_policy.method_context_max_chars,
                     expected_model=ready["model_identity"]["model"])
         batches, plan = plan_batches(native, editor, parent=parent, feedback=feedback,
-                                    experience=experience)
+                                    experience=experience,
+                                    counting_limit=args.max_campaign_batches if args.campaign_index else None)
         checked = editor.preflight(parent=parent, feedback=feedback, batches=batches, delivery_plan=plan)
         if checked != selection["editor_preflight"]:
             raise RuntimeError("assembled evidence or request plan changed")
@@ -191,10 +328,15 @@ def run(args):
         try:
             candidate = editor.run(parent=parent, feedback=feedback, batches=batches,
                                   delivery_plan=plan, forbidden_ids=forbidden, cases=experience.cases)
-            result = read(args.output / selection["kind"] / "final.json")
+            result = read(args.output / selection["campaign_id"] / "final.json")
             result.update(source_campaign=selection["campaign_id"],
-                          source_kind=selection["kind"], slot_key=selection["slot_key"])
+                          source_kind=selection["kind"], candidate_ref=selection["campaign_id"] + "/SKILL.md",
+                          slot_key=selection["slot_key"])
             results.append(result)
+            seal(args.output / "progress" / (selection["campaign_id"] + ".json"), {
+                "completed_campaigns": len(results), "total_campaigns": len(ready["selected"]),
+                "static_valid_candidates": sum(row["status"] == "static_valid" for row in results),
+                "requests": governor.summary()["completed_requests"], "at": time.time()})
         except RevisionOperationalError:
             results.append({"source_campaign": selection["campaign_id"], "status": "operational_failure",
                             "candidate_failure": False, "requests": editor.requests})
@@ -204,6 +346,7 @@ def run(args):
     final = {"status": "stopped_on_operational_failure" if stopped else "revision_complete",
              "at": time.time(), "results": results, "request_governor": governor.summary(),
              "static_valid_candidates": sum(row["status"] == "static_valid" for row in results),
+             "planned_campaigns": len(ready["selected"]),
              "protected_inputs_unchanged": unchanged, "gate_executed": False, "published": False}
     seal(args.output / "revision_final.json", final)
     if not unchanged:
@@ -219,6 +362,10 @@ def main():
     parser.add_argument("--state-root", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--campaign-index", type=Path)
+    parser.add_argument("--max-campaign-batches", type=int, default=128)
+    parser.add_argument("--total-request-cap", type=int, default=1536)
+    parser.add_argument("--gate-request-cap", type=int, default=4096)
     args = parser.parse_args()
     if args.output.is_relative_to(args.frozen_root) or args.output.is_relative_to(args.state_root):
         raise SystemExit("successor must be outside frozen assets")

@@ -12,6 +12,10 @@ import sys
 import time
 from types import MethodType, SimpleNamespace
 
+# This checkout supplies the Gate wrapper, admission policy and scoped guard.
+_script_dir = Path(__file__).resolve().parent
+sys.path[:] = [p for p in sys.path if Path(p).resolve() != _script_dir]
+
 ADMISSION_POLICY_PATH = (
     Path(__file__).resolve().parents[1] / "src/skill3d/evolution/gate_admission_v11.py")
 
@@ -137,7 +141,7 @@ class CheckedFactory:
 def setup(args):
     from skill3d.evaluation.fitset_v11 import SystemVariantRunner, content_sha256
     from skill3d.evolution.fitset_stream_v11 import FitSetWorkerEvolution
-    from skill3d.evolution.fitset_revision_v11 import _static_validate
+    from skill3d.evolution.fitset_revision_v11 import _static_validate as native_static_validate
     from skill3d.schemas import SkillSpecV11
     from skill3d.storage.framework_state_io import FrameworkStateIO
     from skill3d.storage.hot_cache import HotCache
@@ -145,6 +149,9 @@ def setup(args):
     from skill3d.synthesis.request_governor import RequestGovernorConfig
     import freeze_runner_binding_ops
 
+    guard = load("successor_gate_scoped_guard",
+                 args.revision_root.parent / "source/src/skill3d/evolution/revision_guard_v11.py")
+    _static_validate = guard.scoped_static_validator(native_static_validate)
     revision = read(args.revision_root / "revision_final.json")
     ready = read(args.revision_root / "preflight.json")
     if not revision["protected_inputs_unchanged"] or revision["status"] != "revision_complete":
@@ -164,7 +171,9 @@ def setup(args):
         selection = next(item for item in ready["selected"]
                          if item["campaign_id"] == row["source_campaign"])
         parent = SkillSpecV11.model_validate(read(selection["input_refs"]["request"])["parent"])
-        path = args.revision_root / row["source_kind"] / "SKILL.md"
+        if not row["all_evidence_delivered"] or not row.get("all_batches_resolved", True):
+            raise GateAbort("gate_candidate_evidence_unresolved")
+        path = args.revision_root / row.get("candidate_ref", row["source_kind"] + "/SKILL.md")
         candidate, errors = _static_validate(
             parent=parent, candidate_text=path.read_text(),
             forbidden_sample_ids={str(v) for item in config["panel"]["system_variants"]
@@ -209,8 +218,10 @@ def setup(args):
     coordinator.deployment_continuation = coordinator._continuation = None
     coordinator.cached_prefix_recovery = coordinator._cached_prefix_spec = None
     coordinator._request_governor_root = args.output / "request_governor"
+    request_cap = min(ready["gate_request_cap"],
+                      getattr(args, "request_cap", None) or ready["gate_request_cap"])
     coordinator.request_governor_config = RequestGovernorConfig(
-        max_requests=512, max_inflight=1, requests_per_second=0.0)
+        max_requests=request_cap, max_inflight=1, requests_per_second=0.0)
     coordinator._episode_semaphore = None
     coordinator.workers = coordinator.episode_concurrency = 1
     coordinator.run_identity = content_sha256({
@@ -240,7 +251,7 @@ def preflight(args):
     plans, outputs = {}, []
 
     def collect(coordinator, episodes):
-        if len(episodes) > 512:
+        if len(plans) + len(episodes) > runner.request_governor_config.max_requests:
             raise GateAbort("gate_minimum_request_budget")
         pairs = {}
         for arm, variant in episodes:
@@ -288,7 +299,7 @@ def preflight(args):
         "model_identity": revision_ready["model_identity"],
         "solver_config": {key: val for key, val in asdict(runner.base_cfg).items()
                           if key in {"seed", "temperature", "max_tokens", "max_rounds"}},
-        "request_cap": 512, "per_episode_request_cap": 64,
+        "request_cap": runner.request_governor_config.max_requests, "per_episode_request_cap": 64,
         "max_inflight": 1, "transport_retries": 0,
         "executor": "frozen_native_SystemVariantRunner_without_original_receipt_writer",
         "validation_labels_hidden_during_execution": True, "published": False,
@@ -308,6 +319,8 @@ def run(args):
     service = __import__("storage_scaleup_service_ops").facade()
     service.load_service_environment()
     tools, runner, worker, candidates, revision_ready = setup(args)
+    if runner.request_governor_config.max_requests != ready["request_cap"]:
+        raise GateAbort("gate_request_allowance_changed")
     if (args.output / "startup.json").exists():
         raise GateAbort("gate_existing_startup_no_automatic_resume")
     runner.framework_state_io.write_json_once(
@@ -368,7 +381,10 @@ def main():
     parser.add_argument("action", choices=("preflight", "run"))
     for name in ("frozen-root", "state-root", "revision-root", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--request-cap", type=int)
     args = parser.parse_args()
+    if args.request_cap is not None and args.request_cap <= 0:
+        raise SystemExit("remaining Gate allowance must be positive")
     if args.output.is_relative_to(args.frozen_root) or args.output.is_relative_to(args.state_root):
         raise SystemExit("Gate must be outside frozen assets")
     try:
