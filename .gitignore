@@ -53,6 +53,7 @@ qwenkey.md
 /legacy/third_party/**/checkpoints/
 
 # Runtime outputs.
+/runs/
 /logs/
 /results/
 /output/

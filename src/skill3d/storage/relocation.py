@@ -364,7 +364,7 @@ class ValidatedRelocation:
 
     def resolved_artifact(self) -> ReconstructionArtifact:
         """Return a runtime model with verified local refs; no JSON is changed."""
-        art = _artifact(self.artifact_path, self._receipt["logical_input_identity"])
+        art = self._load_artifact()
         refs = artifact_dependency_refs(art)
         updates = {
             name: str(self.resolve(ref))
@@ -375,6 +375,9 @@ class ValidatedRelocation:
             for name, ref in refs.items() if name.startswith("confidence.")
         })
         return art.model_copy(update=updates)
+
+    def _load_artifact(self):
+        return _artifact(self.artifact_path, self._receipt["logical_input_identity"])
 
     def validate_input_identity(self, identity: Mapping) -> dict:
         """Reject hash-only assertions and any changed frozen input field."""
@@ -478,6 +481,21 @@ class ValidatedRelocation:
             return self.validate_input_identity({**body, "sha256": content_sha256(body)})
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise RelocationError(f"cannot recompute relocated scene input: {exc}") from exc
+
+
+class ProducerVerifiedRelocation(ValidatedRelocation):
+    """Framework-only resolver for immutable, already verified publications.
+
+    It keeps the complete original identity and exact alias mapping, and checks
+    path confinement. Payload hashing belongs to production and transport.
+    """
+
+    def _path(self, name):
+        _no_symlinks(self._root)
+        return _target(self._root, self._records[name]["target_ref"])
+
+    def _load_artifact(self):
+        return ReconstructionArtifact.model_validate_json(self.artifact_path.read_bytes())
 
 
 def validate_relocation_receipt(

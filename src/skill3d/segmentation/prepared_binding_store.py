@@ -228,7 +228,9 @@ class PreparedBindingStore:
         scene_artifact: str | Path,
         scene_input_identity: Mapping,
         binding: PreparedObjectBinding,
+        scene_migration_receipt: Mapping | str | Path | None = None,
     ) -> dict:
+        """Publish locally, or keep a fully receipted original logical scene ref."""
         key = self.key_for(request_identity)
         target = self.entry_path(key)
         self.staging.mkdir(parents=True, exist_ok=True)
@@ -274,11 +276,28 @@ class PreparedBindingStore:
                 raise PreparedBindingStoreError(
                     "scene input identity differs from binding request"
                 )
+            scene_ref = str(scene_path)
+            if scene_migration_receipt is not None:
+                try:
+                    resolver = validate_relocation_receipt(
+                        scene_migration_receipt,
+                        expected_input_sha256=input_sha256,
+                        expected_artifact_identity=file_identity(scene_path),
+                        expected_source_artifact=scene_input_identity["artifact_path"],
+                    )
+                    resolver.validate_input_identity(scene_input_identity)
+                    if resolver.artifact_path != scene_path:
+                        raise RelocationError("publication scene is not the receipted artifact")
+                    scene_ref = str(scene_input_identity["artifact_path"])
+                except (RelocationError, KeyError) as exc:
+                    raise PreparedBindingStoreError(
+                        f"prepared binding publication relocation rejected: {exc}"
+                    ) from exc
             manifest_body = {
                 "schema_version": STORE_SCHEMA_VERSION,
                 "key": key,
                 "request_identity": dict(request_identity),
-                "scene_artifact_ref": str(scene_path),
+                "scene_artifact_ref": scene_ref,
                 "scene_artifact_json": file_identity(scene_path),
                 "scene_input_identity_sha256": input_sha256,
                 "binding_generation_sha256": str(
@@ -345,6 +364,33 @@ class PreparedBindingStore:
             ],
             "manifest_sha256": manifest["manifest_sha256"],
         }
+
+    def validate_reference(self, reference: Mapping) -> dict:
+        """Check every original reference field, without rewriting its store root."""
+        from skill3d.storage.relocation import _ref
+
+        try:
+            _ref(reference["store_root"], absolute=True)
+            key = str(reference["key"])
+            expected = self.reference(key)
+            expected["store_root"] = reference["store_root"]
+            if reference.get("manifest_sha256") != expected["manifest_sha256"]:
+                raise PreparedBindingStoreError("prepared binding reference manifest changed")
+            if any(reference.get(name) != expected[name] for name in (
+                "scene_artifact_ref", "scene_input_identity_sha256",
+            )):
+                raise PreparedBindingStoreError("prepared binding reference scene identity changed")
+            if dict(reference) != expected:
+                raise PreparedBindingStoreError(
+                    "prepared binding original reference changed"
+                )
+            manifest = self.manifest(key)
+            self._migration_binding_identity(key, manifest)
+            return manifest
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PreparedBindingStoreError(
+                f"prepared binding original reference rejected: {exc}"
+            ) from exc
 
     def _migration_binding_identity(self, key: str, manifest: Mapping) -> dict:
         if (
@@ -498,6 +544,15 @@ class PreparedBindingStore:
             raise PreparedBindingStoreError(
                 "prepared binding payload identity changed"
             )
+        return self.load_verified(key)
+
+    def load_verified(self, key: str) -> PreparedObjectBinding:
+        """Decode a producer-verified immutable payload, without a second audit.
+
+        This is a trusted framework entry point. Consumers must supply the
+        original catalog/reference through their approved publication provider.
+        """
+        entry = self.entry_path(key)
         try:
             data = json.loads(
                 (entry / "payload" / "binding.json").read_text(
@@ -545,22 +600,26 @@ def load_prepared_binding_reference(
     migration_receipt: Mapping | str | Path | None = None,
     scene_artifact: str | Path | None = None,
     migration_destination_root: str | Path | None = None,
+    physical_store_root: str | Path | None = None,
 ) -> PreparedObjectBinding:
-    """Replay a serialized store reference with full request and scene checks."""
-    store = PreparedBindingStore(reference["store_root"])
-    manifest = store.manifest(str(reference["key"]))
-    if reference.get("manifest_sha256") != manifest.get("manifest_sha256"):
-        raise PreparedBindingStoreError(
-            "prepared binding reference manifest changed"
-        )
-    if migration_receipt is not None and (
-        reference.get("scene_artifact_ref") != manifest.get("scene_artifact_ref")
-        or reference.get("scene_input_identity_sha256")
-        != manifest.get("scene_input_identity_sha256")
-    ):
-        raise PreparedBindingStoreError(
-            "prepared binding reference scene identity changed"
-        )
+    """Replay an original reference; an override requires full scene relocation."""
+    if physical_store_root is not None:
+        from skill3d.storage.relocation import _root
+
+        if migration_receipt is None:
+            raise PreparedBindingStoreError(
+                "physical store override requires a full migration receipt"
+            )
+        try:
+            physical_store_root = _root(physical_store_root)
+        except RelocationError as exc:
+            raise PreparedBindingStoreError(
+                f"prepared binding physical store rejected: {exc}"
+            ) from exc
+    store = PreparedBindingStore(
+        physical_store_root if physical_store_root is not None else reference["store_root"]
+    )
+    store.validate_reference(reference)
     return store.load(
         str(reference["key"]),
         expected_request_identity=reference["request_identity"],

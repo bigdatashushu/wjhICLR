@@ -8,6 +8,9 @@ import re
 from typing import Mapping, Sequence
 
 from skill3d.evolution.leakage import leakage_scan_text
+from skill3d.evolution.evidence_graph_v11 import (
+    GRAPH_INSTRUCTIONS, canonical_text, encode_evidence_graph,
+)
 
 
 class RepairContextError(ValueError):
@@ -36,7 +39,7 @@ def offline_client_identity(client, *, seed: int) -> dict:
             "model_identity_known": False}
 
 
-def revision_contract_text() -> str:
+def revision_contract_text(*, experiment_split: Mapping | None = None) -> str:
     return (
         "Return one JSON object with action='revise' or action='no_change' and "
         "modification_reason. For no_change omit full_skill_md. For revise return "
@@ -46,8 +49,15 @@ def revision_contract_text() -> str:
         "The framework owns identity, version, hashes, scoring and publication. "
         "Use English for method prose and code comments. Never copy a case identity, "
         "question, option list or case-specific answer into the reusable method. "
-        "Only induction question-level supervision is authorized offline; no GT 3D "
-        "annotations or validation/test feedback is authorized. A wrong answer or "
+        + (
+            "Only explicitly mapped experiment learning QA supervision is authorized "
+            "offline; catalog source_split remains unchanged. No experiment validation "
+            "QA, test feedback or GT 3D annotations is authorized. "
+            if experiment_split is not None else
+            "Only induction question-level supervision is authorized offline; no GT 3D "
+            "annotations or validation/test feedback is authorized. "
+        )
+        + "A wrong answer or "
         "an observed tool call alone does not prove referent selection, binding or "
         "perception failure. Distinguish observations from causal hypotheses and "
         "unknowns. Revise only the parent's question-type/initial-evidence slot. "
@@ -60,18 +70,40 @@ def revision_contract_text() -> str:
     )
 
 
-def render_case_evidence(experience, diagnosis: Mapping | None = None) -> str:
+def render_case_evidence(
+    experience, diagnosis: Mapping | None = None, *, experiment_split: Mapping | None = None,
+    compact: bool = False,
+) -> str:
     evidence = (
         experience.model_dump(mode="json")
         if hasattr(experience, "model_dump")
         else dict(experience)
     )
-    if evidence.get("source_split") != "induction" or evidence.get("label_access") is not True:
+    if experiment_split is not None:
+        from skill3d.schemas import V11ExperienceBundle
+        from skill3d.schemas.data_access import validate_learning_authorization
+
+        bundle = V11ExperienceBundle.model_validate(evidence)
+        validate_learning_authorization(
+            bundle.learning_authorization, [case.qa_id for case in bundle.cases],
+            experiment_split)
+        for case in bundle.cases:
+            validate_learning_authorization(
+                case.learning_authorization, [case.qa_id], experiment_split)
+    elif (
+        evidence.get("source_split") != "induction" or evidence.get("learning_authorization")
+        or any(_case_dict(case).get("source_split") != "induction"
+               or _case_dict(case).get("learning_authorization")
+               for case in evidence.get("cases", []))
+        or evidence.get("label_access") is not True
+    ):
         raise ValueError("complete revision evidence must be authorized induction evidence")
     if evidence.get("schema_version", "skill-experience-bundle-v11/6.0") != (
             "skill-experience-bundle-v11/6.0"):
         raise ValueError("legacy experience bundles are read-only")
-    text = json.dumps(evidence, ensure_ascii=False, sort_keys=True, allow_nan=False)
+    text = (GRAPH_INSTRUCTIONS + canonical_text(encode_evidence_graph(evidence))
+            if compact else
+            json.dumps(evidence, ensure_ascii=False, sort_keys=True, allow_nan=False))
     if diagnosis is not None:
         text += (
             "\nSource-linked offline diagnosis (hypotheses are not proven causes):\n"

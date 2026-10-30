@@ -25,11 +25,9 @@ def digest(value) -> str:
 
 
 def file_sha256(path) -> str:
-    h = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            h.update(block)
-    return h.hexdigest()
+    from skill3d.infra.m5_identity import file_identity
+
+    return file_identity(path)["sha256"]
 
 
 def model_identity(model_class, checkpoint: Path) -> dict:

@@ -114,7 +114,16 @@ def _list_objects_summary(payload: list, max_chars: int, *, question_type: str =
     from skill3d.online.observation_reader import (
         canonical_payload, object_summary_row, payload_hash,
     )
+    original = payload
     payload = canonical_payload(payload, tool="list_objects")
+    locations = {}
+    for index, obj in enumerate(original):
+        key = json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str)
+        locations.setdefault(key, []).append(index)
+    source_paths = [
+        [locations[json.dumps(obj, sort_keys=True, ensure_ascii=False, default=str)].pop(0)]
+        for obj in payload
+    ]
     digest = hashlib.sha256(json.dumps(
         payload, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
     rows = []
@@ -125,7 +134,8 @@ def _list_objects_summary(payload: list, max_chars: int, *, question_type: str =
         omitted_fields = sorted({key for o, row in zip(payload, rows) if isinstance(o, dict)
                                  for key in o if key not in row})
         body = {
-            "objects": rows, "total": len(payload), "shown": len(rows),
+            "objects": rows, "source_item_paths": source_paths[:len(rows)],
+            "total": len(payload), "shown": len(rows),
             "omitted": len(payload) - len(rows), "fields_omitted": omitted_fields,
             "coverage_complete": len(rows) == len(payload),
             "audit_omitted": audit_omitted, "payload_sha256": digest,
@@ -249,9 +259,12 @@ class ValidatedObservation:
                                  question_type=question_type)
         flags = (f" degraded_evidence={_json(self.degraded_evidence)}"
                  if self.degraded_evidence else "")
+        label = ("summary view of raw list payload"
+                 if self.source_tool == "list_objects" and isinstance(self.payload, list)
+                 else "data/raw payload")
         return (f"- {self.source_tool}({_json(self.args)}) [result_id={self.result_id}]"
                 f" ToolResult.status=ok evidence_version={self.evidence_version!r}{flags}"
-                f"\n  data/raw payload={text}")
+                f"\n  {label}={text}")
 
 
 def observation_feedback(observations: list[ValidatedObservation], *, question_type: str = "",
@@ -274,6 +287,10 @@ def observation_feedback(observations: list[ValidatedObservation], *, question_t
             lines.append(f"  Identical observations also have result_ids={_json(aliases)}; content is shown once.")
     lines.append("These are raw data values, the contents of each tool response's data field; "
                  "derivation field paths start at this data root. "
+                 "For list_objects the raw data root is a list. The objects envelope is a "
+                 "summary view only: use source_item_paths[i] plus the raw field name. "
+                 "visible_frames.inclusive_ranges and earliest_recorded_frame are summary "
+                 "transforms; read visible_frames to reference original frame values. "
                  "Check data.status, missing items, ambiguity, and degradation flags. "
                  "No detection does not prove absence; None/unmeasurable does not mean zero.")
     if include_reader:

@@ -1,6 +1,7 @@
 """Exercise the additive path through the real solver, scorer and paired driver."""
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -42,11 +43,12 @@ def source(tmp_path_factory):
 
 
 def run_case(source, tmp_path, replies, *, split="inner_validation", enabled=True,
-             max_rounds=2):
+             max_rounds=2, execution_role=None):
     item, artifact = source
     episode = item.episode.model_copy(deep=True, update={"split": split})
     cfg = OnlineRunConfig(
         mode="real", reuse_artifact=artifact, eval_visual_fallback=enabled,
+        evaluation_execution_role=execution_role,
         max_solver_rounds=max_rounds, finalization_rounds=1, seed=7,
         allow_final_test=split == "final_test", trace_dir=str(tmp_path / "traces"))
     client = Client(replies)
@@ -138,6 +140,25 @@ def test_learning_and_disabled_eval_keep_original_failure(source, tmp_path, spli
                            split=split, enabled=enabled)
     assert len(client.calls) == 2
     assert out.final_state == "run_error" and not out.eval_visual_fallback
+
+
+def test_qa_validation_role_enables_fallback_without_changing_induction_source(source, tmp_path):
+    out, client = run_case(
+        source, tmp_path, ["x = 1", "x = 1", "12.5"],
+        split="induction", execution_role="validation")
+    assert len(client.calls) == 3 and out.eval_visual_fallback["accepted"]
+    start = next(receipt for receipt in out.receipts if receipt.event == "episode_start")
+    expected = {"qa_id": source[0].episode.qa_id, "mode": "real",
+                "baseline": "C1_tools_program", "split": "induction"}
+    assert start.payload_digest == hashlib.sha256(
+        json.dumps(expected, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def test_qa_learning_role_disables_fallback_for_validation_source(source, tmp_path):
+    out, client = run_case(
+        source, tmp_path, ["x = 1", "x = 1"],
+        split="inner_validation", execution_role="learning")
+    assert len(client.calls) == 2 and not out.eval_visual_fallback
 
 
 @pytest.mark.parametrize("answer", ["12.5", "99"])

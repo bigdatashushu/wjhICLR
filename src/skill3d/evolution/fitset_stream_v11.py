@@ -27,10 +27,14 @@ from skill3d.evaluation.gate_process_metrics import (
     episode_process_metrics, aggregate_gate_process_metrics,
 )
 from skill3d.evolution.fitset_revision_v11 import (
+    FIT_REVISION_PROMPT_VERSION,
     FitSetSlotReviser,
+    RevisionInputBudgetExhausted,
+    RevisionOperationalError,
     load_active_parent_slots,
 )
 from skill3d.evolution.gate_admission_v11 import gate_admission_decision
+from skill3d.evolution.deployment_continuation_v11 import revision_intents_used
 from skill3d.evolution.leakage import leakage_scan_text
 from skill3d.evolution.revision_schedule import (
     candidate_dedup_key, normalized_method_sha256, scheduling_decision,
@@ -51,6 +55,9 @@ from skill3d.schemas import (
     V11ExperienceCase, V11ExperienceBundle, DataAccessRecord,
 )
 from skill3d.schemas.evidence import skill_evidence_state
+from skill3d.schemas.data_access import (
+    learning_authorization_for, validate_learning_authorization,
+)
 from pydantic import Field, model_validator
 from skill3d.skills.promote_atomic import read_snapshot
 from skill3d.skills.v11_library import (
@@ -72,6 +79,8 @@ class FitSetEvolutionConfig:
     gate_seeds: tuple[int, ...] = (137, 138)
     max_revision_attempts: int = 3
     max_tokens: int = 8192
+    revision_input_max_bytes: int = 128000
+    revision_input_max_chars: int = 72000
     scheduling_mode: Literal["batch_v1", "novel_failure_v1"] = "novel_failure_v1"
     max_revision_requests_per_slot: int = 18
     max_gate_candidates_per_slot: int = 6
@@ -95,11 +104,15 @@ class FitSetEvolutionConfig:
             raise ValueError("unknown revision scheduling mode")
         if min(self.max_revision_requests_per_slot, self.max_gate_candidates_per_slot) < 1:
             raise ValueError("per-slot revision/gate limits must be positive")
+        if self.revision_input_max_bytes < 4096 or self.revision_input_max_chars < 4096:
+            raise ValueError("revision input byte budget must be at least 4096")
         if self.learning_input_mode not in {
                 "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"}:
             raise ValueError("unknown learning input mode")
-        if self.gate_mode not in {"same_question", "scene_disjoint"}:
+        if self.gate_mode not in {"same_question", "scene_disjoint", "qa_disjoint"}:
             raise ValueError("unknown gate mode")
+        if self.gate_mode == "qa_disjoint" and self.gate_seeds != (137, 138):
+            raise ValueError("qa_disjoint requires frozen dual seeds 137/138")
         if min(self.diagnosis_max_cases, self.diagnosis_max_input_chars,
                self.diagnosis_max_images, self.diagnosis_max_output_tokens) < 1:
             raise ValueError("diagnosis budgets must be positive")
@@ -117,6 +130,7 @@ class FitSetExperienceCase(Spec):
     evidence_state: Literal["g0m0", "g1m0", "g1m1"]
     source_split: Literal["induction", "inner_validation", "outer_holdout"]
     experiment_role: Literal["fit_set_learning"] = "fit_set_learning"
+    learning_authorization: dict = Field(default_factory=dict)
     delivered_skill_version: str
     delivered_content_sha256: str
     delivered_skill_md: str
@@ -133,6 +147,8 @@ class FitSetExperienceCase(Spec):
 
     @model_validator(mode="after")
     def _validate_identity(self):
+        if self.learning_authorization:
+            validate_learning_authorization(self.learning_authorization, [self.qa_id])
         if hashlib.sha256(self.delivered_skill_md.encode()).hexdigest() != (
                 self.delivered_content_sha256):
             raise ValueError("fit-set case delivery hash 改变")
@@ -152,6 +168,7 @@ class FitSetExperienceCase(Spec):
                 "qa_id", "scene_id", "question_type", "evidence_state", "source_split",
                 "delivered_skill_version", "delivered_content_sha256", "delivered_skill_md",
                 "score", "outcome", "trace_ref", "initial_evidence_states", "evidence_history",
+                "learning_authorization",
             ):
                 if getattr(self, field) != getattr(self.full_case, field):
                     raise ValueError(f"fit-set buffer/canonical case {field} mismatch")
@@ -159,8 +176,34 @@ class FitSetExperienceCase(Spec):
 
 
 class FitSetStreamingBuffer(StreamingEvolutionRunner):
+    def __init__(self, root, *, stream_id, config=None, framework_state_io=None):
+        self.framework_state_io = framework_state_io
+        if framework_state_io is not None:
+            from skill3d.storage.framework_state_io import bind_framework_writers
+            framework_state_io.mkdir(Path(root))
+            bind_framework_writers(self, StreamingEvolutionRunner, {
+                "_write_atomic": framework_state_io.write_bytes,
+                "_write_create_once": framework_state_io.write_bytes_once,
+            })
+            self._bounded_attempt = self.__dict__.pop("_attempt")
+        super().__init__(root, stream_id=stream_id, config=config)
+
+    def _attempt(self, *args, **kwargs):
+        if self.framework_state_io is None:
+            return super()._attempt(*args, **kwargs)
+        result = self._bounded_attempt(*args, **kwargs)
+        self.framework_state_io.after_batch(best=result.outcome == "promoted")
+        return result
+
     def _decode_case(self, data: bytes) -> FitSetExperienceCase:
         return FitSetExperienceCase.model_validate_json(data)
+
+    def _load_cases(self, slot) -> tuple[FitSetExperienceCase, ...]:
+        """Use the latest slot/parent batch; retain all stored refs for audit."""
+        return tuple(
+            self._decode_case((self.root / ref).read_bytes())
+            for ref in slot.case_refs[-self.config.batch_size:]
+        )
 
 
 @dataclass
@@ -175,13 +218,19 @@ class FrozenSkillProvider:
 class SeededGateClient:
     """模型 seed 独立于封存的 M5 seed；记录每次真实请求参数。"""
 
-    def __init__(self, client, seed: int, audit_path: Path):
+    def __init__(self, client, seed: int, audit_path: Path, framework_state_io=None):
         self.client = client
         self.seed = seed
         self.audit_path = audit_path
         self.requests = []
         self.audit_context = {}
         self.request_context = {}
+        self.framework_state_io = framework_state_io
+
+    def _write_create_once(self, path, value):
+        if self.framework_state_io is None:
+            return _write_create_once(path, value)
+        return self.framework_state_io.write_json_once(path, value)
 
     def __getattr__(self, name):
         return getattr(self.client, name)
@@ -213,7 +262,7 @@ class SeededGateClient:
             "retry_of": None,
         }
         self.requests.append(copy.deepcopy(request))
-        _write_create_once(
+        self._write_create_once(
             self.audit_path.with_name(
                 f"{self.audit_path.stem}-{index:03d}.json"), request,
         )
@@ -226,7 +275,7 @@ class SeededGateClient:
             error_type = type(exc).__name__
             raise
         finally:
-            _write_create_once(self.audit_path.with_name(
+            self._write_create_once(self.audit_path.with_name(
                 f"{self.audit_path.stem}-response-{index:03d}.json"), {
                 "request_seed": self.seed,
                 "request_index": index, "request_identity_sha256": content_sha256(request_identity),
@@ -252,6 +301,7 @@ def initialize_worker_library(
     seed_skills: list[SkillSpecV11],
     owned_slots: list[str],
     run_identity: str,
+    framework_state_io=None,
 ) -> None:
     """从完整 seed 写独立文件；共享库无写入、无符号链接。"""
     seed_by_slot = {skill.slot_key: skill for skill in seed_skills}
@@ -277,21 +327,39 @@ def initialize_worker_library(
     for skill in seed_skills:
         relative = source_ref_for(skill)
         path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(skill.skill_md, encoding="utf-8")
+        if framework_state_io is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(skill.skill_md, encoding="utf-8")
+        else:
+            framework_state_io.write_text_once(path, skill.skill_md)
         sources.append(LoadedSkillV11(relative, skill.content_sha256, skill))
     snapshot, manifest = build_v11_snapshot(
         sources, snapshot_id="FIT-seed-" + run_identity[:16],
         require_complete=True, created_by="fitset_isolated_seed",
     )
-    write_v11_snapshot(root, snapshot, manifest, activate=True)
-    _write_create_once(marker, identity)
+    if framework_state_io is None:
+        write_v11_snapshot(root, snapshot, manifest, activate=True)
+        _write_create_once(marker, identity)
+    else:
+        framework_state_io.write_snapshot(root, snapshot, manifest, activate=True)
+        framework_state_io.write_json_once(marker, identity)
 
 
 def collect_fitset_case(variant: Mapping, outcome: Mapping,
                         parent: SkillSpecV11, label: Mapping,
-                        trace_ref: str) -> FitSetExperienceCase:
+                        trace_ref: str, *, experiment_split: Mapping | None = None,
+                        ) -> FitSetExperienceCase:
     """只从完成轨迹形成 learning case，不把框架故障归为方法经验。"""
+    authorization = (
+        learning_authorization_for(experiment_split, [variant["qa_id"]])
+        if experiment_split is not None else {})
+    if authorization:
+        _require(all(variant.get(field, "learning") == "learning"
+                     for field in ("experiment_role", "experiment_split")),
+                 "Validation role cannot enter learning case construction")
+        _require(variant.get("split") in {"induction", "inner_validation"}
+                 and variant.get("source_split", variant["split"]) == variant["split"],
+                 "Authorized learning must preserve the real source_split")
     key = f"{parent.skill_id}@{parent.version}"
     _require(outcome.get("delivered_skill_versions") == [key],
              "实际 Skill delivery 与槽位 parent 不一致")
@@ -333,6 +401,7 @@ def collect_fitset_case(variant: Mapping, outcome: Mapping,
         qa_id=variant["qa_id"], scene_id=variant["scene_id"],
         question_type=parent.question_type, evidence_state=parent.evidence_state,
         source_split=variant["split"],
+        learning_authorization=authorization,
         outcome="success" if score == 1 else "failure",
         delivered_skill_version=key, delivered_content_sha256=parent.content_sha256,
         delivered_skill_md=parent.skill_md, initial_evidence_states=initial,
@@ -404,6 +473,7 @@ class FitSetWorkerEvolution:
         initialize_worker_library(
             self.library, seed_skills=runner.seed_skills,
             owned_slots=self.owned_slots, run_identity=runner.run_identity,
+            framework_state_io=getattr(runner, "framework_state_io", None),
         )
         self.stream = FitSetStreamingBuffer(
             self.root / "buffer",
@@ -412,9 +482,15 @@ class FitSetWorkerEvolution:
                 batch_size=self.config.batch_size,
                 tail_for_unattempted_slots=self.config.tail_for_unattempted_slots,
                 minimum_tail_cases=self.config.minimum_tail_cases),
+            framework_state_io=getattr(runner, "framework_state_io", None),
         )
         self.rows = {row["variant_id"]: row for row in runner.variants}
         self.rows.update(getattr(runner, "gate_variant_rows", {}))
+
+    def _write_create_once(self, path, value):
+        if getattr(self.runner, "framework_state_io", None) is None:
+            return _write_create_once(path, value)
+        return self.runner._write_create_once(path, value)
 
     def provider(self, variant):
         parents, snapshot = _active(self.library)
@@ -429,8 +505,10 @@ class FitSetWorkerEvolution:
         }
 
     def ingest_result(self, variant, row):
+        authorization = self.runner.learning_authorization(variant)
         outcome_path = (self.runner.root / "variants"
                         / _variant_key(variant["variant_id"]) / "outcome.json")
+        trace_ref = self.runner.logical_path(outcome_path)
         outcome = json.loads(outcome_path.read_text())
         identity = row["skill_identity"]
         snapshot = read_snapshot(self.library / "snapshots", identity["snapshot_ref"])
@@ -440,7 +518,9 @@ class FitSetWorkerEvolution:
                           variant["question_type"], variant["evidence_state"]))
         accessed_at = datetime.now(timezone.utc).isoformat()
         label = self.runner.label_metadata[variant["qa_id"]]
-        case = collect_fitset_case(variant, outcome, parent, label, str(outcome_path))
+        case = collect_fitset_case(
+            variant, outcome, parent, label, trace_ref,
+            experiment_split=self.runner.experiment_split)
         if self.config.learning_input_mode != "aggregate_v1":
             from skill3d.evolution.case_records_v11 import case_from_fitset_outcome
 
@@ -450,16 +530,18 @@ class FitSetWorkerEvolution:
                 full_case = V11ExperienceCase.model_validate_json(canonical_path.read_bytes())
                 _require(full_case.delivered_content_sha256 == parent.content_sha256
                          and full_case.qa_id == variant["qa_id"]
-                         and full_case.trace_ref == str(outcome_path),
+                         and full_case.trace_ref == trace_ref
+                         and full_case.learning_authorization == authorization,
                          "canonical learning case identity changed")
             else:
                 full_case = case_from_fitset_outcome(
                     variant=variant, outcome=outcome, parent=parent, label=label,
-                    trace_ref=str(outcome_path), question_text=source["question_text"],
+                    trace_ref=trace_ref, question_text=source["question_text"],
                     options=source["options"], frame_set_hash=source["frame_set_hash"],
                     image_refs=source["image_refs"],
+                    experiment_split=self.runner.experiment_split,
                 )
-                _write_create_once(canonical_path, full_case.model_dump(mode="json"))
+                self._write_create_once(canonical_path, full_case.model_dump(mode="json"))
             case = FitSetExperienceCase.model_validate({
                 **case.model_dump(mode="json"),
                 "full_case": full_case.model_dump(mode="json"),
@@ -475,10 +557,12 @@ class FitSetWorkerEvolution:
                 "reference_answer_sha256": hashlib.sha256(
                     label["reference_answer"].encode()).hexdigest(),
         }
+        if authorization:
+            access["learning_authorization"] = authorization
         if access_path.exists():
             prior = json.loads(access_path.read_text())
             access["accessed_at"] = prior["accessed_at"]
-        _write_create_once(access_path, access)
+        self._write_create_once(access_path, access)
         result = self.stream.ingest(
             case, parent_snapshot_id=identity["snapshot_ref"], attempt=self.attempt)
         if result is None:
@@ -508,7 +592,21 @@ class FitSetWorkerEvolution:
 
     def _gate(self, request, parent, candidate, attempt_root):
         panel_ids = self.runner.gate_panels[request.slot_key]
-        if len(panel_ids) < self.config.gate_size:
+        if self.config.gate_mode == "qa_disjoint":
+            learning_qa = {row["qa_id"] for row in self.runner.variants}
+            _require(not learning_qa & {self.rows[value]["qa_id"] for value in panel_ids},
+                     "gate QA overlaps learning QA")
+            _require(all(
+                self.runner.experiment_split["qa_roles"].get(self.rows[value]["qa_id"])
+                == "validation" for value in panel_ids),
+                "gate contains non-validation QA")
+            expected = [row["variant_id"] for row in self.runner.gate_variant_rows.values()
+                        if row["slot_key"] == request.slot_key]
+            _require(panel_ids == expected, "qa_disjoint must use all validation variants")
+        panel_size = (
+            len({self.rows[value]["qa_id"] for value in panel_ids})
+            if self.config.gate_mode == "qa_disjoint" else len(panel_ids))
+        if panel_size < self.config.gate_size:
             body = {
                 "passed": False, "conditions": {"gate_size": False},
                 "reason": "槽位题量不足冻结 gate_size", "arms": [],
@@ -536,16 +634,22 @@ class FitSetWorkerEvolution:
                         "run": self.runner.run_identity, "seed": seed,
                         "skill": spec.model_dump(mode="json"),
                     }),
+                    framework_state_io=self.runner.framework_state_io,
                 )
                 _, evaluation_snapshot = _active(output / "library")
                 gate_runner = copy.copy(self.runner)
                 gate_runner.root = output
+                gate_runner.deployment_continuation = None
+                gate_runner._continuation = None
                 gate_runner._request_governor_root = self.runner.request_governor_root
                 gate_runner._request_category = "gate"
                 gate_runner.evolution_config = None
+                gate_runner._qa_disjoint_gate = self.config.gate_mode == "qa_disjoint"
                 gate_runner.capture_offline_case_input = False
                 gate_runner.label_metadata = {}
-                if gate_runner.published_inputs is not None:
+                gate_runner.experiment_split = None
+                gate_runner.gate_deferred_reasons = {}
+                if gate_runner.published_inputs is not None or gate_runner._qa_disjoint_gate:
                     gate_runner.input_contract_identity = copy.deepcopy(
                         self.runner.input_contract_identity)
                     gate_runner.input_contract_identity.pop("offline_metadata", None)
@@ -579,7 +683,7 @@ class FitSetWorkerEvolution:
                 }
                 if binding_seeds:
                     frozen["binding_seed_by_variant"] = binding_seeds
-                _write_create_once(output / "gate_identity.json", frozen)
+                self._write_create_once(output / "gate_identity.json", frozen)
                 arm_runners[(seed, name)] = gate_runner
         schedule = []
         for seed_index, seed in enumerate(self.config.gate_seeds):
@@ -589,7 +693,7 @@ class FitSetWorkerEvolution:
                 for name in order:
                     episodes.append((arm_runners[(seed, name)], self.rows[variant_id]))
                     schedule.append({"seed": seed, "arm": name, "variant_id": variant_id})
-        _write_create_once(attempt_root / "gate_schedule.json", {
+        self._write_create_once(attempt_root / "gate_schedule.json", {
             "schema_version": "gate-balanced-order/1.0", "submission_order": schedule,
             "concurrency_limit": self.runner.episode_concurrency,
             "completion_order_guaranteed": False,
@@ -711,17 +815,62 @@ class FitSetWorkerEvolution:
         result_path = root / "result.json"
         if result_path.exists():
             return StreamingAttemptResult(**json.loads(result_path.read_text()))
+        continuation = getattr(self.runner, "_continuation", None)
+        revision_root = (root if continuation is None else
+                         root / "deployments" / continuation.deployment_id)
+        pending_intents = False
+        if continuation is not None:
+            namespaces = [root, *sorted((root / "deployments").glob("*"))]
+            for namespace in namespaces:
+                intents = list(namespace.glob("revision/slots/*/*/request_intent_*.json"))
+                pending_intents |= bool(
+                    intents or list(namespace.glob("diagnosis/*/request_intent.json")))
+                if namespace == revision_root:
+                    continue
+                for intent in intents:
+                    exchange = intent.with_name(intent.name.replace("request_intent_", "attempt_"))
+                    if not exchange.is_file():
+                        raise RevisionOperationalError(
+                            "continuation cannot retry an ambiguous original revision request")
+                    _require(intent.resolve().is_relative_to(self.root.resolve())
+                             and exchange.resolve().is_relative_to(self.root.resolve()),
+                             "continuation revision receipt escaped the worker locator")
+                    prior = json.loads(intent.read_bytes())
+                    _require(json.loads(exchange.read_bytes()).get("request") == prior["request"],
+                             "continuation original intent/exchange identity changed")
+                    if prior["request"]["prompt_version"] == FIT_REVISION_PROMPT_VERSION:
+                        raise RevisionOperationalError(
+                            "continuation cannot replay an unresolved request under the same protocol")
         parent = self._parent_for(request)
+        if self.config.gate_mode == "qa_disjoint":
+            for case in request.cases:
+                validate_learning_authorization(
+                    case.learning_authorization, [case.qa_id], self.runner.experiment_split)
+            reason = self.runner.gate_deferred_reasons.get(request.slot_key)
+            if reason:
+                # Admission is deferred, not the learning stream's batch window.
+                result = StreamingAttemptResult(
+                    outcome="no_change", campaign_id=token, reason=reason)
+                self._write_create_once(root / "gate_deferred.json", {
+                    "admission_status": "deferred", "learning_continues": True,
+                    "reason": reason, "gate_size": self.config.gate_size,
+                    "panel_ids": self.runner.gate_panels[request.slot_key],
+                    "run_identity": self.runner.run_identity,
+                    "parent_hash": parent.content_sha256,
+                    "case_ids": [case.case_id for case in request.cases],
+                })
+                self._write_create_once(result_path, asdict(result))
+                return result
         feedback = sanitized_slot_feedback(request.cases)
-        _write_create_once(root / "feedback.json", feedback)
-        _write_create_once(root / "request.json", {
+        self._write_create_once(root / "feedback.json", feedback)
+        self._write_create_once(root / "request.json", {
             "slot": request.slot_key, "parent": parent.model_dump(mode="json"),
             "parent_content_sha256": parent.content_sha256,
             "case_ids": [case.case_id for case in request.cases],
             "new_case_count": request.new_case_count,
             "run_identity": self.runner.run_identity,
         })
-        schedule_path = root / "schedule.json"
+        schedule_path = revision_root / "schedule.json"
         if schedule_path.exists():
             schedule = json.loads(schedule_path.read_text())
             _require(schedule.get("identity_sha256") == content_sha256({
@@ -729,17 +878,13 @@ class FitSetWorkerEvolution:
             }), "revision schedule receipt changed")
         else:
             prior_patterns = set()
-            revision_requests_used = 0
+            revision_requests_used = revision_intents_used(self.root, request.slot_key)
             for path in sorted((self.root / "campaigns").glob("*/request.json")):
                 if path.parent == root:
                     continue
                 prior = json.loads(path.read_text())
                 if prior["slot"] != request.slot_key:
                     continue
-                revision_requests_used += len(list(
-                    (path.parent / "revision").glob("slots/*/*/request_intent_*.json")))
-                revision_requests_used += len(list(
-                    (path.parent / "diagnosis").glob("*/request_intent.json")))
                 prior_schedule = path.parent / "schedule.json"
                 if (prior["parent_content_sha256"] == parent.content_sha256
                         and prior_schedule.exists()):
@@ -772,16 +917,19 @@ class FitSetWorkerEvolution:
                 self.config.max_revision_attempts,
                 max(0, schedule["remaining_revision_requests"] - diagnosis_cost))
             schedule["identity_sha256"] = content_sha256(schedule)
-            _write_create_once(schedule_path, schedule)
+            self._write_create_once(schedule_path, schedule)
         if not schedule["scheduled"]:
+            if continuation is not None and pending_intents:
+                raise RevisionOperationalError(
+                    "continuation cannot turn an unresolved request into a method result")
             result = StreamingAttemptResult(
                 outcome="no_change", campaign_id=token, reason=schedule["reason_code"])
-            _write_create_once(result_path, asdict(result))
+            self._write_create_once(result_path, asdict(result))
             return result
         forbidden = {str(value) for row in self.runner.variants
                      for value in (row["qa_id"], row["scene_id"], row["variant_id"])}
         reviser = FitSetSlotReviser(
-            output_root=root / "revision", panel=self.runner.panel,
+            output_root=revision_root / "revision", panel=self.runner.panel,
             panel_name=self.runner.panel_name, variants=[],
             accumulation_root=self.runner.root,
             label_metadata={}, library_root=self.library,
@@ -793,7 +941,15 @@ class FitSetWorkerEvolution:
             max_attempts=schedule["revision_attempt_budget"],
             max_tokens=self.config.max_tokens,
             method_context_max_chars=self.runner.base_cfg.retrieval_policy.method_context_max_chars,
+            experiment_split=self.runner.experiment_split,
+            input_max_bytes=self.config.revision_input_max_bytes,
+            input_max_chars=self.config.revision_input_max_chars,
+            evidence_request_budget=max(0, schedule["remaining_revision_requests"]
+                                        - schedule["revision_attempt_budget"]
+                                        - int(self.config.learning_input_mode.startswith("diagnosis"))),
         )
+        if self.runner.framework_state_io is not None:
+            self.runner.framework_state_io.adapt_reviser(reviser)
         _require(not leakage_scan_text(
             json.dumps(feedback), forbidden_sample_ids=forbidden),
                  "offline prompt 泄漏扫描失败")
@@ -810,25 +966,40 @@ class FitSetWorkerEvolution:
                          == [case.case_id for case in full_cases],
                          "canonical experience changed during resume")
             else:
-                access = DataAccessRecord(
-                    record_id=f"fit-label-access-{token}",
-                    at=datetime.now(timezone.utc).isoformat(), split="induction",
-                    purpose="skill_induction", component_role="inducer",
-                    run_id=token, n_items=len(full_cases), label_access=True,
-                    input_manifest_sha256=content_sha256(
-                        [case.model_dump(mode="json") for case in full_cases]),
-                    source_refs=[case.trace_ref for case in full_cases],
-                    notes=["Question-level induction labels only; no GT 3D access"],
-                )
+                accesses = []
+                for source in sorted({case.source_split for case in full_cases}):
+                    source_cases = [case for case in full_cases if case.source_split == source]
+                    accesses.append(DataAccessRecord(
+                        record_id=f"fit-label-access-{token}-{source}",
+                        at=datetime.now(timezone.utc).isoformat(), split=source,
+                        purpose="skill_induction", component_role="inducer",
+                        run_id=token, n_items=len(source_cases), label_access=True,
+                        input_manifest_sha256=content_sha256(
+                            [case.model_dump(mode="json") for case in source_cases]),
+                        source_refs=[case.trace_ref for case in source_cases],
+                        notes=["Authorized learning question labels only; no GT 3D access"],
+                        learning_authorization=(
+                            learning_authorization_for(self.runner.experiment_split, [
+                                case.qa_id for case in source_cases])
+                            if self.runner.experiment_split is not None else {}),
+                    ))
+                sources = [access.split for access in accesses]
                 experience = V11ExperienceBundle(
                     campaign_id=token, parent_snapshot_id=request.parent_snapshot_id,
                     parent_skill_version=request.parent_skill_version,
                     parent_content_sha256=parent.content_sha256,
                     question_type=parent.question_type, evidence_state=parent.evidence_state,
-                    source_split="induction", split="learning", label_access=True,
-                    source_run_ref=str(root), label_access_record=access, cases=full_cases,
+                    source_split=sources[0] if len(sources) == 1 else sources,
+                    split="learning", label_access=True,
+                    learning_authorization=(
+                        learning_authorization_for(self.runner.experiment_split, [
+                            case.qa_id for case in full_cases])
+                        if self.runner.experiment_split is not None else {}),
+                    source_run_ref=str(root), label_access_record=accesses[0],
+                    label_access_records=accesses if self.runner.experiment_split is not None else [],
+                    cases=full_cases,
                 )
-                _write_create_once(bundle_path, experience.model_dump(mode="json"))
+                self._write_create_once(bundle_path, experience.model_dump(mode="json"))
             if self.config.learning_input_mode.startswith("diagnosis"):
                 from skill3d.evolution.diagnosis_v11 import (
                     FrozenCaseImageProvider, OfflineDiagnosisConfig, V11CaseDiagnoser,
@@ -840,7 +1011,7 @@ class FitSetWorkerEvolution:
                         self.runner.revision_client_factory(), "diagnosis",
                         {"slot_key": request.slot_key, "campaign_id": token,
                          "run_identity": self.runner.run_identity}),
-                    root / "diagnosis",
+                    revision_root / "diagnosis",
                     OfflineDiagnosisConfig(
                         mode="multimodal" if multimodal else "text",
                         max_cases=self.config.diagnosis_max_cases,
@@ -848,6 +1019,9 @@ class FitSetWorkerEvolution:
                         max_images=self.config.diagnosis_max_images,
                         max_output_tokens=self.config.diagnosis_max_output_tokens),
                 )
+                if self.runner.framework_state_io is not None:
+                    self.runner.framework_state_io.adapt_diagnoser(
+                        diagnoser, {"campaign_id": token})
                 diagnosis = diagnoser.diagnose(
                     parent, experience, context={"campaign_id": token},
                     image_provider=FrozenCaseImageProvider(
@@ -859,6 +1033,17 @@ class FitSetWorkerEvolution:
                 slot=(request.question_type, request.evidence_state),
                 parent=parent, feedback=feedback, forbidden_ids=forbidden,
                 experience=experience, diagnosis=diagnosis)
+        except RevisionInputBudgetExhausted as exc:
+            self._write_create_once(root / "input_budget_refusal.json", {
+                "schema": "revision-input-budget-refusal/1",
+                "source_bundle_sha256": exc.source_sha256,
+                "needed_batches": exc.needed, "available_counted_requests": exc.available,
+                "model_requests_initiated": 0, "method_assessed": False,
+                "parent_preserved": True, "canonical_cases_retained": True,
+            })
+            result = StreamingAttemptResult(
+                outcome="no_change", campaign_id=token,
+                reason="revision_input_request_budget_exhausted")
         except FitSetError as exc:
             result = StreamingAttemptResult(
                 outcome="rejected", campaign_id=token, reason=str(exc))
@@ -867,7 +1052,7 @@ class FitSetWorkerEvolution:
                 result = StreamingAttemptResult(
                     outcome="no_change", campaign_id=token,
                     reason="Current process evidence does not support a method revision")
-                _write_create_once(result_path, asdict(result))
+                self._write_create_once(result_path, asdict(result))
                 return result
             dedup_key = candidate_dedup_key(
                 slot=request.slot_key, parent_hash=parent.content_sha256,
@@ -896,7 +1081,7 @@ class FitSetWorkerEvolution:
                              and prior_decision["candidate_hash"] == previous["candidate_sha256"]
                              and previous["parent_sha256"] == parent.content_sha256,
                              "重复候选原始证据身份改变")
-                    _write_create_once(root / "duplicate.json", {
+                    self._write_create_once(root / "duplicate.json", {
                         **entry, "original_campaign_id": previous["campaign_id"],
                         "original_decision_sha256": content_sha256(prior_decision),
                         "gate_reexecuted": False,
@@ -904,11 +1089,11 @@ class FitSetWorkerEvolution:
                     result = StreamingAttemptResult(
                         outcome="duplicate", campaign_id=token,
                         reason="Identical method under the same parent; original gate retained")
-                    _write_create_once(result_path, asdict(result))
+                    self._write_create_once(result_path, asdict(result))
                     return result
                 _require(previous == entry, "candidate index identity changed")
             else:
-                _write_create_once(index_path, entry)
+                self._write_create_once(index_path, entry)
             if decision_path.exists():
                 decision = json.loads(decision_path.read_text())
                 body = {key: value for key, value in decision.items()
@@ -921,7 +1106,7 @@ class FitSetWorkerEvolution:
                          "A/B decision candidate/parent 身份改变")
             else:
                 decision = self._gate(request, parent, candidate, root)
-                _write_create_once(decision_path, decision)
+                self._write_create_once(decision_path, decision)
             if not decision["passed"]:
                 result = StreamingAttemptResult(
                     outcome="rejected", campaign_id=token, reason="严格 A/B 未提升")
@@ -939,7 +1124,10 @@ class FitSetWorkerEvolution:
                         modification_reason="fit-set dual-seed strict A/B passed",
                         source_run_ref=str(root),
                     )
-                    publish_v11_candidate(self.library, proposal)
+                    if self.runner.framework_state_io is None:
+                        publish_v11_candidate(self.library, proposal)
+                    else:
+                        self.runner.framework_state_io.publish_candidate(self.library, proposal)
                 active, after = _active(self.library)
                 _require(active[slot] == candidate, "发布后正常 loader/hash 验证失败")
                 for other in ALL_FIT_SLOTS:
@@ -953,16 +1141,17 @@ class FitSetWorkerEvolution:
                     active_skill_version=f"{candidate.skill_id}@{candidate.version}",
                     active_content_sha256=candidate.content_sha256,
                 )
-                _write_create_once(root / "post_load.json", {
+                self._write_create_once(root / "post_load.json", {
                     "verified": True, "snapshot": after, "slot": request.slot_key,
                     "version": result.active_skill_version,
                     "content_sha256": candidate.content_sha256,
                 })
-        _write_create_once(result_path, asdict(result))
+        self._write_create_once(result_path, asdict(result))
         return result
 
 
-def freeze_fitset_stream(system_root: str | Path, output_dir: str | Path) -> dict:
+def freeze_fitset_stream(system_root: str | Path, output_dir: str | Path,
+                        *, framework_state_io=None, system_runner=None) -> dict:
     """合并唯一 owner 的最后发布版本；不产生额外终版修订。"""
     from skill3d.evaluation.fitset_v11 import (
         build_fit_skill_bundle,
@@ -1046,8 +1235,17 @@ def freeze_fitset_stream(system_root: str | Path, output_dir: str | Path) -> dic
              "freeze 槽位 owner 重复")
     result_paths = list((root / "results").glob("*.json"))
     ids = {json.loads(path.read_text())["variant_id"] for path in result_paths}
+    result_count = len(result_paths)
+    if system_runner is not None:
+        _require(system_runner.root == root
+                 and system_runner.run_identity == manifest["identity_sha256"],
+                 "freeze recovery runner identity changed")
+        completed = system_runner.completed()
+        _require(ids <= set(completed), "freeze ordinary results changed")
+        ids = set(completed)
+        result_count = len(completed)
     _require(ids == set(manifest["variant_ids"])
-             and len(ids) == len(result_paths)
+             and len(ids) == result_count
              and summary["completed_variants"] == len(ids),
              "freeze 分母/结果文件不一致")
     return build_fit_skill_bundle(
@@ -1060,4 +1258,6 @@ def freeze_fitset_stream(system_root: str | Path, output_dir: str | Path) -> dic
             "workers": receipts, "selected_slots": sorted(selected),
             "no_additional_revision": True,
         },
+        **({"framework_state_io": framework_state_io}
+           if framework_state_io is not None else {}),
     )

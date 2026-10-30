@@ -546,7 +546,29 @@ def test_legacy_cache_migration_does_not_invent_upstream_history(tmp_path, upstr
         assert upstream.calls == 1
 
 
-@pytest.mark.parametrize("cap", [0, 9, 32, True])
-def test_upstream_cap_cannot_be_raised_above_eight(tmp_path, upstream, cap):
-    with pytest.raises(ValueError, match="between 1 and 8"):
+@pytest.mark.parametrize("cap", [0, 65, -1, True])
+def test_upstream_cap_is_bounded_to_64(tmp_path, upstream, cap):
+    with pytest.raises(ValueError, match="between 1 and 64"):
         gateway_module.PerceptionGateway(CONFIG, tmp_path / "cache", max_concurrency=cap)
+
+
+@pytest.mark.parametrize("cap", [16, 32, 64])
+def test_expanded_capacity_preserves_admission_and_audit(tmp_path, upstream, cap):
+    upstream.expected = cap
+    upstream.release.clear()
+    unique = [envelope() for _ in range(cap)]
+    with service(tmp_path, upstream, max_concurrency=cap) as gateway:
+        with ThreadPoolExecutor(max_workers=cap) as pool:
+            owners = [pool.submit(gateway.chat, raw) for raw in unique]
+            try:
+                assert upstream.entered.wait(timeout=10)
+                counts(gateway, started=cap, active=cap, peak=cap)
+                with pytest.raises(gateway_module.GatewayError) as error:
+                    gateway.chat(envelope())
+                assert (error.value.status, error.value.code) == (429, "capacity")
+            finally:
+                upstream.release.set()
+            assert all(future.result(timeout=10)[0] == 200 for future in owners)
+        counts(gateway, started=cap, active=0, succeeded=cap, failed=0, unknown=0)
+        assert upstream.calls == cap
+        assert len(receipts(gateway)) == cap

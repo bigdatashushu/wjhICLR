@@ -8,7 +8,11 @@
 - 每题派发前冻结 Skill 内容 hash 和 snapshot identity，结果、trace、work、recon 使用原有独立 variant 目录。
 - 同一 lineage 可并行执行当前批次的剩余题目。结果按 `scene_id`、`variant_id` 顺序入库。
 - 第 12 条新经验触发既有 reviser、双 seed parent/candidate A/B、严格准入、原子发布和正常加载验证。完成后才能派发该 lineage 的下一批。
-- 协调器串行处理修订和发布。此时暂停新的在线题目派发，已启动题目继续完成，gate episode 使用共享 episode permit 并行执行。因此这版不承诺所有阶段都持续占满 32 路。
+- 默认 `--reviser-concurrency 1` 时，协调器串行处理修订和发布。
+  设置为 2–owner 数时，各 owner 在独立进程的主线程中串行入库、修订和执行 gate。
+  同时最多允许指定数量的 owner 事务；事务期间暂停该 owner 的新派发，其他 owner 继续。
+  协调器收到完成回执后重新加载该 owner 的 stream 和 library，再派发下一窗口。
+  solver 和所有 gate 继续共用一个 episode permit，所有模型调用共用原请求 governor。
 - 在线 executor 不接收 owner、label metadata、revision factory 或 gate factory。原有 online label isolation 和 prepared-binding 检查继续生效。
 - 完整案例与诊断模式将公开输入采集开关单独冻结进 run identity。executor 保存实际问题、
   选项、原始图像及输入 hash，同时移除演化配置和离线 metadata 身份；gate 副本关闭采集。
@@ -26,12 +30,17 @@
 | `--requests-per-second` | 全局请求启动频率；0 不限频率 |
 | `--episode-concurrency` | 在线和 gate episode 的共享上限；新调度器中 0 使用 workers |
 | `--skill-owners` | 固定 library owner 数，独立于 workers |
+| `--reviser-concurrency` | 同时执行修订事务的 owner 上限，默认 1，最大为 owner 数 |
 
 预算耗尽按取消运行处理，绕过模型故障恢复，不进入 Skill 方法失败或 A/B 拒绝统计。进程死亡后 OS 自动释放 permit，但未收到完成记录的请求仍占用累计额度，不自动重放。摘要区分 active、completed、error 和 unknown，并汇总可测的 token usage。日志不记录 prompt、凭据或异常正文。
 
 ## 恢复
 
 使用相同代码、输入、scheduler、workers、owner 数和请求策略才能 `--resume`。学习选择必须是每条 lineage 的前缀，不能跳过早先题目后继续积累。
+
+已有 run 若要增开 Reviser，必须使用新冻结源码和显式 deployment continuation。
+授权只允许 `execution.reviser_concurrency` 在 1–冻结 owner 数内变化，
+不会允许修改其他 execution 字段或请求预算；原 manifest、失败、已完成结果和 ledger 前缀保留。
 
 完成结果不重新执行。乱序完成的结果在缺失的早先题目完成后按冻结顺序入库。其他 lineage 推进共享 owner snapshot 时，未完成派发仍绑定原来的 snapshot，且必须证明方法 hash 未变。
 

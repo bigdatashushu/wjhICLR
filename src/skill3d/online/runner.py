@@ -220,8 +220,10 @@ class OnlineRunConfig:
     max_solver_rounds: Optional[int] = None
     max_retries_per_operation: Optional[int] = None
     finalization_rounds: Optional[int] = None
-    # 仅评测失败后追加一次干净视觉请求，不占原 solver 轮数；induction 硬禁用。
+    # 仅评测失败后追加一次干净视觉请求，不占原 solver 轮数。
     eval_visual_fallback: bool = False
+    # QA 分区角色与原始数据 split 分开；学习禁用，验证可覆盖 induction 来源。
+    evaluation_execution_role: Optional[str] = None
     # Content-addressed provenance for the active skill snapshot. The human
     # readable ref remains separate so pointer movement cannot hide lineage.
     active_snapshot_manifest_sha256: str = ""
@@ -240,6 +242,8 @@ class OnlineRunConfig:
     def __post_init__(self) -> None:
         if self.mode not in {"real", "mock_light"}:
             raise ValueError("mode 只支持 real 或 mock_light")
+        if self.evaluation_execution_role not in {None, "learning", "validation"}:
+            raise ValueError("evaluation_execution_role must be learning, validation or None")
         if (self.prepared_binding_seed is not None
                 and type(self.prepared_binding_seed) is not int):
             raise ValueError("prepared_binding_seed must be an int or None")
@@ -1182,6 +1186,7 @@ def run_episode(
     input_error: Optional[InputErrorRecord] = None,
     artifact_relocation: ValidatedRelocation | None = None,
     original_item: EpisodeItem | None = None,
+    binding_derivation_context=None,
 ) -> EpisodeOutcome:
     """跑完一条在线链 episode。
 
@@ -1428,18 +1433,25 @@ def run_episode(
                     art, pixels, None, episode, cfg, m5_llm)
             else:
                 from copy import deepcopy
+                from skill3d.evaluation.verified_publication_v11 import (
+                    ProducerVerifiedBindingContext,
+                )
 
-                binding = deepcopy(prepared_binding)
+                verified_binding = isinstance(
+                    binding_derivation_context, ProducerVerifiedBindingContext)
+                binding = prepared_binding if verified_binding else deepcopy(prepared_binding)
                 if cfg.mode == "real":
                     from skill3d.segmentation.question_binding import (
                         binding_parameters, question_input, validate_prepared_binding,
                     )
                     validate_prepared_binding(
-                        binding, frames=pixels, depth=_load_npy(art.depth_maps),
-                        c2w=_load_npy(art.c2w_list), intrinsics=_load_npy(art.intrinsics),
-                        point_conf=_load_npy(art.depth_conf),
-                        depth_conf=_load_npy(art.depth_conf),
-                        point_map=_load_npy(art.point_map),
+                        binding, frames=pixels,
+                        depth=None if verified_binding else _load_npy(art.depth_maps),
+                        c2w=None if verified_binding else _load_npy(art.c2w_list),
+                        intrinsics=None if verified_binding else _load_npy(art.intrinsics),
+                        point_conf=None if verified_binding else _load_npy(art.depth_conf),
+                        depth_conf=None if verified_binding else _load_npy(art.depth_conf),
+                        point_map=None if verified_binding else _load_npy(art.point_map),
                         inputs=question_input(episode.question,
                             canonical_task(episode.question_type), episode.options),
                         scene_identity=str(
@@ -1449,11 +1461,14 @@ def run_episode(
                               else cfg.prepared_binding_seed),
                         model_weights_sha256="",
                         source_compatibility=cfg.prepared_binding_source_compatibility,
+                        binding_derivation_context=binding_derivation_context,
                         parameters=binding_parameters(
                             semantic_min_pixels=cfg.semantic_min_pixels,
                             semantic_max_pixels=cfg.semantic_max_pixels,
                             semantic_relation_batch_size=cfg.semantic_relation_batch_size,
                             semantic_review_config=cfg.semantic_review_config))
+                if verified_binding:
+                    binding = deepcopy(binding)
                 m5_objects, m5_stats = binding.objects, binding.stats
                 m5_notes, m5_materialized = binding.notes, binding.materialized
             prepared_measurements = (
@@ -1583,7 +1598,9 @@ def run_episode(
     answer: Optional[str] = kernel.answer_slot.answer if kernel is not None else None
     visual_payload = None
     if (cfg.eval_visual_fallback and cfg.mode == "real"
-            and episode.split in EVAL_VISUAL_SPLITS
+            and (cfg.evaluation_execution_role == "validation"
+                 or (cfg.evaluation_execution_role is None
+                     and episode.split in EVAL_VISUAL_SPLITS))
             and outcome.final_state == "run_error" and outcome.agent_rounds > 0
             and answer is None):
         original = {
@@ -3539,6 +3556,7 @@ def run_split(
     llm=None,
     prepared_bindings: Optional[Mapping[str, PreparedObjectBinding]] = None,
     artifact_relocations: Mapping[str, ValidatedRelocation] | None = None,
+    binding_derivation_contexts: Mapping[str, object] | None = None,
 ) -> tuple[list[EpisodeOutcome], EvaluationRun]:
     """Run EpisodeItems and aggregate outcomes.
 
@@ -3571,6 +3589,12 @@ def run_split(
         store.claim_run(run_id)
         store = store.bind(run_id=run_id)
     prepared = dict(prepared_bindings or {})
+    derivations = dict(binding_derivation_contexts or {})
+    if derivations and (
+        set(derivations) != {it.episode.qa_id for it in items}
+        or not set(derivations) <= set(prepared)
+    ):
+        raise ValueError("binding derivation contexts must cover exactly the prepared run QA")
     unknown_prepared = set(prepared) - {
         it.episode.qa_id for it in items
     }
@@ -3594,6 +3618,7 @@ def run_split(
             input_error=getattr(it, "input_error", None),
             artifact_relocation=relocations.get(it.episode.qa_id),
             original_item=it if relocations else None,
+            binding_derivation_context=derivations.get(it.episode.qa_id),
         )
         for it in items
     ]
