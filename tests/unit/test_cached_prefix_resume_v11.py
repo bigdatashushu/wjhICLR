@@ -160,8 +160,11 @@ def package(monkeypatch):
         live = json.loads(p.ledger.read_bytes())
         assert live["requests"][:4] == state["requests"]
     finally:
-        helper.tearDown()
-        helper.doCleanups()
+        monkeypatch.undo()
+        try:
+            helper.tearDown()
+        finally:
+            helper.doCleanups()
 
 
 class SyntheticNormalClient:
