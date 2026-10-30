@@ -90,6 +90,8 @@ def test_default_launcher_selects_primary_mode():
     arguments = cli.build_parser().parse_args(
         experiment_stages_v11.system_argv(manifest, "learning", preflight=True))
     assert arguments.learning_input_mode == "analysis_synthesis_v1"
+    assert arguments.analysis_concurrency == 4
+    assert arguments.overlap_owner_slots
     assert arguments.gate_mode == "qa_disjoint"
     assert arguments.request_governor_root == "/synthetic/run/requests"
 

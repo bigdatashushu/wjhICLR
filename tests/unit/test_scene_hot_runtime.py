@@ -1,7 +1,7 @@
 import io
 import json
 import tarfile
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 
 import pytest
@@ -124,3 +124,65 @@ def test_wrong_layout_and_unknown_scene_fail_before_network(runtime):
             closure_path=runtime.closure_path, cache_root=runtime.cache_root,
             endpoint="http://unused", token_file=Path("/unused"),
         )
+
+
+def test_cold_transfer_does_not_block_another_hot_episode(runtime):
+    import threading
+    with runtime.scene_lease("b"):
+        pass
+    entered, release = threading.Event(), threading.Event()
+    original = runtime._request
+    calls = []
+    def blocked(path, *args):
+        calls.append(path)
+        if path == "/scene/a":
+            entered.set()
+            assert release.wait(10)
+        return original(path, *args)
+    runtime._request = blocked
+    def read_hot():
+        with runtime.scene_lease("b") as path:
+            return (path / "data.bin").read_bytes()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        cold = pool.submit(runtime.prefetch, "a")
+        try:
+            assert entered.wait(5)
+            duplicate = pool.submit(runtime.prefetch, "a")
+            assert pool.submit(read_hot).result(timeout=3) == b"b" * 1024
+        finally:
+            release.set()
+        assert cold.result(timeout=5)["status"] == "ready"
+        assert duplicate.result(timeout=5)["status"] == "ready"
+    assert calls.count("/scene/a") == 1
+
+
+def test_publish_to_reader_is_guarded_before_current_pin_moves(runtime):
+    import threading
+    cache = runtime.cache()
+    acquired, release = threading.Event(), threading.Event()
+    lease = cache.lease
+    from contextlib import contextmanager
+    @contextmanager
+    def blocked_lease(key, **kwargs):
+        if key == "scene-a":
+            acquired.set()
+            assert release.wait(10)
+        with lease(key, **kwargs) as path:
+            yield path
+    cache.lease = blocked_lease
+    def consume(scene):
+        with runtime.scene_lease(scene) as path:
+            return (path / "data.bin").read_bytes()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(consume, "a")
+        try:
+            assert acquired.wait(5)
+            second = pool.submit(consume, "b")
+            # B cannot reassign A's current pin before A's SH has been taken.
+            with pytest.raises(TimeoutError):
+                second.result(timeout=0.2)
+            assert cache.stats()["slots"]["current"] == "scene-a"
+        finally:
+            release.set()
+        assert first.result(timeout=5) == b"a" * 1024
+        assert second.result(timeout=5) == b"b" * 1024

@@ -14,6 +14,7 @@ from contextlib import redirect_stdout
 from dataclasses import asdict
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 
@@ -58,12 +59,21 @@ def system_argv(manifest, stage, *, preflight=False):
         "learning_input_mode", "scheduling_mode", "max_revision_requests_per_slot",
         "max_gate_candidates_per_slot", "max_revision_attempts", "revision_max_tokens",
         "gate_size", "diagnosis_max_cases", "diagnosis_max_input_chars", "diagnosis_max_images",
-        "diagnosis_max_output_tokens",
+        "diagnosis_max_output_tokens", "analysis_concurrency", "offline_frame_storage",
     }
     for name in sorted(options):
         if name in runtime and runtime[name] != "":
             value = 1 if name == "reviser_concurrency" and not learning else runtime[name]
             argv.extend(["--" + name.replace("_", "-"), str(value)])
+    argv.append("--overlap-owner-slots" if runtime.get("overlap_owner_slots", False)
+                else "--no-overlap-owner-slots")
+    argv.append("--prefetch-scenes" if runtime.get("prefetch_scenes", False)
+                else "--no-prefetch-scenes")
+    if "offline_frame_storage" not in runtime:
+        argv.extend(["--offline-frame-storage", "per_variant_v1"])
+    if runtime.get("revision_request_caps"):
+        argv.extend(["--revision-request-caps", json.dumps(
+            runtime["revision_request_caps"], sort_keys=True)])
     if not learning:
         bundle_stage = "seed" if stage == "initial_validation" else "freeze"
         argv.extend(["--execution-role", "validation", "--skill-bundle",

@@ -149,22 +149,41 @@ class SceneHotRuntime:
             if file_identity(path / name) != row["identity"]:
                 raise IntegrityError("scene shard member bytes changed")
 
-    def _populate(self, cache, scene, *, slot=None):
+    def _populate(self, cache, scene, *, slot=None, held=None):
+        spec = self.closure["shards"][scene]
+        # Duplicate producers serialize by immutable shard, while hot readers
+        # of other scenes need only the short publication/admission section.
+        lock = cache.root / ("scene-transfer-" + hashlib.sha256(
+            spec["key"].encode()).hexdigest() + ".lock")
+        with _flock(lock):
+            return self._populate_shard(cache, scene, slot=slot, held=held)
+
+    def _populate_shard(self, cache, scene, *, slot=None, held=None):
         spec = self.closure["shards"][scene]
         if not cache.contains(spec["key"]):
             # Cached handles still reconcile a crashed producer before a cold
             # admission. Ready scenes keep the scan-free metadata path.
             cache.recover()
-        if cache.contains(spec["key"]):
+        def acquire_reader():
+            if held is None:
+                return
+            with cache._locked() as state:
+                adopted = scene == "state" and (
+                    state["entries"][spec["key"]]["kind"] == "workspace")
+            if not adopted:
+                held.enter_context(cache.lease(spec["key"], touch=False))
+
+        with _flock(cache.root / ".scene-admission.lock"):
+            if cache.contains(spec["key"]):
+                if slot is not None:
+                    cache.pin(slot, spec["key"])
+                acquire_reader()
+                return
             if slot is not None:
-                cache.pin(slot, spec["key"])
-            return
-        if slot is not None:
-            # Current/next pins cannot prevent the following shard from making
-            # space forever. Active readers remain protected by their OS leases.
-            cache.pin(slot, None)
-            if slot == "current":
-                cache.pin("next", None)
+                # OS leases protect existing readers after pin reassignment.
+                cache.pin(slot, None)
+                if slot == "current":
+                    cache.pin("next", None)
 
         def produce(reservation):
             with self._request("/scene/" + scene) as response:
@@ -185,10 +204,18 @@ class SceneHotRuntime:
                     if seen != set(spec["members"]):
                         raise IntegrityError("incomplete scene archive")
 
+        @contextmanager
+        def publication_guard():
+            with _flock(cache.root / ".scene-admission.lock"):
+                yield
+                # The new pin cannot move between publication and reader SH.
+                acquire_reader()
+
         cache.populate(
             spec["key"], produce, kind="result" if scene == "state" else "input",
             extract_bytes=spec["bytes"], allocation_bytes=spec["allocation_bytes"],
             slots=(slot,) if slot is not None else (),
+            publication_guard=publication_guard,
             # Every member was size/hash checked during its single incoming
             # pass, and `seen` proves the full closure. Do not reread the shard.
         )
@@ -198,27 +225,15 @@ class SceneHotRuntime:
         if scene not in self.scenes:
             raise StorageError("episode is outside the pinned scene scope")
         cache = self.cache()
-        # All runtime loaders hold this lock through publish and lease acquisition.
-        # The current pin bridges the otherwise unsafe publish-to-lease interval.
         deadline = time.monotonic() + max_wait_s
         while True:
             held = ExitStack()
             try:
-                with _flock(cache.root / ".scene-admission.lock"):
-                    for name in ("global", "state"):
-                        if name in self.closure["shards"]:
-                            self._populate(cache, name, slot=name)
-                            key = self.closure["shards"][name]["key"]
-                            with cache._locked() as state:
-                                adopted = name == "state" and (
-                                    state["entries"][key]["kind"] == "workspace")
-                            # Adopted workspaces are never evictable. Holding SH
-                            # for an episode would deadlock its short EX writes.
-                            if not adopted:
-                                held.enter_context(cache.lease(key, touch=False))
-                    self._populate(cache, scene, slot="current")
-                    path = held.enter_context(cache.lease(
-                        self.closure["shards"][scene]["key"], touch=False))
+                for name in ("global", "state"):
+                    if name in self.closure["shards"]:
+                        self._populate(cache, name, slot=name, held=held)
+                self._populate(cache, scene, slot="current", held=held)
+                path = cache._entry_path(self.closure["shards"][scene]["key"])
                 break
             except QuotaExceeded:
                 held.close()
@@ -237,8 +252,7 @@ class SceneHotRuntime:
             raise StorageError("prefetch is outside the pinned scene scope")
         cache = self.cache()
         try:
-            with _flock(cache.root / ".scene-admission.lock"):
-                self._populate(cache, scene, slot="next")
+            self._populate(cache, scene, slot="next")
             return {"status": "ready", "scene": scene}
         except QuotaExceeded:
             return {"status": "deferred_storage_quota", "scene": scene}

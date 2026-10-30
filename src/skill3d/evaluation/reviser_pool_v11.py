@@ -91,6 +91,18 @@ class OwnerReviserPool:
         self._status()
         return index, rows
 
+    def blocks_slot(self, index, key):
+        if index not in self.recovered:
+            return True
+        transaction = self.busy.get(index)
+        if transaction is None:
+            return False
+        operation, rows = transaction
+        if operation != "ingest" or not getattr(self.runner, "overlap_owner_slots", False):
+            return True
+        return any(fit_slot_key(row["question_type"], row["evidence_state"]) == key
+                   for row, _result in rows)
+
     def _status(self):
         self.runner._write_json_atomic(
             self.runner.root / "scheduler_receipts/reviser_pool_status.json", {

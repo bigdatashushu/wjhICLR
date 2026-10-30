@@ -7,6 +7,7 @@ No analysis text is written to request receipts or returned to the online solver
 from __future__ import annotations
 
 import ast
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import copy, deepcopy
 from dataclasses import asdict
 import json
@@ -427,6 +428,30 @@ def validate_analysis(value, *, expected_cases: Mapping[int, set[int]], batch_sh
 class TrajectoryAnalyst(AnchoredSlotReviser):
     """Read all evidence batches without modifying the Skill between batches."""
 
+    def __init__(self, *, analysis_concurrency=1, client_factory=None, **kwargs):
+        super().__init__(**kwargs)
+        if type(analysis_concurrency) is not int or not 1 <= analysis_concurrency <= 64:
+            raise ValueError("analysis concurrency must be within 1..64")
+        if analysis_concurrency > 1 and not callable(client_factory):
+            raise ValueError("parallel analysis requires a fresh-client factory")
+        self.analysis_concurrency = analysis_concurrency
+        self.client_factory = client_factory
+
+    def _exchange_actor(self, ordinal):
+        # Adapt a fresh instance rather than copying bound writer/request methods.
+        actor = TrajectoryAnalyst(
+            output_root=self.root, client=self.client_factory(), budget=self.budget,
+            method_context_max_chars=self.method_limit, expected_model=self.expected_model)
+        if hasattr(self, "analysis_batch_chars"):
+            actor.analysis_batch_chars = dict(self.analysis_batch_chars)
+        if hasattr(self, "analysis_chars"):
+            actor.analysis_chars = self.analysis_chars
+        actor.requests = ordinal - 1
+        state_io = getattr(self, "framework_state_io", None)
+        if state_io is not None:
+            state_io.adapt_analysis_reviser(actor)
+        return actor
+
     def _analysis_limit(self, evidence):
         budgets = getattr(self, "analysis_batch_chars", None)
         if budgets is None:
@@ -500,30 +525,26 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
     def analyze(self, *, parent, feedback, batches, cases, forbidden_ids):
         analyses, checks, pending, delivered = {}, [], {}, set()
 
-        def exchange(index, phase, repair=None):
+        def request(actor, index, phase, repair=None):
             batch = batches[index]
             refs = batch_case_rounds(batch)
             try:
-                value = self._request(self._prompt(
+                value = actor._request(actor._prompt(
                     parent=parent, working=parent.skill_md, feedback=feedback,
                     evidence=batch, coverage={}, repair=repair), batch_index=index)
-                delivered.add(index)
                 normalized = validate_analysis(
                     value, expected_cases=refs, batch_sha256=digest(batch),
                     cases=cases, forbidden_ids=forbidden_ids,
                     max_chars=self._analysis_limit(batch))
-                analyses[index] = normalized
-                pending.pop(index, None)
-                row = {"batch": index, "phase": phase, "request": self.requests,
+                row = {"batch": index, "phase": phase, "request": actor.requests,
                        "status": "analyzed",
                        "analysis_sha256": digest(json.dumps(normalized, sort_keys=True)),
                        "case_count": len(normalized["records"])}
-                _write_create_once(self.root / f"analysis_{index:02d}.json", row)
+                return normalized, row, None
             except EditProtocolError as exc:
                 # A malformed response still received the complete evidence.
                 # Service and identity errors escape without creating coverage.
-                delivered.add(index)
-                row = {"batch": index, "phase": phase, "request": self.requests,
+                row = {"batch": index, "phase": phase, "request": actor.requests,
                        "status": "rejected", "code": str(exc)}
                 guidance = {
                     "analysis_text_budget": "Shorten every prose field to its supplied per-field limit; retain every case reference.",
@@ -533,24 +554,92 @@ class TrajectoryAnalyst(AnchoredSlotReviser):
                     "analysis_sample_copy": "Replace copied question, option or reference-answer wording with abstract process observations.",
                     "analysis_round_reference_invalid": "Omit round_indices; the host attaches the exact input rounds to each case record.",
                 }
-                pending[index] = {
+                repair = {
                     "code": str(exc), "instruction": guidance.get(
                         str(exc), "Regenerate valid JSON with the exact supplied references."),
                     "max_chars_per_text_field": analysis_field_budget(
                         refs, self._analysis_limit(batch))}
+                return None, row, repair
+
+        def record(index, outcome):
+            normalized, row, repair = outcome
+            delivered.add(index)
+            if normalized is not None:
+                analyses[index] = normalized
+                pending.pop(index, None)
+                _write_create_once(self.root / f"analysis_{index:02d}.json", row)
+            else:
+                pending[index] = repair
             checks.append(row)
-            _write_create_once(self.root / f"coverage_request_{self.requests:02d}.json", {
-                "batch_sha256": digest(batch), "phase": phase,
+            _write_create_once(self.root / f"coverage_request_{row['request']:02d}.json", {
+                "batch_sha256": digest(batches[index]), "phase": row["phase"],
                 "delivered_batch_indices": sorted(delivered),
                 "resolved_batch_indices": sorted(analyses),
                 "unresolved_batch_indices": sorted(pending)})
 
+        def phase(indices, name):
+            if self.analysis_concurrency == 1:
+                for index in indices:
+                    record(index, request(self, index, name, pending.get(index)))
+                return
+            outcomes, active, actors = {}, {}, []
+            jobs = iter(enumerate(indices, start=self.requests + 1))
+            base_count, failed, exhausted = self.requests, None, False
+            def client_chain(client):
+                chain = []
+                while client is not None and not any(client is value for value in chain):
+                    chain.append(client)
+                    client = vars(client).get("client") if hasattr(client, "__dict__") else None
+                return chain
+            clients = client_chain(self.client)
+            with ThreadPoolExecutor(max_workers=self.analysis_concurrency) as pool:
+                while active or not exhausted:
+                    while not failed and not exhausted and len(active) < self.analysis_concurrency:
+                        item = next(jobs, None)
+                        if item is None:
+                            exhausted = True
+                            break
+                        ordinal, index = item
+                        try:
+                            actor = self._exchange_actor(ordinal)
+                            chain = client_chain(actor.client)
+                            if any(value is client for value in chain for client in clients):
+                                raise RevisionOperationalError("analysis factory reused a mutable client")
+                            clients.extend(chain)
+                            actors.append((actor, ordinal))
+                            future = pool.submit(request, actor, index, name, pending.get(index))
+                            active[future] = index
+                        except BaseException as exc:
+                            failed, exhausted = exc, True
+                            break
+                    if not active:
+                        break
+                    try:
+                        done, _ = wait(active, return_when=FIRST_COMPLETED)
+                    except BaseException as exc:
+                        failed, exhausted = exc, True
+                        continue
+                    # Inspect every ready result before launching another request.
+                    for future in done:
+                        index = active.pop(future)
+                        try:
+                            outcomes[index] = future.result()
+                        except BaseException as exc:
+                            if failed is None:
+                                failed = exc
+                            exhausted = True
+                self.requests = base_count + sum(
+                    actor.requests >= ordinal for actor, ordinal in actors)
+            if failed is not None:
+                raise failed
+            # Coverage and synthesis follow input order, independent of completion.
+            for index in indices:
+                record(index, outcomes[index])
+
         if self.budget.max_requests < 2 * len(batches):
             raise RevisionOperationalError("analysis needs complete delivery and replay reserve")
-        for index in range(len(batches)):
-            exchange(index, "delivery")
-        for index in list(pending):
-            exchange(index, "deferred_replay", pending[index])
+        phase(list(range(len(batches))), "delivery")
+        phase(sorted(pending), "deferred_replay")
         _write_create_once(self.root / "analysis_final.json", {
             "status": "analysis_rejected" if pending else "analysis_complete", "checks": checks,
             "all_evidence_delivered": len(delivered) == len(batches),

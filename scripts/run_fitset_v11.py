@@ -714,6 +714,9 @@ def _run_system(args) -> int:
         scheduler=args.scheduler,
         skill_owners=args.skill_owners,
         reviser_concurrency=getattr(args, "reviser_concurrency", 1),
+        overlap_owner_slots=getattr(args, "overlap_owner_slots", False),
+        offline_frame_storage=getattr(args, "offline_frame_storage", "per_variant_v1"),
+        prefetch_scenes=getattr(args, "prefetch_scenes", False),
         request_governor_config=(
             _request_policy(args) if args.max_requests else None),
         client_factory=_SeededClientFactory(
@@ -731,6 +734,8 @@ def _run_system(args) -> int:
                 max_revision_requests_per_slot=args.max_revision_requests_per_slot,
                 max_gate_candidates_per_slot=args.max_gate_candidates_per_slot,
                 learning_input_mode=args.learning_input_mode,
+                analysis_concurrency=getattr(args, "analysis_concurrency", 1),
+                revision_request_caps=getattr(args, "revision_request_caps", {}),
                 gate_mode=args.gate_mode,
                 diagnosis_max_cases=args.diagnosis_max_cases,
                 diagnosis_max_input_chars=args.diagnosis_max_input_chars,
@@ -961,6 +966,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="fixed Skill library owners, independent of episode executors")
     run.add_argument("--reviser-concurrency", type=int, default=1,
                      help="independent owner revision processes; 1 preserves serial scheduling")
+    run.add_argument("--analysis-concurrency", type=int, default=4,
+                     help="independent analysis clients sharing the frozen request governor")
+    run.add_argument("--offline-frame-storage", choices=("per_variant_v1", "shared_scene_v2"),
+                     default="shared_scene_v2")
+    run.add_argument("--prefetch-scenes", action=argparse.BooleanOptionalAction, default=True)
+    run.add_argument("--overlap-owner-slots", action=argparse.BooleanOptionalAction, default=True,
+                     help="finish unrelated frozen slot windows while an owner revises")
     run.add_argument("--max-requests", type=int, default=0,
                      help="shared solver/diagnosis/reviser/gate request budget; required for episode_pool")
     run.add_argument("--request-concurrency", type=int, default=0)
@@ -1008,6 +1020,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--scheduling-mode", choices=("novel_failure_v1", "batch_v1"),
                      default="batch_v1")
     run.add_argument("--max-revision-requests-per-slot", type=int, default=18)
+    run.add_argument("--revision-request-caps", type=json.loads, default={},
+                     help="explicit JSON slot-to-request-cap map; shared paid cap is unchanged")
     run.add_argument("--max-gate-candidates-per-slot", type=int, default=6)
     run.add_argument("--library-root", default="")
     run.add_argument(

@@ -92,8 +92,21 @@ class FitSetEvolutionConfig:
     diagnosis_max_output_tokens: int = 4096
     tail_for_unattempted_slots: bool = False
     minimum_tail_cases: int = 4
+    analysis_concurrency: int = 1
+    revision_request_caps: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self):
+        if type(self.analysis_concurrency) is not int or not 1 <= self.analysis_concurrency <= 64:
+            raise ValueError("analysis concurrency must be within 1..64")
+        raw_caps = self.revision_request_caps
+        rows = list(raw_caps.items()) if isinstance(raw_caps, Mapping) else list(raw_caps)
+        valid_slots = {fit_slot_key(*slot) for slot in ALL_FIT_SLOTS}
+        if any(not isinstance(row, (tuple, list)) or len(row) != 2
+               or not isinstance(row[0], str) or row[0] not in valid_slots
+               or type(row[1]) is not int or row[1] < 1
+               for row in rows) or len({row[0] for row in rows}) != len(rows):
+            raise ValueError("revision request caps require unique valid slots and positive integers")
+        object.__setattr__(self, "revision_request_caps", tuple(sorted((k, v) for k, v in rows)))
         if self.batch_size != 12:
             raise ValueError("fit-set 槽位批次必须为 12 条")
         if self.gate_size < 1 or self.max_revision_attempts < 1 or self.max_tokens < 1:
@@ -119,6 +132,9 @@ class FitSetEvolutionConfig:
             raise ValueError("diagnosis budgets must be positive")
         if not 1 <= self.minimum_tail_cases < self.batch_size:
             raise ValueError("minimum_tail_cases must be below the batch threshold")
+
+    def revision_request_cap(self, slot_key):
+        return dict(self.revision_request_caps).get(slot_key, self.max_revision_requests_per_slot)
 
 
 class FitSetExperienceCase(Spec):
@@ -908,7 +924,7 @@ class FitSetWorkerEvolution:
                       if self.config.learning_input_mode == "aggregate_v1" else "batch_v1"),
                 revision_requests_used=revision_requests_used,
                 gate_candidates_used=sum(entry["slot"] == request.slot_key for entry in entries),
-                max_revision_requests=self.config.max_revision_requests_per_slot,
+                max_revision_requests=self.config.revision_request_cap(request.slot_key),
                 max_gate_candidates=self.config.max_gate_candidates_per_slot,
             )
             schedule["requested_mode"] = self.config.scheduling_mode
@@ -951,6 +967,11 @@ class FitSetWorkerEvolution:
             evidence_request_budget=max(0, schedule["remaining_revision_requests"]
                                         - schedule["revision_attempt_budget"]
                                         - int(self.config.learning_input_mode.startswith("diagnosis"))),
+            analysis_concurrency=self.config.analysis_concurrency,
+            analysis_client_factory=lambda: self.runner._govern_client(
+                self.runner.revision_client_factory(), "reviser",
+                {"slot_key": request.slot_key, "campaign_id": token,
+                 "run_identity": self.runner.run_identity}),
         )
         if self.runner.framework_state_io is not None:
             self.runner.framework_state_io.adapt_reviser(reviser)
@@ -1029,7 +1050,8 @@ class FitSetWorkerEvolution:
                 diagnosis = diagnoser.diagnose(
                     parent, experience, context={"campaign_id": token},
                     image_provider=FrozenCaseImageProvider(
-                        [self.runner.root]) if multimodal else None,
+                        [self.runner.root], framework_state_io=self.runner.framework_state_io,
+                        continuation=self.runner._continuation) if multimodal else None,
                 )
         decision_path = root / "decision.json"
         try:

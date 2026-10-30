@@ -7,6 +7,7 @@ from dataclasses import asdict
 import hashlib
 import importlib.util
 import json
+import multiprocessing
 from pathlib import Path
 import sys
 import time
@@ -15,21 +16,19 @@ from types import MethodType, SimpleNamespace
 # This checkout supplies the Gate wrapper, admission policy and scoped guard.
 _script_dir = Path(__file__).resolve().parent
 sys.path[:] = [p for p in sys.path if Path(p).resolve() != _script_dir]
+# The uniquely named helper is importable by spawn, behind frozen native modules.
+sys.path.append(str(_script_dir))
+from successor_gate_execution_v11 import (
+    CheckedClient, CheckedFactory, GateAbort, GateClientError, IsolatedRunner,
+)
+EXECUTION_HELPER_PATH = _script_dir / "successor_gate_execution_v11.py"
 
 ADMISSION_POLICY_PATH = (
     Path(__file__).resolve().parents[1] / "src/skill3d/evolution/gate_admission_v11.py")
 
 
-class GateAbort(BaseException):
-    """A service, identity or budget refusal must escape model failure handlers."""
-
-
 class PreparationComplete(BaseException):
     pass
-
-
-class GateClientError(RuntimeError):
-    """Fixed-code error, recorded by the native seeded-client receipt writer."""
 
 
 def identity(path):
@@ -72,70 +71,6 @@ def bind_gate_admission(worker):
         return policy.gate_admission_decision(native_gate(*args, **kwargs))
 
     worker._gate = MethodType(evaluate, worker)
-
-
-class CheckedClient:
-    def __init__(self, client, model, seed):
-        self.client, self.model, self.seed = client, model, seed
-        self.calls = 0
-        client.transport_retries = 0
-
-    def __getattr__(self, name):
-        return getattr(self.client, name)
-
-    def chat(self, *args, **kwargs):
-        from skill3d.synthesis.request_audit import describe_request
-        from skill3d.evaluation.fitset_v11 import content_sha256
-        if (self.calls >= 64 or kwargs.get("seed") != self.seed
-                or self.client.transport_retries != 0
-                or self.client.audit_identity(seed=self.seed).get("model") != self.model):
-            raise GateClientError("gate_request_identity_or_episode_budget")
-        expected = describe_request(
-            self.client.build_payload(*args, **kwargs),
-            model_identity=self.client.audit_identity(seed=self.seed),
-            wire_encoding_known=True)
-        self.calls += 1
-        try:
-            result = self.client.chat(*args, **kwargs)
-        except Exception:
-            raise GateClientError("gate_service_failure") from None
-        if (self.client.last_response_identity.get("model") != self.model
-                or content_sha256(self.client.last_request_identity) != content_sha256(expected)):
-            raise GateClientError("gate_response_or_wire_identity")
-        return result
-
-
-class CheckedFactory:
-    def __init__(self, config, endpoint, model, framework_state_io):
-        self.config, self.endpoint, self.model = config, endpoint, model
-        self.framework_state_io = framework_state_io
-
-    def __call__(self, seed, output):
-        from run_fitset_v11 import _RevisionClientFactory
-        from skill3d.evolution.fitset_stream_v11 import SeededGateClient
-        from skill3d.evaluation.fitset_v11 import _variant_key
-        from skill3d.online.config import online_model_from
-
-        class FailClosedSeededClient(SeededGateClient):
-            def chat(self, *args, **kwargs):
-                try:
-                    return super().chat(*args, **kwargs)
-                except Exception as exc:
-                    # Native receipts finish before the error escapes online
-                    # model-failure handlers as an operational stop.
-                    code = str(exc) if isinstance(exc, GateClientError) else "gate_client_refused"
-                    raise GateAbort(code) from None
-
-        def make(variant_id):
-            raw = _RevisionClientFactory(
-                self.config, online_model_from(self.config).max_tokens, self.endpoint)()
-            if not raw.configured:
-                raise GateAbort("gate_service_unconfigured")
-            return FailClosedSeededClient(
-                CheckedClient(raw, self.model, seed), seed,
-                output / "request_seeds" / (_variant_key(variant_id) + ".json"),
-                framework_state_io=self.framework_state_io)
-        return make
 
 
 def setup(args):
@@ -196,24 +131,10 @@ def setup(args):
     if gate_io.root != args.output or cache.min_free_bytes != io._workspace.cache.min_free_bytes:
         raise GateAbort("gate_workspace_identity_or_storage_floor")
 
-    class IsolatedRunner(SystemVariantRunner):
-        def _write_create_once(self, path, value):
-            if not Path(path).is_relative_to(args.output):
-                raise GateAbort("gate_write_scope")
-            return super()._write_create_once(path, value)
-
-        def _prepare_one(self, variant, *, preflight=False):
-            prepared = super()._prepare_one(variant, preflight=preflight)
-            plan = {key: value for key, value in prepared["plan"].items() if key != "skill_identity"}
-            key = str(self.root.relative_to(args.output)) + "/" + str(variant["variant_id"])
-            expected = getattr(self, "_prepared_identity", {}).get(key)
-            if expected is not None and content_sha256(plan) != expected:
-                raise GateAbort("gate_prepared_input_identity")
-            return prepared
-
     coordinator = IsolatedRunner.__new__(IsolatedRunner)
     coordinator.__dict__ = copy.copy(vars(native))
     coordinator.root = args.output
+    coordinator._output_scope = args.output
     coordinator.framework_state_io = gate_io
     coordinator.deployment_continuation = coordinator._continuation = None
     coordinator.cached_prefix_recovery = coordinator._cached_prefix_spec = None
@@ -221,14 +142,18 @@ def setup(args):
     request_cap = min(ready["gate_request_cap"],
                       getattr(args, "request_cap", None) or ready["gate_request_cap"])
     coordinator.request_governor_config = RequestGovernorConfig(
-        max_requests=request_cap, max_inflight=1, requests_per_second=0.0)
-    coordinator._episode_semaphore = None
-    coordinator.workers = coordinator.episode_concurrency = 1
+        max_requests=request_cap, max_inflight=getattr(args, "request_concurrency", 4),
+        requests_per_second=0.0)
+    workers = getattr(args, "workers", 4)
+    coordinator._episode_semaphore = multiprocessing.get_context("spawn").BoundedSemaphore(workers)
+    coordinator.workers = coordinator.episode_concurrency = workers
     coordinator.run_identity = content_sha256({
         "schema": "harness3d-independent-successor-gate/1",
         "original_run": native.run_identity,
         "revision_final": identity(args.revision_root / "revision_final.json"),
         "gate_source": identity(Path(__file__)),
+        "execution_helper": identity(EXECUTION_HELPER_PATH),
+        "workers": workers, "request_concurrency": coordinator.request_governor_config.max_inflight,
     })
     coordinator.gate_client_factory = CheckedFactory(
         config["settings"], config["transport"]["endpoint"], ready["model_identity"]["model"], gate_io)
@@ -292,6 +217,7 @@ def preflight(args):
         "status": "ready", "at": time.time(), "model_requests": 0, "candidates": outputs,
         "prepared_input_identities": plans, "planned_episodes": len(plans),
         "gate_source_identity": identity(Path(__file__)),
+        "execution_helper_source_identity": identity(EXECUTION_HELPER_PATH),
         "admission_policy_source_identity": identity(ADMISSION_POLICY_PATH),
         "native_sources": revision_ready["source_identity"],
         "revision_final_identity": identity(args.revision_root / "revision_final.json"),
@@ -300,7 +226,8 @@ def preflight(args):
         "solver_config": {key: val for key, val in asdict(runner.base_cfg).items()
                           if key in {"seed", "temperature", "max_tokens", "max_rounds"}},
         "request_cap": runner.request_governor_config.max_requests, "per_episode_request_cap": 64,
-        "max_inflight": 1, "transport_retries": 0,
+        "max_inflight": getattr(args, "request_concurrency", 4),
+        "workers": getattr(args, "workers", 4), "transport_retries": 0,
         "executor": "frozen_native_SystemVariantRunner_without_original_receipt_writer",
         "validation_labels_hidden_during_execution": True, "published": False,
     }
@@ -316,11 +243,16 @@ def run(args):
         raise GateAbort("gate_source_changed")
     if ready["admission_policy_source_identity"] != identity(ADMISSION_POLICY_PATH):
         raise GateAbort("gate_admission_policy_source_changed")
+    if ready["execution_helper_source_identity"] != identity(EXECUTION_HELPER_PATH):
+        raise GateAbort("gate_execution_helper_changed")
     service = __import__("storage_scaleup_service_ops").facade()
     service.load_service_environment()
     tools, runner, worker, candidates, revision_ready = setup(args)
     if runner.request_governor_config.max_requests != ready["request_cap"]:
         raise GateAbort("gate_request_allowance_changed")
+    if (runner.workers != ready["workers"]
+            or runner.request_governor_config.max_inflight != ready["max_inflight"]):
+        raise GateAbort("gate_concurrency_changed")
     if (args.output / "startup.json").exists():
         raise GateAbort("gate_existing_startup_no_automatic_resume")
     runner.framework_state_io.write_json_once(
@@ -335,22 +267,6 @@ def run(args):
     runner._prepared_identity = ready["prepared_input_identities"]
     governor = runner._request_governor()
 
-    def execute(coordinator, episodes):
-        for arm, variant in episodes:
-            key = str(arm.root.relative_to(args.output)) + "/" + str(variant["variant_id"])
-            if key not in ready["prepared_input_identities"]:
-                raise GateAbort("gate_unprepared_episode")
-            if arm._result_path(variant["variant_id"]).exists():
-                raise GateAbort("gate_existing_result_no_automatic_resume")
-            result = arm._run_one(variant)
-            if result.get("service_errors"):
-                raise GateAbort("gate_episode_service_failure")
-            runner.framework_state_io.write_json_once(
-                arm.root / "progress" / (hashlib.sha256(key.encode()).hexdigest() + ".json"), {
-                "status": result["status"], "requests": result.get("model_request_count"),
-                "at": time.time(), "gate_request_summary": governor.summary()})
-
-    runner._run_gate_episodes = MethodType(execute, runner)
     results, failure = [], None
     try:
         for selection, parent, candidate in candidates:
@@ -382,7 +298,11 @@ def main():
     for name in ("frozen-root", "state-root", "revision-root", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--request-cap", type=int)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--request-concurrency", type=int, default=4)
     args = parser.parse_args()
+    if not 1 <= args.workers <= 64 or not 1 <= args.request_concurrency <= 64:
+        raise SystemExit("Gate concurrency must be within 1..64")
     if args.request_cap is not None and args.request_cap <= 0:
         raise SystemExit("remaining Gate allowance must be positive")
     if args.output.is_relative_to(args.frozen_root) or args.output.is_relative_to(args.state_root):

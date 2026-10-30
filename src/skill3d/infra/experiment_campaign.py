@@ -172,6 +172,22 @@ def validate_profile(profile):
             "aggregate_v1", "full_cases_v1", "analysis_synthesis_v1",
             "diagnosis_v1", "diagnosis_multimodal_v1"},
             "Unknown learning input mode")
+        require(type(runtime.get("analysis_concurrency", 1)) is int
+                and 1 <= runtime.get("analysis_concurrency", 1) <= 64,
+                "Analysis concurrency must be within 1..64")
+        require(type(runtime.get("overlap_owner_slots", False)) is bool,
+                "Owner-slot overlap must be boolean")
+        require(type(runtime.get("prefetch_scenes", False)) is bool,
+                "Scene prefetch must be boolean")
+        require(runtime.get("offline_frame_storage", "per_variant_v1")
+                in {"per_variant_v1", "shared_scene_v2"}, "Unknown offline frame storage")
+        caps = runtime.get("revision_request_caps", {})
+        require(isinstance(caps, dict), "Revision request caps must be a slot map")
+        from skill3d.evolution.fitset_stream_v11 import FitSetEvolutionConfig
+        try:
+            FitSetEvolutionConfig(revision_request_caps=caps)
+        except (TypeError, ValueError):
+            raise CampaignError("Revision request caps are invalid") from None
     return profile
 
 

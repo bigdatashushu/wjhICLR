@@ -279,3 +279,93 @@ def test_owner_service_error_stops_dispatch_and_retains_immutable_results(tmp_pa
     assert "provider body" not in json.dumps(receipt)
     assert not any(row["initial_skill_selection"]["skill_version"].endswith("@1.1.0")
                    for row in runner.completed().values())
+
+
+def test_busy_owner_blocks_only_transaction_slots_after_recovery():
+    from types import SimpleNamespace
+    from skill3d.evaluation.reviser_pool_v11 import OwnerReviserPool
+    pool = OwnerReviserPool.__new__(OwnerReviserPool)
+    pool.runner = SimpleNamespace(overlap_owner_slots=True)
+    row = {"question_type": "object_counting", "evidence_state": "g0m0"}
+    pool.busy = {0: ("ingest", [(row, {})])}
+    pool.recovered = set()
+    assert pool.blocks_slot(0, "object_size_estimation/g0m0")
+    pool.recovered.add(0)
+    assert pool.blocks_slot(0, "object_counting/g0m0")
+    assert not pool.blocks_slot(0, "object_size_estimation/g0m0")
+    pool.runner.overlap_owner_slots = False
+    assert pool.blocks_slot(0, "object_size_estimation/g0m0")
+    pool.runner.overlap_owner_slots = True
+    pool.busy[0] = ("recover", [])
+    assert pool.blocks_slot(0, "object_size_estimation/g0m0")
+
+
+class OverlapOwnerProbeRunner(ProbeRunner):
+    def _run_one(self, variant):
+        if (getattr(self, "_request_category", "solver") == "solver"
+                and variant["question_type"] == "object_size_estimation"
+                and variant["wave_index"] == 0):
+            deadline = time.monotonic() + 40
+            marker = self.root / "owner_overlap_started.json"
+            while not marker.exists():
+                assert time.monotonic() < deadline, "first owner revision never began"
+                time.sleep(0.03)
+        return super()._run_one(variant)
+
+
+@dataclass
+class OverlapOwnerClient:
+    root: object
+    def chat(self, messages, **kwargs):
+        from test_fitset_stream_v11 import RevisionClient
+        if "object_abs_distance" in messages[-1]["content"]:
+            marker = self.root / "owner_overlap_started.json"
+            if not marker.exists():
+                _write_create_once(marker, {"started": time.time()})
+            deadline = time.monotonic() + 40
+            while True:
+                rows = [json.loads(p.read_text()) for p in (self.root / "results").glob("*.json")]
+                count = sum(row["question_type"] == "object_size_estimation" for row in rows)
+                if count >= 12:
+                    break
+                assert time.monotonic() < deadline, "unrelated frozen window did not progress"
+                time.sleep(0.03)
+        return RevisionClient().chat(messages, **kwargs)
+
+
+@dataclass
+class OverlapOwnerFactory:
+    root: object
+    def __call__(self):
+        return OverlapOwnerClient(self.root)
+
+
+def test_unrelated_window_finishes_during_revision_without_crossing_publication(tmp_path):
+    runner = pool_runner(tmp_path, 2)
+    runner.__class__ = OverlapOwnerProbeRunner
+    runner.reviser_concurrency = 2
+    runner.overlap_owner_slots = True
+    runner.revision_client_factory = OverlapOwnerFactory(runner.root)
+    assert runner.run(resume=False)["completed_variants"] == 39
+    receipt = json.loads((runner.root / "episode_pool_receipt.json").read_text())
+    active, overlapped, ingestion = set(), False, {}
+    ownership = json.loads((runner.root / "manifest.json").read_text())["execution"]["slot_ownership"]
+    for event in receipt["events"]:
+        if event["kind"] == "reviser_started":
+            active.add(event["owner"])
+        elif event["kind"] == "reviser_done":
+            active.remove(event["owner"])
+        elif event["kind"] == "dispatched":
+            key = event["slot_key"]
+            if key == "object_size_estimation/g0m0" and ownership[key] in active:
+                overlapped = True
+        elif event["kind"] == "ingested":
+            ingestion.setdefault(event["slot_key"], []).append(event["variant_id"])
+    assert overlapped
+    for task in ["object_counting", "object_abs_distance", "object_size_estimation"]:
+        rows = sorted([row for row in runner.completed().values()
+                       if row["question_type"] == task], key=lambda row: row["qa_id"])
+        assert all(row["initial_skill_selection"]["skill_version"].endswith("@1.0.0")
+                   for row in rows[:12])
+        assert rows[12]["initial_skill_selection"]["skill_version"].endswith("@1.1.0")
+        assert ingestion[task + "/g0m0"] == [row["variant_id"] for row in rows]

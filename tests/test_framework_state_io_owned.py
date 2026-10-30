@@ -505,7 +505,6 @@ class FrameworkStateIOChecks(unittest.TestCase):
         runtime = object.__new__(SceneHotRuntime)
         runtime.scenes = {"synthetic-scene"}
         runtime.cache = lambda: self.cache
-        runtime._populate = lambda *_args, **_kwargs: None
         runtime.closure = {"shards": {
             "global": {"key": "global"}, "state": {"key": "state"},
             "synthetic-scene": {"key": "scene"},
@@ -737,6 +736,64 @@ class FrameworkStateIOChecks(unittest.TestCase):
         self.assertIn("cold_history", delta)
         record = self.io.cold_reference(self.io.root / "seed.bin")
         self.assertEqual(record.identity, dict(baseline.files["seed.bin"]))
+
+    def test_shared_scene_png_retention_and_cold_diagnosis_preserve_bytes(self):
+        import numpy as np
+        from skill3d.evaluation.fitset_v11 import SystemVariantRunner, _variant_key
+        from skill3d.evolution.diagnosis_v11 import FrozenCaseImageProvider
+        from skill3d.infra.m5_identity import content_sha256
+        from skill3d.storage.hot_cache import ArchiveReceiver
+        from skill3d.storage.offline_frames import scene_key
+        receiver = ArchiveReceiver(self.base / "shared-receiver", disk_usage=_disk_usage)
+        self.workspace.transfer = receiver.receive
+        def fetch(ack, ref, writer):
+            writer.write((receiver.published_path(ack.identity) / ref).read_bytes())
+        self.io.enable_cold_history(fetch)
+        runner = object.__new__(SystemVariantRunner)
+        runner.root = self.io.root / "accumulation"
+        runner.framework_state_io = self.io
+        runner._continuation = None
+        runner._cached_prefix_spec = None
+        runner.published_inputs = None
+        runner.offline_frame_storage = "shared_scene_v2"
+        variants = [
+            {"variant_id": "shared-qa-" + str(index), "qa_id": str(index),
+             "scene_id": "shared-scene", "split": "induction"} for index in range(2)]
+        fs = SimpleNamespace(frame_ids=list(range(32)), source_frame_indices=list(range(32)),
+                             frame_set_hash="a" * 64)
+        item = SimpleNamespace(episode=SimpleNamespace(frame_set=fs, question="Synthetic.", options=[]),
+                               pixels=[np.full((4, 5, 3), i, np.uint8) for i in range(32)])
+        manifest = {"shared_frame_consumers": {
+            scene_key("shared-scene"): sorted(_variant_key(row["variant_id"]) for row in variants)}}
+        self.io.write_json_once(runner.root / "manifest.json",
+                               {**manifest, "identity_sha256": content_sha256(manifest)})
+        for variant in variants:
+            runner._freeze_offline_case_input(variant, item)
+        source = runner.offline_case_input(variants[0])
+        originals = {Path(ref["path"]): Path(ref["path"]).read_bytes()
+                     for ref in source["image_refs"]}
+        envelope = self._envelope()
+        self.io.write_json_once(runner._result_path(variants[0]["variant_id"]),
+                                {**variants[0], "offline_input_sha256": hashlib.sha256(
+                                    (runner.root / "variants" / _variant_key(variants[0]["variant_id"])
+                                     / "offline_input.json").read_bytes()).hexdigest()})
+        self.io._archive_completed_history()
+        self.assertTrue(all(path.exists() for path in originals))
+        self.io.write_json_once(runner._result_path(variants[1]["variant_id"]),
+                                {**variants[1], "offline_input_sha256": hashlib.sha256(
+                                    (runner.root / "variants" / _variant_key(variants[1]["variant_id"])
+                                     / "offline_input.json").read_bytes()).hexdigest()})
+        self.io._archive_completed_history()
+        self.assertTrue(all(not path.exists() for path in originals))
+        self.assertEqual(runner.offline_case_input(variants[0]), source)
+        provider = FrozenCaseImageProvider([runner.root], framework_state_io=self.io)
+        import base64
+        delivered = provider({}, source["image_refs"][0])
+        self.assertEqual(base64.b64decode(delivered["data_url"].split(",", 1)[1]),
+                         next(iter(originals.values())))
+        self.io._archive_completed_history()
+        self.assertEqual(len(self.io._cold_history.records()), 32)
+        self.assertEqual(self._envelope(), envelope)
 
     def test_cold_transport_reconstructs_with_spawned_framework_io(self):
         self.io.enable_cold_history(_fetch_forbidden)

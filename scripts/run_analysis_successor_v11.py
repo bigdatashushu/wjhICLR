@@ -125,8 +125,19 @@ def preflight(args):
                    {"slot": selection["slot_key"], "batch_count": row["batch_count"],
                     "at": time.time(), "model_requests": 0})
     cap = sum(r["total_request_cap"] for r in rows)
-    if cap > args.reviser_request_cap:
-        raise RuntimeError("prepared analysis cohort exceeds shared revision allowance")
+    required_caps = {}
+    for row in rows:
+        required_caps[row["slot_key"]] = required_caps.get(row["slot_key"], 0) + row["total_request_cap"]
+    budget = {
+        "status": "ready" if cap <= args.reviser_request_cap else "budget_refused",
+        "model_requests": 0, "required_total": cap,
+        "authorized_total": args.reviser_request_cap,
+        "required_revision_request_caps": required_caps,
+        "gate_allowance_unchanged": args.gate_request_cap,
+    }
+    tools.seal(args.output / "required_budget.json", budget)
+    if budget["status"] != "ready":
+        return budget
     if before != tools.protected(args.state_root, args.frozen_root):
         raise RuntimeError("protected inputs changed")
     tools.seal(args.output / "preflight.json", {
@@ -134,9 +145,12 @@ def preflight(args):
         "protected_inputs":before, "model_identity":client.audit_identity(seed=137),
         "model_requests":0, "total_reviser_request_cap":cap,
         "gate_request_cap":args.gate_request_cap, "selection":args.selection,
+        "analysis_concurrency": args.analysis_concurrency,
+        "required_revision_request_caps": required_caps,
         "selection_slots": getattr(args, "slots", None),
         "gate_feedback_visible_to_reviser":False, "publication_authorized":False})
     return {"status":"ready", "model_requests":0, "reviser_cap":cap,
+            "required_revision_request_caps":required_caps,
             "cohort":[{"slot":r["slot_key"],"campaign":r["campaign_id"],
                       "batches":r["batch_count"]} for r in rows]}
 
@@ -149,6 +163,8 @@ def run(args):
         raise RuntimeError("source changed after preflight")
     if ready["protected_inputs"] != tools.protected(args.state_root, args.frozen_root):
         raise RuntimeError("protected input changed after preflight")
+    if args.analysis_concurrency != ready["analysis_concurrency"]:
+        raise RuntimeError("analysis concurrency changed after preflight")
     tools.seal(args.output / "startup.json", {"at":time.time(),
                                              "preflight":tools.identity(args.output/"preflight.json")})
     __import__("storage_scaleup_service_ops").facade().load_service_environment()
@@ -156,7 +172,8 @@ def run(args):
     if not raw.configured:
         raise RuntimeError("service environment unavailable")
     governor = RequestGovernor(args.output / "request_governor", RequestGovernorConfig(
-        max_requests=ready["total_reviser_request_cap"], max_inflight=1, requests_per_second=0.0))
+        max_requests=ready["total_reviser_request_cap"],
+        max_inflight=ready["analysis_concurrency"], requests_per_second=0.0))
     results, stopped = [], False
     for selection in ready["selected"]:
         metadata, parent, feedback, experience, batches = prepare_one(
@@ -164,15 +181,23 @@ def run(args):
         if metadata != selection:
             raise RuntimeError("prepared analysis input changed")
         root = args.output / selection["campaign_id"]
-        client = GovernedClient(raw, governor, category="reviser", context={
+        context = {
             "campaign_id":selection["campaign_id"],"slot_key":parent.slot_key,
-            "run_identity":tools.identity(args.output/"preflight.json")["sha256"]})
+            "run_identity":tools.identity(args.output/"preflight.json")["sha256"]}
+        client = GovernedClient(raw, governor, category="reviser", context=context)
+        def fresh_client():
+            fresh = config["factory_type"](
+                config["settings"], config["evolution"]["max_tokens"],
+                config["transport"]["endpoint"])()
+            fresh.transport_retries = 0
+            return GovernedClient(fresh, governor, category="reviser", context=context)
         forbidden = {str(row[k]) for row in config["panel"]["system_variants"]
                      for k in ("qa_id","scene_id","variant_id")}
         analyst = analysis.TrajectoryAnalyst(output_root=root/"analysis",client=client,
             budget=budget_type(max_requests=selection["analysis_request_cap"],repair_reserve=0),
             method_context_max_chars=config["base"].retrieval_policy.method_context_max_chars,
-            expected_model="qwen3.8-flash")
+            expected_model="qwen3.8-flash", analysis_concurrency=args.analysis_concurrency,
+            client_factory=fresh_client)
         caps = selection["analysis_chars_per_batch"]
         if len(caps) != len(batches):
             raise RuntimeError("analysis batch budget count changed")
@@ -235,7 +260,12 @@ def main():
     p.add_argument("--slots", nargs="+")
     p.add_argument("--reviser-request-cap",type=int,default=1536)
     p.add_argument("--gate-request-cap",type=int,default=4096)
+    p.add_argument("--analysis-concurrency",type=int,default=4)
     args=p.parse_args()
+    if not 1 <= args.analysis_concurrency <= 64:
+        raise SystemExit("analysis concurrency must be within 1..64")
+    if min(args.reviser_request_cap, args.gate_request_cap) < 1:
+        raise SystemExit("shared request allowances must be positive")
     if args.output.is_relative_to(args.frozen_root) or args.output.is_relative_to(args.state_root):
         raise SystemExit("new analysis output must be outside frozen assets")
     try:

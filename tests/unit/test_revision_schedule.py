@@ -1,4 +1,7 @@
 import json
+from dataclasses import asdict, FrozenInstanceError
+
+import pytest
 
 from skill3d.evolution.revision_schedule import (
     failure_patterns, normalized_method_sha256, scheduling_decision,
@@ -84,3 +87,32 @@ def test_slot_request_cap_prevents_additional_revision(tmp_path):
         "scheduled", "slot_revision_request_limit"]
     assert len(list((runner.root / "workers").glob(
         "*/campaigns/*/revision/slots/*/*/request_intent_*.json"))) == 1
+
+
+def test_explicit_slot_caps_are_frozen_and_other_caps_remain_unchanged(tmp_path):
+    caps = {"object_counting/g0m0": 1}
+    config = FitSetEvolutionConfig(scheduling_mode="batch_v1", revision_request_caps=caps)
+    caps["object_counting/g0m0"] = 99
+    assert config.revision_request_cap("object_counting/g0m0") == 1
+    assert config.revision_request_cap("object_size_estimation/g0m0") == 18
+    assert FitSetEvolutionConfig(**asdict(config)) == config
+    with pytest.raises(FrozenInstanceError):
+        config.max_revision_requests_per_slot = 99
+    runner = make_runner(tmp_path, n=24)
+    runner.evolution_config = config
+    runner.revision_client_factory = no_change_revision_factory
+    runner.run(resume=False)
+    schedules = [json.loads(path.read_text()) for path in
+                 (runner.root / "workers").glob("*/campaigns/*/schedule.json")]
+    assert sorted(row["reason_code"] for row in schedules) == [
+        "scheduled", "slot_revision_request_limit"]
+
+
+@pytest.mark.parametrize("caps", [
+    {"unknown/g0m0": 1}, {"object_counting/g0m0": True},
+    {"object_counting/g0m0": 0}, {"object_counting/g0m0": 1.5},
+    [("object_counting/g0m0", 1), ("object_counting/g0m0", 2)],
+])
+def test_invalid_slot_caps_are_refused(caps):
+    with pytest.raises(ValueError, match="unique valid slots"):
+        FitSetEvolutionConfig(revision_request_caps=caps)

@@ -25,6 +25,7 @@ def evidence():
                   if s.slot_key == "object_counting/g0m0")
     cases = [{
         "case_id": f"case-{i}", "score": score, "question_text": "Count all chairs in this room.",
+        "source_split": "induction",
         "reference_answer": "2", "model_answer": "1",
         "delivered_content_sha256": parent.content_sha256,
         "rounds": [{"program_source": "ReturnAnswer('1')", "results": []}],
@@ -36,6 +37,16 @@ def evidence():
         "parent_content_sha256": parent.content_sha256, "cases": cases,
     }
     return parent, value
+
+
+def test_diagnosis_refuses_case_without_induction_provenance_before_request(tmp_path):
+    parent, bundle = evidence()
+    bundle["cases"][0].pop("source_split")
+    client = Client()
+    diagnoser = V11CaseDiagnoser(client, tmp_path / "audit", OfflineDiagnosisConfig(mode="text"))
+    with pytest.raises(ValueError, match="authorized induction evidence"):
+        diagnoser.diagnose(parent, bundle)
+    assert client.calls == []
 
 
 class Client:

@@ -1044,6 +1044,7 @@ class HotCache:
         slots: tuple[str, ...] = (),
         validator: Callable[[Path], object] | None = None,
         workspace_bytes: int | None = None,
+        publication_guard=None,
     ) -> Path:
         """Invoke a real producer; its payload goes under reservation.path/payload."""
         if workspace_bytes is not None:
@@ -1054,8 +1055,11 @@ class HotCache:
                           output_bytes=output_bytes, allocation_bytes=allocation_bytes) as reservation:
             (reservation.path / "payload").mkdir()
             producer(reservation)
-            return reservation.commit(key, kind=kind, slots=slots, validator=validator,
-                                      workspace_bytes=workspace_bytes)
+            # Download/production stays outside admission. A caller may bridge
+            # atomic publication to its reader lease under a short shared guard.
+            with publication_guard() if publication_guard is not None else nullcontext():
+                return reservation.commit(key, kind=kind, slots=slots, validator=validator,
+                                          workspace_bytes=workspace_bytes)
 
     def new_workspace(
         self, key: str, producer: Callable[[Reservation], object], *,

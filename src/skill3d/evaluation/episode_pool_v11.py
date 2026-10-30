@@ -116,6 +116,11 @@ def _execute_locked(runner, pending, accept):
     peak = 0
     last_slot = ""
     owner_pool = None
+    prefetch = None
+    runtime = getattr(getattr(runner, "published_inputs", None), "runtime", None)
+    if getattr(runner, "prefetch_scenes", False) and runtime is not None:
+        from skill3d.storage.scene_prefetch import ScenePrefetch
+        prefetch = ScenePrefetch(runtime, events)
 
     def ingest_ready():
         if owner_pool is not None:
@@ -160,9 +165,7 @@ def _execute_locked(runner, pending, accept):
     def candidates():
         found = {}
         for key in sorted(by_slot):
-            if owner_pool is not None and (
-                    owner_indices[key] in owner_pool.busy
-                    or owner_indices[key] not in owner_pool.recovered):
+            if owner_pool is not None and owner_pool.blocks_slot(owner_indices[key], key):
                 continue
             rows = by_slot[key]
             owner = owners[key]
@@ -221,6 +224,8 @@ def _execute_locked(runner, pending, accept):
                 process.start()
                 processes.append(process)
         while True:
+            if prefetch is not None:
+                prefetch.poll()
             if (aborted is not None or stop.is_set()) and not closing:
                 stop.set()
                 for _ in processes:
@@ -271,6 +276,15 @@ def _execute_locked(runner, pending, accept):
                     jobs.put((dict(row), skills, identity))
                     events.append({"kind": "dispatched", **frozen, "at": time.time()})
                     peak = max(peak, len(inflight))
+                if prefetch is not None and inflight:
+                    choices = candidates()
+                    ordered = sorted(choices)
+                    key = (next((value for value in ordered if value > last_slot), ordered[0])
+                           if ordered else None)
+                    prefetch.consider(
+                        choices[key] if key is not None else None,
+                        active_scenes={str(row["scene_id"]) for row in inflight.values()},
+                        completed_count=len(existing))
             if not inflight and not (owner_pool is not None and owner_pool.busy):
                 break
             try:
@@ -359,6 +373,12 @@ def _execute_locked(runner, pending, accept):
             process.join()
         if owner_pool is not None:
             owner_pool.finish()
+        if prefetch is not None:
+            try:
+                prefetch.close()
+            except BaseException as exc:
+                if aborted is None:
+                    aborted = exc
         signal.signal(signal.SIGINT, prior_handler)
         jobs.cancel_join_thread()
         jobs.close()

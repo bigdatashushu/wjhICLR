@@ -306,8 +306,40 @@ class FrameworkStateIO:
                 ref = path.relative_to(self.root).as_posix()
                 if ref not in existing:
                     selected.append((ref, path.stat().st_size))
-        for phase in ("initial_validation", "accumulation", "final_validation"):
-            base = self.root / phase
+        bases = [(phase, self.root / phase)
+                 for phase in ("initial_validation", "accumulation", "final_validation")]
+        bases.extend((phase, self.root / "stages" / stage / "system")
+                     for phase, stage in (("initial_validation", "initial_validation"),
+                                          ("accumulation", "learning"),
+                                          ("final_validation", "final_validation")))
+        for phase, base in bases:
+            # The scene-consumer set is frozen before any dispatch. Shared
+            # originals remain hot until every selected QA has a final result.
+            manifest_path = base / "manifest.json"
+            if manifest_path.is_file():
+                from skill3d.infra.m5_identity import content_sha256
+                manifest = json.loads(manifest_path.read_bytes())
+                consumers = manifest.get("shared_frame_consumers")
+                if consumers is not None:
+                    from skill3d.evaluation.fitset_v11 import _variant_key
+                    from skill3d.storage.offline_frames import reject_links, scene_key
+                    body = {key: value for key, value in manifest.items()
+                            if key != "identity_sha256"}
+                    if content_sha256(body) != manifest.get("identity_sha256"):
+                        raise IntegrityError("shared frame consumer manifest changed")
+                    for scene, keys in consumers.items():
+                        if not keys or not all((base / "results" / (key + ".json")).is_file()
+                                               for key in keys):
+                            continue
+                        for key in keys:
+                            row = json.loads((base / "results" / (key + ".json")).read_bytes())
+                            if _variant_key(row.get("variant_id", "")) != key or (
+                                scene_key(row.get("scene_id", "")) != scene
+                            ):
+                                raise IntegrityError("shared frame completion identity changed")
+                        for path in (base / "variants" / "shared_frames" / scene).rglob("*.png"):
+                            reject_links(base, path)
+                            add(path)
             for result in (base / "results").glob("*.json"):
                 variant = base / "variants" / result.stem
                 for directory in ("trace", "offline_images"):
@@ -369,6 +401,7 @@ class FrameworkStateIO:
         bind_framework_writers(reviser, AnchoredSlotReviser, replacements)
         if isinstance(reviser, TrajectoryAnalyst):
             bind_framework_writers(reviser, TrajectoryAnalyst, replacements)
+        reviser.framework_state_io = self
 
     def adapt_diagnoser(self, diagnoser, context):
         from skill3d.evolution.diagnosis_v11 import V11CaseDiagnoser, _sha

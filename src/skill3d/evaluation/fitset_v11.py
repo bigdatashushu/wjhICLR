@@ -1268,10 +1268,20 @@ class SystemVariantRunner:
         deployment_continuation: str | Path | None = None,
         framework_state_io=None,
         cached_prefix_recovery: str | Path | None = None,
+        overlap_owner_slots: bool = False,
+        offline_frame_storage: str = "per_variant_v1",
+        prefetch_scenes: bool = False,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
         self.root = Path(output_root).resolve()
+        _require(type(overlap_owner_slots) is bool, "owner-slot overlap must be boolean")
+        self.overlap_owner_slots = overlap_owner_slots
+        _require(offline_frame_storage in {"per_variant_v1", "shared_scene_v2"},
+                 "unknown frozen offline frame storage policy")
+        _require(type(prefetch_scenes) is bool, "scene prefetch must be boolean")
+        self.offline_frame_storage = offline_frame_storage
+        self.prefetch_scenes = prefetch_scenes
         self.framework_state_io = framework_state_io
         if framework_state_io is not None:
             framework_state_io.validate_root(self.root)
@@ -1513,6 +1523,9 @@ class SystemVariantRunner:
         self.__dict__.setdefault("cached_prefix_recovery", None)
         self.__dict__.setdefault("_cached_prefix_spec", None)
         self.__dict__.setdefault("_continuation", None)
+        self.__dict__.setdefault("overlap_owner_slots", False)
+        self.__dict__.setdefault("offline_frame_storage", "per_variant_v1")
+        self.__dict__.setdefault("prefetch_scenes", False)
 
     @property
     def execution_scheduler(self) -> str:
@@ -1633,9 +1646,21 @@ class SystemVariantRunner:
                     _json_value(asdict(self.evolution_config))
                     if self.evolution_config is not None else None),
                 "capture_offline_case_input": self.capture_offline_case_input,
-                "offline_case_input_schema": "v11-fit-set-offline-input/1.0",
+                "offline_case_input_schema": (
+                    "v11-fit-set-offline-input/2.0" if self.offline_frame_storage
+                    == "shared_scene_v2" else "v11-fit-set-offline-input/1.0"),
             },
         }
+        if self.offline_frame_storage == "shared_scene_v2":
+            from skill3d.storage.offline_frames import scene_key
+            body["request_input_config"]["offline_frame_storage"] = self.offline_frame_storage
+            body["shared_frame_consumers"] = {
+                scene_key(scene): sorted(_variant_key(row["variant_id"])
+                                         for row in self.variants if row["scene_id"] == scene)
+                for scene in sorted({row["scene_id"] for row in self.variants})
+            }
+        if self.prefetch_scenes:
+            body["execution"]["prefetch_scenes"] = True
         if self.scheduler == "episode_pool":
             body["execution"].update({
                 "skill_owners": self.skill_owners,
@@ -1645,6 +1670,8 @@ class SystemVariantRunner:
             })
             if self.reviser_concurrency > 1:
                 body["execution"]["reviser_concurrency"] = self.reviser_concurrency
+            if self.overlap_owner_slots:
+                body["execution"]["overlap_owner_slots"] = True
         if self.request_governor_config is not None:
             body["request_policy"] = asdict(self.request_governor_config)
         if self.experiment_split is not None:
@@ -1733,12 +1760,20 @@ class SystemVariantRunner:
     def logical_path(self, path: str | Path) -> str:
         if self._continuation is not None:
             return self._continuation.logical_path(path)
+        path = Path(path)
+        if path.is_absolute() and ".." not in path.parts and path.is_relative_to(self.root):
+            # New framework outputs have their own frozen run root. They are
+            # not members of the sealed input transport descriptor.
+            return str(path)
         logical = getattr(self.published_inputs, "logical_path", None)
         return str(logical(path)) if callable(logical) else str(path)
 
     def logical_file(self, path: str | Path, expected_hash: str) -> Path:
         if self._continuation is not None:
             physical = self._continuation.physical_path(path)
+        elif (Path(path).is_absolute() and ".." not in Path(path).parts
+              and Path(path).is_relative_to(self.root)):
+            physical = Path(path)
         else:
             locate = getattr(self.published_inputs, "logical_file", None)
             physical = Path(locate(path, expected_hash)) if callable(locate) else Path(path)
@@ -1832,8 +1867,12 @@ class SystemVariantRunner:
 
     def _freeze_offline_case_input(self, variant: Mapping, item: EpisodeItem) -> None:
         from PIL import Image
+        from skill3d.storage.offline_frames import (
+            LEGACY_SCHEMA, SHARED_SCHEMA, publish_frame, shared_frame_path,
+        )
 
         variant_root = self.root / "variants" / _variant_key(str(variant["variant_id"]))
+        shared = getattr(self, "offline_frame_storage", "per_variant_v1") == "shared_scene_v2"
         if (variant_root / "offline_input.json").exists():
             self.offline_case_input(variant)
             return
@@ -1853,9 +1892,13 @@ class SystemVariantRunner:
                 data = buffer.getvalue()
             else:
                 data = frame_bytes[index]
-            path = variant_root / "offline_images" / f"{index:02d}.png"
+            digest = hashlib.sha256(data).hexdigest()
+            path = (shared_frame_path(self.root, variant["scene_id"], fs.frame_set_hash, digest)
+                    if shared else variant_root / "offline_images" / f"{index:02d}.png")
             if self.framework_state_io is not None:
                 pending_images.append((path, data))
+            elif shared:
+                publish_frame(self.root, path, data)
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -1863,7 +1906,6 @@ class SystemVariantRunner:
                         stream.write(data)
                 except FileExistsError:
                     _require(path.read_bytes() == data, f"immutable offline image changed: {path}")
-            digest = hashlib.sha256(data).hexdigest()
             image_refs.append({
                 "path": self.logical_path(path),
                 "file_sha256": digest, "content_sha256": digest,
@@ -1878,9 +1920,12 @@ class SystemVariantRunner:
             # section replaces 32 acquisitions and durable accounting updates.
             with self.framework_state_io.section():
                 for path, data in pending_images:
-                    self.framework_state_io.write_bytes_once(path, data)
+                    if shared:
+                        publish_frame(self.root, path, data, state_io=self.framework_state_io)
+                    else:
+                        self.framework_state_io.write_bytes_once(path, data)
         self._write_create_once(variant_root / "offline_input.json", {
-            "schema_version": "v11-fit-set-offline-input/1.0",
+            "schema_version": SHARED_SCHEMA if shared else LEGACY_SCHEMA,
             "variant_id": variant["variant_id"],
             "variant_sha256": content_sha256(variant),
             "qa_id": variant["qa_id"], "scene_id": variant["scene_id"],
@@ -1901,6 +1946,10 @@ class SystemVariantRunner:
         return self._offline_case_input_body(variant)
 
     def _offline_case_input_body(self, variant: Mapping, *, cold_records=None) -> dict:
+        from skill3d.storage.offline_frames import (
+            LEGACY_SCHEMA, SHARED_SCHEMA, reject_links, shared_frame_path,
+        )
+        from skill3d.storage.hot_cache import IntegrityError
         path = (self.root / "variants" / _variant_key(str(variant["variant_id"]))
                 / "offline_input.json")
         _require(path.is_file(), f"{variant['variant_id']}: offline_input.json is missing")
@@ -1908,7 +1957,7 @@ class SystemVariantRunner:
         _require(set(value) == {
             "schema_version", "variant_id", "variant_sha256", "qa_id", "scene_id",
             "split", "question_text", "options", "frame_set_hash", "image_refs",
-        } and value.get("schema_version") == "v11-fit-set-offline-input/1.0"
+        } and value.get("schema_version") in {LEGACY_SCHEMA, SHARED_SCHEMA}
                  and value.get("variant_id") == variant["variant_id"]
                  and value.get("variant_sha256") == content_sha256(variant)
                  and value.get("qa_id") == variant["qa_id"]
@@ -1930,21 +1979,34 @@ class SystemVariantRunner:
             _require(set(ref) == fields and ref["frame_set_hash"] == value["frame_set_hash"],
                      f"{variant['variant_id']}: offline image provenance changed")
             logical = Path(ref["path"])
+            shared = value["schema_version"] == SHARED_SCHEMA
+            expected = (shared_frame_path(self.root, variant["scene_id"],
+                                         value["frame_set_hash"], ref["file_sha256"])
+                        if shared else path.parent / "offline_images" / logical.name)
             _require(logical.is_absolute() and ".." not in logical.parts
                      and str(logical) == ref["path"]
-                     and logical.parent == Path(self.logical_path(path.parent)) / "offline_images",
+                     and (logical == Path(self.logical_path(expected)) if shared else
+                          logical.parent == Path(self.logical_path(path.parent)) / "offline_images"),
                      f"{variant['variant_id']}: offline image logical parent changed")
-            if cold_records and self._continuation is not None:
-                physical = self._continuation.physical_path(logical)
+            try:
+                reject_links(self.root, expected)
+            except IntegrityError as exc:
+                raise FitSetError(
+                    f"{variant['variant_id']}: frozen offline image content changed") from exc
+            if cold_records:
+                physical = (self._continuation.physical_path(logical)
+                            if self._continuation is not None else expected)
                 cold = self.framework_state_io.cold_reference(physical, records=cold_records)
                 if cold is not None and not physical.exists():
                     _require(not physical.is_symlink()
-                             and physical.parent == path.parent / "offline_images"
+                             and physical == expected
                              and cold.sha256 == ref["file_sha256"] == ref["content_sha256"],
                              f"{variant['variant_id']}: frozen cold image changed")
                     continue
-            image_path = self.logical_file(logical, ref["file_sha256"])
-            _require(image_path.resolve().parent == (path.parent / "offline_images").resolve()
+            image_path = expected if shared else self.logical_file(logical, ref["file_sha256"])
+            _require(image_path.resolve() == expected.resolve()
+                     and image_path.is_file()
+                     and file_identity(image_path)["sha256"] == ref["file_sha256"]
                      and ref["file_sha256"] == ref["content_sha256"],
                      f"{variant['variant_id']}: frozen offline image changed")
         return value

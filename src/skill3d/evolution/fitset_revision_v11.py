@@ -485,6 +485,8 @@ class FitSetSlotReviser:
         input_max_bytes: int = DEFAULT_REVISION_INPUT_MAX_BYTES,
         input_max_chars: int = DEFAULT_REVISION_INPUT_MAX_CHARS,
         evidence_request_budget: int = 0,
+        analysis_concurrency: int = 1,
+        analysis_client_factory=None,
     ) -> None:
         self.root = Path(output_root).resolve()
         self.panel = panel
@@ -500,6 +502,8 @@ class FitSetSlotReviser:
         self.input_max_bytes = int(input_max_bytes)
         self.input_max_chars = int(input_max_chars)
         self.evidence_request_budget = int(evidence_request_budget)
+        self.analysis_concurrency = analysis_concurrency
+        self.analysis_client_factory = analysis_client_factory
         if (self.input_max_bytes < 4096 or self.input_max_chars < 4096
                 or self.evidence_request_budget < 0):
             raise FitSetError("revision input/batch budgets are invalid")
@@ -927,6 +931,9 @@ class FitSetSlotReviser:
             "editor_request_cap": editor_cap, "budget": budget_options,
             "contract_sha256": ExecutionContract(self.method_context_max_chars).sha256,
         }
+        # Omit the legacy execution default to keep old serial receipts readable.
+        if self.analysis_concurrency != 1:
+            identity["analysis_concurrency"] = self.analysis_concurrency
         root = self.root / "slots" / slot[0] / slot[1]
         final_path = root / "final.json"
 
@@ -1011,7 +1018,8 @@ class FitSetSlotReviser:
             budget=RevisionBudget(max_requests=max(1, available), repair_reserve=0,
                                   **budget_options),
             method_context_max_chars=self.method_context_max_chars,
-            expected_model=expected_model)
+            expected_model=expected_model, analysis_concurrency=self.analysis_concurrency,
+            client_factory=self.analysis_client_factory)
         batches, preparation = prepare_analysis_batches(
             self, analyst=analyst, parent=parent, feedback=compact_feedback,
             experience=experience)

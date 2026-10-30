@@ -53,16 +53,28 @@ def _write_once(path, value):
 class FrozenCaseImageProvider:
     """Read only explicitly allowlisted local images and verify the recorded bytes."""
 
-    def __init__(self, roots):
+    def __init__(self, roots, *, framework_state_io=None, continuation=None):
         self.roots = tuple(Path(root).resolve() for root in roots)
+        self.framework_state_io = framework_state_io
+        self.continuation = continuation
         if not self.roots:
             raise ValueError("image provider requires explicit allowed roots")
 
     def __call__(self, case, ref):
-        path = Path(str(ref.get("path") or "")).resolve()
-        if not any(path.is_relative_to(root) for root in self.roots) or not path.is_file():
+        logical = Path(str(ref.get("path") or ""))
+        physical = (self.continuation.physical_path(logical)
+                    if self.continuation is not None else logical)
+        path = physical.resolve()
+        if physical.is_symlink() or not any(
+            path.is_relative_to(root) for root in self.roots
+        ):
             raise OfflineDiagnosisError("image source is missing or outside frozen roots")
-        data = path.read_bytes()
+        if self.framework_state_io is not None:
+            data = self.framework_state_io.read_history_bytes(path)
+        elif path.is_file():
+            data = path.read_bytes()
+        else:
+            raise OfflineDiagnosisError("image source is missing or outside frozen roots")
         expected = str(ref.get("file_sha256") or ref.get("content_sha256") or "")
         if not expected or hashlib.sha256(data).hexdigest() != expected:
             raise OfflineDiagnosisError("image source hash mismatch")
