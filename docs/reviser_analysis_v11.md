@@ -1,6 +1,12 @@
 # 完整学习轨迹分析与锚点修订
 
-入口为 `scripts/run_analysis_successor_v11.py`。它在独立目录内读取冻结学习轨迹，先逐批分析，再以完整分析集合生成一次锚点修订。配对评估由 `scripts/run_successor_gate_v11.py` 单独执行。运行目录、原 Skill 库与原请求账本分别绑定，不向原库发布候选。
+2026-10-30 起，Skill 演化以 `scripts/run_analysis_successor_v11.py` 的“分批独立分析，再汇总锚点修订”为主方向。统一入口 `experiment.sh` 与 `run_fitset_v11.py run-system` 默认选择 `analysis_synthesis_v1`，在原生槽位流中复用相同的分析器、证据规划器和锚点编辑器，完成后沿用原生双 seed Gate 与 run-local 发布。每批分析独立读取父 Skill 和当前批次，最终编辑器综合完整分析集合。
+
+`scripts/run_analysis_successor_v11.py` 继续作为读取历史冻结学习轨迹的独立入口；其配对评估由 `scripts/run_successor_gate_v11.py` 单独执行，不向原库发布候选。它依赖相应冻结运行的操作层，不是统一入口直接启动的子脚本。旧逐批修改工作稿模式通过显式 `--learning-input-mode full_cases_v1` 保留作对照；模式进入冻结运行身份，不能在旧实验中原地切换。历史生产 streaming 保留其原合同。
+
+原生主路径的 `revision/slots/<task>/<state>/analysis_plan.json` 封存实际批次、来源身份和字符额度；`analysis/` 保存覆盖与请求哈希，`synthesis/` 保存锚点编辑审计和静态候选，槽位 `final.json` 绑定这些文件的完整哈希。分析正文只留内存，不保存到请求回执。最终静态候选仍需通过原生 Gate，静态通过不直接发布。
+
+默认最终编辑最多 3 次请求，含最多 2 次静态修复；B 个分析批次先预留 `2B+3` 次请求，覆盖每批首次分析、一次格式重放及编辑。原生主路径使用原有共享 governor，并将分析与编辑 intent 一并计入每槽位累计修订额度，不增加默认总预算。默认每槽位 18 次修订额度容纳最多 7 批的完整预留；更长轨迹需在新实验配置中显式分配相应额度，否则零请求拒绝，不删减案例。分析正文丢失的中断运行停止待审计，不自动重做付费分析；最终编辑完整回执已落盘时可核验恢复。
 
 ## 可复用接口
 

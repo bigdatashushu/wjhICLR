@@ -107,7 +107,8 @@ class FitSetEvolutionConfig:
         if self.revision_input_max_bytes < 4096 or self.revision_input_max_chars < 4096:
             raise ValueError("revision input byte budget must be at least 4096")
         if self.learning_input_mode not in {
-                "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"}:
+                "aggregate_v1", "full_cases_v1", "analysis_synthesis_v1",
+                "diagnosis_v1", "diagnosis_multimodal_v1"}:
             raise ValueError("unknown learning input mode")
         if self.gate_mode not in {"same_question", "scene_disjoint", "qa_disjoint"}:
             raise ValueError("unknown gate mode")
@@ -816,6 +817,9 @@ class FitSetWorkerEvolution:
         if result_path.exists():
             return StreamingAttemptResult(**json.loads(result_path.read_text()))
         continuation = getattr(self.runner, "_continuation", None)
+        if continuation is not None and self.config.learning_input_mode == "analysis_synthesis_v1":
+            raise RevisionOperationalError(
+                "analysis/synthesis requires its original frozen deployment; use a new run for deployment changes")
         revision_root = (root if continuation is None else
                          root / "deployments" / continuation.deployment_id)
         pending_intents = False
@@ -1032,12 +1036,17 @@ class FitSetWorkerEvolution:
             candidate = reviser._revise_slot(
                 slot=(request.question_type, request.evidence_state),
                 parent=parent, feedback=feedback, forbidden_ids=forbidden,
-                experience=experience, diagnosis=diagnosis)
+                experience=experience, diagnosis=diagnosis,
+                learning_input_mode=self.config.learning_input_mode)
         except RevisionInputBudgetExhausted as exc:
             self._write_create_once(root / "input_budget_refusal.json", {
                 "schema": "revision-input-budget-refusal/1",
                 "source_bundle_sha256": exc.source_sha256,
-                "needed_batches": exc.needed, "available_counted_requests": exc.available,
+                "needed": exc.needed, "available": exc.available, "budget_unit": exc.unit,
+                **({"needed_batches": exc.needed, "available_counted_requests": exc.available}
+                   if exc.unit == "batches" else
+                   {"needed_counted_requests": exc.needed,
+                    "available_counted_requests": exc.available}),
                 "model_requests_initiated": 0, "method_assessed": False,
                 "parent_preserved": True, "canonical_cases_retained": True,
             })

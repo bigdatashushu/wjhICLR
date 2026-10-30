@@ -356,6 +356,19 @@ class FrameworkStateIO:
             "_write_create_once": self.write_json_once,
             "_write_text_create_once": self.write_text_once,
         })
+        reviser.framework_state_io = self
+
+    def adapt_analysis_reviser(self, reviser):
+        from skill3d.evolution.revision_edits_v11 import AnchoredSlotReviser
+        from skill3d.evolution.trajectory_analysis_v11 import TrajectoryAnalyst
+        self.validate_root(reviser.root)
+        replacements = {
+            "_write_create_once": self.write_json_once,
+            "_write_text_create_once": self.write_text_once,
+        }
+        bind_framework_writers(reviser, AnchoredSlotReviser, replacements)
+        if isinstance(reviser, TrajectoryAnalyst):
+            bind_framework_writers(reviser, TrajectoryAnalyst, replacements)
 
     def adapt_diagnoser(self, diagnoser, context):
         from skill3d.evolution.diagnosis_v11 import V11CaseDiagnoser, _sha

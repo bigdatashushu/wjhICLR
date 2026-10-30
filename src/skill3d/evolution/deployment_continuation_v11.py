@@ -449,6 +449,7 @@ def revision_intents_used(worker_root: Path, slot_key: str) -> int:
         namespaces = [campaign, *sorted((campaign / "deployments").glob("*"))]
         for namespace in namespaces:
             paths = [*namespace.glob("revision/slots/*/*/request_intent_*.json"),
+                     *namespace.glob("revision/slots/*/*/*/request_intent_*.json"),
                      *namespace.glob("diagnosis/*/request_intent.json")]
             for path in paths:
                 _require(path.resolve().is_relative_to(worker_root.resolve()),
@@ -459,6 +460,13 @@ def revision_intents_used(worker_root: Path, slot_key: str) -> int:
                              and isinstance(intent.get("request_identity"), dict),
                              "invalid diagnosis request intent")
                     identity = {"intent": intent,
+                                "logical_intent_ref": path.relative_to(worker_root).as_posix()}
+                elif path.parent.name in {"analysis", "synthesis"}:
+                    _require(bool(intent.get("prompt_sha256"))
+                             and isinstance(intent.get("request_identity"), dict)
+                             and type(intent.get("ordinal")) is int,
+                             "invalid analysis/synthesis request intent")
+                    identity = {"slot": slot_key, "intent": intent,
                                 "logical_intent_ref": path.relative_to(worker_root).as_posix()}
                 else:
                     _require(isinstance(intent.get("request"), dict)

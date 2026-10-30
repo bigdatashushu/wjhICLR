@@ -169,7 +169,8 @@ def validate_profile(profile):
                 and 0 < baseline["workers"] <= runtime["request_concurrency"],
                 "Native baseline requires prepared-32 and bounded workers")
         require(runtime.get("learning_input_mode") in {
-            "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"},
+            "aggregate_v1", "full_cases_v1", "analysis_synthesis_v1",
+            "diagnosis_v1", "diagnosis_multimodal_v1"},
             "Unknown learning input mode")
     return profile
 

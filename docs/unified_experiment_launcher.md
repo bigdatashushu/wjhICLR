@@ -43,6 +43,8 @@
 
 ## 并发、输出与续跑
 
+学习阶段默认使用 `analysis_synthesis_v1`：每槽位收齐 12 条新完整轨迹，先按实际请求容量分批独立分析，再以全部分析集合生成一次锚点修订。这是 `run_analysis_successor_v11.py` 的主方向在原生入口中的集成，复用其分析和编辑组件，不依赖历史实验操作层。分析、格式重放、最终编辑和静态修复都使用本 campaign 的共享请求账本，并计入原有每槽位修订额度；预留不足时零请求拒绝。候选仍由原生双 seed Gate 决定晋升。详见[主修订合同](reviser_analysis_v11.md)。显式 `full_cases_v1` 保留原逐批改写作对照；切换模式须新建冻结运行。
+
 默认 16 个执行 worker、4 个固定 Skill owner、4 路 reviser、最多 4 个同时模型请求；初始/最终验证使用单 reviser 参数且不开演化。可设置 `--workers 8 --revisers 2`；episode 与请求容量等完整参数放在 profile 中冻结。RPC 服务、GPU 服务和集群配置沿用你显式给定的配置，入口本身不占用或重配置 GPU。
 
 每次新实验创建 `runs/<dataset>/<UTC时间>/`，或使用明确的 `--output-dir`。它与数据输入目录隔离；已有目录只能核验续跑。代码冻结到该目录 `code/source`，源码 Git 必须干净且已提交。学习 owner 使用原 runner 的独立库，不改共享初始 Skill 库。

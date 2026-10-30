@@ -976,8 +976,10 @@ def build_parser() -> argparse.ArgumentParser:
                           "across every worker and gate; 0 uses the scheduler default")
     run.add_argument("--gate-size", type=int, default=8)
     run.add_argument("--learning-input-mode", choices=(
-        "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"),
-        default="full_cases_v1")
+        "aggregate_v1", "full_cases_v1", "analysis_synthesis_v1",
+        "diagnosis_v1", "diagnosis_multimodal_v1"),
+        default="analysis_synthesis_v1",
+        help="primary: independent complete-trajectory analysis, then one anchored synthesis")
     run.add_argument("--experiment-split-manifest", default="",
                      help="opt-in hash-anchored QA learning/validation allocation; "
                           "accumulation requires qa_disjoint; final_system requires "

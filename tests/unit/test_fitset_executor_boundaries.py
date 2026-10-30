@@ -24,7 +24,7 @@ from skill3d.synthesis.request_governor import RequestGovernorConfig
 
 LIBRARY = Path(__file__).resolve().parents[2] / "skill_library"
 METADATA = {"path": "/synthetic/coordinator-only-metadata.json", "sha256": "f" * 64}
-MODES = ["full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"]
+MODES = ["analysis_synthesis_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1"]
 
 
 def forbidden(*_args, **_kwargs):

@@ -97,7 +97,7 @@ def test_gate_lookup_is_merged_but_scheduling_and_manifest_execution_are_learnin
 
 
 @pytest.mark.parametrize("mode", [
-    "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1",
+    "analysis_synthesis_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1",
 ])
 @pytest.mark.parametrize("split", ["inner_validation", "outer_holdout", "", "learning"])
 def test_rich_learning_rejects_every_non_induction_split(build, mode, split):

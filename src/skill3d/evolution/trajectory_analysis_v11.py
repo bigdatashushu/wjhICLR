@@ -27,6 +27,19 @@ ANALYSIS_PROTOCOL = "v11-source-linked-trajectory-analysis/1"
 VIEW_PROTOCOL = "v11-audit-metadata-separated-view/1"
 
 
+def compact_analysis_feedback(feedback: Mapping) -> dict:
+    """Keep aggregate learning outcomes; bind the original feedback separately."""
+    keys = ("schema_version", "question_type", "evidence_state", "n_cases",
+            "mean_score", "legal_answer_rate", "available_rate", "score_bands")
+    result = {key: feedback[key] for key in keys if key in feedback}
+    result["process_summary"] = [
+        {key: value for key, value in row.items()
+         if key in ("count", "n_cases", "failure_categories", "outcome")}
+        for row in feedback.get("signatures") or []]
+    result["privacy"] = "Aggregate learning outcomes only; original feedback retained in host receipts."
+    return result
+
+
 def task_semantics(question_type: str) -> str:
     """Retain the task's estimand and the meaning of observed evidence."""
     shared = (
@@ -343,6 +356,34 @@ def analysis_field_budget(expected_cases: Mapping[int, set[int]], max_chars: int
         raise RevisionOperationalError("analysis schema leaves insufficient prose budget")
     # Reserve escaping and punctuation overhead; the final aggregate check stays.
     return min(1400, max(16, allowance * 4 // 5))
+
+
+def prepare_analysis_batches(native, *, analyst, parent, feedback, experience,
+                             on_fragment_refusal=None) -> tuple[list[str], dict]:
+    """Shared zero-request planning for the primary and successor entrances."""
+    batches, plan = plan_analysis_evidence(
+        native, analyst=analyst, parent=parent, feedback=feedback,
+        experience=experience, on_fragment_refusal=on_fragment_refusal)
+    compact = [compact_batch(batch) for batch in batches]
+    caps = allocate_analysis_chars(
+        [batch_case_rounds(batch) for batch, _ in compact])
+    analyst.analysis_batch_chars = {
+        digest(batch): cap for (batch, _), cap in zip(compact, caps)}
+    sizes = [
+        analyst._check_size(analyst._prompt(
+            parent=parent, working=parent.skill_md, feedback=feedback,
+            evidence=batch, coverage={}))
+        for batch, _ in compact]
+    return [batch for batch, _ in compact], {
+        "native_plan": plan,
+        "projection_receipts": [receipt for _, receipt in compact],
+        "analysis_request_sizes": sizes,
+        "batch_count": len(batches),
+        "analysis_chars_per_batch": caps,
+        "analysis_budget_policy": "schema-reserved-prose-per-case/1",
+        "total_analysis_chars": sum(caps),
+        "analysis_request_cap": 2 * len(batches),
+    }
 
 
 def validate_analysis(value, *, expected_cases: Mapping[int, set[int]], batch_sha256: str,

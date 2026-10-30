@@ -67,12 +67,13 @@ class RevisionOperationalError(RuntimeError):
 class RevisionInputBudgetExhausted(RevisionOperationalError):
     """A complete known input needs more calls than the remaining frozen budget."""
 
-    def __init__(self, *, needed, available, source_sha256):
+    def __init__(self, *, needed, available, source_sha256, unit="batches"):
         self.needed = int(needed)
         self.available = int(available)
         self.source_sha256 = source_sha256
+        self.unit = unit
         super().__init__(
-            f"complete evidence needs {needed} batches but only {available} counted requests are available")
+            f"complete evidence needs {needed} {unit} but only {available} are available")
 
 
 def _write_create_once(path: Path, value: object) -> None:
@@ -879,6 +880,180 @@ class FitSetSlotReviser:
             "token_count_status": "not_measured",
         }
 
+    def _revise_analysis_slot(
+        self, *, slot, parent, feedback, forbidden_ids, experience,
+    ) -> SkillSpecV11 | None:
+        """Use the successor's independent analysis and one anchored synthesis."""
+        from skill3d.evolution.trajectory_analysis_v11 import (
+            ANALYSIS_PROTOCOL, TrajectoryAnalyst, compact_analysis_feedback,
+            prepare_analysis_batches, synthesis_evidence,
+        )
+        from skill3d.evolution.revision_edits_v11 import (
+            PROTOCOL, AnchoredSlotReviser, RevisionBudget,
+            _static_validate as validate_candidate,
+        )
+        from skill3d.evolution.revision_guard_v11 import leakage_scan_text as scan
+
+        if experience is None or len(experience.cases) != 12:
+            raise RevisionOperationalError("primary revision requires 12 complete learning cases")
+        render_case_evidence(experience, experiment_split=self.experiment_split)
+        if (experience.parent_content_sha256 != parent.content_sha256
+                or experience.question_type != parent.question_type
+                or experience.evidence_state != parent.evidence_state):
+            raise RevisionOperationalError("analysis learning parent or slot identity changed")
+        compact_feedback = compact_analysis_feedback(feedback)
+        if scan(parent.skill_md + json.dumps(compact_feedback), forbidden_sample_ids=forbidden_ids):
+            raise FitSetError("analysis control text failed leakage validation")
+        audit_fn = getattr(self.client, "audit_identity", None)
+        if not callable(audit_fn):
+            raise RevisionOperationalError("primary revision requires an audited model client")
+        model_identity = audit_fn(seed=137)
+        expected_model = model_identity.get("model")
+        if not expected_model:
+            raise RevisionOperationalError("primary revision model identity is unavailable")
+        available = self.evidence_request_budget + self.max_attempts
+        editor_cap = min(3, self.max_attempts)
+        budget_options = {
+            "max_tokens": self.max_tokens, "input_max_bytes": self.input_max_bytes,
+            "input_max_chars": self.input_max_chars, "seed": 137, "temperature": 0.0,
+        }
+        identity = {
+            "workflow": "analysis_synthesis_v1", "analysis_protocol": ANALYSIS_PROTOCOL,
+            "edit_protocol": PROTOCOL, "slot_key": fit_slot_key(*slot),
+            "parent_sha256": parent.content_sha256,
+            "experience_sha256": content_sha256(experience.model_dump(mode="json")),
+            "feedback_sha256": content_sha256(feedback),
+            "model_identity": model_identity, "available_requests": available,
+            "editor_request_cap": editor_cap, "budget": budget_options,
+            "contract_sha256": ExecutionContract(self.method_context_max_chars).sha256,
+        }
+        root = self.root / "slots" / slot[0] / slot[1]
+        final_path = root / "final.json"
+
+        def artifacts():
+            paths = [root / "analysis_plan.json"]
+            for directory in ("analysis", "synthesis"):
+                paths.extend(sorted((root / directory).glob("*")))
+            result = {}
+            for path in paths:
+                if path.is_symlink() or not path.is_file():
+                    raise RevisionOperationalError("analysis receipt is missing or not a regular file")
+                result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+            return result
+
+        def candidate_from_final(receipt):
+            body = {key: value for key, value in receipt.items() if key != "identity_sha256"}
+            if (receipt.get("identity_sha256") != content_sha256(body)
+                    or receipt.get("input_identity") != identity
+                    or receipt.get("artifact_sha256") != artifacts()):
+                raise RevisionOperationalError("frozen analysis revision receipts changed")
+            if receipt["status"] in {"analysis_rejected", "static_rejected"}:
+                raise FitSetError("primary revision did not produce a complete valid candidate")
+            if receipt["status"] == "no_change":
+                return None
+            if (receipt["status"] != "static_valid"
+                    or not receipt["all_batches_resolved"]
+                    or not receipt["all_evidence_delivered"]):
+                raise RevisionOperationalError("primary revision coverage is incomplete")
+            text = (root / "synthesis" / "SKILL.md").read_text(encoding="utf-8")
+            candidate, problems = validate_candidate(
+                parent=parent, candidate_text=text, forbidden_sample_ids=forbidden_ids,
+                method_context_max_chars=self.method_context_max_chars)
+            if (problems or candidate is None
+                    or candidate.content_sha256 != receipt["candidate_sha256"]
+                    or candidate_sample_copy_leaks(text, experience.cases)):
+                raise RevisionOperationalError("frozen analysis candidate no longer validates")
+            return candidate
+
+        def finish():
+            analysis_final = json.loads((root / "analysis" / "analysis_final.json").read_bytes())
+            resolved = analysis_final.get("all_batches_resolved") is True
+            delivered = analysis_final.get("all_evidence_delivered") is True
+            editor_final = (
+                json.loads((root / "synthesis" / "final.json").read_bytes()) if resolved else {})
+            status = editor_final.get("status", "analysis_rejected")
+            if resolved and (not delivered or status not in {
+                    "static_valid", "no_change", "static_rejected"}):
+                raise RevisionOperationalError("primary revision terminal receipt is incomplete")
+            body = {
+                "schema_version": "v11-fit-set-analysis-revision/1",
+                "input_identity": identity, "status": status,
+                "all_batches_resolved": resolved,
+                "all_evidence_delivered": delivered and editor_final.get(
+                    "all_evidence_delivered", False),
+                "candidate_sha256": editor_final.get("candidate_sha256"),
+                "analyst_requests": analysis_final["model_requests"],
+                "editor_requests": editor_final.get("requests", 0),
+                "analysis_text_persisted": False, "published": False,
+                "artifact_sha256": artifacts(),
+            }
+            _write_create_once(final_path, {**body, "identity_sha256": content_sha256(body)})
+            return candidate_from_final(json.loads(final_path.read_bytes()))
+
+        if final_path.is_file():
+            return candidate_from_final(json.loads(final_path.read_bytes()))
+        plan_path = root / "analysis_plan.json"
+        if plan_path.is_file():
+            plan = json.loads(plan_path.read_bytes())
+            if plan.get("input_identity") != identity:
+                raise RevisionOperationalError("analysis plan identity changed")
+            if (root / "synthesis" / "final.json").is_file():
+                return finish()
+            if any(root.glob("*/request_intent_*.json")):
+                # Summaries deliberately live only in memory. Repeating paid
+                # analysis to rebuild a lost summary would change the budget.
+                raise RevisionOperationalError("interrupted analysis requires audit; requests are not replayed")
+        elif any(root.glob("*/request_intent_*.json")):
+            raise RevisionOperationalError("analysis request exists without its frozen plan")
+
+        analyst = TrajectoryAnalyst(
+            output_root=root / "analysis", client=self.client,
+            budget=RevisionBudget(max_requests=max(1, available), repair_reserve=0,
+                                  **budget_options),
+            method_context_max_chars=self.method_context_max_chars,
+            expected_model=expected_model)
+        batches, preparation = prepare_analysis_batches(
+            self, analyst=analyst, parent=parent, feedback=compact_feedback,
+            experience=experience)
+        needed = preparation["analysis_request_cap"] + editor_cap
+        if needed > available:
+            raise RevisionInputBudgetExhausted(
+                needed=needed, available=available, unit="requests",
+                source_sha256=identity["experience_sha256"])
+        _write_create_once(plan_path, {
+            "input_identity": identity, **preparation,
+            "editor_request_cap": editor_cap, "total_request_cap": needed,
+            "model_requests": 0, "publication_authorized": False,
+        })
+        analyst.budget = RevisionBudget(
+            max_requests=preparation["analysis_request_cap"], repair_reserve=0,
+            **budget_options)
+        state_io = getattr(self, "framework_state_io", None)
+        if state_io is not None:
+            state_io.adapt_analysis_reviser(analyst)
+        summaries = analyst.analyze(
+            parent=parent, feedback=compact_feedback, batches=batches,
+            cases=experience.cases, forbidden_ids=forbidden_ids)
+        if summaries is None:
+            return finish()
+        evidence = synthesis_evidence(summaries, question_type=parent.question_type)
+        editor = AnchoredSlotReviser(
+            output_root=root / "synthesis", client=self.client,
+            budget=RevisionBudget(max_requests=editor_cap, repair_reserve=editor_cap - 1,
+                                  **budget_options),
+            method_context_max_chars=self.method_context_max_chars,
+            expected_model=expected_model)
+        if state_io is not None:
+            state_io.adapt_analysis_reviser(editor)
+        editor.run(
+            parent=parent, feedback=compact_feedback, batches=[evidence],
+            delivery_plan={
+                "analysis_input_sha256": hashlib.sha256(evidence.encode()).hexdigest(),
+                "original_batch_count": len(batches), "analysis_complete": True,
+            },
+            forbidden_ids=forbidden_ids, cases=experience.cases)
+        return finish()
+
     def _revise_slot(
         self,
         *,
@@ -888,7 +1063,12 @@ class FitSetSlotReviser:
         forbidden_ids: set[str],
         experience=None,
         diagnosis=None,
+        learning_input_mode="full_cases_v1",
     ) -> SkillSpecV11 | None:
+        if learning_input_mode == "analysis_synthesis_v1":
+            return self._revise_analysis_slot(
+                slot=slot, parent=parent, feedback=feedback,
+                forbidden_ids=forbidden_ids, experience=experience)
         slot_name = fit_slot_key(*slot)
         slot_root = self.root / "slots" / slot[0] / slot[1]
         final_path = slot_root / "final.json"

@@ -64,17 +64,8 @@ def selections(args, helper):
 
 
 def compact_feedback(feedback):
-    # Keep aggregate outcomes and process categories; remove duplicated signature
-    # documentation from the control block. Original feedback identity is sealed.
-    keys = ("schema_version", "question_type", "evidence_state", "n_cases",
-            "mean_score", "legal_answer_rate", "available_rate", "score_bands")
-    result = {key: feedback[key] for key in keys if key in feedback}
-    signatures = feedback.get("signatures") or []
-    result["process_summary"] = [
-        {k:v for k,v in row.items() if k in ("count", "n_cases", "failure_categories", "outcome")}
-        for row in signatures]
-    result["privacy"] = "Aggregate learning outcomes only; original feedback retained in host receipts."
-    return result
+    from skill3d.evolution.trajectory_analysis_v11 import compact_analysis_feedback
+    return compact_analysis_feedback(feedback)
 
 
 def prepare_one(args, helper, config, history, client, analysis, selection):
@@ -108,29 +99,17 @@ def prepare_one(args, helper, config, history, client, analysis, selection):
                                    for k, v in complete.items() if k != "rounds"},
         })
 
-    batches, plan = analysis.plan_analysis_evidence(
+    batches, preparation = analysis.prepare_analysis_batches(
         native, analyst=analyst, parent=parent, feedback=feedback,
         experience=experience, on_fragment_refusal=planning_refusal)
-    compact = [analysis.compact_batch(batch) for batch in batches]
-    caps = analysis.allocate_analysis_chars(
-        [analysis.batch_case_rounds(batch) for batch, _ in compact])
-    analyst.analysis_batch_chars = {
-        analysis.digest(batch): cap for (batch, _), cap in zip(compact, caps)}
-    checked = [analyst._check_size(analyst._prompt(parent=parent, working=parent.skill_md,
-                    feedback=feedback, evidence=batch, coverage={})) for batch, _ in compact]
     metadata = {
         **selection, "input_identities": identities,
         "input_refs": {k:str(v) for k,v in paths.items()},
         "parent_sha256": parent.content_sha256,
-        "native_plan": plan, "projection_receipts": [r for _,r in compact],
-        "analysis_request_sizes": checked, "batch_count": len(batches),
-        "analysis_chars_per_batch": caps,
-        "analysis_budget_policy": "schema-reserved-prose-per-case/1",
-        "total_analysis_chars": sum(caps),
-        "analysis_request_cap": 2 * len(batches), "revision_request_cap": 3,
+        **preparation, "revision_request_cap": 3,
         "total_request_cap": 2 * len(batches) + 3,
     }
-    return metadata, parent, feedback, experience, [b for b,_ in compact]
+    return metadata, parent, feedback, experience, batches
 
 
 def preflight(args):

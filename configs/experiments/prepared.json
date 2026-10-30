@@ -21,7 +21,7 @@
     "max_requests": 0,
     "min_free_gib": 80,
     "scene_cache_size": 2,
-    "learning_input_mode": "full_cases_v1",
+    "learning_input_mode": "analysis_synthesis_v1",
     "scheduling_mode": "batch_v1",
     "max_revision_requests_per_slot": 18,
     "max_gate_candidates_per_slot": 6,

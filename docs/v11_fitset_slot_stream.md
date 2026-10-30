@@ -1,7 +1,9 @@
 # Harness3D v11 案例学习与槽位流式实验
 
-2026-10-23 起，CLI 默认使用 `full_cases_v1 + scene_disjoint + batch_v1`。
-这是新的运行身份，不能续跑统计输入版 frozen run。旧同题探索仅通过显式
+2026-10-30 起，CLI 默认使用 `analysis_synthesis_v1 + scene_disjoint + batch_v1`，
+采用分批独立轨迹分析与一次汇总锚点修订；统一入口的 learning 使用同一修订模式，
+并显式选择按 QA 隔离的 `qa_disjoint`。这是新的运行身份，不能原地续跑此前修订模式
+的 frozen run。旧逐批完整案例改写通过显式 `full_cases_v1` 保留；旧同题探索通过显式
 `--learning-input-mode aggregate_v1 --gate-mode same_question` 保留。
 
 实验以 `(question_type, evidence_state)` 作为并发、经验缓冲和版本所有权单位。共有 19 个可达槽位：8 个 g0m0、8 个 g1m0、3 个米制任务 g1m1。active seed 物理保存 24 条；5 个非米制 g1m1 不参与运行、修订或 A/B，冻结时保持 seed 内容和版本。
@@ -17,11 +19,12 @@
 进入完成结果。离线适配器连接各轮程序、工具结果、观察／使用／撤销关系、初末证据历史、
 图片 provenance、预测和题级 induction 参考答案，形成 canonical `V11ExperienceCase`。
 `FitSetExperienceCase` 只作为流式缓冲兼容封装，完整案例保存在 `full_case`，
-批次写出 `experience_bundle.json`。聚合统计继续作为概览，原始证据也实际交付修订器。
+批次写出 `experience_bundle.json`。聚合统计继续作为概览，主路径将完整原始证据
+交付各批分析器，最终编辑器读取全部来源绑定分析集合。
 非 induction、父版本或交付 hash 错配、服务故障、缺失 delivery、SIGALRM 环境故障
 不进入完整案例 buffer；不放宽生产标签隔离。
 
-复用 `StreamingEvolutionRunner` 的 `new_since_attempt`：达到 12 条新合格轨迹立即暂停该槽位下一题，尝试离线修订。拒绝后保留同 parent 的已有经验，再收 12 条新轨迹触发下一次；晋升后换 parent、清空旧 parent buffer。下一题必须加载新版本。未满 12 条不做尾批修订。发布后正常 loader 和 hash 验证必须通过，才能继续。
+复用 `StreamingEvolutionRunner` 的 `new_since_attempt`：达到 12 条新合格轨迹立即暂停该槽位下一题，尝试离线修订。拒绝后保留同 parent 的历史记录，再收 12 条新轨迹触发下一次；fit-set 每次实际修订只读取当前 parent 的最新 12 条，全部旧记录继续保留供审计。晋升后换 parent、清空旧 parent 的活跃 buffer，旧文件不删除。下一题必须加载新版本。未满 12 条不做尾批修订。发布后正常 loader 和 hash 验证必须通过，才能继续。
 
 ## 严格准入
 
@@ -37,7 +40,7 @@
 
 每候选在 seed 137 和 138 分别执行 parent/candidate，两臂独立 namespace、trace、临时目录、结果文件，共享只读问题、32 帧、artifact、binding 和配置。M5 identity 继续使用封存 seed，模型请求 seed 由 gate client 单独覆盖并记录；不重新计算或修改 binding。
 
-两个 seed 都要满足分数严格提升、run error 不增加、program error 不增加、legal rate 不下降、无不可信几何、无服务错误、实际 Skill delivery/hash 正确、模型 seed 记录正确、两臂输入计划 hash 相同。静态检查保持同 lineage、题型、状态、name、完整 SKILL.md、大小上限、已知工具与泄漏扫描。Skill 不能改变框架工具授权。准入决定带 hash，候选正文与 parent/run 身份一一对应。
+两个 seed 都要满足分数严格提升、终态 run error 不增加、legal rate 不下降、无不可信几何、无服务错误、实际 Skill delivery/hash 正确、模型 seed 记录正确、两臂输入计划 hash 相同。程序中间轮次错误保留为诊断指标，不再否决晋升，以 `gate_admission_v11.py` 为准。静态检查保持同 lineage、题型、状态、name、完整 SKILL.md、大小上限、已知工具与泄漏扫描。Skill 不能改变框架工具授权。准入决定带 hash，候选正文与 parent/run 身份一一对应。
 
 A/B 结果只能用于准入，不进入下一批 revision。离线模型接收当前 parent 正文、
 本槽位工具合同、聚合概览和已授权完整 induction 案例；不能执行实验、评分或决定晋升。
@@ -45,7 +48,9 @@ A/B 结果只能用于准入，不进入下一批 revision。离线模型接收�
 ## r10 后的反馈与修订协议
 
 当前流使用 `harness3d-fitset-stream/5.0`、`skill-evolution-stream-v11/2.0`，
-修订使用 `v11-fit-set-slot-revision/4.0` 与 `fit-set-slot-revision-v4-case-repair`，
+主分析协议为 `v11-source-linked-trajectory-analysis/1`，锚点编辑协议为
+`v11-anchored-revision-edits/2`，槽位终态回执为 `v11-fit-set-analysis-revision/1`；
+显式直接修订对照保留 `v11-fit-set-slot-revision/4.0`，
 canonical bundle 为 `skill-experience-bundle-v11/6.0`。旧 case 可离线读取；
 旧 checkpoint 不能以新行为继续运行，须新建运行身份。历史结果和分母不修改。
 
@@ -57,7 +62,9 @@ canonical bundle 为 `skill-experience-bundle-v11/6.0`。旧 case 可离线读�
 
 在线 prompt 与修订器同源读取 `ExecutionContract`，合同携带版本/hash、方法完整字符上限、提交/观察动作及工具返回约束。工具目录从实际签名生成，明确能力上界和运行时对象/集合前置条件。静态检查增加带行号和合同依据的确定性冲突检查、示例编译、参数与返回类型检查；它不能证明任意自然语言算法正确，也不能代替性能 gate。
 
-修订响应必须声明 `action: revise | no_change`。revise 包含完整正文、单一
+主路径的最终编辑响应声明 `action: revise | no_change`；revise 返回原文 SHA、
+单一修改假设和最多 8 个句子锚点替换，主机应用实际替换并生成完整正文。
+直接修订对照的响应也声明 `action: revise | no_change`，其 revise 包含完整正文、单一
 change_hypothesis、实际变更的 changed_sections、expected_process_effect 和
 evidence_signature_refs；改动声明与实际段落差异校验。no_change 不生成候选、
 不运行 gate、不切换 parent、不阻塞后续批次，保存可恢复身份收据。静态重试返回
@@ -66,10 +73,11 @@ evidence_signature_refs；改动声明与实际段落差异校验。no_change �
 
 ## 可选诊断与预算
 
-`--learning-input-mode` 有四种冻结选择：
+`--learning-input-mode` 有五种冻结选择：
 
+- `analysis_synthesis_v1`：默认主方向，完整轨迹分批独立分析，全部解决后一次汇总锚点修订；
 - `aggregate_v1`：历史统计直接修订；
-- `full_cases_v1`：默认完整文本案例直接修订；
+- `full_cases_v1`：显式保留的完整文本案例逐批改写对照；
 - `diagnosis_v1`：一次文本案例诊断，再以完整案例、诊断和原始来源片段修订；
 - `diagnosis_multimodal_v1`：诊断额外接收经过 hash 校验的真实冻结图片。
 
@@ -81,7 +89,8 @@ evidence_signature_refs；改动声明与实际段落差异校验。no_change �
 
 观察和原因假设分开保存，假设要求支持证据、父方法标题位置、置信程度和替代解释，
 引用不存在则拒绝。诊断不执行工具、不补造检测或重建、不决定候选晋升。
-原始完整 bundle 始终进入修订器。文本和多模态模式的真实模型效果尚待单独验证。
+诊断对照路径的原始完整 bundle 始终进入修订器。主分析路径的原轨迹交付分析器，
+最终编辑器读取全部摘要。文本和多模态模式的真实模型效果尚待单独验证。
 
 诊断、修订和静态修复都计入每槽位修订请求上限；启用 `--max-requests` 时，
 所有请求与 solver/gate 共用累计 governor、并发 permit 和限速。`episode_pool`

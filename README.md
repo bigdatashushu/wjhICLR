@@ -12,7 +12,12 @@ Harness3D 同题 fit-set 入口为 `scripts/run_fitset_v11.py`。每槽位由唯
 worker 串行消费，12 条新合格轨迹触发修订，经双 seed 严格 A/B 后才发布到独立
 run-local library。ready_579 覆盖 16 槽位，米制扩展覆盖完整 19 槽位；最终冻结
 每槽位最后发布版本，5 个不可达 g1m1 保留 seed。旧线程并发实验无效且不能恢复，
-新实验需先运行 model-free preflight 和 pilot 审计。详见[同题槽位流合同](docs/v11_fitset_slot_stream.md)。
+新实验需先运行 model-free preflight 和 pilot 审计。Skill 演化的主方向是
+`run_analysis_successor_v11.py` 的分批独立轨迹分析与一次汇总锚点修订；统一入口与
+fit-set CLI 默认使用 `analysis_synthesis_v1`，复用同一分析器、证据规划器和编辑器。
+完整原轨迹交给各批分析器，最终编辑器综合来源绑定摘要，候选仍须通过双 seed Gate。
+旧逐批改写通过显式 `full_cases_v1` 保留，冻结实验不原地切换。
+详见[轨迹分析与修订](docs/reviser_analysis_v11.md)和[同题槽位流合同](docs/v11_fitset_slot_stream.md)。
 
 当前在线合同使用 `program_synth_v11_8_en`、
 `solver-v11.8-task-tools` 和 `tool-docs-v11.8-task-tools`。类别匹配、对象覆盖、

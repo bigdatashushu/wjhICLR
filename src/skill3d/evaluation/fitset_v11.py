@@ -1428,7 +1428,8 @@ class SystemVariantRunner:
                              and row.get("source_split", row["split"]) == row["split"],
                              f"{variant_id}: source_split must preserve the source catalog")
             _require(learning_mode in {
-                "aggregate_v1", "full_cases_v1", "diagnosis_v1", "diagnosis_multimodal_v1",
+                "aggregate_v1", "full_cases_v1", "analysis_synthesis_v1",
+                "diagnosis_v1", "diagnosis_multimodal_v1",
             }, "unknown learning input mode")
             _require(gate_mode != "same_question" or not self.gate_variant_rows,
                      "same_question cannot accept separate gate variants")
