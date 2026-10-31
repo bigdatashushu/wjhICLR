@@ -117,6 +117,7 @@ class BailianClient:
         self.last_generation: dict = {}
         self.last_response_identity: dict = {}
         self.last_request_identity: dict = {}
+        self.last_reasoning_content: str | None = None
 
     @property
     def configured(self) -> bool:
@@ -185,6 +186,7 @@ class BailianClient:
             payload, model_identity=self.audit_identity(seed=seed))
         self.last_usage = {}
         self.last_response_identity = {}
+        self.last_reasoning_content = None
         self.last_generation = {
             "mode": "nonstream", "usage_status": "unknown",
             "provider": self.provider, "endpoint_sha256": self.endpoint_hash,
@@ -215,9 +217,6 @@ class BailianClient:
             raise ServiceUnavailable(
                 _scrub(f"{type(exc).__name__}: {exc}", api_key)) from exc
         try:
-            content = body["choices"][0]["message"]["content"]
-            if not isinstance(content, str) or not content:
-                raise ValueError("empty content")
             usage = body.get("usage") or {}
             self.last_usage = dict(usage) if isinstance(usage, dict) else {}
             self.last_generation["usage_status"] = (
@@ -229,8 +228,15 @@ class BailianClient:
                 "model": str(body.get("model") or self.model),
                 "created": body.get("created"),
                 "backend_fingerprint": body.get("system_fingerprint"),
+                "model_reported": bool(body.get("model")),
             }
             self.last_generation["response_identity"] = self.last_response_identity
+            message = body["choices"][0]["message"]
+            reasoning = message.get("reasoning_content")
+            self.last_reasoning_content = reasoning if isinstance(reasoning, str) else None
+            content = message.get("content")
+            if not isinstance(content, str) or not content:
+                raise ValueError("empty content")
             return content
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise RuntimeError(f"invalid Bailian response: {exc}") from exc

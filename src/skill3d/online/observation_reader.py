@@ -100,7 +100,8 @@ def object_summary_row(obj, *, question_type=""):
     return row
 
 
-def read_observation(observations, result_id, fields=None, offset=0, limit=8):
+def read_observation(observations, result_id, fields=None, offset=0, limit=8,
+                     *, public_fields=None):
     if not isinstance(result_id, str) or not result_id:
         raise ValueError("result_id must be an existing nonempty result ID")
     if type(offset) is not int or offset < 0:
@@ -115,7 +116,8 @@ def read_observation(observations, result_id, fields=None, offset=0, limit=8):
     rows = payload if isinstance(payload, list) else [payload]
     present = {k for row in rows if isinstance(row, dict) for k in row}
     allowed = (set(OBJECT_FIELDS) if obs.source_tool == "list_objects"
-               else _PUBLIC_FIELDS.get(obs.source_tool, set()))
+               else (public_fields or {}).get(
+                   obs.source_tool, _PUBLIC_FIELDS.get(obs.source_tool, set())))
     if fields is not None and (
             not isinstance(fields, list) or not fields or len(fields) > 32
             or any(not isinstance(k, str) or k not in allowed for k in fields)):

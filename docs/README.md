@@ -6,6 +6,7 @@
 
 | 文档 | 用途 |
 |---|---|
+| [BLINK 主实验](blink_experiment.md) | 原图与 thinking、40/93 划分、Skill 训练/Gate 和冻结四臂评分 |
 | [配对评测与消融合同](skill_ablation_v11.md) | B01/B11 面板、共享准备、配对身份与评分 |
 | [同题 fit-set 槽位流](v11_fitset_slot_stream.md) | 同题学习、修订、晋升及恢复 |
 | [Episode 并发池](v11_episode_pool.md) | spawn worker、并发和谱系边界 |

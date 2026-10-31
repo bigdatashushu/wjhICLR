@@ -249,7 +249,7 @@ def _denial_receipt(kernel: Any, name: str, call_args: dict,
     spec = kernel._registry.get(name).spec  # noqa: SLF001
     profile = getattr(scene, "evidence_profile", None)
     try:
-        decision = authorize_tool_call(
+        decision = kernel._registry.authorize(
             name, spec, scope=str(getattr(scene, "question_tool_scope", "")),
             profile=profile,
             available_artifacts=getattr(scene, "available_artifacts", ()) or (),
@@ -279,7 +279,9 @@ def _denial_receipt(kernel: Any, name: str, call_args: dict,
         dependency_refs=deps, allowed=False, reason_codes=reason_codes,
         metric_gate_result=gate_payload, args=dict(call_args),
         scene_route=str(getattr(scene, "scene_route", "") or ""),
-        question_tool_scope=str(getattr(scene, "question_tool_scope", "") or ""))
+        question_tool_scope=str(getattr(scene, "question_tool_scope", "") or ""),
+        **({"decision_version": kernel._registry.decision_version}
+           if kernel._registry.decision_version else {}))
 
 
 def _request_digest(scene: Any, name: str, call_args: dict) -> str:
@@ -494,7 +496,8 @@ class RestrictedNamespaceKernel:
             if len(self.observation_reads) - self._cell_read_mark >= MAX_READS_PER_ROUND:
                 raise ValueError("ReadObservation per-round budget exhausted")
             valid = [o for o in collect_validated(self) if o.result_id not in self.unresolved_result_ids]
-            page = read_observation(valid, result_id, fields, offset, limit)
+            page = read_observation(valid, result_id, fields, offset, limit,
+                                    public_fields=self._registry.public_fields)
         except ValueError as exc:
             receipt["reason_code"] = "observation_read_rejected"
             self.authorization_receipts.append(receipt)

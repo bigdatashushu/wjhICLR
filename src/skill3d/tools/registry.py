@@ -45,7 +45,7 @@ from skill3d.tools.contract import (
     evidence_visible,
     scope_allows,
 )
-from skill3d.schemas.authorization import ToolAuthorizationReceipt
+from skill3d.schemas.authorization import AuthorizationDecision, ToolAuthorizationReceipt
 from skill3d.tools.contract import authorize_tool_call
 from skill3d.tools.mock_switch import MockSwitch, request_key
 from skill3d.tools.scene_handle import SceneHandle
@@ -84,8 +84,30 @@ class _RegisteredTool:
 class ToolRegistry:
     """ToolSpec 注册表：统一签名 (handle: SceneHandle, **args) -> Any。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, authorizer: Optional[Callable] = None,
+                 model_tools: Optional[Iterable[str]] = None,
+                 public_fields: Optional[dict[str, Iterable[str]]] = None,
+                 decision_version: str = "") -> None:
         self._tools: dict[str, _RegisteredTool] = {}
+        # Instance-local extension: the default registry retains the VSI contract.
+        self._authorizer = authorizer
+        self._model_tools = MODEL_TOOLS if model_tools is None else frozenset(model_tools)
+        self.public_fields = {k: frozenset(v) for k, v in (public_fields or {}).items()}
+        self.decision_version = decision_version
+
+    def authorize(self, name: str, spec: ToolSpec, **context):
+        if self._authorizer is None:
+            return authorize_tool_call(name, spec, **context)
+        try:
+            decision = self._authorizer(name, spec, **context)
+            if not isinstance(decision, AuthorizationDecision):
+                raise TypeError("authorizer must return an AuthorizationDecision")
+            return AuthorizationDecision.model_validate(decision.model_dump(warnings=False))
+        except Exception as exc:
+            raise ArtifactUnavailableError(
+                name, ["authorization_decision_invalid"],
+                args=context.get("args"), failure_cause=FailureCause(
+                    code="authorization_decision_invalid", scope="local_call")) from exc
 
     # ---- 注册 ----
     def register(self, spec: ToolSpec) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -138,7 +160,7 @@ class ToolRegistry:
         return sorted(self._tools.keys())
 
     def model_names(self) -> list[str]:
-        return sorted(set(self._tools) & MODEL_TOOLS)
+        return sorted(set(self._tools) & self._model_tools)
 
     def get(self, name: str) -> _RegisteredTool:
         if name not in self._tools:
@@ -214,7 +236,7 @@ class ToolRegistry:
             return self.model_names()  # Public catalog, not episode authorization.
         return [
             name for name in self.names()
-            if authorize_tool_call(
+            if self.authorize(
                 name, self._tools[name].spec, scope=scope or "",
                 profile=evidence_profile,
                 available_artifacts=KNOWN_ARTIFACTS if available is None else available,
@@ -261,7 +283,7 @@ class ToolRegistry:
             facts = ", ".join(t.spec.requires_local_facts) or "none"
             modes = ""
             if name == "object_surface_distance":
-                metric = authorize_tool_call(
+                metric = self.authorize(
                     name, t.spec, scope=scope or "", profile=evidence_profile,
                     available_artifacts=KNOWN_ARTIFACTS if available is None else available,
                     gate_passed=gate_passed, local_facts=local_facts,
@@ -372,7 +394,7 @@ class ToolRegistry:
             question_type=scene.question_type, args=args,
             local_facts=scene.local_facts, gate_passed=scene.metric_gate_passed,
             model_call=model_call)
-        decision = authorize_tool_call(name, entry.spec, **authorization_context)
+        decision = self.authorize(name, entry.spec, **authorization_context)
         receipt = ToolAuthorizationReceipt(
             episode_id=episode_id, tool_id=name, argument_digest=digest,
             evidence_version=str(getattr(profile, "profile_version", "") or ""),
@@ -381,9 +403,33 @@ class ToolRegistry:
             reason_codes=list(decision.reason_codes),
             metric_gate_result=dict(decision.metric_gate_result),
             args=dict(args), scene_route=str(scene.scene_route),
-            question_tool_scope=str(scope))
+            question_tool_scope=str(scope),
+            **({"decision_version": self.decision_version} if self.decision_version else {}))
 
         effective = effective_tool_spec(entry.spec, args)
+        if self._authorizer is not None:
+            # Extension authorizers own their evidence vocabulary and scope. They
+            # must fail closed; they never alter the legacy global vocabulary.
+            if not decision.allowed:
+                raise ArtifactUnavailableError(
+                    name, decision.missing_refs or decision.reason_codes,
+                    route=scene.scene_route, available=available, args=args)
+        else:
+            self._check_legacy_contract(
+                name, entry.spec, effective, scene, args, decision, available, profile, scope)
+
+        switch = mock_switch or MockSwitch()
+        fn, source = switch.resolve(
+            name, entry.fn, entry.spec.returns_schema_ref, args, scene, mode
+        )
+        MockSwitch.assert_admission_clean(source, mode)
+        return self._execute(
+            name, args, scene, entry, fn, source, profile, available, digest,
+            receipt, authorization_context)
+
+    @staticmethod
+    def _check_legacy_contract(name, spec, effective, scene, args, decision,
+                               available, profile, scope):
         if "task_denied" in decision.reason_codes:
             raise ToolContractError(
                 name, f"Tool {name} is not exposed for question type {scene.question_type}; "
@@ -409,7 +455,7 @@ class ToolRegistry:
 
         # ② 米制 Tool 的逐题授权（v5 HC33 语义的题型维度补充）
         check_metric_task_contract(
-            name, entry.spec.supported_metric_tasks,
+            name, spec.supported_metric_tasks,
             scene.allowed_metric_tasks, scene.question_type, args=args)
 
         # ③ 证据契约（§7.2/§13.2 执行期二次校验）
@@ -426,13 +472,8 @@ class ToolRegistry:
                 name, decision.missing_refs, route=scene.scene_route,
                 available=available, args=args)
 
-        switch = mock_switch or MockSwitch()
-        fn, source = switch.resolve(
-            name, entry.fn, entry.spec.returns_schema_ref, args, scene, mode
-        )
-        # T4 防污染：准入阶段（mode=real）出现 mock_* source 必须抛错
-        MockSwitch.assert_admission_clean(source, mode)
-
+    def _execute(self, name, args, scene, entry, fn, source, profile, available,
+                 digest, receipt, authorization_context):
         t0 = time.perf_counter()
         error: Optional[str] = None
         error_code: Optional[str] = None
@@ -444,7 +485,7 @@ class ToolRegistry:
         try:
             value = fn(scene, **args)
             if scene._consumed_dependency_refs:
-                actual = authorize_tool_call(
+                actual = self.authorize(
                     name, entry.spec, **authorization_context,
                     consumed_dependency_refs=scene._consumed_dependency_refs)
                 receipt = receipt.model_copy(update={

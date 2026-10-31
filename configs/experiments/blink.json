@@ -1,0 +1,44 @@
+{
+  "schema": "harness3d-blink-campaign/1",
+  "data_root": "/home/wangy/wangjh/harness3d/four-datasets-20261031/smallimage",
+  "dataset_root": "/tmp/h3d-four-smallimage-public-20261031/dataset",
+  "inputs": {
+    "public_manifest": "{data_root}/manifest.json",
+    "prepared_root": "{data_root}/prepared",
+    "host_answers": "{data_root}/host_evaluation/answers.json",
+    "seed_skills": "{data_root}/seed_skills.json"
+  },
+  "model": {
+    "model": "qwen3.8-flash",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key_env": "DASHSCOPE_API_KEY",
+    "timeout_s": 180,
+    "temperature": 0,
+    "max_output_tokens": 8192
+  },
+  "solver": {
+    "max_requests": 4,
+    "max_solve_rounds": 2,
+    "max_tokens": 8192,
+    "category_max_tokens": 256,
+    "max_categories": 12,
+    "cell_timeout_s": 30,
+    "max_feedback_chars": 24000,
+    "seed": 137,
+    "enable_thinking": true,
+    "original_image_bytes": true,
+    "explicit_final_answer": true,
+    "capture_responses": true,
+    "expected_model": "qwen3.8-flash"
+  },
+  "runtime": {
+    "request_concurrency": 4,
+    "max_requests": 0,
+    "revision_interval": 12,
+    "gate_size": 8,
+    "gate_seeds": [137, 138],
+    "revision_max_tokens": 2048,
+    "expected_train": 40,
+    "expected_test": 93
+  }
+}
