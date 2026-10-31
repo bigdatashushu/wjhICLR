@@ -10,6 +10,45 @@ from skill3d.storage.hot_cache import IntegrityError, _flock
 
 SHARED_SCHEMA = "v11-fit-set-offline-input/2.0"
 LEGACY_SCHEMA = "v11-fit-set-offline-input/1.0"
+OVERVIEW_SCHEMA = "v11-fit-set-offline-input/3.0"
+OVERVIEW_DESCRIPTOR_FIELDS = frozenset({
+    "schema", "scene_id", "image_id", "image_path", "png_sha256", "rgb_sha256",
+    "scene_artifact_sha256", "frozen_scene_sha256", "render_spec_sha256",
+    "world_frame_status", "resolution_wh", "selected_azimuth_degrees",
+    "elevation_degrees", "render_only_cutaway",
+})
+
+
+def overview_ref(root, descriptor, *, logical_path=str):
+    """Keep the overview outside the original FrameSet and share its PNG."""
+    path = shared_frame_path(
+        root, descriptor["scene_id"], descriptor["render_spec_sha256"],
+        descriptor["png_sha256"])
+    return {
+        **descriptor, "kind": "scene_overview", "path": logical_path(path),
+        "file_sha256": descriptor["png_sha256"],
+        "content_sha256": descriptor["rgb_sha256"],
+    }
+
+
+def validate_overview_png(data, descriptor):
+    """Verify frozen replay bytes without consulting the source render cache."""
+    import io
+    import numpy as np
+    from PIL import Image
+
+    if hashlib.sha256(data).hexdigest() != descriptor["png_sha256"]:
+        raise IntegrityError("frozen overview PNG identity changed")
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format != "PNG" or image.mode != "RGB" or image.size != (640, 480):
+                raise IntegrityError("frozen overview must be a 640x480 RGB PNG")
+            pixels = np.asarray(image)
+            digest = hashlib.sha256(pixels.tobytes()).hexdigest()
+    except (OSError, ValueError) as exc:
+        raise IntegrityError("frozen overview PNG cannot be decoded") from exc
+    if digest != descriptor["rgb_sha256"]:
+        raise IntegrityError("frozen overview RGB identity changed")
 
 
 def scene_key(scene):

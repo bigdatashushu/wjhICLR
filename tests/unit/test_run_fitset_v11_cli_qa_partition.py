@@ -122,7 +122,11 @@ def test_new_options_document_same_scene_question_disjoint_and_preserve_defaults
     assert args.experiment_split_manifest == ""
     assert args.execution_role == ""
     assert args.gate_mode == "scene_disjoint"
-    assert args.learning_input_mode == "full_cases_v1"
+    assert args.learning_input_mode == "analysis_synthesis_v1"
+    legacy = cli.build_parser().parse_args([
+        *cli_case.argv, "--learning-input-mode", "full_cases_v1",
+    ])
+    assert legacy.learning_input_mode == "full_cases_v1"
     assert args.gate_variant_ids == args.gate_panel_name == ""
     help_text = " ".join(
         cli.build_parser()._subparsers._group_actions[0].choices["run-system"].format_help().split())

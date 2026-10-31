@@ -11,10 +11,20 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    # pytest's pythonpath setting changes only this interpreter's sys.path.
+    # Crash/recovery tests also start clean Python children, sometimes outside
+    # the repository, so give them the same absolute source root.
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    inherited = [path for path in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+                 if path and path != source_root]
+    os.environ["PYTHONPATH"] = os.pathsep.join([source_root, *inherited])
     try:
         from skill3d.env_preflight import (
             FROZEN_ENV_PYTHON,

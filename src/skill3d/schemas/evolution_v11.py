@@ -9,7 +9,9 @@ from typing import Literal, Optional
 from pydantic import Field, field_validator, model_serializer, model_validator
 
 from . import Spec
-from .data_access import DataAccessRecord, validate_learning_authorization
+from .data_access import (
+    DataAccessRecord, validate_learning_authorization, validate_learning_source,
+)
 from .skill import SkillCandidateV11
 from .evidence import SkillEvidenceState, skill_evidence_state
 
@@ -37,7 +39,7 @@ class V11ExperienceCase(Spec):
     evidence_state: SkillEvidenceState
     question_text: str
     options: list[str] = Field(default_factory=list)
-    source_split: Literal["induction", "inner_validation"]
+    source_split: Literal["induction", "inner_validation", "outer_holdout", "final_test"]
     learning_authorization: dict = Field(default_factory=dict)
     split: Literal["learning"]
     label_access: Literal[True]
@@ -100,6 +102,7 @@ class V11ExperienceCase(Spec):
 
         if self.learning_authorization:
             validate_learning_authorization(self.learning_authorization, [self.qa_id])
+            validate_learning_source(self.learning_authorization, self.qa_id, self.source_split)
             access = ((self.rounds[0].get("experience_provenance") or {}).get(
                 "offline_label_access_record") if self.rounds else None)
             if not access:
@@ -155,8 +158,8 @@ class V11ExperienceBundle(Spec):
     parent_content_sha256: str
     question_type: str
     evidence_state: SkillEvidenceState
-    source_split: Literal["induction", "inner_validation"] | list[
-        Literal["induction", "inner_validation"]
+    source_split: Literal["induction", "inner_validation", "outer_holdout", "final_test"] | list[
+        Literal["induction", "inner_validation", "outer_holdout", "final_test"]
     ]
     learning_authorization: dict = Field(default_factory=dict)
     split: Literal["learning"]
@@ -217,8 +220,14 @@ class V11ExperienceBundle(Spec):
                 validate_learning_authorization(row.learning_authorization, [
                     case.qa_id for case in cases])
                 if any(row.learning_authorization[key] != self.learning_authorization[key]
-                       for key in self.learning_authorization if key != "qa_ids"):
+                       for key in self.learning_authorization
+                       if key not in {"qa_ids", "source_split_by_qa"}):
                     raise ValueError("bundle label access authorization identity mismatch")
+                if row.learning_authorization.get("source_split_by_qa") != (
+                    {case.qa_id: self.learning_authorization["source_split_by_qa"][case.qa_id]
+                     for case in cases} if "source_split_by_qa" in self.learning_authorization else None
+                ):
+                    raise ValueError("bundle scoped source authorization mismatch")
             elif row.learning_authorization:
                 raise ValueError("experiment label access requires bundle learning authorization")
         for case in self.cases:
@@ -234,8 +243,14 @@ class V11ExperienceBundle(Spec):
             if self.learning_authorization:
                 validate_learning_authorization(case.learning_authorization, [case.qa_id])
                 if any(case.learning_authorization[key] != self.learning_authorization[key]
-                       for key in self.learning_authorization if key != "qa_ids"):
+                       for key in self.learning_authorization
+                       if key not in {"qa_ids", "source_split_by_qa"}):
                     raise ValueError("case/bundle learning authorization identity mismatch")
+                if case.learning_authorization.get("source_split_by_qa") != (
+                    {case.qa_id: self.learning_authorization["source_split_by_qa"][case.qa_id]}
+                    if "source_split_by_qa" in self.learning_authorization else None
+                ):
+                    raise ValueError("case/bundle scoped source authorization mismatch")
             if case.delivered_skill_version != self.parent_skill_version:
                 raise ValueError("经验 case 未实际交付目标父版本")
             if case.delivered_content_sha256 != self.parent_content_sha256:

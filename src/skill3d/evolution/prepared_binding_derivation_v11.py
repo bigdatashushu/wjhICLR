@@ -2,8 +2,9 @@
 
 The caller supplies trusted published source references, not a self-issued
 source seal. Every derivation/replay loads those immutable entries again, checks
-the original binary receipts, reads geometry/masks, and audits the complete
-destination scene group. Historical generation identities are never resealed.
+the original binary receipts and checks the complete destination scene group.
+Explicit source-audit reuse preserves the old verdicts without repeating mask
+conflict or numeric reviews. Historical generation identities are never resealed.
 """
 
 from __future__ import annotations
@@ -24,7 +25,8 @@ from skill3d.legacy.readers import load_artifact_v5
 from skill3d.online import runner
 from skill3d.online.runner import OnlineRunConfig, PreparedObjectBinding
 from skill3d.segmentation.binding_validation import (
-    BINDING_VALIDATION_VERSION, validate_binding,
+    BINDING_VALIDATION_VERSION, SEMANTIC_IDENTITY_KEY, _semantic_identity,
+    _semantic_policy_passes, validate_binding,
 )
 from skill3d.segmentation.intern_binary_review import (
     admission_identity, validate_category_receipt,
@@ -49,6 +51,18 @@ LEGACY_SOURCES_SHA256 = "0fd603e51ad1eea00f786509c45b1008cfa5d3f9dbd3bd7a453acca
 LEGACY_STORE_SOURCE = {
     "size": 22304,
     "sha256": "ee39e7f64ce2414029859f5822760929a216ce01604b2669758415b9e49f151b",
+}
+AUDIT_MODES = ("reaudit", "reuse_source_audit")
+LEGACY_VALIDATION_VERSION = "m5-binding-validation-v2-semantic-review"
+_REUSED_AUDIT_SOURCES = {
+    "segmentation/sam2_tracker.py": {
+        "size": 40757,
+        "sha256": "fcfbdc4f7fed3e64d7da6fa79313d90e5eebca8962fc0006a229ce1cb62ca3a3",
+    },
+    "tools/category_match.py": {
+        "size": 10190,
+        "sha256": "76032ba2a8975f9c6d2b209aedd2233528b665de4d5f1794630b15faf6112de7",
+    },
 }
 _REQUEST_CHANGES = {
     "input_sha256", "scene_audit_qa_ids", "binding_version", "parameters",
@@ -90,6 +104,7 @@ class PreparedBindingDerivationContext:
     cfg: OnlineRunConfig
     target_relocations: Mapping[str, ValidatedRelocation] | None = None
     target_migration_receipts: Mapping[str, Mapping | str | Path] | None = None
+    audit_mode: str = "reaudit"
     _replay_cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
 
@@ -205,6 +220,7 @@ def _context_fingerprint(context):
             qa: str(receipt) if isinstance(receipt, Path) else receipt
             for qa, receipt in (context.target_migration_receipts or {}).items()},
         "cfg": {name: getattr(context.cfg, name) for name in cfg_fields},
+        "audit_mode": context.audit_mode,
         "implementation": _implementation(),
         "current_sources": source_identity(Path(__file__).resolve().parents[1]),
     })
@@ -449,8 +465,66 @@ def _implementation():
         "validator": file_identity(root / "segmentation/binding_validation.py"),
         "prepared_validator": file_identity(root / "segmentation/question_binding.py"),
         "audit": file_identity(root / "segmentation/sam2_tracker.py"),
+        "label_relation": file_identity(root / "tools/category_match.py"),
         "store": file_identity(root / "segmentation/prepared_binding_store.py"),
     }
+
+
+def _reuse_validation(obj, generation_sha):
+    """Upgrade only the semantic seal; retain every original numeric verdict."""
+    receipt = obj.binding_validation
+    _require(receipt is not None and receipt.version == LEGACY_VALIDATION_VERSION
+             and receipt.generation_sha256 == generation_sha,
+             f"original validation receipt missing or changed: {obj.obj_id}")
+    required = {
+        "nonempty_mask", "finite_points", "point_confidence", "no_binding_flags",
+        "instance_not_suspect", "candidate_identity", "semantic_review",
+        "intern_binary_integrity",
+    }
+    if receipt.checks.get("nonempty_mask"):
+        required.update(("visible_frames", "mask_support"))
+    if receipt.checks.get("finite_points"):
+        required.update(("centroid", "bbox"))
+    _require(required <= set(receipt.checks)
+             and set(receipt.errors) == {k for k, passed in receipt.checks.items() if not passed}
+             and receipt.status == ("unavailable" if receipt.errors else "validated"),
+             f"original validation verdict is inconsistent: {obj.obj_id}")
+    _require(receipt.checks["no_binding_flags"] == (not bool(obj.binding_flags))
+             and receipt.checks["instance_not_suspect"] == (not obj.duplicate_suspect),
+             f"original flags/verdict changed: {obj.obj_id}")
+    files = {
+        name: file_identity(getattr(obj, name))
+        for name in ("mask_per_frame", "pointcloud_world", "pointconf_world")
+        if getattr(obj, name, None)
+    }
+    _require(receipt.files == files
+             and {"mask_per_frame", "pointcloud_world"} <= set(files),
+             f"original validation file identities changed: {obj.obj_id}")
+    checks = dict(receipt.checks)
+    checks["semantic_policy"] = all(_semantic_policy_passes(row)
+                                    for row in obj.binding_provenance)
+    checks["candidate_provenance"] = (
+        [row.get("candidate_id") for row in obj.binding_provenance] == obj.candidate_ids
+        and all(row.get("category") == obj.category_name for row in obj.binding_provenance))
+    _require(checks["semantic_policy"] and checks["candidate_provenance"],
+             f"current semantic contract failed: {obj.obj_id}")
+    return receipt.model_copy(update={
+        "version": BINDING_VALIDATION_VERSION, "checks": checks,
+        "files": {**files, SEMANTIC_IDENTITY_KEY: _semantic_identity(obj)},
+    })
+
+
+def _source_audit_contract(binding, request, qa_ids, scene_identity):
+    _require(request.get("scene_audit_qa_ids") == qa_ids,
+             "reuse requires the exact original full scene audit scope")
+    audits = binding.stats.get("semantic_conflict_audits")
+    _require(isinstance(audits, list), "original scene conflict audit receipts missing")
+    for audit in audits:
+        _digest(audit, "audit_sha256", "original scene conflict audit")
+        _require(audit.get("scene_identity") == scene_identity
+                 and bool(audit.get("qa_ids"))
+                 and set(audit["qa_ids"]) <= set(qa_ids),
+                 "original scene conflict audit scope changed")
 
 
 def _derive(context):
@@ -464,6 +538,13 @@ def _derive(context):
                     context.target_artifact_paths):
         _require(set(mapping) == set(indexed), "destination scene group is incomplete")
     _require(context.cfg.mode == "real", "only real sealed inputs may be derived")
+    _require(context.audit_mode in AUDIT_MODES, "unsupported source audit mode")
+    reuse = context.audit_mode == "reuse_source_audit"
+    if reuse:
+        root = Path(__file__).resolve().parents[1]
+        _require(all(file_identity(root / name) == identity
+                     for name, identity in _REUSED_AUDIT_SOURCES.items()),
+                 "current conflict/label rules differ from the reviewed source")
     scenes = {item.episode.scene_name for item in context.items}
     _require(len(scenes) == 1, "derive one complete destination scene group at a time")
     bindings, arrays, anchors, destinations, scene_ids = {}, {}, {}, {}, set()
@@ -490,6 +571,8 @@ def _derive(context):
         _require(actual == dict(new_input), "destination input does not recompute")
         old, old_input, manifest, old_art, anchor = _load_source(context.sources[qa_id], item)
         _legacy_contract(old, manifest["request_identity"], request)
+        if reuse:
+            _source_audit_contract(old, manifest["request_identity"], qa_ids, _scene(art))
         identity = old.stats["generation"]["identity"]
         values = _arrays(art, array_cache)
         geometry = _geometry(values, geometry_cache)
@@ -515,6 +598,10 @@ def _derive(context):
         derived = copy.deepcopy(old)
         derived.prepared_measurements = {}
         _derive_policy(derived, request["parameters"])
+        if reuse:
+            for obj in derived.objects:
+                obj.binding_validation = _reuse_validation(
+                    obj, derived.stats["generation"]["sha256"])
         derived.stats["version"] = M5_BINDING_VERSION
         bindings[qa_id], arrays[qa_id], anchors[qa_id] = derived, values, anchor
         scene_ids.add(_scene(art))
@@ -522,24 +609,25 @@ def _derive(context):
             "input_sha256": new_input["sha256"], "request_identity": copy.deepcopy(dict(request)),
         }
     _require(len(scene_ids) == 1, "destination group reconstruction identities differ")
-    audited, audits = audit_semantic_mask_conflicts(
+    audited, audits = ({}, []) if reuse else audit_semantic_mask_conflicts(
         [(qa_id, bindings[qa_id].objects) for qa_id in qa_ids],
         scene_identity=next(iter(scene_ids)))
     for qa_id in qa_ids:
         binding, values = bindings[qa_id], arrays[qa_id]
         generation_sha = binding.stats["generation"]["sha256"]
-        binding.objects = []
-        for obj in audited[qa_id]:
-            verdict = validate_binding(
-                obj, depth_maps=values["depth"], n_frames=len(indexed[qa_id].pixels),
-                generation_sha256=generation_sha)
-            _require(set(verdict.errors) <= {"no_binding_flags", "instance_not_suspect"},
-                     f"current array/semantic validation failed for {qa_id}/{obj.obj_id}: {verdict.errors}")
-            binding.objects.append(obj.model_copy(update={"binding_validation": verdict}))
-        binding.stats["semantic_conflict_audits"] = [
-            audit for audit in audits if qa_id in audit["qa_ids"]]
-        if binding.stats.get("grounding"):
-            binding.stats["grounding"] = refresh_coverage(binding.stats["grounding"], binding.objects)
+        if not reuse:
+            binding.objects = []
+            for obj in audited[qa_id]:
+                verdict = validate_binding(
+                    obj, depth_maps=values["depth"], n_frames=len(indexed[qa_id].pixels),
+                    generation_sha256=generation_sha)
+                _require(set(verdict.errors) <= {"no_binding_flags", "instance_not_suspect"},
+                         f"current array/semantic validation failed for {qa_id}/{obj.obj_id}: {verdict.errors}")
+                binding.objects.append(obj.model_copy(update={"binding_validation": verdict}))
+            binding.stats["semantic_conflict_audits"] = [
+                audit for audit in audits if qa_id in audit["qa_ids"]]
+            if binding.stats.get("grounding"):
+                binding.stats["grounding"] = refresh_coverage(binding.stats["grounding"], binding.objects)
         body = {
             "schema_version": DERIVATION_SCHEMA_VERSION,
             "source_commit": LEGACY_SOURCE_COMMIT, "semantic_policy": "category-only",
@@ -550,6 +638,10 @@ def _derive(context):
             "output_binding_sha256": content_sha256(_content(binding)),
             "new_model_requests": 0, "new_detector_requests": 0, "new_sam2_tracks": 0,
             "generation_resealed": False, "quality_assessed": False,
+            "audit_mode": context.audit_mode,
+            "source_audit_reused": reuse,
+            "new_mask_conflict_audits": 0 if reuse else 1,
+            "new_numeric_validations": 0 if reuse else len(binding.objects),
         }
         binding.stats["binding_derivation"] = {**body, "sha256": content_sha256(body)}
     return bindings
@@ -576,25 +668,62 @@ def derive_prepared_binding_scene_v11(context: PreparedBindingDerivationContext)
         raise PreparedBindingStoreError(f"binding derivation rejected: {exc}") from exc
 
 
-def publish_derived_binding_scene_v11(context: PreparedBindingDerivationContext, *, store_root):
+def publish_derived_binding_scene_v11(
+    context: PreparedBindingDerivationContext, *, store_root, publish_qa_ids=None,
+):
     """Publish into a new store and return the normal current store references."""
     store = PreparedBindingStore(store_root)
     _require(all(store.root != PreparedBindingStore(source["reference"]["store_root"]).root
                  for source in context.sources.values()), "destination store must be new")
+    ids = list(context.sources) if publish_qa_ids is None else list(publish_qa_ids)
+    _require(bool(ids) and len(set(ids)) == len(ids) and set(ids) <= set(context.sources),
+             "publication QA selection must be a nonempty subset of the full scene")
+    publish_ids = set(ids)
+    # Derive and audit the full source scene even when only selected experiment
+    # outputs are persisted. Every persisted receipt retains the full closure.
     bindings = derive_prepared_binding_scene_v11(context)
     receipts = {
         qa: (context.target_migration_receipts or {}).get(qa) or _source_receipt(context.sources[qa])
         for qa in bindings if qa in (context.target_relocations or {})
     }
     _require(all(receipts.values()), "relocated publication requires explicit scene receipts")
-    return {
-        qa_id: store.publish(
+
+    def publish(qa_id, binding):
+        request = context.target_requests[qa_id]
+        key = store.key_for(request)
+        if (store.entry_path(key) / "manifest.json").is_file():
+            reference = store.reference(key)
+            _require(reference["request_identity"] == request,
+                     "existing derived request changed")
+            migration = None
+            destination = None
+            if qa_id in receipts:
+                original = read_relocation_receipt(receipts[qa_id])
+                destination = original["destination_root"]
+                migration = store.create_migration_receipt(
+                    key, scene_input_identity=context.target_inputs[qa_id],
+                    destination_root=destination,
+                    scene_artifact_ref=original["artifact"]["target_ref"],
+                    dependency_refs={
+                        name: row["target_ref"]
+                        for name, row in original["dependencies"].items()})
+            existing = load_prepared_binding_reference(
+                reference, scene_input_identity=context.target_inputs[qa_id],
+                scene_artifact=context.target_artifact_paths[qa_id],
+                migration_receipt=migration, migration_destination_root=destination)
+            _require(existing.stats.get("binding_derivation")
+                     == binding.stats.get("binding_derivation")
+                     and content_sha256(_content(existing)) == content_sha256(_content(binding)),
+                     "existing derived output differs from the full scene audit")
+            return reference
+        return store.publish(
             request_identity=context.target_requests[qa_id],
             scene_artifact=context.target_artifact_paths[qa_id],
             scene_input_identity=context.target_inputs[qa_id], binding=binding,
             scene_migration_receipt=receipts.get(qa_id))
-        for qa_id, binding in bindings.items()
-    }
+
+    return {qa_id: publish(qa_id, binding)
+            for qa_id, binding in bindings.items() if qa_id in publish_ids}
 
 
 def validate_derived_prepared_binding(binding, *, context, frames, depth, c2w, intrinsics,
@@ -633,12 +762,13 @@ def validate_derived_prepared_binding(binding, *, context, frames, depth, c2w, i
     expected_receipt = context._replay_cache["expected"][qa_id]
     _require(receipt == expected_receipt,
              "source, policy, implementation, audit or output seal changed")
-    for obj in binding.objects:
-        verdict = validate_binding(
-            obj, depth_maps=depth, n_frames=len(frames),
-            generation_sha256=binding.stats["generation"]["sha256"])
-        _require(verdict == obj.binding_validation,
-                 f"consumer current validation receipt changed: {obj.obj_id}")
+    if context.audit_mode != "reuse_source_audit":
+        for obj in binding.objects:
+            verdict = validate_binding(
+                obj, depth_maps=depth, n_frames=len(frames),
+                generation_sha256=binding.stats["generation"]["sha256"])
+            _require(verdict == obj.binding_validation,
+                     f"consumer current validation receipt changed: {obj.obj_id}")
     _require(content_sha256(_content(binding)) == expected_receipt["output_binding_sha256"],
              "derived binding output/files changed")
 

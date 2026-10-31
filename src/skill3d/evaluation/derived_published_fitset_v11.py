@@ -11,7 +11,7 @@ from skill3d.evaluation.published_fitset_v11 import (
     PublishedFitSetInputProvider, _require,
 )
 from skill3d.evolution.prepared_binding_derivation_v11 import (
-    DERIVATION_SCHEMA_VERSION, LEGACY_SOURCE_COMMIT,
+    AUDIT_MODES, DERIVATION_SCHEMA_VERSION, LEGACY_SOURCE_COMMIT,
     PreparedBindingDerivationContext, _check_cache,
     _content, _context_fingerprint, _stamp, publish_derived_binding_scene_v11,
 )
@@ -27,7 +27,7 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
 
     def __init__(
         self, manifest_path, *, derivation_root, binding_cfg, max_scenes=2,
-        transport_locator=None, derived_replay=None,
+        transport_locator=None, derived_replay=None, audit_mode="reaudit",
     ):
         """``derived_replay`` pins existing references/receipts, never rederives.
 
@@ -41,6 +41,8 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
             manifest_path, max_scenes=max_scenes, transport_locator=transport_locator)
         self.derivation_root = Path(derivation_root).expanduser().absolute()
         self.binding_cfg = copy.deepcopy(binding_cfg)
+        _require(audit_mode in AUDIT_MODES, "unsupported source audit mode")
+        self.audit_mode = audit_mode
         self._approved_derived_replay = copy.deepcopy(derived_replay)
         self._derived_scenes = {}
         self._derivation_locks = {}
@@ -49,7 +51,7 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
                  "relocated derived inputs require approved existing derived replay")
         _require(all(
             self.derivation_root != Path(entry["reference"]["store_root"])
-            for entry in self._entries.values()
+            for entry in self._source_entries.values()
         ), "derivation destination must be separate from source stores")
         if derived_replay is not None:
             _require(self.transport_locator is not None
@@ -75,6 +77,7 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
             "destination_root": str(self.derivation_root),
             "source_catalog_preserved": True,
             "new_model_requests": 0,
+            "audit_mode": audit_mode,
         }
 
     def __getstate__(self):
@@ -105,7 +108,7 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
             trees.add(str(Path(reference["store_root"]) / "entries" / key[:2] / key))
             self._add_spawn_migration_files(
                 files, approved["migration_receipts"][qa_id],
-                self._entries[qa_id]["publication_root"])
+                self._source_entries[qa_id]["publication_root"])
         return files, roots, trees
 
     def for_spawned_episode(self, variant):
@@ -141,14 +144,14 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
         _require(set(ids) == set(indexed), "derivation must include the full original scene QA group")
         sources, inputs, relocations, paths = {}, {}, {}, {}
         for qa_id in ids:
-            original = self._entries[qa_id]
+            original = self._source_entries[qa_id]
             variant = {
                 "qa_id": qa_id, "scene_id": scene_id, "split": original["split"],
                 "source_split": original["split"],
                 "artifact_ref": original["reference"]["scene_artifact_ref"],
                 "question_type": canonical_task(indexed[qa_id].episode.question_type),
             }
-            transport = self._transport(variant, indexed[qa_id])
+            transport = self._transport_entry(variant, indexed[qa_id], original)
             sources[qa_id] = {
                 "reference": original["reference"], "identity": transport["identity"],
                 "artifact_path": original["scene_artifact"],
@@ -175,12 +178,14 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
             sources=sources, items=[indexed[qa_id] for qa_id in ids],
             target_inputs=inputs, target_requests=requests,
             target_artifact_paths=paths, cfg=cfg, target_relocations=relocations,
+            audit_mode=getattr(self, "audit_mode", "reaudit"),
         )
         references = publish_derived_binding_scene_v11(
-            context, store_root=self.derivation_root / scene_id)
+            context, store_root=self.derivation_root / scene_id,
+            publish_qa_ids=[qa_id for qa_id in ids if qa_id in self._entries])
         store = PreparedBindingStore(self.derivation_root / scene_id)
         migrations = {}
-        for qa_id in ids:
+        for qa_id in references:
             original_migration = sources[qa_id]["migration_receipt"]
             migrations[qa_id] = store.create_migration_receipt(
                 references[qa_id]["key"], scene_input_identity=inputs[qa_id],
@@ -217,14 +222,14 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
                 closure.setdefault(str(path), _stamp(path))
 
         for qa_id in ids:
-            original = self._entries[qa_id]
+            original = self._source_entries[qa_id]
             item = indexed[qa_id]
             variant = {
                 "qa_id": qa_id, "scene_id": scene_id, "split": original["split"],
                 "artifact_ref": original["reference"]["scene_artifact_ref"],
                 "question_type": canonical_task(item.episode.question_type),
             }
-            transport = self._transport(variant, item)
+            transport = self._transport_entry(variant, item, original)
             identity = transport["identity"]
             source_store = source_stores.setdefault(str(transport["store_root"]),
                                                     PreparedBindingStore(transport["store_root"]))
@@ -285,6 +290,8 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
                      and receipt.get("quality_assessed") is False
                      and receipt.get("source_commit") == LEGACY_SOURCE_COMMIT
                      and receipt.get("semantic_policy") == "category-only"
+                     and receipt.get("audit_mode", "reaudit")
+                     == getattr(self, "audit_mode", "reaudit")
                      and receipt.get("output_binding_sha256") == content_sha256(_content(binding))
                      and binding.stats.get("generation") == generation,
                      "derived replay output or initial generation seal changed")
@@ -322,6 +329,7 @@ class DerivedPublishedFitSetInputProvider(PublishedFitSetInputProvider):
             target_inputs=inputs, target_requests=requests,
             target_artifact_paths=paths, cfg=cfg, target_relocations=relocations,
             target_migration_receipts=migrations)
+        context = replace(context, audit_mode=getattr(self, "audit_mode", "reaudit"))
         # The approved immutable output replaces re-derivation as the expected
         # seal. Existing consumer validation still checks arrays, objects, and
         # every output field, with a stamp guard over actual physical files.

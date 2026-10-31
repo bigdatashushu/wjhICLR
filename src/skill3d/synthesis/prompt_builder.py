@@ -290,6 +290,25 @@ def build_finalization_prompt(*, question: str, options: Sequence[str], question
     ])
 
 
+SCENE_OVERVIEW_GUIDANCE = (
+    "Rendered low-resolution cutaway, not a video frame or time sample. "
+    "Missing surfaces may be reconstruction gaps or render-only cutaway; absence does not "
+    "establish empty space or scene completeness. Orientation is not necessarily the task "
+    "direction. This image grants no metric quality, metric scale, world-frame validity, "
+    "or tool authorization. Use original frames for appearance and temporal order."
+)
+
+
+def scene_overview_manifest_text(record) -> str:
+    return (
+        f"[Scene overview] image_id={record.image_id} scene_id={record.scene_id} "
+        f"delivered_size={record.sent_hw} "
+        f"azimuth_degrees={record.selected_azimuth_degrees} "
+        f"elevation_degrees={record.elevation_degrees} "
+        f"world_frame_status={record.world_frame_status}. {SCENE_OVERVIEW_GUIDANCE}"
+    )
+
+
 def build_image_messages(text: str, frames, *, max_images: int = 32,
                          jpeg_quality: int = 80,
                          extra: Optional[Sequence] = None) -> list[dict]:
@@ -304,6 +323,8 @@ def build_image_messages(text: str, frames, *, max_images: int = 32,
     v9 §9.4：`extra` 是本次要一并送达的**派生图**（`inspect_frames` 的裁剪结果），
     顺序在请求里排在原帧**之前**（与 runner 的 `ImageRound.image_ids` 一一对应）。
     超服务图像上限时抛错（不静默丢图）；被省略的图由账本记为 unobserved。
+    An enabled scene_overview is the first extra; its separate kind and provenance
+    are declared by the image ledger, never inferred from a frame slot.
     """
     import base64
 

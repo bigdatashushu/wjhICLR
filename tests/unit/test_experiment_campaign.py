@@ -212,6 +212,82 @@ def native_manifest(tmp_path):
     return {"profile": campaign.expand(profile, context), "run_root": context["run_root"]}
 
 
+@pytest.mark.parametrize("alias", [None, "vsi", "vsibench", "vsi-m4-1000"])
+def test_default_vsi_profile_selects_1000_train_test_subset(alias, tmp_path):
+    argv = ["--dry-run", "--output-dir", str(tmp_path / "new-run")]
+    if alias is not None:
+        argv.extend(["--dataset", alias])
+    dataset, _, _, profile, _, profile_path, context = campaign.resolve_new(
+        campaign.parser().parse_args(argv))
+    assert dataset == "vsi-bench"
+    assert profile_path.name == "vsi_m4_1000.json"
+    assert Path(context["data_root"]) == ROOT.parent / "vsibench-m4-success-1000"
+    runtime = profile["runtime"]
+    assert runtime["gate_mode"] == "train_sample"
+    assert (runtime["expected_train_questions"], runtime["expected_test_questions"],
+            runtime["expected_scenes"]) == (300, 700, 164)
+    assert runtime["learning_input_mode"] == "analysis_synthesis_v1"
+    assert runtime["max_requests"] == 0
+
+
+def test_new_vsi_stages_use_training_gate_and_test_only_validation(tmp_path):
+    template = campaign.read_json(ROOT / "configs/experiments/vsi_m4_1000.json")
+    context = {"data_root": str(tmp_path / "inputs"), "source_root": str(ROOT),
+               "run_root": str(tmp_path / "run"), "python": sys.executable,
+               "dataset": "vsi-bench"}
+    manifest = {"profile": campaign.expand(template, context), "run_root": context["run_root"]}
+    cli = stages.fitset_cli()
+    learning = cli.build_parser().parse_args(stages.system_argv(manifest, "learning", preflight=True))
+    assert learning.gate_mode == "train_sample" and learning.phase == "accumulation"
+    assert learning.execution_role == ""
+    for phase in ("initial_validation", "final_validation"):
+        args = cli.build_parser().parse_args(stages.system_argv(manifest, phase, preflight=True))
+        assert args.phase == "final_system" and args.execution_role == "validation"
+        assert args.gate_mode == "scene_disjoint"
+    assert manifest["profile"]["baseline"]["scope"] == "panel"
+
+
+def test_optional_overview_reaches_system_stages_and_preserves_baseline(tmp_path):
+    template = campaign.read_json(ROOT / "configs/experiments/vsi_m4_1000.json")
+    template["inputs"]["scene_overviews"] = "{data_root}/scene_overviews"
+    campaign.validate_profile(template)
+    context = {"data_root": str(tmp_path / "inputs"), "source_root": str(ROOT),
+               "run_root": str(tmp_path / "run"), "python": sys.executable,
+               "dataset": "vsi-bench"}
+    manifest = {"profile": campaign.expand(template, context), "run_root": context["run_root"]}
+    for phase in ("learning", "initial_validation", "final_validation"):
+        args = stages.fitset_cli().build_parser().parse_args(
+            stages.system_argv(manifest, phase, preflight=True))
+        assert args.scene_overview_manifest == str(
+            tmp_path / "inputs/scene_overviews/manifest.json")
+    assert manifest["profile"]["baseline"] == {
+        "protocol": "prepared-32", "scope": "panel", "workers": 4}
+    template["runtime"]["gate_mode"] = "qa_disjoint"
+    with pytest.raises(campaign.CampaignError, match="Scene overviews require"):
+        campaign.validate_profile(template)
+
+
+def test_optional_derived_store_is_shared_by_train_and_test_stages(tmp_path):
+    template = campaign.read_json(ROOT / "configs/experiments/vsi_m4_1000.json")
+    campaign.validate_profile(template)
+    context = {"data_root": str(tmp_path / "inputs"), "source_root": str(ROOT),
+               "run_root": str(tmp_path / "run"), "python": sys.executable,
+               "dataset": "vsi-bench"}
+    manifest = {"profile": campaign.expand(template, context), "run_root": context["run_root"]}
+    for phase in ("learning", "initial_validation", "final_validation"):
+        args = stages.fitset_cli().build_parser().parse_args(
+            stages.system_argv(manifest, phase, preflight=True))
+        assert args.derived_binding_root == str(
+            tmp_path / "inputs/derived_bindings_v4_vsi1000_reuse_audit_20261031")
+        assert args.binding_derivation_audit_mode == "reuse_source_audit"
+    legacy = native_manifest(tmp_path)
+    assert not stages.fitset_cli().build_parser().parse_args(
+        stages.system_argv(legacy, "learning")).derived_binding_root
+    assert stages.fitset_cli().build_parser().parse_args(
+        stages.system_argv(legacy, "learning")).binding_derivation_audit_mode == "reaudit"
+    assert manifest["profile"]["baseline"]["protocol"] == "prepared-32"
+
+
 def test_native_cli_wiring_uses_fixed_roles_shared_budget_and_four_revisers(tmp_path):
     manifest = native_manifest(tmp_path)
     manifest["profile"]["runtime"]["max_requests"] = 100

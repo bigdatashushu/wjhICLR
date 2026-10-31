@@ -101,6 +101,7 @@ from skill3d.synthesis.prompt_builder import (
     PromptBuilder,
     build_finalization_prompt,
     round_action_instructions,
+    scene_overview_manifest_text,
 )
 from skill3d.synthesis.eval_visual_fallback import (
     EVAL_VISUAL_SPLITS,
@@ -210,6 +211,7 @@ class OnlineRunConfig:
     max_tokens: int = 8192
     temperature: float = 0.0
     max_images: int = 32                    # M8 送进模型的最大帧数（与 §4 M1 对齐）
+    scene_overview: dict | None = None      # Verified precomputed descriptor, never pixels.
     max_pixels: int = 131072                # 实测起点：32 帧 ≈ 9.7k prompt tokens（A-4）
     max_model_len: int = 32768
     # ---- v6 度量证据门（D3）----
@@ -240,6 +242,11 @@ class OnlineRunConfig:
     # 该模式只能用于候选效果评测（不得用于 learning 经验采集 / 发布后运行 / 最终成绩）。
     evaluation_binding: Optional[object] = None
     def __post_init__(self) -> None:
+        if self.scene_overview is not None:
+            if not isinstance(self.scene_overview, dict):
+                raise ValueError("scene_overview must be a descriptor dict or None")
+            if self.max_images < 33:
+                raise ValueError("scene_overview requires max_images >= 33 (32 originals + 1)")
         if self.mode not in {"real", "mock_light"}:
             raise ValueError("mode 只支持 real 或 mock_light")
         if self.evaluation_execution_role not in {None, "learning", "validation"}:
@@ -1206,6 +1213,13 @@ def run_episode(
             and type(cfg.prepared_binding_seed) is not int):
         raise ValueError("prepared_binding_seed must be an int or None")
     pixels = list(pixels)
+    if cfg.scene_overview is not None:
+        from skill3d.online.scene_overview import read_overview_image
+
+        if cfg.max_images < 33 or len(pixels) != 32:
+            raise ValueError("scene_overview requires 32 readable originals and max_images >= 33")
+        # Fail before reconstruction/perception can issue any model requests.
+        read_overview_image(cfg.scene_overview, scene_id=episode.scene_name)
     if artifact_relocation is not None:
         _validate_artifact_relocation(
             artifact_relocation, cfg, episode, pixels, original_item=original_item)
@@ -2405,6 +2419,8 @@ def _configure_image_ledger(handle: Optional[SceneHandle], cfg: OnlineRunConfig,
     ledger.episode_id = str(getattr(episode, "qa_id", "") or "")
     ledger.max_images = max(1, int(cfg.max_images))
     ledger.max_derived_images = max(0, int(cfg.max_derived_images))
+    if cfg.scene_overview is not None:
+        ledger.register_scene_overview(cfg.scene_overview, scene_id=episode.scene_name)
     if str(cfg.image_layout) != str(ledger_layout := LAYOUT_DERIVED_PLUS_ORIGINALS):
         # 目前只实现了一种声明布局；配置写了别的名字要在 trace 里看得出来，
         # 而不是静默按默认布局跑（"事先声明的布局"不能名不副实）。
@@ -2651,6 +2667,9 @@ def _image_manifest_text(ledger, plan) -> str:
     for i in plan.derived_image_ids:
         idx += 1
         rec = ledger.get(i)
+        if rec.kind == "scene_overview":
+            lines.append(f"{idx}. {scene_overview_manifest_text(rec)}")
+            continue
         lines.append(
             f"{idx}. [Crop] image_id={rec.image_id} source_frame={rec.source_frame_id} "
             f"crop_box(x0,y0,x1,y1)={rec.box_xyxy} source_size={rec.source_hw} "
@@ -2744,6 +2763,12 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                             prompt=prompt, delivery=delivery)
     # ---- v9 §9.4：主动图像的布局规划（声明布局，图数不超过服务上限）----
     ledger = getattr(handle, "_ledger", None) if handle is not None else None  # noqa: SLF001
+    if cfg.scene_overview is not None:
+        if ledger is None or len(ledger.frame_ids) != 32:
+            raise ValueError("scene_overview requires a ledger with 32 readable frozen originals")
+        ledger.register_scene_overview(cfg.scene_overview, scene_id=episode.scene_name)
+    elif ledger is not None and ledger.scene_overview_image_id is not None:
+        raise ValueError("A scene overview ledger requires scene_overview to be enabled")
     extra_images: list = []
     frames_for_request = list(pixels or [])
     if ledger is not None and ledger.has_frames():
@@ -2799,6 +2824,12 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                         "source_frame_index": ledger.physical_index_of(slot)})
                 else:
                     entry = ledger.get(image_id)
+                    if entry.kind == "scene_overview":
+                        image_mapping.append({
+                            **entry.model_dump(mode="json"),
+                            "description": scene_overview_manifest_text(entry),
+                        })
+                        continue
                     image_mapping.append({
                         "image_id": image_id, "frame_slot": entry.source_frame_id,
                         "source_frame_index": entry.source_frame_index,

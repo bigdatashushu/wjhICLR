@@ -30,14 +30,14 @@ from test_cache_relocation import _receipt, _rehash_receipt, _signed
 from test_cluster_scene_compute import _frozen, _write
 
 
-def _published(tmp_path, *, n_questions=2):
+def _published(tmp_path, *, n_questions=2, split="induction"):
     frozen = _frozen(tmp_path, n_questions=n_questions)
-    frozen.manifest["split"] = "induction"
+    frozen.manifest["split"] = split
     for item, question in zip(frozen.items, frozen.manifest["questions"]):
-        item.episode.split = "induction"
-        question["episode"]["split"] = "induction"
+        item.episode.split = split
+        question["episode"]["split"] = split
         logical = question["logical_input_identity"]
-        logical["episode"]["split"] = "induction"
+        logical["episode"]["split"] = split
         logical["sha256"] = content_sha256(
             {name: value for name, value in logical.items() if name != "sha256"})
     _write(frozen.root / "scene.json", frozen.manifest)
@@ -100,7 +100,7 @@ def _published(tmp_path, *, n_questions=2):
         _write(identity_path, logical)
         catalog[qa_id] = {
             "qa_id": qa_id, "scene_id": item.episode.scene_name,
-            "split": "induction", "variant": "base", "reference": reference,
+            "split": split, "variant": "base", "reference": reference,
             "scene_artifact": str(destination / "scene/artifact.json"),
             "scene_input_identity_file": str(identity_path),
             "scene_input_identity_file_sha256": file_identity(identity_path)["sha256"],
@@ -122,7 +122,7 @@ def _published(tmp_path, *, n_questions=2):
     manifest = {
         "schema": PUBLISHED_INPUT_SCHEMA,
         "source_catalog_sha256": file_identity(catalog_path)["sha256"],
-        "selection_policy": {"split": "induction", "variant": "base", "limit": 8},
+        "selection_policy": {"split": split, "variant": "base", "limit": 8},
         "entries": {
             qa_id: {**deepcopy(entry), "input_root": str(frozen.root),
                     "frozen_scene_sha256": file_identity(frozen.root / "scene.json")["sha256"]}
@@ -134,7 +134,7 @@ def _published(tmp_path, *, n_questions=2):
     variants = {
         qa_id: {
             "variant_id": f"published/{qa_id}", "qa_id": qa_id,
-            "scene_id": "scene-one", "split": "induction",
+            "scene_id": "scene-one", "split": split,
             "question_type": "object_rel_distance",
             "artifact_ref": entry["reference"]["scene_artifact_ref"],
         }

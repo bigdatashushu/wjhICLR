@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -13,7 +14,13 @@ from skill3d.adapters.episode_source import load_synthetic_items
 from skill3d.evaluation.skill_ablation_v11 import quality_contract
 from skill3d.evolution import adapters_v11 as adapters
 from skill3d.online.runner import OnlineRunConfig
-from skill3d.schemas import SkillCandidateV11, SkillSpecV11
+from skill3d.schemas import (
+    DataAccessRecord,
+    SkillCandidateV11,
+    SkillSpecV11,
+    V11ExperienceBundle,
+    V11ExperienceCase,
+)
 from skill3d.skills.delivery import check_service_limit
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -97,23 +104,65 @@ class _OfflineClient:
         return _Meta(self.text)
 
 
-class _Experience:
-    parent_snapshot_id = "snapshot-parent"
-    cases = []
-
-    def model_copy(self, **_kwargs):
-        return _Experience()
-
-    def model_dump(self, **_kwargs):
-        return {
-            "source_split": "induction",
-            "label_access": True,
-            "cases": [{
-                "case_id": "private-case",
-                "question_text": "Which object is closest?",
-                "reference_answer": "B",
-            }],
-        }
+def _experience() -> V11ExperienceBundle:
+    """Schema-valid synthetic induction evidence bound to the actual parent source."""
+    parent = _parent()
+    parent_key = f"{parent.skill_id}@{parent.version}"
+    states = {"geometry_3d": "available", "metric_scale": "unavailable"}
+    case = V11ExperienceCase(
+        case_id="private-case",
+        qa_id="private-qa",
+        scene_id="private-scene",
+        question_type=parent.question_type,
+        evidence_state=parent.evidence_state,
+        question_text="Which object is closest?",
+        options=["A", "B"],
+        source_split="induction",
+        split="learning",
+        label_access=True,
+        outcome="failure",
+        episode_status="answered",
+        delivered_skill_version=parent_key,
+        delivered_content_sha256=parent.content_sha256,
+        delivered_skill_md=parent.skill_md,
+        response_text="ReturnAnswer('A')",
+        response_texts=["ReturnAnswer('A')"],
+        program_source="ReturnAnswer('A')",
+        initial_evidence_states=states,
+        evidence_states=states,
+        evidence_history=[{"trigger": "initial", "evidence_states": states}],
+        model_answer="A",
+        reference_answer="B",
+        score=0.0,
+        failure_categories=["answer_incorrect"],
+        trace_ref="fixture:parent-learning:private-qa",
+    )
+    manifest = json.dumps([case.model_dump(mode="json")], sort_keys=True).encode("utf-8")
+    return V11ExperienceBundle(
+        campaign_id="revision-test",
+        parent_snapshot_id="snapshot-parent",
+        parent_skill_version=parent_key,
+        parent_content_sha256=parent.content_sha256,
+        question_type=parent.question_type,
+        evidence_state=parent.evidence_state,
+        source_split="induction",
+        split="learning",
+        label_access=True,
+        source_run_ref="fixture:parent-learning",
+        label_access_record=DataAccessRecord(
+            record_id="fixture-label-access",
+            at="2026-10-09T00:00:00+00:00",
+            split="induction",
+            purpose="skill_induction",
+            component_role="inducer",
+            run_id="fixture-parent-learning",
+            input_manifest_sha256=hashlib.sha256(manifest).hexdigest(),
+            n_items=1,
+            label_access=True,
+            source_refs=[case.trace_ref],
+        ),
+        cases=[case],
+    )
 
 
 def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_path):
@@ -133,7 +182,7 @@ def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_pa
     proposal = reviser(
         campaign_id="campaign-test",
         parent=_parent(),
-        experience=_Experience(),
+        experience=_experience(),
         attempt=1,
         static_feedback=feedback,
         idempotency_key="campaign-test:revise:1",
@@ -160,11 +209,17 @@ def test_offline_reviser_returns_complete_source_and_writes_metadata_only(tmp_pa
     assert not re.search(r"[\u4e00-\u9fff]", json.dumps(client.calls[0][0], ensure_ascii=False))
     assert all(problem in client.calls[0][0][1]["content"] for problem in feedback)
     repeated = reviser(
-        campaign_id="campaign-test", parent=_parent(), experience=_Experience(),
+        campaign_id="campaign-test", parent=_parent(), experience=_experience(),
         attempt=1, static_feedback=feedback, idempotency_key="campaign-test:revise:1")
     assert repeated == proposal
     assert len(client.calls) == 1
     frozen = json.loads((tmp_path / "campaign-test/revision_input.json").read_bytes())
+    for metadata in (audit, json.dumps(frozen)):
+        assert "Which object is closest?" not in metadata
+        assert "reference_answer" not in metadata
+        assert all(identity not in metadata for identity in (
+            "private-case", "private-qa", "private-scene",
+        ))
     identity = frozen["client_identity"]
     assert set(identity) == {
         "provider", "model_id", "endpoint_hash", "prompt_version", "request_params",
@@ -179,7 +234,7 @@ def test_invalid_offline_response_is_recorded_and_not_requested_again(tmp_path):
     for _ in range(2):
         with pytest.raises(adapters.V11RevisionFormatError):
             reviser(
-                campaign_id="bad", parent=_parent(), experience=_Experience(),
+                campaign_id="bad", parent=_parent(), experience=_experience(),
                 attempt=1, static_feedback=[], idempotency_key="bad:revise:1")
     assert len(client.calls) == 1
     exchange = json.loads((tmp_path / "bad/revision_01.exchange.json").read_bytes())
@@ -189,9 +244,52 @@ def test_invalid_offline_response_is_recorded_and_not_requested_again(tmp_path):
 def _revision_kwargs(**changes):
     return {
         "campaign_id": "revision-test", "parent": _parent(),
-        "experience": _Experience(), "attempt": 1, "static_feedback": [],
+        "experience": _experience(), "attempt": 1, "static_feedback": [],
         "idempotency_key": "revision-test:revise:1", **changes,
     }
+
+
+@pytest.mark.parametrize(("scope", "field", "value"), [
+    ("bundle", "source_split", "inner_validation"),
+    ("bundle", "source_split", "outer_holdout"),
+    ("bundle", "source_split", "final_test"),
+    ("case", "source_split", "inner_validation"),
+    ("case", "source_split", "outer_holdout"),
+    ("case", "source_split", "final_test"),
+    ("case", "source_split", None),
+    ("bundle", "label_access", False),
+    ("bundle", "learning_authorization", {"gate_mode": "qa_disjoint"}),
+    ("case", "learning_authorization", {"gate_mode": "qa_disjoint"}),
+])
+def test_offline_reviser_rejects_unauthorized_evidence_before_client_use(
+    tmp_path, scope, field, value,
+):
+    evidence = _experience().model_dump(mode="json")
+    target = evidence if scope == "bundle" else evidence["cases"][0]
+    target[field] = value
+    client = _OfflineClient("")
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+
+    with pytest.raises(ValueError, match="authorized induction evidence"):
+        reviser(**_revision_kwargs(experience=evidence))
+
+    assert client.health_calls == 0
+    assert not client.calls
+    assert not (tmp_path / "revision-test/revision_01.intent.json").exists()
+    assert not (tmp_path / "revision-test/revision_01.exchange.json").exists()
+
+
+def test_offline_reviser_rejects_legacy_evidence_before_client_use(tmp_path):
+    evidence = _experience().model_dump(mode="json")
+    evidence["schema_version"] = "skill-experience-bundle-v11/5.0"
+    client = _OfflineClient("")
+    reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path)
+
+    with pytest.raises(ValueError, match="legacy experience bundles are read-only"):
+        reviser(**_revision_kwargs(experience=evidence))
+
+    assert client.health_calls == 0
+    assert not client.calls
 
 
 def test_offline_no_change_preserves_reason_and_response_receipt(tmp_path):
@@ -277,13 +375,7 @@ def test_frozen_revision_request_rejects_changed_resume_inputs(tmp_path, changed
     reviser(**_revision_kwargs())
     kwargs = _revision_kwargs()
     if changed == "evidence":
-        class ChangedExperience(_Experience):
-            def model_dump(self, **kwargs):
-                value = super().model_dump(**kwargs)
-                value["cases"][0]["question_text"] = "Different frozen evidence"
-                return value
-
-        kwargs["experience"] = ChangedExperience()
+        kwargs["experience"].cases[0].question_text = "Different frozen evidence"
     elif changed == "max_tokens":
         reviser = adapters.V11OfflineReviser(client, audit_root=tmp_path, max_tokens=100)
     elif changed == "model":
@@ -454,7 +546,7 @@ def test_paired_evaluator_rejects_cache_without_actual_panel(tmp_path):
     with pytest.raises(adapters.V11AdapterError, match="panel"):
         evaluator(
             campaign_id="campaign-test", parent=parent, candidate=candidate,
-            experience=_Experience(), question_type=parent.question_type, seed=seed,
+            experience=_experience(), question_type=parent.question_type, seed=seed,
             model_id=cfg.online_model, model_config_sha256=model_identity["sha256"],
             quality_contract_sha256=contract["sha256"],
             solver_config_sha256=solver_identity["sha256"],
@@ -480,7 +572,7 @@ def test_promotion_evaluator_rejects_outer_holdout_source(tmp_path):
             campaign_id="campaign-test",
             parent=_parent(),
             candidate=_candidate(),
-            experience=_Experience(),
+            experience=_experience(),
             question_type="object_rel_distance",
             seed=17,
         )

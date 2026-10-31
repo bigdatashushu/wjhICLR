@@ -11,6 +11,14 @@ __pycache__/
 # Local editors
 .vscode/
 .idea/
+.DS_Store
+
+# Local BLINK experiment evidence; retain scripts and report source.
+/BLINK/toolexperiment/4090_cache.json
+/BLINK/toolexperiment/4090_environment.json
+/BLINK/toolexperiment/rgb_correspondences.json
+/BLINK/toolexperiment/visual_annotations.json
+/BLINK/toolexperiment/results/
 
 # ---- 本地私有配置（含 GPT-6 中转站密钥，禁止入库）----
 configs/*.local.env

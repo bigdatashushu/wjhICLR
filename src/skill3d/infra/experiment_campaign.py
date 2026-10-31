@@ -148,8 +148,13 @@ def validate_profile(profile):
                     and isinstance(receipt.get("equals"), dict) and receipt["equals"],
                     "Every stage requires a completion receipt contract")
     else:
-        require(set(profile["inputs"]) == NATIVE_INPUTS, "Incomplete prepared input paths")
+        require(NATIVE_INPUTS <= set(profile["inputs"])
+                <= NATIVE_INPUTS | {"scene_overviews", "derived_binding_root"},
+                "Incomplete prepared input paths")
         runtime = profile.get("runtime") or {}
+        if "scene_overviews" in profile["inputs"]:
+            require(runtime.get("gate_mode") == "train_sample",
+                    "Scene overviews require the explicit train/test dataset profile")
         for name in ("workers", "skill_owners", "reviser_concurrency",
                      "episode_concurrency", "request_concurrency", "scene_cache_size"):
             require(type(runtime.get(name)) is int and runtime[name] > 0,
@@ -172,6 +177,8 @@ def validate_profile(profile):
             "aggregate_v1", "full_cases_v1", "analysis_synthesis_v1",
             "diagnosis_v1", "diagnosis_multimodal_v1"},
             "Unknown learning input mode")
+        require(runtime.get("gate_mode", "qa_disjoint") in {"qa_disjoint", "train_sample"},
+                "Unknown native gate mode")
         require(type(runtime.get("analysis_concurrency", 1)) is int
                 and 1 <= runtime.get("analysis_concurrency", 1) <= 64,
                 "Analysis concurrency must be within 1..64")
@@ -242,6 +249,46 @@ def verify_files(rows):
 
 def pins(profile):
     return {name: path_identity(path) for name, path in profile["inputs"].items()}
+
+
+def check_train_test_inputs(profile):
+    """Validate the new default's QA roles without loading geometry or labels."""
+    runtime = profile.get("runtime", {})
+    if runtime.get("gate_mode") != "train_sample":
+        return
+    from skill3d.evaluation.fitset_v11 import load_fitset_panel, select_panel_variants
+    from skill3d.evaluation.published_fitset_v11 import PublishedFitSetInputProvider
+    from skill3d.evaluation.qa_partition_v11 import (
+        load_qa_partition_manifest, select_qa_execution_variants,
+    )
+    inputs = profile["inputs"]
+    partition = load_qa_partition_manifest(inputs["qa_split"], metadata_path=inputs["metadata"])
+    panel = load_fitset_panel(inputs["panel"])
+    variants = select_panel_variants(panel, runtime["panel_name"])
+    provider = PublishedFitSetInputProvider(inputs["published_inputs"], max_scenes=1)
+    entries = provider.entries
+    if "scene_overviews" in inputs:
+        from skill3d.online.scene_overview import SceneOverviewStore
+        SceneOverviewStore(Path(inputs["scene_overviews"]) / "manifest.json").validate_entries(entries)
+    require({row["qa_id"] for row in variants} == set(entries) == set(partition.questions),
+            "Train/test panel, partition and published question IDs differ")
+    for row in variants:
+        entry = entries[row["qa_id"]]
+        require(entry["scene_id"] == row["scene_id"] and entry["split"] == row["split"]
+                and entry["reference"]["scene_artifact_ref"] == row["artifact_ref"],
+                "Train/test panel changed its original prepared input")
+    scene_sets = []
+    for role, key in (("learning", "expected_train_questions"),
+                      ("validation", "expected_test_questions")):
+        selected = select_qa_execution_variants(variants, partition, role=role)
+        ids = {row["qa_id"] for row in selected}
+        if key in runtime:
+            require(len(ids) == runtime[key], "Train/test question count changed")
+        scenes = {row["scene_id"] for row in selected}
+        if "expected_scenes" in runtime:
+            require(len(scenes) == runtime["expected_scenes"], "Train/test scene coverage changed")
+        scene_sets.append(scenes)
+    require(scene_sets[0] == scene_sets[1], "Train and test must cover the same complete scene set")
 
 
 def get_field(value, key):
@@ -528,7 +575,8 @@ def launch(args):
     require(Path(interpreter).is_file(), "Experiment interpreter does not exist")
     require(sys.version_info >= (3, 11), "Execution requires Python 3.11+; select it with --python")
     input_pins = pins(profile)
-    if profile["backend"] == "prepared-v11":
+    check_train_test_inputs(profile)
+    if profile["backend"] == "prepared-v11" and not args.check:
         require(profile["runtime"]["max_requests"] > 0,
                 "Supply --max-requests or freeze a positive budget in the profile")
     if args.check:

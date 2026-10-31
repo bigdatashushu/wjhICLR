@@ -46,12 +46,17 @@ def system_argv(manifest, stage, *, preflight=False):
         "--published-inputs", inputs["published_inputs"],
         "--experiment-split-manifest", inputs["qa_split"],
         "--config", inputs["online_config"],
-        "--gate-mode", "qa_disjoint" if learning else "scene_disjoint",
+        "--gate-mode", runtime.get("gate_mode", "qa_disjoint") if learning else "scene_disjoint",
         "--phase", "accumulation" if learning else "final_system",
         "--output-dir", str(root / "stages" / stage / "system"),
         "--library-root", inputs["seed_library"],
         "--scheduler", "episode_pool", "--request-governor-root", str(root / "requests"),
     ]
+    if "scene_overviews" in inputs:
+        overview_manifest = Path(inputs["scene_overviews"]) / "manifest.json"
+        argv.extend(["--scene-overview-manifest", str(overview_manifest)])
+    if "derived_binding_root" in inputs:
+        argv.extend(["--derived-binding-root", inputs["derived_binding_root"]])
     options = {
         "seed", "panel_name", "workers", "skill_owners", "reviser_concurrency",
         "episode_concurrency", "request_concurrency", "requests_per_second", "max_requests",
@@ -60,6 +65,7 @@ def system_argv(manifest, stage, *, preflight=False):
         "max_gate_candidates_per_slot", "max_revision_attempts", "revision_max_tokens",
         "gate_size", "diagnosis_max_cases", "diagnosis_max_input_chars", "diagnosis_max_images",
         "diagnosis_max_output_tokens", "analysis_concurrency", "offline_frame_storage",
+        "binding_derivation_audit_mode",
     }
     for name in sorted(options):
         if name in runtime and runtime[name] != "":

@@ -535,7 +535,11 @@ def test_published_gate_copies_keep_transport_but_drop_offline_metadata_and_labe
 
 def test_cli_defaults_and_explicit_diagnosis_flags_are_frozen(case):
     args = cli.build_parser().parse_args(case.argv[:-4])
-    assert args.learning_input_mode == "full_cases_v1"
+    assert args.learning_input_mode == "analysis_synthesis_v1"
+    legacy = cli.build_parser().parse_args([
+        *case.argv[:-4], "--learning-input-mode", "full_cases_v1",
+    ])
+    assert legacy.learning_input_mode == "full_cases_v1"
     assert args.gate_mode == "scene_disjoint"
     assert args.scheduling_mode == "batch_v1"
     assert (args.diagnosis_max_cases, args.diagnosis_max_input_chars,

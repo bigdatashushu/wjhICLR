@@ -1,0 +1,50 @@
+{
+  "schema": "harness3d-experiment-profile/1",
+  "backend": "prepared-v11",
+  "inputs": {
+    "panel": "{data_root}/panel.json",
+    "metadata": "{data_root}/host_evaluation/metadata.jsonl",
+    "published_inputs": "{data_root}/published_inputs.json",
+    "derived_binding_root": "{data_root}/derived_bindings_v4_vsi1000_reuse_audit_20261031",
+    "scene_overviews": "{data_root}/scene_overviews",
+    "qa_split": "{data_root}/split.json",
+    "online_config": "{data_root}/online.yaml",
+    "seed_library": "{source_root}/skill_library"
+  },
+  "runtime": {
+    "seed": 137,
+    "binding_derivation_audit_mode": "reuse_source_audit",
+    "panel_name": "ready_579",
+    "workers": 16,
+    "skill_owners": 4,
+    "reviser_concurrency": 4,
+    "analysis_concurrency": 4,
+    "overlap_owner_slots": true,
+    "prefetch_scenes": true,
+    "offline_frame_storage": "shared_scene_v2",
+    "episode_concurrency": 16,
+    "request_concurrency": 4,
+    "requests_per_second": 0,
+    "max_requests": 0,
+    "min_free_gib": 80,
+    "scene_cache_size": 2,
+    "learning_input_mode": "analysis_synthesis_v1",
+    "gate_mode": "train_sample",
+    "expected_train_questions": 300,
+    "expected_test_questions": 700,
+    "expected_scenes": 164,
+    "scheduling_mode": "batch_v1",
+    "max_revision_requests_per_slot": 18,
+    "max_gate_candidates_per_slot": 6,
+    "max_revision_attempts": 3,
+    "revision_max_tokens": 8192,
+    "gate_size": 8,
+    "perception_endpoint": "",
+    "perception_capacity": 0
+  },
+  "baseline": {
+    "protocol": "prepared-32",
+    "scope": "panel",
+    "workers": 4
+  }
+}

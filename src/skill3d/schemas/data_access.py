@@ -51,6 +51,12 @@ ACCESS_PURPOSES = ("skill_induction", "candidate_admission_panel", "learning_run
 REFUSAL_REASON_CODES = frozenset({"not_in_learning_split"})
 
 EXPERIMENT_QA_ROLE_SCHEMA = "harness3d-experiment-qa-roles/1.0"
+TRAIN_TEST_PARTITION_SCHEMA = "harness3d-train-test-split/1"
+
+
+def is_train_test_partition(value: Mapping | None) -> bool:
+    return bool(value and value.get("protocol") == TRAIN_TEST_PARTITION_SCHEMA
+                and value.get("partition_schema") == TRAIN_TEST_PARTITION_SCHEMA)
 
 
 def _identity_sha256(value: object) -> str:
@@ -76,6 +82,14 @@ def normalize_experiment_split(value: Mapping) -> dict:
         or role not in {"learning", "validation"} for key, role in roles.items()
     ):
         raise ValueError("qa_roles must map nonempty QA IDs to learning/validation")
+    if (body.get("protocol") == TRAIN_TEST_PARTITION_SCHEMA
+            or body.get("partition_schema") == TRAIN_TEST_PARTITION_SCHEMA):
+        sources = body.get("source_split_by_qa")
+        if (not is_train_test_partition(body)
+                or body.get("source_split_preserved") is not True
+                or not isinstance(sources, dict) or set(sources) != set(roles)
+                or any(source not in DATA_SPLITS for source in sources.values())):
+            raise ValueError("train/test protocol requires the complete preserved source role map")
     manifest = body.get("manifest_identity")
     if not isinstance(manifest, dict) or not any(
         re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(key, "")))
@@ -95,14 +109,23 @@ def normalize_experiment_split(value: Mapping) -> dict:
 def learning_authorization_for(experiment_split: Mapping, qa_ids: Sequence[str]) -> dict:
     overlay = normalize_experiment_split(experiment_split)
     ids = sorted(set(qa_ids))
-    if not ids or any(overlay["qa_roles"].get(qa) != "learning" for qa in ids):
+    if (overlay.get("execution_role") == "validation" or not ids
+            or any(overlay["qa_roles"].get(qa) != "learning" for qa in ids)):
         raise ValueError("validation or unmapped QA cannot enter learning")
-    return {
-        "gate_mode": "qa_disjoint", "experiment_role": "learning", "qa_ids": ids,
+    receipt = {
+        "gate_mode": "train_sample" if is_train_test_partition(overlay) else "qa_disjoint",
+        "experiment_role": "learning", "qa_ids": ids,
         "protocol": overlay["protocol"], "manifest_identity": overlay["manifest_identity"],
         "qa_roles_sha256": overlay["qa_roles_sha256"],
         "experiment_split_sha256": overlay["identity_sha256"],
     }
+    if is_train_test_partition(overlay):
+        receipt.update({
+            "partition_schema": TRAIN_TEST_PARTITION_SCHEMA,
+            "source_split_by_qa": {qa: overlay["source_split_by_qa"][qa] for qa in ids},
+            "source_split_by_qa_sha256": _identity_sha256(overlay["source_split_by_qa"]),
+        })
+    return receipt
 
 
 def validate_learning_authorization(
@@ -112,7 +135,8 @@ def validate_learning_authorization(
     ids = sorted(set(qa_ids))
     if (
         not ids or authorization.get("qa_ids") != ids
-        or authorization.get("gate_mode") != "qa_disjoint"
+        or authorization.get("gate_mode") != (
+            "train_sample" if is_train_test_partition(authorization) else "qa_disjoint")
         or authorization.get("experiment_role") != "learning"
         or not authorization.get("protocol")
         or not isinstance(authorization.get("manifest_identity"), dict)
@@ -120,6 +144,16 @@ def validate_learning_authorization(
                for key in ("qa_roles_sha256", "experiment_split_sha256"))
     ):
         raise ValueError("missing or invalid explicit learning authorization")
+    if authorization.get("gate_mode") == "train_sample":
+        sources = authorization.get("source_split_by_qa")
+        if (not isinstance(sources, dict) or set(sources) != set(ids)
+                or any(source not in DATA_SPLITS for source in sources.values())
+                or not re.fullmatch(r"[0-9a-f]{64}", str(
+                    authorization.get("source_split_by_qa_sha256", "")))):
+            raise ValueError("train/test learning authorization lacks scoped source identity")
+    elif (authorization.get("protocol") == TRAIN_TEST_PARTITION_SCHEMA
+          or authorization.get("partition_schema") == TRAIN_TEST_PARTITION_SCHEMA):
+        raise ValueError("train/test learning requires train_sample authorization")
     manifest = authorization["manifest_identity"]
     if not any(re.fullmatch(r"[0-9a-f]{64}", str(manifest.get(key, "")))
                for key in ("sha256", "identity_sha256")):
@@ -128,6 +162,16 @@ def validate_learning_authorization(
         experiment_split, ids,
     ):
         raise ValueError("learning authorization differs from frozen QA role map")
+
+
+def validate_learning_source(authorization: Mapping, qa_id: str, source_split: str) -> None:
+    """Keep legacy split guards; only the new scoped receipt admits all four."""
+    validate_learning_authorization(authorization, authorization.get("qa_ids", []))
+    if is_train_test_partition(authorization):
+        if authorization["source_split_by_qa"].get(qa_id) != source_split:
+            raise ValueError("authorized learning source_split changed")
+    elif source_split not in {"induction", "inner_validation"}:
+        raise ValueError("legacy learning authorization requires induction/inner_validation")
 
 
 def utcnow_iso() -> str:
@@ -175,8 +219,9 @@ class DataAccessRecord(Spec):
         if self.learning_authorization:
             validate_learning_authorization(
                 self.learning_authorization, self.learning_authorization.get("qa_ids", []))
-            if (self.split not in {"induction", "inner_validation"}
-                    or self.component_role != "inducer"
+            for qa_id in self.learning_authorization["qa_ids"]:
+                validate_learning_source(self.learning_authorization, qa_id, self.split)
+            if (self.component_role != "inducer"
                     or self.purpose != "skill_induction"
                     or not self.label_access
                     or len(self.learning_authorization["qa_ids"]) != self.n_items):
@@ -201,8 +246,11 @@ __all__ = [
     "REFUSAL_REASON_CODES",
     "DataAccessRecord",
     "EXPERIMENT_QA_ROLE_SCHEMA",
+    "TRAIN_TEST_PARTITION_SCHEMA",
+    "is_train_test_partition",
     "learning_authorization_for",
     "normalize_experiment_split",
     "validate_learning_authorization",
+    "validate_learning_source",
     "utcnow_iso",
 ]

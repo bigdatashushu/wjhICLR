@@ -1,9 +1,12 @@
 """Label-free replay of audited publications and independently extracted inputs.
 
-The input manifest uses ``v11-published-fitset-inputs/1``. Its ``entries`` map
-QA IDs to original ``cluster_audit`` catalog entries plus ``input_root`` and
-``frozen_scene_sha256``. ``source_catalog_sha256`` and ``selection_policy`` are
-required provenance anchors. No catalog locator or sealed identity is rewritten.
+Input ``entries`` map QA IDs to original ``cluster_audit`` catalog entries plus
+``input_root`` and ``frozen_scene_sha256``. ``source_catalog_sha256`` and
+``selection_policy`` are required provenance anchors. Full-QA and explicit
+train/test schemas also pin ``source_catalog_file`` and full ``scene_scopes``.
+Train/test selection requires ``selection_policy.train_test_manifest_sha256``
+and ``selection_policy.original_source_split_preserved=true``; original splits,
+catalog locators, and sealed identities are never rewritten.
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ if TYPE_CHECKING:
 
 PUBLISHED_INPUT_SCHEMA = "v11-published-fitset-inputs/1"
 FULLQA_INPUT_SCHEMA = "v11-published-fitset-inputs/2"
+TRAIN_TEST_INPUT_SCHEMA = "v11-published-train-test-inputs/1"
 TRANSPORT_RECEIPT_SCHEMA = "v11-published-fitset-transport/1"
 _CATALOG_FIELDS = {
     "qa_id", "scene_id", "split", "variant", "reference", "scene_artifact",
@@ -188,18 +192,36 @@ class PublishedFitSetInputProvider:
         manifest, _ = _read_anchored(
             self.manifest_path, self._manifest_identity["sha256"])
         self.schema = manifest.get("schema")
-        _require(self.schema in {PUBLISHED_INPUT_SCHEMA, FULLQA_INPUT_SCHEMA},
+        _require(self.schema in {
+            PUBLISHED_INPUT_SCHEMA, FULLQA_INPUT_SCHEMA, TRAIN_TEST_INPUT_SCHEMA,
+        },
                  "published fit-set input manifest schema changed")
         scene_compute._digest(manifest.get("source_catalog_sha256"))
         _require(bool(manifest.get("selection_policy")),
                  "published inputs require a selection_policy")
+        fullqa = self.schema in {FULLQA_INPUT_SCHEMA, TRAIN_TEST_INPUT_SCHEMA}
+        allowed_splits = (
+            {"induction", "inner_validation", "outer_holdout", "final_test"}
+            if self.schema == TRAIN_TEST_INPUT_SCHEMA else
+            {"induction", "inner_validation"} if fullqa else {"induction"}
+        )
+        if self.schema == TRAIN_TEST_INPUT_SCHEMA:
+            policy = manifest["selection_policy"]
+            _require(isinstance(policy, dict)
+                     and policy.get("original_source_split_preserved") is True,
+                     "train/test selection_policy must preserve original source splits")
+            scene_compute._digest(policy.get("train_test_manifest_sha256"))
+            _require(isinstance(manifest.get("source_catalog_file"), str)
+                     and bool(manifest["source_catalog_file"]),
+                     "train/test inputs require an anchored source_catalog_file")
+            scene_compute._reference(manifest["source_catalog_file"], absolute=True)
         entries = manifest.get("entries")
         _require(isinstance(entries, dict) and bool(entries),
                  "published inputs require entries keyed by qa_id")
         self.scene_scopes = {}
         self._source_catalog_file = manifest.get("source_catalog_file")
         source_catalog = None
-        if self.schema == FULLQA_INPUT_SCHEMA:
+        if fullqa:
             source_catalog, _ = _read_anchored(
                 self._physical_file(
                     manifest["source_catalog_file"], manifest["source_catalog_sha256"]),
@@ -217,11 +239,31 @@ class PublishedFitSetInputProvider:
                 _require(isinstance(ids, list) and 1 <= len(ids) <= 128
                          and len(set(ids)) == len(ids)
                          and all(isinstance(q, str) and q for q in ids)
-                         and scope["split"] in {"induction", "inner_validation"},
+                         and scope["split"] in allowed_splits,
                          "invalid fullQA bounded question/split scope")
                 self.scene_scopes[scene_id] = copy.deepcopy(scope)
+        # A selected experiment may expose fewer QAs than the immutable M5
+        # scene audit. Keep the full catalog closure private for derivation.
+        source_entries = copy.deepcopy(entries)
+        if fullqa:
+            base_catalog = (source_catalog.get("variants") or {}).get("base")
+            _require(isinstance(base_catalog, dict), "fullQA base catalog is missing")
+            scoped_ids = set()
+            for scene_id, scope in self.scene_scopes.items():
+                for qa_id in scope["qa_ids"]:
+                    _require(qa_id not in scoped_ids, "fullQA QA appears in multiple scenes")
+                    scoped_ids.add(qa_id)
+                    original = base_catalog.get(qa_id)
+                    _require(isinstance(original, dict)
+                             and original.get("scene_id") == scene_id,
+                             "fullQA scene source catalog entry is missing or changed")
+                    source_entries.setdefault(qa_id, {
+                        **copy.deepcopy(original),
+                        "input_root": scope["input_root"],
+                        "frozen_scene_sha256": scope["frozen_scene_sha256"],
+                    })
         public_entries = {}
-        for qa_id, entry in entries.items():
+        for qa_id, entry in source_entries.items():
             _require(
                 isinstance(qa_id, str) and bool(qa_id)
                 and isinstance(entry, dict)
@@ -230,11 +272,11 @@ class PublishedFitSetInputProvider:
                 and entry["qa_id"] == qa_id,
                 "published entry differs from the original catalog schema/qa_id",
             )
-            allowed_splits = ({"induction", "inner_validation"} if
-                              self.schema == FULLQA_INPUT_SCHEMA else {"induction"})
             _require(entry["split"] in allowed_splits and entry["variant"] == "base",
-                     f"{qa_id}: published fit-set requires induction/base")
-            if self.schema == FULLQA_INPUT_SCHEMA:
+                     (f"{qa_id}: published train/test requires original source split/base"
+                      if self.schema == TRAIN_TEST_INPUT_SCHEMA else
+                      f"{qa_id}: published fit-set requires induction/base"))
+            if fullqa:
                 original = {k: v for k, v in entry.items()
                             if k not in _INPUT_FIELDS | _PROVENANCE_FIELDS}
                 _require(source_catalog["variants"]["base"].get(qa_id) == original,
@@ -269,9 +311,12 @@ class PublishedFitSetInputProvider:
                 "migration_receipt_file", "publication_root",
             ):
                 scene_compute._reference(entry[name], absolute=True)
-            public_entries[qa_id] = _public_entry(entry)
+            public = _public_entry(entry)
+            if qa_id in entries:
+                public_entries[qa_id] = public
         _public_json({**manifest, "entries": public_entries})
         self._entries = copy.deepcopy(entries)
+        self._source_entries = source_entries
         scene_qa_ids = {}
         for qa_id, entry in self._entries.items():
             scene_qa_ids.setdefault(entry["scene_id"], []).append(qa_id)
@@ -360,6 +405,9 @@ class PublishedFitSetInputProvider:
             _require(scope is None or set(ids) == set(scope["qa_ids"]),
                      "spawn replay requires the complete original scene QA group")
             state["_entries"] = copy.deepcopy({qa: self._entries[qa] for qa in ids})
+            state["_source_entries"] = copy.deepcopy({
+                qa: self._source_entries[qa] for qa in ids
+            })
             state["scene_scopes"] = (
                 {scene_id: copy.deepcopy(scope)} if scope is not None else {})
             state["_scene_qa_ids"] = {scene_id: ids}
@@ -416,14 +464,17 @@ class PublishedFitSetInputProvider:
         return {"path": str(physical), "sha256": sha256, "size": physical.stat().st_size}
 
     def _entry(self, variant: Mapping) -> dict:
+        return self._checked_entry(variant, self._entries.get(variant.get("qa_id")))
+
+    def _checked_entry(self, variant: Mapping, entry: dict | None) -> dict:
         if not self._reuse_verified_publications:
             _require(_file(self.manifest_path) == self._manifest_identity,
                      "published input manifest integrity changed")
         qa_id = variant.get("qa_id")
-        entry = self._entries.get(qa_id)
         _require(entry is not None, f"{qa_id}: published catalog entry is missing")
         _require(
-            variant.get("split") == entry["split"]
+            qa_id == entry["qa_id"]
+            and variant.get("split") == entry["split"]
             and (variant.get("source_split", entry["split"]) == entry["split"])
             and variant.get("scene_id") == entry["scene_id"]
             and entry["variant"] == "base"
@@ -627,12 +678,17 @@ class PublishedFitSetInputProvider:
         return self._scene(self._entry(variant)).png_bytes
 
     def _transport(self, variant: Mapping, item: EpisodeItem) -> dict:
+        return self._transport_entry(
+            variant, item, self._entries.get(variant.get("qa_id")))
+
+    def _transport_entry(self, variant: Mapping, item: EpisodeItem, entry: dict) -> dict:
+        """Replay one privately anchored entry without expanding public dispatch."""
         from skill3d.infra.m5_identity import content_sha256
         from skill3d.segmentation.prepared_binding_store import (
             PreparedBindingStore, PreparedBindingStoreError,
         )
 
-        entry = self._entry(variant)
+        entry = self._checked_entry(variant, entry)
         self._validate_item(variant, entry, item)
         identity, identity_file = self._publication_file(
             entry["scene_input_identity_file"],
@@ -789,6 +845,6 @@ class PublishedFitSetInputProvider:
 
 
 __all__ = [
-    "PUBLISHED_INPUT_SCHEMA", "FULLQA_INPUT_SCHEMA", "PublishedFitSetInputError",
-    "PublishedFitSetInputProvider",
+    "PUBLISHED_INPUT_SCHEMA", "FULLQA_INPUT_SCHEMA", "TRAIN_TEST_INPUT_SCHEMA",
+    "PublishedFitSetInputError", "PublishedFitSetInputProvider",
 ]

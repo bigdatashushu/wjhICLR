@@ -13,7 +13,10 @@ import re
 from typing import Mapping, Sequence
 
 from skill3d.routing.task_classifier import canonical_task
-from skill3d.schemas.data_access import normalize_experiment_split
+from skill3d.schemas.data_access import (
+    DATA_SPLITS, TRAIN_TEST_PARTITION_SCHEMA, is_train_test_partition,
+    normalize_experiment_split,
+)
 
 
 QA_PARTITION_SCHEMA = "harness3d-qa-overlapping-scene-split/1"
@@ -24,6 +27,7 @@ QUESTION_FIELDS = {
     "qa_id", "dataset", "scene_name", "question_type", "question", "options",
     "source_split",
 }
+TRAIN_TEST_PUBLIC_EXTRA_FIELDS = {"id", "split", "benchmark_split", "experiment_split"}
 
 
 class QAPartitionError(ValueError):
@@ -123,6 +127,112 @@ class QAPartition:
     experiment_split: dict
 
 
+def _read_question_jsonl(path: Path, expected: str) -> tuple[list[dict], dict]:
+    data = path.read_bytes()
+    sha256 = hashlib.sha256(data).hexdigest()
+    _require(sha256 == _digest(expected), f"QA partition file hash changed: {path}")
+    rows = [json.loads(line, object_pairs_hook=_unique_object)
+            for line in data.splitlines() if line.strip()]
+    _require(bool(rows) and all(isinstance(row, dict) for row in rows),
+             f"QA partition requires nonempty question JSONL: {path}")
+    _require(hashlib.sha256(path.read_bytes()).hexdigest() == sha256,
+             f"QA partition file changed during reading: {path}")
+    return rows, {"path": str(path.resolve()), "size": len(data), "sha256": sha256}
+
+
+def _load_train_test_partition(path, manifest, identity, metadata_path, public_scope_path):
+    """Public train/test JSONL, with no allocation tables or legacy source scope."""
+    split_id = manifest.get("split_id")
+    _require(isinstance(split_id, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", split_id) is not None,
+             "QA partition requires a distinct split_id")
+    _require(type(manifest.get("seed")) is int, "QA partition seed must be an integer")
+    _digest(manifest.get("metadata_sha256"))
+    if metadata_path is not None:
+        _require(_file_digest(metadata_path) == manifest["metadata_sha256"],
+                 "QA partition metadata file hash changed")
+    scenes = manifest.get("scene_names")
+    _require(isinstance(scenes, list) and bool(scenes)
+             and all(isinstance(scene, str) and scene for scene in scenes)
+             and len(set(scenes)) == len(scenes), "invalid QA partition scene scope")
+    _require(manifest.get("source_split_preserved") is True,
+             "QA partition must preserve original source splits")
+    files = manifest.get("files")
+    _require(isinstance(files, dict) and set(files) == {"train", "test"},
+             "train/test partition requires exactly two public role files")
+
+    def resolve(ref):
+        _require(isinstance(ref, str) and bool(ref), "QA partition requires a question file path")
+        result = Path(ref)
+        return result if result.is_absolute() else path.parent / result
+
+    source_path = resolve(str(public_scope_path) if public_scope_path is not None
+                          else manifest.get("questions_file"))
+    source_rows, source_identity = _read_question_jsonl(
+        source_path, manifest.get("questions_sha256"))
+    originals = {}
+    for row in source_rows:
+        _require(QUESTION_FIELDS <= set(row)
+                 and set(row) <= QUESTION_FIELDS | TRAIN_TEST_PUBLIC_EXTRA_FIELDS,
+                 "train/test source question fields changed")
+        _require(all(isinstance(row[key], str) and row[key]
+                     for key in ("qa_id", "dataset", "scene_name", "question_type", "question")),
+                 "invalid train/test source question identity")
+        qa_id = row["qa_id"]
+        _require(("id" not in row or str(row["id"]) == qa_id)
+                 and ("split" not in row or row["split"] == row["source_split"])
+                 and ("benchmark_split" not in row or row["benchmark_split"] == "test")
+                 and ("experiment_split" not in row or row["experiment_split"] in {"train", "test"}),
+                 f"{qa_id}: inconsistent public question extras")
+        _require(qa_id not in originals, f"duplicate source QA: {qa_id}")
+        _require(row["source_split"] in DATA_SPLITS, f"{qa_id}: unsupported original source_split")
+        _require(row["options"] is None or (
+            isinstance(row["options"], list) and all(isinstance(x, str) for x in row["options"])),
+            f"{qa_id}: invalid public options")
+        canonical_task(row["question_type"])
+        originals[qa_id] = row
+    _require({row["scene_name"] for row in source_rows} == set(scenes),
+             "train/test source scene scope changed")
+    questions, roles, file_identities = {}, {}, {}
+    for public_role, core_role in (("train", "learning"), ("test", "validation")):
+        entry = files[public_role]
+        _require(isinstance(entry, dict), f"QA partition lacks {public_role} file")
+        rows, file_identity = _read_question_jsonl(
+            resolve(entry.get("path")), entry.get("sha256"))
+        file_identities[public_role] = file_identity
+        for row in rows:
+            _require(QUESTION_FIELDS | {"experiment_split"} <= set(row)
+                     and set(row) <= QUESTION_FIELDS | TRAIN_TEST_PUBLIC_EXTRA_FIELDS,
+                     f"train/test {public_role} question fields changed")
+            qa_id = row["qa_id"]
+            _require(isinstance(qa_id, str) and qa_id and qa_id not in questions,
+                     f"duplicate or invalid QA in role union: {qa_id!r}")
+            _require(row["experiment_split"] == public_role,
+                     f"{qa_id}: mismatched public experiment role")
+            original = originals.get(qa_id)
+            _require(original is not None and all(row[key] == original[key] for key in QUESTION_FIELDS),
+                     f"{qa_id}: original question/source fields changed")
+            _require(("id" not in row or str(row["id"]) == qa_id)
+                     and ("split" not in row or row["split"] == row["source_split"])
+                     and ("benchmark_split" not in row or row["benchmark_split"] == "test")
+                     and original.get("experiment_split", public_role) == public_role,
+                     f"{qa_id}: inconsistent public question extras")
+            questions[qa_id] = deepcopy(row)
+            roles[qa_id] = core_role
+        _require({row["scene_name"] for row in rows} == set(scenes),
+                 f"train/test {public_role} must cover every declared scene")
+    _require(set(questions) == set(originals), "train/test role union differs from source questions")
+    overlay = normalize_experiment_split({
+        "protocol": TRAIN_TEST_PARTITION_SCHEMA, "partition_schema": TRAIN_TEST_PARTITION_SCHEMA,
+        "split_id": split_id, "seed": manifest["seed"], "manifest_identity": identity,
+        "qa_roles": roles, "source_split_preserved": True,
+        "source_split_by_qa": {qa: row["source_split"] for qa, row in questions.items()},
+        "source_files": file_identities, "source_scope_identity": source_identity,
+        "scope": {"total_qa": len(questions), "scene_names": scenes,
+                  "metadata_sha256": manifest["metadata_sha256"]},
+    })
+    return QAPartition(questions=questions, experiment_split=overlay)
+
+
 def load_qa_partition_manifest(
     path: str | Path,
     *,
@@ -138,6 +248,9 @@ def load_qa_partition_manifest(
     """
     path = Path(path).resolve()
     manifest, manifest_identity = _read_anchored(path)
+    if manifest.get("schema") == TRAIN_TEST_PARTITION_SCHEMA:
+        return _load_train_test_partition(
+            path, manifest, manifest_identity, metadata_path, public_scope_path)
     _require(manifest.get("schema") == QA_PARTITION_SCHEMA, "unknown QA partition schema")
     split_id = manifest.get("split_id")
     _require(isinstance(split_id, str) and re.fullmatch(r"[A-Za-z0-9_.-]+", split_id) is not None,
@@ -298,7 +411,9 @@ def _qa_variant_groups(variants: Sequence[Mapping], partition: QAPartition) -> d
                  f"{variant_id}: unknown partition QA")
         question = partition.questions[qa_id]
         role = overlay["qa_roles"].get(qa_id)
-        _require(role in QA_ROLES and role == question["experiment_split"],
+        public_role = {"learning": "train", "validation": "test"}.get(role) if (
+            is_train_test_partition(overlay)) else role
+        _require(role in QA_ROLES and public_role == question["experiment_split"],
                  f"{variant_id}: unknown or mismatched partition role")
         for field in ("experiment_role", "experiment_split"):
             _require(field not in row or row[field] == role,
@@ -338,6 +453,8 @@ def select_qa_execution_variants(
     variants: Sequence[Mapping], partition: QAPartition, *, role: str = "validation",
 ) -> list[dict]:
     """Select a frozen execution role without creating a learning/gate stream."""
+    if is_train_test_partition(partition.experiment_split):
+        role = {"train": "learning", "test": "validation"}.get(role, role)
     _require(role in QA_ROLES, "unknown QA execution role")
     groups = _qa_variant_groups(variants, partition)
     _require(bool(groups[role]), f"QA partition has no {role} execution variants")

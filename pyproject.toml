@@ -24,6 +24,8 @@ dependencies = [
     "openai>=1.12.0",
     "requests>=2.32,<3",
     "pyyaml>=6.0,<7",
+    # Successor readers and full experiments inspect available memory/disk.
+    "psutil>=5.9,<8",
 ]
 
 [project.optional-dependencies]

@@ -1,5 +1,6 @@
 """Local real pinned Handler/Client/Queue tests; no models or remote actions."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import base64
 from dataclasses import replace
 import hashlib
@@ -883,24 +884,35 @@ class WarmAndActivationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Linux"):
                 self.validate()
 
+    @contextmanager
+    def frozen_imports(self):
+        source = self.root / "source_frozen"
+        # Freeze the coordinator's startup tree, not other tests' imports.
+        paths = (
+            "scripts/cluster_coordinator.py",
+            "src/skill3d/__init__.py",
+            "src/skill3d/cluster/__init__.py",
+            "src/skill3d/cluster/identity.py",
+            "src/skill3d/cluster/publication.py",
+            "src/skill3d/cluster/queue.py",
+        )
+        pins = {}
+        for relative in paths:
+            target = source / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            raw = (ROOT / relative).read_bytes()
+            target.write_bytes(raw)
+            pins[relative] = hashlib.sha256(raw).hexdigest()
+        with patch.dict(sys.modules), patch.object(sys, "path", list(sys.path)):
+            for name in list(sys.modules):
+                if name == "cluster_coordinator" or name == "skill3d" or name.startswith("skill3d."):
+                    del sys.modules[name]
+            coordinator = transport.verify_frozen_imports(self.root, {"code_sha256": pins})
+            yield coordinator, pins
+
     def test_frozen_imports_all_method_pins_and_loaded_dependencies_are_bound(self):
         source = self.root / "source_frozen"
-        modules, pins = {}, {}
-        for name, loaded in list(sys.modules.items()):
-            if name == "cluster_coordinator" or name == "skill3d" or name.startswith("skill3d."):
-                path = Path(loaded.__file__).resolve()
-                relative = path.relative_to(ROOT.resolve())
-                target = source / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                raw = path.read_bytes()
-                target.write_bytes(raw)
-                pins[str(relative)] = hashlib.sha256(raw).hexdigest()
-                proxy = transport.types.ModuleType(name)
-                proxy.__file__ = str(target)
-                modules[name] = proxy
-        coordinator = modules["cluster_coordinator"]
-        coordinator.SQLiteJobQueue = SQLiteJobQueue
-        with patch.dict(sys.modules, modules), patch.object(sys, "path", list(sys.path)):
+        with self.frozen_imports() as (coordinator, pins):
             self.assertIs(transport.verify_frozen_imports(self.root, {"code_sha256": pins}), coordinator)
             self.assertEqual(sys.path[:2], [str(source / "scripts"), str(source / "src")])
             for bad in ({}, {**pins, "../escape.py": "0" * 64},
@@ -911,12 +923,26 @@ class WarmAndActivationTests(unittest.TestCase):
                        if name != "src/skill3d/cluster/publication.py"}
             with self.assertRaisesRegex(RuntimeError, "unbound frozen dependency"):
                 transport.verify_frozen_imports(self.root, {"code_sha256": unbound})
-            with patch.object(modules["skill3d"], "__file__", str(ROOT / "src/skill3d/__init__.py")):
+            with patch.object(sys.modules["skill3d"], "__file__", str(ROOT / "src/skill3d/__init__.py")):
                 with self.assertRaisesRegex(RuntimeError, "outside source_frozen"):
                     transport.verify_frozen_imports(self.root, {"code_sha256": pins})
             with patch.object(coordinator, "__file__", frozen.__file__):
                 with self.assertRaisesRegex(RuntimeError, "coordinator import"):
                     transport.verify_frozen_imports(self.root, {"code_sha256": pins})
+
+    def test_frozen_import_fixture_isolated_from_ambient_namespace_modules(self):
+        namespace = transport.types.ModuleType("skill3d.fixture_namespace")
+        namespace.__file__ = None
+        namespace.__path__ = [str(ROOT / "src/skill3d/legacy")]
+        with patch.dict(sys.modules, {namespace.__name__: namespace}):
+            before = dict(sys.modules)
+            before_path = list(sys.path)
+            with self.frozen_imports() as (coordinator, pins):
+                self.assertNotIn(namespace.__name__, sys.modules)
+                self.assertIs(transport.verify_frozen_imports(self.root, {"code_sha256": pins}),
+                              coordinator)
+            self.assertEqual(dict(sys.modules), before)
+            self.assertEqual(sys.path, before_path)
 
     def test_explicit_base_pin_and_cli_method_ssd_constraints(self):
         wrong = self.root / "wrong.py"

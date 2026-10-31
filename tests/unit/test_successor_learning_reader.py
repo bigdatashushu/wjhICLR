@@ -14,6 +14,16 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
+@pytest.fixture(autouse=True)
+def sufficient_host_resources(monkeypatch):
+    """Unit cases control the observed resource receipts independently of host load."""
+    import psutil
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=32 * 1024 ** 3))
+    monkeypatch.setattr(
+        psutil, "disk_usage", lambda path: SimpleNamespace(free=120 * 1024 ** 3))
+
+
 def test_large_member_uses_native_materialization_and_rejects_changed_bytes(tmp_path, monkeypatch):
     psutil = ModuleType("psutil")
     psutil.virtual_memory = lambda: SimpleNamespace(available=32 * 1024 ** 3)
@@ -116,3 +126,15 @@ def test_isolated_reader_respects_disk_floor_before_fetch(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="free-space floor"):
         module.isolated_learning_bytes(history, tmp_path / "original", tmp_path / "cache")
     assert "fetch" not in events
+
+
+def test_isolated_reader_respects_memory_headroom_before_fetch(tmp_path, monkeypatch):
+    import psutil
+    history, _, events = isolated_history(b"original")
+    monkeypatch.setattr(
+        psutil, "virtual_memory", lambda: SimpleNamespace(available=1024 ** 3))
+    root = tmp_path / "cache"
+    with pytest.raises(RuntimeError, match="memory headroom"):
+        module.isolated_learning_bytes(history, tmp_path / "original", root)
+    assert "fetch" not in events
+    assert not root.exists()

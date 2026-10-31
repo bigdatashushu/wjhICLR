@@ -293,21 +293,134 @@ def _validate(case, binding, *, context=True, **overrides):
     return validate_prepared_binding(binding, **values)
 
 
-def _replace_source(case, mutate, *, request_mutate=None):
-    source = case.context.sources["qa-1"]
+def _replace_source(case, mutate, *, request_mutate=None, qa_id="qa-1"):
+    source = case.context.sources[qa_id]
     binding = copy.deepcopy(source["prepared"])
     mutate(binding)
     request = copy.deepcopy(source["reference"]["request_identity"])
     if request_mutate:
         request_mutate(request)
         _seal(request)
-    store = PreparedBindingStore(case.root / "replacement-store")
+    case._replacement_index = getattr(case, "_replacement_index", 0) + 1
+    store = PreparedBindingStore(
+        case.root / f"replacement-store-{qa_id}-{case._replacement_index}")
     reference = store.publish(
         request_identity=request, scene_artifact=case.path,
         scene_input_identity=source["identity"], binding=binding)
     source.update(
         reference=reference,
         prepared=load_prepared_binding_reference(reference, scene_input_identity=source["identity"]))
+
+
+def _reviewed_reuse_case(case):
+    from skill3d.segmentation.binding_validation import validate_binding
+
+    for qa_id in case.context.sources:
+        def review(binding):
+            obj = binding.objects[0]
+            mask = np.zeros((32, 3, 4), np.uint8)
+            mask[:, :, :2] = qa_id == "qa-1"
+            mask[:, :, 2:] = qa_id == "qa-2"
+            path = case.root / (qa_id + "-reviewed-mask.npy")
+            np.save(path, mask)
+            obj.mask_per_frame = str(path)
+            obj.duplicate_suspect = qa_id == "qa-2"
+            obj.binding_flags = [{"code": "manual_block"}] if qa_id == "qa-2" else []
+            obj.binding_provenance[0]["semantic_policy"] = "category-only"
+            verdict = validate_binding(obj, generation_sha256=binding.stats["generation"]["sha256"])
+            obj.binding_provenance[0].pop("semantic_policy")
+            obj.binding_validation = verdict.model_copy(update={
+                "version": derivation.LEGACY_VALIDATION_VERSION,
+                "checks": {k: v for k, v in verdict.checks.items()
+                           if k not in {"semantic_policy", "candidate_provenance"}},
+                "files": {k: v for k, v in verdict.files.items() if k != "binding_semantics"},
+            })
+            binding.stats["semantic_conflict_audits"] = []
+            binding.stats["status"] = "unavailable"
+            binding.materialized = False
+        _replace_source(case, review, qa_id=qa_id)
+    case.context = replace(case.context, audit_mode="reuse_source_audit")
+    return case
+
+
+def test_reuse_preserves_old_verdicts_without_new_reviews(case, monkeypatch, tmp_path):
+    from skill3d.segmentation.binding_validation import binding_is_usable
+
+    _reviewed_reuse_case(case)
+    before = copy.deepcopy(case.context.sources)
+    monkeypatch.setattr(derivation, "audit_semantic_mask_conflicts", _never)
+    monkeypatch.setattr(derivation, "validate_binding", _never)
+    monkeypatch.setattr(derivation, "refresh_coverage", _never)
+    references = derivation.publish_derived_binding_scene_v11(
+        case.context, store_root=tmp_path / "reused")
+    for qa_id, reference in references.items():
+        binding = load_prepared_binding_reference(
+            reference, scene_input_identity=case.context.target_inputs[qa_id])
+        old = before[qa_id]["prepared"]
+        assert binding.materialized == old.materialized is False
+        assert binding.stats["status"] == old.stats["status"] == "unavailable"
+        assert binding.stats["grounding"] == old.stats["grounding"]
+        assert binding.stats["semantic_conflict_audits"] == old.stats["semantic_conflict_audits"]
+        assert binding.stats["generation"] == old.stats["generation"]
+        obj, source = binding.objects[0], old.objects[0]
+        assert obj.binding_flags == source.binding_flags
+        assert obj.duplicate_suspect == source.duplicate_suspect
+        assert obj.binding_validation.status == source.binding_validation.status
+        assert obj.binding_validation.errors == source.binding_validation.errors
+        assert all(obj.binding_validation.checks[k] == v
+                   for k, v in source.binding_validation.checks.items())
+        assert "valid_depth" not in obj.binding_validation.checks
+        assert binding_is_usable(obj, strict=True) == (qa_id == "qa-1")
+        receipt = binding.stats["binding_derivation"]
+        assert receipt["source_audit_reused"] is True
+        assert receipt["audit_mode"] == "reuse_source_audit"
+        assert receipt["new_mask_conflict_audits"] == receipt["new_numeric_validations"] == 0
+        if qa_id == "qa-1":
+            _validate(case, binding)
+            bad = copy.deepcopy(binding)
+            bad.objects[0].binding_validation.status = "unavailable"
+            with pytest.raises(PreparedBindingStoreError, match="output/files changed"):
+                _validate(case, bad)
+
+
+@pytest.mark.parametrize("tamper", [
+    "scope", "rule", "files", "checks", "verdict", "generation", "audit", "flags",
+])
+def test_reuse_rejects_changed_source_review(case, monkeypatch, tamper):
+    _reviewed_reuse_case(case)
+    monkeypatch.setattr(derivation, "audit_semantic_mask_conflicts", _never)
+    monkeypatch.setattr(derivation, "validate_binding", _never)
+    if tamper == "scope":
+        _replace_source(case, lambda _: None,
+                        request_mutate=lambda req: req.update(scene_audit_qa_ids=["qa-1"]))
+    elif tamper == "rule":
+        monkeypatch.setattr(derivation, "_REUSED_AUDIT_SOURCES", {"tools/category_match.py": {}})
+    else:
+        def mutate(binding):
+            obj = binding.objects[0]
+            if tamper == "files":
+                obj.binding_validation.files["mask_per_frame"]["sha256"] = "changed"
+            elif tamper == "checks":
+                obj.binding_validation.checks.pop("centroid")
+            elif tamper == "verdict":
+                obj.binding_validation.status = "unavailable"
+            elif tamper == "generation":
+                obj.binding_validation.generation_sha256 = "changed"
+            elif tamper == "audit":
+                binding.stats["semantic_conflict_audits"] = [{"audit_sha256": "changed"}]
+            elif tamper == "flags":
+                obj.binding_flags = [{"code": "manual_block"}]
+        _replace_source(case, mutate)
+    with pytest.raises(PreparedBindingStoreError):
+        derivation.derive_prepared_binding_scene_v11(case.context)
+
+
+def test_reuse_cannot_be_selected_by_an_output_receipt(case):
+    _reviewed_reuse_case(case)
+    binding = derivation.derive_prepared_binding_scene_v11(case.context)["qa-1"]
+    case.context = replace(case.context, audit_mode="reaudit")
+    with pytest.raises(PreparedBindingStoreError):
+        _validate(case, binding)
 
 
 def _spawn_provider(case):
@@ -477,6 +590,95 @@ def test_publish_reload_and_consume_is_path_independent(case, tmp_path):
     _validate(case, binding)
     with pytest.raises(PreparedBindingStoreError, match="must be new"):
         derivation.publish_derived_binding_scene_v11(case.context, store_root=case.store.root)
+
+
+def test_subset_provider_derives_full_scene_without_publicly_admitting_omitted_qa(
+    case, tmp_path, monkeypatch,
+):
+    from skill3d.evaluation.derived_published_fitset_v11 import DerivedPublishedFitSetInputProvider
+    from skill3d.evaluation.published_fitset_v11 import PublishedFitSetInputError
+
+    provider, variant = _spawn_provider(case)
+    provider.binding_cfg = replace(case.context.cfg, seed=137)
+    provider.derivation_root = tmp_path / "subset-derived"
+    provider.scene_scopes = {variant["scene_id"]: {"qa_ids": ["qa-1", "qa-2"]}}
+    provider._source_entries = {
+        qa: {"qa_id": qa, "scene_id": variant["scene_id"], "split": "induction",
+             "variant": "base", "reference": source["reference"],
+             "scene_artifact": str(case.path), "publication_root": str(case.root)}
+        for qa, source in case.context.sources.items()
+    }
+    provider._entries = {"qa-1": provider._source_entries["qa-1"]}
+    variant["split"] = "induction"
+    monkeypatch.setattr(provider, "_scene", lambda entry: SimpleNamespace(items=case.old_items))
+    visited = []
+
+    def transport(row, item, original):
+        visited.append(row["qa_id"])
+        source = case.context.sources[row["qa_id"]]
+        migration = case.store.create_migration_receipt(
+            source["reference"]["key"], scene_input_identity=source["identity"],
+            destination_root=case.root, scene_artifact_ref="artifact.json",
+            dependency_refs={
+                name: Path(record["path"]).relative_to(case.root).as_posix()
+                for name, record in source["identity"]["files"].items()
+            })
+        resolver = case.store.validate_migration_receipt(
+            source["reference"]["key"], migration,
+            scene_input_identity=source["identity"], destination_root=case.root)
+        return {"identity": source["identity"], "migration": migration, "resolver": resolver}
+
+    monkeypatch.setattr(provider, "_transport_entry", transport)
+    context, references, migrations = provider._derive_scene(provider._entries["qa-1"])
+    assert visited == ["qa-1", "qa-2"]
+    assert set(provider.entries) == {"qa-1"}
+    assert set(context.sources) == {"qa-1", "qa-2"}
+    assert set(references) == set(migrations) == {"qa-1"}
+    for qa, reference in references.items():
+        binding = load_prepared_binding_reference(
+            reference, scene_input_identity=context.target_inputs[qa],
+            migration_receipt=migrations[qa], migration_destination_root=case.root)
+        receipt = binding.stats["binding_derivation"]
+        assert receipt["scene_audit_qa_ids"] == ["qa-1", "qa-2"]
+        assert reference["request_identity"]["seed"] == 0
+        assert receipt["new_model_requests"] == 0 and not receipt["generation_resealed"]
+        assert binding.stats["generation"] == case.context.sources[qa]["prepared"].stats["generation"]
+        assert binding.objects[0].binding_validation.status == "unavailable"
+        assert any(flag["code"] == "semantic_label_mask_conflict"
+                   for flag in binding.objects[0].binding_flags)
+    with pytest.raises(PublishedFitSetInputError, match="catalog entry is missing"):
+        provider({**variant, "qa_id": "qa-2"})
+
+
+@pytest.mark.parametrize("ids", [[], ["qa-1", "qa-1"], ["qa-missing"]])
+def test_publication_subset_cannot_change_full_scene_audit_scope(case, tmp_path, ids):
+    root = tmp_path / "invalid-publication"
+    with pytest.raises(PreparedBindingStoreError, match="publication QA selection"):
+        derivation.publish_derived_binding_scene_v11(
+            case.context, store_root=root, publish_qa_ids=ids)
+    assert not list(root.rglob("manifest.json"))
+
+
+def test_existing_derived_outputs_are_revalidated_without_repacking(case, tmp_path, monkeypatch):
+    root = tmp_path / "reusable-derived"
+    refs = derivation.publish_derived_binding_scene_v11(
+        case.context, store_root=root, publish_qa_ids=["qa-1"])
+    monkeypatch.setattr(PreparedBindingStore, "publish", _never)
+    replay = derivation.publish_derived_binding_scene_v11(
+        replace(case.context), store_root=root, publish_qa_ids=["qa-1"])
+    assert replay == refs
+
+
+def test_existing_derived_payload_tampering_aborts_without_repacking(case, tmp_path, monkeypatch):
+    root = tmp_path / "rejected-derived"
+    refs = derivation.publish_derived_binding_scene_v11(
+        case.context, store_root=root, publish_qa_ids=["qa-1"])
+    path = PreparedBindingStore(root).entry_path(refs["qa-1"]["key"]) / "payload/binding.json"
+    path.write_bytes(path.read_bytes() + b" ")
+    monkeypatch.setattr(PreparedBindingStore, "publish", _never)
+    with pytest.raises(PreparedBindingStoreError):
+        derivation.publish_derived_binding_scene_v11(
+            replace(case.context), store_root=root, publish_qa_ids=["qa-1"])
 
 
 def test_non_audit_flags_and_suspects_are_not_promoted(case):

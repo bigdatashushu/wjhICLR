@@ -29,22 +29,25 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 from . import Spec
 
 IMAGE_LEDGER_SCHEMA_VERSION = "2.0"
 
 # 图像种类：原帧 / 裁剪 / 拼版（多张派生图合并成一张，用于服务图像上限内交付）
-ImageKind = Literal["frame", "crop", "contact_sheet"]
+ImageKind = Literal["frame", "crop", "contact_sheet", "scene_overview"]
 
 # 本轮图像的布局策略（§9.4"事先声明的布局或分批观察方案"）
 # - `originals_only`：只有冻结 FrameSet 的原帧（无派生图时的常态）
 # - `derived_plus_originals_v1`：派生图优先占位，其后按帧序补原帧，总数不超过服务上限
 LAYOUT_ORIGINALS_ONLY = "originals_only"
 LAYOUT_DERIVED_PLUS_ORIGINALS = "derived_related_spread_v2"
+LAYOUT_OVERVIEW_PLUS_ORIGINALS = "scene_overview_plus_originals_v1"
+LAYOUT_OVERVIEW_PLUS_DERIVED = "scene_overview_plus_derived_related_spread_v1"
 IMAGE_LAYOUTS: tuple[str, ...] = (
     LAYOUT_ORIGINALS_ONLY, LAYOUT_DERIVED_PLUS_ORIGINALS, "derived_plus_originals_v1",
+    LAYOUT_OVERVIEW_PLUS_ORIGINALS, LAYOUT_OVERVIEW_PLUS_DERIVED,
 )
 
 # 裁剪/缩放变换的版本（§9.4"记录源帧、像素范围和变换"）
@@ -107,11 +110,13 @@ class ProducedImage(Spec):
     @field_validator("kind")
     @classmethod
     def _known_kind(cls, v: str) -> str:
-        if v not in ("frame", "crop", "contact_sheet"):
+        if v not in ("frame", "crop", "contact_sheet", "scene_overview"):
             raise ValueError(f"Unknown image kind {v!r}")
         return v
 
     def model_post_init(self, __context) -> None:  # noqa: D105 - pydantic v2 hook
+        if self.kind == "scene_overview" and not isinstance(self, SceneOverviewImage):
+            raise ValueError("Scene overviews require the typed SceneOverviewImage provenance")
         if self.kind in ("crop", "contact_sheet"):
             if self.source_frame_id is None or not self.box_xyxy:
                 raise ValueError(
@@ -131,6 +136,57 @@ class ProducedImage(Spec):
         return bool(self.observed_rounds)
 
 
+class SceneOverviewProvenance(Spec):
+    """Metadata-only validator shared with offline refs; no nested record field."""
+
+    model_config = {"serialize_by_alias": True, "validate_by_name": True}
+
+    schema_version: Literal["harness3d-scene-overview/1"] = Field(alias="schema")
+    scene_id: str
+    png_sha256: str
+    rgb_sha256: str
+    scene_artifact_sha256: str
+    frozen_scene_sha256: str
+    render_spec_sha256: str
+    world_frame_status: Literal["available", "degraded", "unavailable"]
+    resolution_wh: list[int]
+    selected_azimuth_degrees: float = Field(allow_inf_nan=False)
+    elevation_degrees: float = Field(allow_inf_nan=False)
+    render_only_cutaway: Literal[True]
+
+    @field_validator("resolution_wh")
+    @classmethod
+    def _resolution(cls, value: list[int]) -> list[int]:
+        if value != [640, 480]:
+            raise ValueError("Scene overview resolution must be [640, 480]")
+        return value
+
+    @field_validator("png_sha256", "rgb_sha256", "scene_artifact_sha256",
+                     "frozen_scene_sha256", "render_spec_sha256")
+    @classmethod
+    def _sha256(cls, value: str) -> str:
+        if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
+            raise ValueError("Scene overview provenance requires lowercase SHA256")
+        return value
+
+
+class SceneOverviewImage(ProducedImage, SceneOverviewProvenance):
+    """Flat descriptor metadata for offline image refs; paths remain in file refs."""
+
+    kind: Literal["scene_overview"] = "scene_overview"
+
+    def model_post_init(self, __context) -> None:
+        super().model_post_init(__context)
+        if any(value is not None for value in (
+                self.source_frame_id, self.source_frame_index, self.box_xyxy, self.scale)):
+            raise ValueError("A scene overview is not a video frame or crop")
+        if (self.resolution_wh != [640, 480]
+                or self.source_hw != [480, 640] or self.sent_hw != [480, 640]
+                or self.content_sha256 != f"sha256:{self.rgb_sha256}"
+                or self.image_id != f"overview-{self.scene_id}-{self.rgb_sha256[:12]}"):
+            raise ValueError("Scene overview pixels must match their source provenance")
+
+
 class ImageRound(Spec):
     """一次模型请求的图像清单（§9.4"实际传入图像、缩放和 token 成本完整记录"）。"""
 
@@ -143,6 +199,9 @@ class ImageRound(Spec):
     image_ids: list[str] = []              # 实际装进请求的顺序（与请求里逐一对齐）
     original_image_ids: list[str] = []
     derived_image_ids: list[str] = []
+    # Included in derived_image_ids for the existing extra-image adapter, not crop quota.
+    scene_overview_image_ids: list[str] = Field(
+        default_factory=list, exclude_if=lambda value: not value)
     n_images: int = 0
     max_images: int = 0                    # 服务图像上限（本 run 的声明值）
     omitted_originals: list[str] = []      # 本轮没进请求的原帧（已在更早轮次交付过）
@@ -161,6 +220,19 @@ class ImageRound(Spec):
         return v
 
     def model_post_init(self, __context) -> None:  # noqa: D105
+        if bool(self.scene_overview_image_ids) != (
+                self.layout in (LAYOUT_OVERVIEW_PLUS_ORIGINALS, LAYOUT_OVERVIEW_PLUS_DERIVED)):
+            raise ValueError("Scene overview layout and image identity must agree")
+        if self.scene_overview_image_ids:
+            if (len(self.scene_overview_image_ids) != 1
+                    or self.image_ids[:1] != self.scene_overview_image_ids
+                    or self.derived_image_ids[:1] != self.scene_overview_image_ids
+                    or self.image_ids != self.derived_image_ids + self.original_image_ids
+                    or len(set(self.image_ids)) != len(self.image_ids)
+                    or self.n_images != len(self.image_ids)
+                    or self.n_images > min(33, self.max_images)
+                    or set(self.image_ids) & set(self.omitted_originals + self.omitted_derived)):
+                raise ValueError("Scene overview must lead a consistent 32+1 image manifest")
         if self.observed and not self.delivered:
             raise ValueError("observed=True but delivered=False (§9.4: images outside a request cannot count as observed)")
         if self.n_images and self.n_images != len(self.image_ids):
@@ -174,8 +246,12 @@ __all__ = [
     "IMAGE_TRANSFORM_VERSION",
     "LAYOUT_DERIVED_PLUS_ORIGINALS",
     "LAYOUT_ORIGINALS_ONLY",
+    "LAYOUT_OVERVIEW_PLUS_ORIGINALS",
+    "LAYOUT_OVERVIEW_PLUS_DERIVED",
     "TOKEN_ESTIMATE_SOURCE",
     "ImageKind",
     "ImageRound",
     "ProducedImage",
+    "SceneOverviewImage",
+    "SceneOverviewProvenance",
 ]

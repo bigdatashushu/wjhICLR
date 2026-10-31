@@ -46,7 +46,7 @@ from skill3d.routing.task_classifier import TASK_TYPES, canonical_task
 from skill3d.schemas import SkillSpecV11
 from skill3d.schemas.answer import CANONICAL_UNIT_BY_QUESTION_TYPE
 from skill3d.schemas.data_access import (
-    learning_authorization_for, normalize_experiment_split,
+    DATA_SPLITS, is_train_test_partition, learning_authorization_for, normalize_experiment_split,
 )
 from skill3d.schemas.evidence import SKILL_EVIDENCE_STATES
 from skill3d.schemas.reconstruction import METRIC_TASK_TYPES
@@ -1234,6 +1234,7 @@ class SystemVariantRunner:
     cached_prefix_recovery = None
     _cached_prefix_spec = None
     _continuation = None
+    scene_overviews = None
 
     def __init__(
         self,
@@ -1271,6 +1272,7 @@ class SystemVariantRunner:
         overlap_owner_slots: bool = False,
         offline_frame_storage: str = "per_variant_v1",
         prefetch_scenes: bool = False,
+        scene_overviews=None,
     ) -> None:
         _require(phase in {"accumulation", "final_system"},
                  "system phase must be accumulation or final_system")
@@ -1320,6 +1322,26 @@ class SystemVariantRunner:
             for key, value in binding_refs.items()
         }
         self.base_cfg = copy.deepcopy(base_cfg)
+        self.scene_overviews = scene_overviews
+        self._scene_overview_descriptors = {}
+        if scene_overviews is not None:
+            _require(published_inputs is not None,
+                     "scene overviews require published inputs")
+            _require(self.base_cfg.max_images == 32
+                     and getattr(self.base_cfg, "scene_overview", None) is None,
+                     "scene overviews require an unchanged 32-image base config")
+            overview_identity = copy.deepcopy(scene_overviews.identity)
+            _require(isinstance(overview_identity, dict)
+                     and ("scene_overviews" not in self.input_contract_identity
+                          or self.input_contract_identity["scene_overviews"] == overview_identity),
+                     "scene overview input contract identity changed")
+            self.input_contract_identity["scene_overviews"] = overview_identity
+            scene_overviews.validate_entries(published_inputs.entries)
+            for row in self.variant_rows.values():
+                if row["scene_id"] not in self._scene_overview_descriptors:
+                    descriptor = scene_overviews.descriptor(
+                        row["scene_id"], entry=published_inputs._entry(row))
+                    self._scene_overview_descriptors[row["scene_id"]] = copy.deepcopy(descriptor)
         self.phase = phase
         self.skills_for_variant = skills_for_variant
         self.client_factory = client_factory
@@ -1333,8 +1355,8 @@ class SystemVariantRunner:
         except ValueError as exc:
             raise FitSetError(str(exc)) from exc
         _require(self.experiment_split is None or phase == "final_system" or (
-            evolution_config is not None and evolution_config.gate_mode == "qa_disjoint"),
-            "experiment_split requires opt-in qa_disjoint evolution")
+            evolution_config is not None and evolution_config.gate_mode in {"qa_disjoint", "train_sample"}),
+            "experiment_split requires opt-in qa_disjoint or train_sample evolution")
         if self.experiment_split is not None and phase == "final_system":
             _require(
                 self.experiment_split.get("execution_role") == "validation"
@@ -1342,8 +1364,11 @@ class SystemVariantRunner:
                 "final_system overlay requires execution_role=validation without gate/evolution")
             _require(all(
                 self.experiment_split["qa_roles"].get(row["qa_id"]) == "validation"
-                and row.get("split") in {"induction", "inner_validation"}
+                and row.get("split") in (DATA_SPLITS if is_train_test_partition(
+                    self.experiment_split) else {"induction", "inner_validation"})
                 and row.get("source_split", row.get("split")) == row.get("split")
+                and (not is_train_test_partition(self.experiment_split)
+                     or self.experiment_split["source_split_by_qa"].get(row["qa_id"]) == row.get("split"))
                 and all(row.get(field, "validation") == "validation"
                         for field in ("experiment_role", "experiment_split"))
                 for row in self.variants),
@@ -1416,11 +1441,17 @@ class SystemVariantRunner:
             learning_mode = self.evolution_config.learning_input_mode
             gate_mode = self.evolution_config.gate_mode
             legacy = learning_mode == "aggregate_v1" and gate_mode == "same_question"
-            _require(gate_mode in {"same_question", "scene_disjoint", "qa_disjoint"},
+            _require(gate_mode in {"same_question", "scene_disjoint", "qa_disjoint", "train_sample"},
                      "unknown gate mode")
             _require(gate_mode != "qa_disjoint" or self.experiment_split is not None,
                      "qa_disjoint requires explicit experiment_split")
-            if gate_mode == "qa_disjoint":
+            _require(gate_mode != "train_sample" or is_train_test_partition(self.experiment_split),
+                     "train_sample requires the explicit hashed train/test protocol")
+            _require(not is_train_test_partition(self.experiment_split) or gate_mode == "train_sample",
+                     "train/test protocol requires train_sample, not legacy gates")
+            _require(gate_mode != "train_sample" or not self.gate_variant_rows,
+                     "train_sample cannot accept separate gate variants")
+            if gate_mode in {"qa_disjoint", "train_sample"}:
                 learning_qa = {row["qa_id"] for row in self.variants}
                 gate_qa = {row["qa_id"] for row in self.gate_variant_rows.values()}
                 _require(not learning_qa & gate_qa,
@@ -1434,8 +1465,12 @@ class SystemVariantRunner:
                     _require(all(row.get(field, expected_role) == expected_role
                                  for field in ("experiment_role", "experiment_split")),
                              f"{variant_id}: declared QA role differs from frozen role map")
-                    _require(row.get("split") in {"induction", "inner_validation"}
-                             and row.get("source_split", row["split"]) == row["split"],
+                    _require(row.get("split") in (DATA_SPLITS if gate_mode == "train_sample"
+                                                 else {"induction", "inner_validation"})
+                             and row.get("source_split", row["split"]) == row["split"]
+                             and (gate_mode != "train_sample"
+                                  or self.experiment_split["source_split_by_qa"].get(row["qa_id"])
+                                  == row["split"]),
                              f"{variant_id}: source_split must preserve the source catalog")
             _require(learning_mode in {
                 "aggregate_v1", "full_cases_v1", "analysis_synthesis_v1",
@@ -1456,7 +1491,8 @@ class SystemVariantRunner:
                          and label.get("question_type") == row["question_type"],
                          f"{variant_id}: label metadata identity changed")
                 if variant_id not in self.gate_variant_rows:
-                    _require(legacy or gate_mode == "qa_disjoint" or row.get("split") == "induction",
+                    _require(legacy or gate_mode in {"qa_disjoint", "train_sample"}
+                             or row.get("split") == "induction",
                              f"{variant_id}: rich/disjoint learning requires induction-only variants")
                     by_slot.setdefault(key, []).append(row)
             gate_by_slot: dict[str, list[dict]] = {}
@@ -1474,6 +1510,14 @@ class SystemVariantRunner:
                              f"{variant_id}: gate prepared binding reference is missing")
                     gate_by_slot.setdefault(row["slot_key"], []).append(row)
             for key, rows in by_slot.items():
+                if gate_mode == "train_sample":
+                    self.gate_panels[key] = sorted(row["variant_id"] for row in rows)
+                    n_qa = len({row["qa_id"] for row in rows})
+                    if n_qa < self.evolution_config.gate_size:
+                        self.gate_deferred_reasons[key] = (
+                            f"train_sample admission deferred: {n_qa} training QA; "
+                            f"gate_size={self.evolution_config.gate_size}; parent retained")
+                    continue
                 if gate_mode == "qa_disjoint":
                     gate_rows = gate_by_slot.get(key, ())
                     self.gate_panels[key] = [row["variant_id"] for row in gate_rows]
@@ -1508,6 +1552,20 @@ class SystemVariantRunner:
         except ValueError as exc:
             raise FitSetError(str(exc)) from exc
 
+    def _allow_original_final_test(self, variant: Mapping) -> bool:
+        if self.base_cfg.allow_final_test:
+            return True
+        overlay = (getattr(self, "_train_sample_partition", None)
+                   if getattr(self, "_train_sample_gate", False)
+                   else self.experiment_split)
+        if not is_train_test_partition(overlay):
+            return False
+        overlay = normalize_experiment_split(overlay)
+        role = ("learning" if getattr(self, "_train_sample_gate", False)
+                or overlay.get("execution_role") != "validation" else "validation")
+        return (overlay["qa_roles"].get(variant["qa_id"]) == role
+                and overlay["source_split_by_qa"].get(variant["qa_id"]) == variant["split"])
+
     def __getstate__(self) -> dict:
         # Spawned workers receive the live permit as an explicit process
         # argument, never through the pickled runner, so drop it here to keep
@@ -1526,6 +1584,19 @@ class SystemVariantRunner:
         self.__dict__.setdefault("overlap_owner_slots", False)
         self.__dict__.setdefault("offline_frame_storage", "per_variant_v1")
         self.__dict__.setdefault("prefetch_scenes", False)
+        self.__dict__.setdefault("scene_overviews", None)
+        self.__dict__.setdefault("_scene_overview_descriptors", {})
+
+    def _scene_overview_for_variant(self, variant: Mapping) -> dict | None:
+        if self.scene_overviews is None:
+            return None
+        _require(self.scene_overviews.identity == self.input_contract_identity["scene_overviews"],
+                 "scene overview store identity changed")
+        descriptor = self.scene_overviews.descriptor(
+            variant["scene_id"], entry=self.published_inputs._entry(variant))
+        _require(descriptor == self._scene_overview_descriptors.get(variant["scene_id"]),
+                 f"{variant['variant_id']}: scene overview descriptor changed")
+        return copy.deepcopy(descriptor)
 
     @property
     def execution_scheduler(self) -> str:
@@ -1651,7 +1722,11 @@ class SystemVariantRunner:
                     == "shared_scene_v2" else "v11-fit-set-offline-input/1.0"),
             },
         }
-        if self.offline_frame_storage == "shared_scene_v2":
+        if self.scene_overviews is not None:
+            from skill3d.storage.offline_frames import OVERVIEW_SCHEMA
+            body["request_input_config"]["offline_case_input_schema"] = OVERVIEW_SCHEMA
+            body["scene_overview_descriptors"] = copy.deepcopy(self._scene_overview_descriptors)
+        if self.offline_frame_storage == "shared_scene_v2" or self.scene_overviews is not None:
             from skill3d.storage.offline_frames import scene_key
             body["request_input_config"]["offline_frame_storage"] = self.offline_frame_storage
             body["shared_frame_consumers"] = {
@@ -1853,6 +1928,9 @@ class SystemVariantRunner:
                     "runtime_evidence_state": values["state"],
                     "binding_key": values["reference"]["key"],
                     "binding_manifest_sha256": values["reference"]["manifest_sha256"],
+                    **({key: values["plan"][key] for key in (
+                        "scene_overview", "scene_overview_sha256")}
+                       if "scene_overview" in values["plan"] else {}),
                     "model_requests": 0,
                 },
             )
@@ -1865,10 +1943,13 @@ class SystemVariantRunner:
             self._execute_preflight_pending(
                 list(self.gate_variant_rows.values()), validate, lambda _: None)
 
-    def _freeze_offline_case_input(self, variant: Mapping, item: EpisodeItem) -> None:
+    def _freeze_offline_case_input(
+        self, variant: Mapping, item: EpisodeItem, *, scene_overview: Mapping | None = None,
+    ) -> None:
         from PIL import Image
         from skill3d.storage.offline_frames import (
-            LEGACY_SCHEMA, SHARED_SCHEMA, publish_frame, shared_frame_path,
+            LEGACY_SCHEMA, OVERVIEW_SCHEMA, SHARED_SCHEMA, overview_ref,
+            publish_frame, shared_frame_path, validate_overview_png,
         )
 
         variant_root = self.root / "variants" / _variant_key(str(variant["variant_id"]))
@@ -1876,6 +1957,13 @@ class SystemVariantRunner:
         if (variant_root / "offline_input.json").exists():
             self.offline_case_input(variant)
             return
+        if self.scene_overviews is not None:
+            expected_overview = self._scene_overview_for_variant(variant)
+            _require(scene_overview is None or scene_overview == expected_overview,
+                     "offline overview differs from the actual execution descriptor")
+            scene_overview = expected_overview
+        else:
+            _require(scene_overview is None, "offline overview requires explicit opt-in")
         fs = item.episode.frame_set
         _require(fs is not None and len(fs.frame_ids) == len(item.pixels) == 32,
                  "offline case requires the frozen 32-frame public input")
@@ -1924,7 +2012,7 @@ class SystemVariantRunner:
                         publish_frame(self.root, path, data, state_io=self.framework_state_io)
                     else:
                         self.framework_state_io.write_bytes_once(path, data)
-        self._write_create_once(variant_root / "offline_input.json", {
+        value = {
             "schema_version": SHARED_SCHEMA if shared else LEGACY_SCHEMA,
             "variant_id": variant["variant_id"],
             "variant_sha256": content_sha256(variant),
@@ -1934,7 +2022,23 @@ class SystemVariantRunner:
             "options": list(item.episode.options or []),
             "frame_set_hash": fs.frame_set_hash,
             "image_refs": image_refs,
-        })
+        }
+        if scene_overview is not None:
+            from skill3d.online.scene_overview import read_overview_image
+            read_overview_image(scene_overview, scene_id=variant["scene_id"])
+            data = Path(scene_overview["image_path"]).read_bytes()
+            validate_overview_png(data, scene_overview)
+            target = shared_frame_path(
+                self.root, variant["scene_id"], scene_overview["render_spec_sha256"],
+                scene_overview["png_sha256"])
+            publish_frame(self.root, target, data, state_io=self.framework_state_io)
+            value.update(
+                schema_version=OVERVIEW_SCHEMA,
+                frame_storage_schema=SHARED_SCHEMA if shared else LEGACY_SCHEMA,
+                scene_overview_ref=overview_ref(
+                    self.root, scene_overview, logical_path=self.logical_path),
+            )
+        self._write_create_once(variant_root / "offline_input.json", value)
 
     def offline_case_input(self, variant: Mapping) -> dict:
         """Read the public input frozen during execution; never recover labels."""
@@ -1947,17 +2051,24 @@ class SystemVariantRunner:
 
     def _offline_case_input_body(self, variant: Mapping, *, cold_records=None) -> dict:
         from skill3d.storage.offline_frames import (
-            LEGACY_SCHEMA, SHARED_SCHEMA, reject_links, shared_frame_path,
+            LEGACY_SCHEMA, OVERVIEW_SCHEMA, SHARED_SCHEMA, overview_ref,
+            reject_links, shared_frame_path, validate_overview_png,
         )
         from skill3d.storage.hot_cache import IntegrityError
         path = (self.root / "variants" / _variant_key(str(variant["variant_id"]))
                 / "offline_input.json")
         _require(path.is_file(), f"{variant['variant_id']}: offline_input.json is missing")
         value = json.loads(path.read_text(encoding="utf-8"))
+        overview_enabled = self.scene_overviews is not None
+        extra_fields = {"frame_storage_schema", "scene_overview_ref"} if overview_enabled else set()
         _require(set(value) == {
             "schema_version", "variant_id", "variant_sha256", "qa_id", "scene_id",
             "split", "question_text", "options", "frame_set_hash", "image_refs",
-        } and value.get("schema_version") in {LEGACY_SCHEMA, SHARED_SCHEMA}
+        } | extra_fields
+                 and value.get("schema_version") in (
+                     {OVERVIEW_SCHEMA} if overview_enabled else {LEGACY_SCHEMA, SHARED_SCHEMA})
+                 and (not overview_enabled
+                      or value.get("frame_storage_schema") in {LEGACY_SCHEMA, SHARED_SCHEMA})
                  and value.get("variant_id") == variant["variant_id"]
                  and value.get("variant_sha256") == content_sha256(variant)
                  and value.get("qa_id") == variant["qa_id"]
@@ -1979,7 +2090,7 @@ class SystemVariantRunner:
             _require(set(ref) == fields and ref["frame_set_hash"] == value["frame_set_hash"],
                      f"{variant['variant_id']}: offline image provenance changed")
             logical = Path(ref["path"])
-            shared = value["schema_version"] == SHARED_SCHEMA
+            shared = value.get("frame_storage_schema", value["schema_version"]) == SHARED_SCHEMA
             expected = (shared_frame_path(self.root, variant["scene_id"],
                                          value["frame_set_hash"], ref["file_sha256"])
                         if shared else path.parent / "offline_images" / logical.name)
@@ -2009,6 +2120,26 @@ class SystemVariantRunner:
                      and file_identity(image_path)["sha256"] == ref["file_sha256"]
                      and ref["file_sha256"] == ref["content_sha256"],
                      f"{variant['variant_id']}: frozen offline image changed")
+        if overview_enabled:
+            descriptor = self._scene_overview_descriptors.get(variant["scene_id"])
+            _require(descriptor is not None and value["scene_overview_ref"] == overview_ref(
+                self.root, descriptor, logical_path=self.logical_path),
+                f"{variant['variant_id']}: offline overview provenance changed")
+            expected = shared_frame_path(
+                self.root, variant["scene_id"], descriptor["render_spec_sha256"],
+                descriptor["png_sha256"])
+            try:
+                reject_links(self.root, expected)
+                cold = (self.framework_state_io.cold_reference(expected, records=cold_records)
+                        if cold_records else None)
+                if cold is not None and not expected.exists():
+                    _require(cold.sha256 == descriptor["png_sha256"],
+                             f"{variant['variant_id']}: frozen cold overview changed")
+                else:
+                    validate_overview_png(expected.read_bytes(), descriptor)
+            except (OSError, IntegrityError) as exc:
+                raise FitSetError(
+                    f"{variant['variant_id']}: frozen offline overview changed") from exc
         return value
 
     def _require_storage_reserve(self, variant_id: str) -> None:
@@ -2129,17 +2260,20 @@ class SystemVariantRunner:
             artifact = load_artifact_v5(artifact_path)
         _require(state == variant["evidence_state"],
                  f"{variant_id}: runtime evidence state changed to {state}")
+        scene_overview = self._scene_overview_for_variant(variant)
         frozen_parameters = dict(
             ((derived_reference or reference).get("request_identity") or {}).get("parameters") or {})
         frozen_review = copy.deepcopy(
             frozen_parameters.get("experimental_semantic_review"))
         runtime_base_cfg = replace(
             copy.deepcopy(self.base_cfg),
+            allow_final_test=self._allow_original_final_test(variant),
             semantic_review_config=frozen_review,
             evaluation_execution_role=(
                 "validation" if getattr(self, "_qa_disjoint_gate", False)
                 or (self.experiment_split or {}).get("execution_role") == "validation"
-                else "learning" if self.experiment_split else None),
+                else "learning" if self.experiment_split
+                or getattr(self, "_train_sample_gate", False) else None),
         )
         if self.published_inputs is not None:
             binding_seed = reference["request_identity"]["seed"]
@@ -2147,6 +2281,10 @@ class SystemVariantRunner:
                      f"{variant_id}: invalid sealed binding seed")
             runtime_base_cfg = replace(
                 runtime_base_cfg, prepared_binding_seed=binding_seed)
+        if scene_overview is not None:
+            runtime_base_cfg = replace(
+                runtime_base_cfg, scene_overview=scene_overview,
+                max_images=self.base_cfg.max_images + 1)
         runtime_parameters = binding_parameters(
             semantic_min_pixels=runtime_base_cfg.semantic_min_pixels,
             semantic_max_pixels=runtime_base_cfg.semantic_max_pixels,
@@ -2220,6 +2358,9 @@ class SystemVariantRunner:
         }
         if transport_receipt is not None:
             plan["published_transport"] = transport_receipt
+        if scene_overview is not None:
+            plan["scene_overview"] = copy.deepcopy(scene_overview)
+            plan["scene_overview_sha256"] = content_sha256(scene_overview)
         if derived_reference is not None:
             plan["derived_binding_reference"] = copy.deepcopy(derived_reference)
             plan["derived_binding_migration"] = copy.deepcopy(derived_migration_receipt)
@@ -2327,10 +2468,11 @@ class SystemVariantRunner:
             variant, preflight=True) if spec else self._prepare_one(variant))
         variant_id = prepared_run["variant_id"]
         item = prepared_run["item"]
-        if getattr(self, "_qa_disjoint_gate", False):
+        if (getattr(self, "_qa_disjoint_gate", False)
+                or getattr(self, "_train_sample_gate", False)):
             _require(not self.capture_offline_case_input and not self.label_metadata
                      and not item.episode.ground_truth,
-                     "qa_disjoint gate executor requires label-free public input")
+                     "QA gate executor requires label-free public input")
         artifact_path = prepared_run["artifact_path"]
         state = prepared_run["state"]
         prepared = prepared_run["prepared"]
@@ -2349,7 +2491,9 @@ class SystemVariantRunner:
             _require(not (variant_root / "outcome.json").exists(),
                      "cached-prefix original outcome already exists")
         if self.capture_offline_case_input and spec is None:
-            self._freeze_offline_case_input(variant, item)
+            self._freeze_offline_case_input(
+                variant, item, **({"scene_overview": runtime_base_cfg.scene_overview}
+                                 if self.scene_overviews is not None else {}))
         shared_plan = {key: value for key, value in prepared_run["plan"].items()
                        if key != "skill_identity"}
         actual_context = {
@@ -2823,6 +2967,9 @@ class SystemVariantRunner:
         }
         if values["plan"].get("published_transport") is not None:
             receipt["published_transport"] = values["plan"]["published_transport"]
+        if "scene_overview" in values["plan"]:
+            for key in ("scene_overview", "scene_overview_sha256"):
+                receipt[key] = copy.deepcopy(values["plan"][key])
         self._write_create_once(
             self.root / "preflight"
             / f"{_variant_key(values['variant_id'])}.json",

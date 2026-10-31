@@ -46,7 +46,7 @@ from skill3d.evaluation.qa_partition_v11 import (
     partition_qa_variants,
     select_qa_execution_variants,
 )
-from skill3d.schemas.data_access import normalize_experiment_split
+from skill3d.schemas.data_access import is_train_test_partition, normalize_experiment_split
 from skill3d.online.config import (
     active_vision_from,
     load_config,
@@ -474,33 +474,42 @@ def _select_gate_variants(panel: dict, args) -> list[dict]:
 
 def _select_experiment_variants(panel: dict, args) -> tuple[list[dict], list[dict], dict | None]:
     manifest_path = args.experiment_split_manifest
-    if manifest_path or args.execution_role or args.gate_mode == "qa_disjoint":
+    if manifest_path or args.execution_role or args.gate_mode in {"qa_disjoint", "train_sample"}:
         if args.phase == "final_system":
-            if not manifest_path or args.execution_role != "validation":
+            if not manifest_path or args.execution_role not in {"validation", "test"}:
                 raise FitSetError("final_system manifest requires --execution-role validation and --experiment-split-manifest")
-            if args.gate_mode == "qa_disjoint":
-                raise FitSetError("final_system execution role does not use qa_disjoint or evolution")
+            if args.gate_mode in {"qa_disjoint", "train_sample"}:
+                raise FitSetError(f"final_system execution role does not use {args.gate_mode} or evolution")
         else:
             if args.execution_role:
                 raise FitSetError("--execution-role is only valid for final_system")
-            if not manifest_path or args.gate_mode != "qa_disjoint":
-                raise FitSetError("--experiment-split-manifest and --gate-mode qa_disjoint require each other")
+            if not manifest_path or args.gate_mode not in {"qa_disjoint", "train_sample"}:
+                raise FitSetError("--experiment-split-manifest and --gate-mode qa_disjoint/train_sample require each other")
         if args.gate_variant_ids or args.gate_panel_name:
             raise FitSetError("experiment split manifest cannot be mixed with legacy gate selectors")
         partition = load_qa_partition_manifest(manifest_path, metadata_path=args.metadata)
+        train_test = is_train_test_partition(partition.experiment_split)
+        if args.phase == "accumulation" and train_test != (args.gate_mode == "train_sample"):
+            raise FitSetError("train_sample requires the new train/test manifest; legacy QA manifests use qa_disjoint")
+        if args.execution_role == "test" and not train_test:
+            raise FitSetError("public test execution role requires a train/test manifest")
         selected = select_panel_variants(panel, args.panel_name)
         if args.phase == "final_system":
-            variants = select_qa_execution_variants(selected, partition, role=args.execution_role)
+            variants = select_qa_execution_variants(selected, partition, role="validation")
             gate_variants = []
             overlay = {key: value for key, value in partition.experiment_split.items()
                        if key != "identity_sha256"}
-            overlay["execution_role"] = args.execution_role
+            overlay["execution_role"] = "validation"
             experiment_split = normalize_experiment_split(overlay)
-            role = args.execution_role
+            role = "validation"
         else:
             if args.seed != partition.experiment_split["seed"]:
                 raise FitSetError("accumulation seed differs from frozen experiment split")
-            variants, gate_variants = partition_qa_variants(selected, partition)
+            if train_test:
+                variants = select_qa_execution_variants(selected, partition, role="learning")
+                gate_variants = []
+            else:
+                variants, gate_variants = partition_qa_variants(selected, partition)
             experiment_split = partition.experiment_split
             role = "learning"
         selected_ids = [value for value in args.variant_ids.split(",") if value]
@@ -579,6 +588,13 @@ def _run_system(args) -> int:
         if not args.bindings or not args.direct_run_root:
             raise FitSetError("legacy inputs require --bindings and --direct-run-root")
         bindings = load_variant_bindings(args.bindings, frozen_union)
+    scene_overviews = None
+    if getattr(args, "scene_overview_manifest", ""):
+        if published_inputs is None or not is_train_test_partition(experiment_split):
+            raise FitSetError("scene overviews require published train/test inputs")
+        from skill3d.online.scene_overview import SceneOverviewStore
+        scene_overviews = SceneOverviewStore(args.scene_overview_manifest)
+        scene_overviews.validate_entries(entries)
     raw = resolve_runtime(load_config(args.config), seed=args.seed)
     model = online_model_from(raw)
     if (
@@ -647,6 +663,7 @@ def _run_system(args) -> int:
         published_inputs = DerivedPublishedFitSetInputProvider(
             args.published_inputs, derivation_root=args.derived_binding_root,
             binding_cfg=_base_config(raw), max_scenes=args.scene_cache_size,
+            audit_mode=args.binding_derivation_audit_mode,
             **({"transport_locator": hot_runtime.locator,
                 "derived_replay": hot_runtime.closure["derived_replay"]} if hot_runtime else {}))
     if hot_runtime:
@@ -703,6 +720,7 @@ def _run_system(args) -> int:
         base_cfg=_base_config(raw),
         phase=args.phase,
         published_inputs=published_inputs,
+        **({"scene_overviews": scene_overviews} if scene_overviews is not None else {}),
         **({"deployment_continuation": args.deployment_continuation}
            if getattr(args, "deployment_continuation", None) else {}),
         **({"cached_prefix_recovery": args.cached_prefix_recovery}
@@ -937,7 +955,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="hash-pinned label-free r04 catalog and frozen scene inputs")
     run.add_argument("--derived-binding-root", default="",
                      help="explicit separate store for audited v3-to-current M5 derivation")
+    run.add_argument("--binding-derivation-audit-mode",
+                     choices=("reaudit", "reuse_source_audit"), default="reaudit",
+                     help="explicitly reuse reviewed source verdicts during v3 derivation")
     run.add_argument("--metadata", required=True)
+    run.add_argument("--scene-overview-manifest", default="",
+                     help="optional pinned scene-layout PNG manifest for the VSI1000 train/test input")
     run.add_argument("--transport-closure", default="")
     run.add_argument("--transport-cache-root", default="")
     run.add_argument("--transport-endpoint", default="")
@@ -994,18 +1017,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="primary: independent complete-trajectory analysis, then one anchored synthesis")
     run.add_argument("--experiment-split-manifest", default="",
                      help="opt-in hash-anchored QA learning/validation allocation; "
-                          "accumulation requires qa_disjoint; final_system requires "
+                          "accumulation requires qa_disjoint (legacy) or train_sample (train/test); final_system requires "
                           "--execution-role validation; source split stays unchanged")
-    run.add_argument("--execution-role", choices=("validation",), default="",
+    run.add_argument("--execution-role", choices=("validation", "test"), default="",
                      help="final_system only: execute manifest-authorized validation QAs "
                           "with frozen Skills, no learning/gate evolution; "
                           "same-scene question-disjoint from the manifest's learning role")
-    run.add_argument("--gate-mode", choices=("same_question", "scene_disjoint", "qa_disjoint"),
+    run.add_argument("--gate-mode", choices=("same_question", "scene_disjoint", "qa_disjoint", "train_sample"),
                      default="scene_disjoint",
                      help="qa_disjoint requires --experiment-split-manifest: "
                           "same-scene question-disjoint, not scene-disjoint; "
                           "all variants of a QA inherit one role; "
-                          "validation QAs cannot enter learning")
+                          "validation QAs cannot enter learning; train_sample requires "
+                          "the train/test manifest and samples unique training QAs "
+                          "within the same question-type/evidence slot per revision")
     gate_selector = run.add_mutually_exclusive_group()
     gate_selector.add_argument("--gate-variant-ids", default="",
                                help="comma-separated held-out IDs from the normalized panel")

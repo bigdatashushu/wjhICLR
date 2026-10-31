@@ -1,6 +1,7 @@
-"""One additional evaluation request with only frozen frames and the question.
+"""One additional evaluation request with frozen images and the question.
 
-No episode, Skill, scene, program, feedback or reference answer enters this API.
+Only an explicitly enabled precomputed overview supplements the frozen frames.
+No episode, Skill, program, feedback or reference answer enters this API.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import re
 from typing import Sequence
 
 from skill3d.schemas import AnswerPayload, CANONICAL_UNIT_BY_QUESTION_TYPE
-from skill3d.synthesis.prompt_builder import build_image_messages
+from skill3d.synthesis.prompt_builder import build_image_messages, scene_overview_manifest_text
 from skill3d.synthesis.request_context import request_phase
 from skill3d.verifier.derivation import replay_derivation
 
@@ -107,21 +108,40 @@ def request_visual_answer(*, question: str, options: Sequence[str], question_typ
         return None, {**audit, "skipped_reason": "requires_32_readable_frozen_frames"}
     if max_images < N_FRAMES or ledger.max_images < N_FRAMES:
         return None, {**audit, "skipped_reason": "image_limit_below_32"}
+    overview_id = ledger.scene_overview_image_id
+    if overview_id is not None and min(max_images, ledger.max_images) < N_FRAMES + 1:
+        return None, {**audit, "skipped_reason": "image_limit_below_33"}
     if client is None:
         return None, {**audit, "skipped_reason": "client_unavailable"}
     try:
-        prompt, messages, messages_sha256 = build_visual_request(
-            question=question, options=options, question_type=question_type,
-            frames=[ledger.frame_pixels(fid) for fid in ledger.frame_ids],
-            max_images=max_images)
-    except (KeyError, ValueError) as exc:
+        if overview_id is None:
+            prompt, messages, messages_sha256 = build_visual_request(
+                question=question, options=options, question_type=question_type,
+                frames=[ledger.frame_pixels(fid) for fid in ledger.frame_ids],
+                max_images=max_images)
+        else:
+            ledger.ensure_frame_records()
+            plan = ledger.plan_round(
+                round_index=round_index, trigger=EVAL_VISUAL_PHASE,
+                derived_image_ids=[], original_frame_ids=ledger.frame_ids)
+            prompt = build_visual_prompt(question, options, question_type)
+            prompt += "\nImage 1: " + scene_overview_manifest_text(ledger.get(overview_id))
+            prompt += "\nImages 2-33: the 32 original video frames in chronological order."
+            messages = build_image_messages(
+                prompt, [ledger.pixels_of(i) for i in plan.original_image_ids],
+                extra=[(i, ledger.pixels_of(i)) for i in plan.derived_image_ids],
+                max_images=max_images)
+            ledger.bind_request(round_index, messages)
+            messages_sha256 = plan.request_sha256
+    except (KeyError, ValueError, OSError) as exc:
         return None, {**audit, "skipped_reason": "invalid_visual_input", "error": str(exc)}
     ledger.ensure_frame_records()
-    plan = ledger.plan_round(
-        round_index=round_index, trigger=EVAL_VISUAL_PHASE,
-        derived_image_ids=[], original_frame_ids=ledger.frame_ids)
+    if overview_id is None:
+        plan = ledger.plan_round(
+            round_index=round_index, trigger=EVAL_VISUAL_PHASE,
+            derived_image_ids=[], original_frame_ids=ledger.frame_ids)
     audit.update(
-        prompt=prompt, n_images=N_FRAMES, seed=seed, max_tokens=max_tokens,
+        prompt=prompt, n_images=plan.n_images, seed=seed, max_tokens=max_tokens,
         request_sha256=messages_sha256)
     ledger.mark_round_sent(round_index)
     ledger.mark_delivered(round_index, plan.image_ids)

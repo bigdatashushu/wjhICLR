@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Sequence
 
@@ -25,7 +26,10 @@ from skill3d.schemas.image_ledger import (
     IMAGE_LEDGER_SCHEMA_VERSION,
     LAYOUT_DERIVED_PLUS_ORIGINALS,
     LAYOUT_ORIGINALS_ONLY,
+    LAYOUT_OVERVIEW_PLUS_ORIGINALS,
+    LAYOUT_OVERVIEW_PLUS_DERIVED,
     ProducedImage,
+    SceneOverviewImage,
     ImageRound,
     TOKEN_ESTIMATE_SOURCE,
 )
@@ -76,6 +80,7 @@ class ImageLedger:
     # 当前正在执行的求解轮（runner 每轮设置）：工具产出图像时据此记账
     current_round: int = 0
     _seq: int = 0
+    _scene_overview_descriptor: Optional[dict] = field(default=None, repr=False)
 
     # ---- 冻结帧集（同一 FrameSet，不新采样视频帧；§9.4）----
     def set_frames(self, pixel_ids: Sequence[int], pixels: Sequence[np.ndarray],
@@ -149,6 +154,49 @@ class ImageLedger:
         self._order.append(image_id)
         return rec
 
+    @property
+    def scene_overview_image_id(self) -> Optional[str]:
+        if self._scene_overview_descriptor is None:
+            return None
+        return self._scene_overview_descriptor["image_id"]
+
+    def register_scene_overview(self, descriptor: dict, *,
+                                scene_id: Optional[str] = None) -> ProducedImage:
+        """Read the parent's verified PNG; freeze identity separately from FrameSet."""
+        from skill3d.online.scene_overview import read_overview_image
+
+        if self.max_images < 33:
+            raise ValueError("Scene overview requires max_images >= 33 (32 originals + 1)")
+        if (self._scene_overview_descriptor is not None
+                and descriptor != self._scene_overview_descriptor):
+            raise ValueError("Cannot replace a frozen scene overview within an episode")
+        descriptor = deepcopy(descriptor)
+        pixels = read_overview_image(descriptor, scene_id=scene_id)
+        arr = np.asarray(pixels)
+        if (arr.dtype != np.uint8 or arr.shape != (480, 640, 3)
+                or _digest(arr) != descriptor["rgb_sha256"]):
+            raise ValueError("Scene overview RGB pixels do not match the descriptor")
+        image_id = descriptor["image_id"]
+        if not isinstance(image_id, str) or not image_id or image_id.startswith("frame-"):
+            raise ValueError("Scene overview needs a non-frame image_id")
+        if image_id in self._entries:
+            if self.scene_overview_image_id != image_id:
+                raise ValueError("Scene overview image_id collides with an existing image")
+            return self.get(image_id)
+        arr.setflags(write=False)
+        rec = SceneOverviewImage(
+            **{key: value for key, value in descriptor.items() if key != "image_path"},
+            produced_by="precomputed_scene_overview",
+            produced_round=0, source_hw=[480, 640], sent_hw=[480, 640],
+            transform_version="precomputed_scene_overview_v1",
+            content_sha256=f"sha256:{descriptor['rgb_sha256']}", n_pixels_sent=480 * 640,
+            token_estimate=estimate_image_tokens((480, 640)),
+        )
+        self._entries[image_id] = _Entry(record=rec, pixels=arr)
+        self._order.append(image_id)
+        self._scene_overview_descriptor = descriptor
+        return rec
+
     # ---- 查询 ----
     def get(self, image_id: str) -> ProducedImage:
         if image_id not in self._entries:
@@ -197,7 +245,7 @@ class ImageLedger:
     def undelivered_images_produced_in_round(self, round_index: int) -> list[str]:
         """本轮新产出、**从未交付过**的派生图（让出时点名没写清的兜底，仍然有界）。"""
         return [r.image_id for r in self.all_images()
-                if r.kind != "frame" and r.produced_round == int(round_index)
+                if r.kind in ("crop", "contact_sheet") and r.produced_round == int(round_index)
                 and not r.delivered_rounds]
 
     # ---- 每轮清单的布局（§9.4"事先声明的布局或分批观察方案"）----
@@ -212,18 +260,29 @@ class ImageLedger:
         existing = next((r for r in self.rounds if r.round_index == int(round_index)), None)
         if existing is not None and existing.delivered:
             raise ValueError("A sent image request is immutable; use a new round_index")
+        overview = []
+        if self._scene_overview_descriptor is not None:
+            # Re-read before every request: changed/missing files must not use cached pixels.
+            rec = self.register_scene_overview(self._scene_overview_descriptor)
+            overview = [rec.image_id]
         limit = max(1, int(self.max_images))
+        regular_limit = 32 if overview else limit
         unknown = set(derived_image_ids) - self._entries.keys()
         if unknown:
             raise ValueError(f"Unknown requested images: {sorted(unknown)}")
         requested = list(dict.fromkeys(
-            i for i in derived_image_ids if self.get(i).kind != "frame"))
+            i for i in derived_image_ids if self.get(i).kind in ("crop", "contact_sheet")))
         originals = [f"frame-{fid}" for fid in sorted(set(map(int, original_frame_ids)))]
+        if overview and (len(originals) != 32
+                         or originals != self.frame_image_ids(self.frame_ids)):
+            raise ValueError("Scene overview requires the same 32 readable frozen originals")
         # Keep at least one original for spatial context and the multimodal contract.
         derived = requested[:min(max(0, int(self.max_derived_images)),
-                                 max(0, limit - bool(originals)))]
+                                 max(0, regular_limit - bool(originals)))]
+        if overview and not any(r.delivered for r in self.rounds):
+            derived = []
         chosen, omitted_derived = list(derived), []
-        remaining = max(0, limit - len(chosen))
+        remaining = max(0, regular_limit - len(chosen))
         relevant = list(dict.fromkeys(
             f"frame-{self.get(i).source_frame_id}" for i in derived
             if f"frame-{self.get(i).source_frame_id}" in originals))
@@ -234,7 +293,7 @@ class ImageLedger:
             selected.extend(pool[i] for i in np.linspace(0, len(pool) - 1, count, dtype=int))
         # Keep temporal order in the real request, independent of selection priority.
         chosen_originals = [i for i in originals if i in set(selected)]
-        chosen += chosen_originals
+        chosen = overview + chosen + chosen_originals
         omitted_originals = [i for i in originals if i not in set(chosen_originals)]
         chosen_set = set(chosen)
         omitted_derived = [i for i in requested if i not in chosen_set]
@@ -252,11 +311,12 @@ class ImageLedger:
         rnd = ImageRound(
             round_index=int(round_index), trigger=str(trigger),
             request_id=f"image-request-{int(round_index)}",
-            layout=(LAYOUT_DERIVED_PLUS_ORIGINALS
-                    if derived
-                    else LAYOUT_ORIGINALS_ONLY),
+            layout=((LAYOUT_OVERVIEW_PLUS_DERIVED if derived else LAYOUT_OVERVIEW_PLUS_ORIGINALS)
+                    if overview else
+                    (LAYOUT_DERIVED_PLUS_ORIGINALS if derived else LAYOUT_ORIGINALS_ONLY)),
             image_ids=chosen, original_image_ids=chosen_originals,
-            derived_image_ids=derived, n_images=len(chosen), max_images=limit,
+            derived_image_ids=overview + derived, scene_overview_image_ids=overview,
+            n_images=len(chosen), max_images=limit,
             omitted_originals=omitted_originals, omitted_derived=omitted_derived,
             n_pixels_total=n_pixels, token_estimate_total=tokens)
         if existing is not None:
@@ -382,15 +442,20 @@ class ImageLedger:
     # ---- 落盘 ----
     def stats(self) -> dict[str, Any]:
         imgs = self.all_images()
-        return {
+        stats = {
             "n_images_produced": len(imgs),
             "n_images_delivered": sum(1 for r in imgs if r.delivered_rounds),
             "n_images_observed": sum(1 for r in imgs if r.observed_rounds),
             "n_images_unobserved": sum(1 for r in imgs if not r.observed_rounds),
-            "n_derived_produced": sum(1 for r in imgs if r.kind != "frame"),
+            "n_derived_produced": sum(1 for r in imgs if r.kind in ("crop", "contact_sheet")),
             "n_derived_observed": sum(1 for r in imgs
-                                      if r.kind != "frame" and r.observed_rounds),
+                                      if r.kind in ("crop", "contact_sheet") and r.observed_rounds),
         }
+        overviews = [r for r in imgs if r.kind == "scene_overview"]
+        if overviews:
+            stats.update(n_scene_overview_produced=len(overviews),
+                         n_scene_overview_observed=sum(bool(r.observed_rounds) for r in overviews))
+        return stats
 
     def to_dict(self) -> dict[str, Any]:
         """落盘形态：三态 + 每轮清单 + 统计（像素与路径都不进 trace）。"""

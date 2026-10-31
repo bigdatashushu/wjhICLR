@@ -198,6 +198,18 @@ def _image_groups(ledger):
             "delivered_rounds", "observed_rounds", "unobserved_reason",
             "source_hw", "sent_hw", "scale", "transform_version",
         ))
+        if image.get("kind") == "scene_overview":
+            from skill3d.storage.offline_frames import OVERVIEW_DESCRIPTOR_FIELDS
+            common.update(_fields(image, sorted(
+                OVERVIEW_DESCRIPTOR_FIELDS - {"image_path", "image_id"})))
+            common.update(_fields(image, (
+                "sent_in_requests", "response_completed_in_requests",
+                "present_in_current_request",
+            )))
+            key = json.dumps(common, sort_keys=True)
+            group = groups.setdefault(key, {**common, "images": []})
+            group["images"].append(_fields(image, ("image_id",)))
+            continue
         key = json.dumps(common, sort_keys=True)
         group = groups.setdefault(key, {**common, "frames": []})
         frame = image.get("source_frame_id", image.get("source_frame_index"))

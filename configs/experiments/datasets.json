@@ -2,10 +2,10 @@
   "schema": "harness3d-dataset-registry/1",
   "datasets": {
     "vsi-bench": {
-      "aliases": ["vsibench", "vsi"],
-      "description": "VSI-Bench, using audited published v11 inputs",
-      "profile": "prepared.json",
-      "data_root": "data/vsi-bench"
+      "aliases": ["vsibench", "vsi", "vsi-m4-1000"],
+      "description": "VSI-Bench M4-success 1000 questions: 300 train / 700 test, all 164 scenes in both",
+      "profile": "vsi_m4_1000.json",
+      "data_root": "../vsibench-m4-success-1000"
     },
     "revsi": {
       "aliases": ["re-vsi"],

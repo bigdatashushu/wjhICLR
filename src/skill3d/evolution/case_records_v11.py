@@ -12,7 +12,7 @@ from typing import Any
 from skill3d.evaluation.mra import parse_numeric_answer
 from skill3d.routing.task_classifier import canonical_task
 from skill3d.schemas import DataAccessRecord, SkillSpecV11, V11ExperienceCase, utcnow_iso
-from skill3d.schemas.data_access import learning_authorization_for
+from skill3d.schemas.data_access import learning_authorization_for, validate_learning_source
 from skill3d.schemas.evidence import EvidenceProfile, skill_evidence_state
 
 
@@ -94,15 +94,41 @@ _IMAGE_REF_FIELDS = frozenset({
 
 def _image_ref(value: Any, *, source_ref: str) -> dict:
     row = deepcopy(_mapping(value))
-    _require(not set(row) - _IMAGE_REF_FIELDS,
+    from skill3d.storage.offline_frames import OVERVIEW_DESCRIPTOR_FIELDS
+    is_overview = row.get("kind") == "scene_overview"
+    overview_fields = OVERVIEW_DESCRIPTOR_FIELDS if is_overview else set()
+    _require(not set(row) - (_IMAGE_REF_FIELDS | overview_fields),
              "image_refs must contain provenance only, not pixels or GT annotations")
+    if is_overview:
+        from skill3d.schemas.image_ledger import SceneOverviewImage
+        _require(row.get("content_sha256") in (
+            row.get("rgb_sha256"), f"sha256:{row.get('rgb_sha256')}"),
+            "Scene overview content hash differs from its RGB identity")
+        _require("file_sha256" not in row or row["file_sha256"] == row.get("png_sha256"),
+                 "Scene overview file hash differs from its PNG identity")
+        provenance = {
+            key: value for key, value in row.items()
+            if key in SceneOverviewImage.model_fields or key == "schema"
+        }
+        # File refs use bare digests and omit delivery-only dimensions. Validate
+        # the same typed provenance without inventing observation facts in row.
+        provenance["content_sha256"] = f"sha256:{row.get('rgb_sha256')}"
+        provenance.setdefault("source_hw", [480, 640])
+        provenance.setdefault("sent_hw", [480, 640])
+        try:
+            SceneOverviewImage.model_validate(provenance)
+        except ValueError as exc:
+            raise V11ExperienceBuildError("Invalid scene overview provenance") from exc
+        _require(all(row.get(key) is None for key in (
+            "source_frame_id", "source_frame_index", "frame_id", "frame_set_hash", "box_xyxy")),
+            "A scene overview cannot claim video frame provenance")
     _require(all(
         not isinstance(value, Mapping)
         and (not isinstance(value, (list, tuple))
              or all(not isinstance(item, (Mapping, list, tuple)) for item in value))
         for value in row.values()
     ), "image_refs cannot contain embedded annotations")
-    for key in ("path", "uri", "url", "source_ref", "trace_ref"):
+    for key in ("path", "uri", "url", "source_ref", "trace_ref", "image_path"):
         if key in row:
             _require(isinstance(row[key], str) and not row[key].lower().startswith("data:"),
                      "image_refs cannot contain embedded image bytes")
@@ -146,6 +172,14 @@ def extract_case_image_refs(
         _image_ref(row, source_ref=f"adapter:image_refs/{position}")
         for position, row in enumerate(image_refs)
     )
+    from skill3d.storage.offline_frames import OVERVIEW_DESCRIPTOR_FIELDS
+    overviews = {}
+    for ref in refs:
+        if ref.get("kind") == "scene_overview":
+            identity = {key: ref[key] for key in OVERVIEW_DESCRIPTOR_FIELDS - {"image_path"}
+                        if key in ref}
+            previous = overviews.setdefault(ref["image_id"], identity)
+            _require(previous == identity, "Recorded scene overview identities disagree")
     return refs
 
 
@@ -361,8 +395,11 @@ def case_from_fitset_outcome(
         _require(all(variant.get(field, "learning") == "learning"
                      for field in ("experiment_role", "experiment_split")),
                  "Validation role cannot enter learning case construction")
-        _require(source_split in {"induction", "inner_validation"}
-                 and variant.get("source_split", source_split) == source_split,
+        try:
+            validate_learning_source(authorization, variant.get("qa_id"), source_split)
+        except ValueError as exc:
+            raise V11ExperienceBuildError(str(exc)) from exc
+        _require(variant.get("source_split", source_split) == source_split,
                  "Authorized learning must preserve the real source_split")
     else:
         _require(source_split == "induction"
@@ -426,6 +463,8 @@ def case_from_fitset_outcome(
     _require(all(not ref.get("frame_set_hash") or not hashes
                  or ref["frame_set_hash"] == hashes[0] for ref in refs),
              "Image reference frame-set hash mismatch")
+    _require(all(ref.get("kind") != "scene_overview" or ref["scene_id"] == scene_id
+                 for ref in refs), "Image overview scene identity mismatch")
     rounds = extract_case_rounds(recorded, trace_ref=trace_ref)
 
     # Read only question-level labels after trace provenance passes admission.

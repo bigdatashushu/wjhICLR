@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import random
 import time
 from typing import Literal, Mapping
 
@@ -56,7 +57,7 @@ from skill3d.schemas import (
 )
 from skill3d.schemas.evidence import skill_evidence_state
 from skill3d.schemas.data_access import (
-    learning_authorization_for, validate_learning_authorization,
+    learning_authorization_for, validate_learning_authorization, validate_learning_source,
 )
 from pydantic import Field, model_validator
 from skill3d.skills.promote_atomic import read_snapshot
@@ -123,10 +124,10 @@ class FitSetEvolutionConfig:
                 "aggregate_v1", "full_cases_v1", "analysis_synthesis_v1",
                 "diagnosis_v1", "diagnosis_multimodal_v1"}:
             raise ValueError("unknown learning input mode")
-        if self.gate_mode not in {"same_question", "scene_disjoint", "qa_disjoint"}:
+        if self.gate_mode not in {"same_question", "scene_disjoint", "qa_disjoint", "train_sample"}:
             raise ValueError("unknown gate mode")
-        if self.gate_mode == "qa_disjoint" and self.gate_seeds != (137, 138):
-            raise ValueError("qa_disjoint requires frozen dual seeds 137/138")
+        if self.gate_mode in {"qa_disjoint", "train_sample"} and self.gate_seeds != (137, 138):
+            raise ValueError(f"{self.gate_mode} requires frozen dual seeds 137/138")
         if min(self.diagnosis_max_cases, self.diagnosis_max_input_chars,
                self.diagnosis_max_images, self.diagnosis_max_output_tokens) < 1:
             raise ValueError("diagnosis budgets must be positive")
@@ -145,7 +146,7 @@ class FitSetExperienceCase(Spec):
     scene_id: str
     question_type: str
     evidence_state: Literal["g0m0", "g1m0", "g1m1"]
-    source_split: Literal["induction", "inner_validation", "outer_holdout"]
+    source_split: Literal["induction", "inner_validation", "outer_holdout", "final_test"]
     experiment_role: Literal["fit_set_learning"] = "fit_set_learning"
     learning_authorization: dict = Field(default_factory=dict)
     delivered_skill_version: str
@@ -166,6 +167,9 @@ class FitSetExperienceCase(Spec):
     def _validate_identity(self):
         if self.learning_authorization:
             validate_learning_authorization(self.learning_authorization, [self.qa_id])
+            validate_learning_source(self.learning_authorization, self.qa_id, self.source_split)
+        elif self.source_split == "final_test":
+            raise ValueError("final_test learning requires explicit train/test authorization")
         if hashlib.sha256(self.delivered_skill_md.encode()).hexdigest() != (
                 self.delivered_content_sha256):
             raise ValueError("fit-set case delivery hash 改变")
@@ -374,8 +378,11 @@ def collect_fitset_case(variant: Mapping, outcome: Mapping,
         _require(all(variant.get(field, "learning") == "learning"
                      for field in ("experiment_role", "experiment_split")),
                  "Validation role cannot enter learning case construction")
-        _require(variant.get("split") in {"induction", "inner_validation"}
-                 and variant.get("source_split", variant["split"]) == variant["split"],
+        try:
+            validate_learning_source(authorization, variant["qa_id"], variant.get("split"))
+        except ValueError as exc:
+            raise FitSetError(str(exc)) from exc
+        _require(variant.get("source_split", variant["split"]) == variant["split"],
                  "Authorized learning must preserve the real source_split")
     key = f"{parent.skill_id}@{parent.version}"
     _require(outcome.get("delivered_skill_versions") == [key],
@@ -555,7 +562,10 @@ class FitSetWorkerEvolution:
                     variant=variant, outcome=outcome, parent=parent, label=label,
                     trace_ref=trace_ref, question_text=source["question_text"],
                     options=source["options"], frame_set_hash=source["frame_set_hash"],
-                    image_refs=source["image_refs"],
+                    image_refs=[
+                        *source["image_refs"],
+                        *([source["scene_overview_ref"]] if "scene_overview_ref" in source else []),
+                    ],
                     experiment_split=self.runner.experiment_split,
                 )
                 self._write_create_once(canonical_path, full_case.model_dump(mode="json"))
@@ -607,8 +617,48 @@ class FitSetWorkerEvolution:
         )
         return parent
 
+    def _train_sample_panel(self, request, parent, attempt_root):
+        pool_ids = self.runner.gate_panels[request.slot_key]
+        by_qa = {}
+        for variant_id in sorted(pool_ids):
+            row = self.rows[variant_id]
+            _require(row["slot_key"] == request.slot_key
+                     and row["question_type"] == request.question_type
+                     and row["evidence_state"] == request.evidence_state,
+                     "train_sample pool contains a different question type/evidence slot")
+            self.runner.learning_authorization(row)
+            by_qa.setdefault(row["qa_id"], variant_id)
+        key = {
+            "seed": self.runner.base_cfg.seed, "slot_key": request.slot_key,
+            "parent_skill_version": request.parent_skill_version,
+            "parent_content_sha256": parent.content_sha256,
+            "attempt_index": request.attempt_index,
+            "case_ids": [case.case_id for case in request.cases],
+        }
+        qa_ids = random.Random(content_sha256(key)).sample(
+            sorted(by_qa), min(self.config.gate_size, len(by_qa)))
+        body = {
+            "schema": "harness3d-train-sample-gate/1",
+            "sampling_identity": key, "sampling_identity_sha256": content_sha256(key),
+            "run_identity": self.runner.run_identity,
+            "experiment_split_sha256": self.runner.experiment_split["identity_sha256"],
+            "pool_rows_sha256": content_sha256([self.rows[value] for value in sorted(pool_ids)]),
+            "gate_size": self.config.gate_size, "gate_seeds": list(self.config.gate_seeds),
+            "qa_ids": qa_ids, "panel_ids": [by_qa[qa] for qa in qa_ids],
+        }
+        plan = {**body, "identity_sha256": content_sha256(body)}
+        path = attempt_root / "gate_plan.json"
+        if path.exists():
+            _require(json.loads(path.read_bytes()) == plan,
+                     "train_sample gate plan changed during resume")
+        else:
+            self._write_create_once(path, plan)
+        return plan["panel_ids"]
+
     def _gate(self, request, parent, candidate, attempt_root):
-        panel_ids = self.runner.gate_panels[request.slot_key]
+        panel_ids = (self._train_sample_panel(request, parent, attempt_root)
+                     if self.config.gate_mode == "train_sample"
+                     else self.runner.gate_panels[request.slot_key])
         if self.config.gate_mode == "qa_disjoint":
             learning_qa = {row["qa_id"] for row in self.runner.variants}
             _require(not learning_qa & {self.rows[value]["qa_id"] for value in panel_ids},
@@ -662,11 +712,16 @@ class FitSetWorkerEvolution:
                 gate_runner._request_category = "gate"
                 gate_runner.evolution_config = None
                 gate_runner._qa_disjoint_gate = self.config.gate_mode == "qa_disjoint"
+                gate_runner._train_sample_gate = self.config.gate_mode == "train_sample"
+                gate_runner._train_sample_partition = (
+                    copy.deepcopy(self.runner.experiment_split)
+                    if gate_runner._train_sample_gate else None)
                 gate_runner.capture_offline_case_input = False
                 gate_runner.label_metadata = {}
                 gate_runner.experiment_split = None
                 gate_runner.gate_deferred_reasons = {}
-                if gate_runner.published_inputs is not None or gate_runner._qa_disjoint_gate:
+                if (gate_runner.published_inputs is not None or gate_runner._qa_disjoint_gate
+                        or gate_runner._train_sample_gate):
                     gate_runner.input_contract_identity = copy.deepcopy(
                         self.runner.input_contract_identity)
                     gate_runner.input_contract_identity.pop("offline_metadata", None)
@@ -862,7 +917,7 @@ class FitSetWorkerEvolution:
                         raise RevisionOperationalError(
                             "continuation cannot replay an unresolved request under the same protocol")
         parent = self._parent_for(request)
-        if self.config.gate_mode == "qa_disjoint":
+        if self.config.gate_mode in {"qa_disjoint", "train_sample"}:
             for case in request.cases:
                 validate_learning_authorization(
                     case.learning_authorization, [case.qa_id], self.runner.experiment_split)
@@ -881,6 +936,8 @@ class FitSetWorkerEvolution:
                 })
                 self._write_create_once(result_path, asdict(result))
                 return result
+        if self.config.gate_mode == "train_sample":
+            self._train_sample_panel(request, parent, root)
         feedback = sanitized_slot_feedback(request.cases)
         self._write_create_once(root / "feedback.json", feedback)
         self._write_create_once(root / "request.json", {

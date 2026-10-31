@@ -4,6 +4,20 @@ harness3D 是以 Skill3D 为基础 codebase、面向 VSI-Bench 的 3D 空间感�
 
 专题说明、旧版架构与历史实验报告统一从 [文档索引](docs/README.md) 查阅。
 
+BLINK 的轨迹修订候选与同题直接回答诊断见
+[24 题对照](docs/blink_skill_pilot_20261031.md)；候选没有替换 v11 活跃快照。
+
+当前 `./experiment.sh` 的 VSI-Bench 默认数据为 M4 重建成功场景的 1,000 题子集：
+训练 300 题、测试 700 题，两份均覆盖全部 164 个成功场景，题目无交集。
+每 12 条合格训练轨迹触发 Skill 修订，候选从训练集同题型随机抽取 8 题，
+父版和候选版复用该题单进行双 seed 检验；测试题只用于冻结 Skill 的评测。
+`./experiment.sh --check` 可无模型请求检查实际输入；
+配置为 `configs/experiments/vsi_m4_1000.json`，数据位于仓库同级
+`vsibench-m4-success-1000/`。旧配置、原始 source split 与冻结实验保持各自身份。
+此配置现在为每次系统求解请求额外附带一张 640×480 场景布局总览，
+原始 FrameSet 仍为 32 帧；训练、Gate 和测试一致使用，独立直答 baseline 保持
+32 帧。图片身份与学习轨迹回放规则见[场景总览输入](docs/vsi1000_scene_overview.md)。
+
 当前 checkout 已删除原 Skill-3D 副本、退役 BA/标定实现、v9/v10 演化与发布链、向量检索和 Memory 平台。历史实现通过对应 Git 提交复现。VSI-Bench 数据读取、split、帧集、VGGT/MoGe-2 重建、SAM2 分割、质量门及已有数据产物保持原实现。
 
 在线入口固定 `C1_tools_program`；旧 C0 直答、C2/C5 手工注入、Memory 参数和检索排序配置已删除。正常运行只读取 v11 active snapshot，B01/B11 与父/候选固定注入由对应实验驱动器执行。
