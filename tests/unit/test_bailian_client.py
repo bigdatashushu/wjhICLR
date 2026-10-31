@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import io
+import errno
+import http.client
 import json
+import traceback
 import urllib.error
 
 import pytest
@@ -108,6 +111,111 @@ def test_bailian_missing_or_rejected_key_is_service_unavailable(monkeypatch):
     with pytest.raises(ServiceUnavailable) as error:
         BailianClient(opener=rejected).chat([{"role": "user", "content": "hello"}])
     assert "do-not-leak" not in str(error.value)
+
+
+@pytest.mark.parametrize("failure,expected_code,expected_type", [
+    (TimeoutError("sensitive request detail"), "timeout", "TimeoutError"),
+    (urllib.error.URLError(TimeoutError("sensitive request detail")), "timeout", "TimeoutError"),
+    (urllib.error.URLError(OSError(errno.ETIMEDOUT, "sensitive request detail")),
+     "timeout", "TimeoutError"),
+    (urllib.error.URLError("sensitive request detail"), "transport_error", "URLError"),
+    (OSError("sensitive request detail"), "transport_error", "OSError"),
+    (http.client.RemoteDisconnected("sensitive request detail"),
+     "transport_error", "HTTPException"),
+])
+def test_transport_failure_records_safe_stage_without_retry(
+        monkeypatch, failure, expected_code, expected_type):
+    calls = []
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-secret-only")
+
+    def opener(request, timeout):
+        calls.append(timeout)
+        raise failure
+
+    client = BailianClient(opener=opener, timeout_s=600)
+    with pytest.raises(ServiceUnavailable) as error:
+        client.chat([{"role": "user", "content": "sensitive prompt"}])
+    assert calls == [600]
+    diagnostic = client.last_service_error
+    assert diagnostic["reason_code"] == expected_code
+    assert diagnostic["exception_type"] == expected_type
+    assert diagnostic["request_stage"] == "awaiting_headers"
+    assert diagnostic["http_status"] is None
+    assert diagnostic["timeout_s"] == 600 and diagnostic["elapsed_seconds"] >= 0
+    assert error.value.__suppress_context__ and error.value.__cause__ is None
+    rendered = json.dumps(diagnostic) + "".join(traceback.format_exception_only(error.value))
+    for forbidden in ("sensitive", "test-secret-only", "Authorization", "https://"):
+        assert forbidden not in rendered
+
+
+def test_body_timeout_is_distinct_and_diagnostic_resets_after_success(monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-only")
+
+    class TimedOut(Response):
+        def read(self):
+            raise TimeoutError("private body detail")
+
+    responses = iter([TimedOut({}), Response({
+        "model": "qwen3.8-flash",
+        "choices": [{"message": {"content": "B"}, "finish_reason": "stop"}],
+    })])
+    calls = []
+
+    def opener(request, timeout):
+        calls.append(timeout)
+        return next(responses)
+
+    client = BailianClient(opener=opener, timeout_s=600)
+    with pytest.raises(ServiceUnavailable):
+        client.chat([{"role": "user", "content": "test"}])
+    assert calls == [600]
+    assert client.last_service_error["reason_code"] == "timeout"
+    assert client.last_service_error["request_stage"] == "reading_body"
+    assert client.chat([{"role": "user", "content": "test"}]) == "B"
+    assert calls == [600, 600] and client.last_service_error == {}
+
+
+@pytest.mark.parametrize("status,error_type", [
+    (400, RuntimeError), (401, ServiceUnavailable), (408, ServiceUnavailable),
+    (429, ServiceUnavailable), (500, ServiceUnavailable), (503, ServiceUnavailable),
+])
+def test_http_error_preserves_status_without_reading_error_body_or_retry(
+        monkeypatch, status, error_type):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-secret-only")
+    calls = []
+
+    class SensitiveBody(io.BytesIO):
+        def read(self, *args):
+            pytest.fail("provider error body must not be read")
+
+    body = SensitiveBody(b"test-secret-only private-provider-body")
+
+    def opener(request, timeout):
+        calls.append(timeout)
+        raise urllib.error.HTTPError(
+            "https://private-endpoint", status, "private-provider-detail", {}, body)
+
+    client = BailianClient(opener=opener, timeout_s=600)
+    with pytest.raises(error_type) as error:
+        client.chat([{"role": "user", "content": "private prompt"}])
+    assert calls == [600] and body.closed
+    assert client.last_service_error["http_status"] == status
+    assert client.last_service_error["reason_code"] == "http_error"
+    assert client.last_service_error["request_stage"] == "awaiting_headers"
+    assert error.value.__suppress_context__ and error.value.__cause__ is None
+    rendered = json.dumps(client.last_service_error) + "".join(
+        traceback.format_exception_only(error.value))
+    assert "private" not in rendered and "test-secret-only" not in rendered
+
+
+@pytest.mark.parametrize("raw", [b"private malformed JSON", b"\xff", b"[]"])
+def test_invalid_response_records_safe_diagnostic_without_provider_text(monkeypatch, raw):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-only")
+    client = BailianClient(opener=lambda *args, **kwargs: io.BytesIO(raw))
+    with pytest.raises(RuntimeError) as error:
+        client.chat([{"role": "user", "content": "test"}])
+    assert client.last_service_error["reason_code"] == "invalid_response"
+    assert "private" not in str(error.value)
 
 
 def test_runner_uses_one_flash_client_for_all_online_phases(monkeypatch):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import http.client
 import json
@@ -69,11 +70,18 @@ def _base_url(value: str) -> str:
     return base
 
 
-def _scrub(text: str, secret: str) -> str:
-    result = str(text)
-    if secret:
-        result = result.replace(secret, "<redacted>")
-    return result
+def _transport_error(exc):
+    """Classify known exception types without inspecting their text or payload."""
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    timed_out = isinstance(reason, TimeoutError) or (
+        isinstance(reason, OSError) and reason.errno == errno.ETIMEDOUT)
+    if timed_out:
+        return "timeout", "TimeoutError"
+    if isinstance(exc, urllib.error.URLError):
+        return "transport_error", "URLError"
+    if isinstance(exc, http.client.HTTPException):
+        return "transport_error", "HTTPException"
+    return "transport_error", "OSError"
 
 
 class BailianClient:
@@ -118,6 +126,20 @@ class BailianClient:
         self.last_response_identity: dict = {}
         self.last_request_identity: dict = {}
         self.last_reasoning_content: str | None = None
+        self.last_service_error: dict = {}
+
+    def _record_service_error(self, code, stage, started, exception_type, http_status=None):
+        # Only locally generated codes and numeric values enter this receipt.
+        # No URL, headers, provider body, exception text, or credential is retained.
+        self.last_service_error = {
+            "schema": "bailian-service-error/1",
+            "reason_code": code,
+            "request_stage": stage,
+            "exception_type": exception_type,
+            "http_status": http_status,
+            "elapsed_seconds": round(max(0.0, time.monotonic() - started), 6),
+            "timeout_s": self.timeout_s,
+        }
 
     @property
     def configured(self) -> bool:
@@ -179,6 +201,8 @@ class BailianClient:
         enable_thinking: bool = False,
         top_p: Optional[float] = None,
     ) -> str:
+        started = time.monotonic()
+        self.last_service_error = {}
         payload = self.build_payload(
             messages, max_tokens=max_tokens, seed=seed, temperature=temperature,
             response_format=response_format, enable_thinking=enable_thinking, top_p=top_p)
@@ -194,6 +218,8 @@ class BailianClient:
         }
         api_key = os.environ.get(self.api_key_env, "").strip()
         if not api_key:
+            self._record_service_error(
+                "missing_credentials", "configuration", started, "ServiceUnavailable")
             raise ServiceUnavailable(f"{self.api_key_env} is not configured")
         request = urllib.request.Request(
             self.base_url + "/chat/completions",
@@ -204,19 +230,35 @@ class BailianClient:
                 "Content-Type": "application/json",
             },
         )
+        stage = "awaiting_headers"
         try:
             with self._opener(request, timeout=self.timeout_s) as response:
-                body = json.loads(response.read().decode("utf-8"))
+                stage = "reading_body"
+                raw = response.read()
+                stage = "decoding_body"
+                body = json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            detail = _scrub(exc.read().decode("utf-8", errors="replace"), api_key)
-            message = f"Bailian HTTP {exc.code}: {detail[:1200]}"
+            self._record_service_error(
+                "http_error", stage, started, "HTTPError", http_status=int(exc.code))
+            # Reading an error body can block again and obscure the HTTP status.
+            exc.close()
+            message = f"Bailian HTTP {exc.code}"
             if exc.code in {401, 403, 404, 408, 409, 429} or exc.code >= 500:
-                raise ServiceUnavailable(message) from exc
-            raise RuntimeError(message) from exc
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ServiceUnavailable(
-                _scrub(f"{type(exc).__name__}: {exc}", api_key)) from exc
+                raise ServiceUnavailable(message) from None
+            raise RuntimeError(message) from None
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+            code, exception_type = _transport_error(exc)
+            self._record_service_error(code, stage, started, exception_type)
+            raise ServiceUnavailable(f"Bailian {code} at {stage}") from None
+        except (UnicodeError, ValueError) as exc:
+            self._record_service_error(
+                "invalid_response", stage, started,
+                "UnicodeError" if isinstance(exc, UnicodeError) else "ValueError")
+            raise RuntimeError("invalid Bailian response encoding or JSON") from None
+        failure_message = "invalid Bailian response"
         try:
+            if not isinstance(body, dict):
+                raise ValueError("expected response object")
             usage = body.get("usage") or {}
             self.last_usage = dict(usage) if isinstance(usage, dict) else {}
             self.last_generation["usage_status"] = (
@@ -236,7 +278,10 @@ class BailianClient:
             self.last_reasoning_content = reasoning if isinstance(reasoning, str) else None
             content = message.get("content")
             if not isinstance(content, str) or not content:
+                failure_message += ": empty content"
                 raise ValueError("empty content")
             return content
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
-            raise RuntimeError(f"invalid Bailian response: {exc}") from exc
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+            self._record_service_error(
+                "invalid_response", "validating_body", started, "ValueError")
+            raise RuntimeError(failure_message) from None
