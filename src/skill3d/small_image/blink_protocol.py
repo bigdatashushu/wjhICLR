@@ -140,6 +140,9 @@ def response_record(client, text):
         "request_identity": dict(getattr(client, "last_request_identity", {}) or {}),
         "finish_reason": (getattr(client, "last_generation", {}) or {}).get("finish_reason"),
     }
+    service_error = getattr(client, "last_service_error", None)
+    if service_error:
+        record["service_error"] = dict(service_error)
     secret = os.environ.get(getattr(client, "api_key_env", ""), "")
     if secret and secret in json.dumps(record, ensure_ascii=False):
         raise ValueError("credential_in_response")

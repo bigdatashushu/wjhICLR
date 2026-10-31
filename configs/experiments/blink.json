@@ -12,7 +12,7 @@
     "model": "qwen3.8-flash",
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "api_key_env": "DASHSCOPE_API_KEY",
-    "timeout_s": 180,
+    "timeout_s": 600,
     "temperature": 0,
     "max_output_tokens": 8192
   },

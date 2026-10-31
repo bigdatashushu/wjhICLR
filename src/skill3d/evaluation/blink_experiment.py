@@ -231,7 +231,8 @@ class RecordedClient:
         try:
             text = self.governed.chat(messages, **kwargs)
         except BaseException as exc:
-            write_once(response, {"status": "error", "error_type": type(exc).__name__,
+            write_once(response, {"status": "error", "finished_at": time.time(),
+                                  "error_type": type(exc).__name__,
                                   **response_record(self.client, None)})
             raise
         record = response_record(self.client, text)
@@ -367,7 +368,12 @@ class Campaign:
             if current != expected:
                 raise ValueError("campaign_input_file_changed")
         usage = self.governor.summary()
-        if any(usage[k] for k in ("unknown_requests", "active_requests", "error_requests")):
+        if any(usage[k] for k in ("unknown_requests", "active_requests")):
+            raise RuntimeError("unresolved_or_failed_prior_requests")
+        if "recovery" in self.manifest:
+            from .blink_recovery import verify
+            verify(self)
+        elif usage["error_requests"]:
             raise RuntimeError("unresolved_or_failed_prior_requests")
 
     def references(self, role):
@@ -394,6 +400,11 @@ class Campaign:
                     "images": cache["images"], "artifact_sha256": cache["artifact_sha256"],
                     "model": self.profile["model"], "campaign": self.manifest["content_sha256"],
                     "mode": mode, "allowed_tools": TOOLS if mode == "system" else []}
+        if "recovery" in self.manifest:
+            from .blink_recovery import reused_operation
+            reused = reused_operation(self, problem, identity)
+            if reused is not None:
+                return reused
         op_id = sha_value(identity)
         destination = self.root/"results"/stage/(op_id+".json")
         intent = self.root/"intents"/(op_id+".json")

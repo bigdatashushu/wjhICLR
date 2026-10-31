@@ -25,6 +25,7 @@ from skill3d.small_image.precompute import SmallImagePrecomputer
 from skill3d.small_image.runner import SmallImageRunnerConfig, SmallImageSolver
 from skill3d.small_image.storage import save_prepared
 from skill3d.synthesis.bailian_client import BailianClient
+from skill3d.synthesis.client_errors import ServiceUnavailable
 from skill3d.synthesis.request_governor import RequestGovernor, RequestGovernorConfig
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -169,6 +170,38 @@ def test_request_intent_is_not_replayed_and_full_output_is_outside_budget(tmp_pa
     with pytest.raises(RuntimeError, match="request_replay_forbidden"):
         replay.chat([{"role": "user", "content": "test"}])
     assert len(base.captured) == 1
+
+
+def test_failed_request_records_timing_and_safe_diagnostic_and_remains_counted(tmp_path):
+    calls = []
+
+    def opener(request, timeout):
+        calls.append(timeout)
+        raise TimeoutError("private prompt and unit-test-placeholder")
+
+    base = BailianClient(opener=opener, timeout_s=600)
+    governor = RequestGovernor(tmp_path/"budget", RequestGovernorConfig(4, 1))
+    client = experiment.RecordedClient(base, governor, tmp_path, "operation", "solver")
+    with pytest.raises(ServiceUnavailable):
+        client.chat([{"role": "user", "content": "private question"}], enable_thinking=True)
+    response_path = tmp_path/"requests/operation/001.response.json"
+    before = response_path.read_bytes()
+    response = experiment.read(response_path)
+    intent = experiment.read(tmp_path/"requests/operation/001.intent.json")
+    assert response["finished_at"] >= intent["started_at"]
+    assert response["service_error"]["reason_code"] == "timeout"
+    assert response["service_error"]["request_stage"] == "awaiting_headers"
+    assert response["model_response"] is None and response["reasoning_content"] is None
+    assert response["usage"] == {} and response["status"] == "error"
+    assert "private" not in before.decode() and "unit-test-placeholder" not in before.decode()
+    summary = governor.summary()
+    assert summary["reserved_requests"] == summary["error_requests"] == 1
+    assert summary["active_requests"] == summary["unknown_requests"] == 0
+    replay = experiment.RecordedClient(base, governor, tmp_path, "operation", "solver")
+    with pytest.raises(RuntimeError, match="request_replay_forbidden"):
+        replay.chat([{"role": "user", "content": "private question"}])
+    assert calls == [600] and response_path.read_bytes() == before
+    assert governor.summary()["reserved_requests"] == 1
 
 
 def make_gate_pairs():
