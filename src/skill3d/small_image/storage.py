@@ -16,6 +16,23 @@ from .precompute import PreparedSmallImage, _prepared, validate_prepared_content
 SCHEMA = "small-image-prepared-storage/1"
 
 
+def index_prepared(root) -> dict[str, Path]:
+    """Index existing metadata; different artifacts for one input are ambiguous."""
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError("prepared root must exist")
+    index, identities = {}, {}
+    for path in sorted(root.rglob("metadata.json")):
+        metadata = json.loads(path.read_text())
+        if metadata.get("schema") != SCHEMA:
+            continue
+        key, artifact = metadata["input_sha256"], metadata["artifact_sha256"]
+        if key in identities and identities[key] != artifact:
+            raise ValueError("different prepared artifacts for the same input")
+        index[key], identities[key] = path.parent, artifact
+    return index
+
+
 def _sha(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:

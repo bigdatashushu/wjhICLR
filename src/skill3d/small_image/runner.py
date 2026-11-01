@@ -51,6 +51,8 @@ class SmallImageRunnerConfig:
     explicit_final_answer: bool = False
     capture_responses: bool = False
     expected_model: str = ""
+    prompt_profile: str = PROMPT_VERSION
+    evaluation_role: str = "benchmark"
 
     def __post_init__(self):
         for name in ("enable_thinking", "original_image_bytes", "explicit_final_answer",
@@ -59,14 +61,26 @@ class SmallImageRunnerConfig:
                 raise ValueError(f"invalid {name}")
         if not isinstance(self.expected_model, str):
             raise ValueError("invalid expected_model")
+        from .cv3d_protocol import VERSION as COMPACT_VERSION
+        if self.prompt_profile not in {PROMPT_VERSION, COMPACT_VERSION}:
+            raise ValueError("invalid prompt_profile")
+        compact = self.prompt_profile == COMPACT_VERSION
+        if self.evaluation_role not in {"benchmark", "test_development"}:
+            raise ValueError("invalid evaluation_role")
         for name, lower, upper in (
-            ("max_requests", 1, 4), ("max_solve_rounds", 1, 2),
+            ("max_requests", 1, 6 if compact else 4),
+            ("max_solve_rounds", 1, 5 if compact else 2),
             ("max_categories", 1, 24), ("max_tokens", 1, 8192),
             ("category_max_tokens", 1, 1024), ("max_feedback_chars", 256, 64000),
         ):
             value = getattr(self, name)
             if type(value) is not int or not lower <= value <= upper:
                 raise ValueError(f"invalid {name}")
+        if compact and (
+                self.max_requests != 6 or self.max_solve_rounds != 5
+                or not self.original_image_bytes or not self.explicit_final_answer
+                or self.evaluation_role != "test_development"):
+            raise ValueError("compact CV3D requires five program requests plus one finalization")
         if (type(self.seed) is not int or type(self.cell_timeout_s) not in (int, float)
                 or not math.isfinite(self.cell_timeout_s) or self.cell_timeout_s <= 0):
             raise ValueError("invalid seed or cell timeout")
@@ -101,6 +115,7 @@ class SmallImageResult:
     prompt_version: str = PROMPT_VERSION
     tool_version: str = TOOL_VERSION
     receipt_sha256: str = ""
+    evaluation_role: str = "benchmark"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -243,7 +258,8 @@ def public_model_identity(client, *, seed: int = 137) -> dict:
 
 
 def _result(problem, *, status, model_identity, frames=(), counts=None,
-            rounds=(), kernel=None, prepared=None, answer=None) -> SmallImageResult:
+            rounds=(), kernel=None, prepared=None, answer=None,
+            prompt_version=PROMPT_VERSION, evaluation_role="benchmark") -> SmallImageResult:
     counts = counts or {}
     results = kernel.tool_results if kernel is not None else []
     succeeded = sum(row.status == "ok" and row.error is None
@@ -265,6 +281,8 @@ def _result(problem, *, status, model_identity, frames=(), counts=None,
         succeeded_tool_calls=succeeded, authorization_count=len(authorizations),
         denied_authorizations=sum(row.get("allowed") is False for row in authorizations),
         rounds=tuple(rounds),
+        prompt_version=prompt_version,
+        evaluation_role=evaluation_role,
     )
     digest = hashlib.sha256(json.dumps(
         value.to_dict(), sort_keys=True, ensure_ascii=True, allow_nan=False,
@@ -327,8 +345,11 @@ def preflight_small_image(problem: SmallImageProblem, *, client=None,
             from .blink_protocol import original_messages
             original_messages(problem, "")
     except (OSError, ValueError, TypeError):
-        return _result(problem, status="input_error", model_identity=identity)
-    return _result(problem, status="preflight", model_identity=identity, frames=frames)
+        return _result(problem, status="input_error", model_identity=identity,
+                       prompt_version=config.prompt_profile,
+                       evaluation_role=config.evaluation_role)
+    return _result(problem, status="preflight", model_identity=identity, frames=frames,
+                   prompt_version=config.prompt_profile, evaluation_role=config.evaluation_role)
 
 
 def validate_request_config(client, config):
@@ -351,7 +372,17 @@ def _interfaces(registry, names) -> str:
 
 
 def build_solver_prompt(problem, frames, registry, allowed_tools, *,
-                        finalizing=False, feedback=(), skill_text="") -> str:
+                        finalizing=False, feedback=(), skill_text="",
+                        profile=PROMPT_VERSION, official_prompt=None,
+                        remaining_requests=0) -> str:
+    from .cv3d_protocol import VERSION as COMPACT_VERSION, build_compact_prompt
+    if profile == COMPACT_VERSION:
+        return build_compact_prompt(
+            problem, frames, official_prompt=official_prompt, skill_text=skill_text,
+            feedback=feedback, interfaces=_interfaces(registry, allowed_tools),
+            finalizing=finalizing, remaining_requests=remaining_requests)
+    if profile != PROMPT_VERSION:
+        raise ValueError("unknown solver prompt profile")
     rows = parse_options(problem.options)
     hws = [{"view_index": i, "width": frame.shape[1], "height": frame.shape[0]}
            for i, frame in enumerate(frames)]
@@ -428,7 +459,7 @@ class SmallImageSolver:
                  registry_builder: Callable = build_registry,
                  governor: RequestGovernor | None = None,
                  config: SmallImageRunnerConfig | None = None,
-                 skill_text: str = ""):
+                 skill_text: str = "", official_prompt: str | None = None):
         self.client = client
         self.prepare = prepare
         self.registry_builder = registry_builder
@@ -437,6 +468,7 @@ class SmallImageSolver:
         if not isinstance(skill_text, str) or len(skill_text) > 24000:
             raise ValueError("skill text must be bounded")
         self.skill_text = skill_text
+        self.official_prompt = official_prompt
 
     def __call__(self, problem, **kwargs):
         return self.solve(problem, **kwargs)
@@ -453,11 +485,25 @@ class SmallImageSolver:
         def finish(status, answer=None):
             return _result(problem, status=status, model_identity=identity, frames=frames,
                            counts=counts, rounds=rounds, kernel=kernel, prepared=prepared,
-                           answer=answer)
+                           answer=answer, prompt_version=config.prompt_profile,
+                           evaluation_role=config.evaluation_role)
 
         try:
             frames = load_problem_frames(problem)
             validate_request_config(self.client, config)
+            from .cv3d_protocol import VERSION as COMPACT_VERSION, validate_official_prompt
+            if config.prompt_profile == COMPACT_VERSION:
+                validate_official_prompt(problem, self.official_prompt)
+                if not self.skill_text.strip():
+                    raise ValueError("compact CV3D needs a frozen task Skill")
+                # Category discovery belongs to the already supplied precompute.
+                # The six request slots are exclusively program solving/finalizing.
+                if prepared is None:
+                    raise ValueError("compact CV3D requires existing prepared evidence")
+                if categories is None:
+                    categories = ()
+                if len(self.skill_text) > 4500:
+                    raise ValueError("compact frozen Skill exceeds its reviewed size")
             if categories is not None:
                 categories = validate_categories(categories, max_categories=config.max_categories)
         except (OSError, TypeError, ValueError):
@@ -496,6 +542,10 @@ class SmallImageSolver:
                         row["request_payload_sha256"] = sha_value(client.build_payload(messages, **kwargs))
                         if phase != "category":
                             row["delivered_skill_sha256"] = sha_value(self.skill_text)
+                            if config.prompt_profile == COMPACT_VERSION:
+                                row["official_prompt_sha256"] = hashlib.sha256(
+                                    self.official_prompt.encode("utf-8")).hexdigest()
+                                row["prompt_profile"] = config.prompt_profile
                     text = client.chat(messages, **kwargs)
                     if config.capture_responses:
                         from .blink_protocol import response_record
@@ -561,6 +611,9 @@ class SmallImageSolver:
                     scene.question_tool_scope, scene.available_artifacts,
                     evidence_profile=scene.evidence_profile,
                     question_type=scene.question_type, local_facts=scene.local_facts))
+                if config.prompt_profile == COMPACT_VERSION:
+                    from .cv3d_protocol import task_tool_names
+                    allowed &= task_tool_names(problem.task_type)
                 kernel = RestrictedNamespaceKernel(
                     registry, scene, frames=list(frames), episode_id=problem.sample_id,
                     cell_timeout_s=config.cell_timeout_s)
@@ -573,7 +626,9 @@ class SmallImageSolver:
             for _index in range(config.max_solve_rounds):
                 prompt = build_solver_prompt(
                     problem, frames, registry, allowed, feedback=feedback,
-                    skill_text=self.skill_text)
+                    skill_text=self.skill_text, profile=config.prompt_profile,
+                    official_prompt=self.official_prompt,
+                    remaining_requests=config.max_requests - sum(counts.values()))
                 try:
                     text, row = request("solve", image_messages(prompt))
                 except RequestBudgetExhausted:
@@ -633,7 +688,9 @@ class SmallImageSolver:
             kernel.set_tools_enabled(False)
             prompt = build_solver_prompt(
                 problem, frames, registry, set(), finalizing=True, feedback=feedback,
-                skill_text=self.skill_text)
+                skill_text=self.skill_text, profile=config.prompt_profile,
+                official_prompt=self.official_prompt,
+                remaining_requests=config.max_requests - sum(counts.values()))
             if config.explicit_final_answer:
                 prompt = prompt.replace(
                     'Finalization: return ONLY one JSON object {"answer":"A"} with a valid '
@@ -679,8 +736,10 @@ class SmallImageSolver:
 
 def solve_small_image(problem: SmallImageProblem, *, client, prepared=None,
                       categories=None, prepare=None, governor=None,
-                      config=None, registry_builder=build_registry) -> SmallImageResult:
+                      config=None, registry_builder=build_registry,
+                      skill_text="", official_prompt=None) -> SmallImageResult:
     return SmallImageSolver(
         client, prepare=prepare, governor=governor, config=config,
-        registry_builder=registry_builder).solve(
+        registry_builder=registry_builder, skill_text=skill_text,
+        official_prompt=official_prompt).solve(
             problem, prepared=prepared, categories=categories)
