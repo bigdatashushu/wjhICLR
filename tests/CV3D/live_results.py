@@ -80,4 +80,5 @@ def snapshot(root=ROOT):
 
 
 if __name__ == "__main__":
-    print(json.dumps(snapshot(), ensure_ascii=False))
+    print(json.dumps(snapshot(Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT),
+                     ensure_ascii=False))

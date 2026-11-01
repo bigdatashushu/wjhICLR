@@ -38,7 +38,7 @@ def now():
     return datetime.now().astimezone().isoformat()
 
 
-def scores(inputs, answers, rows):
+def scores(inputs, answers, rows, *, protocol=PAIRED_PROTOCOL):
     arms = {arm: summarize(inputs, answers, rows[arm]) for arm in ("tools", "direct")}
     counts = Counter()
     for public in inputs:
@@ -50,15 +50,16 @@ def scores(inputs, answers, rows):
         counts["both_correct" if a and b else "tools_only" if a else
                "direct_only" if b else "both_wrong"] += 1
     return {
-        "protocol": PAIRED_PROTOCOL, "at": now(), "arms": arms,
+        "protocol": protocol, "at": now(), "arms": arms,
         "paired": dict(counts), "paired_count": sum(counts.values()),
         "complete": all(s["complete"] for s in arms.values()),
     }
 
 
 def schedule(inputs, identities, prepared_index, *, output, governor, client_factory,
-             answers, stop_event=None, concurrency=4, resume_sessions=False):
-    """Start 2 episodes per arm; lend idle capacity when one arm has no queued work."""
+             answers, stop_event=None, concurrency=4, resume_sessions=False,
+             solver=None, protocol=PAIRED_PROTOCOL, lend_idle=True):
+    """Split episode capacity equally, optionally lending idle capacity."""
     stop_event = stop_event or threading.Event()
     if concurrency < 2 or concurrency % 2:
         raise ValueError("paired concurrency must be an even number >= 2")
@@ -85,7 +86,7 @@ def schedule(inputs, identities, prepared_index, *, output, governor, client_fac
         queues[arm] = pending
 
     def worker(arm, public):
-        return solve(
+        return (solver or solve)(
             public, prepared_index.get(public.problem.input_sha256),
             arm=arm, client=client_factory(arm, public), governor=governor,
             output_directory=output / "episodes" / arm / public.problem.sample_id,
@@ -93,7 +94,7 @@ def schedule(inputs, identities, prepared_index, *, output, governor, client_fac
             **({"resume": True} if resume_sessions else {}))
 
     def publish():
-        value = scores(inputs, answers, rows)
+        value = scores(inputs, answers, rows, protocol=protocol)
         value["budget"] = governor.summary()
         write_json(output / "scores.json", value)
         print(json.dumps({
@@ -115,7 +116,8 @@ def schedule(inputs, identities, prepared_index, *, output, governor, client_fac
                 for arm in queues:
                     running = sum(a == arm for a, _ in active.values())
                     other = "direct" if arm == "tools" else "tools"
-                    cap = concurrency // 2 if queues[other] else concurrency
+                    cap = (concurrency if lend_idle and not queues[other]
+                           else concurrency // 2)
                     if queues[arm] and running < cap:
                         eligible.append((running, arm))
                 if not eligible:

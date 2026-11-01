@@ -40,7 +40,7 @@ def follow(args):
                     count["completed"] += 1
                     count["correct"] += int(row["correct"])
                     phase = "训练核验" if row["phase"] == "protocol_train" else "测试"
-                    arm = "工具组" if row["arm"] == "tools" else "直接组"
+                    arm = args.tools_label if row["arm"] == "tools" else "直接组"
                     verdict = "对" if row["correct"] else "错"
                     if row["status"] != "answered":
                         verdict = row["status"]
@@ -60,7 +60,7 @@ def follow(args):
                 if current != last_summary or time.monotonic() - last_heartbeat >= 30:
                     info = value["summary"]["test"]
                     parts = []
-                    for arm, name in (("tools", "工具组"), ("direct", "直接组")):
+                    for arm, name in (("tools", args.tools_label), ("direct", "直接组")):
                         row = info[arm]
                         accuracy = (f'{row["accuracy_recorded"] * 100:.2f}%'
                                     if row["accuracy_recorded"] is not None else "—")
@@ -83,6 +83,7 @@ def main():
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--interval", type=float, default=10)
+    parser.add_argument("--tools-label", default="工具组")
     args = parser.parse_args()
     if args.interval < 5 or not args.log.parent.is_dir():
         parser.error("interval must be at least 5 seconds and log directory must exist")

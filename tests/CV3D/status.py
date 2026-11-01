@@ -83,6 +83,10 @@ def status(root=DEFAULT_ROOT):
             value["requests"][key]["context"]["variant_id"] for key in active_ids
             if key < len(value["requests"])))
     config = json.loads((root / "run_config.json").read_text())
+    if not config.get("shared_slots_root"):
+        out["combined_active_request_slots"] = out.get("cv3d_active_requests", 0)
+        out["evaluation_role"] = config.get("evaluation_role", "benchmark")
+        return out
     slots = Path(config["shared_slots_root"])
     live = 0
     for index in range(4):

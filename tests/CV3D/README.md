@@ -1,5 +1,22 @@
 # CV3D 简化实验
 
+## 六轮主 Skill 与直答
+
+`program_paired.py --config <run_config.json> --execute` 调用实际的
+`SmallImageSolver`，与官方 prompt 直答同时运行。两组均使用原 RGB 文件字节、
+Qwen3.8-Flash thinking、temperature 0、seed 137 和 8192 output tokens。
+Skill 组最多五轮 Python 程序加一次 JSON 最终回答；两组各保留四路并发。
+工具实现、授权和 YieldObservations 重建保持主流程语义，逐轮保存真实参数、
+公开工具结果、模型身份和实际请求哈希。
+
+入口先零请求校验四道 train 与 840 道 test，再验证八个训练 episode 的合法回答
+和成功工具交互，通过后进入 test。独立请求账本为直答保留 844 次请求。
+服务、宿主或预算错误停止新请求，不自动重试。冻结 Skill 使用过 test 轨迹，
+因此结果标记为 `test_development`。`status.py <root>` 与
+`live_results.py <root>` 只读该运行目录，不调用模型。
+
+## 原生工具简化组
+
 模型输入只包含 Hugging Face `test_3d.jsonl` 中原样的 `prompt`（已经含 A/B 选项）、
 工具使用说明、标明身份的原始 RGB 图和同尺寸深度图。没有 Skill、
 Input JSON、求解规约或 Python 程序生成要求，也没有额外的 system 消息。
