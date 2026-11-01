@@ -121,7 +121,12 @@ def test_three_benchmarks_use_callable_solver_original_images_and_explicit_optio
     assert REGISTRY.names() == before
     text = client.calls[0][0][0]["content"][0]["text"]
     assert "video when the question says so" in text
-    assert "BOXES" in text and "POINT markers" in text
+    if benchmark == "mmsi":
+        assert "For CV3D" not in text and "POINT markers" not in text
+        assert result.prompt_version == "small-image-mmsi-ordered-options/1"
+        assert "Option labels and order are authoritative" in text
+    else:
+        assert "BOXES" in text and "POINT markers" in text
     assert "per_view_relative" in text and "world/camera transform" in text
 
 
@@ -448,11 +453,62 @@ def test_options_and_host_only_scoring(options, answer, wanted):
     (("B", "right"), "B"),
     (("A. left", "right"), "B"),
     (("B. left", "A. right"), "B"),
-    (("left", "LEFT"), "A"),
+    (("left", "LEFT"), "left"),
 ])
 def test_ambiguous_or_invalid_options_are_never_guessed(options, answer):
     with pytest.raises(ValueError):
         parse_small_image_answer(answer, options)
+
+
+@pytest.mark.parametrize("options", [
+    ("same", "same"),
+    ("(A) same", "(B) same"),
+    ("A. Same", "B. SAME"),
+])
+def test_repeated_choices_keep_ordered_labels_and_require_unambiguous_answers(options):
+    rows = parse_options(options)
+    assert [label for label, _ in rows] == ["A", "B"]
+    for label in ("A", "B"):
+        assert parse_small_image_answer(label, options) == label
+        assert score_small_image_answer(label, label, options)
+        assert not score_small_image_answer("B" if label == "A" else "A", label, options)
+    assert parse_small_image_answer(f"(B) {rows[1][1]}", options) == "B"
+    with pytest.raises(ValueError, match="unambiguous"):
+        parse_small_image_answer("same", options)
+    assert not score_small_image_answer("same", "B", options)
+
+
+def test_mmsi_repeated_options_reach_final_answer_with_original_order_and_no_cv3d_rules(tmp_path):
+    from dataclasses import replace
+    from skill3d.small_image.runner import MMSI_PROMPT_VERSION
+
+    p = replace(problem(tmp_path, "mmsi", 6), options=("(A) same", "(B) same"))
+    client = FakeClient([YIELD, YIELD, '{"answer":"B"}'])
+    preflight = preflight_small_image(p)
+    assert preflight.status == "preflight" and preflight.prompt_version == MMSI_PROMPT_VERSION
+    result = SmallImageSolver(client)(p, prepared=prepare(p), categories=())
+    assert result.status == "answered" and result.answer == "B" and result.request_count == 3
+    assert result.prompt_version == MMSI_PROMPT_VERSION and result.n_images == 6
+    for messages, _ in client.calls:
+        content = messages[0]["content"]
+        text = content[0]["text"]
+        assert "For CV3D" not in text and "POINT markers" not in text
+        assert "cross-view identity" in text and "Option labels and order" in text
+        assert '"label": "A", "text": "same"' in text
+        assert '"label": "B", "text": "same"' in text
+        assert len([part for part in content if part["type"] == "image_url"]) == 6
+    assert score_small_image_answer(result.answer, "B", p.options)
+
+
+def test_mmsi_profile_cannot_route_other_benchmarks(tmp_path):
+    from skill3d.small_image.runner import MMSI_PROMPT_VERSION
+
+    p = problem(tmp_path, "blink")
+    client = FakeClient([ANSWER])
+    config = SmallImageRunnerConfig(prompt_profile=MMSI_PROMPT_VERSION)
+    assert preflight_small_image(p, config=config).status == "input_error"
+    result = SmallImageSolver(client, config=config)(p, prepared=prepare(p), categories=())
+    assert result.status == "input_error" and client.calls == []
 
 
 def test_preflight_never_calls_client_and_unavailable_prepare_does_not_spend_category_request(tmp_path):

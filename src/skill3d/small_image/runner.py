@@ -30,6 +30,7 @@ from .precompute import validate_prepared_content
 from .tools import TOOL_NAMES, VERSION as TOOL_VERSION, build_registry
 
 PROMPT_VERSION = "small-image-solver/1"
+MMSI_PROMPT_VERSION = "small-image-mmsi-ordered-options/1"
 _LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _OPTION_PREFIX = re.compile(r"^(?:\(([A-Z])\)|([A-Z])[.):])\s*(.+)$", re.DOTALL)
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -63,7 +64,7 @@ class SmallImageRunnerConfig:
         if not isinstance(self.expected_model, str):
             raise ValueError("invalid expected_model")
         from .cv3d_protocol import VERSION as COMPACT_VERSION, SUPPORTED_PROFILES
-        if self.prompt_profile not in {PROMPT_VERSION, *SUPPORTED_PROFILES}:
+        if self.prompt_profile not in {PROMPT_VERSION, MMSI_PROMPT_VERSION, *SUPPORTED_PROFILES}:
             raise ValueError("invalid prompt_profile")
         compact = self.prompt_profile in SUPPORTED_PROFILES
         if self.send_depth_image and self.prompt_profile != COMPACT_VERSION:
@@ -87,6 +88,14 @@ class SmallImageRunnerConfig:
         if (type(self.seed) is not int or type(self.cell_timeout_s) not in (int, float)
                 or not math.isfinite(self.cell_timeout_s) or self.cell_timeout_s <= 0):
             raise ValueError("invalid seed or cell timeout")
+
+
+def _problem_config(problem, config):
+    if problem.benchmark == "mmsi" and config.prompt_profile == PROMPT_VERSION:
+        return replace(config, prompt_profile=MMSI_PROMPT_VERSION)
+    if config.prompt_profile == MMSI_PROMPT_VERSION and problem.benchmark != "mmsi":
+        raise ValueError("MMSI prompt profile requires MMSI inputs")
+    return config
 
 
 @dataclass(frozen=True)
@@ -146,8 +155,8 @@ def parse_options(options: Sequence[str]) -> tuple[tuple[str, str], ...]:
         rows.append((label, text))
     if any(prefixed) and not all(prefixed):
         raise ValueError("mixed labeled and unlabeled options")
-    if len({text.casefold() for _, text in rows}) != len(rows):
-        raise ValueError("duplicate option texts")
+    # Repeated MMSI choices remain distinct ordered options. Text-only answers
+    # must still resolve to exactly one label in parse_small_image_answer.
     return tuple(rows)
 
 
@@ -347,6 +356,7 @@ def preflight_small_image(problem: SmallImageProblem, *, client=None,
     config = config or SmallImageRunnerConfig()
     identity = public_model_identity(client, seed=config.seed) if client is not None else {}
     try:
+        config = _problem_config(problem, config)
         frames = load_problem_frames(problem, original_image_bytes=config.original_image_bytes)
         validate_request_config(client, config)
         if config.original_image_bytes:
@@ -384,6 +394,8 @@ def build_solver_prompt(problem, frames, registry, allowed_tools, *,
                         profile=PROMPT_VERSION, official_prompt=None,
                         remaining_requests=0, send_depth_image=False, context_state=None) -> str:
     from .cv3d_protocol import VERSION as COMPACT_VERSION, LEGACY_VERSION, build_compact_prompt
+    if problem.benchmark == "mmsi" and profile == PROMPT_VERSION:
+        profile = MMSI_PROMPT_VERSION
     if profile == LEGACY_VERSION:
         if send_depth_image or context_state is not None:
             raise ValueError("CV3D v1 requires original RGB and legacy feedback")
@@ -398,13 +410,30 @@ def build_solver_prompt(problem, frames, registry, allowed_tools, *,
             feedback=feedback, interfaces=_interfaces(registry, allowed_tools),
             finalizing=finalizing, remaining_requests=remaining_requests,
             send_depth_image=send_depth_image, context_state=context_state)
-    if profile != PROMPT_VERSION:
+    if profile not in {PROMPT_VERSION, MMSI_PROMPT_VERSION}:
         raise ValueError("unknown solver prompt profile")
+    if profile == MMSI_PROMPT_VERSION and problem.benchmark != "mmsi":
+        raise ValueError("MMSI prompt profile requires MMSI inputs")
     rows = parse_options(problem.options)
     hws = [{"view_index": i, "width": frame.shape[1], "height": frame.shape[0]}
            for i, frame in enumerate(frames)]
+    cv3d_instructions = (
+        "For CV3D Depth, identify the objects enclosed by the original red/blue "
+        "BOXES and reason about their depth; object representative points may help "
+        "but a box center is not necessarily the object's visible surface. "
+        "For CV3D Distance, visually locate the original colored POINT markers "
+        "(red, blue, green, etc.) and use their original pixel locations; never "
+        "replace those distance markers with detected candidate centers. "
+        "Preserve all original colored annotations. "
+        "Depth ordering and spatial distance are different questions. "
+        "Two-dimensional pixel distance does not substitute for 3D distance.\n"
+    ) if profile != MMSI_PROMPT_VERSION else ""
+    option_instructions = (
+        "Option labels and order are authoritative; repeated option text remains "
+        "separate choices. Submit the selected letter, not ambiguous repeated text.\n"
+    ) if profile == MMSI_PROMPT_VERSION else ""
     common = (
-        f"Harness3D small-image solver. Contract {PROMPT_VERSION}.\n"
+        f"Harness3D small-image solver. Contract {profile}.\n"
         "Use only the supplied original images, question, options and valid observations. "
         "Keep the supplied 1-6 images as given, with no 32-frame expansion, "
         "duplication, or generated views. They may be frames of a video when the "
@@ -415,15 +444,7 @@ def build_solver_prompt(problem, frames, registry, allowed_tools, *,
         "camera frames: compare only within the SAME view. They are neither meters "
         "nor registered world geometry. Never compare depth scales across images or "
         "infer a world/camera transform from independent point maps.\n"
-        "For CV3D Depth, identify the objects enclosed by the original red/blue "
-        "BOXES and reason about their depth; object representative points may help "
-        "but a box center is not necessarily the object's visible surface. "
-        "For CV3D Distance, visually locate the original colored POINT markers "
-        "(red, blue, green, etc.) and use their original pixel locations; never "
-        "replace those distance markers with detected candidate centers. "
-        "Preserve all original colored annotations. "
-        "Depth ordering and spatial distance are different questions. "
-        "Two-dimensional pixel distance does not substitute for 3D distance.\n"
+        f"{cv3d_instructions}{option_instructions}"
         "For BLINK/MMSI, anchor every camera, observer, object and region to its "
         "specified image/view index. Honor stated viewing directions, north/up axes "
         "and clockwise/counter-clockwise conventions. Camera x displacement alone "
@@ -506,6 +527,7 @@ class SmallImageSolver:
                            evaluation_role=config.evaluation_role)
 
         try:
+            config = _problem_config(problem, config)
             frames = load_problem_frames(problem, original_image_bytes=config.original_image_bytes)
             validate_request_config(self.client, config)
             from .cv3d_protocol import (
