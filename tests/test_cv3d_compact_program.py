@@ -96,6 +96,20 @@ def test_early_answer_uses_one_request_and_does_not_force_tool_measurements(tmp_
     assert result.attempted_tool_calls == 0
 
 
+def test_original_byte_mode_never_calls_legacy_opencv_encoder(tmp_path, monkeypatch):
+    from skill3d.small_image import runner
+    p = problem(tmp_path)
+    evidence = prepared(p)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("original-byte mode invoked the legacy image re-encoder")
+
+    monkeypatch.setattr(runner, "build_image_messages", forbidden)
+    client = FakeClient([ANSWER])
+    result = solver(client, p)(p, prepared=evidence)
+    assert result.status == "answered" and result.request_count == 1
+
+
 @pytest.mark.parametrize("changes", [
     {"max_requests": 7}, {"max_requests": 5}, {"max_solve_rounds": 6},
     {"max_solve_rounds": 2}, {"original_image_bytes": False},

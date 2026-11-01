@@ -225,7 +225,7 @@ def build_category_messages(question: str) -> list[dict]:
     ]
 
 
-def load_problem_frames(problem: SmallImageProblem) -> tuple[np.ndarray, ...]:
+def load_problem_frames(problem: SmallImageProblem, *, original_image_bytes=False) -> tuple[np.ndarray, ...]:
     if not isinstance(problem, SmallImageProblem):
         raise ValueError("requires a label-free SmallImageProblem")
     parse_options(problem.options)
@@ -237,8 +237,13 @@ def load_problem_frames(problem: SmallImageProblem) -> tuple[np.ndarray, ...]:
     for path in problem.image_paths:
         with Image.open(path) as image:
             frames.append(np.array(image.convert("RGB"), dtype=np.uint8, copy=True))
-    # Validate the actual multimodal input without a model request or GPU backend.
-    build_image_messages("", frames, max_images=len(frames), jpeg_quality=95)
+    # Validate the actual request representation. Original-byte requests do not
+    # need JPEG re-encoding or the OpenCV dependency used by the legacy encoder.
+    if original_image_bytes:
+        from .blink_protocol import original_messages
+        original_messages(problem, "")
+    else:
+        build_image_messages("", frames, max_images=len(frames), jpeg_quality=95)
     return tuple(frames)
 
 
@@ -339,7 +344,7 @@ def preflight_small_image(problem: SmallImageProblem, *, client=None,
     config = config or SmallImageRunnerConfig()
     identity = public_model_identity(client, seed=config.seed) if client is not None else {}
     try:
-        frames = load_problem_frames(problem)
+        frames = load_problem_frames(problem, original_image_bytes=config.original_image_bytes)
         validate_request_config(client, config)
         if config.original_image_bytes:
             from .blink_protocol import original_messages
@@ -489,7 +494,7 @@ class SmallImageSolver:
                            evaluation_role=config.evaluation_role)
 
         try:
-            frames = load_problem_frames(problem)
+            frames = load_problem_frames(problem, original_image_bytes=config.original_image_bytes)
             validate_request_config(self.client, config)
             from .cv3d_protocol import VERSION as COMPACT_VERSION, validate_official_prompt
             if config.prompt_profile == COMPACT_VERSION:

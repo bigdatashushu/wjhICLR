@@ -140,7 +140,7 @@ def main(argv=None) -> int:
             previews = {}
             for problem in problems:
                 prepared = load_prepared(prepared_index[problem.input_sha256], problem=problem)
-                frames = load_problem_frames(problem)
+                frames = load_problem_frames(problem, original_image_bytes=runner_config.original_image_bytes)
                 if _validate_prepared(prepared, problem, frames) is not None:
                     raise ValueError("prepared identity mismatch")
                 if 0 not in prepared.geometries or (
