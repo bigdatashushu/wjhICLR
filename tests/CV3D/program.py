@@ -7,8 +7,10 @@ from pathlib import Path
 import time
 
 from skill3d.schemas.tool_response import model_tool_response
-from skill3d.small_image.blink_protocol import image_identities, original_messages, response_record
-from skill3d.small_image.cv3d_protocol import VERSION, task_tool_names
+from skill3d.small_image.blink_protocol import image_identities, response_record
+from skill3d.small_image.cv3d_protocol import VERSION, task_tool_names, build_compact_messages
+from skill3d.small_image.depth_image import VERSION as DEPTH_IMAGE_VERSION
+from skill3d.small_image.cv3d_context import VERSION as CONTEXT_VERSION, FEEDBACK_VERSION
 from skill3d.small_image.runner import (
     SmallImageRunnerConfig, SmallImageSolver, _validate_prepared, build_solver_prompt,
     load_problem_frames,
@@ -21,7 +23,7 @@ from .common import digest, write_json
 from .data import verified_prepared
 from .inference import prepare_request as native_prepare, solve as native_solve
 
-PROTOCOL = "cv3d-compact-main-skill-versus-direct/1"
+PROTOCOL = "cv3d-compact-main-skill-versus-direct/3"
 
 
 def prepare_request(public, directory, *, arm, frozen, config):
@@ -29,6 +31,8 @@ def prepare_request(public, directory, *, arm, frozen, config):
         return native_prepare(public, arm=arm)
     if arm != "tools":
         raise ValueError("unknown experiment arm")
+    if frozen.prompt_profile != config.prompt_profile:
+        raise ValueError("frozen Skill manifest does not match the runner profile")
     problem = public.problem
     prepared = verified_prepared(public, directory)
     frames = load_problem_frames(problem, original_image_bytes=True)
@@ -42,11 +46,12 @@ def prepare_request(public, directory, *, arm, frozen, config):
     text = build_solver_prompt(
         problem, frames, registry, allowed, skill_text=frozen.texts[problem.task_type],
         profile=config.prompt_profile, official_prompt=public.official_prompt,
-        remaining_requests=config.max_requests)
-    messages = original_messages(problem, text)
+        remaining_requests=config.max_requests, send_depth_image=config.send_depth_image)
+    messages, png, display = build_compact_messages(
+        problem, text, prepared=prepared, send_depth_image=config.send_depth_image)
     identity = {
         **public.identity(), "arm": arm, "arm_label": "skill_program",
-        "evaluation_role": "test_development", "prompt_profile": VERSION,
+        "evaluation_role": "test_development", "prompt_profile": config.prompt_profile,
         "artifact_sha256": prepared.artifact_sha256,
         "initial_messages_sha256": digest(messages),
         "tools_sha256": digest(sorted(allowed)),
@@ -55,7 +60,15 @@ def prepare_request(public, directory, *, arm, frozen, config):
         "skills_manifest_sha256": frozen.manifest_sha256,
         "runner_config": asdict(config),
     }
-    return prepared, messages, sorted(allowed), None, identity
+    if config.prompt_profile == VERSION:
+        identity.update(context_protocol=CONTEXT_VERSION, feedback_protocol=FEEDBACK_VERSION)
+    if display is not None:
+        identity.update(image_input_protocol=DEPTH_IMAGE_VERSION, depth_display=display)
+        identity["images"].append({
+            "view_index": 0, "role": "predicted_depth", "sha256": display["png_sha256"],
+            "width": display["width"], "height": display["height"], "mime_type": "image/png",
+        })
+    return prepared, messages, sorted(allowed), png, identity
 
 
 class ProgramClient(BailianClient):
@@ -114,6 +127,12 @@ class ProgramClient(BailianClient):
                      "status": "error"}
             try:
                 result = call(*args, **kwargs)
+                if result.status != "ok" or result.error is not None or result.error_code:
+                    # Preserve the kernel's terminal tool-contract classification.
+                    # Serializing a failed result as success would replace it with ValueError.
+                    trace.update(status=result.status, error_code=result.error_code,
+                                 authorization=result.authorization)
+                    return result
                 # Preserve exactly the public values returned by the existing registry.
                 envelope = model_tool_response(result)
                 if isinstance(envelope["data"], dict):
@@ -167,12 +186,15 @@ def solve(public, prepared_directory, *, arm, client, governor, output_directory
         row["receipt_sha256"] = digest(row)
         write_json(Path(output_directory) / "result.json", row)
         return row
-    prepared, _, _, _, identity = prepare_request(
+    prepared, _, _, depth_png, identity = prepare_request(
         public, prepared_directory, arm=arm, frozen=frozen, config=config)
     if identity != expected_identity:
         raise ValueError("program input changed after preflight")
     directory = Path(output_directory)
     directory.mkdir(parents=True, exist_ok=True)
+    if depth_png is not None:
+        with (directory / "depth_preview.png").open("xb") as stream:
+            stream.write(depth_png)
     write_json(directory / "started.json", {
         "protocol": PROTOCOL, "input_identity": identity,
     }, exclusive=True)

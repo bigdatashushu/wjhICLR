@@ -11,13 +11,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PIL import Image
 
 from skill3d.small_image.runner import SmallImageRunnerConfig
 from skill3d.small_image.cv3d_protocol import FrozenCV3DSkills
+from skill3d.small_image.storage import load_prepared
 from skill3d.synthesis.request_governor import RequestGovernor, RequestGovernorConfig
 
 from .common import InferenceConfig, digest, read_json
-from .data import PublicInput
+from .data import PublicInput, render_depth
 from .governor import SharedSlots
 from .paired import schedule
 from .program import ProgramClient, PROTOCOL, prepare_request, solve
@@ -34,18 +36,35 @@ YIELD = """def solve(ctx):
 
 def settings():
     return SmallImageRunnerConfig(
-        prompt_profile="cv3d-compact-program/1", evaluation_role="test_development",
+        prompt_profile="cv3d-compact-program/2", evaluation_role="test_development",
         max_requests=6, max_solve_rounds=5, max_tokens=8192, enable_thinking=True,
         original_image_bytes=True, explicit_final_answer=True, capture_responses=True,
+        send_depth_image=True,
         expected_model="qwen3.8-flash")
 
 
-def frozen():
+def frozen(profile="cv3d-compact-program/2"):
     text = "Ground colored boxes and sample visible object surfaces."
     return SimpleNamespace(
+        prompt_profile=profile,
         texts={task: text for task in ("Depth", "Distance")},
         identities={task: hashlib.sha256(text.encode()).hexdigest()
                     for task in ("Depth", "Distance")}, manifest_sha256="a" * 64)
+
+
+def test_legacy_program_identity_uses_original_rgb_without_v2_context(tmp_path):
+    from dataclasses import replace
+
+    public, prepared_path, _ = fixture(tmp_path)
+    legacy = replace(settings(), prompt_profile="cv3d-compact-program/1", send_depth_image=False)
+    _, messages, _, png, identity = prepare_request(
+        public, prepared_path, arm="tools", frozen=frozen(legacy.prompt_profile), config=legacy)
+    assert identity["prompt_profile"] == legacy.prompt_profile
+    assert "context_protocol" not in identity and "feedback_protocol" not in identity
+    assert "image_input_protocol" not in identity and png is None
+    assert len([part for part in messages[0]["content"] if part["type"] == "image_url"]) == 1
+    with pytest.raises(ValueError, match="manifest does not match"):
+        prepare_request(public, prepared_path, arm="tools", frozen=frozen(), config=legacy)
 
 
 def run_program(tmp_path, monkeypatch, responses):
@@ -90,6 +109,9 @@ def test_six_requests_passive_trace_and_original_bytes(tmp_path, monkeypatch):
     assert row["program_result"]["finalization_requests"] == 1
     assert raw.summary()["reserved_requests"] == 6
     assert not stop.is_set()
+    prepared = load_prepared(tmp_path / "prepared", problem=public.problem)
+    expected_png, expected_display = render_depth(
+        prepared.geometries[0]["depth"], prepared.geometries[0]["valid_mask"])
     for ordinal, payload in enumerate(payloads):
         assert payload["max_tokens"] == 8192 and payload["enable_thinking"] is True
         assert payload["temperature"] == 0 and payload["seed"] == 137
@@ -97,12 +119,20 @@ def test_six_requests_passive_trace_and_original_bytes(tmp_path, monkeypatch):
         assert len(payload["messages"]) == 1
         parts = payload["messages"][0]["content"]
         images = [p for p in parts if p["type"] == "image_url"]
-        assert len(images) == 1
+        assert len(images) == 2
         assert base64.b64decode(images[0]["image_url"]["url"].split(",")[1]) == (
             __import__("pathlib").Path(public.problem.image_paths[0]).read_bytes())
+        depth_png = base64.b64decode(images[1]["image_url"]["url"].split(",")[1])
+        assert depth_png == expected_png == (tmp_path / "episode/depth_preview.png").read_bytes()
+        assert Image.open(io.BytesIO(depth_png)).size == (16, 12)
+        assert "PREDICTED DEPTH MAP" in parts[0]["text"]
+        assert "not a second camera view" in parts[0]["text"]
         intent = read_json(tmp_path / f"episode/{ordinal:04d}.intent.json")
+        assert len(intent["images"]) == 2
         assert intent["wire_payload_sha256"] == hashlib.sha256(wire[ordinal]).hexdigest()
         assert "PRIVATE_KEY_SENTINEL" not in json.dumps(intent)
+    assert row["input_identity"]["depth_display"] == expected_display
+    assert row["input_identity"]["images"][1]["sha256"] == hashlib.sha256(expected_png).hexdigest()
     trace = read_json(tmp_path / "episode/0000.tools.json")[0]
     assert trace["response"]["data"]["depth"] == pytest.approx(1.5)
     assert trace["arguments"] == {"view_index": 0, "x": 5, "y": 5}
@@ -114,6 +144,33 @@ def test_six_requests_passive_trace_and_original_bytes(tmp_path, monkeypatch):
     state = read_json(tmp_path / "budget/state.json")
     assert all(r["context"]["variant_id"] == "tools" for r in state["requests"])
     assert "private thinking" not in json.dumps(state)
+
+
+def test_direct_remains_original_only_and_old_rgb_identity_cannot_be_reused(tmp_path, monkeypatch):
+    public, prepared_path, _ = fixture(tmp_path)
+    _, direct_messages, direct_tools, png, _ = prepare_request(
+        public, prepared_path, arm="direct", frozen=frozen(), config=settings())
+    assert png is None and direct_tools == []
+    assert len([part for part in direct_messages[0]["content"] if part["type"] == "image_url"]) == 1
+    old_identity = prepare_request(
+        public, prepared_path, arm="tools", frozen=frozen(),
+        config=replace(settings(), send_depth_image=False))[-1]
+    new_identity = prepare_request(
+        public, prepared_path, arm="tools", frozen=frozen(), config=settings())[-1]
+    assert old_identity["initial_messages_sha256"] != new_identity["initial_messages_sha256"]
+    monkeypatch.setenv("PROGRAM_TEST_KEY", "OFFLINE_ONLY")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("changed input identity admitted a model request")
+
+    client = ProgramClient(InferenceConfig(), api_key_env="PROGRAM_TEST_KEY", opener=forbidden)
+    governor = RequestGovernor(tmp_path / "budget", RequestGovernorConfig(50, 8))
+    with pytest.raises(ValueError, match="input changed after preflight"):
+        solve(
+            public, prepared_path, arm="tools", client=client, governor=governor,
+            output_directory=tmp_path / "episode", frozen=frozen(), config=settings(),
+            expected_identity=old_identity)
+    assert governor.summary()["reserved_requests"] == 0
 
 
 def test_program_service_error_stops_without_retry(tmp_path, monkeypatch):
@@ -210,7 +267,7 @@ def fake_gateway(tmp_path):
 
 def process_fixture(tmp_path, gateway):
     skill_path = (Path(__file__).resolve().parents[2] /
-                  "skill_library/candidates/cv3d-compact-testdev-1/frozen_skills.json")
+                  "skill_library/candidates/cv3d-compact-testdev-2/frozen_skills.json")
     skills = FrozenCV3DSkills(skill_path)
     config = {
         "timeout_s": 10, "gateway": gateway, "auth_module_root": str(tmp_path),
@@ -252,6 +309,14 @@ def test_concurrent_processes_execute_kernel_and_six_requests(tmp_path, fake_gat
     assert "HOST_ONLY_GT" not in json.dumps(envelopes)
     assert all(envelope["payload"]["seed"] == 137 for envelope in envelopes)
     assert all(envelope["payload"]["enable_thinking"] is True for envelope in envelopes)
+    depth_images = {}
+    for envelope in envelopes:
+        operation = envelope["audit_identity"]["operation_id"]
+        images = [part for part in envelope["payload"]["messages"][0]["content"]
+                  if part["type"] == "image_url"]
+        assert len(images) == 2
+        image_pair = [part["image_url"]["url"] for part in images]
+        assert depth_images.setdefault(operation, image_pair) == image_pair
 
 
 def test_process_service_failure_stops_other_process_before_http(tmp_path, fake_gateway):

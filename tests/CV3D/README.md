@@ -5,11 +5,55 @@
 `program_paired.py --config <run_config.json> --execute` 调用实际的
 `SmallImageSolver`，与官方 prompt 直答同时运行。两组均使用原 RGB 文件字节、
 Qwen3.8-Flash thinking、temperature 0、seed 137 和 8192 output tokens。
+当前 `configs/cv3d_program.yaml` 启用 `send_depth_image: true`：
+Skill 组每轮同时收到原始 RGB 和同尺寸的 MoGe2 深度 PNG，包括最终回答阶段。
+Image 2 与 Image 1 共用 `view_index=0` 和原图像素坐标；深色近、浅色远，
+无效像素为洋红色。显示按有效深度 2%–98% 分位截断，工具继续读取原始数值。
+Qwen 直答组沿用官方题目和单张原 RGB。
 Skill 组最多五轮 Python 程序加一次 JSON 最终回答；两组各保留四路并发。
 每道 Skill 题在独立子进程主线程执行，保证 SIGALRM 单元超时和数值模块隔离。
 子进程只接收公开题目、冻结输入身份和独立预算路径；GT 留在宿主评分器。
-工具实现、授权和 YieldObservations 重建保持主流程语义，逐轮保存真实参数、
-公开工具结果、模型身份和实际请求哈希。
+工具实现与授权沿用主流程；上下文协议为 `cv3d-compact-program/2`，
+冻结 Skill 为 `cv3d-compact-testdev-2`。Skill 只描述双图解题策略，
+工具返回结构、全局控制接口与当前输出要求由宿主统一给出。
+逐轮保存真实参数、公开工具结果、模型身份和实际请求哈希。
+程序组保存 `depth_preview.png`、深度显示与原始数组哈希，以及每轮两张图片的身份。
+双图输入使用 `cv3d-original-rgb-and-depth/1` 身份；
+原图版本的旧输入哈希不能用于双图作答。已冻结的旧运行目录保持原有源码和结果。
+`configs/cv3d_program_v1.yaml` 保留 v1 的原 RGB、完整 Skill 和旧反馈协议，
+可用于新建的 v1 重放；提示词由 `cv3d_protocol_v1.py` 原样提供。
+加载器同时支持 v1/v2，清单的 `prompt_profile` 必须与 runner 一致；
+v1 禁止深度图和 v2 上下文。恢复已有实验仍须使用该运行目录的冻结源码，
+不能用新的主库源码替换原始来源清单或重写已有收据。
+
+### 每轮上下文
+
+| 轮次 | 输入 | 输出 |
+| --- | --- | --- |
+| 第 1 轮 | 官方题目、两图及一次图像说明、题型 Skill、工具接口与完整示例、无历史状态 | Python 程序，可测量、Yield 或提前回答 |
+| 第 2–5 轮 | 上述内容，加累计有效观测、轮次状态、模型显式备注和上一轮可修正错误 | 新 Python 程序，消耗同一五轮程序预算 |
+| 第 6 轮 | 题目、两图、Skill 的 Final assessment 决策段、已有观测与备注、轮次状态；不再提供测量策略、程序接口、示例和修复代码的提示 | 最终答案 JSON，工具禁用 |
+
+`ctx.tools` 只用于测量工具；`ReturnAnswer`、`AnswerPayload`、`YieldObservations`
+是全局接口。读取结果使用 `r['data'][field]`、`r['result_id']`。
+`YieldObservations(ids, reason='...')` 可携带目标与坐标对应、参考点及下一步的简短备注；
+每轮最多保留 400 字符，始终标记 `model_note_unverified`。不转发完整旧程序或
+`reasoning_content`，不让模型备注替代测量。
+相同结果对应的完全相同备注只保留最近一次，历史轮次状态和原始响应仍留存。
+
+观测协议 `cv3d-observations/2` 只把相同状态、版本、单位、定义和坐标说明提到公共区。
+每条观测保留真实数值、位置参数、`source_tool`、`result_id` 和所属轮次；
+完整原始 envelope 保留在 `program_result.rounds[].observations`，可无损还原。
+
+### 纠错与终止
+
+语法/程序解析错误、缺少提交动作、非法选项、错误观测 ID、已知控制接口命名空间错误、
+字典点号误用，以及未污染内核的常见 Python 错误可进入下一轮修正。
+错误状态留在原轮记录，下一轮收到固定修复说明及可用的报错行。
+已成功、可信的工具结果保留，无需重复采样。第六轮仅作最终判断，不再修代码。
+安全违规、工具契约/可信性失败、超时、服务错误和请求预算耗尽仍结束该题；
+服务/宿主/预算异常停止新派发，不自动重试 HTTP。
+所有修正都占用原来的五次程序请求，总上限仍是六次模型请求。
 
 入口先零请求校验四道 train 与 840 道 test，再验证八个训练 episode。
 训练要求直答均为合法答案、Skill 在每类任务至少有一个合法答案，并有成功工具交互；

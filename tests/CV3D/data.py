@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image
 
 from skill3d.small_image.datasets import SmallImageProblem, load_manifest, load_problems
+from skill3d.small_image.depth_image import render_depth_image as render_depth
 from skill3d.small_image.storage import load_prepared
 
 from .common import digest, read_json
@@ -138,36 +139,6 @@ def verified_prepared(public_input: PublicInput, directory):
         if points is None or points.shape != (*rgb.shape[:2], 3):
             raise ValueError("Distance requires the original-grid predicted point map")
     return prepared
-
-
-def render_depth(depth, valid_mask) -> tuple[bytes, dict]:
-    """Linear 2%-98% grayscale display; raw numerical tool data is never modified."""
-    depth = np.asarray(depth)
-    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(depth) & (depth > 0)
-    if depth.ndim != 2 or valid.shape != depth.shape or not np.any(valid):
-        raise ValueError("no valid predicted depth")
-    lo, hi = map(float, np.quantile(depth[valid], [0.02, 0.98]))
-    gray = np.zeros(depth.shape, dtype=np.uint8)
-    if hi > lo:
-        gray[valid] = np.rint(
-            np.clip((depth[valid] - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
-    else:
-        gray[valid] = 128
-    rgb = np.repeat(gray[..., None], 3, axis=-1)
-    rgb[~valid] = [255, 0, 255]
-    output = io.BytesIO()
-    Image.fromarray(rgb).save(output, format="PNG")
-    png = output.getvalue()
-    return png, {
-        "display": "linear_grayscale", "lower_quantile": 0.02, "upper_quantile": 0.98,
-        "lower_depth": lo, "upper_depth": hi, "invalid_color": [255, 0, 255],
-        "width": depth.shape[1], "height": depth.shape[0],
-        "png_sha256": hashlib.sha256(png).hexdigest(),
-        "raw_depth_sha256": digest({
-            "dtype": depth.dtype.str, "shape": list(depth.shape),
-            "bytes_sha256": hashlib.sha256(depth.tobytes(order="C")).hexdigest(),
-        }),
-    }
 
 
 def _image_part(data, mime):

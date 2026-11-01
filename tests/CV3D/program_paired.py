@@ -44,8 +44,9 @@ def source_identity():
     root = Path(__file__).resolve().parents[2]
     paths = list((root / "src").rglob("*.py"))
     paths += list((root / "tests/CV3D").glob("*.py"))
-    paths += [root / "configs/cv3d_program.yaml"]
-    paths += list((root / "skill_library/candidates/cv3d-compact-testdev-1").rglob("*"))
+    paths += [root / "configs/cv3d_program.yaml", root / "configs/cv3d_program_v1.yaml"]
+    for version in (1, 2):
+        paths += list((root / f"skill_library/candidates/cv3d-compact-testdev-{version}").rglob("*"))
     return {str(path.relative_to(root)): file_sha256(path)
             for path in sorted(paths) if path.is_file() and not path.name.startswith("test_")}
 
@@ -57,6 +58,8 @@ def preflight(config):
     raw_config = yaml.safe_load(Path(config["runner_config"]).read_text())
     runner = SmallImageRunnerConfig(**raw_config["solver"])
     frozen = FrozenCV3DSkills(config["skills_manifest"])
+    if frozen.prompt_profile != runner.prompt_profile:
+        raise ValueError("frozen Skill manifest does not match the runner profile")
     inputs = replay_inputs(config["public_manifest"], config["dataset_root"],
                            config["official_annotations"])
     train = [p for p in inputs if p.problem.source_split == "train"]

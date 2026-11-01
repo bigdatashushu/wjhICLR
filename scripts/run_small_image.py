@@ -19,7 +19,7 @@ from skill3d.small_image.runner import (
     validate_categories, load_problem_frames, _validate_prepared, build_solver_prompt,
 )
 from skill3d.small_image.cv3d_protocol import (
-    VERSION as CV3D_PROFILE, FrozenCV3DSkills, OfficialCV3DPrompts, task_tool_names,
+    SUPPORTED_PROFILES, FrozenCV3DSkills, OfficialCV3DPrompts, task_tool_names,
 )
 from skill3d.small_image.storage import index_prepared, load_prepared
 from skill3d.small_image.tools import build_registry, TOOL_NAMES
@@ -111,7 +111,7 @@ def main(argv=None) -> int:
             problems = load_problems(root, args.benchmark, args.split, args.limit)
         if not problems:
             raise ValueError("no selected public inputs")
-        compact = runner_config.prompt_profile == CV3D_PROFILE
+        compact = runner_config.prompt_profile in SUPPORTED_PROFILES
         if compact:
             if args.official_annotations is None or args.prepared_root is None:
                 raise ValueError("compact CV3D needs official annotations and prepared cache root")
@@ -119,6 +119,8 @@ def main(argv=None) -> int:
             if not skill_path.is_absolute():
                 skill_path = repository / skill_path
             frozen_skills = FrozenCV3DSkills(skill_path)
+            if frozen_skills.prompt_profile != runner_config.prompt_profile:
+                raise ValueError("frozen Skill manifest does not match the runner profile")
             official = OfficialCV3DPrompts(args.official_annotations)
             prepared_index = index_prepared(args.prepared_root)
             public_prompts = {p.sample_id: official.for_problem(p) for p in problems}
@@ -158,19 +160,27 @@ def main(argv=None) -> int:
                 prompt = build_solver_prompt(
                     problem, frames, registry, allowed,
                     skill_text=frozen_skills.texts[problem.task_type],
-                    profile=CV3D_PROFILE, official_prompt=public_prompts[problem.sample_id],
-                    remaining_requests=6)
-                from skill3d.small_image.blink_protocol import sha_value, original_messages
+                    profile=runner_config.prompt_profile, official_prompt=public_prompts[problem.sample_id],
+                    remaining_requests=6, send_depth_image=runner_config.send_depth_image)
+                from skill3d.small_image.blink_protocol import sha_value
+                from skill3d.small_image.cv3d_protocol import build_compact_messages
+                messages, _, depth_display = build_compact_messages(
+                    problem, prompt, prepared=prepared,
+                    send_depth_image=runner_config.send_depth_image)
                 previews[problem.sample_id] = {
                     "input_sha256": problem.input_sha256,
                     "artifact_sha256": prepared.artifact_sha256,
-                    "initial_messages_sha256": sha_value(original_messages(problem, prompt)),
+                    "initial_messages_sha256": sha_value(messages),
                     "official_prompt_sha256": hashlib.sha256(
                         public_prompts[problem.sample_id].encode("utf-8")).hexdigest(),
                     "skill_sha256": frozen_skills.identities[problem.task_type],
                 }
+                if depth_display is not None:
+                    from skill3d.small_image.depth_image import VERSION as DEPTH_IMAGE_VERSION
+                    previews[problem.sample_id]["depth_display"] = depth_display
+                    previews[problem.sample_id]["image_input_protocol"] = DEPTH_IMAGE_VERSION
             compact_identity = {
-                "protocol": CV3D_PROFILE, "evaluation_role": "test_development",
+                "protocol": runner_config.prompt_profile, "evaluation_role": "test_development",
                 "official_annotations_sha256": official.source_sha256,
                 "skills_manifest_sha256": frozen_skills.manifest_sha256,
                 "solver": config["solver"], "inputs": previews,
@@ -180,9 +190,12 @@ def main(argv=None) -> int:
                         repository / "scripts/run_small_image.py",
                         repository / "src/skill3d/small_image/runner.py",
                         repository / "src/skill3d/small_image/cv3d_protocol.py",
+                        repository / "src/skill3d/small_image/cv3d_protocol_v1.py",
                         repository / "src/skill3d/small_image/tools.py",
                         repository / "src/skill3d/small_image/storage.py",
                         repository / "src/skill3d/small_image/blink_protocol.py",
+                        repository / "src/skill3d/small_image/depth_image.py",
+                        repository / "src/skill3d/small_image/cv3d_context.py",
                     )
                 },
                 "run_request_budget": args.max_requests,

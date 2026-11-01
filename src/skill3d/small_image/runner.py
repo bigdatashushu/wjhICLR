@@ -48,6 +48,7 @@ class SmallImageRunnerConfig:
     # Opt-in protocol; existing campaigns retain their historical defaults.
     enable_thinking: bool = False
     original_image_bytes: bool = False
+    send_depth_image: bool = False
     explicit_final_answer: bool = False
     capture_responses: bool = False
     expected_model: str = ""
@@ -56,15 +57,17 @@ class SmallImageRunnerConfig:
 
     def __post_init__(self):
         for name in ("enable_thinking", "original_image_bytes", "explicit_final_answer",
-                     "capture_responses"):
+                     "capture_responses", "send_depth_image"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"invalid {name}")
         if not isinstance(self.expected_model, str):
             raise ValueError("invalid expected_model")
-        from .cv3d_protocol import VERSION as COMPACT_VERSION
-        if self.prompt_profile not in {PROMPT_VERSION, COMPACT_VERSION}:
+        from .cv3d_protocol import VERSION as COMPACT_VERSION, SUPPORTED_PROFILES
+        if self.prompt_profile not in {PROMPT_VERSION, *SUPPORTED_PROFILES}:
             raise ValueError("invalid prompt_profile")
-        compact = self.prompt_profile == COMPACT_VERSION
+        compact = self.prompt_profile in SUPPORTED_PROFILES
+        if self.send_depth_image and self.prompt_profile != COMPACT_VERSION:
+            raise ValueError("depth image input is defined for compact CV3D v2 only")
         if self.evaluation_role not in {"benchmark", "test_development"}:
             raise ValueError("invalid evaluation_role")
         for name, lower, upper in (
@@ -379,13 +382,22 @@ def _interfaces(registry, names) -> str:
 def build_solver_prompt(problem, frames, registry, allowed_tools, *,
                         finalizing=False, feedback=(), skill_text="",
                         profile=PROMPT_VERSION, official_prompt=None,
-                        remaining_requests=0) -> str:
-    from .cv3d_protocol import VERSION as COMPACT_VERSION, build_compact_prompt
+                        remaining_requests=0, send_depth_image=False, context_state=None) -> str:
+    from .cv3d_protocol import VERSION as COMPACT_VERSION, LEGACY_VERSION, build_compact_prompt
+    if profile == LEGACY_VERSION:
+        if send_depth_image or context_state is not None:
+            raise ValueError("CV3D v1 requires original RGB and legacy feedback")
+        from .cv3d_protocol_v1 import build_compact_prompt as legacy_prompt
+        return legacy_prompt(
+            problem, frames, official_prompt=official_prompt, skill_text=skill_text,
+            feedback=feedback, interfaces=_interfaces(registry, allowed_tools),
+            finalizing=finalizing, remaining_requests=remaining_requests)
     if profile == COMPACT_VERSION:
         return build_compact_prompt(
             problem, frames, official_prompt=official_prompt, skill_text=skill_text,
             feedback=feedback, interfaces=_interfaces(registry, allowed_tools),
-            finalizing=finalizing, remaining_requests=remaining_requests)
+            finalizing=finalizing, remaining_requests=remaining_requests,
+            send_depth_image=send_depth_image, context_state=context_state)
     if profile != PROMPT_VERSION:
         raise ValueError("unknown solver prompt profile")
     rows = parse_options(problem.options)
@@ -496,8 +508,10 @@ class SmallImageSolver:
         try:
             frames = load_problem_frames(problem, original_image_bytes=config.original_image_bytes)
             validate_request_config(self.client, config)
-            from .cv3d_protocol import VERSION as COMPACT_VERSION, validate_official_prompt
-            if config.prompt_profile == COMPACT_VERSION:
+            from .cv3d_protocol import (
+                VERSION as COMPACT_VERSION, SUPPORTED_PROFILES, validate_official_prompt,
+            )
+            if config.prompt_profile in SUPPORTED_PROFILES:
                 validate_official_prompt(problem, self.official_prompt)
                 if not self.skill_text.strip():
                     raise ValueError("compact CV3D needs a frozen task Skill")
@@ -548,6 +562,16 @@ class SmallImageSolver:
                         if phase != "category":
                             row["delivered_skill_sha256"] = sha_value(self.skill_text)
                             if config.prompt_profile == COMPACT_VERSION:
+                                from .cv3d_protocol import skill_for_stage
+                                delivered_skill = skill_for_stage(
+                                    self.skill_text, finalizing=phase == "finalization").strip()
+                                row["delivered_skill_sha256"] = sha_value(delivered_skill)
+                                row["frozen_skill_sha256"] = hashlib.sha256(
+                                    self.skill_text.encode("utf-8")).hexdigest()
+                                row["delivered_skill_scope"] = (
+                                    "final_assessment" if delivered_skill != self.skill_text.strip()
+                                    else "full_strategy")
+                            if config.prompt_profile in SUPPORTED_PROFILES:
                                 row["official_prompt_sha256"] = hashlib.sha256(
                                     self.official_prompt.encode("utf-8")).hexdigest()
                                 row["prompt_profile"] = config.prompt_profile
@@ -578,6 +602,10 @@ class SmallImageSolver:
                 return text, row
 
             def image_messages(prompt):
+                if config.send_depth_image:
+                    from .cv3d_protocol import build_compact_messages
+                    return build_compact_messages(
+                        problem, prompt, prepared=prepared, send_depth_image=True)[0]
                 if config.original_image_bytes:
                     from .blink_protocol import original_messages
                     return original_messages(problem, prompt)
@@ -616,7 +644,7 @@ class SmallImageSolver:
                     scene.question_tool_scope, scene.available_artifacts,
                     evidence_profile=scene.evidence_profile,
                     question_type=scene.question_type, local_facts=scene.local_facts))
-                if config.prompt_profile == COMPACT_VERSION:
+                if config.prompt_profile in SUPPORTED_PROFILES:
                     from .cv3d_protocol import task_tool_names
                     allowed &= task_tool_names(problem.task_type)
                 kernel = RestrictedNamespaceKernel(
@@ -628,12 +656,40 @@ class SmallImageSolver:
                 return finish("precompute_error")
 
             feedback = []
+            from .cv3d_context import CompactContext, correctable_guard, REPAIRABLE_RUNTIME
+            compact_context = CompactContext() if config.prompt_profile == COMPACT_VERSION else None
+
+            def record_context(row, round_number, *, cell=None, error_code=None, note="",
+                               result_ids=()):
+                if compact_context is None:
+                    return
+                observed = []
+                if cell is not None:
+                    # Reuse only trustworthy results. Never reset an untrusted kernel.
+                    for item in kernel.cell_results:
+                        if item.status != "ok" or item.error is not None or item.invalidated_by:
+                            continue
+                        envelope = model_tool_response(item)
+                        public = registry.public_fields.get(item.tool, ())
+                        if isinstance(envelope["data"], dict):
+                            envelope["data"] = {
+                                key: value for key, value in envelope["data"].items() if key in public}
+                        observed.append(envelope)
+                    row["observations"] = observed
+                compact_context.add_observations(observed, round_number)
+                compact_context.record(round_number, row["status"], cell=cell,
+                                       error_code=error_code, note=note, result_ids=result_ids)
+                row["context_state_after"] = compact_context.state()
+
             for _index in range(config.max_solve_rounds):
                 prompt = build_solver_prompt(
-                    problem, frames, registry, allowed, feedback=feedback,
+                    problem, frames, registry, allowed,
+                    feedback=compact_context.feedback() if compact_context else feedback,
                     skill_text=self.skill_text, profile=config.prompt_profile,
                     official_prompt=self.official_prompt,
-                    remaining_requests=config.max_requests - sum(counts.values()))
+                    remaining_requests=config.max_requests - sum(counts.values()),
+                    send_depth_image=config.send_depth_image,
+                    context_state=compact_context.state() if compact_context else None)
                 try:
                     text, row = request("solve", image_messages(prompt))
                 except RequestBudgetExhausted:
@@ -646,20 +702,43 @@ class SmallImageSolver:
                         row["program_source"] = program.program_source
                 except SynthesisError:
                     row["status"] = "program_parse_error"
+                    record_context(row, _index + 1, error_code="program_parse_error")
                     continue
                 guarded = ast_guard(program.program_source, allowed_tools=allowed)
                 if not guarded.ok or "ReadObservation" in program.program_source:
                     row["status"] = "program_rejected"
+                    if (compact_context and "ReadObservation" not in program.program_source
+                            and correctable_guard(guarded.violations)):
+                        row["correctable"] = True
+                        record_context(row, _index + 1, error_code="interface_misuse")
+                        continue
                     return finish("program_rejected")
                 action = check_action(program.program_source, tool_names=allowed)
                 if not action.ok:
                     row["status"] = "program_missing_action"
+                    record_context(row, _index + 1, error_code="program_missing_action")
                     continue
                 kernel.reset_user_namespace()
                 cell = kernel.run_cell(program.program_source)
                 row["tool_calls"] = len(kernel.cell_calls)
                 if cell.error_code or cell.answer_untrusted:
                     row["status"] = "run_error"
+                    if compact_context:
+                        row["execution_error"] = {
+                            "code": cell.error_code, "type": cell.error_type,
+                            "line": cell.error_line, "program_line": cell.error_source_line[:240],
+                            "answer_untrusted": cell.answer_untrusted,
+                        }
+                    if (compact_context and not cell.answer_untrusted and not kernel.answer_untrusted
+                            and not kernel.contract_violations
+                            and cell.error_code in {"violation_runtime", "violation_syntax"}
+                            and cell.error_type in REPAIRABLE_RUNTIME):
+                        row["correctable"] = True
+                        record_context(row, _index + 1, cell=cell, error_code=(
+                            "interface_misuse" if cell.error_type == "AttributeError" else "python_error"))
+                        if compact_context.feedback_chars() > config.max_feedback_chars:
+                            return finish("feedback_limit")
+                        continue
                     return finish("run_error")
                 if cell.answer is not None:
                     try:
@@ -669,14 +748,35 @@ class SmallImageSolver:
                         answer = parse_small_image_answer(payload.value, problem.options)
                     except (ValueError, TypeError):
                         row["status"] = "invalid_answer"
+                        record_context(row, _index + 1, cell=cell, error_code="invalid_answer")
+                        if compact_context and compact_context.feedback_chars() > config.max_feedback_chars:
+                            return finish("feedback_limit")
                         continue
                     row["status"] = "answered"
+                    record_context(row, _index + 1, cell=cell)
                     return finish("answered", answer)
                 valid = {item.result_id for item in kernel.tool_results
                          if item.status == "ok" and item.error is None and not item.invalidated_by}
                 if set(cell.yielded_result_ids) - valid:
                     row["status"] = "invalid_observation_reference"
+                    if compact_context:
+                        row["correctable"] = True
+                        record_context(row, _index + 1, cell=cell,
+                                       error_code="invalid_observation_reference")
+                        if compact_context.feedback_chars() > config.max_feedback_chars:
+                            return finish("feedback_limit")
+                        continue
                     return finish("invalid_observation_reference")
+                if compact_context:
+                    row["status"] = "yielded" if cell.terminated == "yield" else "no_answer"
+                    record_context(
+                        row, _index + 1, cell=cell, note=cell.yielded_reason,
+                        result_ids=cell.yielded_result_ids,
+                        error_code="no_answer" if cell.terminated != "yield" else None)
+                    if compact_context.feedback_chars() > config.max_feedback_chars:
+                        row["status"] = "feedback_limit"
+                        return finish("feedback_limit")
+                    continue
                 for item in kernel.cell_results:
                     envelope = model_tool_response(item)
                     public = registry.public_fields.get(item.tool, ())
@@ -692,10 +792,13 @@ class SmallImageSolver:
             kernel.reset_user_namespace()
             kernel.set_tools_enabled(False)
             prompt = build_solver_prompt(
-                problem, frames, registry, set(), finalizing=True, feedback=feedback,
+                problem, frames, registry, set(), finalizing=True,
+                feedback=compact_context.feedback() if compact_context else feedback,
                 skill_text=self.skill_text, profile=config.prompt_profile,
                 official_prompt=self.official_prompt,
-                remaining_requests=config.max_requests - sum(counts.values()))
+                remaining_requests=config.max_requests - sum(counts.values()),
+                send_depth_image=config.send_depth_image,
+                context_state=compact_context.state() if compact_context else None)
             if config.explicit_final_answer:
                 prompt = prompt.replace(
                     'Finalization: return ONLY one JSON object {"answer":"A"} with a valid '

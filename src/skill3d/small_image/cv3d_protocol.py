@@ -2,11 +2,41 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 from pathlib import Path
 import re
 
-VERSION = "cv3d-compact-program/1"
+from .cv3d_protocol_v1 import VERSION as LEGACY_VERSION
+
+VERSION = "cv3d-compact-program/2"
+SUPPORTED_PROFILES = frozenset({LEGACY_VERSION, VERSION})
+
+
+def build_compact_messages(problem, text, *, prepared, send_depth_image=False):
+    """Preserve original RGB bytes and optionally attach its same-grid depth PNG."""
+    from .blink_protocol import original_messages
+    from .depth_image import render_depth_image
+
+    messages = original_messages(problem, text)
+    if not send_depth_image:
+        return messages, None, None
+    if prepared is None or 0 not in prepared.geometries:
+        raise ValueError("depth image requires prepared same-view geometry")
+    if prepared.problem["input_sha256"] != problem.input_sha256:
+        raise ValueError("depth image input identity mismatch")
+    geometry = prepared.geometries[0]
+    height, width = prepared.frames[0].shape[:2]
+    if (geometry["depth"].shape != (height, width)
+            or geometry["valid_mask"].shape != (height, width)):
+        raise ValueError("depth image must match original RGB grid")
+    png, display = render_depth_image(geometry["depth"], geometry["valid_mask"])
+    messages[0]["content"].extend([
+        {"type": "text", "text": "Image 2: PREDICTED DEPTH MAP (same view_index=0)."},
+        {"type": "image_url", "image_url": {
+            "url": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}},
+    ])
+    return messages, png, display
 
 
 def task_tool_names(task):
@@ -24,10 +54,11 @@ class FrozenCV3DSkills:
         raw = path.read_bytes()
         manifest = json.loads(raw)
         if (manifest.get("schema") != "cv3d-frozen-skills/1"
-                or manifest.get("prompt_profile") != VERSION
+                or manifest.get("prompt_profile") not in SUPPORTED_PROFILES
                 or manifest.get("evaluation_role") != "test_development"
                 or set(manifest.get("tasks", {})) != {"Depth", "Distance"}):
             raise ValueError("invalid compact CV3D frozen Skill manifest")
+        self.prompt_profile = manifest["prompt_profile"]
         self.texts = {}
         self.identities = {}
         for task, record in manifest["tasks"].items():
@@ -97,49 +128,109 @@ def validate_official_prompt(problem, text):
         raise ValueError("compact CV3D requires verified official prompt")
 
 
+TOOL_DETAILS = {
+    "point_depth": "data keys: pixel_xy, depth, n_valid, view_index. Returns median camera-depth from the valid 5x5 neighborhood.",
+    "pair_point_distance": "data keys: a_xy, b_xy, distance, view_index. Euclidean distance between local median 3D camera points.",
+    "view_candidates": "data keys: candidates, count. Candidates contain category, box_xyxy and review flags; hints may be incomplete and category confirmation does not certify mask geometry.",
+    "view_depth_summary": "data keys: views (availability, n_valid, quantiles at 10/50/90 percent). Whole-view statistics, not target measurements.",
+}
+
+
+def compact_interfaces(interfaces):
+    rows = []
+    for line in interfaces.splitlines():
+        signature = line.split(": ", 1)[0]
+        name = signature.removeprefix("- ").split("(", 1)[0]
+        if name not in TOOL_DETAILS:
+            raise ValueError("unexpected compact tool interface")
+        rows.append(f"{signature}: {TOOL_DETAILS[name]}")
+    return "\n".join(rows)
+
+
+def program_contract(task):
+    field = "depth" if task == "Depth" else "distance"
+    return (
+        "Return only a complete Python program defining solve(ctx); the host calls it. "
+        "Measurement functions live in ctx.tools. The global names ReturnAnswer, "
+        "AnswerPayload and YieldObservations are already provided: do not import them "
+        "or prefix them with ctx or ctx.tools.\n"
+        "Tool returns are dictionaries: r['status'] == 'ok', r['data'][field], "
+        f"r['result_id']; never r.status or r.data. Read the measurement as r['data']['{field}'].\n"
+        "End with ReturnAnswer(AnswerPayload(value=letter, unit='option', "
+        "basis='mixed')) when measurements contribute, or basis='visual_estimate' "
+        "for a visual choice. letter must be the option you selected. "
+        "To inspect measurements next round, call YieldObservations([r['result_id'], ...], "
+        "reason='target-to-coordinate mapping and next check, at most 400 characters'). "
+        "Both global controls end the cell immediately. Only reason is carried as your "
+        "unverified working note; it cannot replace measured evidence.\n"
+        "Complete API example (illustrative availability check, not a required action):\n"
+        "```python\n"
+        "def solve(ctx):\n"
+        "    r = ctx.tools.view_depth_summary()\n"
+        "    YieldObservations([r['result_id']], reason='Availability checked; locate the targets next.')\n"
+        "```\n"
+        "Use basic Python and documented interfaces. No ReadObservation, file/network access, "
+        "host inspection, interface mutation or raw arrays. "
+        "Correctable format/API/Python errors receive feedback within the same five program slots; "
+        "security violations, tool failures, timeouts and service failures end the attempt."
+    )
+
+
+def skill_for_stage(skill_text, *, finalizing):
+    if finalizing and "\n## Final assessment\n" in skill_text:
+        return "## Final assessment\n" + skill_text.split("\n## Final assessment\n", 1)[1]
+    return skill_text
+
+
 def build_compact_prompt(problem, frames, *, official_prompt, skill_text,
-                         feedback, interfaces, finalizing, remaining_requests):
+                         feedback, interfaces, finalizing, remaining_requests,
+                         send_depth_image=False, context_state=None):
+    from .cv3d_context import CompactContext, VERSION as CONTEXT_VERSION
     validate_official_prompt(problem, official_prompt)
     h, w = frames[0].shape[:2]
     text = official_prompt + "\n\n" + (
-        f"Image 1 is the ORIGINAL RGB image, {w} x {h} pixels, view_index=0. "
-        "Coordinates use original pixels: x right, y down. The colored annotations "
-        "are object boxes. Depth and 3D point distances are same-view MoGe2 "
-        "predictions in per_view_relative units, not calibrated meters. "
-        "point_depth samples a radius-2 (5x5) neighborhood and needs at least "
-        "3 valid finite positive pixels; it does not filter by object masks. "
-        "pair_point_distance measures Euclidean distance between local median "
-        "predicted 3D points; it is available for Distance only. "
-        "Candidate detections are optional, non-exhaustive localization hints; "
-        "category confirmation does not validate a mask or geometry.\n"
+        f"Image 1: ORIGINAL RGB, {w} x {h} pixels, view_index=0. "
+        f"Use original pixel coordinates: x right, y down; 0 <= x < {w}, 0 <= y < {h}. "
+        "The colored boxes identify the question's instances. "
+        "Choose coordinates on this grid; do not assume an unspecified preview scale.\n"
     )
-    text += f"Task reasoning skill:\n{skill_text}\n"
-    text += "Valid observations: " + json.dumps(
-        list(feedback), ensure_ascii=True, allow_nan=False) + "\n"
+    if send_depth_image:
+        from .depth_image import depth_image_description
+        text += depth_image_description(w, h) + "\n"
+    text += "Measurement units are per_view_relative from MoGe2, not calibrated meters.\n"
+    skill_text = skill_for_stage(skill_text, finalizing=finalizing)
+    text += f"Task reasoning skill:\n{skill_text.strip()}\n\n"
+    if not finalizing:
+        text += "Program tools:\n" + compact_interfaces(interfaces) + "\n"
+        text += (
+            "Samples use radius 2 around the rounded pixel (5x5, clipped at image edges), "
+            "with at least 3 finite positive valid pixels; no object-mask filtering. "
+            "n_valid measures predicted support, not object membership.\n\n"
+        )
+    if not isinstance(feedback, dict):
+        empty = CompactContext()
+        empty.add_observations(feedback, 0)
+        feedback = empty.feedback()
+    context_state = context_state or CompactContext().state()
+    if finalizing and context_state.get("last_error"):
+        context_state = {
+            **context_state, "last_error": {"code": context_state["last_error"]["code"]}}
+    stage = "final answer" if finalizing else "program"
+    text += f"Current stage: {stage}; round {7 - remaining_requests}/6. Context {CONTEXT_VERSION}.\n"
+    text += f"Remaining model requests: {remaining_requests}, including finalization.\n"
+    text += ("No previous round or tool observations yet.\n" if remaining_requests == 6 else
+             "Previous Python variables have been cleared. Earlier code and thinking are not "
+             "available; use the observations, working notes and error feedback below.\n")
     text += (
-        f"Remaining model requests: {remaining_requests}, including finalization. "
-        "Previous Python variables have been cleared; use the observations above "
-        "without assuming previous code or reasoning is available.\n"
+        "Progress: " + json.dumps(context_state, ensure_ascii=True, allow_nan=False) + "\n"
+        "Feedback constants apply to their observations; source_tool and result_id identify "
+        "each measured result. Model notes are fallible context, not verified measurements.\n"
     )
+    text += "Valid observations: " + json.dumps(
+        feedback, ensure_ascii=True, allow_nan=False) + "\n\n"
     if finalizing:
         return text + (
-            'Finalization: return ONLY a JSON object with "answer" (one option letter) '
-            'and optional "reasoning" (a concise explanation). '
-            "No code, tool calls, or observation reads. "
-            "No further evidence requests are available.")
-    return text + (
-        "Program tools:\n" + interfaces + "\n"
-        "Successful returns are dictionaries with status='ok', values in data, "
-        "and result_id for yielding; there is no outer ok boolean. A failed or "
-        "untrusted executed call ends the attempt; do not probe failing calls or "
-        "assume try/except enables recovery. Do not use ReadObservation.\n"
-        "Return a complete def solve(ctx) Python program. Call ctx.tools.<name>(...) "
-        "using the listed arguments. Terminate with "
-        "ReturnAnswer(AnswerPayload(value=selected_letter, unit='option', "
-        "basis='mixed')) when measurements support the choice, or "
-        "basis='visual_estimate' for an image-based choice. To let the model inspect "
-        "successful measurements, terminate with YieldObservations([result_id, ...]). "
-        "Both controls end the cell immediately. Use only supplied evidence and "
-        "allowed tools; do not access files, networks, host internals or raw arrays. "
-        "Return one supplied option; do not abstain."
-    )
+            'Finalization: return ONLY {"answer":"<A or B>","reasoning":"<brief explanation>"}. '
+            "Select one supplied option using the images and existing observations. "
+            "Tools are disabled. Do not output Python or request another round.")
+    return text + "Output contract:\n" + program_contract(problem.task_type)
