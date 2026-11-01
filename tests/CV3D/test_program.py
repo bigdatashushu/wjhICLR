@@ -5,11 +5,15 @@ import hashlib
 import io
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from skill3d.small_image.runner import SmallImageRunnerConfig
+from skill3d.small_image.cv3d_protocol import FrozenCV3DSkills
 from skill3d.synthesis.request_governor import RequestGovernor, RequestGovernorConfig
 
 from .common import InferenceConfig, digest, read_json
@@ -17,6 +21,8 @@ from .data import PublicInput
 from .governor import SharedSlots
 from .paired import schedule
 from .program import ProgramClient, PROTOCOL, prepare_request, solve
+from .program_paired import source_identity
+from .program_worker import ProcessSolver, RunStop
 from .test_simplified import fixture
 
 
@@ -155,3 +161,106 @@ def test_eight_workers_remain_four_per_arm(tmp_path):
     assert peaks == {"tools": 4, "direct": 4}
     assert starts[:8].count("tools") == starts[:8].count("direct") == 4
     assert result["complete"] and result["protocol"] == PROTOCOL
+
+
+@pytest.fixture
+def fake_gateway(tmp_path):
+    envelopes = []
+    responses = [YIELD] * 5 + ['{"answer":"B"}']
+    counts = {}
+    mutex = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            envelope = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            with mutex:
+                operation = envelope["audit_identity"]["operation_id"]
+                step = counts.get(operation, 0)
+                counts[operation] = step + 1
+                envelopes.append(envelope)
+            if isinstance(responses[step], Exception):
+                self.send_error(503)
+                return
+            data = json.dumps({
+                "model": "qwen3.8-flash", "id": "process-fake",
+                "choices": [{"finish_reason": "stop", "message": {
+                    "role": "assistant", "content": responses[step]}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    (tmp_path / "transport_auth.py").write_text(
+        "def load_transport_token():\n    return 'OFFLINE_TEST_TRANSPORT'\n")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", envelopes, responses
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def process_fixture(tmp_path, gateway):
+    skill_path = (Path(__file__).resolve().parents[2] /
+                  "skill_library/candidates/cv3d-compact-testdev-1/frozen_skills.json")
+    skills = FrozenCV3DSkills(skill_path)
+    config = {
+        "timeout_s": 10, "gateway": gateway, "auth_module_root": str(tmp_path),
+        "skills_manifest": str(skill_path),
+    }
+    # Host-only label sentinel cannot enter worker transport, budget or process receipts.
+    manifest = {"source": source_identity(), "host_scoring_sentinel": "HOST_ONLY_GT"}
+    raw = RequestGovernor(tmp_path / "process-budget", RequestGovernorConfig(50, 8))
+    stop = RunStop(tmp_path / "stop")
+    wrapped = SharedSlots(raw, reserve_direct=1, stop_event=stop, stop_on_request_error=True)
+    solver = ProcessSolver(config, manifest, settings(), skills)
+
+    def run(task, ordinal):
+        directory = tmp_path / f"case-{ordinal}"
+        directory.mkdir()
+        public, prepared, _ = fixture(directory, task=task)
+        identity = prepare_request(
+            public, prepared, arm="tools", frozen=skills, config=settings())[-1]
+        return solver(
+            public, prepared, arm="tools", client=None, governor=wrapped,
+            output_directory=directory / "episode", stop_event=stop, expected_identity=identity)
+
+    return run, raw, stop
+
+
+def test_concurrent_processes_execute_kernel_and_six_requests(tmp_path, fake_gateway):
+    gateway, envelopes, _ = fake_gateway
+    run, raw, stop = process_fixture(tmp_path, gateway)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a, b = pool.submit(run, "Depth", 0), pool.submit(run, "Distance", 1)
+        rows = [a.result(), b.result()]
+    assert all(row["status"] == "answered" and row["answer"] == "B" for row in rows)
+    assert all(row["succeeded_tool_calls"] == 5 and row["request_count"] == 6 for row in rows)
+    assert raw.summary()["reserved_requests"] == len(envelopes) == 12
+    assert not stop.is_set()
+    processes = [read_json(tmp_path / f"case-{i}/episode/process.json") for i in range(2)]
+    assert len({record["pid"] for record in processes}) == 2
+    assert all(record["pid"] != __import__("os").getpid() for record in processes)
+    assert "HOST_ONLY_GT" not in json.dumps(envelopes)
+    assert all(envelope["payload"]["seed"] == 137 for envelope in envelopes)
+    assert all(envelope["payload"]["enable_thinking"] is True for envelope in envelopes)
+
+
+def test_process_service_failure_stops_other_process_before_http(tmp_path, fake_gateway):
+    gateway, envelopes, responses = fake_gateway
+    responses[0] = TimeoutError()
+    run, raw, stop = process_fixture(tmp_path, gateway)
+    first = run("Depth", 0)
+    assert first["status"] == "service_error" and stop.path.exists()
+    second = run("Distance", 1)
+    assert second["status"] == "budget_exhausted" and second["request_count"] == 0
+    assert len(envelopes) == raw.summary()["reserved_requests"] == 1
+    assert raw.summary()["error_requests"] == 1

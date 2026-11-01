@@ -6,11 +6,15 @@
 `SmallImageSolver`，与官方 prompt 直答同时运行。两组均使用原 RGB 文件字节、
 Qwen3.8-Flash thinking、temperature 0、seed 137 和 8192 output tokens。
 Skill 组最多五轮 Python 程序加一次 JSON 最终回答；两组各保留四路并发。
+每道 Skill 题在独立子进程主线程执行，保证 SIGALRM 单元超时和数值模块隔离。
+子进程只接收公开题目、冻结输入身份和独立预算路径；GT 留在宿主评分器。
 工具实现、授权和 YieldObservations 重建保持主流程语义，逐轮保存真实参数、
 公开工具结果、模型身份和实际请求哈希。
 
-入口先零请求校验四道 train 与 840 道 test，再验证八个训练 episode 的合法回答
-和成功工具交互，通过后进入 test。独立请求账本为直答保留 844 次请求。
+入口先零请求校验四道 train 与 840 道 test，再验证八个训练 episode。
+训练要求直答均为合法答案、Skill 在每类任务至少有一个合法答案，并有成功工具交互；
+模型程序失败原样保留，不按正确率筛选配置。通过后进入 test。
+独立请求账本为直答保留 844 次请求。
 服务、宿主或预算错误停止新请求，不自动重试。冻结 Skill 使用过 test 轨迹，
 因此结果标记为 `test_development`。`status.py <root>` 与
 `live_results.py <root>` 只读该运行目录，不调用模型。

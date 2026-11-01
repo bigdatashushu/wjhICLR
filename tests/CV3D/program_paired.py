@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from datetime import datetime
 import fcntl
-from functools import partial
 import json
 import os
 from pathlib import Path
@@ -31,7 +31,8 @@ from .common import InferenceConfig, digest, file_sha256, read_json, write_json
 from .data import index_prepared, replay_inputs
 from .governor import SharedSlots
 from .paired import schedule
-from .program import PROTOCOL, ProgramClient, prepare_request, solve
+from .program import PROTOCOL, prepare_request
+from .program_worker import ProcessSolver, RunStop
 from .transport import ProxyOpener, health
 
 
@@ -68,14 +69,20 @@ def preflight(config):
         raise ValueError("requires four train questions and unique phase IDs")
     index = index_prepared(config["prepared_root"])
     identities = {"tools": {}, "direct": {}}
-    for ordinal, public in enumerate(pilot + test, 1):
-        for arm in identities:
-            identities[arm][public.problem.sample_id] = prepare_request(
+    def check(public):
+        return public.problem.sample_id, {
+            arm: prepare_request(
                 public, index.get(public.problem.input_sha256), arm=arm,
                 frozen=frozen, config=runner)[-1]
-        if ordinal % 10 == 0 or ordinal == 844:
-            write_json(output / "preflight_progress.json", {
-                "at": now(), "checked": ordinal, "total": 844, "model_requests": 0})
+            for arm in identities}
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for ordinal, (sample_id, checked) in enumerate(pool.map(check, pilot + test), 1):
+            for arm in identities:
+                identities[arm][sample_id] = checked[arm]
+            if ordinal % 10 == 0 or ordinal == 844:
+                write_json(output / "preflight_progress.json", {
+                    "at": now(), "checked": ordinal, "total": 844, "model_requests": 0})
     manifest = {
         "protocol": PROTOCOL, "evaluation_role": "test_development",
         "config": config, "source": source_identity(),
@@ -118,15 +125,19 @@ def run(config, *, execute=False):
             raise ValueError("gateway identity or capacity changed")
         governor = RequestGovernor(output / "budget", RequestGovernorConfig(
             config["max_requests"], config["concurrency"]))
-        wrapped = SharedSlots(governor, reserve_direct=844, max_slots=8)
+        stop = RunStop(output / "stop_admission")
+        wrapped = SharedSlots(governor, reserve_direct=844, max_slots=8,
+                              stop_event=stop, stop_on_request_error=True)
         model_config = InferenceConfig(timeout_s=config["timeout_s"])
         os.environ["CV3D_PROXY_PLACEHOLDER"] = "local-proxy-configuration"
         run_id = digest(manifest)
+        process_solver = ProcessSolver(config, manifest, runner, frozen)
 
         def client_factory(arm, public):
+            if arm == "tools":
+                return None  # Its authenticated client is built only in the child.
             operation = digest({"arm": arm, "input": public.problem.input_sha256})
-            cls = ProgramClient if arm == "tools" else NativeToolClient
-            return cls(model_config, api_key_env="CV3D_PROXY_PLACEHOLDER",
+            return NativeToolClient(model_config, api_key_env="CV3D_PROXY_PLACEHOLDER",
                        opener=ProxyOpener(
                            gateway=config["gateway"], secret_loader=load_transport_token,
                            operation_id=operation, run_identity=run_id))
@@ -141,17 +152,22 @@ def run(config, *, execute=False):
                 answers={p.problem.sample_id: normalize_answer(
                     answer_map[(p.problem.source_split, p.problem.sample_id)], p.problem.options)
                          for p in selected},
-                solver=partial(solve, frozen=frozen, config=runner), protocol=PROTOCOL)
+                solver=process_solver, protocol=PROTOCOL, stop_event=stop)
             if not result["complete"]:
                 raise ValueError("main paired stage stopped")
             if stage == "protocol_train":
                 calls = sum(row["succeeded_tool_calls"] for row in rows["tools"].values())
-                if not calls or any(row["status"] != "answered"
-                                    for arm in rows for row in rows[arm].values()):
-                    raise ValueError("training did not establish legal answers and tool interaction")
+                tasks_answered = {row["task_type"] for row in rows["tools"].values()
+                                  if row["status"] == "answered"}
+                if (not calls or tasks_answered != {"Depth", "Distance"}
+                        or any(row["status"] != "answered" for row in rows["direct"].values())):
+                    raise ValueError("training did not establish task answers and tool interaction")
                 write_json(output / "protocol_validation.json", {
                     "status": "passed", "at": now(), "train_questions": 4,
                     "successful_tool_calls": calls, "requests": governor.summary(),
+                    "model_failure_statuses_retained": dict(Counter(
+                        row["status"] for row in rows["tools"].values())),
+                    "gate_uses_accuracy": False,
                     "test_scores_used_to_change_configuration": False,
                 }, exclusive=True)
         write_json(output / "completion.json", {

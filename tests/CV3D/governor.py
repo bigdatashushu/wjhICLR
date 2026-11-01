@@ -9,12 +9,13 @@ from skill3d.synthesis.request_governor import RequestBudgetExhausted
 
 class SharedSlots:
     def __init__(self, governor, shared_slots_root=None, *, reserve_direct=0, stop_event=None,
-                 max_slots=4):
+                 max_slots=4, stop_on_request_error=False):
         self.governor = governor
         self.slots_root = Path(shared_slots_root) if shared_slots_root else None
         self.reserve_direct = reserve_direct
         self.stop_event = stop_event
         self.max_slots = max_slots
+        self.stop_on_request_error = stop_on_request_error
 
     @contextmanager
     def request(self, category, context):
@@ -42,6 +43,8 @@ class SharedSlots:
             with ExitStack() as stack:
                 with (self.governor.root / "paired-admission.lock").open("a+b") as admission:
                     fcntl.flock(admission, fcntl.LOCK_EX)
+                    if self.stop_event is not None and self.stop_event.is_set():
+                        raise RequestBudgetExhausted("run stopped before locked admission")
                     with self.governor._locked():
                         state = self.governor._state()
                         direct_used = sum(r["context"].get("variant_id") == "direct"
@@ -51,7 +54,12 @@ class SharedSlots:
                                 len(state["requests"]) >= self.governor.config.max_requests - reserve):
                             raise RequestBudgetExhausted("direct baseline budget reserved")
                     receipt = stack.enter_context(self.governor.request(category, context))
-                yield receipt
+                try:
+                    yield receipt
+                except BaseException:
+                    if self.stop_on_request_error and self.stop_event is not None:
+                        self.stop_event.set()
+                    raise
         finally:
             if slot is not None:
                 slot.close()
