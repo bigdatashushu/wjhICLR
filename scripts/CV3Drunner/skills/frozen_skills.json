@@ -1,0 +1,16 @@
+{
+  "schema": "cv3d-frozen-skills/1",
+  "prompt_profile": "cv3d-box-review-program/3",
+  "evaluation_role": "test_development",
+  "revision": "annotation-grounding-and-next-request-measurement-review",
+  "tasks": {
+    "Depth": {
+      "path": "depth.md",
+      "sha256": "e74b70c865232d176117d35ce3aaed49576b6a5efd91b3a22d5703b8fff75040"
+    },
+    "Distance": {
+      "path": "distance.md",
+      "sha256": "c0b0fedc12231d689cce3eca394128e67727a9719407f3a633fbcc613054286f"
+    }
+  }
+}

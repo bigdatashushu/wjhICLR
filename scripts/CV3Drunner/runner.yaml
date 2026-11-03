@@ -1,0 +1,15 @@
+solver:
+  prompt_profile: cv3d-box-review-program/3
+  evaluation_role: test_development
+  max_requests: 6
+  max_solve_rounds: 5
+  max_tokens: 8192
+  cell_timeout_s: 30
+  max_feedback_chars: 24000
+  seed: 137
+  enable_thinking: true
+  original_image_bytes: true
+  send_depth_image: true
+  explicit_final_answer: true
+  capture_responses: true
+  expected_model: qwen3.8-flash
