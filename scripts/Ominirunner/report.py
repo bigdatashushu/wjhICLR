@@ -29,14 +29,14 @@ def report(root):
     metric_headers = [
         f'{label}（{score["table"]["direct"]["metrics"].get(group, {}).get("n", 0)}）'
         for group, label in zip(groups, labels)]
-    caps = "／".join(map(str, config["text_caps"]))
+    caps = "／".join("不设硬上限" if n is None else str(n) for n in config["text_caps"])
     lines = [
-        f"# Omni3D-Bench：静态 Skill 与原图直接作答的 {n} 题对照",
+        f"# Omni3D-Bench：原图表面复核程序组与千问直答的 {n} 题对照",
         "",
         f"本次完成 {n} 题、{2*n} 个 episode，按固定 VADAR 官方规则评分。"
         "保留此前 12 题，另按公开类型和题号加入 8 题；新增题用 "
         "`SHA256('omni20:137:'+sample_id)` 排序，在未使用的题目中选取 4 float、2 int、2 str。"
-        "本轮检查五轮程序协议下的作答和工具使用表现。",
+        "本轮复用此前同一批 20 题，检查原图标点、局部表面复核与结构化复核记录下的作答表现。",
         "",
         "| 方法 | "+" | ".join(metric_headers)+" | 逐题平均分 | 合法答案 | 请求 | 实际 token |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -63,17 +63,23 @@ def report(root):
         "每请求 `max_tokens=8192`。原图 JPEG 与完整官方题文逐题相同。"
         "直接组仅收到原图与原生答案 JSON 格式要求；静态组增加现有 MoGe2 深度、"
         f'逐题范围候选与局部数值工具、一份冻结短 Skill，最多 {config["max_program_rounds"]} '
-        "个程序轮及一个 JSON 终结轮。",
+        "个程序轮及一个 JSON 终结轮。工具调用与数值测量不设次数上限。",
         "",
-        f"每次请求重新组装上下文。各轮文本硬上限为 {caps} 字符，"
-        "静态组每轮最多两图；新测量在下一次请求中交付并复核。"
+        f"每次请求重新组装上下文。各轮文本限制为 {caps}，"
+        f'超过 {config.get("text_record_threshold", 10000)} 字符的请求记录长度与超出量。'
+        "程序组首轮两图，有测量后增加 RGB 标点副本与待复核点的原像素局部图；"
+        "程序轮保留全部测量事实，终结轮最多八条测量；局部图最多两页。"
+        "新测量在下一次请求中交付，由同一个千问模型记录 ID 和使用决定。"
         "完整程序与 thinking 留在宿主轨迹，不累积回模型上下文。",
         "",
         "## 运行与证据",
         "",
         f'- 审计时间：{datetime.fromtimestamp(audit["at"], timezone(timedelta(hours=8))).isoformat()}。',
         f'- 同一冻结身份：`{audit["run_identity"]}`，在线依赖源码 {audit["source_pins"]} 个文件。',
-        f'- 实际收费 {audit["charged_requests"]} 次，{2*n} 个 episode 请求、usage 与本次／既有主账本一致。',
+        f'- 本轮新增收费 {audit["charged_requests"]} 次；复用 {audit.get("reused_direct", 0)} '
+        '份原始直答。表中请求与 token 包含复用结果的历史用量，新增费用单独核验。',
+        f'- episode 调度并发 {frozen["max_episode_workers"]}，'
+        f'本轮实际请求峰值 {audit.get("peak_request_concurrency", 2)}。',
         "- 参考答案只由完成后的宿主评分读取，报告与在线请求没有 GT。",
     ]
     for arm in ("direct", "skill"):
@@ -84,6 +90,7 @@ def report(root):
             f'已准入数值测量 {sum(e["measurements"] for e in entries)}、'
             f'有效测量 {sum(e["valid_measurements"] for e in entries)}；'
             f'最大实际文本 {max(e["max_text_chars"] for e in entries)} 字符；'
+            f'超一万字符请求 {sum(len(e.get("over_threshold_rounds", [])) for e in entries)} 次；'
             f'含 thinking 正文的响应 {sum(e["thinking_content_requests"] for e in entries)} 次；'
             f'平均 episode {row["mean_episode_seconds"]:.1f} 秒。')
         lines.append(
@@ -96,7 +103,16 @@ def report(root):
             measured_answers = sum(e["status"] == "answered" and e["valid_measurements"] > 0
                                    for e in entries)
             lines.append(f'- 静态组各轮状态：{dict(round_statuses)}；'
-                         f'成功答案中使用有效数值测量的题目 {measured_answers}。')
+                         f'成功答案中具有有效数值测量的题目 {measured_answers}。')
+            decisions = Counter()
+            for entry in entries:
+                decisions.update(entry["surface_review_decisions"])
+            lines.append(f'- 同模型表面复核决定：{dict(decisions)}；'
+                         f'结束时待复核测量 {sum(e["pending_surface_reviews"] for e in entries)}。'
+                         "这些决定是模型判断，宿主验证记录与图像映射，未替模型认证对象绑定。")
+            lines.append(f'- 声明的答案依据：{dict(Counter(e["answer_basis"] for e in entries))}；'
+                         f'通过宿主算术核验的答案 {sum(e["verified_arithmetic"] for e in entries)}。'
+                         "具有成功测量不等于答案使用了测量；完整范围和尺度锚点仍是模型声明。")
     completion = []
     for item in read(root/"inputs.json"):
         for arm in ("direct", "skill"):
@@ -125,12 +141,9 @@ def report(root):
     failures = audit.get("program_failures", [])
     if failures:
         lines += ["", "## 程序接口与失败", ""]
-        lines.append("逐轮记录格式修正、执行错误及额度终止；实际最终失败按零分保留。")
-        if frozen["schema"].endswith("/2"):
-            lines.append("额度终止前的成功证据交付下一请求复核。")
+        lines.append("逐轮记录格式修正和执行错误；实际最终失败按零分保留。")
         for row in failures:
             reason = ("；".join(row["guard_violations"]) if row["guard_violations"] else
-                      row.get("quota_reason") or "超过工具或测量额度" if row["quota_rejection"] else
                       row.get("feedback_code") or
                       f'{row["error_code"]} / {row["error_type"]}')
             lines.append(f'- 题 {row["sample_id"]}，第 {row["round"]+1} 次请求：'
@@ -151,13 +164,18 @@ def report(root):
                      f'{clean(s["prediction"])} | {s["score"]:.2f} | {s["requests"]}/{s["tool_calls"]} |')
     lines += [
         "",
+        "本次是已检查过的 20 题诊断复测。程序组同时增加几何输入、复核提示、"
+        "图像和多轮计算，组间差值衡量这一整套配置，不能单独归因于工具或表面复核。"
+        "浮点题使用 MRA，因此逐题平均分不等于二元准确率。",
+        "",
         "评分来源：VADAR commit `56018ebc2ecf7a430fc94e64e80e2768b0931739`。"
         "int 对预测字符串执行 int；str 只执行 lower，不 trim；float 使用严格 `<` 的 "
         ".50、.45、.40、.35、.30、.25、.20、.15、.10、.05 十个阈值。全部失败保留分母。",
         "",
         "机器证据：[scores.json](scores.json)、[audit.json](audit.json)、"
         "[frozen.json](frozen.json)、[preflight.json](preflight.json)。"
-        "详细请求、图像、thinking 和程序轨迹见 episodes 目录。",
+        "完整输出、thinking、程序、工具、复核和提示文本汇总见 "
+        "[trajectories.json](trajectories.json)，原始请求及图像见 episodes 目录。",
         "",
     ]
     (root/"report.md").write_text("\n".join(lines), encoding="utf-8")

@@ -1,6 +1,6 @@
 # BLINK 主实验入口
 
-`scripts/run_blink_experiment.py` 将成功直答评测使用的原图和 thinking 设置接入
+`scripts/BLINKRunner/run.py` 将成功直答评测使用的原图和 thinking 设置接入
 BLINK 的代码求解、Skill 学习和父候选 Gate。实验在 Titan 上读取已发布缓存，
 不重新调用检测、分割或 MoGe2。
 
@@ -58,7 +58,7 @@ Gate 核对实际请求 seed、交付 Skill 哈希、输入、缓存、模型及
 在 Mac 仓库根目录预览，不读取服务器输入：
 
 ```bash
-.venv/bin/python scripts/run_blink_experiment.py --dry-run
+.venv/bin/python scripts/BLINKRunner/run.py --dry-run
 ```
 
 在 Titan 的代码 checkout 中使用绝对解释器和已有 CPU OpenCV 兼容路径：
@@ -66,7 +66,7 @@ Gate 核对实际请求 seed、交付 Skill 哈希、输入、缓存、模型及
 ```bash
 PYTHONPATH=/home/wangy/wangjh/skill3d-lab/pilot-20261021-01/runtime/cpu_compat \
 /home/wangy/wangjh/skill3d-lab/pilot-20261021-01/runtime/skill3d-exp/bin/python \
-scripts/run_blink_experiment.py --check
+scripts/BLINKRunner/run.py --check
 ```
 
 `--check` 是默认模式。逐题核验全部原图、输入哈希、缓存文件与内容身份、初始 Skill，
@@ -95,7 +95,7 @@ GT 文件在此阶段只记录文件身份；实际执行的宿主另冻结文�
 准备好实际预算和新输出目录后：
 
 ```bash
-python scripts/run_blink_experiment.py --execute \
+python scripts/BLINKRunner/run.py --execute \
   --max-requests REQUEST_BUDGET --output-dir /path/to/new-blink-run
 ```
 
@@ -104,8 +104,8 @@ python scripts/run_blink_experiment.py --execute \
 本入口通过配置的百炼地址调用；未来接入其他网关须独立冻结并核验真实服务身份。
 
 ```bash
-python scripts/run_blink_experiment.py --resume --check --output-dir /path/to/blink-run
-python scripts/run_blink_experiment.py --resume --execute --output-dir /path/to/blink-run
+python scripts/BLINKRunner/run.py --resume --check --output-dir /path/to/blink-run
+python scripts/BLINKRunner/run.py --resume --execute --output-dir /path/to/blink-run
 ```
 
 续跑加载运行目录中的原源码和原预算，不要求再次手填预算。
@@ -128,3 +128,7 @@ python scripts/run_blink_experiment.py --resume --execute --output-dir /path/to/
 非法答案和程序失败留在分母中；训练和 Gate 只用训练反馈。
 原 `BLINK/evaluate.py` 和历史直答结果保留原用途，新入口不接管旧运行。
 客户端实现有更新，历史运行的冻结源码哈希仍以原 manifest 为准。
+
+主入口和 24 题测试代码已收录到 [`scripts/BLINKRunner`](../scripts/BLINKRunner/README.md)。
+原 `scripts/run_blink_experiment.py` 保留为转发入口；新运行同时冻结新目录入口，
+历史运行继续使用各自的原始冻结源码。

@@ -578,6 +578,11 @@ def source_files(repo):
         repo/"scripts/run_blink_experiment.py",
         repo/"configs/experiments/blink.json",
     ])
+    # Historical frozen runs contain only the original entrypoint. New runs
+    # also freeze the consolidated implementation used by its forwarding shim.
+    runner = repo/"scripts/BLINKRunner/run.py"
+    if runner.is_file():
+        paths.extend([runner, runner.with_name("__init__.py")])
     return {str(p.relative_to(repo)): file_sha(p) for p in paths}
 
 

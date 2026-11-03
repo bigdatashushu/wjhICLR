@@ -27,3 +27,7 @@ temperature 0、seed 137、每次最大输出 8192 token、单次超时
 
 详细运行回执和逐题对照留在实验任务的外部输出目录。
 API 凭据、原图、几何缓存及原始响应轨迹不进入 Git。
+
+当时使用的两组 `pilot.py`、`continuation.py` 和 `start.py` 已按原字节收录到
+[`scripts/BLINKRunner/pilots`](../scripts/BLINKRunner/README.md)，
+原始文件位置和 SHA-256 见该目录的 `source_manifest.json`。

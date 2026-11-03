@@ -1,0 +1,17 @@
+GLOBAL RULES
+Use the original ordered views, current option letters and the question's reference frame. Original Image 1 has view_index=0. Each RGB/depth pair shares its captioned original pixel grid. Interpret preview colors and validity with the shared depth legend.
+
+Each view has an independent camera frame and relative scale. Raw Z, distances, depth colors and coordinates cannot be compared across views or converted to meters/world directions. Image-plane, viewpoint-rotation and cross-view relations rely on RGB, perspective, occlusion and the question's reference frame. Only the four supplied evidence tools are admissible when tools are enabled.
+
+Candidate categories are confirmed and question/option-relevant, but IDs and box_xyxy are incomplete location hints, not verified identities, object counts or mask quality. Empty candidates do not prove absence. Depth summary quantiles are [10%, 50%, 90%]; availability alone does not imply usable local depth.
+
+Pixel binding must match each target to its original RGB and view_index. Visible interior surfaces avoid silhouettes, gaps, occluders, invalid depth and background; a box center may miss the object. Coordinates use 0 <= x < width and 0 <= y < height, not memorized examples. Empty/invalid patches can cause a terminal tool-contract failure rather than a recoverable quality notice.
+
+point_depth is local camera Z, not Euclidean camera distance. Same-view depth order needs both target surfaces; one Z or a view quantile cannot establish it. pair_point_distance is Euclidean distance between local median camera points: both endpoints must bind correctly, and comparisons to one reference share the same verified reference pixel. It is not object-center distance, minimum object gap, complete dimensions or Z difference; separate point_depth calls are not prerequisites.
+
+Both measurements use 5x5 patches in per-view relative units. Nearby offsets -3, 0, +3 check stability; local relative depth range above 10% is edge_sampling, while insufficient_local_depth means missing usable local evidence. Outer status="ok" means execution success, not reliable data. data.status="unreliable" supplies no depth/distance; reason_code, reason, sample_stability and pair unreliable_endpoints explain rejection. Stable samples can still bind the wrong object. Missing or rejected values are not numerical evidence.
+
+Compact evidence separates pending review/inspection from delivered history. Each group has source_tool, execution status, shared_data, data_keys and rows. Read each row as [sequence_index, result_id, *values]; data_keys names the values, which combine with shared_data to reconstruct the original data. The first two row items are metadata. Sequence indices preserve original observation order. Distinguish group execution status from data.status and reuse already supplied evidence.
+
+OVERALL CONDITIONAL SEQUENCE
+The current phase determines admissible actions. Inspect RGB/depth and reuse prompt evidence. In program phases, missing hints are yielded before visual binding; bound pixels support needed batched same-view measurements, with every new measurement (including unreliable notices) yielded for later review before answering. Repair preserves pending review and hint inspection. Only unreliable or visually misbound pixels need replacement; verified pair endpoints remain, and new samples need yield/review. Clearly visual deciding evidence or unavailable reliable measurement supports a visual answer. Final phases admit only supplied evidence and visual reasoning.

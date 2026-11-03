@@ -351,7 +351,8 @@ def test_direct_worker_payload_uses_same_official_prompt_without_reading_prepare
     assert base.captured[0]["max_tokens"] == 8192 and "response_format" not in base.captured[0]
 
 
-def test_formal_freeze_rejects_dirty_repo_and_copies_only_selected_source(tmp_path, monkeypatch):
+@pytest.mark.parametrize("consolidated", [False, True])
+def test_formal_freeze_rejects_dirty_repo_and_copies_only_selected_source(tmp_path, monkeypatch, consolidated):
     profile = experiment.profile_at(CONFIG)
     profile["runtime"]["max_requests"] = 10
     monkeypatch.setattr(experiment.subprocess, "check_output", lambda *args, **kwargs: " M file\n")
@@ -364,6 +365,15 @@ def test_formal_freeze_rejects_dirty_repo_and_copies_only_selected_source(tmp_pa
         target = repo/relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("# test fixture\n")
+    expected_sources = {
+        "src/skill3d/minimal.py", "scripts/run_blink_experiment.py", "configs/experiments/blink.json"}
+    if consolidated:
+        for relative in ("scripts/BLINKRunner/run.py", "scripts/BLINKRunner/__init__.py",
+                         "scripts/BLINKRunner/pilots/skill24/pilot.py"):
+            target = repo/relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# consolidated fixture\n")
+        expected_sources.update({"scripts/BLINKRunner/run.py", "scripts/BLINKRunner/__init__.py"})
     answers = tmp_path/"references.json"
     answers.write_text("[]")
     profile["inputs"]["host_answers"] = str(answers)
@@ -371,8 +381,7 @@ def test_formal_freeze_rejects_dirty_repo_and_copies_only_selected_source(tmp_pa
     monkeypatch.setattr(experiment.subprocess, "check_output", lambda cmd, **kwargs: (
         "" if "status" in cmd else "a"*40+"\n"))
     manifest = experiment.create_run(repo, tmp_path/"new-run", profile, inspection)
-    assert set(manifest["source_files"]) == {
-        "src/skill3d/minimal.py", "scripts/run_blink_experiment.py", "configs/experiments/blink.json"}
+    assert set(manifest["source_files"]) == expected_sources
     assert not (tmp_path/"new-run/code/source/credentials.txt").exists()
     assert experiment.source_files(tmp_path/"new-run/code/source") == manifest["source_files"]
 
@@ -406,7 +415,7 @@ def test_spawn_worker_imports_and_executes_real_solver_in_process_main_thread(tm
 
 
 def test_resume_uses_saved_budget_and_frozen_entry_without_new_development_preflight(tmp_path, monkeypatch):
-    path = ROOT/"scripts/run_blink_experiment.py"
+    path = ROOT/"scripts/BLINKRunner/run.py"
     spec = importlib.util.spec_from_file_location("blink_cli_test", path)
     cli = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cli)

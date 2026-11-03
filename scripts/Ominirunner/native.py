@@ -84,15 +84,17 @@ def parse_json(text):
 
 class NativeSlot:
     def __init__(self):
-        self.answer = self.payload = self.raw_value = None
+        self.answer = self.payload = self.raw_value = self.evidence = None
         self.given = False
         self.adapter_problems = []
 
-    def __call__(self, value):
+    def __call__(self, value, evidence=None):
         if self.given:
             raise ValueError("duplicate_native_answer")
         self.answer = scalar(value)
         self.raw_value = value
+        # Snapshot literals before leaving the generated namespace.
+        self.evidence = json.loads(json.dumps(evidence, allow_nan=False))
         self.given = True
         raise AnswerTerminate(self.answer)
 
@@ -101,21 +103,9 @@ class NativeKernel(RestrictedNamespaceKernel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.answer_slot = NativeSlot()
-        self._registry.on_quota_exhausted = self._quota_yield
-
-    def _quota_yield(self, reason):
-        ids = [r.result_id for r in self.tool_results
-               if r.status == "ok" and not r.error and not r.invalidated_by
-               and r.result_id not in self.unresolved_result_ids]
-        self.yield_slot(ids, "Host quota exhausted: " + reason)
-
-    def run_cell(self, code, **kwargs):
-        before = len(self._registry.quota_denials)
-        cell = super().run_cell(code, **kwargs)
-        if len(self._registry.quota_denials) > before:
-            cell.host_observation_yield = True
-        return cell
+        self._ns["ReturnAnswer"] = lambda value, evidence=None: self.answer_slot(value, evidence)
 
     def reset_user_namespace(self):
         super().reset_user_namespace()
         self.answer_slot.raw_value = None
+        self.answer_slot.evidence = None

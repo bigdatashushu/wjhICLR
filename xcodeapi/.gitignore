@@ -1,0 +1,7 @@
+# Local credentials/configuration and experiment output stay on this machine.
+credentials.local.env
+*.local.env
+profiles.local.json
+local/
+results/
+__pycache__/

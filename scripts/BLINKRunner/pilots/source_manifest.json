@@ -1,0 +1,54 @@
+{
+  "schema": "harness3d-blink-pilot-source-archive/1",
+  "experiment_date": "2026-10-31",
+  "source_split": "train",
+  "questions": 24,
+  "selection_seed": 137,
+  "files_preserved_byte_for_byte": true,
+  "frozen_solver_source": "/home/wangy/wangjh/harness3d/four-datasets-20261031/blink-recovery-20261031-1ee33f28c07e/code/source",
+  "runs": {
+    "skill24": {
+      "arm": "initial_skill",
+      "skill": "trajectory-1",
+      "server_run": "/home/wangy/wangjh/harness3d/four-datasets-20261031/blink-pilot24-revised-20261031",
+      "correct": 22,
+      "model_requests": 50
+    },
+    "direct24": {
+      "arm": "direct",
+      "server_run": "/home/wangy/wangjh/harness3d/four-datasets-20261031/blink-pilot24-direct-20261031",
+      "correct": 21,
+      "model_requests": 24
+    }
+  },
+  "files": {
+    "skill24/pilot.py": {
+      "original_path": "/private/tmp/h3d-blink-revised-pilot-20261031/pilot.py",
+      "sha256": "cdcecc6991266de480975fcdba13c8984468b5841727e1b31304f27b79d15c2a"
+    },
+    "skill24/continuation.py": {
+      "original_path": "/private/tmp/h3d-blink-revised-pilot-20261031/continuation.py",
+      "sha256": "b2b023f83a8248130441e32e690aa91ab196aa0f1d7448626178bb9cbfda5d07"
+    },
+    "skill24/start.py": {
+      "original_path": "/private/tmp/h3d-blink-revised-pilot-20261031/start.py",
+      "sha256": "955bc389a8bf11dff8d928ceb1aef273b115c75c19de6f0f5da852bebcb6628b"
+    },
+    "skill24/test_continuation.py": {
+      "original_path": "/private/tmp/h3d-blink-revised-pilot-20261031/test_continuation.py",
+      "sha256": "0c9cb46769977620f8a74ad4aa91fb86861e8af70406024784298d670acacb30"
+    },
+    "direct24/pilot.py": {
+      "original_path": "/private/tmp/h3d-blink-direct24-20261031/pilot.py",
+      "sha256": "f71657689765455c198d19ab46ed68ce7df24ffa5209246d63609da3eb8cc0ae"
+    },
+    "direct24/continuation.py": {
+      "original_path": "/private/tmp/h3d-blink-direct24-20261031/continuation.py",
+      "sha256": "b2b023f83a8248130441e32e690aa91ab196aa0f1d7448626178bb9cbfda5d07"
+    },
+    "direct24/start.py": {
+      "original_path": "/private/tmp/h3d-blink-direct24-20261031/start.py",
+      "sha256": "8da89dedd98e26135e449d32be8eb013cfc4e7f214cfce67758100ea07e557b6"
+    }
+  }
+}

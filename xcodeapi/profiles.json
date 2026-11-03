@@ -1,0 +1,26 @@
+{
+  "gpt": {
+    "protocol": "responses",
+    "base_url": "https://xcode.best/v1",
+    "model": "gpt-6.1-sol",
+    "api_key_env": "XCODE_GPT_API_KEY",
+    "auth": "bearer",
+    "timeout_seconds": 180
+  },
+  "claude": {
+    "protocol": "messages",
+    "base_url": "https://xcode.best/v1",
+    "model": "",
+    "api_key_env": "XCODE_CLAUDE_API_KEY",
+    "auth": "bearer",
+    "timeout_seconds": 180
+  },
+  "gemini": {
+    "protocol": "chat_completions",
+    "base_url": "https://xcode.best/v1",
+    "model": "gemini-3.8-flash-tiered",
+    "api_key_env": "XCODE_GEMINI_API_KEY",
+    "auth": "bearer",
+    "timeout_seconds": 180
+  }
+}

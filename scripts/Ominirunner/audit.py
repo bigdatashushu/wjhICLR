@@ -18,9 +18,15 @@ from .budget import audit as budget_audit
 from .common import Config, IDS, VERSION, digest, read, sha, validate_source, write
 from .data import load, pair_identity, problem
 from .protocol import messages
-from .native import ProgramFormatError, parse_program, program_feedback
-from .tools import MEASUREMENTS, build_registry, empty_counts, remaining
+from .native import ProgramFormatError, parse_program, program_feedback, scalar
+from .tools import MEASUREMENTS, build_registry, empty_counts
 from .transport import health
+from .review import (final_payload, pending, priority_ids, state,
+                     validate as validate_reviews, validate_program)
+from .evidence import (EvidenceError, dependency_ids, feedback as evidence_feedback,
+                       validate as validate_evidence)
+from .reuse import request_cap, validate as validate_reuse
+from . import report as report_module
 
 
 def replay_contexts(item, result, rgb, frame, cache):
@@ -30,21 +36,30 @@ def replay_contexts(item, result, rgb, frame, cache):
 
     config = Config()
     observations, errors, note, review_ids = [], [], "", []
+    reviews = {}
+    calculation_ids = []
     counters = empty_counts()
     registry = build_registry(cache, problem(item), config)[0] if result["arm"] == "skill" else None
+
+    def check_review_state(row):
+        if (row.get("measurement_review_state") != state(reviews)
+                or row.get("pending_measurement_ids") != pending(observations, reviews)
+                or row.get("next_review_measurement_ids") != review_ids
+                or row.get("calculation_dependency_ids") != calculation_ids):
+            raise ValueError("round_surface_review_state_changed")
+
     for index, row in enumerate(result["rounds"]):
         if row["round"] != index or row["tool_counts_before"] != counters:
             raise ValueError("round_order_changed")
         expected, receipt = messages(
             item, rgb, frame, cache, arm=result["arm"], config=config, round_index=index,
             observations=observations, note=note, errors=errors, review_ids=review_ids,
-            counters=counters)
+            counters=counters, reviews=reviews, dependency_ids=calculation_ids)
         if row["request"] != receipt:
             raise ValueError("reconstructed_public_context_changed")
         if row["phase"] != receipt["phase"]:
             raise ValueError("phase_changed")
         yield index, expected
-        review_ids = []
         if row["status"] == "program_parse_error":
             try:
                 parse_program(row["output"])
@@ -54,6 +69,7 @@ def replay_contexts(item, result, rgb, frame, cache):
                 raise ValueError("unexpected_parse_failure")
             if errors != row["feedback_errors"]:
                 raise ValueError("parse_feedback_changed")
+            check_review_state(row)
             continue
         if row["status"] in ("program_missing_action", "repairable_namespace_error"):
             errors = program_feedback("control_namespace_error" if
@@ -61,15 +77,36 @@ def replay_contexts(item, result, rgb, frame, cache):
                                       else "program_missing_action")
             if errors != row["feedback_errors"] or row.get("tool_receipts"):
                 raise ValueError("nonexecuted_feedback_changed")
+            check_review_state(row)
             continue
+        review_errors = []
+        final_raw, final_declared, parsed_final = None, None, False
+        if result["arm"] == "skill" and (row.get("cell") or row["phase"] == "final"):
+            accepted = {}
+            if row["phase"] == "final":
+                try:
+                    final_raw, proposed, final_declared = final_payload(row["output"])
+                    parsed_final = True
+                    if final_declared != row.get("evidence_declaration"):
+                        raise ValueError("final_evidence_declaration_changed")
+                    accepted, review_errors = validate_reviews(
+                        proposed, observations, receipt["visible_measurement_ids"])
+                except (ValueError, TypeError):
+                    if row["status"] != "invalid_answer":
+                        raise
+            else:
+                accepted, review_errors = validate_program(
+                    row["program"], observations, receipt["visible_measurement_ids"])
+            if list(accepted.values()) != row.get("measurement_reviews", []):
+                raise ValueError("surface_review_projection_changed")
+            if review_errors != row.get("review_feedback_errors", []):
+                raise ValueError("surface_review_feedback_changed")
+            reviews.update(accepted)
+        fresh = []
         for raw in row.get("tool_receipts", []):
             tool = ToolResult.model_validate(raw)
             # Signature binding failures happen before registry admission.
             if not tool.failure_cause or tool.failure_cause.code != "invalid_tool_arguments":
-                if (counters["calls"] >= config.max_tool_calls
-                        or tool.tool in MEASUREMENTS and
-                        counters["measurements"] >= config.max_measurements):
-                    raise ValueError("tool_receipt_above_episode_quota")
                 counters["calls"] += 1
                 counters["attempted"] += 1
                 counters["measurements"] += int(tool.tool in MEASUREMENTS)
@@ -80,48 +117,82 @@ def replay_contexts(item, result, rgb, frame, cache):
                                     if k in registry.public_fields[tool.tool]}
                 observations.append(response)
                 if tool.tool in MEASUREMENTS:
-                    review_ids.append(tool.result_id)
-        if review_ids != row.get("new_measurement_ids", []):
+                    fresh.append(tool.result_id)
+        if row.get("cell"):
+            review_ids = priority_ids(observations, reviews, fresh, row["cell"]["yielded_result_ids"])
+        elif row["phase"] == "final":
+            review_ids = priority_ids(observations, reviews, yielded=review_ids)
+        if fresh != row.get("new_measurement_ids", []):
             raise ValueError("measurement_receipt_projection_changed")
+        if "evidence_declaration" in row:
+            # Saved JSON sorts mapping keys; the worker used the original
+            # final-output binding order when choosing dependency priorities.
+            declaration = final_declared if parsed_final else row["evidence_declaration"]
+            calculation_ids = dependency_ids(declaration, observations, calculation_ids)
+        check_review_state(row)
         cell = row.get("cell")
+        answer_errors = []
+        if result["arm"] == "skill" and (
+                parsed_final or cell and cell["answer"] is not None
+                and not cell["error_code"] and not cell["answer_untrusted"]):
+            raw_answer = final_raw if parsed_final else row["submitted_native_answer"]
+            try:
+                declared_evidence = final_declared if parsed_final else row.get("evidence_declaration")
+                checked = validate_evidence(raw_answer, declared_evidence,
+                                            observations, reviews, receipt["visible_measurement_ids"])
+            except (ValueError, TypeError) as exc:
+                answer_errors = evidence_feedback(
+                    exc if isinstance(exc, EvidenceError) else
+                    str(exc) if type(exc) is ValueError else "answer_evidence_invalid")
+                if row["status"] not in ("answer_evidence_required", "invalid_answer"):
+                    raise ValueError("invalid_evidence_answer_accepted") from None
+                # Native worker appends review feedback to the same list object
+                # retained in answer_feedback_errors; final JSON does not.
+                recorded_errors = answer_errors + review_errors if cell else answer_errors
+                if recorded_errors != row.get("answer_feedback_errors", []):
+                    raise ValueError("answer_feedback_changed")
+            else:
+                if row["status"] != "answered" or checked != row.get("answer_evidence"):
+                    raise ValueError("answer_evidence_projection_changed")
+                if (scalar(raw_answer) != result["answer"]
+                        or checked != result["answer_evidence"]):
+                    raise ValueError("episode_answer_evidence_changed")
         if cell:
             errors = []
-            for denial in row.get("quota_denials", []):
-                measure = int(denial["tool"] in MEASUREMENTS)
-                reason = ("tool_calls_exhausted" if counters["calls"] >= config.max_tool_calls
-                          else "measurements_exhausted" if measure and
-                          counters["measurements"] >= config.max_measurements else "")
-                if (not reason or denial["reason"] != reason or denial["admitted"] is not False
-                        or denial["argument_digest"] != digest(denial["args"])
-                        or denial["remaining"] != remaining(config, counters)
-                        or "result_id" in denial):
-                    raise ValueError("quota_denial_changed")
-                counters["attempted"] += 1
-                counters["attempted_measurements"] += measure
-                counters["rejected"] += 1
-                counters["rejected_measurements"] += measure
+            if row.get("quota_denials"):
+                raise ValueError("unexpected_quota_denial")
             if counters != row["tool_counts_after"]:
                 raise ValueError("admitted_tool_counts_changed")
             if cell["error_code"] or cell["answer_untrusted"]:
                 errors = [{"code": cell["error_code"], "type": cell["error_type"],
                            "line": cell["error_line"]}]
-            elif row.get("quota_denials"):
-                errors = [{"code": "quota_exhausted",
-                           "reason": row["quota_denials"][-1]["reason"],
-                           "repair": "Review delivered successful evidence and submit final JSON."}]
             elif cell["answer"] is None:
                 valid = {r["result_id"] for r in observations}
                 if set(cell["yielded_result_ids"]) - valid:
                     errors = [{"code": "invalid_observation_reference"}]
+            else:
+                errors = answer_errors
             note = cell["yielded_reason"][:200]
+            errors.extend(review_errors)
     if result["tool_counts"] != counters:
         raise ValueError("episode_tool_counts_changed")
+    if result.get("context_text") != {
+            "record_threshold": config.text_record_threshold,
+            "max_chars": max((r["request"]["text_chars"] for r in result["rounds"]), default=0),
+            "over_threshold_rounds": [r["round"] for r in result["rounds"]
+                                     if r["request"]["text_over_threshold"]]}:
+        raise ValueError("episode_context_threshold_changed")
+    if (state(reviews) != result.get("measurement_reviews", [])
+            or pending(observations, reviews) != result.get("pending_measurement_ids", [])
+            or calculation_ids != result.get("calculation_dependency_ids", [])):
+        raise ValueError("episode_surface_reviews_changed")
 
 
 def run(root):
     frozen, inputs = read(root / "frozen.json"), read(root / "inputs.json")
+    reused = frozen.get("reused_direct", {})
     if (frozen["schema"] != VERSION or frozen["config"] != Config().public()
-            or frozen["max_requests"] != Config().trial_request_cap):
+            or frozen["max_requests"] != request_cap(reused)):
         raise ValueError("audit_contract_changed")
     validate_source(frozen["source"])
     completed = read(root / "completed.json")
@@ -154,7 +225,7 @@ def run(root):
     for records in (local_rows, charged):
         if any(r["status"] != "completed" for r in records):
             raise ValueError("uncertain_or_failed_request")
-    usage = Counter()
+    usage, historical_usage = Counter(), Counter()
     episodes, failures, receipts = [], [], []
     expected_charges = {}
     for item in inputs:
@@ -162,10 +233,20 @@ def run(root):
         for arm in ("direct", "skill"):
             directory = root / "episodes" / (item["sample_id"]+"-"+arm)
             result = read(directory / "result.json")
+            reuse = reused.get(item["sample_id"]) if arm == "direct" else None
+            expected_identity = reuse["source_run_identity"] if reuse else digest(frozen)
+            if reuse:
+                context, _ = messages(item, rgb, frame, None, arm="direct", config=Config())
+                validate_reuse(reuse, item, context)
+                if read(directory / "reuse.json") != reuse:
+                    raise ValueError("reuse_copy_provenance_changed")
+                for name, expected in reuse["files"].items():
+                    if sha(directory / name) != expected:
+                        raise ValueError("reuse_copy_changed")
             if (result["receipt_sha256"] != digest({
                     k: v for k, v in result.items() if k != "receipt_sha256"})
                     or result["pair_identity"] != pair_identity(item)
-                    or result["run_identity"] != digest(frozen)
+                    or result["run_identity"] != expected_identity
                     or result["reference_answer_visible"] or result["real_labels_available"]
                     or result["automatic_retry"] or result["sample_id"] != item["sample_id"]
                     or result["arm"] != arm):
@@ -173,16 +254,20 @@ def run(root):
             if (result["request_count"] != len(result["rounds"])
                     or not 1 <= result["request_count"] <= Config().request_limit(arm)):
                 raise ValueError("episode_request_limit")
-            expected_charges[(item["sample_id"], arm)] = (result["request_count"], result["usage"])
+            if not reuse:
+                expected_charges[(item["sample_id"], arm)] = (result["request_count"], result["usage"])
             receipts.append(result["receipt_sha256"])
-            reconstructed = dict(replay_contexts(item, result, rgb, frame, cache))
+            reconstructed = {0: context} if reuse else dict(
+                replay_contexts(item, result, rgb, frame, cache))
             pending, facts, thinking_count, max_chars = set(), {}, 0, 0
             for row in result["rounds"]:
                 index, receipt = row["round"], row["request"]
-                delivered = set(receipt["reviewed_measurement_ids"])
-                if pending - delivered:
-                    raise ValueError("missing_next_request_measurement_review")
-                pending.clear()
+                delivered = set(receipt.get("reviewed_measurement_ids", []))
+                if delivered - pending:
+                    raise ValueError("review_delivery_not_pending")
+                if (receipt["phase"] == "final" and len(receipt.get("visible_measurement_ids", [])) > 8
+                        or len(receipt.get("rgb_crop_sheets", [])) > 2):
+                    raise ValueError("evidence_delivery_not_bounded")
                 payload = read(directory / f"{index:02d}.messages.json")
                 parts = payload[0]["content"]
                 if len(payload) != 1 or payload[0]["role"] != "user":
@@ -194,13 +279,19 @@ def run(root):
                 texts = [p["text"] for p in parts if p["type"] == "text"]
                 if texts[0] != item["question"] or sum(t.count(item["question"]) for t in texts) != 1:
                     raise ValueError("official_question_changed")
-                if receipt["text_chars"] != sum(map(len, texts)) or receipt["text_chars"] > receipt["text_cap"]:
+                cap = receipt["text_cap"]
+                if (receipt["text_chars"] != sum(map(len, texts))
+                        or cap is not None and receipt["text_chars"] > cap):
                     raise ValueError("context_limit_broken")
+                if not reuse and (
+                        receipt["text_over_threshold"] != (receipt["text_chars"] > Config().text_record_threshold)
+                        or receipt["text_over_threshold_chars"] != max(0, receipt["text_chars"]-Config().text_record_threshold)):
+                    raise ValueError("context_threshold_record_changed")
                 max_chars = max(max_chars, receipt["text_chars"])
                 images = [p["image_url"]["url"] for p in parts if p["type"] == "image_url"]
                 hashes = [hashlib.sha256(base64.b64decode(u.split(",", 1)[1])).hexdigest()
                           for u in images]
-                if (len(images) != (1 if arm == "direct" else 2)
+                if (len(images) != receipt["image_count"]
                         or hashes != receipt["image_sha256"] or hashes[0] != item["image_sha256"]):
                     raise ValueError("image_identity_changed")
                 if (row["parameters"] != Config().kwargs()
@@ -215,32 +306,33 @@ def run(root):
                         if not r["authorization"].get("allowed") or not r["result_id"]:
                             raise ValueError("invalid_tool_receipt")
                         facts[r["result_id"]] = r
-                pending.update(row.get("new_measurement_ids", []))
-                if row.get("status") == "answered" and pending:
-                    raise ValueError("unreviewed_measurement_accepted")
+                pending = set(row.get("pending_measurement_ids", pending))
                 if row.get("status") in ("program_rejected", "run_error", "repairable_program_error",
-                                         "repairable_namespace_error", "program_parse_error",
-                                         "quota_exhausted"):
+                                         "repairable_namespace_error", "program_parse_error"):
                     cell = row.get("cell", {})
                     failures.append({
                         "sample_id": item["sample_id"], "arm": arm, "round": index,
                         "status": row["status"], "guard_violations": row.get("guard_violations", []),
                         "error_code": cell.get("error_code"), "error_type": cell.get("error_type"),
-                        "feedback_code": next((e["code"] for e in row.get("feedback_errors", [])), ""),
-                        "quota_reason": next((d["reason"] for d in row.get("quota_denials", [])), ""),
-                        "quota_rejection": bool(row.get("quota_denials"))})
-            if result["status"] == "answered" and pending:
-                raise ValueError("measurement_review_missing_at_answer")
+                        "feedback_code": next((e["code"] for e in row.get("feedback_errors", [])), "")})
             for key, value in result["usage"].items():
-                usage[key] += value
+                (historical_usage if reuse else usage)[key] += value
             episodes.append({
                 "sample_id": item["sample_id"], "arm": arm, "status": result["status"],
+                "reused": bool(reuse), "source_run_identity": expected_identity,
                 "request_count": result["request_count"], "max_text_chars": max_chars,
+                "over_threshold_rounds": [r["round"] for r in result["rounds"]
+                                          if r["request"]["text_chars"] > Config().text_record_threshold],
                 "thinking_content_requests": thinking_count,
                 "tool_calls": result["tool_counts"]["calls"],
                 "rejected_calls": result["tool_counts"]["rejected"],
                 "measurements": result["tool_counts"]["measurements"],
                 "valid_measurements": sum(r["tool"] in MEASUREMENTS for r in facts.values()),
+                "surface_review_decisions": dict(Counter(
+                    r["decision"] for r in result.get("measurement_reviews", []))),
+                "pending_surface_reviews": len(result.get("pending_measurement_ids", [])),
+                "answer_basis": result["basis"],
+                "verified_arithmetic": bool((result.get("answer_evidence") or {}).get("verified_arithmetic")),
                 "round_statuses": dict(Counter(row["status"] for row in result["rounds"])),
                 "receipt_sha256": result["receipt_sha256"]})
     for records in (charged, local_rows):
@@ -263,7 +355,7 @@ def run(root):
             raise ValueError("per_episode_charge_mismatch")
     if sorted(receipts) != sorted(completed["episode_receipt_sha256"]):
         raise ValueError("completed_receipt_set_changed")
-    if sum(r["request_count"] for r in episodes) != len(charged):
+    if sum(r["request_count"] for r in episodes if not r["reused"]) != len(charged):
         raise ValueError("request_denominator_mismatch")
     sys.path.insert(0, frozen["auth_module_root"])
     from transport_auth import load_transport_token
@@ -272,15 +364,23 @@ def run(root):
         raise ValueError("post_run_service_changed")
     after = budget_audit(shared_root.parents[1])
     value = {
-        "schema": "omni-post-run-audit/2", "status": "passed", "at": time.time(),
+        "schema": "omni-post-run-audit/9", "status": "passed", "at": time.time(),
         "run_identity": digest(frozen), "pairs": len(inputs), "episodes": episodes,
         "charged_requests": len(charged), "usage": dict(usage), "model": Config().model,
+        "reused_direct": len(reused), "historical_usage": dict(historical_usage),
+        "historical_requests": len(reused),
+        "total_comparison_requests": len(charged) + len(reused),
+        "peak_request_concurrency": local["peak_inflight"],
         "thinking_both_arms": True, "source_pins": len(frozen["source"]),
         "host_only_source": {
-            name: sha(Path(__file__).parent / name) for name in ("audit.py", "report.py")},
+            "audit.py": sha(Path(__file__)), "report.py": sha(Path(report_module.__file__))},
         "historical_admission_prefixes": prefixes, "budget_after": after,
         "verified_original_rgb_both_arms": True, "verified_depth_grid_identity": True,
         "verified_next_request_review": True, "verified_fresh_bounded_contexts": True,
+        "verified_same_model_surface_review_records": True,
+        "verified_persisted_surface_review_state": True,
+        "verified_priority_measurement_delivery": True,
+        "verified_declared_answer_evidence": True,
         "verified_public_context_reconstruction": True,
         "verified_per_episode_request_and_usage_charges": True,
         "verified_request_and_usage_charges": True, "reference_answer_visible": False}

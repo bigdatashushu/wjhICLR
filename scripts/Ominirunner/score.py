@@ -62,9 +62,15 @@ def score(root, annotation_path):
         legal = requests = tool_calls = 0
         for item in inputs:
             result = read(root / "episodes" / (item["sample_id"]+"-"+arm) / "result.json")
+            reuse = frozen.get("reused_direct", {}).get(item["sample_id"]) if arm == "direct" else None
+            expected_identity = reuse["source_run_identity"] if reuse else digest(frozen)
+            if reuse:
+                audited = read(root / "audit.json")
+                if audited["status"] != "passed" or audited["run_identity"] != digest(frozen):
+                    raise ValueError("reuse_requires_completed_audit")
             if (result["receipt_sha256"] != digest({
                     k: v for k, v in result.items() if k != "receipt_sha256"})
-                    or result["run_identity"] != digest(frozen)):
+                    or result["run_identity"] != expected_identity):
                 raise ValueError("result_identity_changed")
             label = selected[item["sample_id"]]
             pred = result["answer"] if result["status"] == "answered" else ""
@@ -80,6 +86,7 @@ def score(root, annotation_path):
             scored.append({"sample_id": item["sample_id"], "arm": arm, "group": group,
                            "score": value, "legal": valid, "prediction": pred,
                            "status": result["status"], "requests": result["request_count"],
+                           "reused": bool(reuse), "source_run_identity": expected_identity,
                            "tool_calls": result["tool_counts"]["calls"]})
         table[arm] = {
             "metrics": {g: {"n": len(v), "value": sum(v)/len(v)} for g, v in groups.items()},
@@ -91,6 +98,8 @@ def score(root, annotation_path):
                "engine_source_sha256": ENGINE_SHA, "thresholds": THRESHOLDS,
                "run_identity": digest(frozen), "pairs": len(inputs), "table": table,
                "scored": scored, "ground_truth_in_report": False}
+    summary["new_requests"] = sum(r["requests"] for r in scored if not r["reused"])
+    summary["reused_requests"] = sum(r["requests"] for r in scored if r["reused"])
     write(root / "scores.json", summary, exclusive=True)
     print({arm: value["metrics"] for arm, value in table.items()})
     return summary

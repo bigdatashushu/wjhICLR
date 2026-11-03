@@ -7,13 +7,21 @@ import json
 import os
 from pathlib import Path
 
-VERSION = "omni-static-depth-versus-official-direct/2"
+VERSION = "omni-static-depth-versus-official-direct/9"
 PRIOR_IDS = ("15", "28", "38", "0", "3", "31", "2", "21", "33", "10", "81", "106")
 # Added questions were selected from public type/ID bindings, before any labels.
 ADDED_IDS = ("190", "375", "411", "222", "49", "479", "417", "350")
 IDS = PRIOR_IDS + ADDED_IDS
+MAX_CONCURRENCY = len(IDS) * 2
 MANIFEST_SHA = "ca0d46e1ea137844933da8fc4d785a5e5acb72ad2aea7ab24e3d3a334d95fc9c"
 BINDINGS_SHA = "43c0deaf3f06931a15e2c68158b6c709670ef7936f39e46d7dca1eb6fa7987c3"
+
+
+def concurrency(value):
+    """Bound concurrency by the total episode count, not a fixed sixteen slots."""
+    if type(value) is not int or not 1 <= value <= MAX_CONCURRENCY:
+        raise ValueError("invalid_episode_concurrency")
+    return value
 
 
 @dataclass(frozen=True)
@@ -25,15 +33,13 @@ class Config:
     max_tokens: int = 8192
     timeout_s: int = 600
     max_program_rounds: int = 5
-    max_tool_calls: int = 8
-    max_measurements: int = 6
-    text_caps: tuple = (4000, 6000, 6000, 6000, 6000, 4500)
+    text_caps: tuple = (None, None, None, None, None, 10000)
+    text_record_threshold: int = 10000
     cell_timeout_s: int = 30
 
     def __post_init__(self):
         if (self.max_program_rounds < 1
-                or len(self.text_caps) != self.max_program_rounds + 1
-                or not 0 < self.max_measurements <= self.max_tool_calls):
+                or len(self.text_caps) != self.max_program_rounds + 1):
             raise ValueError("invalid_episode_limits")
 
     def request_limit(self, arm):
@@ -94,8 +100,9 @@ def skill_text():
 
 def validate_source(source):
     root = Path(__file__).resolve().parents[2]
-    if "scripts/Ominirunner/worker.py" not in source:
-        raise ValueError("worker_pin_missing")
+    if not {"scripts/Ominirunner/worker.py", "scripts/Ominirunner/review.py",
+            "scripts/Ominirunner/evidence.py", "scripts/Ominirunner/sampling.py"} <= set(source):
+        raise ValueError("solver_pin_missing")
     for name, expected in source.items():
         path = Path(name)
         if path.is_absolute() or ".." in path.parts or sha(root / path) != expected:

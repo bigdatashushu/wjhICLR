@@ -1,11 +1,11 @@
-Read the entire question. Bind each object, part and reference in RGB; preserve stated sizes, directions, options and answer requirements. Identify the required count, order, distance or ratio, including its numerator, denominator and common reference.
+1. Read RGB/question; fix targets, reference, quantity, count scope and stated scale. Answer clear visual questions directly.
 
-Use RGB for semantics, visible surfaces and occlusion. Use the aligned depth display to inspect near/far trends, invalid areas and sample locations. Select interior pixels on the intended visible surfaces; avoid background, boundaries, holes and occluders. A box center need not lie on the object.
+2. When tools are open, localize in RGB; use view_candidates only when needed (incomplete clues, not counts/absence). Use view_depth_summary only if depth validity is doubtful.
 
-Camera depth Z differs from Euclidean distance between 3D points. Use the dimension and reference requested by the question. Relative point measurements share a scale only within this image; a stated physical size can anchor a supported ratio but does not reveal hidden endpoints or certify complete object dimensions.
+3. If needed and tools are open, measure target surfaces with point_depth or pair_point_distance; use a common reference for comparisons. Check box centers in RGB and distinguish target samples from background/occluders.
 
-Before using new numerical evidence, inspect it in the next request alongside RGB and the depth sampling markers. Check object binding, sampled surfaces and numerical/visual agreement. If they conflict, revisit binding and pixels.
+4. Next request, first review RGB markers/crops and raw values; write ID + usable/resample/uncertain in measurement_reviews. Exclude wrong/unclear values. If tools are open, replace unresolved points; check small gaps with alternative representative points and review again.
 
-For counts, inspect visible instances, parts, duplicates and the question's scope. Detections are incomplete clues, not a certified count. Category confirmation does not validate a mask for geometry.
+5. Calculate from visible usable values representing the asked quantity. Match stated scale to the full span, keep one object scope/shape for counts/volume ratios, and treat notes as hypotheses.
 
-For complete dimensions, volume, physical interactions or unseen extent unsupported by local surface evidence, reason from RGB and record the result as a visual estimate or mixed judgment. Submit the native number or text requested by the question.
+6. Stop once resolved. Declare calculation bindings/expression for tool-derived numbers and preserve intermediate precision. If geometry stays unresolved, use an RGB estimate. Keep answer/assumptions consistent, basis brief, and obey the current output contract.

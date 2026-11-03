@@ -1,0 +1,5 @@
+{
+  "cache_root": "/home/wangy/wangjh/harness3d/four-datasets-20261031/mindcube-perview-20261101-r01",
+  "output": "/home/wangy/wangjh/harness3d/four-datasets-20261031/mindcube-tiny-program-new-run",
+  "arms": ["skill"]
+}
