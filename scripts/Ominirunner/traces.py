@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from collections import Counter
 from pathlib import Path
 
 from .common import digest, read, write
@@ -47,10 +48,19 @@ def export(root):
                   "over_threshold_chars": row["request"]["text_chars"]-threshold}
                  for case in cases for arm, data in case["arms"].items()
                  for row in data["result"]["rounds"] if row["request"]["text_chars"] > threshold]
-    value = {"schema": "omni-full-inference-trajectories/2", "run_identity": digest(frozen),
+    activity = {}
+    for arm in ("direct", "skill"):
+        counts, usage = Counter(), Counter()
+        for case in cases:
+            result = case["arms"][arm]["result"]
+            counts.update(result.get("evidence_activity") or {})
+            usage.update(result.get("usage", {}))
+        activity[arm] = {"evidence_activity": dict(counts), "usage": dict(usage)}
+    value = {"schema": "omni-full-inference-trajectories/3", "run_identity": digest(frozen),
              "pairs": len(cases), "ground_truth_included": False,
              "text_record_threshold": threshold, "over_threshold_requests": oversized,
              "new_requests": audited["charged_requests"],
-             "reused_direct": audited.get("reused_direct", 0), "cases": cases}
+             "reused_direct": audited.get("reused_direct", 0),
+             "activity_by_arm": activity, "cases": cases}
     write(root / "trajectories.json", value, exclusive=True)
     return value

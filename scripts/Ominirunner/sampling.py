@@ -3,22 +3,23 @@ from __future__ import annotations
 
 import numpy as np
 
-from skill3d.tools.contract import ConfidenceGateError, DomainValueError
+from skill3d.tools.contract import ConfidenceGateError
+from .recovery import input_error
 
-VERSION = "omni-raw-pixel-sampling/1"
+VERSION = "omni-raw-pixel-sampling/2"
 EDGE_NOTE = ("At object edges, samples may hit other surfaces and differ greatly; "
              "identify which returned values belong to the target.")
 
 
-def sample(handle, view_index, xy):
+def sample(handle, view_index, xy, field="pixel_xy"):
     geometry, depth, valid = handle.geometry(view_index)
     if (not isinstance(xy, (tuple, list)) or len(xy) != 2
             or any(type(v) not in (int, float) or not np.isfinite(v) for v in xy)):
-        raise DomainValueError("omni_sampling", "pixel must be a finite [x,y] pair")
+        raise input_error("omni_sampling", field, "finite [x,y]", xy)
     x, y = xy
     h, w = depth.shape
     if not 0 <= x < w or not 0 <= y < h:
-        raise DomainValueError("omni_sampling", "pixel lies outside original image")
+        raise input_error("omni_sampling", field, f"original pixels: 0<=x<{w}, 0<=y<{h}", xy)
     ix, iy = min(round(x), w-1), min(round(y), h-1)
     x0, y0, x1, y1 = max(0, ix-2), max(0, iy-2), min(w, ix+3), min(h, iy+3)
     mask = valid[y0:y1, x0:x1]
@@ -39,8 +40,8 @@ def point_depth(handle, view_index, x, y):
 
 
 def pair_point_distance(handle, view_index, a_xy, b_xy):
-    geometry, a_pixel, a_z, a_samples, _ = sample(handle, view_index, a_xy)
-    _, b_pixel, b_z, b_samples, _ = sample(handle, view_index, b_xy)
+    geometry, a_pixel, a_z, a_samples, _ = sample(handle, view_index, a_xy, "a_xy")
+    _, b_pixel, b_z, b_samples, _ = sample(handle, view_index, b_xy, "b_xy")
     points = geometry.get("points")
     if points is None or np.shape(points) != (*handle.frames[view_index].shape[:2], 3):
         raise ConfidenceGateError("pair_point_distance", "point map unavailable or grid mismatch")

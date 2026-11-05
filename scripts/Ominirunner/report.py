@@ -22,6 +22,9 @@ def report(root):
     score, audit, frozen = read(root/"scores.json"), read(root/"audit.json"), read(root/"frozen.json")
     if audit["status"] != "passed" or audit["run_identity"] != score["run_identity"]:
         raise ValueError("report_requires_audited_score")
+    if frozen.get("measurement_reviewer") and frozen.get("question_replay"):
+        from .host_report import report as host_report
+        return host_report(root, score, audit, frozen)
     config = frozen["config"]
     n = score["pairs"]
     groups = ("float", "int", "yes_no", "other_text")
@@ -30,13 +33,21 @@ def report(root):
         f'{label}（{score["table"]["direct"]["metrics"].get(group, {}).get("n", 0)}）'
         for group, label in zip(groups, labels)]
     caps = "／".join("不设硬上限" if n is None else str(n) for n in config["text_caps"])
+    selection = frozen.get("selection")
+    selection_description = (
+        f"排除旧 {len(selection['excluded_sample_ids'])} 题及其图片，在 "
+        f"{selection['eligible_questions']} 条公开候选中，按 "
+        f"`SHA256('{selection['seed']}:'+sample_id)` 升序抽取 {n} 题。"
+        f"题型分布为 {selection['task_types']}；抽样未读取答案或得分，两组均重新运行。"
+        if selection else
+        "保留此前 12 题，另按公开类型和题号加入 8 题；新增题用 "
+        "`SHA256('omni20:137:'+sample_id)` 排序，在未使用的题目中选取 4 float、2 int、2 str。"
+        "本轮复用此前同一批 20 题，检查原图标点、局部表面复核与结构化复核记录下的作答表现。")
     lines = [
         f"# Omni3D-Bench：原图表面复核程序组与千问直答的 {n} 题对照",
         "",
         f"本次完成 {n} 题、{2*n} 个 episode，按固定 VADAR 官方规则评分。"
-        "保留此前 12 题，另按公开类型和题号加入 8 题；新增题用 "
-        "`SHA256('omni20:137:'+sample_id)` 排序，在未使用的题目中选取 4 float、2 int、2 str。"
-        "本轮复用此前同一批 20 题，检查原图标点、局部表面复核与结构化复核记录下的作答表现。",
+        + selection_description,
         "",
         "| 方法 | "+" | ".join(metric_headers)+" | 逐题平均分 | 合法答案 | 请求 | 实际 token |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -113,6 +124,18 @@ def report(root):
             lines.append(f'- 声明的答案依据：{dict(Counter(e["answer_basis"] for e in entries))}；'
                          f'通过宿主算术核验的答案 {sum(e["verified_arithmetic"] for e in entries)}。'
                          "具有成功测量不等于答案使用了测量；完整范围和尺度锚点仍是模型声明。")
+            changes = Counter()
+            for entry in entries:
+                changes.update(entry.get("evidence_activity") or {})
+            if changes:
+                lines.append(
+                    f'- 可观察进展：新增观察 {changes["new_observations"]}，'
+                    f'不同内容的观察 {changes["novel_observations"]}，'
+                    f'复核状态变化 {changes["changed_reviews"]}，'
+                    f'无进展轮次 {changes["no_progress_rounds"]}；'
+                    f'成功返回的替换测量 {changes["replacement_measurements"]}，'
+                    f'其中内容新增且终态 usable 的替换 {changes["usable_novel_replacements"]}。'
+                    "usable 仍是同模型的 RGB 判断，不等于独立视觉认证。")
     completion = []
     for item in read(root/"inputs.json"):
         for arm in ("direct", "skill"):
@@ -127,11 +150,14 @@ def report(root):
                  f'本次追加 {audit["charged_requests"]} 次，'
                  f'按上下文、category、usage、status 的多重集合核对后去重 '
                  f'{budget["mirrored_request_copies_excluded"]:,} 份局部副本。原始账本均保留。')
-    lines += ["", "## 原 12 题与新增 8 题", "",
-              "| 子集 | 题数 | 直接逐题平均分 | 静态逐题平均分 | 胜/负/平 |",
-              "|---|---:|---:|---:|---|"]
-    for label, ids in (("原 12 题", PRIOR_IDS), ("新增 8 题", ADDED_IDS)):
-        selected = [paired[i] for i in ids if i in paired]
+    subsets = [(label, [paired[i] for i in ids if i in paired])
+               for label, ids in (("原 12 题", PRIOR_IDS), ("新增 8 题", ADDED_IDS))]
+    subsets = [(label, rows) for label, rows in subsets if rows]
+    if subsets:
+        lines += ["", "## 原 12 题与新增 8 题", "",
+                  "| 子集 | 题数 | 直接逐题平均分 | 静态逐题平均分 | 胜/负/平 |",
+                  "|---|---:|---:|---:|---|"]
+    for label, selected in subsets:
         d = sum(r["direct"]["score"] for r in selected)/len(selected)
         s = sum(r["skill"]["score"] for r in selected)/len(selected)
         w = sum(r["skill"]["score"] > r["direct"]["score"] for r in selected)
@@ -164,7 +190,8 @@ def report(root):
                      f'{clean(s["prediction"])} | {s["score"]:.2f} | {s["requests"]}/{s["tool_calls"]} |')
     lines += [
         "",
-        "本次是已检查过的 20 题诊断复测。程序组同时增加几何输入、复核提示、"
+        (f"本次是重新抽取的 {n} 题配对实验。" if selection else
+         "本次是已检查过的 20 题诊断复测。") + "程序组同时增加几何输入、复核提示、"
         "图像和多轮计算，组间差值衡量这一整套配置，不能单独归因于工具或表面复核。"
         "浮点题使用 MRA，因此逐题平均分不等于二元准确率。",
         "",

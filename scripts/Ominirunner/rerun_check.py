@@ -12,7 +12,7 @@ if not __package__:
     __package__ = "Ominirunner"
 
 from skill3d.synthesis.request_governor import RequestGovernor, RequestGovernorConfig
-from .common import concurrency, digest, read, write
+from .common import IDS, concurrency, digest, read, write
 from .rerun import transition
 from .reuse import accounted_requests, request_cap
 
@@ -36,27 +36,28 @@ def main():
             else:
                 raise AssertionError("active permits allowed policy mutation")
         assert read(shared / "state.json")["policy"]["max_inflight"] == 4
-        transition(shared, 20, root / "to20.json")
-        gate = Barrier(20)
+        transition(shared, 30, root / "to30.json")
+        gate = Barrier(30)
 
         def request(index):
-            governor = RequestGovernor(shared, RequestGovernorConfig(20000, 20))
+            governor = RequestGovernor(shared, RequestGovernorConfig(20000, 30))
             with governor.request("solver", {"slot_key": index}) as receipt:
                 gate.wait(timeout=20)
                 receipt["usage"] = {"total_tokens": index}
 
-        with ThreadPoolExecutor(max_workers=20) as pool:
-            list(pool.map(request, range(20)))
+        with ThreadPoolExecutor(max_workers=30) as pool:
+            list(pool.map(request, range(30)))
         state = read(shared / "state.json")
-        assert state["peak_inflight"] == 20
-        assert len(state["requests"]) == 21 and digest(state["requests"][:1]) == prefix
+        assert state["peak_inflight"] == 30
+        assert len(state["requests"]) == 31 and digest(state["requests"][:1]) == prefix
         assert all(r["status"] == "completed" for r in state["requests"][1:])
         transition(shared, 4, root / "to4.json")
         restored = read(shared / "state.json")
         assert restored["requests"] == state["requests"]
         assert len(restored["policy_transitions"]) == 2
-        assert request_cap(dict.fromkeys(map(str, range(15)))) == 125
-        assert request_cap(dict.fromkeys(map(str, range(20)))) == 120
+        assert request_cap(dict.fromkeys(IDS[:15])) == 125
+        assert request_cap(dict.fromkeys(IDS)) == 120
+        assert request_cap({}, tuple(str(i) for i in range(120, 135))) == 105
         assert accounted_requests([
             {"arm": "direct", "sample_id": "1", "request_count": 1},
             {"arm": "direct", "sample_id": "2", "request_count": 1},
@@ -69,8 +70,8 @@ def main():
                 pass
             else:
                 raise AssertionError("invalid concurrency accepted")
-    print("passed: 20 live permits, active-slot rejection, immutable unknown rows, "
-          "4→20→4 restoration, cap125/cap120 and reused-charge exclusion; model requests=0")
+    print("passed: 30 live permits, active-slot rejection, immutable unknown rows, "
+          "4→30→4 restoration, cap105/cap125/cap120 and reused-charge exclusion; model requests=0")
 
 
 if __name__ == "__main__":

@@ -59,7 +59,8 @@ def score(root, annotation_path):
     table, scored = {}, []
     for arm in ("direct", "skill"):
         groups, statuses, usage, times = {}, Counter(), {}, []
-        legal = requests = tool_calls = 0
+        legal = requests = tool_calls = reviewer_requests = 0
+        reviewer_usage = Counter()
         for item in inputs:
             result = read(root / "episodes" / (item["sample_id"]+"-"+arm) / "result.json")
             reuse = frozen.get("reused_direct", {}).get(item["sample_id"]) if arm == "direct" else None
@@ -79,6 +80,8 @@ def score(root, annotation_path):
             groups.setdefault(group, []).append(value)
             statuses[result["status"]] += 1
             requests += result["request_count"]
+            reviewer_requests += result.get("jev_request_count", 0)
+            reviewer_usage.update(result.get("jev_usage", {}))
             tool_calls += result["tool_counts"]["calls"]
             times.append(result["elapsed_seconds"])
             for key, value_usage in result["usage"].items():
@@ -86,19 +89,23 @@ def score(root, annotation_path):
             scored.append({"sample_id": item["sample_id"], "arm": arm, "group": group,
                            "score": value, "legal": valid, "prediction": pred,
                            "status": result["status"], "requests": result["request_count"],
+                           "reviewer_requests": result.get("jev_request_count", 0),
                            "reused": bool(reuse), "source_run_identity": expected_identity,
                            "tool_calls": result["tool_counts"]["calls"]})
         table[arm] = {
             "metrics": {g: {"n": len(v), "value": sum(v)/len(v)} for g, v in groups.items()},
             "legal": legal, "n": len(inputs), "statuses": dict(statuses),
             "requests": requests, "tool_calls": tool_calls, "usage": usage,
+            "reviewer_requests": reviewer_requests, "reviewer_usage": dict(reviewer_usage),
             "mean_episode_seconds": sum(times)/len(times),
             "sample_weighted_score": sum(sum(v) for v in groups.values())/len(inputs)}
     summary = {"schema": "omni-official-host-score/1", "engine_commit": ENGINE_COMMIT,
                "engine_source_sha256": ENGINE_SHA, "thresholds": THRESHOLDS,
                "run_identity": digest(frozen), "pairs": len(inputs), "table": table,
                "scored": scored, "ground_truth_in_report": False}
-    summary["new_requests"] = sum(r["requests"] for r in scored if not r["reused"])
+    summary["new_solver_requests"] = sum(r["requests"] for r in scored if not r["reused"])
+    summary["new_reviewer_requests"] = sum(r["reviewer_requests"] for r in scored if not r["reused"])
+    summary["new_requests"] = summary["new_solver_requests"] + summary["new_reviewer_requests"]
     summary["reused_requests"] = sum(r["requests"] for r in scored if r["reused"])
     write(root / "scores.json", summary, exclusive=True)
     print({arm: value["metrics"] for arm, value in table.items()})

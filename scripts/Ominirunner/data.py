@@ -9,7 +9,8 @@ import numpy as np
 from PIL import Image
 
 from skill3d.small_image.storage import load_prepared
-from .common import BINDINGS_SHA, IDS, MANIFEST_SHA, digest, read, sha
+from .common import BINDINGS_SHA, IDS, MANIFEST_SHA, digest, read, selected_ids, sha
+from .answer_contract import specification
 
 PUBLIC = {"benchmark", "source_split", "sample_id", "question", "image_keys",
           "task_type", "options", "input_sha256"}
@@ -17,7 +18,7 @@ FIELDS = PUBLIC | {"image_path", "image_sha256", "prepared_path", "artifact_sha2
                    "method_identity", "publication_receipt_sha256"}
 
 
-def select(cache_root):
+def select(cache_root, sample_ids=IDS):
     root = Path(cache_root)
     if sha(root / "manifest.json") != MANIFEST_SHA or sha(root / "bindings.json") != BINDINGS_SHA:
         raise ValueError("cache_manifest_identity")
@@ -28,10 +29,12 @@ def select(cache_root):
     if len(manifest) != 201 or len(bindings) != 501 or len(catalog) != 201:
         raise ValueError("incomplete_cache_catalog")
     result = []
-    for sample_id in IDS:
+    for sample_id in selected_ids({"sample_ids": sample_ids}):
         public = bindings[sample_id]
-        if set(public) != PUBLIC or len(public["image_keys"]) != 1 or public["options"]:
+        if (set(public) != PUBLIC or len(public["image_keys"]) != 1
+                or not isinstance(public["options"], list)):
             raise ValueError("unexpected_public_fields")
+        specification(public)
         key = public["image_keys"][0]
         image, cache = manifest[key], catalog[key]
         if image["image_sha256"] != cache["image_sha256"]:
@@ -74,7 +77,8 @@ def load(item, *, prepared=True):
 
 def problem(item):
     return SimpleNamespace(benchmark=item["benchmark"], question=item["question"],
-                           input_sha256=item["input_sha256"], task_type=item["task_type"])
+                           input_sha256=item["input_sha256"], task_type=item["task_type"],
+                           options=item["options"])
 
 
 def pair_identity(item):

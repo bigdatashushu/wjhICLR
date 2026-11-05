@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 
-VERSION = "omni-static-depth-versus-official-direct/9"
+VERSION = "omni-static-depth-versus-official-direct/13"
 PRIOR_IDS = ("15", "28", "38", "0", "3", "31", "2", "21", "33", "10", "81", "106")
 # Added questions were selected from public type/ID bindings, before any labels.
 ADDED_IDS = ("190", "375", "411", "222", "49", "479", "417", "350")
@@ -24,6 +24,16 @@ def concurrency(value):
     return value
 
 
+def selected_ids(frozen):
+    """Read the ordered question contract, retaining historical defaults."""
+    values = frozen.get("sample_ids", IDS)
+    if (not isinstance(values, (list, tuple)) or not values
+            or len(values) > len(IDS) or len(set(values)) != len(values)
+            or any(not isinstance(v, str) or not v.isdecimal() for v in values)):
+        raise ValueError("invalid_selected_questions")
+    return tuple(values)
+
+
 @dataclass(frozen=True)
 class Config:
     model: str = "qwen3.8-flash"
@@ -33,7 +43,7 @@ class Config:
     max_tokens: int = 8192
     timeout_s: int = 600
     max_program_rounds: int = 5
-    text_caps: tuple = (None, None, None, None, None, 10000)
+    text_caps: tuple = (None, None, None, None, None, 20000)
     text_record_threshold: int = 10000
     cell_timeout_s: int = 30
 
@@ -91,8 +101,9 @@ def write(path, value, *, exclusive=False):
     temp.replace(path)
 
 
-def skill_text():
-    text = (Path(__file__).parent / "static_skill.txt").read_text().strip()
+def skill_text(*, host_review=False):
+    filename = "static_skill_host.txt" if host_review else "static_skill.txt"
+    text = (Path(__file__).parent / filename).read_text(encoding="utf-8").strip()
     if not text or len(text) > 1800:
         raise ValueError("static_skill_length")
     return text
@@ -101,7 +112,11 @@ def skill_text():
 def validate_source(source):
     root = Path(__file__).resolve().parents[2]
     if not {"scripts/Ominirunner/worker.py", "scripts/Ominirunner/review.py",
-            "scripts/Ominirunner/evidence.py", "scripts/Ominirunner/sampling.py"} <= set(source):
+            "scripts/Ominirunner/evidence.py", "scripts/Ominirunner/sampling.py",
+            "scripts/Ominirunner/answer_contract.py", "scripts/Ominirunner/coordinates.py",
+            "scripts/Ominirunner/instances.py", "scripts/Ominirunner/progress.py",
+            "scripts/Ominirunner/recovery.py", "scripts/Ominirunner/submission.py",
+            "scripts/Ominirunner/provenance.py", "scripts/Ominirunner/task_evidence.py"} <= set(source):
         raise ValueError("solver_pin_missing")
     for name, expected in source.items():
         path = Path(name)

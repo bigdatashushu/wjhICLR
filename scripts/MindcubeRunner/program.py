@@ -2,31 +2,49 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 
 from skill3d.sandbox.kernel import AnswerTerminate, RestrictedNamespaceKernel
 
 
+def program_context(source):
+    return {"source": source,
+            "source_utf8_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest()}
+
+
 class ProgramFormatError(ValueError):
-    pass
+    def __init__(self, code, *, source=None, previous_response=None, syntax_error=None):
+        super().__init__(code)
+        self.details = program_context(source) if source is not None else {}
+        if previous_response is not None:
+            self.details["previous_response"] = previous_response
+        if syntax_error is not None:
+            self.details.update(type=type(syntax_error).__name__, line=syntax_error.lineno,
+                                column=syntax_error.offset, syntax_message=syntax_error.msg)
+            lines = source.splitlines()
+            if syntax_error.lineno is not None and 1 <= syntax_error.lineno <= len(lines):
+                self.details["source_line"] = lines[syntax_error.lineno - 1]
 
 
 def parse_program(text):
     match = re.fullmatch(r"```python[ \t]*\n([\s\S]*?)\n?```", text.strip())
-    if not match or "```" in match[1]:
-        raise ProgramFormatError("python_fence_required")
+    if not match:
+        raise ProgramFormatError("python_fence_required", previous_response=text)
+    if "```" in match[1]:
+        raise ProgramFormatError("python_fence_required", source=match[1])
     try:
         tree = ast.parse(match[1])
     except SyntaxError as exc:
-        raise ProgramFormatError("python_syntax_error") from exc
+        raise ProgramFormatError("python_syntax_error", source=match[1], syntax_error=exc) from exc
     if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef):
-        raise ProgramFormatError("solve_entry_required")
+        raise ProgramFormatError("solve_entry_required", source=match[1])
     entry, args = tree.body[0], tree.body[0].args
     if (entry.name != "solve" or entry.decorator_list or entry.returns
             or args.posonlyargs or args.kwonlyargs or args.kwarg or args.vararg or args.defaults
             or len(args.args) != 1 or args.args[0].arg != "ctx" or args.args[0].annotation):
-        raise ProgramFormatError("solve_entry_required")
+        raise ProgramFormatError("solve_entry_required", source=match[1])
     return match[1]
 
 

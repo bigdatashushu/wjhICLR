@@ -1,0 +1,46 @@
+{
+  "schema": "gptexp-config/1",
+  "model": "gpt-6.1-sol",
+  "reasoning_effort": "high",
+  "temperature": 0,
+  "seed": 137,
+  "automatic_retry": false,
+  "upstream_policy": {
+    "require_reported_sampling_match": true,
+    "require_reported_instructions_match": true,
+    "require_reported_output_limit_match": true
+  },
+  "max_requests": 13470,
+  "max_inflight": 2,
+  "max_workers": 4,
+  "queue_timeout_seconds": 604800,
+  "worker_timeout_seconds": 864000,
+  "apis": [
+    {
+      "id": "xcode-1",
+      "base_url": "https://xcode.best/v1",
+      "protocol": "responses",
+      "model": "gpt-6.1-sol",
+      "api_key_env": "XCODE_GPT_API_KEY",
+      "credentials_file": "",
+      "max_inflight": 1,
+      "requests_per_second": 0,
+      "timeout_seconds": 36000,
+      "enabled": true,
+      "validated": false
+    },
+    {
+      "id": "xcode-2",
+      "base_url": "https://xcode.best/v1",
+      "protocol": "responses",
+      "model": "gpt-6.1-sol",
+      "api_key_env": "XCODE_GPT_API_KEY_2",
+      "credentials_file": "",
+      "max_inflight": 1,
+      "requests_per_second": 0,
+      "timeout_seconds": 36000,
+      "enabled": false,
+      "validated": false
+    }
+  ]
+}

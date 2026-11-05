@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 import shutil
 
-from .common import Config, digest, read, sha, write
+from .common import Config, IDS, digest, read, selected_ids, sha, write
 from .data import pair_identity
 
 
@@ -78,8 +78,17 @@ def materialize(entry, root):
     return read(target / "result.json")
 
 
-def request_cap(reused):
-    return Config().trial_request_cap - len(reused)
+def request_cap(reused, sample_ids=IDS, measurement_reviewer=None):
+    ids = selected_ids({"sample_ids": sample_ids})
+    if not set(reused) <= set(ids):
+        raise ValueError("reuse_outside_selection")
+    config = Config()
+    extra = 0
+    if measurement_reviewer is not None:
+        from .jev import Policy
+        extra = len(ids) * Policy.parse(measurement_reviewer).max_requests
+    return (len(ids) * (config.request_limit("direct") + config.request_limit("skill"))
+            - len(reused) + extra)
 
 
 def accounted_requests(results, reused):

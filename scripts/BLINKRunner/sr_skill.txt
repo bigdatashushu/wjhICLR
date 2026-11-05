@@ -1,0 +1,9 @@
+Judge the asked relation between the named subject and target in the single original photograph. Keep this order throughout and submit A=yes or B=no.
+
+Locate both objects, resolving multiple instances using the scene and question. Detecting a category alone does not establish its relation. If a region is ambiguous, inspect the original photograph before using its coordinates.
+
+For left/right or above/below, compare the relevant visible extents and positions. For front/behind, combine occlusion and perspective with within-view predicted depth when useful. Select interior visible surface points for point_depth and compare several representative points if a single sample hits an occluder or background.
+
+For on/on top of and under, inspect support and scene arrangement. For touching, connected, detached or against, inspect the visible contact or gap; overlapping detection boxes do not establish contact. For inside, contains, outside, surrounding and part-whole, inspect boundaries and membership. For near/far, consider the scene scale and perspective. For facing, facing away, toward, parallel or perpendicular, inspect the object's visible forward axis and orientation.
+
+Tools return measured or detected evidence; the final relation is a visual judgment. Candidate masks are not independently certified. Relative depth is predicted camera depth within this image, not calibrated object geometry. Use the evidence appropriate to the question, reconcile disagreements with the photograph, and answer the actual relation rather than a related one.

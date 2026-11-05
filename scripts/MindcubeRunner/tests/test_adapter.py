@@ -3,8 +3,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import base64
 import copy
+import hashlib
 import json
 import io
+import re
 import subprocess
 import sys
 import threading
@@ -21,11 +23,12 @@ from skill3d.synthesis.bailian_client import BailianClient
 
 from MindcubeRunner.budget import LEDGERS, DualBudget, audit
 from MindcubeRunner.common import Config, digest, read, sha, validate_preflight, write
+from MindcubeRunner.context_stage import guidance
 from MindcubeRunner.data import PUBLIC, digest_bytes, load, pair_identity, problem, select
 from MindcubeRunner.depth_input import depth_preview
 from MindcubeRunner.observation_context import build_observation_context, restore_observations
-from MindcubeRunner.program import parse_json
-from MindcubeRunner.protocol import messages
+from MindcubeRunner.program import parse_json, parse_program
+from MindcubeRunner.protocol import candidate_query_context, messages
 from MindcubeRunner.run import preflight
 from MindcubeRunner.score import load_answers, summarize
 from MindcubeRunner.tools import ALLOWED, build_registry
@@ -169,6 +172,12 @@ def context_observations(client, index):
     line = next(line for line in text(client, index).splitlines()
                 if line.startswith("TOOL RESULTS "))
     return restore_observations(json.loads(line[len("TOOL RESULTS "):]))
+
+
+def context_feedback(client, index):
+    line = next(line for line in text(client, index).splitlines()
+                if line.startswith("RECENT FEEDBACK "))
+    return json.loads(line[len("RECENT FEEDBACK "):])
 
 
 def test_select_tiny_order_and_independent_geometry(snapshot):
@@ -435,6 +444,86 @@ def test_new_candidates_are_inspected_before_next_measurement(snapshot, tmp_path
         *first["tool_observations"], *second["tool_observations"]]
 
 
+def test_prompt_tool_example_yields_its_actual_result_to_next_request(snapshot, tmp_path):
+    examples = re.findall(r"```python\n([\s\S]*?)\n```",
+                          guidance(["plan_or_measure"], final=False))
+    source = next(example for example in examples if "ctx.tools.view_candidates(" in example)
+    result, client, _, _ = episode(tmp_path, snapshot[2][0], [
+        "```python\n" + source + "\n```", program('ReturnAnswer("B")')])
+    first, second = result["rounds"]
+    assert first["status"] == "yielded"
+    assert result["status"] == "answered" and result["request_count"] == 2
+    assert result["tool_counts"] == {"calls": 1, "measurements": 0}
+    observation = first["tool_observations"][0]
+    assert observation["source_tool"] == "view_candidates"
+    assert observation["data"]["candidates"]
+    assert first["cell"]["yielded_result_ids"] == [observation["result_id"]]
+    assert second["request"]["hint_result_ids"] == [observation["result_id"]]
+    assert second["request"]["context_actions"] == ["inspect_hints"]
+    assert context_observations(client, 1) == [observation]
+
+
+@pytest.mark.parametrize("arguments,view_index,category", [
+    ("", -1, ""),
+    ('view_index=1, category="unexposed-category"', 1, "unexposed-category"),
+    ("view_index=0", 0, ""),
+])
+def test_empty_query_scope_survives_unexecuted_repairs_and_final(
+        snapshot, tmp_path, monkeypatch, arguments, view_index, category):
+    item = snapshot[2][0]
+    cache = load(item)
+    for candidate in cache.candidates:
+        candidate["category_confirmed"] = False
+    monkeypatch.setattr("MindcubeRunner.worker.load", lambda *args, **kwargs: cache)
+    first = program(f"r = ctx.tools.view_candidates({arguments})\n"
+                    'YieldObservations([r["result_id"]], reason="Inspect locations")')
+    rejected = "Explanation outside the fence\n" + program(
+        'r = ctx.tools.view_candidates(view_index=1, category="proposed-only")\n'
+        'YieldObservations([r["result_id"]])')
+    result, client, _, directory = episode(
+        tmp_path, item, [first, *([rejected] * 4), '{"answer":"B"}'], cache=cache)
+    assert result["status"] == "answered" and result["request_count"] == 6
+    assert result["tool_counts"] == {"calls": 1, "measurements": 0}
+    observation = result["rounds"][0]["tool_observations"][0]
+    assert observation["data"]["candidates"] == [] and observation["data"]["count"] == 0
+    expected = [{"result_id": observation["result_id"],
+                 "view_index": view_index, "category": category}]
+    first_trace = read(directory / "traces/00/trace.json")
+    executed = next(e["data"]["results"][0] for e in first_trace["events"]
+                    if e["kind"] == "tool_finished")
+    assert executed["result_id"] == expected[0]["result_id"]
+    assert executed["args"].get("view_index", -1) == view_index
+    assert executed["args"].get("category", "") == category
+    assert "EXECUTED CANDIDATE QUERIES [" not in text(client, 0)
+    for index in range(1, 6):
+        history = next(line.removeprefix("EXECUTED CANDIDATE QUERIES ")
+                       for line in text(client, index).splitlines()
+                       if line.startswith("EXECUTED CANDIDATE QUERIES "))
+        assert json.loads(history) == expected
+        assert context_observations(client, index) == [observation]
+        assert result["rounds"][index]["request"]["candidate_query_history_sha256"] == digest(expected)
+        assert result["rounds"][index]["request"]["candidate_query_count"] == 1
+        trace = read(directory / "traces" / f"{index:02d}" / "trace.json")
+        state = next(e["data"] for e in trace["events"] if e["kind"] == "state_before")
+        assert state["candidate_queries"] == expected
+        assert not any(e["kind"] == "tool_started" for e in trace["events"])
+    assert all(row["status"] == "program_parse_error" for row in result["rounds"][1:5])
+    assert result["rounds"][-1]["phase"] == "final"
+    assert 'category="proposed-only"' not in text(client, 5)
+
+
+@pytest.mark.parametrize("change", [
+    {"result_id": "no-such-result"}, {"view_index": True}, {"view_index": 2},
+    {"category": ["not-a-string"]}, {"extra": "not-public"},
+])
+def test_candidate_query_history_rejects_unbound_or_malformed_records(change):
+    observations = [{"result_id": "query-1", "source_tool": "view_candidates",
+                     "status": "ok", "data": {"candidates": [], "count": 0}}]
+    query = {"result_id": "query-1", "view_index": -1, "category": "", **change}
+    with pytest.raises(ValueError, match="invalid_candidate_query_record"):
+        candidate_query_context(observations, [query], view_count=2)
+
+
 @pytest.mark.parametrize("failure_after_measurement", [False, True])
 def test_repair_keeps_measurement_review_and_exact_evidence(
         snapshot, tmp_path, failure_after_measurement):
@@ -460,6 +549,61 @@ def test_repair_keeps_measurement_review_and_exact_evidence(
     assert reviewed["reviewed_measurement_ids"] == first["new_measurement_ids"]
     assert context_observations(client, review_round) == first["tool_observations"]
     assert result["answer"] == "B"
+    if failure_after_measurement:
+        assert context_feedback(client, review_round)[0]["source"] == parse_program(outputs[0])
+        assert result["tool_counts"]["measurements"] == 1
+    else:
+        assert context_feedback(client, review_round)[0]["previous_response"] == outputs[1]
+
+
+def test_global_prefix_error_delivers_exact_program_and_syntax_location(snapshot, tmp_path):
+    failed = program('GLOBAL ReturnAnswer("B")')
+    source = failed.removeprefix("```python\n").removesuffix("\n```")
+    result, client, _, directory = episode(tmp_path, snapshot[2][0], [
+        failed, program('ReturnAnswer("B")')])
+    error = result["rounds"][0]["feedback_errors"][0]
+    assert error["code"] == "python_syntax_error" and error["type"] == "SyntaxError"
+    assert error["line"] == 2 and error["column"] > 0
+    assert error["syntax_message"] == "invalid syntax"
+    assert error["source_line"] == source.splitlines()[1]
+    assert error["source"] == source
+    assert error["source_utf8_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+    assert context_feedback(client, 1) == [error]
+    assert "Do not put GLOBAL" in error["repair"]
+    assert result["request_count"] == 2 and result["answer"] == "B"
+    assert result["rounds"][1]["request"]["context_actions"] == ["repair"]
+    assert len(client.calls[1][0]) == 1 and client.calls[1][0][0]["role"] == "user"
+    assert [p for p in content(client, 1) if p["type"] == "image_url"] == [
+        p for p in content(client, 0) if p["type"] == "image_url"]
+    first = read(directory / "traces/00/trace.json")
+    assert first["events"][-1]["data"]["state_after"]["errors"] == [error]
+    assert not any(e["kind"] == "cell_completed" for e in first["events"])
+
+
+def test_final_after_syntax_errors_excludes_previous_program_data(snapshot, tmp_path):
+    failed = program('GLOBAL ReturnAnswer("B")')
+    result, client, _, _ = episode(
+        tmp_path, snapshot[2][0], [failed] * 5 + ['{"answer":"B"}'])
+    assert result["request_count"] == 6 and result["answer"] == "B"
+    final_feedback = context_feedback(client, 5)[0]
+    assert final_feedback["code"] == "python_syntax_error" and final_feedback["line"] == 2
+    assert set(final_feedback) == {"code", "type", "line", "column", "repair"}
+    final_text = text(client, 5)
+    for forbidden in ("GLOBAL ReturnAnswer", "def solve", "source_utf8_sha256",
+                      "syntax_message", "```python"):
+        assert forbidden not in final_text
+
+
+def test_oversized_previous_program_stops_before_another_request(snapshot, tmp_path):
+    failed = program("# " + "x" * 24000 + '\nGLOBAL ReturnAnswer("B")')
+    result, client, _, directory = episode(tmp_path, snapshot[2][0], [failed])
+    assert result["status"] == "context_limit"
+    assert result["request_count"] == len(client.calls) == 1
+    error = result["rounds"][0]["feedback_errors"][0]
+    assert len(error["source"]) > 24000
+    second = read(directory / "traces/01/trace.json")
+    assert second["events"][-1]["data"]["state_after"]["errors"] == [error]
+    assert not any(e["kind"] == "admitted" for e in second["events"])
 
 
 def test_final_after_fifth_parse_error_has_only_current_json_format(snapshot, tmp_path):
@@ -517,20 +661,23 @@ def test_pending_context_overflow_is_explicit_and_does_not_truncate(snapshot):
 
 def test_wrong_control_namespace_repairs_in_original_slots(snapshot, tmp_path):
     _, _, items = snapshot
-    result, _, _, _ = episode(tmp_path, items[0], [
+    result, client, _, _ = episode(tmp_path, items[0], [
         program('ctx.tools.YieldObservations([])'),
         program('ReturnAnswer("A")')])
     assert result["answer"] == "A" and result["request_count"] == 2
     assert result["rounds"][0]["status"] == "repairable_program_error"
     assert result["rounds"][0]["executed"] is False
+    assert context_feedback(client, 1)[0]["source"] == parse_program(
+        program('ctx.tools.YieldObservations([])'))
 
 
 def test_ordinary_runtime_repair_and_answer_slot_reset(snapshot, tmp_path):
     _, _, items = snapshot
-    result, _, _, _ = episode(tmp_path, items[0], [
+    result, client, _, _ = episode(tmp_path, items[0], [
         program('ReturnAnswer("D")'), program('ReturnAnswer("B")')])
     assert result["answer"] == "B"
     assert result["rounds"][0]["cell"]["error_code"] == "violation_runtime"
+    assert context_feedback(client, 1)[0]["source"] == parse_program(program('ReturnAnswer("D")'))
 
 
 def test_unlimited_calls_execute_and_review_across_program_rounds(snapshot, tmp_path):

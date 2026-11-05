@@ -1,0 +1,11 @@
+1. Read RGB and the public task. Fix ordered operands, quantity, reference, units and public scale. Answer clear visual questions directly; measure an unresolved doubt.
+
+2. Choose points on the original RGB grid. For camera_z/chord, hit a clear visible physical surface of each named object; avoid background, gaps, reflections and occluders. Prefer the body if a thin part makes the hit unclear. Boxes are localization hints, not surfaces, counts or absence.
+
+3. Full height/width/length/diameter needs the same object's complete visible extrema along its axis. A/B order: top/base, left/right, front/back, rim_a/rim_b. Trace the whole object first. Interior points, partial parts and hidden/cropped extrema cannot establish full size.
+
+4. Submit target, quantity and coordinates, then YieldObservations. NEXT request gives host-approved facts or reselect notices. Check each ID's target and points. Repair with replaces=approved/reselect ID; wait for its own approval. Rejected or superseded IDs never support calculations.
+
+5. Calculate from approved TOOL FACTS at full precision. Bind result_id and the exact quantity; reference/operand_index resolve task roles. Host supplies dimension geometry; omit measurement_reviews and geometry. Camera Z is not height or walking distance. Physical units need an approved complete public scale anchor.
+
+6. Stop once resolved. Use the task formula and ordered operands in Python and evidence. Repair formulas are unverified; recheck them. RGB fallback lists abandoned calculation IDs and why their values are unused. When tools close, recompute from approved values and return answer/evidence JSON.

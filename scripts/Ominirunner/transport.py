@@ -63,23 +63,32 @@ def health(gateway, loader):
 
 class DualBudget:
     """Config-derived local cap and existing common cap20000, without retries."""
-    def __init__(self, local, shared, stop_file, campaign, arm, sample_id, run_identity):
+    def __init__(self, local, shared, stop_file, campaign, arm, sample_id, run_identity, *,
+                 reserved_cap=None, aggregate_policy=None):
         self.local, self.shared, self.stop = local, shared, Path(stop_file)
         self.context = {"variant_id": arm, "slot_key": sample_id,
                         "campaign_id": campaign, "run_identity": run_identity}
+        self.reserved_cap = reserved_cap
+        self.aggregate_policy = aggregate_policy
 
     @contextmanager
-    def request(self):
+    def request(self, category="solver"):
+        if category not in ("solver", "gate"):
+            raise ValueError("omni_request_category_invalid")
         if self.stop.exists():
             raise RequestBudgetExhausted("run_admission_stopped")
-        from .budget import audit
+        from .budget import admission, audit
         accounting = audit(self.shared.root.parents[1])
-        if accounting["used"] >= accounting["global_cap"]:
+        if self.aggregate_policy is None and accounting["used"] >= accounting["global_cap"]:
             raise RequestBudgetExhausted("aggregate_global_budget_exhausted")
-        with self.local.request("solver", self.context) as local:
+        if self.reserved_cap is not None:
+            remaining = max(0, self.reserved_cap - accounting["shared_campaign_counts"].get(
+                self.context["campaign_id"], 0))
+            admission(accounting, remaining, self.aggregate_policy)
+        with self.local.request(category, self.context) as local:
             if self.stop.exists():
                 raise RequestBudgetExhausted("run_admission_stopped")
-            with self.shared.request("solver", self.context) as shared:
+            with self.shared.request(category, self.context) as shared:
                 try:
                     yield local
                 finally:

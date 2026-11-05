@@ -26,7 +26,8 @@ from . import VERSION
 from .budget import DualBudget
 from .common import Config, digest, read, validate_source, write
 from .data import load, pair_identity, problem
-from .program import OptionKernel, ProgramFormatError, parse_json, parse_program, wrong_controls
+from .program import (OptionKernel, ProgramFormatError, parse_json, parse_program,
+                      program_context, wrong_controls)
 from .protocol import messages
 from .tools import ALLOWED, MEASUREMENTS, build_registry, empty_counts
 from .transport import ProxyOpener, auth_loader, health
@@ -35,13 +36,26 @@ from .traces import POLICY, TraceError, TraceWriter, mark_orphans, storage_check
 JOB_SCHEMA = "mindcube-label-free-worker/1"
 
 
-def feedback(code):
+def feedback(code, *, details=None, source=None):
     repair = {
-        "control_namespace_error": "Use global ReturnAnswer or YieldObservations; ctx.tools has evidence tools only.",
-        "program_missing_action": "End solve with global ReturnAnswer or YieldObservations.",
+        "python_syntax_error": (
+            "Fix the reported syntax line and column in the previous source. "
+            "Call ReturnAnswer(letter) or YieldObservations(...) directly as Python functions. "
+            "Do not put GLOBAL or the Python global keyword before a function call."),
+        "python_fence_required": (
+            "Put the corrected def solve(ctx): and its body in exactly one closed python fence; "
+            "remove prose or extra fences."),
+        "solve_entry_required": (
+            "Use exactly one top-level def solve(ctx): with no annotations, decorators "
+            "or extra parameters; put all program statements inside its body."),
+        "control_namespace_error": "Call ReturnAnswer or YieldObservations directly; ctx.tools has evidence tools only.",
+        "program_missing_action": "End solve with a direct call to ReturnAnswer or YieldObservations.",
         "runtime_error": "Correct the Python error; valid answers are current option letters.",
     }.get(code, "Output one closed python fence with only def solve(ctx):.")
-    return [{"code": code, "repair": repair}]
+    error = {"code": code, "repair": repair, **(details or {})}
+    if source is not None:
+        error.update(program_context(source))
+    return [error]
 
 
 def solve(job, client, budget):
@@ -50,6 +64,7 @@ def solve(job, client, budget):
     directory = Path(job["output_directory"])
     cache = load(item, prepared=arm == "skill")
     observations, errors, review_ids, hint_ids, rounds = [], [], [], [], []
+    candidate_queries = []
     counters, kernel = empty_counts(), None
     status, answer = "no_answer", None
     if arm == "skill":
@@ -61,7 +76,8 @@ def solve(job, client, budget):
     started = time.monotonic()
     def state():
         return {"review_ids": list(review_ids), "hint_ids": list(hint_ids),
-                "errors": errors, "observations": observations, "counters": dict(counters)}
+                "errors": errors, "observations": observations, "counters": dict(counters),
+                "candidate_queries": list(candidate_queries)}
 
     def checkpoint(trace, row):
         trace.finish(row["status"], state(), row)
@@ -85,7 +101,8 @@ def solve(job, client, budget):
         try:
             context, receipt = messages(item, cache, arm=arm, config=config, round_index=index,
                                         observations=observations, errors=errors,
-                                        review_ids=review_ids, hint_ids=hint_ids, counters=counters)
+                                        review_ids=review_ids, hint_ids=hint_ids, counters=counters,
+                                        candidate_queries=candidate_queries)
         except ValueError as exc:
             status = "context_limit" if str(exc) == "context_limit" else "context_error"
             trace.finish(status, state(), {"sent": False, "error_type": type(exc).__name__})
@@ -141,7 +158,7 @@ def solve(job, client, budget):
         try:
             program = parse_program(text)
         except ProgramFormatError as exc:
-            errors = feedback(str(exc))
+            errors = feedback(str(exc), details=exc.details)
             row.update(status="program_parse_error", feedback_errors=errors)
             checkpoint(trace, row)
             continue
@@ -161,7 +178,8 @@ def solve(job, client, budget):
             checkpoint(trace, row)
             break
         if wrong or not check_action(program, tool_names=ALLOWED).ok:
-            errors = feedback("control_namespace_error" if wrong else "program_missing_action")
+            errors = feedback("control_namespace_error" if wrong else "program_missing_action",
+                              source=program)
             row.update(status="repairable_program_error", feedback_errors=errors, executed=False)
             checkpoint(trace, row)
             continue
@@ -182,6 +200,12 @@ def solve(job, client, budget):
                                   if k in registry.public_fields[result.tool]}
                 observations.append(public)
                 delivered.append(public)
+                if result.tool == "view_candidates":
+                    candidate_queries.append({
+                        "result_id": result.result_id,
+                        "view_index": result.args.get("view_index", -1),
+                        "category": result.args.get("category", ""),
+                    })
                 if result.tool in MEASUREMENTS:
                     fresh.append(result.result_id)
                 else:
@@ -207,7 +231,8 @@ def solve(job, client, budget):
         errors, stop_episode = [], False
         if cell.error_code or cell.answer_untrusted:
             errors = [{"code": cell.error_code or "untrusted_answer",
-                       "type": cell.error_type, "line": cell.error_line}]
+                       "type": cell.error_type, "line": cell.error_line,
+                       **program_context(program)}]
             if cell.answer_untrusted or cell.error_code in ("timeout", "tool_contract"):
                 status, row["status"], stop_episode = "run_error", "run_error", True
             else:

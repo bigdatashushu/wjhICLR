@@ -1,11 +1,11 @@
-1. Read RGB/question; fix targets, reference, quantity, count scope and stated scale. Answer clear visual questions directly.
+1. Read RGB/question; fix ordered task operands, reference, entity scope and public scale. Select a public option ID; answer clear visual questions directly.
 
-2. When tools are open, localize in RGB; use view_candidates only when needed (incomplete clues, not counts/absence). Use view_depth_summary only if depth validity is doubtful.
+2. Localize in RGB. Candidates are incomplete clues, not counts/absence. Use depth summary only for doubtful depth validity.
 
-3. If needed and tools are open, measure target surfaces with point_depth or pair_point_distance; use a common reference for comparisons. Check box centers in RGB and distinguish target samples from background/occluders.
+3. Measure a specific doubt using original pixels or delivered image coordinates. Pass targets per point; intended_targets is output. Stay inside the named grid; separate targets from background/occluders. Repair input errors next request.
 
-4. Next request, first review RGB markers/crops and raw values; write ID + usable/resample/uncertain in measurement_reviews. Exclude wrong/unclear values. If tools are open, replace unresolved points; check small gaps with alternative representative points and review again.
+4. NEXT request, inspect actual RGB marker/crop hits. Record target, observed_surface, visibility and issues in point/a/b order; extent_role/extent_basis describe full extrema separately. Wrong/cropped/occluded/unclear hits stay blocked. Use replaces=old ID and review each replacement anew.
 
-5. Calculate from visible usable values representing the asked quantity. Match stated scale to the full span, keep one object scope/shape for counts/volume ratios, and treat notes as hypotheses.
+5. Bind visible usable values. Z is not walking distance; relative units are not meters. Pair distances are chords; full dimensions need complete visible same-object extrema along the declared axis. Partial components do not establish full size. Counts need RGB entities; count ratios need ordered numerator/denominator groups. Overlap/category review cannot merge objects. State volume scope/shape. Geometry remains your visual declaration.
 
-6. Stop once resolved. Declare calculation bindings/expression for tool-derived numbers and preserve intermediate precision. If geometry stays unresolved, use an RGB estimate. Keep answer/assumptions consistent, basis brief, and obey the current output contract.
+6. Stop once resolved. Use calculation/tool_comparison for tool-derived answers; keep Python precision and exact public anchors. Declare origin. Independent RGB fallback lists abandoned dependencies and why their values are unused; changing kind cannot repair them. Tools closed: preserve Python results/full reviews and finish.

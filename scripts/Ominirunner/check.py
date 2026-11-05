@@ -24,7 +24,8 @@ from skill3d.sandbox.ast_guard import ast_guard
 from .common import ADDED_IDS, Config, IDS, PRIOR_IDS
 from .native import NativeKernel, parse_json, parse_program, scalar
 from .protocol import (OUTPUT, REVIEW_OUTPUT, EVIDENCE_OUTPUT, RAW_FORMAT,
-                       crop_sheets, messages, overlay, packed, review_summary)
+                       crop_sheets, evidence_output, messages, overlay, packed, review_summary, task_output)
+from .answer_contract import specification
 from .review import program_reviews, validate as validate_reviews
 from .evidence import (ABS_TOL, REL_TOL, EvidenceError, dependency_ids, expression_value,
                        feedback as evidence_feedback, validate as validate_evidence)
@@ -48,7 +49,7 @@ def fixture():
                             geometries={0: {"depth": depth, "valid_mask": depth > 0,
                                             "points": points}},
                             provenance={"question": "SECRET_UNION_QUESTION"})
-    item = {"question": "How many chairs are visible?", "sample_id": "15",
+    item = {"question": "Observe chairs and return a native scalar.", "sample_id": "15",
             "benchmark": "Omni3D-Bench", "source_split": "benchmark",
             "task_type": "int", "image_keys": ["image"], "input_sha256": "q",
             "options": [], "image_sha256": "unused"}
@@ -132,14 +133,14 @@ def main(engine=None):
             if arm == "skill":
                 assert "no count limits." in raw and RAW_FORMAT in context[0]["content"][1]["text"]
                 text = context[0]["content"][1]["text"]
-                assert EVIDENCE_OUTPUT in text  # full protocol remains visible from round one
+                assert evidence_output(specification(item)) in text  # full applicable schema is visible
                 if receipt["phase"] == "final":
                     assert "def solve(ctx)" not in text and "ReturnAnswer(" not in text
                     assert "FIRST literal assignment" not in text and "tools closed" in text
                 else:
                     assert 'final JSON {"answer"' not in text and "FIRST literal assignment" in text
-                    assert "answer = 2.0 * h / w" in text
-                    assert "ReturnAnswer(answer, evidence=evidence)" in text
+                    assert "TASK SUBMISSION TEMPLATE" in text
+                    assert "ReturnAnswer(1, evidence=evidence)" in text
                     assert "Do not hand-compute or round a numeric answer literal." in text
                 assert "chord is not full size and MUST omit geometry" in text
                 assert "rel_tol=1e-9, abs_tol=1e-9" in text
@@ -207,7 +208,11 @@ def main(engine=None):
                     output = json.dumps(value)
             if self.auto_evidence and any(r["source_tool"] in ("point_depth", "pair_point_distance")
                                           for r in facts):
-                evidence = {"kind": "visual_estimate", "basis": "Synthetic RGB estimate"}
+                evidence = {"kind": "visual_estimate", "basis": "Synthetic independent RGB estimate",
+                            "provenance": {"source": "rgb_only", "referenced_result_ids": [],
+                                "abandoned_result_ids": [r["result_id"] for r in facts
+                                                        if r["source_tool"] in ("point_depth", "pair_point_distance")],
+                                "abandonment_reason": "Offline fixture ignores all tool numbers and returns a fixed RGB estimate."}}
                 if output.startswith("```python\n") and "evidence=" not in output:
                     output = re.sub(r"ReturnAnswer\(([^()\n]*)\)",
                                     lambda m: "ReturnAnswer(" + m[1] + ", evidence=" + repr(evidence) + ")",
@@ -287,25 +292,32 @@ def main(engine=None):
     checked.append("edge and one-valid-pixel patches remain usable with exact pixel coordinates")
     checked.append("explicit calculation sample selects exact delivered value and rejects invalid cells")
 
-    for example in re.findall(r"```python\n[\s\S]*?```", OUTPUT):
+    dimension_task = specification({
+        "question": "If the public_anchor is 2m wide, what is the height of the target?", "task_type": "float"})
+    examples = OUTPUT + "\n" + task_output(dimension_task)
+    for example in re.findall(r"```python\n[\s\S]*?```", examples):
         if "ReturnAnswer(" in example:
             kernel.reset_user_namespace()
             cell = kernel.run_cell(parse_program(example))
             assert not cell.error_code
             if kernel.answer_slot.evidence["kind"] == "calculation":
-                example_values = {"FULL_HEIGHT_ID": 3.141592653589793,
-                                  "FULL_WIDTH_ID": 1.2345678901234567}
+                example_values = {"TARGET_DIMENSION_ID": 3.141592653589793,
+                                  "ANCHOR_DIMENSION_ID": 1.2345678901234567}
                 example_facts = [{"result_id": key, "source_tool": "pair_point_distance",
-                                  "data": {"distance": value}}
-                                 for key, value in example_values.items()]
-                example_reviews = {key: {"result_id": key, "decision": "usable"}
-                                   for key in example_values}
+                                  "data": {"distance": value, "intended_targets": [
+                                      {"target": target, "surface": anchor} for anchor in anchors]}}
+                                 for key, value, target, anchors in [
+                                     ("TARGET_DIMENSION_ID", example_values["TARGET_DIMENSION_ID"], "target", ["top", "base"]),
+                                     ("ANCHOR_DIMENSION_ID", example_values["ANCHOR_DIMENSION_ID"], "public_anchor", ["left", "right"])]]
+                example_reviews = {r["result_id"]: {"result_id": r["result_id"], "decision": "usable",
+                    "observed_surfaces": [{**s, "decision": "usable", "visibility": "visible"}
+                                          for s in r["data"]["intended_targets"]]} for r in example_facts}
                 checked_example = validate_evidence(
                     kernel.answer_slot.raw_value, kernel.answer_slot.evidence,
-                    example_facts, example_reviews, list(example_values))
-                assert checked_example["calculated_value"] == 2.0*example_values["FULL_HEIGHT_ID"]/example_values["FULL_WIDTH_ID"]
+                    example_facts, example_reviews, list(example_values), dimension_task)
+                assert checked_example["calculated_value"] == 2.0*example_values["TARGET_DIMENSION_ID"]/example_values["ANCHOR_DIMENSION_ID"]
             else:
-                assert cell.answer == "1.25"
+                assert cell.answer == "1"
                 assert validate_evidence(kernel.answer_slot.raw_value, kernel.answer_slot.evidence,
                                          [mixed], {}, [])["kind"] == "visual_estimate"
     checked.append("submission and Python calculation examples execute with their declared evidence")
@@ -485,16 +497,27 @@ def main(engine=None):
             assert result["tool_counts"]["rejected"] == 0
             assert result["rounds"][0]["cell"]["answer_untrusted"] is True
             assert (path/"00.execution.json").exists()
-        episode("admitted domain failure charged and fatal", [
-            fenced('ctx.tools.point_depth(view_index=0,x=-1,y=10)\nReturnAnswer(3)')
-        ], admitted_failure)
+        def input_repair(result, path):
+            assert result["status"] == "answered" and result["request_count"] == 3
+            assert result["tool_counts"]["calls"] == result["tool_counts"]["measurements"] == 2
+            assert result["rounds"][0]["cell"]["answer_untrusted"] is True
+            assert result["rounds"][0]["status"] == "repairable_tool_arguments"
+            assert result["rounds"][0]["feedback_errors"][0]["code"] == "omni_invalid_input"
+        episode("admitted local input failure charged and repaired in next cell", [
+            fenced('ctx.tools.point_depth(view_index=0,x=-1,y=10)\nReturnAnswer(3)'),
+            fenced('r=ctx.tools.point_depth(view_index=0,x=10,y=10)\nYieldObservations([r["result_id"]])'),
+            fenced('ReturnAnswer(3)')
+        ], input_repair)
         def signature_failure(result, path):
-            assert result["status"] == "run_error" and result["request_count"] == 1
+            assert result["status"] == "answered" and result["request_count"] == 2
             assert result["tool_counts"] == empty_counts()
             assert len(result["rounds"][0]["tool_receipts"]) == 1
             assert result["rounds"][0]["cell"]["error_code"] == "tool_contract"
-        episode("invalid signature fails before registry admission", [
-            fenced('ctx.tools.point_depth(view_index=0,x=10)\nReturnAnswer(3)')
+            assert result["rounds"][0]["cell"]["answer_untrusted"] is True
+            assert result["rounds"][0]["status"] == "repairable_tool_arguments"
+        episode("invalid signature repaired without charging registry admission", [
+            fenced('ctx.tools.point_depth(view_index=0,x=10)\nReturnAnswer(3)'),
+            fenced('ReturnAnswer(3)')
         ], signature_failure)
         valid_mask = cache.geometries[0]["valid_mask"].copy()
         try:
@@ -576,8 +599,8 @@ def main(engine=None):
             "review_decision_invalid", "review_not_measurement", "review_duplicate"]
         assert errors[0]["index"] == 1 and errors[0]["field"] == "decision"
         assert validate_reviews([review], [observation], [])[1][0]["code"] == "review_not_delivered"
-        assert len(REVIEW_OUTPUT) < 550 and '"reason":' not in REVIEW_OUTPUT
-        checked.append("minimal reason-free reviews and per-record decision/type/duplicate feedback")
+        assert len(REVIEW_OUTPUT) < 750 and '"reason":' not in REVIEW_OUTPUT
+        checked.append("bounded reason-free reviews and per-record decision/type/duplicate feedback")
 
         def calculation(facts, *, decision="usable", tamper=0, quantity="camera_z",
                         unknown=False, geometry=None, final=False):
@@ -714,7 +737,7 @@ def main(engine=None):
             assert list(last["evidence_declaration"]["bindings"]) == ["a_first", "z_second"]
             measurements = stored["rounds"][4]["tool_receipts"]
             assert last["calculation_dependency_ids"] == [
-                measurements[1]["result_id"], measurements[0]["result_id"]]
+                measurements[0]["result_id"], measurements[1]["result_id"]]
             contexts = dict(replay_contexts(item, stored, rgb, frame, cache))
             assert contexts[5] == json.loads((path/"05.messages.json").read_text())
             altered = deepcopy(stored)
@@ -726,7 +749,7 @@ def main(engine=None):
             else:
                 raise AssertionError("tampered final binding priority accepted")
 
-        episode("persisted final JSON preserves original binding priority and rejects order tampering",
+        episode("persisted final JSON uses canonical binding priority and rejects order tampering",
                 [fenced('YieldObservations([])')]*4 + [
                     fenced('ctx.tools.point_depth(view_index=0,x=10,y=10)\n'
                            'ctx.tools.point_depth(view_index=0,x=15,y=10)\nYieldObservations([])'),
@@ -852,7 +875,7 @@ def main(engine=None):
         def text_feedback(result, path):
             error = result["rounds"][1]["answer_feedback_errors"][0]
             assert error["code"] == "calculation_numeric_required" and error["field"] == "answer"
-            assert error["actual_type"] == "str" and "category/text" in error["repair"]
+            assert error["actual_type"] == "str" and "tool_comparison" in error["repair"]
         episode("text answer with numeric calculation receives a type-specific repair", [
             sample,
             lambda f: calculation(f).replace("ReturnAnswer(2.9,", "ReturnAnswer('tv',"),
@@ -961,7 +984,7 @@ def main(engine=None):
         def rejected_final(result, path):
             assert result["status"] == "invalid_answer" and result["request_count"] == 6
             assert result["measurement_reviews"][0]["decision"] == "resample"
-            assert result["pending_measurement_ids"] == []
+            assert result["pending_measurement_ids"] == [result["measurement_reviews"][0]["result_id"]]
             final = json.loads((path/"05.execution.json").read_text())
             assert final["measurement_review_state"] == result["measurement_reviews"]
             assert final["answer_feedback_errors"][0]["code"] == "calculation_measurement_not_usable"
@@ -1002,13 +1025,15 @@ def main(engine=None):
                 receipt = row["request"]
                 assert receipt["image_count"] <= 5
                 if receipt["phase"] == "final":
-                    assert receipt["text_chars"] <= 10000
+                    assert receipt["text_chars"] <= Config().text_caps[-1]
                     assert len(receipt["visible_measurement_ids"]) <= 8
                 elif row["round"] > 0:
                     assert receipt["text_chars"] > 10000 and receipt["text_over_threshold"]
                     assert len(receipt["visible_measurement_ids"]) == 80
                 assert len(receipt["rgb_crop_sheets"]) <= 2
-            assert result["context_text"]["over_threshold_rounds"] == [1, 2, 3, 4]
+            assert result["context_text"]["over_threshold_rounds"] == [
+                row["round"] for row in result["rounds"]
+                if row["request"]["text_chars"] > Config().text_record_threshold]
             assert result["pending_measurement_ids"] == []  # all samples were delivered for review
             assert result["rounds"][-1]["request"]["context_packing"]["omitted_count"] > 0
         episode("eighty calls all execute and final JSON survives bounded backlog", [

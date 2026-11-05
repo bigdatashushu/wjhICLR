@@ -1,0 +1,36 @@
+precompute:
+  device: cuda:0
+  cache_dir: null
+  max_categories: 2
+  max_candidates_per_view: 4
+  candidate_selection: top2_per_category
+  detector:
+    endpoint: http://127.0.0.1:20031
+    identity:
+      model: GroundingDINO
+      deployment: harness3d-r04-3090-proxy
+    max_attempts: 1
+    timeout_s: 120
+    total_timeout_s: 120
+  sam2:
+    checkpoint: /home/zhouky/wangjh/harness3d/precompute-20261022-r01/imports/assets/sam2/sam2.1_hiera_large.pt
+    config: configs/sam2.1/sam2.1_hiera_l.yaml
+    identity:
+      model: facebook/sam2.1-hiera-large
+      checkpoint_sha256: 2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318
+  moge2:
+    checkpoint: /home/zhouky/wangjh/harness3d/precompute-20261022-r01/imports/assets/moge2/model.pt
+    identity:
+      model: Ruicheng/moge-2-vitl
+      checkpoint_sha256: 3eefd4abb2102f38f12b2d1992e5ff15e4923e5431c67dd494afe157e0111cd5
+    infer_kwargs:
+      resolution_level: 6
+  review:
+    provider: intern-decision
+    endpoint: http://127.0.0.1:27345
+    expected_identity_sha256: c16e97ae7e43e8605e201de8388eb9a318bc5f260e05a59e869943a8762c0cb2
+    timeout_s: 60
+    mode: binary
+    prompt_version: P1
+    yes_threshold: 0.77
+    admission_policy: category-only

@@ -1,8 +1,10 @@
 """Offline tests for guidance only; no worker, tools or model dependencies."""
+import ast
 from copy import deepcopy
 from itertools import product
 from pathlib import Path
 import unittest
+import re
 
 from MindcubeRunner.context_stage import format_feedback, guidance, stage_actions
 
@@ -66,7 +68,7 @@ class GuidanceTests(unittest.TestCase):
     def test_program_format_requires_yield_and_prompt_evidence(self):
         text = guidance(["plan_or_measure"], final=False)
         for required in ("one closed python fence", "only def solve(ctx):",
-                         "GLOBAL ReturnAnswer", "YieldObservations", "unlimited",
+                         "direct Python function call", "YieldObservations", "unlimited",
                          "MUST yield all new result_ids", "unreliable notices",
                          "Do not answer after measuring", "Variables reset",
                          "evidence remains in the prompt", "no ReadObservation"):
@@ -75,12 +77,43 @@ class GuidanceTests(unittest.TestCase):
         self.assertNotIn("ctx.tools.YieldObservations", text)
         self.assertNotIn("provisional", text)
 
+    def test_program_examples_have_valid_entries_and_bare_controls(self):
+        text = guidance(["repair"], final=False)
+        sources = re.findall(r"```python\n([\s\S]*?)\n```", text)
+        controls = set()
+        for source in sources:
+            with self.subTest(source=source):
+                tree = ast.parse(source)
+                self.assertEqual(len(tree.body), 1)
+                entry = tree.body[0]
+                self.assertEqual(entry.name, "solve")
+                self.assertEqual([arg.arg for arg in entry.args.args], ["ctx"])
+                calls = [node for node in ast.walk(entry)
+                         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                         and node.func.id in {"ReturnAnswer", "YieldObservations"}]
+                self.assertEqual(len(calls), 1)
+                controls.add(calls[0].func.id)
+                for node in ast.walk(entry):
+                    if isinstance(node, ast.Attribute):
+                        self.assertNotIn(node.attr, {"ReturnAnswer", "YieldObservations"})
+        self.assertEqual(controls, {"ReturnAnswer", "YieldObservations"})
+        self.assertNotIn("GLOBAL ReturnAnswer", text)
+
     def test_repair_preserves_review_and_hint_instructions(self):
         text = guidance(["repair", "review_measurements", "inspect_hints"], final=False)
         for required in ("REPAIR", "REVIEW MEASUREMENTS", "INSPECT HINTS",
                          "unreliable_endpoints", "box center"):
             self.assertIn(required, text)
         self.assertNotIn("PLAN OR MEASURE", text)
+
+    def test_pending_evidence_does_not_repeat_initial_query_example(self):
+        for actions in (["inspect_hints"], ["review_measurements"],
+                        ["repair", "inspect_hints", "review_measurements"]):
+            text = guidance(actions, final=False)
+            self.assertNotIn("```", text)
+            self.assertIn("YieldObservations", text)
+            self.assertIn("ReturnAnswer", text)
+        self.assertIn("ctx.tools.view_candidates(", guidance(["plan_or_measure"], final=False))
 
     def test_final_is_closed_even_with_stale_program_actions(self):
         for actions in (["answer_json"], ["repair", "review_measurements",
@@ -158,7 +191,10 @@ class FeedbackTests(unittest.TestCase):
 
     def test_only_sanitized_scalar_fields_survive(self):
         errors = [{"code": ["not a diagnostic"], "type": {"unsafe": "object"},
-                   "line": True, "repair": ["not repair text"], "extra": "drop"},
+                   "line": True, "column": True, "source": {"unsafe": "object"},
+                   "source_line": ["unsafe"], "syntax_message": ["unsafe"],
+                   "previous_response": ["unsafe"],
+                   "repair": ["not repair text"], "extra": "drop"},
                   {"code": "runtime_error", "type": "NameError", "line": "traceback text"},
                   "not a mapping"]
         original = deepcopy(errors)
@@ -168,6 +204,21 @@ class FeedbackTests(unittest.TestCase):
                 self.assertEqual(len(result), 2)
                 self.assertEqual(set(result[0]), {"repair"})
                 self.assertEqual(set(result[1]), {"code", "type", "repair"})
+        self.assertEqual(errors, original)
+
+    def test_previous_program_and_syntax_details_are_program_phase_only(self):
+        source = 'def solve(ctx):\n    GLOBAL ReturnAnswer("B")'
+        errors = [{"code": "python_syntax_error", "type": "SyntaxError", "line": 2,
+                   "column": 12, "source": source, "source_utf8_sha256": "source-hash",
+                   "source_line": source.splitlines()[1], "syntax_message": "invalid syntax",
+                   "previous_response": "```python\n" + source + "\n```"}]
+        original = deepcopy(errors)
+        program = format_feedback(errors, final=False)[0]
+        for field in errors[0]:
+            self.assertEqual(program[field], errors[0][field])
+        final = format_feedback(errors, final=True)[0]
+        self.assertEqual(set(final), {"code", "type", "line", "column", "repair"})
+        self.assertEqual(final["repair"], "Follow the final output format above.")
         self.assertEqual(errors, original)
 
 
