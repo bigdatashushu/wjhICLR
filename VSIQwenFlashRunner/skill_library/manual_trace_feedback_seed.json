@@ -1,0 +1,556 @@
+{
+  "active": {
+    "manifest_sha256": "cfbd36796cede3c7c967ac9d6e307d4cd4296f5a366bc9ec9a8a9b590bf235b5",
+    "snapshot_id": "g1m1-manual-trace-feedback-20261105-v1"
+  },
+  "changed_slots": [
+    {
+      "after": "S07-g1m1@1.0.1",
+      "before": "S07-g1m1@1.0.0",
+      "chars": 5799,
+      "content_sha256": "5caf54ffe35355f68ee6844a4932938a83cf1c086717b2f38432aed0ed0737b9",
+      "diff": "--- S07-g1m1@1.0.0\n+++ S07-g1m1@1.0.1\n@@ -7,19 +7,28 @@\n \n # Determine the order of first appearances\n \n+## Read usable evidence\n+\n+- Follow the current round's action format. Program rounds use Python and documented tool names; preserve reserved variables and do not invent `scene` methods or XML calls. When finalization requests only JSON, return only that JSON.\n+- A tool returns a dictionary envelope. Its decoded payload is `r[\"data\"]`, and its ID is `r[\"result_id\"]`. For example, object rows are `list_objects(category_filter=category)[\"data\"]`. Do not use `.value`, decode `data` again, or read payload keys from the envelope root.\n+- Reuse valid result IDs. For omitted fields or rows, use `ReadObservation`; advance by its returned `next_cursor`, and confirm the union of read ranges covers the relevant records. A page may contain fewer rows than the requested limit. Print output is diagnostic; use `show` and `YieldObservations` to expose evidence for another round. Rebuild variables from retained observations after yielding.\n+- Check inner status, local binding diagnostics, and current authorization before using a value. A failed object binding stops that object's geometry branch. A duplicate warning requires identity checks; it is not a blanket reason to discard every candidate. Report the evidence actually used.\n+\n ## Method\n \n 1. List all categories to order and the complete option sequences. Use frozen FrameSet slots 0..31 as the timeline; do not reorder time by filenames, interface layout, or video frames that were not provided.\n 2. Inspect original images and use `list_objects(category_filter)` to collect known instances of each category. Every instance of a category may provide earlier visible evidence.\n 3. When `object_visible_frames(obj_id)` is authorized, obtain an ascending visible-frame list for each instance. For each category, take the minimum frame slot across all nonempty instance lists as its earliest visibility under current evidence.\n+   A geometry duplicate flag is not a reason to discard earlier category-visible pixels. Verify the category and include its temporal evidence when the mask is usable. Missing categories remain unknown; do not insert infinity and stable-sort it into a complete sequence.\n 4. Record the earliest evidence for each category and the preceding frame range already checked. A tool's first detection is only an upper bound under current observations; it is not automatically the true first appearance.\n 5. Prioritize early frames and adjacent slots that could change the option ordering. For suspected missed categories, detect relevant frozen frames or inspect crops, and use clearer later views to verify partial early appearances.\n-6. Compare the categories' ordering constraints against each option. If order cannot be resolved within one sampling interval, do not invent subframe timestamps. Choose the complete valid sequence best supported by visible evidence.\n+6. Compare the categories' ordering constraints against each option. Equal earliest slots remain tied: do not order them by object ID, dictionary order, or insertion order. Keep a partial order, inspect earlier relevant original frames when available, and choose the complete option that best satisfies the supported relations. Do not invent subframe timestamps. If a computed sequence matches no option, do not default to a letter. Any visual correction must identify the changed relation and its visible basis; rematch the entire sequence before returning the answer.\n \n ## Branches and checks\n \n - An empty `object_visible_frames` list means the instance has no valid visible mask; it does not mean the category never appears in the entire video.\n - Detector failure, an unexecuted detector, or an empty return cannot prove earlier absence. Healthy empty detections constrain only inspected frames.\n+- Check inner detector status before using detections. A fault must not enter time minima, sorting, or supporting result IDs. Stop unchanged calls to an unconfigured service. If original frames conflict with recorded visibility, state which relation is corrected and the visible basis; do not silently relabel a mask's first slot.\n - Aggregate multiple instances of a category by earliest visibility; do not inspect only an arbitrary default instance.\n - Repeated placeholder images, missing frames, and derived crops are not new real time points.\n - Relative appearance order does not require 3D geometry, a world frame, or metric scale. Missing capabilities must not block visual ordering.\n",
+      "diff_sha256": "d791941f0b7d9562a7b1f48b835eee4dff15c66526d191c51f6186e3a8f97734",
+      "parent_content_sha256": "a990d9ffae2c11893e6a82878ee2a397f962018c967fb3337709b632881b8b89",
+      "reason": "按全部可用类别实例建立时间偏序；unknown/fault 不排序，疑似重复不自动删除早期像素，最终序列严格匹配选项。",
+      "skill_id": "S07-g1m1",
+      "slot": "obj_appearance_order/g1m1",
+      "source_ref": "versions/S07-g1m1/1.0.1/order-first-appearances-g1m1/SKILL.md",
+      "supporting_trace_refs": [
+        {
+          "qa_ids": [
+            "2867",
+            "3875",
+            "3879",
+            "4030"
+          ],
+          "report": "count_temporal-review.json",
+          "rules": [
+            "G01",
+            "G02",
+            "G05",
+            "G06",
+            "G07",
+            "G08",
+            "G09"
+          ]
+        },
+        {
+          "qa_ids": [
+            "4082"
+          ],
+          "report": "route_temporal-review.json",
+          "rules": [
+            "R02",
+            "R07",
+            "R08",
+            "R09"
+          ]
+        }
+      ]
+    },
+    {
+      "after": "S02-g1m1@1.0.2",
+      "before": "S02-g1m1@1.0.1",
+      "chars": 5593,
+      "content_sha256": "7d20e0c39e96d5ba7d4c212054d0cd9181f31c37fa23883226fe7e7da688d8b4",
+      "diff": "--- S02-g1m1@1.0.1\n+++ S02-g1m1@1.0.2\n@@ -7,6 +7,13 @@\n \n # Estimate absolute distance between objects\n \n+## Read usable evidence\n+\n+- Follow the current round's action format. Program rounds use Python and documented tool names; preserve reserved variables and do not invent `scene` methods or XML calls. When finalization requests only JSON, return only that JSON.\n+- A tool returns a dictionary envelope. Its decoded payload is `r[\"data\"]`, and its ID is `r[\"result_id\"]`. For example, object rows are `list_objects(category_filter=category)[\"data\"]`. Do not use `.value`, decode `data` again, or read payload keys from the envelope root.\n+- Reuse valid result IDs. For omitted fields or rows, use `ReadObservation`; advance by its returned `next_cursor`, and confirm the union of read ranges covers the relevant records. A page may contain fewer rows than the requested limit. Print output is diagnostic; use `show` and `YieldObservations` to expose evidence for another round. Rebuild variables from retained observations after yielding.\n+- Check inner status, local binding diagnostics, and current authorization before using a value. A failed object binding stops that object's geometry branch. A duplicate warning requires identity checks; it is not a blanket reason to discard every candidate. Report the evidence actually used.\n+\n ## Method\n \n 1. Extract both objects' roles and disambiguating descriptions. The question asks for the nearest distance between objects, not camera-to-object distance or a default centroid distance.\n@@ -14,6 +21,7 @@\n 3. When metric geometry is authorized, call `object_surface_distance(obj_a, obj_b, unit=\"m\")`. Check that returned `a` and `b` match the intended instances, and inspect `distance`, `definition`, `n_valid_points`, and `degradation_flags`.\n 4. `distance` is already in meters; use it directly as a metric candidate without applying scale again. Use `distance_normalized` only for auditing or consistency checks; do not independently convert it to meters without valid scale.\n 5. Check whether occlusion, point-set contamination, partial visibility, or duplicate instances affect the nearest surfaces. The tool uses a robust low-quantile point-cloud surface-distance proxy; do not claim exact ground truth for complete invisible surfaces.\n+   A finite zero can come from contact, containment, shared points, or overlapping masks. Check the intended surfaces and available diagnostics against original views before claiming contact. A low quantile can be dominated by a small contaminated subset even when flags are empty; do not claim that an unavailable contamination audit passed.\n 6. If tool measurements are unavailable, compare object boundaries, adjacency, and depth cues across original views. Use supported reference sizes to estimate the metric magnitude, then return the best-supported finite non-negative number.\n \n ## Branches and checks\n@@ -21,6 +29,7 @@\n - Without valid scale, 3D geometry, or object grounding, do not call metric distance tools or fabricate scale authorization from a visual guess.\n - Tool failures, invalid numbers, empty point sets, and invalidated results do not mean zero distance; use visual estimation instead.\n - Do not reconvert `distance`, which is already in meters. Convert to another unit only when explicitly required by the question.\n+- For a direct measurement, submit the original `distance` with `unit=\"m\"` and a `field` derivation referring to that same result. Do not round the value beyond the registered replay contract. Keep the number, unit, and derivation consistent; use `mixed` only for an actual additional visual inference, not to bypass replay.\n - Resolving both `obj_a` and `obj_b` to the same object indicates a grounding error; disambiguate again.\n - Visual reference objects should be at similar depths and have reasonable size ranges. Pixel ratios across different depths are not metric ratios.\n - Before submission, check object identities, distance definition, units, and evidence basis. Do not record a visual estimate as a tool measurement.\n",
+      "diff_sha256": "5b060c635de4a7dc21e106adfb390288ea16f3dbfa4663eb0363e39a0223d716",
+      "parent_content_sha256": "c2ce08b8120553c3034bb8b024bb4dad9e3f84689999ac4e4026c88b81cf8e80",
+      "reason": "读取真实响应与完整候选，审查低分位零值和共享表面；同步原精度、单位与 field 重放。",
+      "skill_id": "S02-g1m1",
+      "slot": "object_abs_distance/g1m1",
+      "source_ref": "versions/S02-g1m1/1.0.2/estimate-object-distance-g1m1/SKILL.md",
+      "supporting_trace_refs": [
+        {
+          "qa_ids": [
+            "1599",
+            "4636",
+            "4681",
+            "4757",
+            "798"
+          ],
+          "report": "metric_distance_size-review.json",
+          "rules": [
+            "G01",
+            "G02",
+            "G03",
+            "G05",
+            "G06"
+          ]
+        }
+      ]
+    },
+    {
+      "after": "S01-g1m1@1.0.1",
+      "before": "S01-g1m1@1.0.0",
+      "chars": 6662,
+      "content_sha256": "797df717f18e42fa72d3e23922d399b52d385683b229d4d5fb1909bbbdf5918e",
+      "diff": "--- S01-g1m1@1.0.0\n+++ S01-g1m1@1.0.1\n@@ -7,12 +7,20 @@\n \n # Count distinct objects across frames\n \n+## Read usable evidence\n+\n+- Follow the current round's action format. Program rounds use Python and documented tool names; preserve reserved variables and do not invent `scene` methods or XML calls. When finalization requests only JSON, return only that JSON.\n+- A tool returns a dictionary envelope. Its decoded payload is `r[\"data\"]`, and its ID is `r[\"result_id\"]`. For example, object rows are `list_objects(category_filter=category)[\"data\"]`. Do not use `.value`, decode `data` again, or read payload keys from the envelope root.\n+- Reuse valid result IDs. For omitted fields or rows, use `ReadObservation`; advance by its returned `next_cursor`, and confirm the union of read ranges covers the relevant records. A page may contain fewer rows than the requested limit. Print output is diagnostic; use `show` and `YieldObservations` to expose evidence for another round. Rebuild variables from retained observations after yielding.\n+- Check inner status, local binding diagnostics, and current authorization before using a value. A failed object binding stops that object's geometry branch. A duplicate warning requires identity checks; it is not a blanket reason to discard every candidate. Report the evidence actually used.\n+\n ## Method\n \n 1. Extract the target category, spatial scope, and inclusion or exclusion relations from the question. Distinguish whole objects from parts; do not count an object's attachments as additional instances.\n 2. Inspect the original images and organize target candidates. `list_objects(category_filter)` returns object records containing `obj_id`, `category_name`, `visible_frames`, `track_id`, and `duplicate_suspect`. The record count is only the candidate count, not the final answer.\n-3. Build an instance table for this question with each candidate's co-occurrence frames, track, neighboring structures, and appearance. Require multiple identity cues before merging across frames. Keep similar objects visible simultaneously in one frame as separate instances; appearance similarity alone does not justify merging.\n-4. When `count_objects(category_name)` is authorized, read `count`, `n_records`, `n_distinct_tracks`, `n_geometric_merges`, `n_without_track`, `duplicate_suspect`, and `diagnostic_warnings`. The tool first groups records with the same nonempty track; untracked records each form their own group. It then deduplicates groups by geometric overlap. A group without a point cloud still counts once. `count = n_distinct_tracks - n_geometric_merges`; it is not the raw record count. Cross-check against the instance table and coverage in the original images.\n+3. Build an instance table for this question with each candidate's co-occurrence frames, track, neighboring structures, and appearance. Require multiple identity cues before merging across frames. Keep simultaneously visible, spatially separate whole objects distinct. Co-occurring records may still be overlapping masks or part-whole splits; distinguish those from separate objects before grouping. Appearance similarity alone does not justify merging. Read frame/category values from retained observations instead of reconstructing them from memory.\n+4. When `count_objects(category_name)` is authorized and collection binding is usable, read `count`, `n_records`, `n_distinct_tracks`, `n_geometric_merges`, `n_without_track`, `diagnostic_warnings`, and `instance_consolidation.method`. The tool groups records with the same nonempty track; untracked records form their own groups. Under `verified_m5_instances`, geometric merging is skipped and the count relies on the established instance bindings. The legacy `track_then_bidirectional_nn_pointcloud_overlap_v11` branch can merge track groups geometrically. Read the actual method instead of assuming the legacy branch ran. `count = n_distinct_tracks - n_geometric_merges`; cross-check it against the instance table and original images.\n+   Different track IDs alone do not prove distinct physical entities. If the collection precondition rejects unavailable bindings, no count was produced: do not infer its hypothetical value. Continue the question-scoped instance table from actual visual identity and inclusion evidence.\n 5. If omissions could change the count, call `detect_objects` for the target category and relevant frozen frames. Distinguish `status=\"fault\"`, `status=\"empty\"`, and `status=\"ok\"`, and check `error` for partial frame failures. New detections are 2D candidates added to this question's inventory; they do not automatically acquire 3D grounding or cross-frame tracks. Do not sum detections of the same object across frames or add them directly to the old `count`. Recheck identities and duplicates using co-occurrence, appearance, and position.\n 6. Resolve specific conflicts between tool results and visual observations, then choose the best-supported non-negative integer. A zero count must be supported by valid observations or healthy empty detections.\n \n@@ -20,6 +28,7 @@\n \n - If `count_objects` is unavailable or its payload is unusable, continue using the original images and instance table; do not equate candidate records with the answer.\n - A detector fault, an unexecuted tool, or an invalid return does not imply zero. Healthy empty detections establish only that the specified frames yielded no detection, not that the object is absent from the entire video.\n+- If detector feedback establishes an unconfigured or unhealthy service, stop that detection branch and continue from usable original frames and retained observations. More calls to the same unavailable service cannot fill coverage.\n - Reappearance after occlusion, fragmented tracks, and duplicate detections may overestimate the count. Limited frame coverage and fully invisible instances may underestimate it.\n - Geometric positions can assist deduplication only with valid evidence and grounding. Do not present 2D detection boxes as 3D instances.\n - Before submission, check that each entity is counted once across frames, similar but distinct instances have not been merged, and the result is the non-negative integer requested by the question.\n",
+      "diff_sha256": "139b9e422224736aa23bed45e4f852999a7d1a54de920a4cf58abf6c5be70e62",
+      "parent_content_sha256": "3ac357a1672b0e0d33f8c2c861935f995ffb791c895f82be78a5362ea7478103",
+      "reason": "落实 data/游标覆盖、整对象实例表、检测故障状态门及当前计数分支；禁止从失败计数推断数值。",
+      "skill_id": "S01-g1m1",
+      "slot": "object_counting/g1m1",
+      "source_ref": "versions/S01-g1m1/1.0.1/count-scene-objects-g1m1/SKILL.md",
+      "supporting_trace_refs": [
+        {
+          "qa_ids": [
+            "4509",
+            "4513",
+            "4574",
+            "4576"
+          ],
+          "report": "count_temporal-review.json",
+          "rules": [
+            "G01",
+            "G02",
+            "G03",
+            "G04",
+            "G07",
+            "G08",
+            "G09"
+          ]
+        },
+        {
+          "qa_ids": [
+            "4462"
+          ],
+          "report": "metric_room_size-review.json",
+          "rounds": [
+            2,
+            3,
+            4,
+            5
+          ]
+        },
+        {
+          "check": "require_question_binding suppresses geometric consolidation",
+          "lines": [
+            253,
+            332
+          ],
+          "source": "code/source/src/skill3d/tools/geometry_tools.py"
+        }
+      ]
+    },
+    {
+      "after": "S06-g1m1@1.0.1",
+      "before": "S06-g1m1@1.0.0",
+      "chars": 5291,
+      "content_sha256": "0adbc5a91d4ec8579ce62b5ec5253101e1c591c24b2922af32d8a5fe54ac393f",
+      "diff": "--- S06-g1m1@1.0.0\n+++ S06-g1m1@1.0.1\n@@ -7,12 +7,20 @@\n \n # Judge direction from a specified location and heading\n \n+## Read usable evidence\n+\n+- Follow the current round's action format. Program rounds use Python and documented tool names; preserve reserved variables and do not invent `scene` methods or XML calls. When finalization requests only JSON, return only that JSON.\n+- A tool returns a dictionary envelope. Its decoded payload is `r[\"data\"]`, and its ID is `r[\"result_id\"]`. For example, object rows are `list_objects(category_filter=category)[\"data\"]`. Do not use `.value`, decode `data` again, or read payload keys from the envelope root.\n+- Reuse valid result IDs. For omitted fields or rows, use `ReadObservation`; advance by its returned `next_cursor`, and confirm the union of read ranges covers the relevant records. A page may contain fewer rows than the requested limit. Print output is diagnostic; use `show` and `YieldObservations` to expose evidence for another round. Rebuild variables from retained observations after yielding.\n+- Check inner status, local binding diagnostics, and current authorization before using a value. A failed object binding stops that object's geometry branch. A duplicate warning requires identity checks; it is not a blanket reason to discard every candidate. Report the evidence actually used.\n+\n ## Method\n \n 1. Extract `observer`, `facing_at`, and `target` separately, retaining the original options. Facing an object means the observer looks toward it; it does not refer to the furniture's own front.\n 2. Disambiguate each role's instance. For categories with multiple objects, use question modifiers, co-occurring structures, and visible frames to identify the specific `obj_id`. Do not use the first default category match.\n 3. Choose `difficulty` from the option set: use `easy` for left/right only, `medium` for left/right/back, and `hard` for the four front/back and left/right quadrants.\n 4. When geometry is authorized and local world conventions are valid, call `relative_direction_of(observer_id, facing_at_id, target_id, difficulty)`. Read and check `direction`, `difficulty`, `world_up_used`, and `handedness_used`.\n+   Prefer this relation tool to recomputing direction from a flattened layout. If valid normalized centroids are used, retain all three coordinates and project facing and target vectors onto the plane perpendicular to the returned unit world-up vector: `v_h = v - dot(v,u)*u`. Compute left/right and front/back in that plane with the documented handedness. Do not silently drop Z or assume XY is horizontal. Missing `centroid_metric` does not invalidate normalized relative geometry.\n 5. Map the returned direction strictly to the current options. easy permits only left/right; medium permits left/right/back; hard permits front-left, front-right, back-left, and back-right.\n 6. If the tool is unavailable, build a local layout of the three roles from original images. Place the observer at an imagined origin facing facing_at, then determine which side contains target. Do not directly reuse left/right from the camera image.\n \n",
+      "diff_sha256": "eb3624eae07b4b7ece285cd5d92661162bd7d6dc8dab87dfb5958d5f4191b6b3",
+      "parent_content_sha256": "e89107c6998e751ae63cf06c49f47f4997219bf6a7c4f06daf2932335daccc7f",
+      "reason": "优先三角色关系工具；手算保留三维坐标并按实际 world_up 投影，避免默认 XY 和空米制字段误判。",
+      "skill_id": "S06-g1m1",
+      "slot": "object_rel_direction/g1m1",
+      "source_ref": "versions/S06-g1m1/1.0.1/judge-relative-direction-g1m1/SKILL.md",
+      "supporting_trace_refs": [
+        {
+          "qa_ids": [
+            "1024",
+            "1589",
+            "3672",
+            "4287",
+            "4356"
+          ],
+          "report": "spatial_relation-review.json",
+          "rules": [
+            "SR1",
+            "SR2",
+            "SR3",
+            "SR4",
+            "SR7",
+            "SR8"
+          ]
+        }
+      ]
+    },
+    {
+      "after": "S03-g1m1@1.0.1",
+      "before": "S03-g1m1@1.0.0",
+      "chars": 6177,
+      "content_sha256": "3bccecc37246a878bb2e4e6ed881f0c5ac75ba76cdb75252a7e022cf57ed2eda",
+      "diff": "--- S03-g1m1@1.0.0\n+++ S03-g1m1@1.0.1\n@@ -7,6 +7,13 @@\n \n # Reason about relative distances between objects\n \n+## Read usable evidence\n+\n+- Follow the current round's action format. Program rounds use Python and documented tool names; preserve reserved variables and do not invent `scene` methods or XML calls. When finalization requests only JSON, return only that JSON.\n+- A tool returns a dictionary envelope. Its decoded payload is `r[\"data\"]`, and its ID is `r[\"result_id\"]`. For example, object rows are `list_objects(category_filter=category)[\"data\"]`. Do not use `.value`, decode `data` again, or read payload keys from the envelope root.\n+- Reuse valid result IDs. For omitted fields or rows, use `ReadObservation`; advance by its returned `next_cursor`, and confirm the union of read ranges covers the relevant records. A page may contain fewer rows than the requested limit. Print output is diagnostic; use `show` and `YieldObservations` to expose evidence for another round. Rebuild variables from retained observations after yielding.\n+- Check inner status, local binding diagnostics, and current authorization before using a value. A failed object binding stops that object's geometry branch. A duplicate warning requires identity checks; it is not a blanket reason to discard every candidate. Report the evidence actually used.\n+\n ## Method\n \n 1. Extract the reference object, candidate categories, and original option mapping. The reference is the object named in the question, not the camera. The candidate list must cover all options.\n@@ -14,11 +21,13 @@\n 3. When geometric tools are authorized, call `relative_distance_rank(reference, candidate_categories)`. Check that returned `reference` matches the intended instance, and inspect `ranking`, `closest_category`, `categories_without_detection`, `definition`, and `degradation_flags`.\n 4. Rank using `distance_normalized` values from the same call. A shared scale cancels in relative ranking, so metric scale is unnecessary. Do not fabricate scale to obtain meters or substitute camera depth or 2D pixel gaps for object-to-object distances.\n 5. Focus on incorrect bindings, point-set contamination, occlusion, duplicate instances, and coverage gaps that could change the top two candidates. When additional evidence is needed, prioritize frozen frames or candidate categories directly relevant to these ambiguities.\n+   Check plausible reference-instance alternatives and the top-two margin. A small nonzero difference in sampled point distances does not establish a stable ordering under uncertain surfaces. Use public relation tools; `list_objects` records are metadata, not a `point_cloud.points` API. Do not fabricate direct point access.\n 6. Map the nearest category back to a valid option in the current question. Recheck reference identity, candidate coverage, distance definition, and option mapping before submission.\n \n ## Branches and checks\n \n - Categories in `categories_without_detection` are unknown, not infinitely distant, and must not be silently removed. Detect them when available; otherwise retain incomplete coverage as uncertainty in the final comparison.\n+- Read inner `status`, `categories_with_invalid_geometry`, `tied_categories`, and `margin_normalized` when available. Complete the actual comparison after collecting candidates; repeated inventories do not rank distances. An unconfigured or unhealthy detector ends that supplementation branch. Do not resolve an incomplete or tied ranking through a default first category or letter.\n - An unauthorized tool, failed execution, empty ranking, or invalidated result does not imply zero distance or object absence. Compare visually using shared structures, occlusion, relative depth, and local layouts in the original images.\n - The result uses a robust low-quantile surface-distance proxy. Do not relabel it as exact nearest-point distance, centroid distance, or official 3D ground truth.\n - 2D image gaps are only visual cues. Do not rank directly by pixel gaps when candidates differ in depth or perspective distortion is substantial.\n",
+      "diff_sha256": "ab8a4dda1ac3cb619012178d4ef34f043f09cd747ddc3841afeca19db14f1776",
+      "parent_content_sha256": "1c554c57766e5c423c6d675f01f580aa00c213c98ffc74aaa898f52b6891aa2f",
+      "reason": "从候选清单推进到完整距离比较；保留缺项/近并列，修复游标、跨轮变量和未公开点云访问。",
+      "skill_id": "S03-g1m1",
+      "slot": "object_rel_distance/g1m1",
+      "source_ref": "versions/S03-g1m1/1.0.1/rank-object-distances-g1m1/SKILL.md",
+      "supporting_trace_refs": [
+        {
+          "qa_ids": [
+            "3131",
+            "3153"
+          ],
+          "report": "route_temporal-review.json",
+          "rules": [
+            "R01",
+            "R02",
+            "R03",
+            "R04",
+            "R09"
+          ]
+        },
+        {
+          "qa_ids": [
+            "1402",
+            "1949",
+            "3092"
+          ],
+          "report": "spatial_relation-review.json",
+          "rules": [
+            "SR1",
+            "SR4",
+            "SR5",
+            "SR6",
+            "SR7",
+            "SR8"
+          ]
+        }
+      ]
+    },
+    {
+      "after": "S04-g1m1@1.0.1",
+      "before": "S04-g1m1@1.0.0",
+      "chars": 5796,
+      "content_sha256": "646a5159269a85e9ca9d545a7647d6b1a990cdb618bded778a6142c09715b1c8",
+      "diff": "--- S04-g1m1@1.0.0\n+++ S04-g1m1@1.0.1\n@@ -7,6 +7,13 @@\n \n # Estimate an object's longest dimension\n \n+## Read usable evidence\n+\n+- Follow the current round's action format. Program rounds use Python and documented tool names; preserve reserved variables and do not invent `scene` methods or XML calls. When finalization requests only JSON, return only that JSON.\n+- A tool returns a dictionary envelope. Its decoded payload is `r[\"data\"]`, and its ID is `r[\"result_id\"]`. For example, object rows are `list_objects(category_filter=category)[\"data\"]`. Do not use `.value`, decode `data` again, or read payload keys from the envelope root.\n+- Reuse valid result IDs. For omitted fields or rows, use `ReadObservation`; advance by its returned `next_cursor`, and confirm the union of read ranges covers the relevant records. A page may contain fewer rows than the requested limit. Print output is diagnostic; use `show` and `YieldObservations` to expose evidence for another round. Rebuild variables from retained observations after yielding.\n+- Check inner status, local binding diagnostics, and current authorization before using a value. A failed object binding stops that object's geometry branch. A duplicate warning requires identity checks; it is not a blanket reason to discard every candidate. Report the evidence actually used.\n+\n ## Method\n \n 1. Identify the target instance and the object's intended extent from the question. The canonical task asks for the maximum of the complete object's length, width, and height, not pixel length, volume, or a prominent part.\n@@ -14,13 +21,16 @@\n 3. When metric geometry is authorized, call `object_3d_extent(obj_id)`. Check that `extent_metric` contains three finite non-negative lengths, and read `n_valid_points` and `degradation_flags`.\n 4. Take the maximum of `extent_metric` as the longest dimension, cross-checking `extent_longest_metric` when present. Tool lengths are in meters. Multiply by 100 when centimeters are requested; do not apply scale or unit conversion twice.\n 5. If `bbox_fallback_no_pointcloud` was used or the point set covers only the visible portion, use original images to assess axis-aligned-box overestimation, object rotation, underestimation from partial point clouds, and omitted attachments.\n+   The current three axes describe world-axis bounds, not automatically the object's own length, width, and height. Inspect all relevant same-category candidates, image-edge truncation, rotation, and complete outline coverage before treating the maximum as a complete-object estimate. Sufficient points, category validation, or empty flags do not establish surface completeness.\n 6. If measurements are unavailable, first determine which dimension is longest. Then estimate visually using complete views, reference objects at similar depths, and category size ranges. Return the best-supported single number.\n \n ## Branches and checks\n \n - Without valid scale, geometry, or object grounding, do not call metric size tools or write an image-based scale guess back into the tool path.\n - `extent_metric` is a three-element list; select its largest finite value instead of submitting the whole list.\n+- For centimeters derived from `extent_longest_metric`, use the registered `convert` derivation with `parameters={\"field\":\"extent_longest_metric\",\"from_unit\":\"m\",\"to_unit\":\"cm\"}` and the original result ID. Submit the unrounded converted value. A meter-field `field` derivation cannot support a centimeter answer. Do not change a pure conversion to `mixed` to bypass a unit or value mismatch.\n - A partial outline or point cloud does not establish the exact size of the complete object.\n+- A crop must include the intended whole object and useful context. Check that the image was actually delivered and observed before using it; a crop or resize is not a new metric calibration.\n - An axis-aligned bounding box may overestimate a rotated object; partial surfaces may underestimate its complete size. Interpret these effects using `degradation_flags` and original images.\n - Category knowledge provides an estimation range, not a fixed category constant that replaces scene-specific judgment.\n - Before submission, check target identity, the longest-dimension choice, and a single meters-to-centimeters conversion.\n",
+      "diff_sha256": "6adb68d2a26d43770a1d9d2c0e83e9807f1346595c2eab1265111029877aa83f",
+      "parent_content_sha256": "a058af059ae19b5694b63caf34da934e5618d36d6f05821761398322053faced",
+      "reason": "区分世界轴边界和完整对象尺寸，检查同类候选/裁剪；使用 convert 表达厘米换算并保持重放一致。",
+      "skill_id": "S04-g1m1",
+      "slot": "object_size_estimation/g1m1",
+      "source_ref": "versions/S04-g1m1/1.0.1/estimate-object-size-g1m1/SKILL.md",
+      "supporting_trace_refs": [
+        {
+          "qa_ids": [
+            "2385",
+            "3255",
+            "3400"
+          ],
+          "report": "metric_distance_size-review.json",
+          "rules": [
+            "G01",
+            "G02",
+            "G04",
+            "G05"
+          ]
+        },
+        {
+          "qa_ids": [
+            "3425",
+            "373"
+          ],
+          "report": "metric_room_size-review.json",
+          "rounds": [
+            2,
+            3,
+            4,
+            5
+          ]
+        }
+      ]
+    },
+    {
+      "after": "S05-g1m1@1.0.1",
+      "before": "S05-g1m1@1.0.0",
+      "chars": 5857,
+      "content_sha256": "8ecb7068c739551ff5d44bc60781ac017aa7dd0e69fef5850ad39086f672280c",
+      "diff": "--- S05-g1m1@1.0.0\n+++ S05-g1m1@1.0.1\n@@ -7,12 +7,20 @@\n \n # Estimate room boundaries and floor area\n \n+## Read usable evidence\n+\n+- Follow the current round's action format. Program rounds use Python and documented tool names; preserve reserved variables and do not invent `scene` methods or XML calls. When finalization requests only JSON, return only that JSON.\n+- A tool returns a dictionary envelope. Its decoded payload is `r[\"data\"]`, and its ID is `r[\"result_id\"]`. For example, object rows are `list_objects(category_filter=category)[\"data\"]`. Do not use `.value`, decode `data` again, or read payload keys from the envelope root.\n+- Reuse valid result IDs. For omitted fields or rows, use `ReadObservation`; advance by its returned `next_cursor`, and confirm the union of read ranges covers the relevant records. A page may contain fewer rows than the requested limit. Print output is diagnostic; use `show` and `YieldObservations` to expose evidence for another round. Rebuild variables from retained observations after yielding.\n+- Check inner status, local binding diagnostics, and current authorization before using a value. A failed object binding stops that object's geometry branch. A duplicate warning requires identity checks; it is not a blanket reason to discard every candidate. Report the evidence actually used.\n+\n ## Method\n \n 1. Determine whether the requested space is a single room, a connected region, or a union of multiple spaces. Use doorways, walls, corners, and camera motion to distinguish spaces; count repeated views of the same region only once.\n 2. Use original images and the scene summary to check floor, wall, and boundary coverage. Furniture-occluded floor is not missing area. Floor pixel count, wall area, and room diagonal are not the requested floor area.\n 3. When metric plane tools are authorized, call `plane_fit_room_size()` and read `room_area_m2`, `room_diagonal_normalized`, `plane_inlier_ratio`, `fit_quality`, and `degradation_flags`.\n 4. `room_area_m2` is already in square meters; use it directly as an area candidate without reapplying scale or squared conversion. `fit_quality` is audit information, not an independent reason to abstain outside the frozen thresholds.\n+   The current estimator uses a robust enclosing rectangle of the point cloud's horizontal projection. It does not measure an identified floor-region union. Check walls, doorways, recesses, adjacent spaces, and repeated coverage in original views before using this proxy for the requested room. A positive area, empty flags, or high fit quality does not establish the spatial scope. A saturated `floor_fit_ratio=1` does not prove complete floor coverage: inspect its documented numerator and denominator when available, and keep missing coverage evidence unknown.\n 5. Check that fitted coverage matches the requested space. Interpret nonrectangular or multi-region scenes through supported decomposition and unions. Do not fill recesses, space beyond doors, or gaps between regions using an enclosing rectangle or convex hull.\n 6. If plane measurements are unavailable, construct a simplified floor layout across original views. Estimate major dimensions from wall segments, doorways, and size references at similar depths, then compute area from a supported combination of regions.\n 7. Check whether unobserved boundaries, repeated regions, or spatial scope dominate the uncertainty. Return the best-supported finite positive area in square meters.\n@@ -22,6 +30,7 @@\n - Without valid scale, a point cloud, or metric authorization, do not call `plane_fit_room_size` or present normalized area as square meters.\n - Tool failures, invalid numbers, and invalidated results do not mean zero area; use visual layout estimation.\n - `room_area_m2` already includes area-scale conversion. Do not multiply by scale squared again.\n+- When submitting the direct area candidate, use the original unrounded `room_area_m2`, `unit=\"m2\"`, and a `field` derivation from that result. Code-only rounding does not change the registered replay operation. Use a visual layout correction only with actual additional evidence and a matching evidence basis.\n - Furniture occlusion does not automatically reduce room area. Do not sum repeated views or overlapping regions twice.\n - Combining rooms must follow the requested scope. Visibility of an adjacent space does not justify expanding the boundary.\n - Before submission, check spatial scope, square-meter units, and consistency with the measurement or visual basis.\n",
+      "diff_sha256": "bc5c2bd340ad15b2a2e7b0c6954623b79c17cd64463a8f7735ee56c03489f5ae",
+      "parent_content_sha256": "a8a87aaefb0489a42bd09ebecc3a71844c16a7b26c0914ffcc4429e24dc72f51",
+      "reason": "明确包围矩形面积代理和房间范围核对；饱和拟合比例不证明覆盖，原面积与单位/重放同步。",
+      "skill_id": "S05-g1m1",
+      "slot": "room_size_estimation/g1m1",
+      "source_ref": "versions/S05-g1m1/1.0.1/estimate-room-area-g1m1/SKILL.md",
+      "supporting_trace_refs": [
+        {
+          "qa_ids": [
+            "2666",
+            "3822",
+            "3837",
+            "3839",
+            "593"
+          ],
+          "report": "metric_room_size-review.json",
+          "rules": [
+            "R1",
+            "R2",
+            "R3",
+            "R4"
+          ]
+        },
+        {
+          "check": "floor_fit_ratio mixes full-cloud inliers with candidate-band denominator",
+          "lines": [
+            1143,
+            1146
+          ],
+          "source": "code/source/src/skill3d/tools/distance_primitives.py"
+        }
+      ]
+    },
+    {
+      "after": "S08-g1m1@1.0.1",
+      "before": "S08-g1m1@1.0.0",
+      "chars": 7555,
+      "content_sha256": "424de7ed76c343c9217f8cadfb8ee49bc5d9ad1df8b0fc4f98389c16494e4ef6",
+      "diff": "--- S08-g1m1@1.0.0\n+++ S08-g1m1@1.0.1\n@@ -7,11 +7,18 @@\n \n # Determine turns along a specified route\n \n+## Read usable evidence\n+\n+- Follow the current round's action format. Program rounds use Python and documented tool names; preserve reserved variables and do not invent `scene` methods or XML calls. When finalization requests only JSON, return only that JSON.\n+- A tool returns a dictionary envelope. Its decoded payload is `r[\"data\"]`, and its ID is `r[\"result_id\"]`. For example, object rows are `list_objects(category_filter=category)[\"data\"]`. Do not use `.value`, decode `data` again, or read payload keys from the envelope root.\n+- Reuse valid result IDs. For omitted fields or rows, use `ReadObservation`; advance by its returned `next_cursor`, and confirm the union of read ranges covers the relevant records. A page may contain fewer rows than the requested limit. Print output is diagnostic; use `show` and `YieldObservations` to expose evidence for another round. Rebuild variables from retained observations after yielding.\n+- Check inner status, local binding diagnostics, and current authorization before using a value. A failed object binding stops that object's geometry branch. A duplicate warning requires identity checks; it is not a blanket reason to discard every candidate. Report the evidence actually used.\n+\n ## Method\n \n 1. Expand the question into a start location, initial facing object, ordered landmarks, straight segments, and missing turns. Preserve each option's complete action sequence. Follow the specified route rather than replacing it with a shorter route.\n 2. Use original images and object records to confirm landmark instances and their order. For repeated categories, disambiguate using question descriptions, doorways, neighboring structures, and observation order. Revisiting the same location does not create a new landmark.\n-3. At each turn, construct a triple of previous position, current position, and next position. The arrival heading is inherited from the preceding segment; judge the next action relative to that heading. For the first turn at the start, use initial facing object minus start as the forward vector and first landmark minus start as the target vector.\n+3. At each turn, construct a triple of previous position, current position, and next position. The arrival heading is inherited from the preceding segment; judge the next action relative to that heading. For the first turn at the start, use initial facing object minus start as the forward vector and first landmark minus start as the target vector. Reverse the initial heading when the question specifies facing away. A corner, a point beyond a landmark, or a stop after a stated travel distance is a path position; do not replace it automatically with an object centroid. Record the stop position and heading before evaluating the next turn.\n 4. When geometry is authorized, obtain coordinates from `object_centroid(obj_id)` using `centroid_normalized`, and read `world_up_used` and `handedness_used` from the same return. Compute only when all points share a coordinate frame and orientation metadata is valid and consistent. With unit up vector u, incoming f = current - previous, and outgoing g = next - current, first project onto the horizontal plane: f_h = f - dot(f,u)u and g_h = g - dot(g,u)u. Then compute the signed turn angle. Do not guess axes, handedness, or angles if either horizontal vector is near zero or orientation metadata is None.\n 5. The function below returns degrees: positive is right, negative is left, near zero is straight, and an absolute angle near 180 is a U-turn. Flip the sign for left handedness. For nearly collinear vectors, use the dot product to distinguish same from opposite directions rather than relying only on the cross-product sign. Interpret vocabulary, angle tolerances, and action sequences using the question and visual layout; do not reuse the direction task's medium 135-degree threshold.\n \n",
+      "diff_sha256": "a18c7974f03f6e1c58dfbfbe55b3a73589039e4b62a87804b514fb9f648b7b9b",
+      "parent_content_sha256": "37f7da103fe7b0e6d0a72edd73d0b1e3ae0c764af2d06cd2b04763397047993c",
+      "reason": "复用有效观测并遵守执行格式；路线逐段维护停点和到达朝向，角落/越过路标/距离停点不默认替换为质心。",
+      "skill_id": "S08-g1m1",
+      "slot": "route_planning/g1m1",
+      "source_ref": "versions/S08-g1m1/1.0.1/infer-route-turns-g1m1/SKILL.md",
+      "supporting_trace_refs": [
+        {
+          "qa_ids": [
+            "4963",
+            "5021",
+            "5024",
+            "5109",
+            "5121"
+          ],
+          "report": "route_temporal-review.json",
+          "rules": [
+            "R01",
+            "R02",
+            "R03",
+            "R05",
+            "R06",
+            "R08",
+            "R09"
+          ]
+        }
+      ]
+    }
+  ],
+  "diagnostic_identity": "aa1cbeb673c03664f7a51eb0049174312906942809a75c45cc7174c88dfcaaf7",
+  "feedback_question_count": 40,
+  "feedback_role": "manual_engineering_diagnostic_test_traces",
+  "feedback_source_run": "runs/g1m1-diagnostic40-20261105-r05",
+  "leakage_scan": {
+    "diagnostic_ids_and_question_text_absent": true,
+    "scanned_new_bodies": 8
+  },
+  "main_adjudications": [
+    {
+      "action": "S01 读取 instance_consolidation.method，分别解释 verified_m5_instances 和 legacy track_then 分支。",
+      "finding": "当前 require_question_binding 分支跳过几何整合。不同 track 在旧分支可以几何合并，但不能据此声称本轮 count 已做几何合并；不同 track 也不是物理实体独立性的证明。",
+      "lines": [
+        294,
+        332
+      ],
+      "source": "code/source/src/skill3d/tools/geometry_tools.py",
+      "topic": "count_branch_contract"
+    },
+    {
+      "action": "Skill 先检查内层状态并停止不可用分支；工具/配置修复留在报告，不改冻结实现。",
+      "finding": "tool-response/2.0 的外层 ok 是执行返回状态，保留内层 fault 符合当前边界合同；本轮没有把 envelope 本身判为实现错误。未配置检测服务、fault 在 mixed 中仍能作为支持、确定性故障被标 transient 是单独的问题。",
+      "lines": [
+        29,
+        44
+      ],
+      "source": "code/source/src/skill3d/schemas/tool_response.py",
+      "topic": "detector_transport_and_evidence"
+    },
+    {
+      "action": "S02 区分内部数值和目标表面可靠性，不更改点数门或污染阈值。",
+      "finding": "零分位可复现，点/掩码重叠使物理可靠性存疑；不能仅由此认证接触，也不能在没有真值的情况下判最终答案错误。",
+      "qa_id": "4636",
+      "review": "metric_distance_size-review.json",
+      "topic": "zero_distance_reliability"
+    },
+    {
+      "action": "原程序状态、独立回退和未确认物理结论分别记录。",
+      "finding": "有原帧依据的零工具视觉路线可成立为视觉推理过程。宿主独立视觉回退不能记为原工具程序成功；几何内部复算不能认证最终物理答案。",
+      "reviews": [
+        "route_temporal-review.json",
+        "count_temporal-review.json",
+        "spatial_relation-review.json"
+      ],
+      "topic": "geometry_and_visual_fallback"
+    }
+  ],
+  "main_agent_previously_saw_original_offline_evaluation": true,
+  "new_model_requests": 0,
+  "new_skill_quality_measured": false,
+  "paired_gate_evaluated": false,
+  "parent": {
+    "manifest_sha256": "410553a36f8c02bd710d0e1d48204d8ed93843bf5f5bc1e96ae59cf1817c6171",
+    "snapshot_id": "mixed-r04-20261026-v1"
+  },
+  "preserved_slots": [
+    {
+      "content_sha256": "7be0a670d707a1a782281e516c865323044afbaaeadbb1c28eb375823f221fcd",
+      "skill_version": "S07-g0m0@1.0.0",
+      "slot": "obj_appearance_order/g0m0"
+    },
+    {
+      "content_sha256": "36893e43415689555f9b2493c9f4601a214a854f437fd56126d50807c3ca13d3",
+      "skill_version": "S07-g1m0@1.0.0",
+      "slot": "obj_appearance_order/g1m0"
+    },
+    {
+      "content_sha256": "18173b2ab253ab5dc9937c6672f9a5dc1c44d3801f100cf60dc7b6fde8b6849e",
+      "skill_version": "S02-g0m0@1.0.0",
+      "slot": "object_abs_distance/g0m0"
+    },
+    {
+      "content_sha256": "ad381a4a4508950803956cb139e5266f6b4aefa6d159d7bf8a94df9f90e2a604",
+      "skill_version": "S02-g1m0@1.0.1",
+      "slot": "object_abs_distance/g1m0"
+    },
+    {
+      "content_sha256": "4960897d12b5fc30895169bcb79820e13f71748ae15ac3fc0b9838ec36b80804",
+      "skill_version": "S01-g0m0@1.0.0",
+      "slot": "object_counting/g0m0"
+    },
+    {
+      "content_sha256": "45f3028324d97a7cc53d88cb67a4e5f1b83c62152d169076993ff29888704cd6",
+      "skill_version": "S01-g1m0@1.0.0",
+      "slot": "object_counting/g1m0"
+    },
+    {
+      "content_sha256": "a98217a42b3e79a137d9cf1494fe30b7e6e37e19cb134a12db799eba78069b14",
+      "skill_version": "S06-g0m0@1.0.0",
+      "slot": "object_rel_direction/g0m0"
+    },
+    {
+      "content_sha256": "b174c9f1ef239970d338591d329eabcf09fb74cc04ded544905fe430f4e5e83d",
+      "skill_version": "S06-g1m0@1.0.0",
+      "slot": "object_rel_direction/g1m0"
+    },
+    {
+      "content_sha256": "a59e169ee5b4c2c156ae53da61af6ca5339c6a3d88860556f84d3c1d4ebe600e",
+      "skill_version": "S03-g0m0@1.0.0",
+      "slot": "object_rel_distance/g0m0"
+    },
+    {
+      "content_sha256": "2e2f6eaa1f1dcb46b32cb92de5a3c42605f8261ea237842100b37bba00212129",
+      "skill_version": "S03-g1m0@1.0.0",
+      "slot": "object_rel_distance/g1m0"
+    },
+    {
+      "content_sha256": "61680fa84389f4d49148e57ab37a0624207f05351c7d5d9129df379c2b917753",
+      "skill_version": "S04-g0m0@1.0.0",
+      "slot": "object_size_estimation/g0m0"
+    },
+    {
+      "content_sha256": "da85fa745511c29140787f37cec2a53759500802e2ff5ff0aafd7c27846d999f",
+      "skill_version": "S04-g1m0@1.1.0",
+      "slot": "object_size_estimation/g1m0"
+    },
+    {
+      "content_sha256": "82a9289a528bc1ba6426cd59e10c20429d47ed7b935c3939c02f9c570a49967e",
+      "skill_version": "S05-g0m0@1.1.0",
+      "slot": "room_size_estimation/g0m0"
+    },
+    {
+      "content_sha256": "968b36b58507f42f35c0c674545a063fbab54e879e33a6d8783ff2ce14a19141",
+      "skill_version": "S05-g1m0@1.0.0",
+      "slot": "room_size_estimation/g1m0"
+    },
+    {
+      "content_sha256": "76cdbfefe0ed014364f23416bd22624622767be8dedc3dba6988855ff099c222",
+      "skill_version": "S08-g0m0@1.0.0",
+      "slot": "route_planning/g0m0"
+    },
+    {
+      "content_sha256": "f9c1fda4ce043ac1fb02b685d60564911248ef4169524468e32764f7ed6153f3",
+      "skill_version": "S08-g1m0@1.0.0",
+      "slot": "route_planning/g1m0"
+    }
+  ],
+  "reference_answers_provided_to_reviewers": false,
+  "review_packet_score_null_count": 40,
+  "reviewer_count": 5,
+  "reviewers": [
+    {
+      "agent": "metric_distance_size",
+      "json_sha256": "e520cd3027c88f3a75753e132f08526f0d96cb4779dcab529cc1d3652bff4ee7",
+      "markdown_sha256": "254f7d4859ccfdd28393ff581321106731006608b1ce38bfba29647c8e6fe973",
+      "qa_ids": [
+        "1599",
+        "4636",
+        "4681",
+        "4757",
+        "798",
+        "2385",
+        "3255",
+        "3400"
+      ]
+    },
+    {
+      "agent": "metric_room_size",
+      "json_sha256": "1ee1d53748cf31ce24e461d516203ed41488c5cf07efa4e2750e63550455f6a7",
+      "markdown_sha256": "40c4510906de1b5717113a99a5262b65dace49636a9f580a2af91bd7e69711c0",
+      "qa_ids": [
+        "2666",
+        "3822",
+        "3837",
+        "3839",
+        "593",
+        "3425",
+        "373",
+        "4462"
+      ]
+    },
+    {
+      "agent": "count_temporal",
+      "json_sha256": "621d499f0a07a6e4988414c1e9cd35299fa8d3a93e8f4eab08eb0d45564ed66f",
+      "markdown_sha256": "248a75b509a59c1e74238a42902b59e7dddeab645c4d4e18ed488da5d707a371",
+      "qa_ids": [
+        "4509",
+        "4513",
+        "4574",
+        "4576",
+        "2867",
+        "3875",
+        "3879",
+        "4030"
+      ]
+    },
+    {
+      "agent": "spatial_relation",
+      "json_sha256": "82382b6a817bcafd3bc3a1dce1940ddcb82ac05f566d6088f588684ef0c130ba",
+      "markdown_sha256": "a6ef7e1d607e6eda11e5b13dc46f34f814281d5c90bbc22ff0cec13f2652151d",
+      "qa_ids": [
+        "1024",
+        "1589",
+        "3672",
+        "4287",
+        "4356",
+        "1402",
+        "1949",
+        "3092"
+      ]
+    },
+    {
+      "agent": "route_temporal",
+      "json_sha256": "c06f9d1f32f43d38667e6e0c5ca0649d2e2ef613efb0c97cf1f4db8910fd82b3",
+      "markdown_sha256": "35b1904f1d0c3fe1d24b5178c715b5d3a40ff0bb4b4c7550675b553fef73006a",
+      "qa_ids": [
+        "3131",
+        "3153",
+        "4963",
+        "5021",
+        "5024",
+        "5109",
+        "5121",
+        "4082"
+      ]
+    }
+  ],
+  "revision_rule_inputs": "label-free traces and verified source contracts",
+  "same_cases_are_unseen_validation": false,
+  "schema": "vsi-manual-trace-feedback-seed/1",
+  "validation": {
+    "active_slots": 24,
+    "complete_delivery_limit": 8000,
+    "preserved_other_state_bodies": 16
+  }
+}

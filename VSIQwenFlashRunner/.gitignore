@@ -1,0 +1,18 @@
+# Local runtime outputs; keep directory skeletons.
+/runs/*
+!/runs/.gitkeep
+/prepared_cache/*
+!/prepared_cache/.gitkeep
+
+# Local credentials and environment configuration.
+.env
+.env.*
+!.env.example
+*.local.env
+
+# Local Python caches.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

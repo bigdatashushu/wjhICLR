@@ -1,0 +1,19 @@
+{
+  "model": "qwen3.8-flash",
+  "mode": "direct",
+  "n_shots": 3,
+  "seed": 137,
+  "max_tokens": 4096,
+  "max_requests_per_episode": 20,
+  "enable_thinking": false,
+  "max_requests": 60,
+  "eval_sets": ["base"],
+  "limit_per_subset": 3,
+  "resolution": 500,
+  "code_root": "../src",
+  "remote_host": "cvailab@10.10.0.198",
+  "remote_root": "/home/cvailab/wangjh/embodiedRunner",
+  "simulator_timeout_s": 600,
+  "gpu_device": 3,
+  "output_dir": "runs/qwen-bare-official-3shot-pilot"
+}

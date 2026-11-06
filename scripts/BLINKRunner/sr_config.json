@@ -18,6 +18,6 @@
     "explicit_final_answer": true,
     "capture_responses": true,
     "expected_model": "qwen3.8-flash",
-    "prompt_profile": "small-image-blink-sr/1"
+    "prompt_profile": "small-image-blink-sr/2"
   }
 }

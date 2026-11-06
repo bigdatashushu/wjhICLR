@@ -1,0 +1,22 @@
+{
+  "active_by_question_type": {
+    "object_rel_distance": "S03@1.1.0"
+  },
+  "entries": [
+    {
+      "content_sha256": "c85e8cadc39b2d447d06d8ea08cc62e7a62581cd7b3f089fce133e9c0da8239d",
+      "parent_version": null,
+      "question_type": "object_rel_distance",
+      "skill_id": "S03",
+      "skill_version": "S03@1.1.0",
+      "source_ref": "versions/S03/1.1.0/rank-object-distances/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    }
+  ],
+  "generation": 0,
+  "library_format": "harness3d-skill-library/2.0",
+  "manifest_sha256": "fa465e0150fc5ce9979041754054894e76071f93f7e810bd0c6b9975aa001beb",
+  "parent_snapshot_id": "S0-seed-20260925-v1",
+  "snapshot_id": "S0-v11-s03-format-migration"
+}

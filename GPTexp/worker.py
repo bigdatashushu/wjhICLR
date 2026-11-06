@@ -9,6 +9,7 @@ import time
 import traceback
 
 from .adapters import COUNTS, ROOT, make_specs, setup, solve
+from .MMSIGPT.packaging import preflight_identity
 from .api_pool import ApiPool
 from .traces import digest, file_digest, read, write
 from .transport import ResponsesClient
@@ -25,8 +26,8 @@ def main():
         specs = make_specs(args.dataset)
         write(output, {"dataset": args.dataset, "questions": COUNTS[args.dataset],
                        "specs": specs, "model_requests": 0, "reference_answers_read": False,
-                       "identity": digest(specs), "adapter_files": {
-                           name: file_digest(ROOT / name) for name in ("adapters.py", "worker.py")}},
+                       "identity": digest(specs),
+                       "adapter_files": preflight_identity(ROOT, args.dataset)},
               exclusive=True)
         print(args.dataset, "preflight passed", len(specs), "arms")
         return 0

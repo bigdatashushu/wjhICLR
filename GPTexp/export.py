@@ -43,7 +43,7 @@ def trajectory_rows(directory, manifest):
             yield row
 
 
-def export(directory, *, references=None):
+def export(directory, *, references=None, row_provider=trajectory_rows):
     directory = Path(directory)
     manifest = read(directory / "manifest.json")
     if digest({k: v for k, v in manifest.items() if k != "run_identity"}) != manifest["run_identity"]:
@@ -56,9 +56,13 @@ def export(directory, *, references=None):
     header = {"schema": "gptexp-full-trajectories/1", "run_identity": manifest["run_identity"],
               "fixed_questions": manifest["counts"], "expected_arms": manifest["arms"],
               "reference_answer_visible": False}
+    if manifest.get("reused_arms") is not None:
+        header.update(reused_arms=manifest["reused_arms"],
+                      source_run_identity=manifest["source_run_identity"],
+                      selection_policy=manifest["selection_policy"])
     with combined_temp.open("w", encoding="utf-8") as full, jsonl_temp.open("w", encoding="utf-8") as stream:
         full.write(json.dumps(header, ensure_ascii=False)[:-1] + ', "episodes": [')
-        for row in trajectory_rows(directory, manifest):
+        for row in row_provider(directory, manifest):
             encoded = json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False)
             if episodes:
                 full.write(",\n")
@@ -126,6 +130,8 @@ def export(directory, *, references=None):
                     "answer": result["answer"], "status": result["status"],
                     "correct": result["status"] == "answered" and result["answer"] == reference,
                     "api_id": episode.get("api_id")}
+                if "reuse_provenance" in episode:
+                    row[arm]["reuse_provenance"] = episode["reuse_provenance"]
             scored_pairs.append(row)
         write(directory / "scored_pairs.json", {
             "run_identity": manifest["run_identity"], "pairs": scored_pairs,
@@ -174,7 +180,7 @@ def export(directory, *, references=None):
         "request_accounting": "requests count admitted attempts; queued intents are separate",
         "host_scored": bool(mapping), "statistics": statistics,
         "paired_statistics": paired_statistics})
-    lines = ["# GPT-6.1-sol 配对评测\n",
+    lines = [f"# {manifest['config']['model']} 配对评测\n",
              f"固定 {manifest['questions']:,} 题；已保存 {completed}/{manifest['arms']:,} 个完整题臂，"
              f"{len(episodes) - completed} 个未完成题臂的部分轨迹。\n",
              "两臂使用原冻结题单、提示词、工具及预算；GPT reasoning effort 为 high。\n",

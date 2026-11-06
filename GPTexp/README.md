@@ -18,6 +18,8 @@
 
 所有本轮代码、输入部署包和结果位于本目录。服务器镜像目录为 `/home/wangy/wangjh/harness3d/GPTexp`；既有公共图片和 prepared 缓存只读复用。
 
+MMSI 使用 GPT 的后续开发入口为 [`MMSIGPT/`](MMSIGPT/README.md)。MMSI 的输入准备、Direct/Harness、提示和工具权限在该包中维护；`scripts/MMSIRunner` 与 `frozen/mmsi` 保留原始归档。通用 worker 已路由到新包，部署和源码身份也包含新包。该本地迁移尚未部署或改变现有服务器冻结运行。
+
 ```bash
 # 在 wjhICLR 目录运行；所有操作均使用 Python 标准模块入口。
 python3 -B -m GPTexp.selfcheck

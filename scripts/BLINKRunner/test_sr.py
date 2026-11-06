@@ -21,6 +21,7 @@ from skill3d.small_image.precompute import SmallImagePrecomputer
 from sr_adapter import SRSolver as SmallImageSolver
 from sr_protocol import (
     VERSION, official_prompt, relation_for, validate_official_prompt,
+    explicit_sr_answer,
 )
 from skill3d.small_image.storage import save_prepared
 
@@ -274,3 +275,137 @@ def test_prepared_cache_binds_to_sr_input_and_excludes_unrelated_metric_tools(tm
     wrong = replace(p, question="Is the car behind the cat?")
     with pytest.raises((OSError, ValueError)):
         sr.prepared_for(wrong, cache_root)
+
+
+def sr_solver(p, replies):
+    _, config, _ = sr.configuration()
+    client = FakeClient(replies)
+    solver = SmallImageSolver(
+        client, config=config, skill_text=sr.SKILL.read_text(),
+        registry_builder=sr.scoped_registry, official_prompt=official_prompt(p))
+    return solver, client
+
+
+def test_visual_json_has_one_request_and_preserves_raw_response(tmp_path):
+    p = problem(tmp_path)
+    raw = '```json\n{"reasoning":"literal text: ReturnAnswer(\\\"B\\\")","answer":"A"}\n```'
+    solver, client = sr_solver(p, [raw])
+    result = solver.solve(p, prepared=prepared(p), categories=())
+    assert result.status == "answered" and result.answer == "A"
+    assert result.request_count == len(client.calls) == 1
+    assert result.attempted_tool_calls == 0
+    assert result.rounds[0]["model_response"] == raw
+    assert result.rounds[0]["host_constructed"] is True
+    assert result.rounds[0]["submission_format"] == "sr_strict_json_fence"
+    assert "literal text" not in solver.execution_trace[0]["program_source"]
+    value = result.to_dict()
+    digest = value.pop("receipt_sha256")
+    value["receipt_sha256"] = ""
+    import hashlib
+    assert digest == hashlib.sha256(json.dumps(
+        value, sort_keys=True, ensure_ascii=True, allow_nan=False,
+        separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+@pytest.mark.parametrize("raw", [
+    '{"answer":"A","answer":"B"}',
+    '{"answer":"yes"}',
+    '{"answer":"A","extra":"ignored"}',
+    '{"answer":"A","reasoning":null}',
+    'The answer is A. {"answer":"B"}',
+])
+def test_json_submission_rejects_ambiguous_or_unexpected_data(raw):
+    with pytest.raises(ValueError):
+        explicit_sr_answer(raw)
+
+
+def test_tool_answer_is_deferred_until_model_sees_actual_depth(tmp_path):
+    p = problem(tmp_path)
+    code = (
+        "def solve(ctx):\n"
+        "    r = ctx.tools.point_depth(view_index=0, x=7, y=6)\n"
+        "    ReturnAnswer(AnswerPayload(value='A', unit='option', basis='mixed'))"
+    )
+    solver, client = sr_solver(p, [code, '{"answer":"B","reasoning":"inspected depth"}'])
+    result = solver.solve(p, prepared=prepared(p), categories=())
+    assert result.status == "answered" and result.answer == "B"
+    assert result.request_count == 2 and result.succeeded_tool_calls == 1
+    first = solver.execution_trace[0]
+    assert first["execution"]["answer"] is None and first["answer_payload"] is None
+    assert first["execution"]["terminated"] == "yield"
+    assert first["execution"]["host_observation_yield"] is True
+    assert first["proposed_answer_not_submitted"]["value"] == "A"
+    result_id = first["tool_results"][0]["result_id"]
+    followup = client.calls[1][0][0]["content"][0]["text"]
+    assert result_id in followup and '"depth": 8.0' in followup
+    assert not solver.execution_trace[1]["tool_calls"]
+
+
+def test_wrong_depth_field_preserves_error_and_repairs_within_budget(tmp_path):
+    p = problem(tmp_path)
+    code = (
+        "def solve(ctx):\n"
+        "    r = ctx.tools.point_depth(view_index=0, x=7, y=6)\n"
+        "    d = r['data']['value']\n"
+        "    YieldObservations([r['result_id']])"
+    )
+    solver, client = sr_solver(p, [code, code, '{"answer":"B"}'])
+    result = solver.solve(p, prepared=prepared(p), categories=())
+    assert result.status == "answered" and result.request_count == 3
+    assert result.succeeded_tool_calls == 2
+    for first in solver.execution_trace[:2]:
+        assert first["execution"]["error_code"] == "violation_runtime"
+        assert first["execution"]["error_type"] == "KeyError"
+        assert first["execution"]["error_line"] == 3
+        assert first["effective_execution"]["terminated"] == "yield"
+        assert first["bounded_repair_requested"]["type"] == "KeyError"
+        assert not first["contract_violations"]
+    followup = client.calls[1][0][0]["content"][0]["text"]
+    assert '"type": "KeyError"' in followup and '"depth": 8.0' in followup
+    assert "point_depth uses 'depth'" in followup
+
+
+@pytest.mark.parametrize("code,status,tool_calls", [
+    ("def solve(ctx):\n"
+     "    r = ctx.tools.point_depth(view_index=0, x=16, y=6)\n"
+     "    ReturnAnswer(AnswerPayload(value='A', unit='option', basis='mixed'))",
+     "run_error", 1),
+    ("def solve(ctx):\n"
+     "    tool = getattr(ctx.tools, 'point_depth')\n"
+     "    r = tool(view_index=0, x=7, y=6)\n"
+     "    YieldObservations([r['result_id']])",
+     "program_rejected", 0),
+])
+def test_unsafe_or_out_of_bounds_program_stops_without_repair(tmp_path, code, status, tool_calls):
+    p = problem(tmp_path)
+    solver, client = sr_solver(p, [code, '{"answer":"A"}'])
+    result = solver.solve(p, prepared=prepared(p), categories=())
+    assert result.status == status and result.answer is None
+    assert result.request_count == len(client.calls) == 1
+    assert result.attempted_tool_calls == tool_calls
+    if tool_calls:
+        first = solver.execution_trace[0]
+        assert first["execution"]["answer_untrusted"] is True
+        assert first["execution"]["error_code"] == "tool_contract"
+        assert first["contract_violations"] and "bounded_repair_requested" not in first
+
+
+def test_strict_finalization_and_scoped_hooks_restore_on_exception(tmp_path):
+    from sr_adapter import integration
+    from skill3d.small_image import runner, blink_protocol
+    p = problem(tmp_path)
+    code = "def solve(ctx):\n    YieldObservations([])"
+    solver, client = sr_solver(p, [code, code, '{"answer":"A","answer":"B"}'])
+    result = solver.solve(p, prepared=prepared(p), categories=())
+    assert result.status == "invalid_finalization" and result.answer is None
+    assert len(client.calls) == 3
+    before = (runner._problem_config, runner.build_solver_prompt,
+              runner.RestrictedNamespaceKernel, runner.assemble_program,
+              blink_protocol.explicit_answer)
+    with pytest.raises(RuntimeError, match="FAKE_ONLY"):
+        with integration(official_prompt(p), []):
+            assert runner.assemble_program is not before[3]
+            raise RuntimeError("FAKE_ONLY")
+    assert before == (runner._problem_config, runner.build_solver_prompt,
+                      runner.RestrictedNamespaceKernel, runner.assemble_program,
+                      blink_protocol.explicit_answer)

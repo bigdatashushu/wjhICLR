@@ -1,0 +1,31 @@
+# CV3D main program solver after authorized test-trajectory Skill revision.
+# Pass --official-annotations and --prepared-root to replay existing evidence.
+dataset_root: /Users/bytedance/wangjh/skill3d-paper-benchmarks-20261030/dataset
+skills_manifest: skill_library/candidates/cv3d-compact-testdev-2/frozen_skills.json
+
+solver:
+  prompt_profile: cv3d-compact-program/2
+  evaluation_role: test_development
+  max_requests: 6
+  max_solve_rounds: 5
+  max_tokens: 8192
+  category_max_tokens: 256
+  max_categories: 12
+  cell_timeout_s: 30
+  max_feedback_chars: 24000
+  seed: 137
+  enable_thinking: true
+  original_image_bytes: true
+  send_depth_image: true
+  explicit_final_answer: true
+  capture_responses: true
+  expected_model: qwen3.8-flash
+
+model:
+  model: qwen3.8-flash
+  model_revision: ""
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  timeout_s: 600
+  temperature: 0
+  max_output_tokens: 8192

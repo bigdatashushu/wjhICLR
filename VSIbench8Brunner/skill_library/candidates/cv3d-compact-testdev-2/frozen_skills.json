@@ -1,0 +1,28 @@
+{
+  "schema": "cv3d-frozen-skills/1",
+  "version": "cv3d-compact-testdev-2",
+  "prompt_profile": "cv3d-compact-program/2",
+  "evaluation_role": "test_development",
+  "test_trajectory_revision_authorized": true,
+  "same_test_set_is_independent_evaluation": false,
+  "revision_source": {
+    "parent_version": "cv3d-compact-testdev-1",
+    "run": "cv3d-program-skill-paired-20261101-r02",
+    "source_split": "test",
+    "scope": "Dual-image reasoning strategies; execution contracts moved to the prompt."
+  },
+  "tasks": {
+    "Depth": {
+      "path": "Depth/SKILL.md",
+      "sha256": "d915cd6d8aeb1a031f004a1323be0f8604674c022084b5329e8712a4935b1b2f",
+      "characters": 1985,
+      "previous_characters": 3184
+    },
+    "Distance": {
+      "path": "Distance/SKILL.md",
+      "sha256": "ec09448ebc8288b1905c896db3e0ad469471038133b4f660963d135e07dd82e9",
+      "characters": 2374,
+      "previous_characters": 3484
+    }
+  }
+}

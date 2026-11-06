@@ -233,17 +233,17 @@ def worker(root, job, model, cap=CAP, concurrency=CONCURRENCY,
     return {"operation_id": job["operation_id"], "status": result["status"]}
 
 
-def run(root):
+def run(root, *, verify_fn=verify, initial_jobs_fn=None):
     root = Path(root).resolve()
     manifest = sr.read(root / "manifest.json")
-    verify(root, manifest)
+    verify_fn(root, manifest)
     size = len(manifest["inspection"]["inputs"])
     cap, concurrency = manifest["request_cap"], manifest["concurrency"]
     role = manifest["evaluation_role"]
     with (root / "active.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         governor = sr.RequestGovernor(root / "budget", sr.RequestGovernorConfig(cap, concurrency))
-        selected, continuation = initial_jobs(root, manifest, governor)
+        selected, continuation = (initial_jobs_fn or initial_jobs)(root, manifest, governor)
         if (root / "paid_run.json").exists():
             raise ValueError("sr_paid_run_replay_forbidden")
         model = manifest["inspection"]["configuration"]["model"]
@@ -290,7 +290,7 @@ def run(root):
             raise ValueError("sr_incomplete_trial")
         return sr.write_once(root / "completed.json", {
             "at": now(), "manifest_sha256": manifest["content_sha256"],
-            "episodes": size * 2, "new_episodes": len(results), "budget": budget,
+            "episodes": len(manifest["jobs"]), "new_episodes": len(results), "budget": budget,
             "reused_direct_episodes": size if continuation else 0,
             "reference_answers_read": False, "automatic_retry": False,
         })

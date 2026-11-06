@@ -1,0 +1,11 @@
+{
+  "schema": "vsi8b-source-bundle/1",
+  "upstream_commit": "1c4fb72479967266107ae3015694f5bcb506c8fe",
+  "upstream_project": "wjhICLR",
+  "source_policy": "content-frozen-local-bundle",
+  "dataset": "vsibench-m4-success-1000",
+  "question_count": 1000,
+  "train_count": 300,
+  "test_count": 700,
+  "scene_count": 164
+}

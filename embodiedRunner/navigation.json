@@ -1,0 +1,20 @@
+{
+  "model": "qwen3.8-flash",
+  "mode": "skill",
+  "seed": 137,
+  "max_tokens": 2048,
+  "max_requests": 60,
+  "max_requests_per_episode": 20,
+  "max_actions_per_plan": 2,
+  "history_steps": 20,
+  "enable_thinking": false,
+  "eval_sets": ["base"],
+  "limit_per_subset": 3,
+  "resolution": 500,
+  "simulator_python": "python3",
+  "simulator_timeout_s": 120,
+  "upstream_root": "upstream",
+  "code_root": "../src",
+  "skill_path": "navigation_skill.md",
+  "output_dir": "runs/navigation-pilot"
+}

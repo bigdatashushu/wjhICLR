@@ -1,0 +1,63 @@
+seed: 137
+max_solver_rounds: 6
+max_retries_per_operation: 3
+finalization_rounds: 1
+eval_visual_fallback: true
+paths:
+  data_root: data
+  vsi_bench_meta: data/vsi_bench_meta
+  raw_videos: /home/wangy/wangjh/harness3d-external-benchmarks-20261023/ReVSI-345a81132-32frame/videos/32_frame
+  raw_video_fallbacks: []
+  reconstructions: data/reconstructions
+  trace_store: data/traces
+  skill_library: skill_library
+  active_snapshot: skill_library/snapshots/active_snapshot.json
+frame_sampling:
+  n_frames: 32
+  strategy: uniform
+input_diagnostics: false
+retrieval:
+  config_version: ret-v11-initial-slot-1
+  method_context_max_chars: 8000
+active_vision:
+  layout: derived_related_spread_v2
+  max_derived_images: 8
+online_model:
+  enabled: true
+  provider: bailian
+  model: qwen3.8-flash
+  model_revision: ''
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  timeout_s: 900.0
+  temperature: 0.0
+  enable_thinking: true
+  max_tokens: 8192
+  max_model_len: 32768
+  n_frames: 32
+  max_pixels: 131072
+  audit_min_pixels: 65536
+  audit_max_pixels: 1048576
+  relation_batch_size: 32
+  mask_review:
+    provider: intern-decision
+    endpoint: "${VSI_REVIEW_ENDPOINT:-http://127.0.0.1:27248}"
+    timeout_s: 60
+    expected_identity_sha256: "${VSI_REVIEW_IDENTITY:-c16e97ae7e43e8605e201de8388eb9a318bc5f260e05a59e869943a8762c0cb2}"
+    mode: binary
+    prompt_version: P1
+    yes_threshold: 0.77
+    admission_policy: category-only
+    target_description:
+      base_url: "${VSI_QWEN8B_BASE_URL:-http://127.0.0.1:8100/v1}"
+      model: "${VSI_QWEN8B_MODEL:-Qwen3-VL-8B-Instruct-FP8}"
+      api_key_env: QWEN3VL8B_API_KEY
+      timeout_s: 180
+      max_tokens: 256
+sandbox:
+  cell_timeout_s: 120
+  max_regenerate: 3
+detection:
+  endpoint: ''
+  box_threshold: 0.25
+split_config: configs/vsi_bench_split.yaml

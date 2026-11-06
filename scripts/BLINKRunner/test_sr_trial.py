@@ -96,8 +96,7 @@ def test_remaining80_full_audit_uses_160_episodes_and_320_request_cap(dataset, t
         payload = json.loads(request.data)
         text = payload["messages"][0]["content"][0]["text"]
         return Response(
-            "def solve(ctx):\n"
-            "    ReturnAnswer(AnswerPayload(value='A', unit='option', basis='visual_estimate'))"
+            '{"answer":"A","reasoning":"FAKE_ONLY_VISUAL"}'
             if "Task reasoning Skill:" in text else '{"answer":"A"}')
 
     monkeypatch.setattr(sr_trial, "FullResponseClient",

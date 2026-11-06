@@ -206,7 +206,11 @@ def collect(run, owner_pid, start_ticks, proc=Path("/proc"), now=None):
                                           key=lambda v: v["finished_at"])[-5:]
         api_rows.append(row)
     execution = safe_read(run / "execution.json")
-    episode_count = sum(1 for _ in (run / "episodes").rglob("episode.json"))
+    manifest = safe_read(run / "manifest.json")
+    reused = numeric(manifest.get("reused_arms"))
+    fresh_count = sum(1 for _ in (run / "episodes").rglob("episode.json"))
+    episode_count = fresh_count + reused
+    expected_arms = numeric(manifest.get("arms"), 3996)
     stage = bootstrap.get("stage")
     stage = stage if stage in STAGES else "starting"
     if (run / "stopped_by_user.json").exists():
@@ -226,7 +230,8 @@ def collect(run, owner_pid, start_ticks, proc=Path("/proc"), now=None):
         "https_tcp_states": dict(tcp_total), "processes": workers, "apis": api_rows,
         "validated_apis": sum(r["validated"] for r in api_rows),
         "requests": {phase: dict(counts) for phase, counts in totals.items()},
-        "completed_arms": episode_count, "expected_arms": 3996,
+        "completed_arms": episode_count, "expected_arms": expected_arms,
+        "reused_arms": reused, "new_completed_arms": fresh_count,
         "execution_complete": execution.get("status") == "complete",
         "monitor_requests": 0, "automatic_retry": False, "reference_answers_read": False,
         "socket_observation_scope": "owned_process_https_tcp; bootstrap sockets are aggregate",
@@ -240,7 +245,8 @@ def report(status):
         "# gpt-5.6-terra 实时连接状态", "",
         f"更新时间：{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(status['at']))}",
         f"模型：{status['model']}；思考档位：{status['reasoning_effort']}；阶段：{status['stage']}",
-        f"API 核验：{status['validated_apis']}/10；已保存题臂：{status['completed_arms']}/3996",
+        f"API 核验：{status['validated_apis']}/10；已保存题臂：{status['completed_arms']}/{status['expected_arms']}",
+        f"其中复用：{status.get('reused_arms', 0)}；新完成：{status.get('new_completed_arms', 0)}",
         f"HTTPS TCP：{tcp}；执行进程存活：{status['owner_alive']}",
         "", "每 5 秒被动读取请求账本和 Linux 进程 socket，不发额外模型请求。",
         "TCP ESTABLISHED 只表示连接建立；调用成功以响应、模型和 high 档位核验为准。",

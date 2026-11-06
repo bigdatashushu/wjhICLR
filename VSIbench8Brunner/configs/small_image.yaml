@@ -1,0 +1,64 @@
+# Independent small-image entry point. No request or GPU inference without --execute.
+dataset_root: /Users/bytedance/wangjh/skill3d-paper-benchmarks-20261030/dataset
+
+solver:
+  max_requests: 4
+  max_solve_rounds: 2
+  max_tokens: 2048
+  category_max_tokens: 256
+  max_categories: 12
+  cell_timeout_s: 30
+  max_feedback_chars: 24000
+  seed: 137
+
+model:
+  model: qwen3.8-flash
+  model_revision: ""
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  timeout_s: 180
+  temperature: 0
+  max_output_tokens: 2048
+
+precompute:
+  # These are the existing server asset paths, not Mac paths.
+  # The parent launcher verifies assets and allocates the explicit device.
+  device: cuda:0
+  cache_dir: null
+  max_categories: 12
+  max_candidates_per_view: 3
+  detector:
+    # Template only: parent supplies a verified endpoint/deployment identity.
+    endpoint: null
+    identity:
+      model: GroundingDINO
+      deployment: existing-harness-detector
+    max_attempts: 1
+    timeout_s: 120
+    total_timeout_s: 120
+  sam2:
+    checkpoint: /home/cvailab/.cache/huggingface/hub/models--facebook--sam2.1-hiera-large/snapshots/227a114a2f535cd147f82442e7d2038cdd2e5d68/sam2.1_hiera_large.pt
+    config: configs/sam2.1/sam2.1_hiera_l.yaml
+    identity:
+      model: facebook/sam2.1-hiera-large
+      revision: 227a114a2f535cd147f82442e7d2038cdd2e5d68
+      code_revision: 2b90b9f5ceec907a1c18123530e92e794ad901a4
+  moge2:
+    # Set the locally verified model.pt path on the execution host.
+    checkpoint: null
+    identity:
+      model: Ruicheng/moge-2-vitl
+      revision: 39c4d5e957afe587e04eec59dc2bcc3be5ecd968
+      code_revision: 74fbce054ebed49800de42d0ad0e83495065719a
+    infer_kwargs:
+      resolution_level: 6
+  review:
+    provider: intern-decision
+    # Supply the live service health identity with its verified endpoint.
+    endpoint: null
+    expected_identity_sha256: null
+    timeout_s: 60
+    mode: binary
+    prompt_version: P1
+    yes_threshold: 0.77
+    admission_policy: category-only

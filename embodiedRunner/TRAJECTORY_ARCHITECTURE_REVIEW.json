@@ -1,0 +1,202 @@
+{
+  "schema": "embodied-five-agent-trajectory-review/1",
+  "date": "2026-11-05",
+  "status": "review_complete",
+  "scope": {
+    "evidence_root": "/Users/bytedance/wangjh/embodied-comparison-20261105",
+    "source_root": "/Users/bytedance/wangjh/wjhICLR/embodiedRunner",
+    "agents": 5,
+    "tasks": 15,
+    "final_instances": 30,
+    "retained_history_records": 16,
+    "new_model_requests": 0,
+    "new_perception_requests": 0,
+    "new_simulator_launches": 0,
+    "code_changes": false
+  },
+  "context_budget": {
+    "kind": "planning_estimate_not_measured",
+    "per_agent_tokens": [8000, 12000],
+    "main_thread_tokens": [10000, 14000],
+    "actual_agent_token_usage_available": false
+  },
+  "agents": [
+    {"id": 1, "tasks": ["eb_navigation:base:000", "eb_navigation:base:001", "eb_navigation:base:002"], "report": "checks/trajectory-review-20261105/agent-1.json", "findings": 8, "event_references_checked": 61},
+    {"id": 2, "tasks": ["eb_navigation:base:003", "eb_navigation:base:004", "eb_habitat:base:003"], "report": "checks/trajectory-review-20261105/agent-2.json", "findings": 8, "event_references_checked": 58},
+    {"id": 3, "tasks": ["eb_alfred:base:000", "eb_alfred:base:001", "eb_alfred:base:002"], "report": "checks/trajectory-review-20261105/agent-3.json", "findings": 7, "event_references_checked": 46},
+    {"id": 4, "tasks": ["eb_alfred:base:003", "eb_alfred:base:004", "eb_habitat:base:000"], "report": "checks/trajectory-review-20261105/agent-4.json", "findings": 5, "event_references_checked": 32},
+    {"id": 5, "tasks": ["eb_habitat:base:001", "eb_habitat:base:002", "eb_habitat:base:004"], "report": "checks/trajectory-review-20261105/agent-5.json", "findings": 5, "event_references_checked": 58}
+  ],
+  "verified_metrics": {
+    "Full": {
+      "tasks": 15, "successes": 8, "success_rate": 0.5333333333333333,
+      "actions_submitted": 216, "actions_acknowledged": 216, "step_observations": 216,
+      "official_invalid": 49, "failed_step_feedback": 61,
+      "qwen_requests": 228, "qwen_tokens": 1008147, "elapsed_seconds_from_existing_receipts": 1744.162,
+      "perception_requests": 678, "tool_calls": 11, "reader_calls": 0, "yield_calls": 0,
+      "program_errors": 12, "format_errors": 0,
+      "observations": 231, "empty_memory_observations": 193,
+      "successful_memory_updates": 5, "tasks_with_any_successful_memory_update": 4,
+      "tasks_with_entirely_empty_memory": 11,
+      "full_skill_requests": 228, "category_review_requests": 130, "all_model_requests": 358
+    },
+    "Direct": {
+      "tasks": 15, "successes": 12, "success_rate": 0.8,
+      "actions_submitted": 157, "actions_acknowledged": 157, "step_observations": 157,
+      "official_invalid": 42, "failed_step_feedback": 16,
+      "qwen_requests": 193, "qwen_tokens": 1006747, "elapsed_seconds_from_existing_receipts": 1311.196,
+      "perception_requests": 0, "tool_calls": 0, "reader_calls": 0, "yield_calls": 0,
+      "program_errors": 0, "format_errors": 36, "invalid_observations": 36,
+      "observations": 208,
+      "public_memory_empty_but_separate_automatic_action_history": true,
+      "format_rejections_with_next_request": 35,
+      "format_rejections_with_identical_next_messages": 35,
+      "all_model_requests": 193
+    },
+    "per_environment": {
+      "eb_navigation": {"tasks": 5, "Full_successes": 2, "Direct_successes": 4, "Full_actions": 71, "Direct_actions": 62, "Full_failed_step_feedback": 12, "Direct_failed_step_feedback": 10},
+      "eb_alfred": {"tasks": 5, "Full_successes": 2, "Direct_successes": 4, "Full_actions": 95, "Direct_actions": 47, "Full_failed_step_feedback": 29, "Direct_failed_step_feedback": 1},
+      "eb_habitat": {"tasks": 5, "Full_successes": 4, "Direct_successes": 4, "Full_actions": 50, "Direct_actions": 48, "Full_failed_step_feedback": 20, "Direct_failed_step_feedback": 5}
+    },
+    "task_outcomes": {"both_success": 7, "Full_only_success": 1, "Direct_only_success": 5, "both_fail": 2},
+    "perception_backends": {"depth_estimator": 218, "detector": 200, "segmenter": 130, "reviewer": 130},
+    "unique_tool_results": {"view_candidates": 11, "empty_candidates": 8, "nonempty_candidates": 3},
+    "program_error_codes": {"violation_runtime": 11, "violation_syntax": 1},
+    "category_review_usage_missing": 130,
+    "retained_history": {
+      "operationally_aborted": 1, "not_started": 15,
+      "qwen_requests": 6, "qwen_tokens": 41100,
+      "actions_submitted": 5, "actions_acknowledged": 4,
+      "terminal_reason": "action_outcome_unknown",
+      "path": "batch-2/comparison-episodes/trajectory-004-Direct/trajectory.json"
+    },
+    "qwen_requests_including_history": 427
+  },
+  "findings": [
+    {
+      "id": "R01", "priority": "P1", "status": "confirmed_implementation_and_behavior",
+      "title": "跨轮状态依赖主动记忆，Full缺少自动实际动作历史",
+      "agent_refs": ["G1-F05", "A2-F01", "G3-01", "G3-04", "A4-F1", "A4-F2", "G5-F1"],
+      "source_refs": [{"path": "action_solver.py", "lines": [92, 152]}, {"path": "action_host.py", "lines": [73, 87]}],
+      "evidence": [
+        {"path": "batch-2/comparison-episodes/trajectory-002-Full/trajectory.json", "event_indices": [28, 44, 60, 76], "meaning": "持有plate后，空记忆下重复导航并返回相同RGB"},
+        {"path": "batch-3/comparison-episodes/trajectory-003-Full/trajectory.json", "event_indices": [227, 231, 232], "meaning": "已送达持物/找浴缸子目标，仍重复拾取"},
+        {"path": "batch-3/comparison-episodes/trajectory-004-Full/trajectory.json", "event_indices": [80, 107, 136, 172, 257], "meaning": "持有orange后错误目的地、重拾与放置失败"}
+      ],
+      "recommendation": "保存有来源的公共实际动作历史与ACK后逻辑状态，分开pending/完成，撤销release后的旧持物推断",
+      "causal_limit": "不能确立记忆缺失独立导致全部失败；非空记忆也出现矛盾动作"
+    },
+    {
+      "id": "R02", "priority": "P1", "status": "confirmed_implementation_and_behavior",
+      "title": "家务格式失败跨观测丢失修复诊断",
+      "agent_refs": ["A2-F02", "G3-06", "A4-F3", "G5-F3", "G1-F06"],
+      "source_refs": [{"path": "action_host.py", "lines": [185, 207]}, {"path": "action_host.py", "lines": [263, 316]}, {"path": "action_solver.py", "lines": [173, 191]}],
+      "evidence": [{"path": "batch-3/comparison-episodes/trajectory-000-Direct/trajectory.json", "event_indices": [155, 156, 157], "meaning": "正确放置意图使用plan键，被拒绝后invalid达到10，step仍20，progress为0.5"}],
+      "recommendation": "跨revision保存有限解析诊断，普通修复提供有界代码片段与当前结果schema，保留原baseline身份",
+      "causal_limit": "改输出字段策略是新协议，不能静默修正原冻结分数"
+    },
+    {
+      "id": "R03", "priority": "P1", "status": "confirmed_implementation_and_behavior",
+      "title": "大量预感知未消费，任务类别解析还有遗漏",
+      "agent_refs": ["G1-F01", "A2-F05", "G3-05", "A4-F4", "G5-F2", "G5-F4"],
+      "source_refs": [{"path": "evidence.py", "lines": [27, 60]}, {"path": "evidence.py", "lines": [140, 246]}, {"path": "action_host.py", "lines": [140, 159]}],
+      "evidence": [
+        {"path": "batch-2/comparison-episodes/trajectory-003-Full/trajectory.json", "event_indices": [3, 8], "meaning": "Toaster类别没有进入预检测，候选为空"},
+        {"path": "batch-2/comparison-episodes/trajectory-002-Full/trajectory.json", "event_indices": [44, 60, 76], "meaning": "相同原图仍按新身份预计算且无工具消费"}
+      ],
+      "recommendation": "检查公开任务词/容器角色覆盖，明确查询触发与消费指标；可缓存纯产物但必须重绑新授权",
+      "causal_limit": "没有几何工具收益证据；补词表不能保证成功"
+    },
+    {
+      "id": "R04", "priority": "P1", "status": "confirmed_behavior_and_delivery_gap",
+      "title": "候选与冻结记忆API被反复误用，示例和修复信息不足",
+      "agent_refs": ["G1-F02", "G1-F03", "G1-F06", "A2-F03", "A4-F4"],
+      "source_refs": [{"path": "action_solver.py", "lines": [22, 44]}, {"path": "action_tools.py", "lines": [38, 56]}, {"path": "action_contract.py", "functions": ["freeze", "validate_memory", "validate_action_payload"]}],
+      "evidence": [{"path": "batch-2/comparison-episodes/trajectory-003-Full/trajectory.json", "event_indices": [8, 164, 167, 174, 177, 186], "meaning": "data字典被当列表、box字段误读、异常回退旋转、最后AST拒绝"}],
+      "recommendation": "交付精确候选/动作表/记忆schema和离线可执行示例，保留严格校验",
+      "causal_limit": "receipt无异常不证明正常候选决策；沙箱可用不等于策略正确"
+    },
+    {
+      "id": "R05", "priority": "P1", "status": "confirmed_official_semantics_and_behavior",
+      "title": "ALFRED放置与清洗前置语义未纳入明确状态",
+      "agent_refs": ["G3-02", "G3-03", "G3-07"],
+      "source_refs": [{"path": "upstream-household/embodiedbench/envs/eb_alfred/thor_connector.py", "lines": [72, 103]}, {"path": "action_host.py", "lines": [297, 304]}],
+      "evidence": [{"path": "comparison-episodes/trajectory-001-Full/trajectory.json", "event_indices": [60, 138, 140, 172], "meaning": "持有ladle时重复开水，没有先放入水槽完成清洗前提"}],
+      "recommendation": "基于公开控制语义说明find/pick/put/drop与处理任务前提，不读取隐藏状态，不替换官方评分",
+      "causal_limit": "官方语义本身不是适配层bug；成功release不证明目的地或任务已正确"
+    },
+    {
+      "id": "R06", "priority": "P2", "status": "confirmed_implementation_and_behavior",
+      "title": "剩余预算不可见，循环与修复耗尽有效行动机会",
+      "agent_refs": ["G1-F04", "A2-F04", "A2-F06"],
+      "source_refs": [{"path": "action_contract.py", "lines": [235, 246]}, {"path": "action_runtime/execution_contract.py", "lines": [26, 28]}],
+      "evidence": [
+        {"path": "batch-2/comparison-episodes/trajectory-000-Full/trajectory.json", "event_indices": [223], "meaning": "17动作后Qwen20请求耗尽"},
+        {"path": "batch-2/comparison-episodes/trajectory-003-Full/trajectory.json", "event_indices": [187], "meaning": "17动作后Qwen20请求耗尽"}
+      ],
+      "recommendation": "只读剩余额度、重复失败信号、显式修复成本；总预算变化两臂共同冻结",
+      "causal_limit": "原预算停止正确，没有超预算；不能推断增加额度必定成功"
+    },
+    {
+      "id": "R07", "priority": "P2", "status": "confirmed_comparison_conditions",
+      "title": "文本历史不对称、Navigation初图不同、批计划提示与单动作执行不一致",
+      "agent_refs": ["G1-F05", "G1-F07", "A2-H02", "G3-07", "A4-F1", "G5-F1"],
+      "source_refs": [{"path": "action_solver.py", "lines": [92, 152]}, {"path": "action_host.py", "lines": [291, 304]}],
+      "recommendation": "继续Full和官方Direct两臂，明确公共历史/控制/输出协议，新结果另冻结目录",
+      "causal_limit": "Navigation不能严格初图配对，ALFRED恢复渲染也非完整状态/像素等价，不归因单项Skill"
+    },
+    {
+      "id": "R08", "priority": "P2", "status": "confirmed_accounting_limits",
+      "title": "官方invalid与动作失败混合，审阅模型token缺失",
+      "agent_refs": ["G3-06", "A4-F3", "G5-F3"],
+      "recommendation": "分开真实动作失败、格式、程序与服务错误，按角色记录调用、缺失usage及中止历史成本",
+      "causal_limit": "Qwen token近似相同不等于完整架构成本相同；未启动记录不当物理失败"
+    }
+  ],
+  "verification": {
+    "original_trajectory_hashes_checked": 46,
+    "original_trajectory_hash_mismatches": 0,
+    "event_index_errors": 0,
+    "final_metric_recalculation_mismatches": 0,
+    "agent_finding_event_references_checked": 255,
+    "agent_finding_reference_location_errors": 0,
+    "main_thread_checked_all_complex_agent_field_expressions": false,
+    "main_thread_rechecked_representative_fields_and_source": true,
+    "all_final_actions_have_step_observations": true,
+    "source_files_checked_against_each_batch": 10,
+    "source_file_mismatches": 0,
+    "model_method_evidence_budget_identities_match_across_batches": true,
+    "new_live_checks": false,
+    "all_binary_assets_rehashed_in_this_review": false,
+    "existing_binary_asset_verification_receipts_used_as_prior_evidence": true
+  },
+  "source_identities": [
+    "514adda9df8f469c01ab2da55cbb472179cfcc70a1bbe03779839881a1715ec0",
+    "8a52f291046c9cb569a7df40637a586b0df721b711d00f95bd2d32929ff2e783",
+    "7f5ec984c11b6534250222d5c647c66d4b9f694d64a78f245b6154358314b656"
+  ],
+  "checked_source_files_sha256": {
+    "action_host.py": "a451040c56b1b8a92b1f0ac2ec4ace99beb190410f34114ed7772fb0ec2afef2",
+    "action_solver.py": "4e63cb979f5e5e1469e4b387669722840b5133ae446b0c8b12592df7844df8ad",
+    "evidence.py": "9ed2b6b727c7b66b6db1de8056eb85a88c799484285178fc26acf1e20c76ad9c",
+    "action_contract.py": "94eb5929c99504513e6177f5e91fb78fba0a1621526f9617c91cd6294e4f7915",
+    "action_tools.py": "09fee0d35d775003b3aebc65227688333c1c516ec05d7620951c0dd1a068722d",
+    "action_runtime/execution_contract.py": "672142066accdb386847b932483b4c6d629ba8669b04ec4586bb8efa141740d5",
+    "methods/navigation.md": "8edf370c6eb56275e593ce6e4ac56574b07a7a5b897af728e0e0b495f0a8f6d3",
+    "methods/alfred.md": "fd90229b085e674d4d004b7db07200a43c693da30a85ed0049954df3cf7b2e05",
+    "methods/habitat.md": "bce56e4063b55ad1d0bc69269208ebb979d15be0d6e27c11cdd097a7d9feb9d2",
+    "upstream-household/embodiedbench/envs/eb_alfred/thor_connector.py": "7d08ac402bab7fd479538b7055fecd30b665fcc7f27d1072963ab856ea87cf30"
+  },
+  "interpretation": {
+    "Full_minus_Direct_percentage_points": -26.66666666666667,
+    "navigation_initial_rgb_matched_pairs": 0,
+    "household_initial_rgb_matched_pairs": 10,
+    "household_initial_rgb_matched_subset": {"tasks": 10, "Full_successes": 6, "Direct_successes": 8},
+    "alfred_recovery_render_profile_changed": true,
+    "single_skill_causal_effect_identified": false,
+    "geometry_benefit_demonstrated": false,
+    "sample_role": "development",
+    "recommended_order": ["R01", "R02", "R04", "R05", "R03", "R06", "R08", "R07"],
+    "remediation_implemented_in_this_review": false
+  }
+}

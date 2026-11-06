@@ -1,0 +1,51 @@
+{
+  "schema": "vsibench8b-build-validation/1",
+  "date": "2026-11-05",
+  "status": "build_verified",
+  "workspace": "/Users/bytedance/wangjh/wjhICLR/VSIbench8Brunner",
+  "dataset": {
+    "name": "vsibench-m4-success-1000",
+    "selected_questions": 1000,
+    "train_questions": 300,
+    "test_questions": 700,
+    "scenes": 164,
+    "preserved_source_scene_audit_questions": 3142,
+    "public_questions_sha256": "8688acbcc1c440d31d2937ebbc10e59e1248425db7554e9ea6fcbbfe2cfc60c5",
+    "published_inputs_sha256": "cb53296975629e71b105921efcb01e21715281d8387783ebbc020853d106d078",
+    "mac_has_remote_scene_directories": false
+  },
+  "method": {
+    "description_model": "Qwen3-VL-8B-Instruct-FP8",
+    "description_input": "same original context/crop/mask-overlay images plus original category",
+    "reviewer": "Intern-Decision-4B",
+    "reviewer_prompt": "P1 with upstream description",
+    "reviewer_yes_threshold": 0.77,
+    "reviewer_admission_policy": "category-only",
+    "solver_model": "qwen3.8-flash",
+    "solver_seed": 137,
+    "m5_seed": 0,
+    "other_runtime_settings_match_original": true,
+    "cache": "independent refreshed M5 store",
+    "retain_json_trajectories": true
+  },
+  "verification": {
+    "tests_passed": 113,
+    "tests_failed": 0,
+    "test_command": "python -m pytest -q -p no:cacheprovider tests",
+    "snapshot_ordering_fix_targeted_tests_passed": 4,
+    "complete_bundle_snapshot_verified": true,
+    "isolated_snapshot_public_input_check": "complete",
+    "isolated_snapshot_model_requests": 0,
+    "original_binary_and_storage_regressions_included": true,
+    "same_image_bytes_in_both_stages_verified": true,
+    "failed_description_blocks_binary_request": true,
+    "original_threshold_preserved": true,
+    "source_geometry_relocation_and_cache_replay_verified": true,
+    "failed_preparation_json_retention_verified": true,
+    "real_model_requests": 0,
+    "new_qwen_service_deployed": false,
+    "real_qwen8b_inference_verified": false,
+    "formal_experiment_started": false,
+    "committed": false
+  }
+}

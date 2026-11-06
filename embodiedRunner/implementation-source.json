@@ -1,0 +1,32 @@
+{
+  "schema": "embodied-implementation-source/2",
+  "implementation_root": "/Users/bytedance/wangjh/wjhICLR/embodiedRunner",
+  "shared_source_root": "/Users/bytedance/wangjh/wjhICLR/src",
+  "source_policy": "Task-local adaptations only; shared src and legacy baseline code stay unchanged.",
+  "head": "1c4fb72479967266107ae3015694f5bcb506c8fe",
+  "reference_receipt": "checks/architecture-preparation/local-readonly.json",
+  "local_adapter_bases": {
+    "src/skill3d/sandbox/kernel.py": "9bd4cc6719a60cfd9a0abfac5249b4ea47e17eea6299af67c069d008b8f599c1",
+    "src/skill3d/sandbox/ast_guard.py": "b342d20f12f70b3c678c04c31de3842ba7a9f00685864595473694ff5dfd0c5c",
+    "src/skill3d/sandbox/action_check.py": "befeb324a8079e6f0dcd56fa9bb5cbf3772dd73a3eb92120c4b93900ad27b365",
+    "src/skill3d/skills/delivery.py": "6b3d0d7e9e9abd03b84e02e2ac9b1356d3a0b61c51cdc23893f8c88b6fa36984"
+  },
+  "protection_verified": {
+    "source_files": 230,
+    "source_changes": 0,
+    "baseline_files": 103,
+    "baseline_changes": 0,
+    "active_pointer_unchanged": true,
+    "final_receipt": "checks/action-v2-p4-preservation-20261105.json"
+  },
+  "intermediate_reference_worktree": "/Users/bytedance/wangjh/wjhICLR-embodied-architecture",
+  "intermediate_worktree_used_for_new_imports": false,
+  "copied_credentials": false,
+  "copied_runs": false,
+  "copied_venvs": false,
+  "live_requests": 0,
+  "simulator_launches": 0,
+  "git_commits": 0,
+  "completed_offline_scope": "P0-P4",
+  "acceptance_receipt": "checks/action-v2-p4-acceptance-20261105.json"
+}

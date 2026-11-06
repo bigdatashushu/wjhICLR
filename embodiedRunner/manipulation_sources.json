@@ -1,0 +1,2017 @@
+{
+  "repository": "EmbodiedBench/EmbodiedBench",
+  "revision": "9be4e980e9cd6bcb38373cd4aab7c32724bdd401",
+  "archive_sha256": "7b729e8f54ff8b8556dcb560b47c39bfa3e1050fbf2b4840a7759c2e2ca92772",
+  "files": [
+    {
+      "path": "README.md",
+      "git_blob_sha": "3f2a9d8b0dac8433054b101e6a7cc2c088cc990a",
+      "sha256": "52a6eb45ef020cb17ad7c2b05e91367e3690fa7164ca00013317567b39ce425b",
+      "bytes": 21272
+    },
+    {
+      "path": "conda_envs/environment_eb-man.yaml",
+      "git_blob_sha": "79225279c477ec7b2bea47f5a408b8288cb95ad0",
+      "sha256": "f671a5d387796029e15552a3576df720529cfaa08817523239c70ef3eed5e8b5",
+      "bytes": 8674
+    },
+    {
+      "path": "embodiedbench/configs/eb-man.yaml",
+      "git_blob_sha": "c53c250c69acb1b5ccb71f6e6efae46b8431a705",
+      "sha256": "f338e890e36974ecf688c74533805348b06a3fa3d594869ee8603a28704c2cd6",
+      "bytes": 248
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/EBManEnv.py",
+      "git_blob_sha": "4247481839596e91413402ceb72cbebc61fafc6f",
+      "sha256": "2422c9e8f9e34eba418275672caf5a12a9ccff1ae4970a7248f2d6127103c816",
+      "bytes": 11970
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/__init__.py",
+      "git_blob_sha": "7791d6a1fdd443e02243ef0d6b9d2cf3bb7987e0",
+      "sha256": "5a647a6007f02b3cfa5e189ff254195b0f23be5f6834dd39dd0c4cfd397d3ad6",
+      "bytes": 773
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/action_modes.py",
+      "git_blob_sha": "20ac6ffe36a89255c57be34e70069f8629161b9b",
+      "sha256": "c1de853894d6f71cb57843286792fd1ffe7327df49e187a96918d2ab971ac617",
+      "bytes": 2037
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/__init__.py",
+      "git_blob_sha": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/conditions.py",
+      "git_blob_sha": "6ad144c12dd2247961895756179c3cf23e1ea8cd",
+      "sha256": "05540873a9688448e5a11524048151638b2bf865f7c0066954f6e7e239d4bfe9",
+      "bytes": 7243
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/const.py",
+      "git_blob_sha": "161f47dfa953a0165cc6ecc1d2ba571cca2166c3",
+      "sha256": "62b2e291cfe629eeccf9bd26e3ef19b3a8a9c0d8eeeb01d8c08c84847cdaf926",
+      "bytes": 878
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/exceptions.py",
+      "git_blob_sha": "6876c2e752aa653efee874d1504d9afc197a05c0",
+      "sha256": "835e10b3bd1b76bccd8f24ff57d04a60dee2f5534d809ec6eb104bc019e77aba",
+      "bytes": 721
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/observation.py",
+      "git_blob_sha": "aae73ef287ce85eee859af79e31d2e6132ffe0f6",
+      "sha256": "75a984a6ba8f27f6822d7bd4047ec978454d51b382308dc1936f5205ca77285a",
+      "bytes": 3781
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/robot.py",
+      "git_blob_sha": "a1252cdd7698b839b7cbeccb47f2d8a9c9bdad29",
+      "sha256": "d70263fb2a4c9213cb961e529252f0bc2d728dd81042b953426543d1a31c86e3",
+      "bytes": 1745
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/scene.py",
+      "git_blob_sha": "5b6d0da5f1db4a8a567b8c7705184ae864c89bad",
+      "sha256": "ea3510370631b8490a285b427e42a21a0bd5a14c937863b5018b488129a6775a",
+      "bytes": 24923
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/spawn_boundary.py",
+      "git_blob_sha": "a4055b162131499e339711e9153eac8a8bb57dfa",
+      "sha256": "22bb89f843b0b26517d80521ff082ffed1772c1a8e5159f8a43429dcc44c094a",
+      "bytes": 7993
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/task.py",
+      "git_blob_sha": "37a57b5e1790beb4fbe9e55618592b4b7144935f",
+      "sha256": "6093403b00f4e491adc7a11e99ec3bf894c68b7938af067b5f23db755a0df984",
+      "bytes": 21922
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/task_utils.py",
+      "git_blob_sha": "f7bfc6329932e2d27cb9a9a591f7e857c725497d",
+      "sha256": "f54616796c63300231a0c11e9cda08ea5f9257306d931e5a378356d8240c78a1",
+      "bytes": 1024
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/unit_tasks.py",
+      "git_blob_sha": "6e30aa0299225b0bc8f8768ad885e08dc727065e",
+      "sha256": "c374bd1931557b482b167e2182053cbee2a1056aa6b4b5b94a455dcaf859fe71",
+      "bytes": 39783
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/utils.py",
+      "git_blob_sha": "cb226e0e6f55aab815ffc742888cea9f7f522074",
+      "sha256": "9d2e71515757e2b5ec0a756271dcee82fca6bad84abe743f152f508631c7ed51",
+      "bytes": 18957
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/backend/waypoints.py",
+      "git_blob_sha": "9eb81bb3a5fc37119eddc0b45443bf6767ddbfe6",
+      "sha256": "20632ccf97b21cbf142923d99a42a4b6f9ffbf0d3575a5a5a19da1d49b982a0e",
+      "bytes": 5943
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/const.py",
+      "git_blob_sha": "31b5522c78ce20e37e37f6667a3f46ff566564d9",
+      "sha256": "2ed6c2301bb7e1e0761e016d5543a29eb230d86d764c7be3c60af7d9e91627c2",
+      "bytes": 5762
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/demo.py",
+      "git_blob_sha": "fd9fd5694839d837f64dc0b40519eaf92b569664",
+      "sha256": "6182f1f2f78c2c07817da2cc63f878a16e6a1c7e723dbdf2374dcbc40c72d211",
+      "bytes": 445
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/environment.py",
+      "git_blob_sha": "b2ea648f95602b9df9214ed361d86436a669b8bf",
+      "sha256": "4c9e41eeb4c725873b2fa0378264d642398988a46b217ff17351855a3eb2f336",
+      "bytes": 11124
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/gym/__init__.py",
+      "git_blob_sha": "97866d760795d1e52e7ec4697e1b8baf9d12c838",
+      "sha256": "13557606e7621db2ee103e572145bbce42f26cf4070688a22ab1fa92e10f4915",
+      "bytes": 833
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/gym/vlmbench_env.py",
+      "git_blob_sha": "ac508c0473ae5ef27623960f7b702fc72bc3eb54",
+      "sha256": "3e9ce38eb32f71747a11688f9a312ebddafaa609db2d03ee5ec8f66ad7b76e97",
+      "bytes": 4391
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/noise_model.py",
+      "git_blob_sha": "8af5a317f9dbec219980d378b887e78fccb96043",
+      "sha256": "8676a897bbc67a7f572a75b4b2d049765c32cdb612bd100bab38ff1aeea0634c",
+      "bytes": 723
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/observation_config.py",
+      "git_blob_sha": "10a50760236ca23ddc59ec6af6a78199af69d865",
+      "sha256": "22f4a74283c9644306b4c83b559a7ad54b2786c2c09fb6d71c097440b3e59e86",
+      "bytes": 5529
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/robot_ttms/jaco.ttm",
+      "git_blob_sha": "20fbef572ba3f2b12fadc2169745ad1036aab4ca",
+      "sha256": "284fbca314a0e3117d5b81aed0cf9b0795b68902794a45228d770d892086a48e",
+      "bytes": 588730
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/robot_ttms/mico.ttm",
+      "git_blob_sha": "0ce19ea031664db8d230f7893f683657d72223cb",
+      "sha256": "e7c4e9c9f9da04f4309296a1dee487ac9bf607bfbff5d2d0ffd80505c1c02f71",
+      "bytes": 589908
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/robot_ttms/panda.ttm",
+      "git_blob_sha": "673d01d16ef12d08d9240e1c19b0d970234cf9d9",
+      "sha256": "81ee253910c9b4ffb8d820bbcdf224db169e71af8d3e378ce71ca26d027c9d10",
+      "bytes": 474146
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/robot_ttms/sawyer.ttm",
+      "git_blob_sha": "2556c99c8ba3da953e86568eefd6fa64fda35ab6",
+      "sha256": "65231d885a16272c3a07e84355c9478a1b156fd3a2913d267d509816b313a7a4",
+      "bytes": 544465
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/robot_ttms/ur5.ttm",
+      "git_blob_sha": "91dd27011357f8f8dce6577ec5862bd05b0a8f27",
+      "sha256": "bce58d385d77f87911155a70bb8e951856d22aa2eba778fd7dcfa8e9a90d25da",
+      "bytes": 353257
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/sim2real/domain_randomization.py",
+      "git_blob_sha": "8a16481b8580a746aeaafbdd386b9ed5682370b2",
+      "sha256": "acf6bd841f6f32e8cf863ba417535cfc48df5238e54bd29eaecce292da14abc2",
+      "bytes": 2272
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/sim2real/domain_randomization_environment.py",
+      "git_blob_sha": "15f4f71bfa545eb94d12455919831a0cb198ab5f",
+      "sha256": "d04760817f2c32606a30f4a04fcf7e1bf85d514e788eea4e5416b0b47511f05b",
+      "bytes": 2233
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/sim2real/domain_randomization_scene.py",
+      "git_blob_sha": "ed670c7af9bdc285c755e42383ebfb4db8b42b1a",
+      "sha256": "bf92d73e2cf02eb4e254c9773ad8e561d2af6da37dda0bf4c5d82814e306d00d",
+      "bytes": 3955
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/task_design.ttt",
+      "git_blob_sha": "bf691115522c5fb7ba0bbcdd374548d624a8a971",
+      "sha256": "6cf7ecc3b7ab094a17c5e0a48affb48b8438fdc67168fcfef850ca470a8e2a4e",
+      "bytes": 6967399
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/task_environment.py",
+      "git_blob_sha": "ebb7bed7a4df9da089be7d81c7385ad9434d2b7d",
+      "sha256": "cc74d57a9b5c1bfaa66e72f3960c16363401983ebafe99bb60e9943783628f1e",
+      "bytes": 30427
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/amsolver/utils.py",
+      "git_blob_sha": "3dee02601a54400e871dc80b9021c8f24870c126",
+      "sha256": "0e49f08fe2a1fe51dea11a35dc5011b435456f41ff3326a1156f595a3ec20dca",
+      "bytes": 16787
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/eb_man_utils.py",
+      "git_blob_sha": "ee4282f3e86daac211928d788f3b61c0ffc57573",
+      "sha256": "15ae5629bfafa5deb6cc9db15d33b96629b9c0af3d38f4c968e42711758c9bf9",
+      "bytes": 19727
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/requirements.txt",
+      "git_blob_sha": "629372aec2917dd43ea6a271ff323bb1bd7bbe80",
+      "sha256": "9349dcf81b30adff4463eb81a8e8b6834478408c845772f2a20b0ac147936566",
+      "bytes": 105
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/setup.py",
+      "git_blob_sha": "3a803728702a01a7b094986877c90194d71d7384",
+      "sha256": "af408e38c63dbd5eafef19fab7a205c748639eb5f34352cbea8ca344cc99adc7",
+      "bytes": 1250
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/simAddOnScript_PyRep.lua",
+      "git_blob_sha": "24da8ef9b34403323bf7b387c1ef610b7a4be2db",
+      "sha256": "075a9eea503183d0c6a11528f2165d265edf6ebaf8e6ec908d9cc8fc8ab173be",
+      "bytes": 17522
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/tools/assets/task_template.txt",
+      "git_blob_sha": "566a7b1bd8c647bfa97551b074e97003cfd9805e",
+      "sha256": "f7bce9a4fd087ea38a69cf874cabe79088bef386f187e3b04bdbd4e314141f4a",
+      "bytes": 792
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/tools/cinematic_recorder.py",
+      "git_blob_sha": "bbc84730ef6818fdb8d84bc4eda6475a4df28ee3",
+      "sha256": "81faf515a6e7322aac81c8a72132dc21f2cb55670b815ab742210c7ab1898397",
+      "bytes": 5236
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/tools/dataset_generator_NLP.py",
+      "git_blob_sha": "21e3a6e45e4d56cfe937ede5da70ec4f18d795ff",
+      "sha256": "0747cc8ea9a91fd9a620084d936efee41071eca100e013e5c0b2bc362d4845c5",
+      "bytes": 16794
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/tools/grasploc.py",
+      "git_blob_sha": "a4787913b9091180b7c003fee9b0193491309dcb",
+      "sha256": "afc0a659146fc809b3aa977ebd37231ef821747083e2cd168a3a00b382c760ca",
+      "bytes": 17705
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/tools/meshlab_stratified_sampling.mlx",
+      "git_blob_sha": "b21e61e8b9c4ada1edc843651eca384213da37d0",
+      "sha256": "4cb82dc61e72dfa4a2e8c6a0b1e8c1614b908163bf9175cf3074328facb0d364",
+      "bytes": 1535
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/tools/task_builder_NLP.py",
+      "git_blob_sha": "289f1006170428e77cb1b343c1aa3037808f6a78",
+      "sha256": "5f338813f2c1a12801dfff9f689540273ef5a59c6e861a2bb44799e1545ef797",
+      "bytes": 11238
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/tools/task_validator.py",
+      "git_blob_sha": "c692cd60004ca264afa271e3c97c93d800eceea4",
+      "sha256": "772fff05fabeb54d78869cc6e703f2ff9f8a03a9af9dd8132b7fca018e7a3b55",
+      "bytes": 4849
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/tools/test_config_generator.py",
+      "git_blob_sha": "5b740d403addf34c83021a461f4388ad52a795eb",
+      "sha256": "b2527bb8d87035857f52ffcb3ccf0399643d4ac66e816b010d0b540e6a665e55",
+      "bytes": 9622
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/cross/cross.dae",
+      "git_blob_sha": "709cf8099b74d86a8d596c9cdcd7764bda9c4688",
+      "sha256": "1a026b8477d0b2897a6ae0b8e5d6b889f0aacdcd98f37ad23ebc7914f181dc6c",
+      "bytes": 5061
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/cross/cross.json",
+      "git_blob_sha": "76e16738bd0d727384a19a95c562c9559b0f7cec",
+      "sha256": "fbc2532d723f4f10abd7988bf3bb5af292ba9a85aa01c34aeaa77c007dd563fe",
+      "bytes": 442
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/cross/cross.pkl",
+      "git_blob_sha": "f10193561416209de3eaa35d3c3b13861183c35a",
+      "sha256": "a9d92b668249928ad180e0f188d0279fbe2af28c537aed2aa750654edb0d12bb",
+      "bytes": 1029284
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/cross/cross.ply",
+      "git_blob_sha": "784e083c00f9edaeb6ad9152e8a09fdd4b840091",
+      "sha256": "cebe790dadf2ed5ae82ee24b30393d822648b56356cea8ddb4d7eafb20f26a04",
+      "bytes": 1011
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/cross/cross.ttm",
+      "git_blob_sha": "5884422edbda472b20a05e0d8911e190e395ee3e",
+      "sha256": "36e416f1b5ce584a88a3ca58a49bb54b22c601f61a61a0f743c1dd0b0846b6eb",
+      "bytes": 33642
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/cross/cross_meshlab.ply",
+      "git_blob_sha": "ad052e33e344a2ad4911941e904b1e2ebb45f4b5",
+      "sha256": "e2f14e9885e2f501d8808ac65aa5275b2427e46449c5f84c2ac327291999e04e",
+      "bytes": 2665445
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/flower/flower.dae",
+      "git_blob_sha": "6a72e0cacd79097e912c9e3572431e700e2a2fd4",
+      "sha256": "fd63d6d325047fc4117ccdb107c090ce1e42cd5646f4e27dae6071c6e5a2fe7f",
+      "bytes": 25953
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/flower/flower.json",
+      "git_blob_sha": "417b59d7f3b20c3594eb982a7a1c0c1a2a5a5249",
+      "sha256": "19897f99c40f710bef0e0d22e5d1cd808b1f202586714c36c40686699979ed2a",
+      "bytes": 434
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/flower/flower.pkl",
+      "git_blob_sha": "996b2acea2898a2f273d102948d833d17412be09",
+      "sha256": "b1e5783901da879c9094b047bb9c7d7e3943b20bcd568d641f0a07acafb1db90",
+      "bytes": 1723556
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/flower/flower.ply",
+      "git_blob_sha": "3451a271b99eed6eb9e9f7cc03bf7a2b46ef5ce2",
+      "sha256": "b1be41a5434cbb60d390b91451d6b74a19d92ed94d1ff11476acd425fe20f897",
+      "bytes": 2636
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/flower/flower.ttm",
+      "git_blob_sha": "102fb17d671dcb553f57b54b4d998a32cf3b6502",
+      "sha256": "5d19247a99d6ba362bc7a3fe79a2b38da7a329473e98d8903b2bac0070eba50d",
+      "bytes": 42350
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/flower/flower_meshlab.ply",
+      "git_blob_sha": "8120af8c59c26c5a0e4113caf96457e20a960586",
+      "sha256": "e2eb691ba48e6ca94555238cc9634d09ac0e346387a7efef8d149b617dbb0370",
+      "bytes": 1856188
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/pentagon/pentagon.dae",
+      "git_blob_sha": "429a42660592a53712180ac562631d26e4ef2abb",
+      "sha256": "34e1940081223b994ca55bd7882f719778636d331b5748b61f0a12da074ddba8",
+      "bytes": 4084
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/pentagon/pentagon.json",
+      "git_blob_sha": "3d1a35a310b380e06ce101e41fedbfb59fa67e06",
+      "sha256": "34fe267b8763c18798cc23fd25f122b56a04cf95d3bca0f3f47e4a7b116a8d6a",
+      "bytes": 446
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/pentagon/pentagon.pkl",
+      "git_blob_sha": "40a095a91527727a2b3422113a3ed321c81409fc",
+      "sha256": "c420adffbd41d6e140a43fed45c6c3e62259512004cf03d7921e39a3ccf1e7e2",
+      "bytes": 1735844
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/pentagon/pentagon.ply",
+      "git_blob_sha": "563ededf545105e8fab4e5d3cf109408cd4133a3",
+      "sha256": "931062780c4bf61f6e7b780f41c9ee78a302f30c636b42adb6732fb44a50bb81",
+      "bytes": 963
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/pentagon/pentagon.ttm",
+      "git_blob_sha": "481510c84eff36413ee02883b357a4fd66644856",
+      "sha256": "cea816d1828947c3c2b87b8b5be9965c77673a5f3ffdcd32c5919fb083fed23e",
+      "bytes": 31418
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/pentagon/pentagon_meshlab.ply",
+      "git_blob_sha": "d1387042b2d104cd922a5c6741349574855d5e24",
+      "sha256": "9cbc87e36aa42d9389cb103bf1519ebbf240ef3b067310ffe160cd235cde5dbe",
+      "bytes": 1709308
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/plane_cross.ttm",
+      "git_blob_sha": "df8652c743c473084d2103fb93bc05e559fa2fe7",
+      "sha256": "dff989277503200f6af8d377f5ecb06d05b7e509c2976fc64e588321c94c5cfb",
+      "bytes": 29248
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/plane_flower.ttm",
+      "git_blob_sha": "191366e089f61aba96bfeb369c2e9eb92c6e80a8",
+      "sha256": "71202c4bce73bf8cc181306e776ba8a4983ae1dd1ab68f345a99bdde3e797052",
+      "bytes": 38095
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/plane_rectangle.ttm",
+      "git_blob_sha": "5d5c0f974ec492af824093c7f1e6b5253ccd93a4",
+      "sha256": "b8a80e0d2da3a6491b627c4f8ce8cb9ba3de7b3df4703717eb7f17fae6601c2e",
+      "bytes": 28665
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/plane_round.ttm",
+      "git_blob_sha": "f6a9f3b9247ffe0fcb760dbb2499aab0f7771112",
+      "sha256": "8013ddedd53e2a5fd02eaf85f02420606cbe7b7dc15d6f143c44b45c82cfa383",
+      "bytes": 31158
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/plane_star.ttm",
+      "git_blob_sha": "adb3985858fdb5104c1998c07b2dc49a9fd903f7",
+      "sha256": "a3c7c4ff687f8ddb4a1449ccadd0c4cbf88dc9a95d5e7c6a5bc391101f9160c8",
+      "bytes": 46009
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basic_shapes/plane_triangle.ttm",
+      "git_blob_sha": "c59f41843c57bf17f67988035e3f9e4a076162a9",
+      "sha256": "95a1e31aadf199af6d72de3b4e52b7dd9190287e55b0731d3737fb9b5a6d7ff1",
+      "bytes": 28538
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basis_shapes.ttm",
+      "git_blob_sha": "cde052a568886b6e951115b948a5ec17c5160a53",
+      "sha256": "f171e54e1d7a552497489352f6ff75fd45bb3ffe409dd67685342167bdeb9a5c",
+      "bytes": 166644
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/basket1.ttm",
+      "git_blob_sha": "351d54e89c1608e482508cdcb15f195dd0c08941",
+      "sha256": "2d7cb71d8c41d94fad5022f43dcd254b31f69b3de8de6bfa5c7df381b86284b2",
+      "bytes": 310232
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet3/cabinet3.json",
+      "git_blob_sha": "345b833a58ba113eca4cc8d6f22bdba477d8de07",
+      "sha256": "4f30e4cf3d78d9afb1d21eeb01c6b99a4ae82272ec168621025ed0438f7b82fe",
+      "bytes": 1018
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet3/cabinet3.ttm",
+      "git_blob_sha": "2c32d8fe8b4fb004349be69b6fc166e3966fe976",
+      "sha256": "e4cb13fd806eb8d244474e4d164a8e98fde17ba55759e3e285bdd1ddc275b03a",
+      "bytes": 264485
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet3/cabinet3_handle.pkl",
+      "git_blob_sha": "1fb990ec5e4ba19158c0643ac68e61e200ef788c",
+      "sha256": "001379f191da5b426bb51d9a5188b3657c49a7919fa8665aa9ebf5a097a85ff4",
+      "bytes": 864164
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet3/cabinet3_handle.ply",
+      "git_blob_sha": "27c7123729dd0b13a4832255953df763d1072d88",
+      "sha256": "e6a67014eeb9f7a8bb0c9fceb73d8c5b8daea1435f28cd7312734e2739a37e35",
+      "bytes": 759
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet3/cabinet3_handle_meshlab.ply",
+      "git_blob_sha": "abb05744a3659d163f291e016dfed38d60c71a45",
+      "sha256": "ebf1e846bfbbb8b52e5aaa659fb149343b1c5ac16300c161da505cae8c665d69",
+      "bytes": 4595285
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet3_original.ttm",
+      "git_blob_sha": "b79270748c181e95aae155e3424b3f4a5eda3a8f",
+      "sha256": "3bca75c50479f7db6054d80d58421f1188345fd0adec64340d6ce53277d2a35f",
+      "bytes": 264493
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet5/cabinet5.json",
+      "git_blob_sha": "051b98e603abaf4bb05c32e335a84fa363fb23a3",
+      "sha256": "923320a6c2b42312bb0cbd22bd417198cf2a230dec755cba513a0772b29f15a3",
+      "bytes": 667
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet5/cabinet5.ttm",
+      "git_blob_sha": "765c5b9f5778bbaf89815716ee371d3f8b1ddde8",
+      "sha256": "1c79fd732df964faf64453e494a7535b5f4416f8c45c6a3e1c4e4aeed137fc45",
+      "bytes": 97677
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet5/cabinet5_handle.pkl",
+      "git_blob_sha": "dc1e7ff1e963f5696e56060b47877092a76b38d5",
+      "sha256": "d0d51ce85896407b79459bdc4f5799f9892f159d6b6303e2bfde0884e626c3ad",
+      "bytes": 2899876
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet5/cabinet5_handle.ply",
+      "git_blob_sha": "3050b10fbc850a1694fb6da198718b38d10e2c98",
+      "sha256": "a3d26b350b133596cebcc4e03611a5259ce47b05a44993952c1f48c98d70c9fc",
+      "bytes": 3682
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet5/cabinet5_handle_meshlab.ply",
+      "git_blob_sha": "60ee2e30e46829cd3292601926110268b8367955",
+      "sha256": "4ff919fcec28fe28d254882cab1ae398ca78421c51d45ac85192826d7fcf6b27",
+      "bytes": 4620293
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet5_original.ttm",
+      "git_blob_sha": "1b2ea128baa68b57db71834186a49e9bb0a397db",
+      "sha256": "eaefeb506fe114956a565a4058b453de9186ca2545476af947e00be3498bac39",
+      "bytes": 97677
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet6/cabinet6.json",
+      "git_blob_sha": "93eb1502c7020abd84cc02b5fa40a64786d2baa8",
+      "sha256": "1072eb1be9c7fce53a1d4b4542f9d1b6c202d1d9b61604191cacc113d73ce680",
+      "bytes": 998
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet6/cabinet6.ttm",
+      "git_blob_sha": "eeef23a31d5f2729781c706caefb280843ac25a6",
+      "sha256": "0bc3270a01755cd15cfd8e4ea3cf51c80040a485361756ac66b3b7322e08dd01",
+      "bytes": 80938
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet6/cabinet6_handle.pkl",
+      "git_blob_sha": "791f11a3ef60d45deb70064c472c47964171f6a1",
+      "sha256": "9bf4d130b68ee1122a31822a48eb17d0f5c9d72428541f600c45866230775076",
+      "bytes": 1082532
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet6/cabinet6_handle.ply",
+      "git_blob_sha": "15ea0ccf8c59e9998f842ed5f771fed4fea84663",
+      "sha256": "f933db06830c1dab720dc691053462e4d1a34c0573a2238156b6083d3179bdb9",
+      "bytes": 2442
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet6/cabinet6_handle_meshlab.ply",
+      "git_blob_sha": "7f3861b7658368d21c1a09d039b9a622374b371b",
+      "sha256": "29a3887ba1da6502f53fb8978268ec9c1d56520c4195af87f9f7e6a7699eb021",
+      "bytes": 4462061
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cabinet/cabinet6_original.ttm",
+      "git_blob_sha": "c861c55121e75caef868cc8ed3dbc6b07bf09f2c",
+      "sha256": "d978eadd14735287cd38afaf20a7f63efb61bd46b0fba9c710def0ec2a5ac60d",
+      "bytes": 80939
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/container/basket1.ttm",
+      "git_blob_sha": "9b4156cfd6379f61a6c2aedecfca3841c35eee28",
+      "sha256": "9a14a443fb3a49e78a4e04b5445cf94815f43843078aff4b7ab83d8b37740a29",
+      "bytes": 308399
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_basic/cube_basic.json",
+      "git_blob_sha": "394ebe7cfe17ebdc78d05f492665fc6ea75ba8e7",
+      "sha256": "d858e0ffc1daaf0f93ba4a2fb1b553221784bed41335f5c5b6b85d490abcbd7a",
+      "bytes": 388
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_basic/cube_basic.pkl",
+      "git_blob_sha": "cd4ecd18f329c96cef1597ff86dea84360e53d50",
+      "sha256": "e3180ad66602f519a23022a6363948af540a37eb3a8e2f2f0adc63c25234c64d",
+      "bytes": 1766049
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_basic/cube_basic.ply",
+      "git_blob_sha": "7c8df23eb8bbac219b3536f082f1f206339f6d96",
+      "sha256": "33003d583484b00bce93992db4443556599e202b87f6dafba927785fcd03ffaa",
+      "bytes": 506
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_basic/cube_basic.ttm",
+      "git_blob_sha": "902c892ec926ab9b6f33f520458bb5cc4e378ba7",
+      "sha256": "812511a59656b226f81730bb10b2679a38bf676e539cce6091c4d308f7f21358",
+      "bytes": 25702
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_basic/cube_basic_meshlab.ply",
+      "git_blob_sha": "0e820b1daac21d5ed807c3d24210bbe6cc8b4b7e",
+      "sha256": "c21590c8f828aa7eca7e4c81a6a6da8bc1adee49f8b0391ac276b1d56df5b005",
+      "bytes": 1010188
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_large/cube_large.json",
+      "git_blob_sha": "93e67781bbe4ac6b360bc65f7c944fe9cf5eeb37",
+      "sha256": "6a2474b7cf02208663bd98786426e3cd9947d7cbdb3256ad67961bbbbd49385d",
+      "bytes": 420
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_large/cube_large.pkl",
+      "git_blob_sha": "e312af88c4382e746e745677b99285a004c4c7b9",
+      "sha256": "370bab13b7493196ec99d88b405be5b6155856bb686a8d10c19cf9705919e05b",
+      "bytes": 551585
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_large/cube_large.ply",
+      "git_blob_sha": "210b889cccafb42807f62a022786ebfad78c239d",
+      "sha256": "d7c61ba97669bf18b29490566e8ee66ee12b37ee261a62995fbea3feb76a5577",
+      "bytes": 506
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_large/cube_large.ttm",
+      "git_blob_sha": "fad991b6b93e6de536251abdb89c7e0f3305403f",
+      "sha256": "4744ed800a6dbb050291ecddb9d2bb1c7d2b4aa7fcbb3ddab71b6c6ccaef1f1d",
+      "bytes": 30865
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_large/cube_large_meshlab.ply",
+      "git_blob_sha": "756f12c090301a122f615ecdd8c262017df7aacc",
+      "sha256": "37a87886d0ab547eb6bbe6f3bb1ce9b41a1af01b7c14a5ace7bc4e30873c168e",
+      "bytes": 2787461
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_normal/cube_normal.json",
+      "git_blob_sha": "6884df396486e5a43da1a8ab7e78f2adf8111c5e",
+      "sha256": "3256a55e8ac685da6b7c47b11a228b9187b7d45fcf5eb4df5291bcb6eebc2bbd",
+      "bytes": 418
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_normal/cube_normal.pkl",
+      "git_blob_sha": "3a197810e068dab0f83d33ec5a6c72ecebe0e5bc",
+      "sha256": "b95d9eaed2095408e951c1f5971f180f61dcaf6fbf6ab7a813e40e5d9c13331e",
+      "bytes": 817569
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_normal/cube_normal.ply",
+      "git_blob_sha": "469cd478370766b4a1a003fa8ded5bc9f6eeffa8",
+      "sha256": "a1dd4b8a4fde19c6a622ecd83aaab6870bd5f03c032f0e9da85b16ab63e9f59e",
+      "bytes": 506
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_normal/cube_normal.ttm",
+      "git_blob_sha": "5d5adf47d4b33356af974baf3ffc16d24e63c5ba",
+      "sha256": "8c9d27d480b84877557d276c365e1a85f4c5c6fe64ec9e4ecba393994da145c8",
+      "bytes": 30830
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_normal/cube_normal_meshlab.ply",
+      "git_blob_sha": "f8e95180647ded853914f7e51fa65889ff524b86",
+      "sha256": "4f6617dec3ee190e6ccdde0744f79e1a2c90f8c5976ee5d7df51f952a8b0e7bf",
+      "bytes": 1440196
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_small/cube_small.json",
+      "git_blob_sha": "14632e937f08ceb25099a54c70513fd4452c9b4c",
+      "sha256": "6365a0ecce015e5199e910f901b487b729ee21f730ef8a39f2857b9eb7710174",
+      "bytes": 420
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_small/cube_small.pkl",
+      "git_blob_sha": "624506b7e9a5797115d73622ceb140eb74f4f7cf",
+      "sha256": "645119eb3d0c80465c597f448c37238af2ca30a3989570650e24a06f8ef3f6dc",
+      "bytes": 524449
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_small/cube_small.ply",
+      "git_blob_sha": "6890a3f12b861b0f1d283c6d56fcb00d2815523d",
+      "sha256": "9208b2e24005fe247a6d1d622afb3c13c350dac42be5f74240327e57933c3a1b",
+      "bytes": 506
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_small/cube_small.ttm",
+      "git_blob_sha": "0e8b587a716218a09a53b728d1e840c621ff44de",
+      "sha256": "3dd263357fbd7057177a08323a9ac37376b6360e534f14fe20b8e904c01179f1",
+      "bytes": 30836
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cube/cube_small/cube_small_meshlab.ply",
+      "git_blob_sha": "04c72eb9ae275898c98276ca59a302dfa73371ed",
+      "sha256": "8e917879a140ecff8f74b373cd883f35525c706c9ec83a360c85d51a0e460f3c",
+      "bytes": 518596
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cylinder/cylinder_normal/cylinder_normal.json",
+      "git_blob_sha": "1740e2e143252b9c3af477d42db23c4f99e5ff73",
+      "sha256": "34fd39fb4fff1123dc7018446f94cfc8fe62cb63e74cc188a4c60c9b5f17d14d",
+      "bytes": 415
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cylinder/cylinder_normal/cylinder_normal.pkl",
+      "git_blob_sha": "546a55d194a2f70664d30fa4c2a871a403f44457",
+      "sha256": "160b7133671035a51a3c70802e89f8afaf3c5e3c55eb9ed1551246b1b314f75b",
+      "bytes": 2021025
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cylinder/cylinder_normal/cylinder_normal.ply",
+      "git_blob_sha": "90daf916507ca4be93b0f05a35a53bd44a4d0beb",
+      "sha256": "71ae7cd4e6fe9aeddafbeb7f15e51d2989084ba24127c718b51bd66cf2077061",
+      "bytes": 2712
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cylinder/cylinder_normal/cylinder_normal.ttm",
+      "git_blob_sha": "544da6e3c3e0eb78d5492ca6ba89d2eed7ccd2fc",
+      "sha256": "dc79b1622d140573b867290217f1814631cf57e5e3e236c8148089ca2a432e40",
+      "bytes": 31193
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/cylinder/cylinder_normal/cylinder_normal_meshlab.ply",
+      "git_blob_sha": "867592b1a3c10cf63f35772ec4604f4cc56fb3f4",
+      "sha256": "ce286865e9a348580ce1d5abc6638c26250d42e3d3864355b7b55f52b19dda33",
+      "bytes": 942292
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/doo1_handle.dae",
+      "git_blob_sha": "d7565ed54a97974b38d0bab78b450c4d025d4dfa",
+      "sha256": "d194dc81a020518fbed5a88433c53728b0a9f45f41e45f6f98a67681549e55c3",
+      "bytes": 69764
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/doo1_handle_2180010.png",
+      "git_blob_sha": "aaa1b1a0f2599f31adf11bff1a7f54ea4191ebdc",
+      "sha256": "ee0791a327d934852182e6bd7586a58b078d0c0d06a208160b4a66b5e911e5eb",
+      "bytes": 82394
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door1/door1.json",
+      "git_blob_sha": "863b717115e635298a9dab5de6f7c31ed2c7a2d2",
+      "sha256": "0e0f06c4b6a6e457bca4d50f094bada973047e91b112613eb36516854236a6f5",
+      "bytes": 886
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door1/door1.ttm",
+      "git_blob_sha": "891dd9d8e42032f51e8cf959fb1ccb311ecf1b21",
+      "sha256": "6f462400c4b3d948942d2cfb984ce22cc9f05fd5ee90ff7052baf60427e93a1a",
+      "bytes": 397052
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door1/door1_handle.pkl",
+      "git_blob_sha": "1c220f2111894225914d7277324ca73a7bc77ef5",
+      "sha256": "1fe902441b2dcabe7c38c5e5698f12c122c4eaaf00cd274c4495ed8d5735164f",
+      "bytes": 1233316
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door1/door1_handle.ply",
+      "git_blob_sha": "51ab5c3fe4ac0cfff3cd967c31381ef041d5e38f",
+      "sha256": "e20ad2985bdd585a93410b90a0e112b2a1bc3f30b92d6912d8ab2a82633ec092",
+      "bytes": 5673
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door1/door1_handle_meshlab.ply",
+      "git_blob_sha": "63835cc2ab7287f3946319dc7e8e36f461577bcf",
+      "sha256": "fe4bc4dee5a6d3654452a73e747f3774476ae8e1544aae84e212080d051d0393",
+      "bytes": 1319044
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door1_large.ttm",
+      "git_blob_sha": "730b0fbe7cca8d120649bc7e3e98df6c7e4a8710",
+      "sha256": "681d2fa74e27259b7b2841f38d6b61696140662f3f3c1d6bbd317468d9a9e7ba",
+      "bytes": 397043
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door1_original.ttm",
+      "git_blob_sha": "effe5eca5f92d7b21fd26fbd8512ae61e855e7ee",
+      "sha256": "88a584dcdc196c044749ed077d0f25702c3ef426ed17f8aaa12b600367e15720",
+      "bytes": 397051
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door2/door2.json",
+      "git_blob_sha": "6852ef1b50c16d13de8be7e494de722b4a33f6ff",
+      "sha256": "2fb073ef6b4b146b8c6d9fdfcd94d6f6a7fa24859bd15113209e915d31fad34c",
+      "bytes": 916
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door2/door2.ttm",
+      "git_blob_sha": "0e5eb01856e62bf74dc1a464e30839717d53ab02",
+      "sha256": "f67d62500e3d2666ca7f5f1b1dbf4ee3260c0a87085ce98ac9424b78093b800f",
+      "bytes": 105287
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door2/door2_handle.pkl",
+      "git_blob_sha": "fa16baf599457ff02e14ec721725fa68843d2f37",
+      "sha256": "4a50f492d53cd24e751dbf6027ac6f99bb29f1b44f57995b156bee76f2603487",
+      "bytes": 1656996
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door2/door2_handle.ply",
+      "git_blob_sha": "eb72d114f05021b1b551d3d1633b0c52860275d5",
+      "sha256": "bfe266e81988b05cf7e7bcfdc2290de879f8c7caafec1edd78fcbc686df56d29",
+      "bytes": 15047
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door2/door2_handle_meshlab.ply",
+      "git_blob_sha": "51d8cb15b469bde12cf07c588570fda62288a151",
+      "sha256": "e0d95bd12103a4a179a3db7ac58359cea28c4d1fc36317fa037968e50520824a",
+      "bytes": 1588900
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/door/door2_original.ttm",
+      "git_blob_sha": "db0fe8bf0220a1a34e761b313f46a441d1fcb97c",
+      "sha256": "fb5f3f48e2c96f39840960e05acb3bb4ffc393c3069bb78258b4dc6e4049b818",
+      "bytes": 105298
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer1/drawer1.json",
+      "git_blob_sha": "fa19151db72eb9a08c429b86dc3dc15887f1914f",
+      "sha256": "25ac2d44df2b4163114bc48f904e759d64fe6dc0526b5a612275e4c1c6b76490",
+      "bytes": 1267
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer1/drawer1.ttm",
+      "git_blob_sha": "118488b231cdf0703cff6776bcd38a6970106d93",
+      "sha256": "2b3221d39adb9483127de3b238902def767f6733583f9796a2d783b135791777",
+      "bytes": 62252
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer1/drawer1_top.pkl",
+      "git_blob_sha": "ea01715458ceb5c93bced161197ac94fa1d285ed",
+      "sha256": "30394b41af049117cec5ea4974560a58d5b64eed06e34d6e22d30d5a2901870f",
+      "bytes": 203937
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer1/drawer1_top.ply",
+      "git_blob_sha": "582a7c6ea76b2fb8ac2c8dd33ebe08459408d71a",
+      "sha256": "af16749a0b587156d0770d7e3ee0233a9b28d563cfc1df7d12958bb0c10c0317",
+      "bytes": 4477
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer1/drawer1_top_meshlab.ply",
+      "git_blob_sha": "97120dd6c0b7058b30da444c0a10f36e2b1a2414",
+      "sha256": "885627ff84328d428de8445b5671bb204af834a03d7f219138a4a0792feeed25",
+      "bytes": 4638365
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer1_original.ttm",
+      "git_blob_sha": "ce95eb9d06539489d73bb1b0da0955a8fd5f63e0",
+      "sha256": "a25a8afd7f9fe406bd5f0ba6c5b160970f73ee8fd5527de6a17efc639fcc20ed",
+      "bytes": 62237
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2/drawer2.json",
+      "git_blob_sha": "4459adc3cca7b3f7d01bce731dde7d20b6a11058",
+      "sha256": "31fdb143955a1c869ef9f081273304c976e2fe95dee3141bcddc5ec85b3ec71d",
+      "bytes": 1306
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2/drawer2.ttm",
+      "git_blob_sha": "46a46cea46960c9a98b39c8c4e66fc49c8227b85",
+      "sha256": "0814333a109dc331211b932c54f15e56cf1faa229891f0f4f9839820efd14a5b",
+      "bytes": 113125
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2/large_drawer.pkl",
+      "git_blob_sha": "1b24df6ba9d0d15d616ee0bd9861f8d52e660cc1",
+      "sha256": "59fb5a5c618b3fb51060be136fbcb2464e7fd73ef8b8090c940a3deeef0194b6",
+      "bytes": 2264996
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2/large_drawer.ply",
+      "git_blob_sha": "7ed63789f14c6a9205c99b8b3e44a2facdc2aa47",
+      "sha256": "2812161c2bd67aef73a9f8871d2a9c3a374347265668aac8a539f5209430abec",
+      "bytes": 3751
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2/large_drawer_meshlab.ply",
+      "git_blob_sha": "2fed94679979c0c79f57b4e4997c2ed3784fc7bc",
+      "sha256": "42d1a352226dd10d8c63de7c723e59fb08f5a814c604fe32f8124a18de09a35c",
+      "bytes": 4735805
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2/small_drawer.pkl",
+      "git_blob_sha": "c35dbe965641423bdbc0c0914a4171dc6d76a10e",
+      "sha256": "b0160202fbb4c495ccb41cc20a9c3e53f3afdad1ed259ad211372fcbf48e6b3f",
+      "bytes": 2191268
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2/small_drawer.ply",
+      "git_blob_sha": "dfd29f3466b45c141928d6476ca6b181f196cebd",
+      "sha256": "c7eab888a9a6dd32feaac9e3be46eb96be4b8b4e10c2304631a36b8b255d1e31",
+      "bytes": 2476
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2/small_drawer_meshlab.ply",
+      "git_blob_sha": "c073382e6b3fb9d73fc0d3f504037ff1a2ad1ec0",
+      "sha256": "34359489d7532489bc01ffd4553eebb9e69e33848ce6cf4b6a6966a207ac4e7e",
+      "bytes": 4673237
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer2_original.ttm",
+      "git_blob_sha": "b05c9bea1d520c03fbdfc6f7ec6b3156ec18b8ba",
+      "sha256": "46757bd467cb64f1d8f154e5a6c7cbd0735c26ec833a351b5684744f8a3f1224",
+      "bytes": 113169
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer3/drawer3.json",
+      "git_blob_sha": "e021ec7fa6bf348b267d4e847cb5ca10f02110bc",
+      "sha256": "064734ff45e88d35d301e7e20980e1ef634df6de2e2252666e12fd0edcc246dc",
+      "bytes": 1225
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer3/drawer3.ttm",
+      "git_blob_sha": "84451a0bef201ed8cf9b47da0de81a060142b1cd",
+      "sha256": "6dc7befac9663d8552e897cca964d16905c2187d6932980a567d93e893dc2821",
+      "bytes": 105863
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer3/handle.pkl",
+      "git_blob_sha": "34b5b7f22c5297e41bbeac8fd25628d55253121a",
+      "sha256": "c9e47a3e2e21f5431b6bd1af9269523767f1d55928e81d0cf6c3593631f97a7b",
+      "bytes": 2059684
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer3/handle.ply",
+      "git_blob_sha": "3bba83c60176778e62577d90bc8a00e99baa4d2a",
+      "sha256": "be3840185641cd7f1a8e200c32aa772bc141c21daa6adde57e15d8482991b31e",
+      "bytes": 1767
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer3/handle_meshlab.ply",
+      "git_blob_sha": "77d91972f34b425a408737b9eea36739a880a3a1",
+      "sha256": "d870e35e161f9bd543d0a7d8873d79d142ac20a7eb35fdbbc390685e98be77c2",
+      "bytes": 4736309
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/drawer/drawer3_original.ttm",
+      "git_blob_sha": "e4693c30722cba04f58f82adc5cdb9dee41098ab",
+      "sha256": "8a568858277c2a63b01af0ea3ded94c3990de6955f29ae25a48d5d785f34ba93",
+      "bytes": 105847
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge1/fridge1.json",
+      "git_blob_sha": "4f014f805aa374b3955b477bd598f9863d689609",
+      "sha256": "35bd67d2559776aca88aa882c4384caa82415fe5a19c02ed8bf25fbc9e7a1d7e",
+      "bytes": 915
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge1/fridge1.ttm",
+      "git_blob_sha": "c2b84dd48719a95bfbd47018eefcc0a051ee8033",
+      "sha256": "f851314ceec166ad7eef376766a6c912954ed1064663e94b987c6b7fb116a77f",
+      "bytes": 2233889
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge1/fridge1_top_door.pkl",
+      "git_blob_sha": "5eb1b22f31c1635819a1d63f63e7619ad7978dfe",
+      "sha256": "161478b5b655b37f73691d2969bc71934faf7b9f12f22b52861a25b6741bbfc3",
+      "bytes": 4557476
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge1/fridge1_top_door.ply",
+      "git_blob_sha": "02d488a089e2523710eeb885a22d9000e72c8610",
+      "sha256": "f8a18ebf989ab25fb6549eef8246419f04ff44690f95cdfb3aeefb38b9484ad0",
+      "bytes": 759
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge1/fridge1_top_door_meshlab.ply",
+      "git_blob_sha": "f7f0a80b4d75cf9d09c477821755f49beb56a77b",
+      "sha256": "a84b3c2c9cc18859d0bbfb9df67d7f4cd99c29049a334114548833f9303d4f9b",
+      "bytes": 4731245
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge1_original.ttm",
+      "git_blob_sha": "f45c6061af0ae320c1b8b9176009efd67d2f7463",
+      "sha256": "7971f1a82415d1b2ec9fc53ec0322bca309d0d55a70334f759c0ec601439b2fc",
+      "bytes": 2233840
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge2/fridge2.json",
+      "git_blob_sha": "4c92d82b22cfb163cc40e31a525fff4e1eb3ab81",
+      "sha256": "88f2bbae8b8c1feb179ea004fd80dabbe94b179a8579286ad0387136215637ea",
+      "bytes": 655
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge2/fridge2.ttm",
+      "git_blob_sha": "d03de34ccc42080d37a9be39d7ff1a731e7ee075",
+      "sha256": "9c081178710828122b86a499f133f3527ec75f95e765ee6d301b6faaf04af66d",
+      "bytes": 72972
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge2/fridge2_door.pkl",
+      "git_blob_sha": "2264d0115a40c5ecc720dd7f64f455a95bbf8992",
+      "sha256": "4b0a2f3d6820f343bc089d515d0a30980e53d324624048a894f7117989c10702",
+      "bytes": 904612
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge2/fridge2_door.ply",
+      "git_blob_sha": "33ac1d2b2e3640110dae615278c5922505fce8ad",
+      "sha256": "da80f945c9082c1bc290cce89ab8fbcf7675e0e81ad9bfed793c4ab3cb71acab",
+      "bytes": 5147
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge2/fridge2_door_meshlab.ply",
+      "git_blob_sha": "c365d4543c46c810658e529b52a649037b89e582",
+      "sha256": "ab9ac5607731fd13d24416e77bb07372a82d9b8f739f82baf658cb0866050b6a",
+      "bytes": 4234925
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge2_original.ttm",
+      "git_blob_sha": "0c01f8bbed3f5a42f1558b4e5ab89be49803df03",
+      "sha256": "90b15dfb17211429a874cbb87b8e935ff360d0849450beb335c77b2b97935dfe",
+      "bytes": 72979
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge5/fridge5.json",
+      "git_blob_sha": "83a7a4e0635d3baebac64876be8adf8ce28af3ae",
+      "sha256": "e924d12d1c27f22bcc73df5629b2bb72926082facb726d4a042aa8ea4f358bd9",
+      "bytes": 655
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge5/fridge5.ttm",
+      "git_blob_sha": "fa65a10c85ac45c9c0b8753de878268bda1e1250",
+      "sha256": "b18a6b404c614534a1266d88e14ae72ad6cecf8b072784a53ee663ca001a3ead",
+      "bytes": 55575
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge5/fridge5_door.pkl",
+      "git_blob_sha": "02fdd691928479a969d6ff75237a18493628e0b8",
+      "sha256": "db2f121eda41483b6177b28a0dbfa4956a0cd78e1b41784e059c614ba7426e65",
+      "bytes": 3832484
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge5/fridge5_door.ply",
+      "git_blob_sha": "5e4ac25c697f887dbedabc66c49b7d072dd5ec72",
+      "sha256": "751bf52772429ccaf3dc61cc9ed0627bfc59d605c2ba0bacc177e5ca8182d23e",
+      "bytes": 2237
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge5/fridge5_door_meshlab.ply",
+      "git_blob_sha": "1cf6265f2612df8845850947babca5e48a588773",
+      "sha256": "a76aba72b8b3d4c59b900d380c930ead43976b0585bcf563e405d19e3050c87e",
+      "bytes": 4684997
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/fridge/fridge5_original.ttm",
+      "git_blob_sha": "b0bfb2a97e437cccaae8d45de169f37924d8d809",
+      "sha256": "8ff8b1eefbd391efe2aa8cb90ba0d9384c1f50632d80a59dc4aca4029bb232e6",
+      "bytes": 55574
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/grill/grill1/grill1.json",
+      "git_blob_sha": "a279936da61db9ddc9b8da2115b14446255a03fb",
+      "sha256": "063ddcbdd34729b24d54f80932829ca62f1ef9de6e9fff14ed0c08c2e818fcb3",
+      "bytes": 627
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/grill/grill1/grill1.ttm",
+      "git_blob_sha": "8689b8b752a50bf3f78e633af697eb0ec53385dc",
+      "sha256": "e8cb19d0ce9d8802f9f798890acf438dc5ea0caba4835f070683c37a33c50046",
+      "bytes": 2717300
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/grill/grill1/grill1_lid.pkl",
+      "git_blob_sha": "403b07ef6ea634431197a910bb6fe61fc0c568b3",
+      "sha256": "df30b67b3ff726483cf8ca5d3fdcf01b348df1e8094c47558d1c74f58bd8e1b2",
+      "bytes": 1281700
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/grill/grill1/grill1_lid.ply",
+      "git_blob_sha": "0dba6dcfb19962ff1316b37e77aaa73022febd7a",
+      "sha256": "3b93cece77662cbfd5599f6122e76ee5b97395b2bbab6a73db883c5c6811f6bc",
+      "bytes": 7877
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/grill/grill1/grill1_lid_meshlab.ply",
+      "git_blob_sha": "c23542aedac019ece3648e108e1c4ce8536afb8e",
+      "sha256": "ad89ecb69820b1c031196a68af4d583b9e0a87fe5c117c083472bbd3dba6f1eb",
+      "bytes": 4727381
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/grill/grill1_original.ttm",
+      "git_blob_sha": "f4fe100d9d98c64ea1cc56831f0fd79147d0b4ae",
+      "sha256": "4d4eae30701cfea2833e28072e327eef5b9a4f744d7b4ef13a11f6396d49c0c1",
+      "bytes": 2717269
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_a/letter_a.dae",
+      "git_blob_sha": "0b4d39962d257076d1c9d899068bafb329841b60",
+      "sha256": "c37723a73dc2173c4ae2c2b9f57f79f15a3d9b072a37c65f612d2203d1ca3509",
+      "bytes": 9094
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_a/letter_a.json",
+      "git_blob_sha": "62c17b71303da0658e8a2e32cd7263e86a46eb7b",
+      "sha256": "67cab8ede4d1e117f072f692f0c80e77ef8f41ed2122a8512510124ad6bd730c",
+      "bytes": 442
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_a/letter_a.pkl",
+      "git_blob_sha": "1bac9727d68542050d720f1b573b41b5ce480556",
+      "sha256": "f0aa85636a926b43ab70870967863afa59a1d828bd4f8fcf65d85a4d0fd948f6",
+      "bytes": 1499556
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_a/letter_a.ply",
+      "git_blob_sha": "926387347eb73f43dc684ca643917b6793d7df68",
+      "sha256": "40426778382bee37238d2215838464474a12ff1f4f4fabc4586e060ebd63e99d",
+      "bytes": 1671
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_a/letter_a.ttm",
+      "git_blob_sha": "8337e2a22b4e8d9392cda3db444a131167336f79",
+      "sha256": "22508a05c1589db4080da65b889d22f36ad48b19ded017290a965ce1fb088c7d",
+      "bytes": 36394
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_a/letter_a_meshlab.ply",
+      "git_blob_sha": "9f3525b92412814693e34d3f806fa061ddeead19",
+      "sha256": "89bb389a539a48621f9491a189336c03458303ce998bfec75844d524c913524a",
+      "bytes": 2023348
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_g/letter_g.dae",
+      "git_blob_sha": "90ab50f929b94051129cb4ee70f1ea2df9497168",
+      "sha256": "5ef67dce568477cbf36d064ecdee87bb1ed1f5191cedd87947332c64c9970f5a",
+      "bytes": 20309
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_r/letter_r.dae",
+      "git_blob_sha": "4c5002ccd19958212fadc300c29685632c195c2e",
+      "sha256": "1cda98f1b722917db61cb70d520bcf684830a6ed3af507086eefb1d337664ce4",
+      "bytes": 12447
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_r/letter_r.json",
+      "git_blob_sha": "d351a33b5f6f40e483c3b52ae775e338c0a4d987",
+      "sha256": "3998bee58e93bcac6d04209f5faf4f68f52e222796158df91102d3eeb98b9fa6",
+      "bytes": 442
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_r/letter_r.pkl",
+      "git_blob_sha": "e62e6fdae4e89c5f0eb64241cd33834d33a39c68",
+      "sha256": "53aff0b85be2a59286e4d4ad056068ed887c309fbbd4e0cc6a7dc29e00b4689f",
+      "bytes": 1547940
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_r/letter_r.ply",
+      "git_blob_sha": "5127651508446f25b88083ecc6b24eebe5db9f5c",
+      "sha256": "c570ea49b384f312823d57e22d3a7093c4212e9ccaf298240fd9df14f501be0c",
+      "bytes": 2266
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_r/letter_r.ttm",
+      "git_blob_sha": "0352e8cd68024d86be10c5f3ef37a681dafdafc7",
+      "sha256": "63f3249d65508652eb043c4b80f6467f3c31ec66a2f8a6b80207d06ee45c73a6",
+      "bytes": 38675
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_r/letter_r_meshlab.ply",
+      "git_blob_sha": "0746db2d4135e4b246c3f1f615c505d5392a7b11",
+      "sha256": "7bb82037c8a244b475b3e18de81f3be3bbcde9f280fcf7511bf71c0b326f435c",
+      "bytes": 2137396
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_t/letter_t.dae",
+      "git_blob_sha": "eba9bacc7e8dc810e6be1d6cb5ca3750f36c2001",
+      "sha256": "c8f6abcbaf9f149a05c2d7db21400b18e51c4403b7354af726535ef87516e16e",
+      "bytes": 4381
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_t/letter_t.json",
+      "git_blob_sha": "71e2685178eafcb57fea556e198080ec6f82914a",
+      "sha256": "56e8a3e198e8d13d882221026a7ad55f1277b33f8aaadeb6455b1ec8882b014a",
+      "bytes": 442
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_t/letter_t.pkl",
+      "git_blob_sha": "dbb723d522c644e812e12827f588f3fd64c3b285",
+      "sha256": "e3e6b236b15db7ad6fc8eb7e7379ecb9d5e0cedded3653a3a4491440d3a3fc48",
+      "bytes": 1690276
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_t/letter_t.ply",
+      "git_blob_sha": "d9da7afffd777ad11a89dc95f8b674184dc77394",
+      "sha256": "b6f5a3cfe795819dc48d1e1565c192f921b7f0960309e03b6e96e1ee18cd0ded",
+      "bytes": 911
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_t/letter_t.ttm",
+      "git_blob_sha": "d01826b3a6c12763d28ba7dffc9282734ebdfab3",
+      "sha256": "e352a56eee125ef48eaeffd8568a7ee5b8c2fe68be746b889d134b888c11a8f1",
+      "bytes": 32547
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_t/letter_t_meshlab.ply",
+      "git_blob_sha": "2170e9a5be3181a8b1a81cca288943e7ec7b1220",
+      "sha256": "056f555dce5d31ad2389d6c447edc4b8f0932ad73aaa1af38e9d465434b6b5e7",
+      "bytes": 1974028
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_v/letter_v.dae",
+      "git_blob_sha": "821143a272254e3f727b3ca9021670810ff360ae",
+      "sha256": "49ad7b65e91caf23152c0fc72b54acb00cdfc536a272a8838ca0172b2282eb12",
+      "bytes": 6692
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_v/letter_v.json",
+      "git_blob_sha": "947fa9e57763ef3ff3734e21bc3f2da82814fc3e",
+      "sha256": "e66131f3c63ec34f1d69c7c43420c7acfda628a51e4c6b1cc6147442a2e42ab7",
+      "bytes": 441
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_v/letter_v.pkl",
+      "git_blob_sha": "641f5246840601080fc2c56a041f03815d46f98b",
+      "sha256": "4fef3795dfc7b0b81ab52f8bf412d7182858f7adcaa2c25622102b1e74845e22",
+      "bytes": 1658020
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_v/letter_v.ply",
+      "git_blob_sha": "ef238181883ef902292654991f5ec2cffdc70f22",
+      "sha256": "25a6fe722307cc9968a18fb69747c7245c9e4718ac5da9a66467a53abe7e5912",
+      "bytes": 1519
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_v/letter_v.ttm",
+      "git_blob_sha": "1a5827f400b44ce3f92ef4e1e65ae8370d242834",
+      "sha256": "8e7fd995e7c026555b783683e999a2a012d21f9c129a506f77627c62104e9c39",
+      "bytes": 34543
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/letters/letter_v/letter_v_meshlab.ply",
+      "git_blob_sha": "d51d14dd308487860a333deeea8619a2d9ade0d8",
+      "sha256": "aef214c3d6477e4693a0f9bdb5a8f1937858531049301b1b07e3eb997ddb868c",
+      "bytes": 1859716
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave1/microwave1.json",
+      "git_blob_sha": "33b4036d0f8e064359cf17dd20961cecfa9a1fbb",
+      "sha256": "ec70e4653d4612f18f5a58bd1115aa58b0868fa4b9f0a2b474411e4d911d6095",
+      "bytes": 697
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave1/microwave1.ttm",
+      "git_blob_sha": "fa2ed335d3f118bce8a194ae6becacd04577b4af",
+      "sha256": "8eff5da342cc9c373193ec0c14df8ad0e007123913f900cfa5f9fcadc7085500",
+      "bytes": 159564
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave1/microwave1_door.pkl",
+      "git_blob_sha": "749b71d34e66115564bc996dc0ca9dbf1b7541be",
+      "sha256": "bb0085db6fdad49bc9051774b36d2403fa03c84d351a0cc1d180376b64bf0358",
+      "bytes": 902308
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave1/microwave1_door.ply",
+      "git_blob_sha": "0abd45bfc16724666cad00a08cd02dd780fac917",
+      "sha256": "9bbf64aedad2d95b7cfb0d27787bd5a278aaee696219ab8b49cd64939d78dc57",
+      "bytes": 759
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave1/microwave1_door_meshlab.ply",
+      "git_blob_sha": "137cbcd098584097ba8d3e5dd6a06e199a73f3c3",
+      "sha256": "74a20e8414f0ff79453e734a3e977aeef80af54197da8d1d74c93ab26a09eaaa",
+      "bytes": 4609781
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave1_original.ttm",
+      "git_blob_sha": "77a49c1a7e0d078efaa1db5bb7854d1bdcd94cba",
+      "sha256": "16577d5a882b55ba78856cb6327f7273944abc4321c1b6b2ef0dce48414ab652",
+      "bytes": 159575
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave4/microwave4.json",
+      "git_blob_sha": "599367c52bc0f5a945e96fd9e77372ad6db3743b",
+      "sha256": "eaeb5451e3db9b0ed9d61de859330bf4eb2d72427d805f6fe5290063b6f92a94",
+      "bytes": 682
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave4/microwave4.ttm",
+      "git_blob_sha": "d6a52d39d064ef429fff415e9cda1145cb27066a",
+      "sha256": "a63fd9ab69f147db91f87ff3fa09c2f35416375d1c012b64d47ca434c7c25ced",
+      "bytes": 269622
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave4/microwave4_door.pkl",
+      "git_blob_sha": "3d1dc105291abaff55f2727eb05d8c5e7744ca64",
+      "sha256": "0622c7898b06cc5fc9c1bfa2a2e181ae754b3cbcd0f3818c0a5cdc91c035cb7e",
+      "bytes": 1077668
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave4/microwave4_door.ply",
+      "git_blob_sha": "8e4cec528b2150d3e6f266f952ce6d533deb39f0",
+      "sha256": "e15a794c3e0ed1e7b20d499e13ea9e4bd8055e2ce1639636909f6716406d85d5",
+      "bytes": 13811
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave4/microwave4_door_meshlab.ply",
+      "git_blob_sha": "8c1989b7248e69022b31854e4109540c8a24c5c2",
+      "sha256": "d2683a754d10a59170445a79397cf1b716e9b9f23b3fa804fb4ad61a56a62721",
+      "bytes": 3308165
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave4_original.ttm",
+      "git_blob_sha": "aead6282264e0a49ca069cd3c82d7fe7dbaa1c28",
+      "sha256": "4e38268b37de0735e78443b2176bbc8b337244b1223ee00067c8f734d8f32145",
+      "bytes": 269648
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave6/microwave6.json",
+      "git_blob_sha": "84572811f3ea37893254b2606d0ddb19755d73b3",
+      "sha256": "41930b5825b73513e71969ba15f72b59d83f9ba1315dbec37368af90e0335b21",
+      "bytes": 682
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave6/microwave6.ttm",
+      "git_blob_sha": "cd051c9893b41d94e51352278e67dc7af01324e1",
+      "sha256": "84d7225b0768ee8287335b2f3cde3a79563d182c3282223b955487bbcaf1e0cf",
+      "bytes": 388622
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave6/microwave6_door.pkl",
+      "git_blob_sha": "b90aae2b3be26de6b494ec7358d94a94d50c5678",
+      "sha256": "056d5e6a1b39cd7217edc505aeea0ad41cfd3f21bc227f3d6b2cd16b7848764e",
+      "bytes": 847524
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave6/microwave6_door.ply",
+      "git_blob_sha": "932eec2013ff3a4dba3282d285d6cfa2df3f5983",
+      "sha256": "9d16779978ec8af4acd6d7aed0a4b25f596b83b48b1a9e7711904bf2347bb241",
+      "bytes": 1101
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave6/microwave6_door_meshlab.ply",
+      "git_blob_sha": "17ca796a4d6f31cceb8e682cf1071be3ecf10591",
+      "sha256": "2acb69b255d8bd7fabcc5e7d26c1a0895c5b828961b89ca9bc51b583a37ca93e",
+      "bytes": 4523333
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/microwave/microwave6_original.ttm",
+      "git_blob_sha": "a32f9f2403f772af2e3e5772ad98d47168bcae90",
+      "sha256": "a675f5e492f6c65c278ad1133df23e4108f6715fb88b6d1090c848d1c1b3570d",
+      "bytes": 388626
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/moon/moon_normal/moon_normal.json",
+      "git_blob_sha": "2cdb8d2ee665f26848aefe4ab908e467eb3288a1",
+      "sha256": "dff2e83218cabf5afb2bf1aea571df7be3144768a283c0e87e170e4f5a944eb9",
+      "bytes": 391
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/moon/moon_normal/moon_normal.pkl",
+      "git_blob_sha": "3d79b1f1441e0281991a5c1935fa086bf2f5b294",
+      "sha256": "591845ff9ff786238d2635be096171df339051be84dd2322c216b73e06644e4a",
+      "bytes": 1783713
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/moon/moon_normal/moon_normal.ply",
+      "git_blob_sha": "adc1a28cad7c895643e694579862730be741f183",
+      "sha256": "268a89330c89540c1fdd7bd97a39b5056a1d84b4c9139f752d7dd3973322eded",
+      "bytes": 3939
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/moon/moon_normal/moon_normal.ttm",
+      "git_blob_sha": "441359e23576df37b8c5a50ae728f2fb634e8821",
+      "sha256": "aa26608f5d8a1f4ef456b194e8f368af73844215e338507e283032cf8af9e48d",
+      "bytes": 63625
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/moon/moon_normal/moon_normal_meshlab.ply",
+      "git_blob_sha": "b5c8217103ca248c153b11191e359d7b85b447ae",
+      "sha256": "06bbc2e1b283625a1c5cf810a4653fa6ca6e5538b4144df5750769c97c6502f4",
+      "bytes": 1227940
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug1/mug1.json",
+      "git_blob_sha": "25e317502d653551d369bf8122366c6090375b01",
+      "sha256": "794a43ffcdcef6024da3b2665533059cf11e5d74e8ccd1568fd70f3b74e2db79",
+      "bytes": 374
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug1/mug1.pkl",
+      "git_blob_sha": "5623876a0183283cd3103e8d0030ef027f979ca6",
+      "sha256": "38ec1139d24df68337ab9b28c407ced49dfd7fe97a1442b8a93fcb01eb1e7e1f",
+      "bytes": 248484
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug1/mug1.ply",
+      "git_blob_sha": "02de1ac3049df016c95c3e5282a313b9dd075a27",
+      "sha256": "cf4978ccfacf7b698d5827e78ea2eba8f35013ff92eb08eadc26c5f7e6e383d4",
+      "bytes": 12481
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug1/mug1.ttm",
+      "git_blob_sha": "b3fd160c749fb20b92857e2c362dbae20f73c925",
+      "sha256": "c3abe8c8eb9e4d596929c89d3bf2d77682afcd6eb7e782f67bf9f88effb39ab8",
+      "bytes": 101520
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug1/mug1_meshlab.ply",
+      "git_blob_sha": "016c820a58d518d886380052a3cf5211b8a4845c",
+      "sha256": "86c0d82275e4a07006d58f59d643daad48e886ab2e19634a298921d5d912b713",
+      "bytes": 4427645
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug1_original.ttm",
+      "git_blob_sha": "e4527436490e8f0181019ccfc79e65f3da4b3a4b",
+      "sha256": "b1f00be608a4500a555572e5354d5c8039cef4425c65a06f1a6080df9bfa0235",
+      "bytes": 101497
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug2/mug2.json",
+      "git_blob_sha": "848065e630dbe1b06475fb8b695d183400df75cf",
+      "sha256": "f096cde739a3d18ed1c982baadc5eeb950ec6d0672c737af6572eec4fa9aa601",
+      "bytes": 368
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug2/mug2.pkl",
+      "git_blob_sha": "e0b9052ae972825482db2e5e5c5dab21b4e38ba6",
+      "sha256": "68cf64634782b0c31d513a649a51498fcd8ebebea9140f34347c220f36b70190",
+      "bytes": 218788
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug2/mug2.ply",
+      "git_blob_sha": "176df56e12108ae1816c104b9ea16ef519baa890",
+      "sha256": "3cfdf9abd7de3715d4b95275792bf4e96f6e382dd3fcc6e1ca9c29185cfb30cd",
+      "bytes": 20902
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug2/mug2.ttm",
+      "git_blob_sha": "df59d288573964b95e901a8148eff9fc91c50c2c",
+      "sha256": "4393b7c8f3b342a8a20d40180f04e765b370d3534e18e1381dc05691e8157875",
+      "bytes": 140670
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug2/mug2_meshlab.ply",
+      "git_blob_sha": "a10078e6416bac63b0b9b8c9ce9b93324a1537e7",
+      "sha256": "e8e5d8153c85a8222513ca194ce40f3d2a59139cc5d4ba7b35840ea8d8f23b33",
+      "bytes": 4291613
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug2_original.ttm",
+      "git_blob_sha": "f42f4caf9b116210f4af62fe14f3b7012be07455",
+      "sha256": "7ae896b3a0436271bea4ac6a7021a43414403438c26d74c66549ae63fe0d4f9e",
+      "bytes": 140636
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug3/mug3.json",
+      "git_blob_sha": "9a2a6545ae8006e7f13de04fd38db453e8a90b77",
+      "sha256": "9ffc77a9b0bfc094419cbddf380cd4cf95263a88b6a3d19e225719da7b386fd7",
+      "bytes": 368
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug3/mug3.pkl",
+      "git_blob_sha": "a553fb6d478c9e013caf1269e75fc6a4c6131d4b",
+      "sha256": "b1886afa401e094edb25ff4703e6c6c94834679f66e728a978fd0af69694a4fe",
+      "bytes": 73380
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug3/mug3.ply",
+      "git_blob_sha": "ddc568cc1779eb74ba981851897828feae316e37",
+      "sha256": "e98095acbe2b760bc63776d38f45091d95e25d2cdd23c5ef879d94b872585267",
+      "bytes": 10125
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug3/mug3.ttm",
+      "git_blob_sha": "09786de18b1a32692f02115ffe37550427c6643b",
+      "sha256": "5bafa750ba6ce5f3a18d00ae458ad47581ae8a6c5b65507c4a25d7caa2da5b61",
+      "bytes": 77744
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug3/mug3_meshlab.ply",
+      "git_blob_sha": "9cae766e6e1d8126ac702347d50b10bec4420f8a",
+      "sha256": "7bdbd3d3b729bd5530288fecbd49642cae007d57fabb7c8cb4517718ce8daef0",
+      "bytes": 4375565
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug3_original.ttm",
+      "git_blob_sha": "036ff2cfa281da56fdc6359bdcfa77fa9c10fc50",
+      "sha256": "fe792c452ecbebc6ebf7a8ffb8315cd08e48788ec856d8e6a631733bb91f3c5e",
+      "bytes": 77706
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug4/mug4.json",
+      "git_blob_sha": "58400ee9741d4467e437b57e4fbe53e8716011c0",
+      "sha256": "b3113abe3d0b2cb25bb3dabe523e5a4b742371172083503b8f397c158d478403",
+      "bytes": 368
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug4/mug4.pkl",
+      "git_blob_sha": "b7f2d1c3d9e9884b1fa5f6c3c0c93b84538a3717",
+      "sha256": "e32828c5dc667eca874b5d4cb46d7c3e66172e913cb07087239206e219d78897",
+      "bytes": 238500
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug4/mug4.ply",
+      "git_blob_sha": "3220c76eecddb0d0f4deb4a480b8f1f5655a3664",
+      "sha256": "0a762ae5d2be0c6adb33d684b55c0d394d4f5a2ab0e618f57a35fbbb278c11dd",
+      "bytes": 49127
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug4/mug4.ttm",
+      "git_blob_sha": "c152a68dbc7ea79e577fbdcae3f27a567155e3a7",
+      "sha256": "c165cc6047fc50e59561a2c69c0a832a04710fca42678cbbca53c4844c242e1d",
+      "bytes": 284959
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug4/mug4_meshlab.ply",
+      "git_blob_sha": "33de54f60236f984bcb58ea4ac3f0b146fb15e09",
+      "sha256": "b9b1e225d11cf96a09636d61c010036cad43a59acfb3379b394b60977f7d4442",
+      "bytes": 4383029
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug4_original.ttm",
+      "git_blob_sha": "049414e0ff1d812167c53f69b1e3e8dac4a189a7",
+      "sha256": "381cff5ff6c8df704f866add0d6f7f0a7e129100bbb66b84bcc94b9c34ccba08",
+      "bytes": 284922
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug5/mug5.json",
+      "git_blob_sha": "20fe14909bd00fdd00adf299a5833c651631b2b8",
+      "sha256": "4d828a2b76715f8682ec528a85536241c5d2c67ffc3e8a18d8faec2f6028364c",
+      "bytes": 368
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug5/mug5.pkl",
+      "git_blob_sha": "b96c0a0e75f3c2767d131d0bd74c1076fb0b6cd5",
+      "sha256": "1caf70290aab3503ce0eaf4c1ae060e114330244a50bc51283302afa718337fb",
+      "bytes": 224420
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug5/mug5.ply",
+      "git_blob_sha": "97da6b5fffa0dddb989f2e728d92d3ff667d1476",
+      "sha256": "2a6eaf64e687a8076b950d3e98d3246d7be5575d6675a2caf49eece73bf2b3c7",
+      "bytes": 16731
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug5/mug5.ttm",
+      "git_blob_sha": "5fa9f3cf5dd9fee91bee5d1b856e54f66b0861f9",
+      "sha256": "70032470d0c06319c1573a7233820a7a8677d28df02510da981ee5d24f09e8d0",
+      "bytes": 188844
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug5/mug5_meshlab.ply",
+      "git_blob_sha": "ddeb576619ed00a218aba5007b7387c77aae6900",
+      "sha256": "2f797dbbaaa3bc9ef185d586c956791155435bfd1126c224f8b62f582b9a122f",
+      "bytes": 3450773
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug5_original.ttm",
+      "git_blob_sha": "6614b917571590a70100d015ad1545ec3001abe6",
+      "sha256": "f80b0fda34822ccf3b20abd0ef4a4e30f36cca10a8280ed7d50855a9c98336cc",
+      "bytes": 188820
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug6/mug6.json",
+      "git_blob_sha": "ef657a3f573b843845a7cc594f60d3c9809d9c37",
+      "sha256": "acf8339cd1b31dc99fc99b4e240d92eaa17a72b7eb2c0ae675bea1d59b645a58",
+      "bytes": 368
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug6/mug6.pkl",
+      "git_blob_sha": "8e6ac81308a87e81cfaffc8adfe04446d5d41a89",
+      "sha256": "18ab5958d5b3c9ebce2f08c6f9cea74a72abed6a0b03ce01d18460771bc941b5",
+      "bytes": 129700
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug6/mug6.ply",
+      "git_blob_sha": "909e9e55cbb0c46f02befa3bc4a87858eb33fc92",
+      "sha256": "d2ec0fe279f7d52c08b9a1d1b4c2a60d7a584daefd15a49fb562a45d912948e2",
+      "bytes": 9803
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug6/mug6.ttm",
+      "git_blob_sha": "afb1abaf20a14240bfac694384afb952bff7438c",
+      "sha256": "44583e3ead8afb9a5a6bfe74fb4e346e202bab34f48565e6be602818d929a851",
+      "bytes": 93643
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug6/mug6_meshlab.ply",
+      "git_blob_sha": "bcd74ccba2d353339546b5216b697a76f2c8e414",
+      "sha256": "5cb33fc6ed040e9c8eca126f068d83e847d2466b9056761fa5f0ae3c09748206",
+      "bytes": 4115813
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/mug/mug6_original.ttm",
+      "git_blob_sha": "5b2cbda7f9c61dbf656bdb5bd5e076572f523873",
+      "sha256": "9b541b80558e404caf3d8332e2d4275dacae7483e55cbbe3f66f0f9844eee10a",
+      "bytes": 93606
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/pencil/pencil1/pencil1.json",
+      "git_blob_sha": "70ba46dac18f9a2e5b1a5098474390985a3fface",
+      "sha256": "0b03e8ca53af1598ba567fca1bcf86cd7a0ab102e7fa94c2a4e287f3c86230ec",
+      "bytes": 386
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/pencil/pencil1/pencil1.pkl",
+      "git_blob_sha": "743aabcd5d3f3a421e66791feb037be44a3cc807",
+      "sha256": "5c971d5e3d1c3d62e0446cd1c7a367f6363600b078fa8cd5166f5bcd90a0cd47",
+      "bytes": 4255137
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/pencil/pencil1/pencil1.ply",
+      "git_blob_sha": "3dfc163106522a3225dcde882d0fab3a6505b6d7",
+      "sha256": "3bc1e005463ad23cf326a7a92931c6c30c3a43555eb45ac5bfdff4802ca1e818",
+      "bytes": 2027
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/pencil/pencil1/pencil1.ttm",
+      "git_blob_sha": "b239692e6a823835e5c195e88075315b42de43ef",
+      "sha256": "41fb49d143bc10cdedea1f39288de3a1781a985dbd49542071c7e9a1f330a5ef",
+      "bytes": 35115
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/pencil/pencil1/pencil1_meshlab.ply",
+      "git_blob_sha": "af8bb277c3b26264b4138fc928b50272bb4649fa",
+      "sha256": "558fe912725f84512d000d9196412eed551dbfc5a44b445f50885272647b887d",
+      "bytes": 866572
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/pencil/pencil1_original.ttm",
+      "git_blob_sha": "95f9f48feddab445e61fcefcc03914c694ce069a",
+      "sha256": "bcc8a1b339a9f889f4ec06100c74276dd4896743fd687a996b2c58c896e1e3be",
+      "bytes": 35066
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/save_model.py",
+      "git_blob_sha": "7a3bff65eecf44ac60878b59710973bb436fe060",
+      "sha256": "eaac5821c9d093e2014797f00ebf5c108c66f771bf5dc9e90ad31336a35990e5",
+      "bytes": 23435
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/sorter.ttm",
+      "git_blob_sha": "089e102527175fcfbafa11ea22b337c075f84b06",
+      "sha256": "1271ad44714c2c56ce8439ca425e87f4dff6fa41210baa5ea72103a44464a5b2",
+      "bytes": 97909
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/star/star_normal/star_normal.json",
+      "git_blob_sha": "4a200582886c429e6700f6a2f41c31855c7aa987",
+      "sha256": "5934226570445ef70b210830a2a4dc620aefa96a5f01f3c69531934de543ca8f",
+      "bytes": 391
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/star/star_normal/star_normal.pkl",
+      "git_blob_sha": "201fefb2a5f6f63854a76e5d54c1a145e657cee5",
+      "sha256": "24a53b55c2b85014fe8848d31f412f5b7faf4d4ea2e16ee4dbc489e124c7907b",
+      "bytes": 688289
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/star/star_normal/star_normal.ply",
+      "git_blob_sha": "03af8dfeecc736cdddc4604d5d764afc233ced74",
+      "sha256": "bc653280265b8edea7484bf02b64eed3e36b7feb54694a6fd925bbe788b1cdaf",
+      "bytes": 1553
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/star/star_normal/star_normal.ttm",
+      "git_blob_sha": "e9986582997214d869d8ec270a2e8eeb79c666ef",
+      "sha256": "89c7fa882560ede2078b1fc435874e5a96201864be9b1b6eb1feb2f2619c1876",
+      "bytes": 53038
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/star/star_normal/star_normal_meshlab.ply",
+      "git_blob_sha": "b76a3cc0c5bc6c5cb5d765109468596be39b5552",
+      "sha256": "fa6bc09abdef0b681e262fa4832b05b4084ccd8603af2ebd7a25efc82d51eed7",
+      "bytes": 1321588
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/triangular/triangular_normal/triangular_normal.json",
+      "git_blob_sha": "3b88e5cc35ecd17f8c8566587b4d727131a973d3",
+      "sha256": "c37d2318494cc8f25666ebc4be52268ee34c26fffac6c958e4fdc7c0f66ed5fc",
+      "bytes": 440
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/triangular/triangular_normal/triangular_normal.pkl",
+      "git_blob_sha": "8a6e8667d029b0b93681457da1c1fc3322c072bf",
+      "sha256": "97dac14c47bfecb128a555e8a08c2732e2f7d4eb32c7871b02c933c3969143d5",
+      "bytes": 1604001
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/triangular/triangular_normal/triangular_normal.ply",
+      "git_blob_sha": "90fb110ac6a7551a1b94e199d6f1d739ac67648d",
+      "sha256": "a7442a3485a712441a59903bdd5d34268f5ad7a0b0c15a56aacafefbf4412b61",
+      "bytes": 429
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/triangular/triangular_normal/triangular_normal.ttm",
+      "git_blob_sha": "d733a3235ac152b086f8e8859041d3d50bcd0e82",
+      "sha256": "17a8a42eb3d28a749247b17c822c826730ceb6b7625065693279bda2296729fd",
+      "bytes": 28710
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/triangular/triangular_normal/triangular_normal_meshlab.ply",
+      "git_blob_sha": "52b3d38cab6c705b24135c12b9264850830ff212",
+      "sha256": "2a1efadac97307f653524babe9656b788365349bf6df0156a7def9d16296fc82",
+      "bytes": 764164
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/wiper/sponge/sponge.json",
+      "git_blob_sha": "65be75acddea7841914b7a75a8840e135032f145",
+      "sha256": "1703606f939940942f0ad80fe9c376613d78527d5b739cee7302eb06673796af",
+      "bytes": 381
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/wiper/sponge/sponge.pkl",
+      "git_blob_sha": "f965e1fdad00517ea73bf38a819ab4ad3bd2f8a1",
+      "sha256": "a225db86e2f451f41b08c42d6ddfcd6579f662551b7d2e4bd0cad7944f1aea19",
+      "bytes": 2291620
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/wiper/sponge/sponge.ply",
+      "git_blob_sha": "d6112ba62841032e1940770ff5bfd3b7736802ee",
+      "sha256": "365c1e3ca78962b9773096dbcfd5051cc713011a7bb9d061866b05214768ac1e",
+      "bytes": 506
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/wiper/sponge/sponge.ttm",
+      "git_blob_sha": "1d19c2895b294951242550d2c3358f823f03fa27",
+      "sha256": "aafd4c0d676939a3c0234a6eefebbf1ec045c01611bcf7182668fdea265d5171",
+      "bytes": 35788
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/wiper/sponge/sponge_meshlab.ply",
+      "git_blob_sha": "82ef668447e0dc71369770cd485b2f789bc3d0a9",
+      "sha256": "e463896902cf6c764e7e586f4638020ac8f1e00a997c5b8448368159fa6b94e8",
+      "bytes": 2261308
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/object_models/wiper/sponge_original.ttm",
+      "git_blob_sha": "30dbfc737f4bfafaea6513b8b1f137b555401e6e",
+      "sha256": "b5d84bc5319b63f4ff67d20fca9c55fec92c4674c52d0542579740e0af478efc",
+      "bytes": 35741
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/scripts/VLDataloader.py",
+      "git_blob_sha": "c1cf60fd752578302740c87d871303d48bd99244",
+      "sha256": "06d1837a42939d6bf2d113211e18d14e3dafaf863c961e90cd07357c6473f7e4",
+      "bytes": 16225
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/scripts/cliport_test.py",
+      "git_blob_sha": "b3702be6254d7452d10101e9f16a24bb4bed2a5d",
+      "sha256": "1efe01d9d2bebd656f5ed4606f438dfaf6c5cafee63169601c6e8c9e65c30830",
+      "bytes": 18962
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/scripts/eval_sampler.py",
+      "git_blob_sha": "8dda230655ea47a2222d59923c6308e93ef4660c",
+      "sha256": "7468b93eec0c9e3402272c3000b2e4de3f5ecf7b15e08453eb8849c2034ef3db",
+      "bytes": 4911
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/scripts/train_baselines.py",
+      "git_blob_sha": "07b92b4b31685b6ff04b4505cf492184ed81dc47",
+      "sha256": "21df87cc0641248035e34c431db1a890ac85e96dddfca33dcc7037b90674de6a",
+      "bytes": 22117
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/task_ttms/drop_pen.ttm",
+      "git_blob_sha": "895b71adc064747b021ccdfbdb12b0e03f996288",
+      "sha256": "24b6fda057ea8b42e68fa58d3940cd5567c268815612cbe1f7fb0a0a3e4ea8b7",
+      "bytes": 22802
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/task_ttms/open_door.ttm",
+      "git_blob_sha": "a2b21301f162c60a2f2cca6f3911e56dc54500ef",
+      "sha256": "05a495657a997f02e700b8fab2fd75be39b7ac4c09a9f4a7714ce8ebcde27891",
+      "bytes": 26384
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/task_ttms/open_drawer.ttm",
+      "git_blob_sha": "6a5e5795501306fde3a26d86079234eec49437b4",
+      "sha256": "bd2a17900e69cd5f9a740fba3065c14d14155a241f4d14ab39e0f4a7bff9c676",
+      "bytes": 26378
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/task_ttms/pick_cube.ttm",
+      "git_blob_sha": "c5f5e06b2aa080854a72c02a26f2758fb24e0a69",
+      "sha256": "ac1c411f56c107440057b41b9ec1d63d8f9210a9c181bac57ba02e0a3e9cb792",
+      "bytes": 42927
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/task_ttms/place_into_shape_sorter.ttm",
+      "git_blob_sha": "2038fe8c2926dc425a71856d5d22bfdad63fb1f7",
+      "sha256": "70b846a4f02cdc067d597ad1904a188d99e9c37f5485ce3a78c8d488dc17230c",
+      "bytes": 97977
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/task_ttms/pour_demo.ttm",
+      "git_blob_sha": "30c97dc79f00b4f94bc939a1e20432c2b7d26c92",
+      "sha256": "4f54d05f8af16fe91d8477b4f9ce2f9d9cd82cf62037b31aee0197f86d897804",
+      "bytes": 22814
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/task_ttms/stack_cubes.ttm",
+      "git_blob_sha": "6f349eb3dd0ce6dd218fe04c53c37ee4c618d045",
+      "sha256": "6702ad38bd11e9416f1a023cc0bfdbf5fa260a0dd4e64f0394c9ed736560ffac",
+      "bytes": 17335
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/task_ttms/wipe_table.ttm",
+      "git_blob_sha": "18a2b7e8118ed9f2fd7f19bd326e14c0698e9067",
+      "sha256": "520b27a54724a10e5a25c09d7eec1b1de1af0e80cf887bf669dc93831c9c2e5a",
+      "bytes": 25111
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/drop_pen.py",
+      "git_blob_sha": "002eed58d62f4e9746dfd40abe61a947a5699641",
+      "sha256": "6a0668ea773b942cee382839980cdbc699e942109b2ab70468e51ca4d9c42501",
+      "bytes": 6853
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/drop_pen_color.py",
+      "git_blob_sha": "5a05f37a2439cbef65b79ebd759b8a4cdb49e30e",
+      "sha256": "529234cc8f1b8dc7948715ced1e70cfce41e131aa135c0cf3f963c43b8c7d4dd",
+      "bytes": 1299
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/drop_pen_relative.py",
+      "git_blob_sha": "e2f523606b5d9808b4eed2eb28e36e8662281702",
+      "sha256": "a71a9ba093999369e6c702a75f36f0e2c3689810c4bfbfe024608b5e9f370e35",
+      "bytes": 2308
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/drop_pen_size.py",
+      "git_blob_sha": "83e5272cf3c188b35b97274ed1ad151af616ec1e",
+      "sha256": "4ed41c49b34c7ce821d33cae972678eba7665957ffbf5c431ef3115bd6e8e2a2",
+      "bytes": 2777
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/open_door.py",
+      "git_blob_sha": "f7208d9b3d912278a6f0c66e22902f71ef85c9c1",
+      "sha256": "04bfc75d407d9d8c78545f9ef1161acae5d63a4805d4ecb66b38e928d0737207",
+      "bytes": 6033
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/open_door_complex.py",
+      "git_blob_sha": "22a31a81f8fdc23b97ebb48e1d90fe5ed65384d0",
+      "sha256": "cabd335eeab9d25935db69dfb6a1d985d666a77274333660b9640aa0b37e75fa",
+      "bytes": 6531
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/open_drawer.py",
+      "git_blob_sha": "fb1364a76d331cf8deae2213b787c0a451f54613",
+      "sha256": "75fd8081f4c6b075c32a89ea9f276b68c694f0cb38206f4909e963f26e0f530b",
+      "bytes": 6002
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/open_drawer_cabinet.py",
+      "git_blob_sha": "a0760ffdded19cd4755ae47054c318a78210e3e9",
+      "sha256": "5b496f1089345f4a5be4809a666a3fe2924bca01e3aa0780a23c1740b3b1fc9a",
+      "bytes": 810
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pick_cube.py",
+      "git_blob_sha": "158df5354f56285314cf8c0a4a766ba6f96049e0",
+      "sha256": "2024c2c8514c39fef855f771f24dcf718aae8515c387c54988dad578ccbe7b18",
+      "bytes": 4900
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pick_cube_color.py",
+      "git_blob_sha": "8ba23d934ad26fac037b95fae960946001394592",
+      "sha256": "5f34d63639c880f2a83d17e04ffcf239ee6e8d7d45558a76adafc01a7a6d4d52",
+      "bytes": 1697
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pick_cube_relative.py",
+      "git_blob_sha": "e582c930845cb5fd1ce32ea8fd02ff9f9bb888bd",
+      "sha256": "ffafc2b21dc84e86b6fa9971091cc9b532a40893f7fdcaa855295861de2879c1",
+      "bytes": 2713
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pick_cube_shape.py",
+      "git_blob_sha": "7702f246125da7d4d7f1a820e95ff31b780e078e",
+      "sha256": "016aae118c7d9cebabdd14202565e2bd08541e074b662e89373b5d2538294a20",
+      "bytes": 2267
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pick_cube_size.py",
+      "git_blob_sha": "5ec249796f55cf02b9c745477d4107b7872f5f4d",
+      "sha256": "0ddba5956932f18c61a51d882e2e359567b81abad1151b0394ab23537c6d0b47",
+      "bytes": 2791
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/place_into_shape_sorter.py",
+      "git_blob_sha": "5ead6154c45916cb6f1886fc50eda7198fb81495",
+      "sha256": "9073789aabd5e0d95c8c4921ea27422201fce90e736d856e755e5fec6462da19",
+      "bytes": 6370
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/place_into_shape_sorter_color.py",
+      "git_blob_sha": "a3395e8ec8293e21f321658d754da66795d00597",
+      "sha256": "13be84ffc543ae973d080e531d1713a7489355739f168b1fcd4dcd89dfc21dc9",
+      "bytes": 1092
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/place_into_shape_sorter_relative.py",
+      "git_blob_sha": "8d4297ccf68aa46b50091145ade717f5065737be",
+      "sha256": "c89709f12b98f3a74e1a11ee55d37a31d7b1c1db7d8c5597b44b03b06b01d183",
+      "bytes": 2459
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/place_into_shape_sorter_shape.py",
+      "git_blob_sha": "a47c6c4653928e54ff034478847b01f2c76abce6",
+      "sha256": "cd339cca1c6629f44856200aba8f30ea0ee9c3d008a4d9d2428071fda7e05ebd",
+      "bytes": 1230
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pour_demo.py",
+      "git_blob_sha": "b7cca70cf2ec019f7abf80726e356514ce2ba0b0",
+      "sha256": "287716d485ae98bf3406b544043e843c4730e49b5866a995f635c94f66dbf4ee",
+      "bytes": 12271
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pour_demo_color.py",
+      "git_blob_sha": "0db6ab7ee6ebc62791770f09eb2d3798c07e09ff",
+      "sha256": "4978227f35a63d2a6681ea4cd2c5a403c764ec6d5c12ab2f596d49f24702c8fc",
+      "bytes": 939
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pour_demo_relative.py",
+      "git_blob_sha": "693cc7cca4859bdaaaf2e8ad959e8621a10d26fb",
+      "sha256": "086f9790bd9fb3bc54b4529a87e8fcaf93264c3e3476bd421512fb5359dd4b7e",
+      "bytes": 1893
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/pour_demo_size.py",
+      "git_blob_sha": "699b2468142ee968eaf9bf7fc77495867b2c7bcc",
+      "sha256": "bed8e312a1b68c154acde1cd8cbc00cab5091e233ece12c3bd1f2706ba74cc28",
+      "bytes": 2080
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/stack_cubes.py",
+      "git_blob_sha": "90694174922159d285c82de895e6aed316d99fe2",
+      "sha256": "dbf303e4226102b05b0aaf095310e133fd62e9da27a5677ed1d8cff09de77a13",
+      "bytes": 6735
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/stack_cubes_color.py",
+      "git_blob_sha": "35102df80847ba0a9906a229c50e4736c24d621f",
+      "sha256": "20102332788ffa22890e721814d8298352bcacc0d8567a39df30f66a96c0902d",
+      "bytes": 1857
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/stack_cubes_relative.py",
+      "git_blob_sha": "e926f7e86e3d742ff6732303ad5129f27d5b2435",
+      "sha256": "29fe3a954d73838e1e7e682177351c63f5740ee9356522713c45cd24e5f287a3",
+      "bytes": 2884
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/stack_cubes_shape.py",
+      "git_blob_sha": "a0c94f0b6238d0ae0a9bdfc631ae47794d1d0c34",
+      "sha256": "2939f26d0446805086df8226e7a314ce5098cb5b70e67998c055107f296994b3",
+      "bytes": 3259
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/stack_cubes_size.py",
+      "git_blob_sha": "931c2e04ef6c8f3e11cc33842a20640de148921c",
+      "sha256": "d9535345f0f6b3d5c3b5e4dfc691efc7109d5be19c8748a13dfe967d42dee6e8",
+      "bytes": 3702
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/wipe_table.py",
+      "git_blob_sha": "8b72d6734c984da42ac3d1120c11f9fcc3a32120",
+      "sha256": "76a396884aef3d13e23f020b5e4fed0bdcdcf825fd838f1ca79c638230a06012",
+      "bytes": 10226
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/wipe_table_color.py",
+      "git_blob_sha": "8407956b6701560ddc24342e32fe897230afd267",
+      "sha256": "59d50d58c74ee04e805db1f236b65fa9073627e7c9bf2ced876234067ad380e7",
+      "bytes": 797
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/wipe_table_direction.py",
+      "git_blob_sha": "5ab9b32aeb75102b9c8f7e76339e155b4c982890",
+      "sha256": "82be1d8d6c54aba5a3db846c30b448205ce8a22bfe63da7f00a82336af3c0909",
+      "bytes": 3518
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/wipe_table_relative.py",
+      "git_blob_sha": "581515e9f6586fabf4a4b7455fd47d2d9a4c5d4d",
+      "sha256": "b7df7d4ca654077386ccc4787a35f8cf79c6fee56e37b749bbab96cf26632ac8",
+      "bytes": 1578
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/wipe_table_shape.py",
+      "git_blob_sha": "5e00e2db85a531d0e142c38ca8321d89fc08b049",
+      "sha256": "38a78233afa319d5faec0878c0841ff05b529606819b3898936e834a9368e06b",
+      "bytes": 1459
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/vlm/tasks/wipe_table_size.py",
+      "git_blob_sha": "9ba94fb7f90fe36cd18c0e81b9d9cb70f8bbf75c",
+      "sha256": "368dd97c7c7812e72b01cb0588f6490e4397bfb36e02d581145803be179ecfda",
+      "bytes": 1402
+    },
+    {
+      "path": "embodiedbench/evaluator/config/eb_manipulation_example.py",
+      "git_blob_sha": "7745e18ab123c0c70e6660e1836eb4318f41c07e",
+      "sha256": "c27e36bad4f4b5c63e9ce4da1ba1f83b65b83792a0fb013a438f31dee011ecc8",
+      "bytes": 44395
+    },
+    {
+      "path": "embodiedbench/evaluator/config/system_prompts.py",
+      "git_blob_sha": "ec21f4c8f41229cbdcc5a64519100d6206cbd24e",
+      "sha256": "b42deeb6a9cd868bc7883668caa68599ae5c0d65af86456cc17b434e86ded86a",
+      "bytes": 8169
+    },
+    {
+      "path": "embodiedbench/planner/manip_planner.py",
+      "git_blob_sha": "527ef6e60985fda613d5efaca2b2092c5da0eaca",
+      "sha256": "1cb4ec95725ff15aec75fe540af93baeb86c1f81678e461b83d922bed88c272a",
+      "bytes": 22336
+    },
+    {
+      "path": "embodiedbench/planner/planner_utils.py",
+      "git_blob_sha": "d684bac4f66ebea46a4a1b7f66a1aa87f5ca0614",
+      "sha256": "17939735839f7bd74a3a631682ff9b6eab6ad6a46d5453bc98505ed7ffe38996",
+      "bytes": 13952
+    }
+  ]
+}

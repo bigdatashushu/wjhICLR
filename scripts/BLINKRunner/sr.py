@@ -98,6 +98,11 @@ def check(data_root, splits, config_path=CONFIG, prepared_root=None, sample_ids=
         if len(set(sample_ids)) != len(sample_ids) or set(sample_ids) - set(by_id):
             raise ValueError("sr_selected_input_identity_mismatch")
         items = [by_id[sample_id] for sample_id in sample_ids]
+    return inspect_inputs(manifest, items, config_path, prepared_root)
+
+
+def inspect_inputs(manifest, items, config_path=CONFIG, prepared_root=None):
+    """Inspect public problems while retaining their frozen absolute image paths."""
     profile, config, client = configuration(config_path)
     skill = SKILL.read_text(encoding="utf-8")
     raw_precomputer = SmallImagePrecomputer()

@@ -1,0 +1,126 @@
+{
+  "active_by_question_type": {
+    "obj_appearance_order": "S07@1.1.0",
+    "object_abs_distance": "S02@1.1.0",
+    "object_counting": "S01@1.1.0",
+    "object_rel_direction": "S06@1.1.0",
+    "object_rel_distance": "S03@1.1.0",
+    "object_size_estimation": "S04@1.1.0",
+    "room_size_estimation": "S05@1.1.0",
+    "route_planning": "S08@1.1.0"
+  },
+  "entries": {
+    "S01@1.1.0": {
+      "candidate_type": "skill",
+      "content_sha256": "71d271244353424584240def82807678ad7bced0fb1b72c535debf21422ab249",
+      "created_by": "format_migration",
+      "format": "skill-md/v11",
+      "parent_version": null,
+      "question_type": "object_counting",
+      "skill_id": "S01",
+      "source_ref": "versions/S01/1.1.0/count-scene-objects/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    "S02@1.1.0": {
+      "candidate_type": "skill",
+      "content_sha256": "a1004bfa6ff53c430aafc98cbc657491eaca2fa460177fa103f8a83bf4c45c98",
+      "created_by": "format_migration",
+      "format": "skill-md/v11",
+      "parent_version": null,
+      "question_type": "object_abs_distance",
+      "skill_id": "S02",
+      "source_ref": "versions/S02/1.1.0/estimate-object-distance/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    "S03@1.1.0": {
+      "candidate_type": "skill",
+      "content_sha256": "c85e8cadc39b2d447d06d8ea08cc62e7a62581cd7b3f089fce133e9c0da8239d",
+      "created_by": "format_migration",
+      "format": "skill-md/v11",
+      "parent_version": null,
+      "question_type": "object_rel_distance",
+      "skill_id": "S03",
+      "source_ref": "versions/S03/1.1.0/rank-object-distances/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    "S04@1.1.0": {
+      "candidate_type": "skill",
+      "content_sha256": "752c81103283a360b992776d1113029aca7ddd9e4995a7b55c6ab684da0239cd",
+      "created_by": "format_migration",
+      "format": "skill-md/v11",
+      "parent_version": null,
+      "question_type": "object_size_estimation",
+      "skill_id": "S04",
+      "source_ref": "versions/S04/1.1.0/estimate-object-size/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    "S05@1.1.0": {
+      "candidate_type": "skill",
+      "content_sha256": "628a5606ce78ac9446bdc64bdbe57888286ece01da21c6d1436b62201fd56516",
+      "created_by": "format_migration",
+      "format": "skill-md/v11",
+      "parent_version": null,
+      "question_type": "room_size_estimation",
+      "skill_id": "S05",
+      "source_ref": "versions/S05/1.1.0/estimate-room-area/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    "S06@1.1.0": {
+      "candidate_type": "skill",
+      "content_sha256": "2f71b79eea7832e24832d00f8cd7e2c5b9f0277db30c494f59796e4e6737894e",
+      "created_by": "format_migration",
+      "format": "skill-md/v11",
+      "parent_version": null,
+      "question_type": "object_rel_direction",
+      "skill_id": "S06",
+      "source_ref": "versions/S06/1.1.0/judge-relative-direction/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    "S07@1.1.0": {
+      "candidate_type": "skill",
+      "content_sha256": "81299ef053778b14dc5eb8b74952c3c7b4ad85850bb19cc998e97d102f2dc3fb",
+      "created_by": "format_migration",
+      "format": "skill-md/v11",
+      "parent_version": null,
+      "question_type": "obj_appearance_order",
+      "skill_id": "S07",
+      "source_ref": "versions/S07/1.1.0/order-first-appearances/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    },
+    "S08@1.1.0": {
+      "candidate_type": "skill",
+      "content_sha256": "91f5b1e1c16ee5376bf3af4afceec8b278a8a85bad5efb2ded3b03c69bf1283f",
+      "created_by": "format_migration",
+      "format": "skill-md/v11",
+      "parent_version": null,
+      "question_type": "route_planning",
+      "skill_id": "S08",
+      "source_ref": "versions/S08/1.1.0/infer-route-turns/SKILL.md",
+      "state": "active",
+      "version": "1.1.0"
+    }
+  },
+  "generation": 0,
+  "manifest_hash": "992c7624e2af429df8efc63b22a2b5eaf82ba3a53772d0f5cde19bf839a54a8b",
+  "manifest_ref": "manifests/manifest_S0-v11-format-migration.json",
+  "parent_snapshot_id": "S0-seed-20260925-v1",
+  "schema_version": "runtime-skill-snapshot/2.0",
+  "skill_versions": [
+    "S01@1.1.0",
+    "S02@1.1.0",
+    "S03@1.1.0",
+    "S04@1.1.0",
+    "S05@1.1.0",
+    "S06@1.1.0",
+    "S07@1.1.0",
+    "S08@1.1.0"
+  ],
+  "snapshot_id": "S0-v11-format-migration"
+}

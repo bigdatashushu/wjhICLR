@@ -1,0 +1,24 @@
+{
+  "schema_version": "v11-reachable-slots/1.0",
+  "slots": [
+    "object_counting/g0m0",
+    "object_abs_distance/g0m0",
+    "object_size_estimation/g0m0",
+    "room_size_estimation/g0m0",
+    "object_rel_distance/g0m0",
+    "object_rel_direction/g0m0",
+    "route_planning/g0m0",
+    "obj_appearance_order/g0m0",
+    "object_counting/g1m0",
+    "object_abs_distance/g1m0",
+    "object_size_estimation/g1m0",
+    "room_size_estimation/g1m0",
+    "object_rel_distance/g1m0",
+    "object_rel_direction/g1m0",
+    "route_planning/g1m0",
+    "obj_appearance_order/g1m0",
+    "object_abs_distance/g1m1",
+    "object_size_estimation/g1m1",
+    "room_size_estimation/g1m1"
+  ]
+}

@@ -1,0 +1,103 @@
+# harness3d v11 运行配置；在线求解与离线修订由各自入口驱动。
+
+seed: 0
+
+# v9 execution/evolution starting configuration. These values are recorded
+# for reproducibility; real runtime wiring and calibration remain pending.
+max_solver_rounds: 6
+max_retries_per_operation: 3
+finalization_rounds: 1
+# 只在评测原流程失败后，预算外追加一次 32 原帧直答；induction 不启用。
+eval_visual_fallback: true
+
+paths:
+  data_root: data
+  vsi_bench_meta: data/vsi_bench_meta
+  # 本机实测可用（2026-09-18）：288/288 scene 全覆盖，布局 <root>/<dataset>/<scene>.mp4
+  raw_videos: /nas/wangjh/Skill-3D/dataset/VSI-Bench
+  # v9 §5.2"可重试加载"的来源副本（用户 2026-09-27 裁定：重试 = **换来源/换副本**）。
+  # 主来源缺失/不可解码时，按序尝试这些备用根：<fb>/<dataset>/<scene>.mp4（目录式镜像）
+  # 与 <fb>/<dataset>_<scene>.mp4（平铺式镜像）。本机 VSI_videos 是**部分**副本
+  # （274 个文件，未覆盖全部 288 scene），因此只有主来源真的坏掉/缺失时才会用到它。
+  # 用了副本的题会记进 RunManifest 的 source_retried_samples，且 video_id 带来源标签
+  # （副本可能是另一种编码，禁止与主来源共用重建缓存）。
+  raw_video_fallbacks:
+    - /nas/wangjh/Skill-3D/dataset/VSI_videos
+  reconstructions: data/reconstructions
+  trace_store: data/traces
+  # 每个题型＋初始证据状态槽位唯一 active Skill。
+  skill_library: skill_library
+  active_snapshot: skill_library/snapshots/active_snapshot.json
+
+frame_sampling:
+  n_frames: 32                          # 与 VSI-Bench 官方开源模型对齐
+  strategy: uniform
+# M2 质量诊断（模糊／曝光／对比度／运动）：v9 §5.1 要求**默认关闭**，
+# 只在独立诊断实验中开启。默认 1.0 权重不影响主流程（scene_route 不再被 M2 权重左右）。
+input_diagnostics: false
+
+# v11 固定按题型＋初始证据状态查找唯一方法。
+retrieval:
+  config_version: ret-v11-initial-slot-1  # 人类标签；内容摘要由代码复算并落盘
+  # §13.5"上下文放不下时先减少完整条目"的上限，同时是"超过服务限制的候选在静态
+  # 检查中拒绝"的判据（单条正文超过它的候选永远无法完整交付）。
+  # 依据：32 帧 @max_pixels=131072 ≈ 9.7k prompt tokens，max_model_len=32768，
+  # 留出推理与程序输出余量后给方法上下文的预算。
+  method_context_max_chars: 8000
+
+# v9 §9.4 主动图像（inspect_frames / detect_objects）：图像布局必须**事先声明**。
+# 单次请求上限冻结为 32 张图。观察轮用声明布局 `derived_related_spread_v2`：
+# 引用裁剪优先，再保留源帧，其余名额均匀覆盖冻结帧；按时间顺序交付原帧。
+# 每请求记录当前实际图像，不把历史请求当作持续视觉记忆。
+active_vision:
+  layout: derived_related_spread_v2
+  max_derived_images: 8        # 单次请求里派生图的占位上限（服务上限内）
+
+# M5 题目解析、M8 程序生成、评测视觉补答使用百炼；M5 类别审核独立配置。
+# 密钥只从 api_key_env 指定的环境变量读取，不得写入 YAML 或收据。
+online_model:
+  enabled: true
+  provider: bailian
+  model: qwen3.8-flash
+  model_revision: ""                   # 固定版本可填；空别名禁用跨运行磁盘缓存
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  api_key_env: DASHSCOPE_API_KEY
+  timeout_s: 180.0
+  temperature: 0.0
+  max_tokens: 8192                     # M8 单次最大输出；M5 各调用仍使用更小的请求级上限
+  max_model_len: 32768
+  # M8 32 帧输入（§1.2 / §4 M1）
+  n_frames: 32
+  max_pixels: 131072
+  # M5 单候选审核图的缩放范围
+  audit_min_pixels: 65536
+  audit_max_pixels: 1048576
+  relation_batch_size: 32
+  # M5 仅审核类别；没有可见性/纯净度/完整性的模型质量结论。
+  # 显式设为 null 可切回 Qwen 的盲审 + 关系 + 质量准入。
+  mask_review:
+    provider: intern-decision
+    endpoint: http://127.0.0.1:18445
+    timeout_s: 60
+    expected_identity_sha256: aa1a6239ae7883717e649f829bf2d200be7d851fb4db2701ac6900c4ddc2d9c2
+    mode: binary
+    prompt_version: P1
+    yes_threshold: 0.77
+    admission_policy: category-only
+
+sandbox:
+  cell_timeout_s: 120                   # TODO_CALIBRATE
+  max_regenerate: 3                     # AST 失败有限重生成 TODO_CALIBRATE
+
+# M5 开放词表检测器（GroundingDINO 服务；确定性 Tool，非 LLM）。
+# Qwen3.8-Flash 只解析题目对象并审核 SAM2 mask，不生成检测框。
+detection:
+  endpoint: http://127.0.0.1:20022     # TODO_USER_INPUT：检测器服务地址（组内服务）
+  box_threshold: 0.25                  # TODO_CALIBRATE
+
+# v4/v5 的 `scale` 段（冻结 conformal 校准器、标定池、逐题型授权校准）已按 v6 §20
+# 整体废止：v6 放弃一切需要校准的米制尺度路线，改由 reconstruction/metric_fusion.py
+# （零样本度量深度跨帧融合，§11）在推理期产出尺度。该路线的模型卡与阈值属
+# [待实验]/[TODO_CALIBRATE]，PoC 通过前不登记任何默认值（不得给"兜底常量"）。
+
+split_config: configs/vsi_bench_split.yaml

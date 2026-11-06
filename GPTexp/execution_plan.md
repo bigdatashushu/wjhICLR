@@ -73,3 +73,27 @@ python3 -B -m GPTexp.deploy collect --run gpt61-high-full1998-20261105-r01
 ```
 
 实际当前状态以同目录 `live_status.json` 的查询时间为准；启动阶段不代表全量评测已完成。
+
+## 2026-11-05 当前任务：每题型至少 30%，全部复用
+
+用户最新要求为“直接全部复用，每个题型够题单的百分之 30 即可”。Terra 全量 R02 已停止。其 213 个已完成题臂全部纳入新题单，包括失败和无效回答，已完成题臂不重新调用模型。
+
+每个题型按原题量 × 30% 向上取整，先保留所有已有结果涉及的题目，再以种子 137 的哈希顺序补齐。题单固定为 606 题、1,212 个 Direct/Harness 题臂：BLINK Multi-view 28 题、CV3D 252 题、MMSI 112 题、MindCube 214 题。18 个题型的逐型配额见新目录 `selection_report.md`。只补跑缺失的 999 个题臂；新的请求总上限为 3,330。
+
+新任务为 `gpt56-terra-high-type30-20261105-r01`，服务器目录在原 `GPTexp/runs` 下，Mac 同名目录在本项目 `GPTexp/runs` 下。新代码在独立 `type30-runtime-20261105-r01/GPTexp` 中执行，原全量运行时保持不变。模型仍为 `gpt-5.6-terra/high`，10 个 Key，每 Key 最多 1 个在途请求；HTTP、排队、进程等待、原 Prompt、Harness、每题请求上限及 API 参数保持原配置。
+
+`reuse_source` 保存旧 manifest、原请求账本和逐文件校验的 213 份完整 JSON 轨迹。旧 episode 保留原运行身份及原字节，新 manifest 通过快照身份引用它们。只有一侧完成的 5 题在补跑另一侧时固定使用原 API。旧目录中的未完成请求和部分轨迹继续保留。
+
+准备阶段发起 0 次模型请求、0 次新 API 探测，并核验了所有复用轨迹、配置、输入和 API 回执。新任务已启动，不重复执行 `stage`、`prepare` 或 `launch`。服务器与 Mac 均每 5 秒更新 `connection_status.json` 和 `connection_status.md`；监控不发额外模型请求。完成后独立宿主核验合并预测，再读取参考答案评分，生成原统一 JSON/JSONL 轨迹、`scored_pairs.json` 和报告。
+
+查询当前任务：
+
+```bash
+python3 -B -m GPTexp.subset_ops status
+```
+
+回收当前任务：
+
+```bash
+python3 -B -m GPTexp.deploy collect --run gpt56-terra-high-type30-20261105-r01
+```

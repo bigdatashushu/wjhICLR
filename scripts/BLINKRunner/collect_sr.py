@@ -1,6 +1,7 @@
 """Package a completed SR trial with source checks and full archive readback."""
 import argparse
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -9,10 +10,12 @@ import sys
 import tarfile
 
 
-def package(root, backup):
+def package(root, backup, trial_module="sr_trial"):
     root, backup = Path(root).resolve(), Path(backup).resolve()
     sys.path[:0] = [str(root / "source/scripts/BLINKRunner")]
-    import sr_trial as trial
+    if trial_module not in {"sr_trial", "sr_retest"}:
+        raise ValueError("sr_invalid_trial_module")
+    trial = importlib.import_module(trial_module)
     sr = trial.sr
     manifest = sr.read(root / "manifest.json")
     trial.verify(root, manifest)
@@ -20,7 +23,7 @@ def package(root, backup):
     size = len(manifest["inspection"]["inputs"])
     exit_record = json.loads((root / "exit.json").read_text())
     if (completed["manifest_sha256"] != manifest["content_sha256"]
-            or completed["episodes"] != size * 2 or exit_record["returncode"] != 0
+            or completed["episodes"] != len(manifest["jobs"]) or exit_record["returncode"] != 0
             or any(completed["budget"][k] for k in
                    ("error_requests", "unknown_requests", "active_requests"))
             or completed["budget"]["reserved_requests"] > manifest["request_cap"]):
@@ -53,6 +56,10 @@ def package(root, backup):
                                      "package_prepared.py", "collect_sr.py",
                                      "prepare_received.py", "status_sr.py")
               if (root / name).exists()]
+    paths += [root / name for name in (
+        "parent20_manifest.json", "parent80_manifest.json", "cache_reuse.json",
+        "retest_cohort.json", "parent_retest20_manifest.json", "parent_retest20_completed.json")
+              if (root / name).exists()]
     paths += sorted((root / "episodes").glob("*.json"))
     paths += sorted((root / "requests").rglob("*.json"))
     paths += [root / "source" / name for name in manifest["inspection"]["sources"]]
@@ -78,7 +85,9 @@ def package(root, backup):
                 raise ValueError("sr_archive_readback_mismatch")
     with tarfile.open(root / "public_runtime.tar.gz", "x:gz", dereference=True) as archive:
         archive.add(root / "split.json", arcname="split.json")
-        for name in ("cohort.json", "parent_manifest.json"):
+        for name in ("cohort.json", "parent_manifest.json",
+                     "parent20_manifest.json", "parent80_manifest.json",
+                     "retest_cohort.json", "parent_retest20_manifest.json", "parent_retest20_completed.json"):
             if (root / name).exists():
                 archive.add(root / name, arcname=name, recursive=False)
         for name in manifest["inspection"]["sources"]:
@@ -91,7 +100,7 @@ def package(root, backup):
     receipt = sr.write_once(root / "delivery_receipt.json", {
         "archives": archives, "inventory_sha256": inventory["content_sha256"],
         "full_trace_archive_readback": True, "files": len(expected),
-        "completed_episodes": size * 2, "model_requests": completed["budget"]["reserved_requests"],
+        "completed_episodes": len(manifest["jobs"]), "model_requests": completed["budget"]["reserved_requests"],
         "reference_answers_read": False, "backup_root": str(backup),
         "collector_sha256": sr.file_sha(Path(__file__)),
     })
@@ -109,13 +118,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--backup", type=Path, required=True)
+    parser.add_argument("--trial-module", choices=("sr_trial", "sr_retest"), default="sr_trial")
     args = parser.parse_args()
     os.umask(0o077)
     for name in list(os.environ):
         if any(t in name.upper() for t in (
                 "API_KEY", "TOKEN", "ENDPOINT", "BASE_URL", "PASSWORD", "SECRET")):
             os.environ.pop(name, None)
-    print(json.dumps(package(args.root, args.backup)))
+    print(json.dumps(package(args.root, args.backup, args.trial_module)))
 
 
 if __name__ == "__main__":

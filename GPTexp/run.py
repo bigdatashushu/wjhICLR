@@ -14,6 +14,7 @@ import sys
 import time
 
 from .adapters import COUNTS, ROOT
+from .MMSIGPT.packaging import preflight_identity, source_files as mmsi_source_files
 from .api_pool import ApiPool
 from .traces import digest, file_digest, read, write
 
@@ -30,6 +31,7 @@ def environment():
 
 def code_identity():
     files = list(ROOT.glob("*.py"))
+    files.extend(mmsi_source_files(ROOT / "MMSIGPT"))
     vendor = ROOT / "vendor/xcodeapi"
     files.extend(vendor.glob("*.py"))
     if (vendor / "profiles.json").exists():
@@ -67,8 +69,7 @@ def prepare(directory, config, *, datasets=None):
                 cwd=ROOT.parent, env=environment(), check=True, timeout=864000)
         receipt = read(path)
         if (receipt["identity"] != digest(receipt["specs"])
-                or receipt["adapter_files"] != {
-                    name: file_digest(ROOT / name) for name in ("adapters.py", "worker.py")}):
+                or receipt["adapter_files"] != preflight_identity(ROOT, dataset)):
             raise ValueError("preflight_receipt_or_adapter_changed")
         return dataset, receipt
 

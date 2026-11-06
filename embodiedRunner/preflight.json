@@ -1,0 +1,147 @@
+{
+  "schema": "embodiedbench-compatibility-preflight/1",
+  "checked_at_utc": "2026-11-05T07:06:39.238835+00:00",
+  "status": "offline_contract_checks_passed",
+  "upstream_revision": "9be4e980e9cd6bcb38373cd4aab7c32724bdd401",
+  "verified_official_files": 36,
+  "official_source_bytes": 522655,
+  "local_source_sha256": {
+    "pyproject.toml": "d9cf988d1d783330df0a329040d5e1e7d0bf5731441542cbed7ddc13afd379c2",
+    "src/skill3d/schemas/episode.py": "bc8986edf0f25fd77c3a707406dc6c355ff84ae5b77677fa22216074a62f1bc0",
+    "src/skill3d/routing/task_classifier.py": "a9437bdd3ec4ac2ac3dd9456968d088a5721bc0ac227d4f473bb12930b00776e",
+    "src/skill3d/small_image/datasets.py": "0c59cb99c31a91d720af7877bc7a30fb1208ee68395cabaddf5ae1353a8dc977",
+    "src/skill3d/small_image/tools.py": "744badd59c2728baf537f95dee57a6b9be0f5469e863241e0a572f17f77d39ff",
+    "src/skill3d/sandbox/action_check.py": "befeb324a8079e6f0dcd56fa9bb5cbf3772dd73a3eb92120c4b93900ad27b365",
+    "src/skill3d/synthesis/bailian_client.py": "cb128ee792188c4455b2f585d4b5686516e40ace06c6dd2180735e061dc3af72"
+  },
+  "python": "3.11.16",
+  "host": {
+    "system": "Darwin",
+    "machine": "arm64"
+  },
+  "simulator_packages_installed": {
+    "ai2thor": false,
+    "habitat": false,
+    "habitat_sim": false,
+    "pyrep": false,
+    "rlbench": false,
+    "amsolver": false
+  },
+  "official_environments": [
+    "eb-alf",
+    "eb-hab",
+    "eb-nav",
+    "eb-man"
+  ],
+  "environment_interfaces": {
+    "eb-alf": {
+      "max_environment_steps": 30,
+      "reset_arguments": [
+        "self"
+      ],
+      "step_arguments": [
+        "self",
+        "action",
+        "reasoning"
+      ],
+      "vsi_task_type_rejected": true,
+      "small_image_benchmark_rejected": true
+    },
+    "eb-hab": {
+      "max_environment_steps": 30,
+      "reset_arguments": [
+        "self"
+      ],
+      "step_arguments": [
+        "self",
+        "action",
+        "reasoning"
+      ],
+      "vsi_task_type_rejected": true,
+      "small_image_benchmark_rejected": true
+    },
+    "eb-nav": {
+      "max_environment_steps": 20,
+      "reset_arguments": [
+        "self"
+      ],
+      "step_arguments": [
+        "self",
+        "action",
+        "reasoning",
+        "i_flag"
+      ],
+      "vsi_task_type_rejected": true,
+      "small_image_benchmark_rejected": true
+    },
+    "eb-man": {
+      "max_environment_steps": 15,
+      "reset_arguments": [
+        "self"
+      ],
+      "step_arguments": [
+        "self",
+        "discrete_action"
+      ],
+      "vsi_task_type_rejected": true,
+      "small_image_benchmark_rejected": true
+    }
+  },
+  "navigation_action_count": 8,
+  "navigation_actions": [
+    "Move forward by 0.25",
+    "Move backward by 0.25",
+    "Move rightward by 0.25",
+    "Move leftward by 0.25",
+    "Rotate to the right by 90 degrees.",
+    "Rotate to the left by 90 degrees.",
+    "Tilt the camera upward by 30 degrees.",
+    "Tilt the camera downward by 30 degrees."
+  ],
+  "navigation_success_threshold": 1,
+  "navigation_task_counts": {
+    "base": 60,
+    "common_sense": 60,
+    "complex_instruction": 60,
+    "visual_appearance": 60,
+    "long_horizon": 60
+  },
+  "official_plan_required_fields": [
+    "visual_state_description",
+    "reasoning_and_reflection",
+    "language_plan",
+    "executable_plan"
+  ],
+  "standard_action_fields": [
+    "action_id",
+    "action_name"
+  ],
+  "manipulation_action_fields": [
+    "action"
+  ],
+  "local_vsi_task_types": [
+    "object_counting",
+    "object_abs_distance",
+    "object_size_estimation",
+    "room_size_estimation",
+    "object_rel_distance",
+    "object_rel_direction",
+    "route_planning",
+    "obj_appearance_order"
+  ],
+  "local_model_chat_parameters": [
+    "self",
+    "messages",
+    "max_tokens",
+    "seed",
+    "temperature",
+    "response_format",
+    "enable_thinking",
+    "top_p"
+  ],
+  "model_requests": 0,
+  "simulator_launches": 0,
+  "network_connection_attempts": 0,
+  "benchmark_episodes_executed": 0,
+  "benchmark_success_rate": null
+}

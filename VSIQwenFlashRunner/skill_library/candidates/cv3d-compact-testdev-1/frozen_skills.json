@@ -1,0 +1,37 @@
+{
+  "schema": "cv3d-frozen-skills/1",
+  "version": "cv3d-compact-testdev-1",
+  "prompt_profile": "cv3d-compact-program/1",
+  "evaluation_role": "test_development",
+  "test_trajectory_revision_authorized": true,
+  "same_test_set_is_independent_evaluation": false,
+  "revision_source": {
+    "run": "cv3d-simple-paired-20261101-r02",
+    "source_split": "test",
+    "trajectory_archive_sha256": "178c6e065bdc0409a71be2076e693c79a3fa919a54361b068a8f834dca8f89ef",
+    "depth_cases": {
+      "direct_only": 10,
+      "both_correct": 7,
+      "tools_only": 3
+    },
+    "distance_cases": {
+      "direct_only": 13,
+      "both_correct": 8,
+      "tools_only": 3
+    }
+  },
+  "tasks": {
+    "Depth": {
+      "path": "Depth/SKILL.md",
+      "sha256": "8d51eff195fde8182deed7d3a10c9e5dafb3ae65747643b38e4f137bf4fb16fb",
+      "characters": 3184,
+      "previous_characters": 8787
+    },
+    "Distance": {
+      "path": "Distance/SKILL.md",
+      "sha256": "90c5650129d37a524d0edc9a0cd082ba1b8e0a871016ec7da5e39c3d9b955d12",
+      "characters": 3484,
+      "previous_characters": 8732
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "schema": "harness3d-dataset-registry/1",
+  "datasets": {
+    "vsi-bench": {
+      "aliases": ["vsibench", "vsi", "vsi-m4-1000"],
+      "description": "VSI-Bench metric/g1m1 1000 questions: 300 train / 700 test, 160 scenes",
+      "profile": "vsi_m4_1000.json",
+      "data_root": "prepared_cache/vsibench-m4-success-g1m1-1000-seed137-metric-r02"
+    }
+  }
+}

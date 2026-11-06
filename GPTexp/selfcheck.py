@@ -43,7 +43,11 @@ class Opener:
 
 
 def main():
-    config = read(Path(__file__).with_name("config.json"))
+    config = read(Path(__file__).with_name("config.example.json"))
+    config["apis"] = [config["apis"][0]]
+    config["apis"][0].update(id="offline-main", base_url="https://offline.invalid/v1",
+                            api_key_env="OFFLINE_TEST_API_KEY", credentials_file="",
+                            enabled=True, validated=True)
     config["max_requests"] = 1
     config["upstream_policy"] = {
         "require_reported_sampling_match": True,
@@ -172,7 +176,7 @@ def main():
                 "pair_identity": digest("offline-pair"),
                 "arms": [{"arm": arm, "problem": {"sample_id": "offline-synthetic"}}
                          for arm in ("direct", "harness")]}
-        manifest = {"counts": {"blink-multiview": 93}, "questions": 93, "arms": 186,
+        manifest = {"config": config, "counts": {"blink-multiview": 93}, "questions": 93, "arms": 186,
                     "pairs": [pair], "synthetic_fixture": True}
         manifest["run_identity"] = digest(manifest)
         write(directory / "manifest.json", manifest)

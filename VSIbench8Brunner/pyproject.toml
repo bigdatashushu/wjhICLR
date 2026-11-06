@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skill3d"
+version = "0.1.0"
+description = "harness3d: Skill 指导的可校验 3D 代码推理（基于 Skill3D codebase）"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.13",
+    # scipy 自 1.14 起要求 numpy>=2.0；无约束的 "numpy" + "scipy" 会解析出
+    # numpy 1.26 + scipy 1.18 这种**装得上、跑不动**的组合（`import scipy.spatial`
+    # 抛 np.long，或 cKDTree 抛 copy=None），进而让 M4 主门静默降级为
+    # fallback_2d_only。冻结实验环境为 numpy 2.1.2 + scipy 1.16.2。
+    "numpy>=2.0,<3",
+    "scipy>=1.14,<2",
+    "opencv-python>=4.8.0",
+    # Match the vendored VGGT PIL bicubic crop grid for metric depth and masks.
+    "Pillow>=10,<13",
+    "pyarrow",
+    "datasets",
+    "jinja2",
+    "openai>=1.12.0",
+    "requests>=2.32,<3",
+    "pyyaml>=6.0,<7",
+    # Successor readers and full experiments inspect available memory/disk.
+    "psutil>=5.9,<8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.pytest.ini_options]
+# 单一事实源是 src/skill3d（§2）；`pytest` 从仓库根可直接运行，无需先安装。
+testpaths = ["tests"]
+pythonpath = ["src"]
+norecursedirs = ["third_party", ".git", "build", "dist"]

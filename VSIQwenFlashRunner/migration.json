@@ -1,0 +1,63 @@
+{
+  "schema": "vsi-qwen-flash-migration/1",
+  "source_root": "..",
+  "policy": "Local pipeline modules override explicit read-only shared dependencies.",
+  "files": [
+    {
+      "path": "scripts/run_experiment.py",
+      "original_sha256": "4065788fdb11500410c93fd5ad313bcb96af3ba03902b49093fb4c10f95dfcae"
+    },
+    {
+      "path": "scripts/experiment_stage_v11.py",
+      "original_sha256": "0b17a9031d973f7490299f6e522147f0f96e49ca24eb343055b15a0bdc511ce8"
+    },
+    {
+      "path": "scripts/run_fitset_v11.py",
+      "original_sha256": "13db635c1e8b32b590cbeb483bbc649554fd1bdff71da617e86c95e5bc007730"
+    },
+    {
+      "path": "src/skill3d/infra/experiment_campaign.py",
+      "original_sha256": "845fc2a63b5ff9bd8b83c9449a561cca3de1d4ffff4ccd309f3e89a2896584ea"
+    },
+    {
+      "path": "src/skill3d/infra/experiment_stages_v11.py",
+      "original_sha256": "92d5994cda7ae2c319929ab318ba135c04ee5b0d5bc9d56dfcfb119c7b1151e7"
+    },
+    {
+      "path": "src/skill3d/evaluation/fitset_v11.py",
+      "original_sha256": "1ec60b61e75bcd09fb9fa3d89c98c98c46df34dd270264f783c3ce03bedbda3e"
+    },
+    {
+      "path": "src/skill3d/evaluation/published_fitset_v11.py",
+      "original_sha256": "da6bec99f70586eb3b10e987a1d26111fc8e2e16075aa8dd0d4550d7478ffb5f"
+    },
+    {
+      "path": "src/skill3d/evaluation/direct_qwen_v11.py",
+      "original_sha256": "85e1dec47e001a2b409e3f19403a0c437b78af84a6ade73ba1968e0d489f80e2"
+    },
+    {
+      "path": "src/skill3d/evolution/fitset_stream_v11.py",
+      "original_sha256": "62d0ef09be2014e846027d7cb9baeda98b5477df7d4be5885b2af5fff7390876"
+    },
+    {
+      "path": "src/skill3d/evolution/fitset_revision_v11.py",
+      "original_sha256": "5a6e543c7d9934f7d40399d74ab9f27bcdf55980aad3d414908ac16a9b0542f1"
+    },
+    {
+      "path": "src/skill3d/evolution/trajectory_analysis_v11.py",
+      "original_sha256": "7bd06302566e490c74f732bac9a6d2698d1bb4079bf6e15622a765d28ce726e5"
+    },
+    {
+      "path": "src/skill3d/evolution/revision_edits_v11.py",
+      "original_sha256": "35764dd7822eb1c3d7b395167d3f99904d44351bc2582de5206391cfcb16cc97"
+    },
+    {
+      "path": "src/skill3d/evolution/revision_guard_v11.py",
+      "original_sha256": "ed79af68cfd85080adf353b69a59097f081c8108dc2a79692da74a4ffc9a6135"
+    },
+    {
+      "path": "src/skill3d/online/runner.py",
+      "original_sha256": "6107594c0c0aff299e5de0c1e54301a0a6073c0355b220e726aa1a3d60f60994"
+    }
+  ]
+}

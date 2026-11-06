@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import urllib.request
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--trial-module", choices=("sr_trial", "sr_retest"), default="sr_trial")
     args = parser.parse_args()
     root = args.root.resolve()
     os.umask(0o077)
@@ -30,7 +32,7 @@ def main():
         PYTHONDONTWRITEBYTECODE="1", OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
         MKL_NUM_THREADS="1")
     sys.path[:0] = [str(root / "source/scripts/BLINKRunner"), compat]
-    import sr_trial as trial
+    trial = importlib.import_module(args.trial_module)
     manifest = trial.sr.read(root / "manifest.json")
     cap, concurrency = manifest["request_cap"], manifest["concurrency"]
     size = len(manifest["inspection"]["inputs"])
@@ -61,7 +63,7 @@ def emit(name, body):
     with (root/name).open("x") as stream:
         json.dump(body, stream, sort_keys=True)
         stream.write("\\n")
-command = [sys.executable, "-B", str(root/"source/scripts/BLINKRunner/sr_trial.py"),
+command = [sys.executable, "-B", str(root/"source/scripts/BLINKRunner"/TRIAL_FILE),
            "run", "--root", str(root)]
 with (root/"run.log").open("xb") as log:
     runner = subprocess.Popen(command, stdout=log, stderr=log, env=dict(os.environ))
@@ -80,7 +82,8 @@ with (root/"run.log").open("xb") as log:
 emit("exit.json", {"at": datetime.datetime.now().astimezone().isoformat(),
                   "returncode": code, "completed": (root/"completed.json").exists(),
                   "automatic_retry": False})
-'''.replace("RUN_ROOT", repr(str(root))).replace("RUN_CONCURRENCY", str(concurrency))
+'''.replace("RUN_ROOT", repr(str(root))).replace("RUN_CONCURRENCY", str(concurrency)).replace(
+        "TRIAL_FILE", repr(args.trial_module + ".py"))
     with (root / "supervise.py").open("x") as stream:
         stream.write(supervisor)
     subprocess.run([
@@ -92,7 +95,8 @@ emit("exit.json", {"at": datetime.datetime.now().astimezone().isoformat(),
     trial.sr.write_once(root / "launch.json", {
         "at": trial.now(), "status": "launched",
         "manifest_sha256": manifest["content_sha256"], "max_requests": cap,
-        "max_inflight": concurrency, "episodes": size * 2, "new_episodes": len(jobs),
+        "max_inflight": concurrency, "episodes": len(manifest["jobs"]), "new_episodes": len(jobs),
+        "trial_module": args.trial_module,
         "prior_requests": continuation["prior_requests"] if continuation else 0,
         "reused_direct_episodes": size if continuation else 0,
         "tmux_socket": root.name, "tmux_session": "sr20",
@@ -101,7 +105,7 @@ emit("exit.json", {"at": datetime.datetime.now().astimezone().isoformat(),
         "credential_written_to_disk": False, "automatic_retry": False,
     })
     print(json.dumps({"status": "launched", "root": str(root),
-                      "episodes": size * 2, "new_episodes": len(jobs)}))
+                      "episodes": len(manifest["jobs"]), "new_episodes": len(jobs)}))
 
 
 if __name__ == "__main__":

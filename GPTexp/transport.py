@@ -14,6 +14,7 @@ from xcodeapi.content import convert_messages
 from xcodeapi.transport import HTTPResult, _NoRedirect
 
 from .api_pool import resolve_key
+from .response_policy import CORRELATION, policy
 from .traces import credential_free, digest, write
 
 
@@ -48,6 +49,7 @@ class ResponsesClient:
         self.last_request_identity = {}
         self.last_reasoning_content = None
         self.last_service_error = {}
+        self.response_metadata_policy = policy(pool.config)
         self.profile = Profile("responses", self.base_url, self.model,
                                "XCODE_GPT_API_KEY", timeout_seconds=self.timeout_s)
 
@@ -139,20 +141,21 @@ class ResponsesClient:
                 credential_free(raw_body, key)
                 result = normalize_response(
                     self.profile, HTTPResult(raw_body, time.monotonic() - sent, request_id))
-                if result.returned_model != self.model:
+                metadata_gate = self.response_metadata_policy != CORRELATION
+                if metadata_gate and result.returned_model != self.model:
                     raise APIError("actual_model_changed")
-                if (raw_body.get("reasoning") or {}).get("effort") != self.reasoning_effort:
+                if metadata_gate and (raw_body.get("reasoning") or {}).get("effort") != self.reasoning_effort:
                     raise APIError("reported_reasoning_effort_changed")
-                policy = self.pool.config.get("upstream_policy", {})
-                if policy.get("require_reported_sampling_match") and (
+                upstream = self.pool.config.get("upstream_policy", {})
+                if metadata_gate and upstream.get("require_reported_sampling_match") and (
                         "temperature" in raw_body and raw_body["temperature"] != payload["temperature"]
                         or "seed" in raw_body and raw_body["seed"] not in (None, payload.get("seed"))):
                     raise APIError("reported_sampling_changed")
-                if policy.get("require_reported_output_limit_match") and (
+                if metadata_gate and upstream.get("require_reported_output_limit_match") and (
                         "max_output_tokens" in raw_body
                         and raw_body["max_output_tokens"] != payload["max_output_tokens"]):
                     raise APIError("reported_output_limit_changed")
-                if policy.get("require_reported_instructions_match") and (
+                if metadata_gate and upstream.get("require_reported_instructions_match") and (
                         raw_body.get("instructions", "") not in ("", None, payload.get("instructions", ""))):
                     raise APIError("reported_instructions_changed")
                 self.last_usage = {
@@ -160,7 +163,8 @@ class ResponsesClient:
                     "completion_tokens": result.usage.output_tokens,
                     "total_tokens": result.usage.total_tokens}
                 self.last_usage = {k: v for k, v in self.last_usage.items() if v is not None}
-                self.last_response_identity = {"model": result.returned_model, "model_reported": True}
+                self.last_response_identity = {
+                    "model": result.returned_model, "model_reported": bool(result.returned_model)}
                 self.last_reasoning_content = result.reasoning or None
                 finish_reason = {"completed": "stop", "max_output_tokens": "length"}.get(
                     result.finish_reason, result.finish_reason)
@@ -171,6 +175,15 @@ class ResponsesClient:
                           "usage": self.last_usage, "generation": self.last_generation,
                           "response_identity": self.last_response_identity,
                           "elapsed_seconds": time.monotonic() - started, "at": time.time()}
+                if not metadata_gate:
+                    record.update(
+                        response_metadata_policy=self.response_metadata_policy,
+                        request_association={
+                            "api_id": self.api["id"], "operation": self.operation,
+                            "ordinal": self.index, "payload_sha256": digest(payload),
+                            "admission_request_id": admission["request_id"],
+                            "provider_request_id": request_id,
+                            "method": "synchronous HTTP response to this admitted request"})
                 write(str(prefix) + ".response.json", record, exclusive=True)
                 return result.text
         except BaseException as exc:

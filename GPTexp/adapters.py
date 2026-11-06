@@ -1,10 +1,9 @@
-"""Thin dataset adapters; every solver and prompt comes from its frozen source."""
+"""Thin dataset dispatch; MMSI GPT logic is owned by the MMSIGPT package."""
 from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, is_dataclass
-import importlib
 from pathlib import Path
 import sys
 
@@ -26,8 +25,6 @@ def setup(dataset):
     sys.path[:0] = paths
     if dataset == "blink-sr":
         sys.path.insert(0, str(source / "scripts/BLINKRunner"))
-    if dataset == "mmsi":
-        sys.path.insert(0, str(ROOT / "frozen/mmsi"))
     return source
 
 
@@ -118,6 +115,9 @@ def mind_config(value):
 
 def make_specs(dataset):
     """Zero-request validation of every image, prepared artifact and initial prompt."""
+    if dataset == "mmsi":
+        from .MMSIGPT.inputs import make_specs as make_mmsi_specs
+        return make_mmsi_specs()
     source = setup(dataset)
     origin = ROOT / "frozen" / dataset
     from skill3d.small_image.blink_protocol import image_identities, original_messages, sha_value
@@ -140,23 +140,6 @@ def make_specs(dataset):
                     raise ValueError("blink_prepared_changed")
             else:
                 original_messages(problem, benchmark_prompt(problem) + DIRECT_SUFFIX)
-            specs.append(spec)
-    elif dataset == "mmsi":
-        old = read(origin / "manifest.json")
-        for job in old["jobs"]:
-            spec = public_spec(job)
-            spec["arm"] = "direct" if spec["arm"] == "direct" else "harness"
-            if spec["arm"] == "direct":
-                for key in ("prepared_root", "artifact_sha256", "skill", "allowed_tools"):
-                    spec.pop(key, None)
-            problem = problem_for(spec["problem"])
-            if image_identities(problem) != job["images"]:
-                raise ValueError("mmsi_image_order_changed")
-            if spec["arm"] == "harness":
-                prepared = load_prepared(Path(spec["prepared_root"]) / problem.input_sha256, problem=problem)
-                if (prepared.artifact_sha256 != spec["artifact_sha256"]
-                        or _validate_prepared(prepared, problem, load_problem_frames(problem))):
-                    raise ValueError("mmsi_prepared_changed")
             specs.append(spec)
     elif dataset == "cv3d":
         from CV3D.data import PublicInput
@@ -260,6 +243,9 @@ def make_specs(dataset):
 
 def solve(spec, dataset, client, output, run_identity):
     """Run on the fresh subprocess main thread; no reference file is supplied."""
+    if dataset == "mmsi":
+        from .MMSIGPT.runner import solve as solve_mmsi
+        return solve_mmsi(spec, client, output, run_identity)
     if dataset == "mindcube-tiny":
         from MindcubeRunner import worker
         class Budget:
@@ -311,12 +297,8 @@ def solve(spec, dataset, client, output, run_identity):
     from skill3d.small_image.storage import load_prepared
     config = runner.SmallImageRunnerConfig(**spec["solver"])
     if spec["arm"] == "direct":
-        if dataset == "blink-multiview":
-            from skill3d.evaluation.blink_experiment import benchmark_prompt, DIRECT_SUFFIX
-            prompt = benchmark_prompt(problem) + DIRECT_SUFFIX
-        else:
-            module = importlib.import_module("pilot")
-            prompt = module.direct_prompt(problem)
+        from skill3d.evaluation.blink_experiment import benchmark_prompt, DIRECT_SUFFIX
+        prompt = benchmark_prompt(problem) + DIRECT_SUFFIX
         text = client.chat(original_messages(problem, prompt), max_tokens=config.max_tokens,
                            seed=config.seed, temperature=0, enable_thinking=config.enable_thinking)
         try:
@@ -330,14 +312,9 @@ def solve(spec, dataset, client, output, run_identity):
     prepared = load_prepared(Path(spec["prepared_root"]) / problem.input_sha256, problem=problem)
     if prepared.artifact_sha256 != spec["artifact_sha256"]:
         raise ValueError("prepared_identity_changed")
-    if dataset == "blink-multiview":
-        from skill3d.evaluation.blink_experiment import scoped_registry
-        registry = scoped_registry
-        text = spec["skill_text"]
-    else:
-        module = importlib.import_module("pilot")
-        registry = module.registry_for(spec["allowed_tools"])
-        text = spec["skill"]["text"]
+    from skill3d.evaluation.blink_experiment import scoped_registry
+    registry = scoped_registry
+    text = spec["skill_text"]
     cells = []
     with capture_kernel(runner, cells):
         result = runner.SmallImageSolver(

@@ -11,6 +11,7 @@ import sys
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--trial-module", choices=("sr_trial", "sr_retest"), default="sr_trial")
     args = parser.parse_args()
     if not str(args.root).startswith("/var/tmp/harness3d-blink-sr"):
         raise ValueError("unexpected_sr_remote_root")
@@ -27,7 +28,7 @@ def main():
         "ssh", "-F", str(skill / "assets/ssh_config"), "h3d-titan",
         "/home/wangy/wangjh/skill3d-lab/pilot-20261021-01/runtime/skill3d-exp/bin/python",
         "-B", str(args.root / "source/scripts/BLINKRunner/sr_start.py"),
-        "--root", str(args.root)]
+        "--root", str(args.root), "--trial-module", args.trial_module]
     env = dict(os.environ)
     for k in list(env):
         if any(t in k.upper() for t in ("API_KEY", "TOKEN", "ENDPOINT", "BASE_URL", "PASSWORD", "SECRET")):

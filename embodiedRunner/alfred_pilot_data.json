@@ -1,0 +1,27 @@
+{
+  "repository": "EmbodiedBench/EB-ALFRED",
+  "revision": "af55cc721725ed058830fd7a8aee66c1f69efbaa",
+  "subset": "base",
+  "indexes": [
+    0,
+    1,
+    2
+  ],
+  "files": [
+    {
+      "path": "pick_clean_then_place_in_recep-Ladle-None-DiningTable-4/trial_T20190909_164840_568811/pp/ann_2.json",
+      "sha256": "08592f1dc5cc96ab1817246a290bff171e90e1a1e53a4ccd495b66d94f9148e1",
+      "bytes": 379406
+    },
+    {
+      "path": "pick_and_place_with_movable_recep-Spoon-Plate-DiningTable-15/trial_T20190907_112652_334388/pp/ann_1.json",
+      "sha256": "2b2f7317e068adbd9b7d86a84dc669a99da22ff94a2264294e5d749f69b8d99b",
+      "bytes": 248662
+    },
+    {
+      "path": "pick_two_obj_and_place-ToiletPaper-None-Toilet-408/trial_T20190909_080302_174780/pp/ann_0.json",
+      "sha256": "ce00a040c9fd281d33a86fca52d1d8e14c08e85cc0bd2bd0e02bf17974225de5",
+      "bytes": 314618
+    }
+  ]
+}

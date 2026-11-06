@@ -69,6 +69,8 @@ def deploy(*, code_only=False):
                 tar.add(sr_extra, arcname="frozen/blink-sr/source/BLINK/download_data.py")
         for path in ROOT.glob("*.py"):
             tar.add(path, arcname=path.name)
+        from .MMSIGPT.packaging import add_package
+        add_package(tar, ROOT / "MMSIGPT")
         tar.add(directory / "server.config.json", arcname="config.json")
     subprocess.run(SSH + ["mkdir", "-p", SERVER_ROOT], check=True, timeout=36000)
     with archive.open("rb") as stream:

@@ -1,0 +1,33 @@
+checks/
+runs/
+test-output/
+__pycache__/
+.pytest_cache/
+cache/
+tmp/
+/config/
+/data/
+state/
+venv-nav/
+runtime/
+
+# Private authorization and simulator binaries remain local.
+.env
+.env.*
+!.env.example
+*.local.env
+*.pkl
+*.pickle
+*.ttm
+*.ttt
+
+# Keep official Python modules in folders named config or data.
+upstream*/**/config/**
+!upstream*/**/config/**/
+!upstream*/**/config/**/*.py
+!upstream-household/embodiedbench/evaluator/config/alfred_examples.json
+!upstream-household/embodiedbench/evaluator/config/alfred_long_horizon_examples.json
+!upstream-household/embodiedbench/evaluator/config/habitat_examples.json
+upstream*/**/data/**
+!upstream*/**/data/**/
+!upstream*/**/data/**/*.py

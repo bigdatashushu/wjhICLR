@@ -1,0 +1,49 @@
+{
+  "schema": "embodied-method-library/1",
+  "methods": [
+    {
+      "source_ref": "navigation.md",
+      "method_id": "embodied.navigation.current-view",
+      "version": "1.0.0",
+      "environment": "eb_navigation",
+      "control_profile": "embodied-actions/1",
+      "required_capabilities": ["current_rgb"],
+      "optional_capabilities": ["candidate_category", "relative_depth", "relative_points"],
+      "tools": ["view_candidates", "view_depth_summary", "point_depth", "pair_point_distance", "candidate_depth_summary"],
+      "content_sha256": "8edf370c6eb56275e593ce6e4ac56574b07a7a5b897af728e0e0b495f0a8f6d3"
+    },
+    {
+      "source_ref": "alfred.md",
+      "method_id": "embodied.alfred.current-view",
+      "version": "1.0.0",
+      "environment": "eb_alfred",
+      "control_profile": "embodied-actions/1",
+      "required_capabilities": ["current_rgb"],
+      "optional_capabilities": ["candidate_category", "relative_depth", "relative_points"],
+      "tools": ["view_candidates", "view_depth_summary", "point_depth", "pair_point_distance", "candidate_depth_summary"],
+      "content_sha256": "fd90229b085e674d4d004b7db07200a43c693da30a85ed0049954df3cf7b2e05"
+    },
+    {
+      "source_ref": "habitat.md",
+      "method_id": "embodied.habitat.current-view",
+      "version": "1.0.0",
+      "environment": "eb_habitat",
+      "control_profile": "embodied-actions/1",
+      "required_capabilities": ["current_rgb"],
+      "optional_capabilities": ["candidate_category", "relative_depth", "relative_points"],
+      "tools": ["view_candidates", "view_depth_summary", "point_depth", "pair_point_distance", "candidate_depth_summary"],
+      "content_sha256": "bce56e4063b55ad1d0bc69269208ebb979d15be0d6e27c11cdd097a7d9feb9d2"
+    },
+    {
+      "source_ref": "manipulation.md",
+      "method_id": "embodied.manipulation.current-view",
+      "version": "1.0.0",
+      "environment": "eb_manipulation",
+      "control_profile": "embodied-actions/1",
+      "required_capabilities": ["current_rgb"],
+      "optional_capabilities": ["candidate_category", "relative_depth", "relative_points"],
+      "tools": ["view_candidates", "view_depth_summary", "point_depth", "pair_point_distance", "candidate_depth_summary"],
+      "content_sha256": "76976c44c5861f4adade43feb0d5fedead700bb2769d2ae82a1144163f2652f8"
+    }
+  ]
+}

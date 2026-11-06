@@ -1,0 +1,272 @@
+{
+  "repository": "EmbodiedBench/EmbodiedBench",
+  "revision": "9be4e980e9cd6bcb38373cd4aab7c32724bdd401",
+  "files": [
+    {
+      "path": "README.md",
+      "git_blob_sha": "3f2a9d8b0dac8433054b101e6a7cc2c088cc990a",
+      "sha256": "52a6eb45ef020cb17ad7c2b05e91367e3690fa7164ca00013317567b39ce425b",
+      "bytes": 21272,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/README.md"
+    },
+    {
+      "path": "Docker/Dockerfile",
+      "git_blob_sha": "4ef0bafb8718a66355ca265612fa7bbd7ce286c4",
+      "sha256": "18ef3ad61f1ebd28934fd186ac739729f5f0c522d3f8f3d1cac63fb6cdca662f",
+      "bytes": 4500,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/Docker/Dockerfile"
+    },
+    {
+      "path": "conda_envs/environment.yaml",
+      "git_blob_sha": "312a9e9e040a296c3997f6f7830f6dca1f4d2e5b",
+      "sha256": "5ab79364f7d47961f0030821bfec6a89ee788cdd84195c27a1a74375ebde39d5",
+      "bytes": 10263,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/conda_envs/environment.yaml"
+    },
+    {
+      "path": "conda_envs/environment_eb-nav.yaml",
+      "git_blob_sha": "2d9a3d797f929c40fd2cf90f330c727f77f99817",
+      "sha256": "de5286d0c072083dff302367b1e98a6a4b5f8fb2c875234fc5bdb231de41a88d",
+      "bytes": 4972,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/conda_envs/environment_eb-nav.yaml"
+    },
+    {
+      "path": "conda_envs/environment_eb-man.yaml",
+      "git_blob_sha": "79225279c477ec7b2bea47f5a408b8288cb95ad0",
+      "sha256": "f671a5d387796029e15552a3576df720529cfaa08817523239c70ef3eed5e8b5",
+      "bytes": 8674,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/conda_envs/environment_eb-man.yaml"
+    },
+    {
+      "path": "embodiedbench/main.py",
+      "git_blob_sha": "e7e108c62265fb6ade8542b1e6032b4d6bac71d0",
+      "sha256": "f93e1c01dbcfd1d8f695100e53e130b62bb1f518777ebcd49df9d8508d780cca",
+      "bytes": 2375,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/main.py"
+    },
+    {
+      "path": "embodiedbench/configs/config.yaml",
+      "git_blob_sha": "d55442f6c6c073d9f2d653ddb86ec2ed3178acc1",
+      "sha256": "2f852fb12c633fa5d38bc77f9a1baf750cb428d6bde1c692d89f63db1ceac8e6",
+      "bytes": 298,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/configs/config.yaml"
+    },
+    {
+      "path": "embodiedbench/configs/eb-alf.yaml",
+      "git_blob_sha": "47074910f6dc8d2dd483b10ad1154526ad28a1d9",
+      "sha256": "d44b3bde2196aac1c342f4a6afa41c2ce2621c0fc9d1e56276d18256a51347c6",
+      "bytes": 257,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/configs/eb-alf.yaml"
+    },
+    {
+      "path": "embodiedbench/configs/eb-hab.yaml",
+      "git_blob_sha": "c5381071a6c8022467cc250d8cd2f00ffeac51d6",
+      "sha256": "fc66ba766a97bccb27b1fc6405da58bc1adc3d8ff885c470462ade073c589274",
+      "bytes": 236,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/configs/eb-hab.yaml"
+    },
+    {
+      "path": "embodiedbench/configs/eb-nav.yaml",
+      "git_blob_sha": "7fa7cbf31f3afd556328e3ea8f279c23f480f9f8",
+      "sha256": "b5c4bcbc3dc61c62563a7fbc8d19c8bc00073f94831d7dfbfea9c5a41d52823e",
+      "bytes": 298,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/configs/eb-nav.yaml"
+    },
+    {
+      "path": "embodiedbench/configs/eb-man.yaml",
+      "git_blob_sha": "c53c250c69acb1b5ccb71f6e6efae46b8431a705",
+      "sha256": "f338e890e36974ecf688c74533805348b06a3fa3d594869ee8603a28704c2cd6",
+      "bytes": 248,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/configs/eb-man.yaml"
+    },
+    {
+      "path": "embodiedbench/envs/eb_alfred/EBAlfEnv.py",
+      "git_blob_sha": "fb54f5de4fd8d0d5342c6902a5c6eb0bbcdadb8d",
+      "sha256": "ca95f198c1b23e52853cb2e5e8bba11d7e1566b24987b6d9b7e7cc312f7f9b47",
+      "bytes": 17322,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_alfred/EBAlfEnv.py"
+    },
+    {
+      "path": "embodiedbench/envs/eb_alfred/README.md",
+      "git_blob_sha": "207330ee4925b120355f2c5f8053e05be95928dc",
+      "sha256": "0ad8465392dd36ae0a5b2d1adec54f1da89a0ab1fe28a63f3d581dc49cd2061e",
+      "bytes": 10998,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_alfred/README.md"
+    },
+    {
+      "path": "embodiedbench/envs/eb_habitat/EBHabEnv.py",
+      "git_blob_sha": "1a779ff1dca852e1bd32b4b8b47b1136a6917c7c",
+      "sha256": "8765e30893386fbfb2ace6a95b9c9b182d412583cd76390853d2bf2a11f825d3",
+      "bytes": 14812,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_habitat/EBHabEnv.py"
+    },
+    {
+      "path": "embodiedbench/envs/eb_navigation/EBNavEnv.py",
+      "git_blob_sha": "40c0d3a6ac4560414ccca7266e309c7c57e93437",
+      "sha256": "2e127bcc69d5716239afd763f7d0db705a581674d949e558a34d8bb49ee977c2",
+      "bytes": 18295,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_navigation/EBNavEnv.py"
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/EBManEnv.py",
+      "git_blob_sha": "4247481839596e91413402ceb72cbebc61fafc6f",
+      "sha256": "2422c9e8f9e34eba418275672caf5a12a9ccff1ae4970a7248f2d6127103c816",
+      "bytes": 11970,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_manipulation/EBManEnv.py"
+    },
+    {
+      "path": "embodiedbench/envs/eb_manipulation/eb_man_utils.py",
+      "git_blob_sha": "ee4282f3e86daac211928d788f3b61c0ffc57573",
+      "sha256": "15ae5629bfafa5deb6cc9db15d33b96629b9c0af3d38f4c968e42711758c9bf9",
+      "bytes": 19727,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_manipulation/eb_man_utils.py"
+    },
+    {
+      "path": "embodiedbench/evaluator/eb_alfred_evaluator.py",
+      "git_blob_sha": "81ce222420bd4f726e0d390023096981f92dd8ff",
+      "sha256": "4005bd2c65ffd2b2d7b246097d7a6d32becd98f14a245348ee8ecd6f9bd095a3",
+      "bytes": 11878,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/evaluator/eb_alfred_evaluator.py"
+    },
+    {
+      "path": "embodiedbench/evaluator/eb_habitat_evaluator.py",
+      "git_blob_sha": "b1f6b6fbddb48bcb26ce22e21f1c899457c70449",
+      "sha256": "a691a81405ccdf33a70454fb901d466c4bcb514867936b5364b86d5578d6fa3a",
+      "bytes": 12022,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/evaluator/eb_habitat_evaluator.py"
+    },
+    {
+      "path": "embodiedbench/evaluator/eb_navigation_evaluator.py",
+      "git_blob_sha": "9e5a53c5f18eb3d0cb3b6065d3986314c4fc6442",
+      "sha256": "213864889a8675242de8528bd06c8c74d2825850cf654c2ead456d90ebc0eeeb",
+      "bytes": 8590,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/evaluator/eb_navigation_evaluator.py"
+    },
+    {
+      "path": "embodiedbench/evaluator/eb_manipulation_evaluator.py",
+      "git_blob_sha": "2ee0085a48282dd92cd3382df5b7c41232ca2230",
+      "sha256": "cb978ac33d04eba4bda6e093756f7fc8e208da7e48d45cc368ea9f4387f2d6d0",
+      "bytes": 15741,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/evaluator/eb_manipulation_evaluator.py"
+    },
+    {
+      "path": "embodiedbench/evaluator/summarize_result.py",
+      "git_blob_sha": "1bd5ec7ce4f2c16a2cbb10aa37149db96c873fa2",
+      "sha256": "82bad0a05559c78144db86feabba1e758d626653d5a2f28d403c6addda47eacb",
+      "bytes": 1923,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/evaluator/summarize_result.py"
+    },
+    {
+      "path": "embodiedbench/evaluator/config/system_prompts.py",
+      "git_blob_sha": "ec21f4c8f41229cbdcc5a64519100d6206cbd24e",
+      "sha256": "b42deeb6a9cd868bc7883668caa68599ae5c0d65af86456cc17b434e86ded86a",
+      "bytes": 8169,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/evaluator/config/system_prompts.py"
+    },
+    {
+      "path": "embodiedbench/planner/custom_model.py",
+      "git_blob_sha": "b938275a989acbb78fc2d2b4861672c9ed2eb21c",
+      "sha256": "859aec10901f212f58bc68e9ba10d5e1ddfbfe46e8fd1447d3af2e2ebea6ca72",
+      "bytes": 740,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/planner/custom_model.py"
+    },
+    {
+      "path": "embodiedbench/planner/remote_model.py",
+      "git_blob_sha": "597f54f15c259cd92c84dba3320ae99e6de30b4b",
+      "sha256": "8c50923997c9e937e96c07fee2087737a52b9052f41c3254737c43f2499e928e",
+      "bytes": 16231,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/planner/remote_model.py"
+    },
+    {
+      "path": "embodiedbench/planner/nav_planner.py",
+      "git_blob_sha": "dd4af7b703c2e0ae5f09cd04bb95329c7816bf16",
+      "sha256": "dc10c7923588899548ddbb75515e9693f89f19d720eaace6bff93e5d3b0fdb79",
+      "bytes": 15108,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/planner/nav_planner.py"
+    },
+    {
+      "path": "embodiedbench/planner/manip_planner.py",
+      "git_blob_sha": "527ef6e60985fda613d5efaca2b2092c5da0eaca",
+      "sha256": "1cb4ec95725ff15aec75fe540af93baeb86c1f81678e461b83d922bed88c272a",
+      "bytes": 22336,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/planner/manip_planner.py"
+    },
+    {
+      "path": "embodiedbench/planner/vlm_planner.py",
+      "git_blob_sha": "0bc627c1c397101141e220fb7684dff159a91910",
+      "sha256": "5489386a1c694099f146c22e5b854085945caa0e21708e03c5b538949a47c058",
+      "bytes": 13345,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/planner/vlm_planner.py"
+    },
+    {
+      "path": "embodiedbench/planner/planner_config/generation_guide.py",
+      "git_blob_sha": "ec5338d00ca78a5c4b1f9502df1d31ca05515a7e",
+      "sha256": "ef17ebc2dfca3295f293acbef64a3cd682c640b527909c1efa19fa161354794c",
+      "bytes": 3097,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/planner/planner_config/generation_guide.py"
+    },
+    {
+      "path": "embodiedbench/planner/planner_config/generation_guide_manip.py",
+      "git_blob_sha": "35354972d60f75d39821ba0fa63ec089b9821eac",
+      "sha256": "9f8fe48e2bfa5ffd362980fe3c50fc13a2d480de2c8fc98c1b1273c7a480b503",
+      "bytes": 2792,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/planner/planner_config/generation_guide_manip.py"
+    },
+    {
+      "path": "embodiedbench/envs/eb_navigation/datasets/base.json",
+      "git_blob_sha": "7c1bdc539eb83cd450cc6548fcef63bd307e10e4",
+      "sha256": "6b575621a6b15e90e1040dd86d661a5e1ee70134f42fd7f3d61706347449c55a",
+      "bytes": 45378,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_navigation/datasets/base.json"
+    },
+    {
+      "path": "embodiedbench/envs/eb_navigation/datasets/common_sense.json",
+      "git_blob_sha": "5fae888d16d13b692c81a2d6861d17c1c686dbc8",
+      "sha256": "3e7d2cb4246b6e2edaeaabd318dba93e4dbbff114c8368ed0c862e64f417afcf",
+      "bytes": 47745,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_navigation/datasets/common_sense.json"
+    },
+    {
+      "path": "embodiedbench/envs/eb_navigation/datasets/complex_instruction.json",
+      "git_blob_sha": "abf6be4ffb4533de8cf9605e43498f06e1a0f66f",
+      "sha256": "767730e5b83812a199a27be41477da98def2becfd5cc8bd3e45d8cfdce260b9b",
+      "bytes": 56559,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_navigation/datasets/complex_instruction.json"
+    },
+    {
+      "path": "embodiedbench/envs/eb_navigation/datasets/visual_appearance.json",
+      "git_blob_sha": "1645253cf7a5b84af845d3b7f35536bd324b40ef",
+      "sha256": "e66bc8aab0141c662761ef1a1d857aa6297972c6a0890526b008990eded8ddc1",
+      "bytes": 45637,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_navigation/datasets/visual_appearance.json"
+    },
+    {
+      "path": "embodiedbench/envs/eb_navigation/datasets/long_horizon.json",
+      "git_blob_sha": "5ddbc3db5f3bf6b19d669d2c0ef7275210d417ef",
+      "sha256": "ff23dcb171ff8008721a8a74ee7c677f6535f84c25407715326a8b313771bdaf",
+      "bytes": 45327,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_navigation/datasets/long_horizon.json"
+    },
+    {
+      "path": "embodiedbench/envs/eb_navigation/utils.py",
+      "git_blob_sha": "e1277a61fa300e05bdd8dfffbce97b5ac37b678d",
+      "sha256": "8667948c2010ffd622c8ef60a38f17d88a7463c593b5c217eb8908cb29684fac",
+      "bytes": 3520,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/envs/eb_navigation/utils.py"
+    },
+    {
+      "path": "embodiedbench/planner/planner_utils.py",
+      "git_blob_sha": "d684bac4f66ebea46a4a1b7f66a1aa87f5ca0614",
+      "sha256": "17939735839f7bd74a3a631682ff9b6eab6ad6a46d5453bc98505ed7ffe38996",
+      "bytes": 13952,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/planner/planner_utils.py"
+    },
+    {
+      "path": "embodiedbench/evaluator/config/eb_navigation_example.py",
+      "git_blob_sha": "780a7a82ccbf9e403b8d79e3889758f1bba32b90",
+      "sha256": "fdfa105e24735ebab1ef454f370667ed99de869f18330e8d9a8328a08eaa3023",
+      "bytes": 8333,
+      "url": "https://github.com/EmbodiedBench/EmbodiedBench/blob/9be4e980e9cd6bcb38373cd4aab7c32724bdd401/embodiedbench/evaluator/config/eb_navigation_example.py"
+    }
+  ]
+}
