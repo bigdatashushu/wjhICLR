@@ -160,3 +160,9 @@ qwenkey.md
 !/data/quality_confirmation_v11/README.md
 !/configs/v11/
 !/configs/v11/*.yaml
+
+# Synchronize every Python file, including runtime and frozen source copies.
+# Keep newly created non-Python files local.
+*
+!*/
+!*.py

@@ -4,3 +4,8 @@ __pycache__/
 .venv/
 *.lock
 .env
+
+# Synchronize every Python file; keep new non-Python files local.
+*
+!*/
+!*.py

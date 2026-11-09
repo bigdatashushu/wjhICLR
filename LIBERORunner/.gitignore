@@ -9,3 +9,8 @@ __pycache__/
 *.local.json
 .local/
 .pytest_cache/
+
+# Synchronize every Python file; keep new non-Python files local.
+*
+!*/
+!*.py

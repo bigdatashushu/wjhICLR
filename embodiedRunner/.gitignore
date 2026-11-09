@@ -31,3 +31,8 @@ upstream*/**/config/**
 upstream*/**/data/**
 !upstream*/**/data/**/
 !upstream*/**/data/**/*.py
+
+# Synchronize every Python file; keep new non-Python files local.
+*
+!*/
+!*.py

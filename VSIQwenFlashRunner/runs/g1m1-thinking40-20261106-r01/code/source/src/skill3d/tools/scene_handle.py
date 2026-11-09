@@ -1,0 +1,695 @@
+"""SceneHandle：Tool 访问重建产物的唯一只读句柄（硬约束 17）。
+
+Tool 不得自行读原始文件、不得绕过置信度图、不得访问未挂载路径。
+SceneHandle 只持有内存中的数组/对象结构，不暴露任何文件系统路径。
+
+v6 变化（D4/D5/D6）：
+- 可用产物由 `scene_route` × `question_tool_scope` 共同决定（`scale` 只在
+  `metric_enabled` 时可用），不再有 `scale_known` 中间量；
+- `world_up` / `handedness` 从 artifact 的**世界系契约**读入（M3 落盘、M4 校验），
+  缺失时 `up_direction()` 返回 None → 方向类 Tool 必须 fail-closed（§9.8）；
+- `object_points()` 让距离原语拿到对象 3D 点集（句柄负责加载与缓存，
+  Tool 仍然不接触路径）。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+from skill3d.schemas import ObjectRecord, SceneState
+
+from .category_match import matches, normalize
+from .image_ledger import ImageLedger
+from .contract import (
+    ARTIFACT_INTRINSICS,
+    ARTIFACT_OBJECTS,
+    ARTIFACT_POSES,
+    ARTIFACT_SCALE,
+    ConfidenceGateError,
+    DomainValueError,
+    route_aware_available,
+)
+from skill3d.schemas.tool import FailureCause
+
+PREPARED_ROOM_MEASUREMENT_VERSION = "prepared-room-measurement-v1"
+
+
+def canonical_payload_sha256(value) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, allow_nan=False,
+        separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def frozen_reconstruction_identity(artifact) -> str:
+    identity = str(getattr(artifact, "reconstruction_input_identity", "") or "")
+    if identity:
+        return identity
+    return canonical_payload_sha256({
+        "artifact_id": str(getattr(artifact, "artifact_id", "") or ""),
+        "artifact_version": str(getattr(artifact, "artifact_version", "") or ""),
+        "frame_set_hash": str(getattr(artifact, "frame_set_hash", "") or ""),
+    })
+
+
+def prepared_room_request(
+    *,
+    point_map_sha256: str,
+    metric_scale: float,
+    frozen_input_identity: str,
+    world_up,
+) -> dict:
+    from .distance_primitives import DistancePrimitiveParams
+
+    normalized_up = None
+    if world_up is not None:
+        up = np.asarray(world_up, dtype=np.float64)
+        if (up.shape != (3,) or not np.all(np.isfinite(up))
+                or np.linalg.norm(up) <= 1e-12):
+            raise ValueError(
+                "prepared room measurement world_up must be a finite nonzero 3-vector")
+        up = up / np.linalg.norm(up)
+        normalized_up = [float(value) for value in up]
+    implementation = Path(__file__).with_name("distance_primitives.py")
+    request = {
+        "contract_version": PREPARED_ROOM_MEASUREMENT_VERSION,
+        "tool": "plane_fit_room_size",
+        "point_map_sha256": str(point_map_sha256),
+        "metric_scale": float(metric_scale),
+        "distance_primitive_params": DistancePrimitiveParams().snapshot(),
+        "implementation_source_sha256": file_sha256(implementation),
+        "frozen_input_identity": str(frozen_input_identity),
+        "world_up": normalized_up,
+    }
+    return {**request, "request_sha256": canonical_payload_sha256(request)}
+
+
+class SceneHandle:
+    """SceneState 的只读运行期句柄。
+
+    - objects: ObjectRecord 列表（内存结构，非文件路径）
+    - c2w_list / intrinsics: numpy 数组序列（由重建管线加载后注入）
+    - 不提供任何 open()/路径访问接口（`object_points` 是唯一的数组读取入口，
+      且只读 `ObjectRecord` 自带的 ref）
+    """
+
+    def __init__(
+        self,
+        scene_state: SceneState,
+        objects: Optional[list[ObjectRecord]] = None,
+        c2w_list: Optional[np.ndarray] = None,
+        intrinsics: Optional[np.ndarray] = None,
+        quality_overall: Optional[float] = None,
+        objects_materialized: Optional[bool] = None,
+        metric_scale: Optional[float] = None,
+        grounding_coverage: Optional[dict] = None,
+        prepared_measurements: Optional[dict] = None,
+        point_map_sha256: str = "",
+        frozen_input_identity: str = "",
+        require_question_binding: bool = False,
+    ) -> None:
+        self._state = scene_state
+        self.require_question_binding = require_question_binding
+        self.grounding_coverage = dict(grounding_coverage or {})
+        self._prepared_measurements = dict(prepared_measurements or {})
+        self._point_map_sha256 = str(point_map_sha256 or "")
+        self._frozen_input_identity = str(frozen_input_identity or "")
+        # 世界系 → 米 的换算系数。优先用显式传入值（mock_light 的合成几何），
+        # 否则读运行时 artifact。
+        self._metric_scale = metric_scale
+        self._objects = {o.obj_id: o for o in (objects or [])}
+        self._consumed_object_ids: list[str] = []
+        self._resolved_object_ids: list[str] = []
+        self._consumed_dependency_refs: list[str] = []
+        # 硬约束 23：objects **产物是否已产出**与"产物里有没有对象"是两件事。
+        # - M5 未跑/失败 → 产物不存在 → `objects` 不可用 → Tool 抛 ArtifactUnavailableError；
+        # - M5 跑过但一个对象都没绑到 → 产物存在且为空 → `exists_in_scene` 返回 False。
+        # 未显式声明时保守按"空列表视为未产出"处理（老调用点语义不变）。
+        self._objects_materialized = (
+            bool(objects) if objects_materialized is None else bool(objects_materialized)
+        )
+        # category_name 小写索引，供 exists_in_scene / 名称解析
+        self._by_name: dict[str, str] = {}
+        for o in objects or []:
+            self._by_name.setdefault(o.category_name.lower(), o.obj_id)
+        self._c2w = None if c2w_list is None else np.asarray(c2w_list, dtype=np.float64)
+        self._k = None if intrinsics is None else np.asarray(intrinsics, dtype=np.float64)
+        self._quality_overall = quality_overall
+        # 对象 3D 点集缓存（距离原语用；只读 ObjectRecord 的 ref）
+        self._points_cache: dict[str, np.ndarray] = {}
+        # 对象逐点置信度缓存
+        self._conf_cache: dict[str, Optional[np.ndarray]] = {}
+        # 世界系点图 (N,H,W,3)（平面拟合/连通性图用；由重建管线注入）
+        self._point_map: Optional[np.ndarray] = None
+        # v9 §9.4：主动图像账本（帧集 + 产出/交付/观察三态）。
+        # runner 会用真实配置的 max_images 覆盖；这里给一个安全默认（32 = 服务上限）。
+        self._image_ledger = ImageLedger(episode_id=str(getattr(scene_state, "episode_id", "")
+                                                        or ""))
+
+    # ---- 只读元信息 ----
+    @property
+    def frame(self) -> str:
+        return "world"
+
+    @property
+    def scene_route(self) -> str:
+        """scene 级路由（只由 M4 质量决定；v6 D4）。"""
+        return self._state.scene_route
+
+    @property
+    def question_tool_scope(self) -> str:
+        """题级工具集范围（逐题派生收窄；v6 D4）。"""
+        return self._state.question_tool_scope
+
+    @property
+    def question_type(self) -> str:
+        """本 episode 的规范题型（逐题授权的第二维）。"""
+        return str(getattr(self._state, "question_type", "") or "")
+
+    @property
+    def allowed_metric_tasks(self) -> set[str]:
+        """本题被授权使用米制 Tool 的题型集合（空 = 未授权）。
+
+        v6：授权由 `MetricEvidenceGate` 主导（gate 通过 ∧ 题型是米制），
+        返回单元素集合或空集，供 `check_metric_task_contract` 的一致性校验使用。
+        """
+        qt = self.question_type
+        if qt and self._state.metric_task_authorized(qt):
+            return {qt}
+        return set()
+
+    @property
+    def summary(self) -> str:
+        return self._state.summary
+
+    @property
+    def metric_scale(self) -> Optional[float]:
+        """世界系 → 米 的换算系数（米/世界单位）。
+
+        米制 Tool 必须用它把世界单位换算成米，**不得**直接把世界单位当米返回。
+        未融合成功（None 或非有限）→ 米制 Tool fail-closed（硬约束 23）。
+        """
+        if self._metric_scale is not None:
+            return float(self._metric_scale)
+        art = getattr(self._state, "artifact", None)
+        v = getattr(art, "metric_scale", None)
+        return None if v is None else float(v)
+
+    @property
+    def metric_gate_passed(self) -> bool:
+        return self._state.metric_gate_passed
+
+    @property
+    def metric_evidence_gate_result(self):
+        """题级米制门结果（§6.4 授权收据的 `metric_gate_result` 来源）。
+
+        句柄只暴露状态里已有的门对象；没有门时返回 None，由收据侧记
+        `not_applicable`，**不伪造**一个失败的门。
+        """
+        return getattr(self._state, "metric_evidence_gate_result", None)
+
+    @property
+    def evidence_profile(self):
+        """当前 EvidenceProfile（Tool 可见性与降级标记的判据；无则 None）。"""
+        return getattr(self._state, "evidence_profile", None)
+
+    @property
+    def conf_warp_monotonic(self) -> Optional[bool]:
+        """VGGT conf 的 conf-warp 单调性自检结果（§10.3）。
+
+        `True` = conf 可作软权重；`False` = 不单调 → 降权；`None` = 未自检
+        → **完全不使用 conf 过滤**（保守；绝不把未验证的 conf 当硬门）。
+        """
+        art = getattr(self._state, "artifact", None)
+        q = getattr(art, "quality", None)
+        return getattr(q, "conf_warp_monotonic", None)
+
+    @property
+    def world_up(self) -> Optional[np.ndarray]:
+        """世界系"上"方向（M3 落盘的世界系契约；缺失 → None → 方向 Tool fail-closed）。"""
+        art = getattr(self._state, "artifact", None)
+        v = getattr(art, "world_up", None)
+        if v is None:
+            return None
+        arr = np.asarray(v, dtype=np.float64)
+        if arr.shape != (3,) or not np.all(np.isfinite(arr)):
+            return None
+        n = float(np.linalg.norm(arr))
+        if not np.isfinite(n) or n < 1e-9:
+            return None
+        return arr / n
+
+    @property
+    def handedness(self) -> Optional[str]:
+        art = getattr(self._state, "artifact", None)
+        v = getattr(art, "handedness", None)
+        return None if v is None else str(v)
+
+    @property
+    def world_frame_usable(self) -> bool:
+        """局部坐标约定检查，不是公共证据维度。"""
+        return self.world_up is not None and self.handedness in ("right", "left")
+
+    @property
+    def local_facts(self) -> dict[str, bool]:
+        return {"world_frame": self.world_frame_usable}
+
+    @property
+    def quality_overall(self) -> Optional[float]:
+        return self._quality_overall
+
+    @property
+    def quality_status(self) -> str:
+        """质量状态（来自 artifact 的单一事实源；无 artifact 时 not_computed）。"""
+        art = getattr(self._state, "artifact", None)
+        return str(getattr(art, "quality_status", "not_computed"))
+
+    @property
+    def available_artifacts(self) -> set[str]:
+        """可用产物集合（v6：`scene_route` × `question_tool_scope` 共同决定）。
+
+        句柄上真正装载/可用的东西会进一步收窄集合（例如未注入 c2w → 不可称 poses
+        可用，避免"声明可用但实际读不到"的静默错答）。
+
+        `scale` 只在**本题被授权使用米制 Tool**（题型是米制 ∧ gate 通过 ∧
+        scope=metric_enabled）时可用；这样"米制失败"只收回米制工具，
+        `depth/poses/point_cloud/objects` 与相对几何 Tool 不受影响（§7.2/§7.3）。
+        """
+        declared = route_aware_available(
+            getattr(self._state, "available_artifacts", None), self.scene_route)
+        if self._c2w is None:
+            declared -= {ARTIFACT_POSES}
+        if self._k is None:
+            declared -= {ARTIFACT_INTRINSICS, ARTIFACT_POSES}
+        if not self._objects_materialized:
+            declared -= {ARTIFACT_OBJECTS}
+        if not self._state.metric_task_authorized(self.question_type):
+            declared -= {ARTIFACT_SCALE}
+        return declared
+
+    @property
+    def objects_materialized(self) -> bool:
+        """objects 产物是否已产出（决定 `exists_in_scene` 返回 False 还是抛错）。"""
+        return self._objects_materialized
+
+    def binding_usable(self, object_id: str) -> bool:
+        from skill3d.segmentation.binding_validation import binding_is_usable
+        obj = self._objects.get(object_id)
+        return bool(obj and binding_is_usable(obj, strict=self.require_question_binding))
+
+    def object_mask_frames(self, object_id: str) -> list[int]:
+        """按实际 mask 检查可见帧，独立于对象点云与几何门。"""
+        from .contract import ConfidenceGateError
+        from skill3d.schemas.tool import FailureCause
+
+        obj = self.get_object(object_id)
+        if not self.require_question_binding and not obj.mask_per_frame:
+            return sorted(set(int(i) for i in obj.visible_frames))
+        try:
+            mask = np.load(obj.mask_per_frame, allow_pickle=False, mmap_mode="r")
+            if mask.ndim != 3 or not np.isin(mask, [0, 1]).all():
+                raise ValueError("invalid mask shape or values")
+            visible = np.flatnonzero(mask.any(axis=(1, 2))).tolist()
+            if visible != list(obj.visible_frames):
+                raise ValueError("mask and visible_frames disagree")
+            return visible
+        except (OSError, ValueError, TypeError) as exc:
+            raise ConfidenceGateError(
+                "object_visible_frames", f"Object {obj.obj_id} mask is unavailable: {exc}",
+                failure_cause=FailureCause(code="object_mask_unavailable",
+                    scope="local_call")) from exc
+
+    def category_binding_complete(self, name: str) -> bool:
+        """A full scan with usable instances is required; failure is not absence."""
+        if not self.require_question_binding:
+            return self._objects_materialized
+        if name in self._objects:
+            name = self._objects[name].category_name
+        from skill3d.tools.category_match import matches
+        rows = [row for row in self.grounding_coverage.get("requirements", [])
+                if matches(row["name"], name)]
+        return bool(rows) and all(
+            row.get("scan_complete") and row.get("status") == "candidates_available"
+            and not row.get("binding_failures")
+            and bool(row.get("usable_object_ids"))
+            and all(self.binding_usable(oid) for oid in row["usable_object_ids"])
+            for row in rows)
+
+    @property
+    def frame_set_hash(self) -> str:
+        return str(getattr(self._state, "frame_set_hash", "") or "")
+
+    @property
+    def point_map_sha256(self) -> str:
+        return self._point_map_sha256
+
+    @property
+    def frozen_input_identity(self) -> str:
+        return self._frozen_input_identity
+
+    def prepared_measurement(self, tool: str) -> Optional[dict]:
+        value = self._prepared_measurements.get(str(tool))
+        return None if value is None else dict(value)
+
+    # ---- v9 §9.4 主动图像：冻结帧集 + episode 图像账本 ----
+    #
+    # 写入口全部是**下划线私有**：`ast_guard` 禁止模型访问下划线属性，因此模型程序
+    # 无法直接改共享状态（§9.4"agent 不能直接修改共享状态"）；只有工具（框架代码）
+    # 能经这些方法产出图像、并入新检出。
+    def _set_frames(self, pixel_ids: Sequence[int], pixels: Sequence[np.ndarray],
+                    source_frame_indices: Optional[Sequence[int]] = None) -> None:
+        """登记本 episode **实际可读**的帧（槽位 → 像素 + 槽位 → 物理源帧号）。
+
+        `pixel_ids` 是**槽位**（0..n-1，模型指帧口径）；`source_frame_indices` 是这些
+        槽位对应的视频物理帧号（审计用，可缺省）。
+        """
+        self._image_ledger.set_frames(pixel_ids, pixels,
+                                      source_frame_indices=source_frame_indices)
+        self._image_ledger.ensure_frame_records()
+
+    def _set_image_ledger(self, ledger) -> None:
+        self._image_ledger = ledger
+
+    @property
+    def _ledger(self):
+        """图像账本本体（框架/工具内部用；模型访问会撞下划线属性禁令）。"""
+        return self._image_ledger
+
+    @property
+    def ledger_view(self) -> dict:
+        """账本的**只读投影**（三态 + 每轮清单 + 统计），供 trace/审计读取。"""
+        return self._image_ledger.to_dict()
+
+    @property
+    def readable_frame_ids(self) -> list[int]:
+        return self._image_ledger.frame_ids
+
+    def has_frames(self) -> bool:
+        return self._image_ledger.has_frames()
+
+    def _add_detected_objects(self, records: Sequence[ObjectRecord]) -> list[str]:
+        """把 `detect_objects` 的新检出并入 episode 对象记录（框架侧，§9.4）。
+
+        返回新增对象 id。**不**改写 EvidenceProfile（不做未授权的证据升级），
+        只让后续工具调用（`list_objects`/`count_objects`/…）能看到这些记录。
+        """
+        added: list[str] = []
+        for rec in records:
+            if rec.obj_id in self._objects:
+                continue
+            self._objects[rec.obj_id] = rec
+            self._by_name.setdefault(rec.category_name.lower(), rec.obj_id)
+            added.append(rec.obj_id)
+        if added:
+            self._objects_materialized = True
+        return added
+
+    # ---- 对象访问 ----
+    def _record_object_dependency(self, object_id: str) -> None:
+        if object_id not in self._consumed_object_ids:
+            self._consumed_object_ids.append(object_id)
+
+    def _record_dependency(self, ref: str) -> None:
+        if ref not in self._consumed_dependency_refs:
+            self._consumed_dependency_refs.append(ref)
+
+    def _require_object_binding(self, obj: ObjectRecord, tool: str) -> None:
+        conflicts = [
+            flag for flag in (obj.binding_flags or [])
+            if flag.get("code") == "semantic_label_mask_conflict"
+        ]
+        if conflicts:
+            audit_ids = sorted({
+                str(flag.get("audit_sha256") or "") for flag in conflicts
+                if flag.get("audit_sha256")
+            })
+            raise ConfidenceGateError(
+                tool,
+                f"Object {obj.obj_id} ({obj.category_name}) failed binding integrity: "
+                "semantic_label_mask_conflict. Geometry derived from this object is "
+                f"blocked; use the frozen images instead. audit_sha256={audit_ids}",
+                args={"object_id": obj.obj_id, "binding_flags": conflicts},
+                failure_cause=FailureCause(
+                    code="semantic_label_mask_conflict", scope="local_object",
+                    object_ids=[obj.obj_id], audit_ids=audit_ids))
+        if not self.binding_usable(obj.obj_id):
+            raise ConfidenceGateError(
+                tool, f"Object {obj.obj_id} has no usable verified M5 binding; "
+                "use the frozen images.",
+                args={"object_id": obj.obj_id},
+                failure_cause=FailureCause(code="object_binding_unavailable",
+                    scope="local_object", object_ids=[obj.obj_id]))
+
+    def _validated_centroid(self, obj: ObjectRecord, tool: str) -> np.ndarray:
+        c = np.asarray(obj.centroid_world, dtype=np.float64)
+        if c.shape != (3,):
+            raise DomainValueError(
+                tool, f"Object {obj.obj_id} has an invalid centroid shape: {obj.centroid_world}",
+                args={"obj_id": obj.obj_id},
+                failure_cause=FailureCause(code="invalid_centroid",
+                    scope="local_object", object_ids=[obj.obj_id]))
+        if not np.all(np.isfinite(c)):
+            raise DomainValueError(
+                tool, f"Object {obj.obj_id} centroid contains NaN/Inf: {obj.centroid_world}",
+                args={"obj_id": obj.obj_id},
+                failure_cause=FailureCause(code="invalid_centroid",
+                    scope="local_object", object_ids=[obj.obj_id]))
+        return c
+
+    def list_objects(self) -> list[str]:
+        return sorted(self._objects.keys())
+
+    def object_records(self) -> list[ObjectRecord]:
+        """自描述对象清单（§8：`list_objects()` 返回含 category_name 的记录）。"""
+        return [self._objects[oid] for oid in self.list_objects()]
+
+    def list_objects_by_name(self, name: str = "") -> list[str]:
+        """按类别名过滤对象 id（空 = 全部）。
+
+        匹配走 `tools.category_match.matches`（归一化分隔符 + 同义词 + 单复数 +
+        登记的外观前缀），不按子串或任意共享单词匹配。清单里是 `phone` /
+        `trash_can`，题面写 `telephone` / `trash can`，朴素子串匹配两者都返回空 →
+        整类题型 abstain。详见 category_match 模块头。
+
+        计数题必须靠这个（`exists_in_scene` 是布尔，拿它当计数器只能得到 0/1）。
+        """
+        h = str(name or "").strip()
+        if not h:
+            return self.list_objects()
+        out = []
+        for oid in self.list_objects():
+            obj = self._objects.get(oid)
+            val = str(getattr(obj, "category_name", "") or "")
+            if matches(h, val):
+                out.append(oid)
+        return out
+
+    def object_category_name(self, object_id: str) -> str:
+        obj = self._objects.get(str(object_id))
+        return str(getattr(obj, "category_name", "") or "")
+
+    def resolve_object_id(self, name_or_id: str) -> str:
+        """按 obj_id、类别名（归一化匹配）或唯一候选解析对象。
+
+        解析顺序：obj_id 精确 → 类别名精确 → 类别名归一化/同义词匹配。
+        同一优先级存在多个实例时返回受控歧义错误，要求调用方检查可见帧并传 obj_id。
+        """
+        if name_or_id in self._objects:
+            return name_or_id
+        key = normalize(name_or_id)
+        if not key:
+            raise KeyError("Object name must not be empty")
+        exact = [oid for oid in self.list_objects()
+                 if normalize(self._objects[oid].category_name) == key]
+        cands = exact or self.list_objects_by_name(name_or_id)
+        if len(cands) == 1:
+            return cands[0]
+        if cands:
+            raise DomainValueError(
+                "resolve_object_id",
+                f"ambiguous_object: {name_or_id!r} matches multiple instances {cands}; "
+                "use list_objects to inspect visible frames, confirm the instance, then pass an explicit obj_id",
+                args={"name": name_or_id, "candidate_object_ids": cands},
+                failure_cause=FailureCause(code="ambiguous_object", scope="local_call"))
+        raise KeyError(f"Object does not exist: {name_or_id}")
+
+    def get_object(self, name_or_id: str) -> ObjectRecord:
+        return self._objects[self.resolve_object_id(name_or_id)]
+
+    def object_points(self, name_or_id: str) -> np.ndarray:
+        """对象世界系 3D 点集 (N,3)（距离原语用）。
+
+        只读 `ObjectRecord.pointcloud_world` 这个 ref —— Tool 仍然不接触文件路径。
+        ref 为空/文件缺失 → 返回空 (0,3) 数组（调用方按 N_min 判 degraded，
+        **不**在这里伪造点）。
+        """
+        oid = self.resolve_object_id(name_or_id)
+        if self.require_question_binding and not self.binding_usable(oid):
+            raise ValueError(f"Unverified M5 object point cloud: {oid}")
+        if oid in self._points_cache:
+            return self._points_cache[oid]
+        ref = str(getattr(self._objects[oid], "pointcloud_world", "") or "")
+        pts = np.zeros((0, 3), dtype=np.float64)
+        if ref:
+            p = Path(ref)
+            if p.is_file():
+                try:
+                    arr = np.load(p)
+                except Exception:  # noqa: BLE001 - 坏文件不阻断（降级为无点）
+                    arr = None
+                if arr is not None:
+                    arr = np.asarray(arr, dtype=np.float64)
+                    pts = arr if arr.ndim == 2 else np.zeros((0, 3), dtype=np.float64)
+        self._points_cache[oid] = pts
+        return pts
+
+    def object_centroid_world(self, name_or_id: str) -> np.ndarray:
+        obj = self.get_object(name_or_id)
+        return np.asarray(obj.centroid_world, dtype=np.float64)
+
+    def set_object_points(self, name_or_id: str, points) -> None:
+        """注入对象世界系点集（内存路径：重建管线/合成场景已有数组时用）。
+
+        仍然**不暴露路径**：只是把调用方已有的数组放进只读缓存，Tool 侧行为与
+        `object_points()` 完全一致（后续调用直接命中缓存）。真实路径用
+        `ObjectRecord.pointcloud_world` 文件 ref 时不需要调用本方法。
+        """
+        oid = self.resolve_object_id(name_or_id)
+        arr = np.asarray(points, dtype=np.float64)
+        self._points_cache[oid] = (arr if arr.ndim == 2 and arr.shape[1] == 3
+                                   else arr.reshape(-1, 3))
+
+    def object_point_conf(self, name_or_id: str) -> Optional[np.ndarray]:
+        """对象点云的逐点置信度 (N,)（VGGT conf，经 conf-warp 自检后才被使用）。
+
+        ref 缺失/文件损坏 → None（调用方把 conf 当作"不可用"，**不**伪造 1.0）。
+        """
+        oid = self.resolve_object_id(name_or_id)
+        if oid in self._conf_cache:
+            return self._conf_cache[oid]
+        ref = str(getattr(self._objects[oid], "pointconf_world", "") or "")
+        conf: Optional[np.ndarray] = None
+        p = Path(ref) if ref else None
+        if p is not None and p.is_file():
+            try:
+                arr = np.asarray(np.load(p), dtype=np.float64).reshape(-1)
+            except Exception:  # noqa: BLE001 - 坏文件不阻断（降级为 conf 不可用）
+                arr = None
+            if arr is not None and arr.size:
+                pts = self.object_points(oid)
+                if pts.shape[0] == arr.size:
+                    conf = arr
+        self._conf_cache[oid] = conf
+        return conf
+
+    def connectivity_graph(self) -> dict:
+        """场景连通性/可达图（§9.10；route_planning 用）。
+
+        做法（阈值全 `[TODO_CALIBRATE]`）：世界系点云投影到地面平面 → 高度带
+        占据栅格 → 自由空间连通域 → 对象/起点按所在自由域判定可达。
+        `world_up` 缺失 → 抛错（fail-closed，绝不猜竖直方向）。
+        """
+        up = self.world_up
+        if up is None:
+            raise KeyError("World frame contract missing (world_up=None); cannot build connectivity on the correct plane")
+        pm = self.get_point_map()
+        if pm is None or pm.size == 0:
+            raise KeyError("No world point map was provided; cannot build the connectivity graph")
+        from skill3d.tools.connectivity import build_connectivity_graph
+
+        objects = []
+        for obj in self._objects.values():
+            if obj.obj_id not in self._resolved_object_ids:
+                self._resolved_object_ids.append(obj.obj_id)
+            self._require_object_binding(obj, "connectivity_graph")
+            centroid = self._validated_centroid(obj, "connectivity_graph")
+            self._record_object_dependency(obj.obj_id)
+            objects.append((obj.obj_id, centroid))
+        return build_connectivity_graph(
+            point_map=np.asarray(pm, dtype=np.float64).reshape(-1, 3),
+            up=up,
+            objects=objects,
+            start=self.camera_center(0),
+        )
+
+    def up_direction(self) -> Optional[np.ndarray]:
+        """兼容入口：等价于 `world_up`（v6 起来自 artifact 的世界系契约）。
+
+        历史缺陷（保留作记录）：v5 曾在这里用"包围盒最小 extent 轴"猜竖直轴，
+        实测 `acd95847c5` 的最小 extent 是 z，而相机上方向主分量是 **y** →
+        `relative_direction` 在错误的平面里算 left/right，四个 rel_direction 题全错。
+        v6 的世界系契约由 M3 的位姿束估计给出，**不再**从场景几何猜。
+        """
+        return self.world_up
+
+    def camera_center(self, frame_idx: int = 0) -> np.ndarray:
+        """相机中心（世界系）。主相机 = 首帧（世界系原点，c2w[0]=I）。"""
+        if self._c2w is None:
+            raise KeyError("SceneHandle has no c2w_list (missing reconstruction artifact)")
+        return np.asarray(self._c2w[frame_idx][:3, 3], dtype=np.float64)
+
+    def exists(self, name_or_id: str) -> bool:
+        if name_or_id in self._objects:
+            return True
+        return bool(str(name_or_id or "").strip()
+                    and self.list_objects_by_name(name_or_id))
+
+    # ---- 相机参数 ----
+    def get_c2w(self, frame_idx: int) -> np.ndarray:
+        if self._c2w is None:
+            raise KeyError("SceneHandle has no c2w_list (missing reconstruction artifact)")
+        return self._c2w[frame_idx]
+
+    def get_intrinsics(self, frame_idx: int) -> np.ndarray:
+        if self._k is None:
+            raise KeyError("SceneHandle has no intrinsics (missing reconstruction artifact)")
+        return self._k[frame_idx] if self._k.ndim == 3 else self._k
+
+    def get_point_map(self) -> Optional[np.ndarray]:
+        """世界系点图 (N,H,W,3)（平面拟合/连通性图用；未注入则 None）。"""
+        return self._point_map
+
+    def set_point_map(self, point_map: Optional[np.ndarray]) -> None:
+        self._point_map = (None if point_map is None
+                           else np.asarray(point_map, dtype=np.float64))
+
+    # ---- 场景包围盒（世界系）----
+    def scene_bbox(self) -> tuple[np.ndarray, np.ndarray]:
+        """由所有对象 bbox（[min_x,min_y,min_z,max_x,max_y,max_z]）求并集。"""
+        if not self._objects:
+            raise ValueError("The scene has no objects; cannot compute a bounding box")
+        mins, maxs = [], []
+        for o in self._objects.values():
+            if len(o.bbox) != 6:
+                raise ValueError(f"Object {o.obj_id} has an invalid bbox shape: {o.bbox}")
+            mins.append(np.asarray(o.bbox[:3], dtype=np.float64))
+            maxs.append(np.asarray(o.bbox[3:], dtype=np.float64))
+        return np.minimum.reduce(mins), np.maximum.reduce(maxs)
+
+    # ---- 状态指纹（mock_replay 校验用）----
+    def state_digest(self) -> str:
+        payload = {
+            "artifact_ref": self._state.artifact_ref,
+            "scene_route": self._state.scene_route,
+            "question_tool_scope": self._state.question_tool_scope,
+            "question_type": self.question_type,
+            "objects": sorted(self._objects.keys()),
+            "available_artifacts": sorted(self.available_artifacts),
+            "frame_set_hash": self.frame_set_hash,
+            "c2w": None if self._c2w is None else hashlib.sha256(self._c2w.tobytes()).hexdigest(),
+            "k": None if self._k is None else hashlib.sha256(self._k.tobytes()).hexdigest(),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

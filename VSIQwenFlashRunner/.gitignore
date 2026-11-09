@@ -16,3 +16,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Synchronize every Python file; keep new non-Python files local.
+*
+!*/
+!*.py

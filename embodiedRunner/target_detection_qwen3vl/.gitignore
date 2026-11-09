@@ -1,2 +1,7 @@
 __pycache__/
 runs/
+
+# Synchronize every Python file; keep new non-Python files local.
+*
+!*/
+!*.py

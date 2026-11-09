@@ -7,3 +7,8 @@ runs/
 *.env
 *.local.env
 .DS_Store
+
+# Synchronize every Python file; keep new non-Python files local.
+*
+!*/
+!*.py

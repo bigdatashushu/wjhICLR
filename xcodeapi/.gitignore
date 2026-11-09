@@ -5,3 +5,8 @@ profiles.local.json
 local/
 results/
 __pycache__/
+
+# Synchronize every Python file; keep new non-Python files local.
+*
+!*/
+!*.py

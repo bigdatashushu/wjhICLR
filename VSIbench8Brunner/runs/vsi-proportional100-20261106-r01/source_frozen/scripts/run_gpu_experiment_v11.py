@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""Download pinned weights and run the real v11 GPU experiment pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any
+
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from skill3d.infra.experiment_startup import (
+    MODE_ENV, RECEIPT_ENV, RUN_ID_RE, configure_run, freeze_working_tree,
+    verify_source_receipt,
+)
+from skill3d.online.config import (
+    config_receipt, load_config, load_yaml, online_model_from, resolve_runtime,
+    resolve_detector_endpoint,
+)
+
+_COMMIT_RE = __import__("re").compile(r"^[0-9a-f]{40}$")
+
+
+class GPUExperimentError(RuntimeError):
+    """A prerequisite or subprocess failed; no result may be claimed."""
+
+
+def _read_config(path: Path) -> dict:
+    value = load_yaml(path)
+    detector = resolve_detector_endpoint(value.get("experiment"))
+    value["experiment"].update(detector_endpoint=detector["endpoint"],
+                               detector_endpoint_source=detector["source"])
+    runtime = value["runtime"]
+    if type(runtime.get("geometry_gpu")) is not int or runtime["geometry_gpu"] < 0:
+        raise GPUExperimentError("runtime.geometry_gpu must be a non-negative integer")
+    if type(value["experiment"]["seed"]) is not int or value["experiment"]["seed"] < 0:
+        raise GPUExperimentError("experiment.seed must be a non-negative integer")
+    return value
+
+
+def _json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(_json_bytes(value))
+    temporary.replace(path)
+
+
+def _git(root: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise GPUExperimentError(
+            f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def _gpu_inventory() -> list[dict]:
+    binary = shutil.which("nvidia-smi")
+    if binary is None:
+        raise GPUExperimentError("nvidia-smi not found")
+    result = subprocess.run(
+        [
+            binary,
+            "--query-gpu=index,name,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        raise GPUExperimentError(f"nvidia-smi failed: {result.stderr.strip()}")
+    rows = []
+    for line in result.stdout.splitlines():
+        index, name, memory, driver = [part.strip() for part in line.split(",", 3)]
+        rows.append({
+            "index": int(index),
+            "name": name,
+            "memory_total_mib": int(memory),
+            "driver_version": driver,
+        })
+    return rows
+
+
+def _preflight(
+    root: Path,
+    work_dir: Path,
+    cfg: dict,
+    *,
+    dry_run: bool,
+) -> dict:
+    environment = cfg["environment"]
+    experiment = cfg["experiment"]
+    if platform.system() != "Linux" and not dry_run:
+        raise GPUExperimentError("GPU experiment launcher requires Linux")
+    if any("final_test" in str(value) for value in experiment.values()):
+        raise GPUExperimentError("this launcher must not contain final_test inputs")
+    if experiment.get("formal"):
+        if not experiment.get("accept_model_licenses") and not dry_run:
+            raise GPUExperimentError(
+                "formal run requires experiment.accept_model_licenses=true")
+        if not experiment.get("accept_vsi_bench_license") and not dry_run:
+            raise GPUExperimentError(
+                "formal run requires experiment.accept_vsi_bench_license=true")
+        confirmation = Path(
+            str(experiment.get("quality_confirmation") or "")).expanduser()
+        if not confirmation.is_file() and not dry_run:
+            raise GPUExperimentError(
+                "formal run requires an existing quality_confirmation JSON")
+    video_value = str(experiment.get("video_root") or "")
+    video_root = Path(video_value).expanduser() if video_value else None
+    if (
+        (
+            video_root is None
+            or not video_root.is_dir()
+            or not any(video_root.rglob("*.mp4"))
+        )
+        and not dry_run
+    ):
+        raise GPUExperimentError(
+            "real GPU pipeline requires a non-empty licensed VSI-Bench video_root")
+    free_gib = shutil.disk_usage(work_dir.parent).free / (1024 ** 3)
+    required_disk = float(environment.get("min_free_disk_gib", 80))
+    if free_gib < required_disk and not dry_run:
+        raise GPUExperimentError(
+            f"free disk {free_gib:.1f} GiB < required {required_disk:.1f} GiB")
+    gpus = [] if dry_run else _gpu_inventory()
+    required_count = int(environment.get("min_gpu_count", 1))
+    required_memory = float(environment.get("min_gpu_memory_gib", 20)) * 1024
+    if not dry_run and len(gpus) < required_count:
+        raise GPUExperimentError(
+            f"found {len(gpus)} GPUs, need at least {required_count}")
+    geometry_gpu = int(cfg["runtime"]["geometry_gpu"])
+    if not dry_run and geometry_gpu not in {gpu["index"] for gpu in gpus}:
+        raise GPUExperimentError("configured GPU index is absent")
+    selected = [gpu for gpu in gpus if gpu["index"] == geometry_gpu]
+    if not dry_run and any(
+        gpu["memory_total_mib"] < required_memory for gpu in selected
+    ):
+        raise GPUExperimentError(
+            f"selected GPUs need at least {required_memory / 1024:.1f} GiB")
+    if not dry_run and not os.environ.get("DASHSCOPE_API_KEY", "").strip():
+        raise GPUExperimentError(
+            "online qwen3.8-flash requires DASHSCOPE_API_KEY")
+    receipt = (verify_source_receipt(Path(os.environ[RECEIPT_ENV]), root)
+               if os.environ.get(RECEIPT_ENV) else None)
+    commit = receipt["base_commit"] if receipt else _git(root, "rev-parse", "HEAD")
+    if not _COMMIT_RE.fullmatch(commit):
+        raise GPUExperimentError("current code is not at a full Git commit")
+    dirty = receipt["git_dirty"] if receipt else bool(_git(root, "status", "--porcelain"))
+    if experiment.get("formal") and dirty and not dry_run:
+        raise GPUExperimentError(
+            "formal run requires a clean detached/pinned code checkout")
+    return {
+        "platform": platform.platform(),
+        "python": sys.version,
+        "code_commit": commit,
+        "git_dirty": bool(dirty),
+        "source_sha256": receipt["source_sha256"] if receipt else "",
+        "run_mode": experiment.get("run_mode", "formal" if experiment.get("formal") else "development"),
+        "free_disk_gib": round(free_gib, 2),
+        "gpus": gpus,
+    }
+
+
+def _validate_weight_config(cfg: dict) -> None:
+    for name, entry in cfg["weights"].items():
+        if name == "moge2" and not entry.get("enabled"):
+            continue
+        revision = str(entry.get("revision") or "")
+        if not _COMMIT_RE.fullmatch(revision):
+            raise GPUExperimentError(
+                f"weights.{name}.revision must be a 40-char commit")
+        if not str(entry.get("repo_id") or ""):
+            raise GPUExperimentError(f"weights.{name}.repo_id is empty")
+
+
+def _snapshot_files(root: Path) -> list[dict]:
+    files = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or ".cache" in path.relative_to(root).parts:
+            continue
+        files.append({
+            "path": path.relative_to(root).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": _sha256_file(path),
+        })
+    if not files:
+        raise GPUExperimentError(f"downloaded snapshot is empty: {root}")
+    return files
+
+
+def _existing_weight_path(entry: dict) -> tuple[Path | None, str]:
+    value = str(entry.get("existing_path") or "")
+    if not value:
+        return None, ""
+    path = Path(value).expanduser().resolve()
+    if not path.is_dir():
+        return None, ""
+    revision = str(entry.get("revision") or "")
+    snapshot = path / "snapshots" / revision
+    if _COMMIT_RE.fullmatch(revision) and snapshot.is_dir():
+        return snapshot, revision
+    if path.parent.name == "snapshots" and path.name == revision:
+        return path, revision
+    # A mutable directory or refs/main is not proof of the requested revision.
+    return None, ""
+
+
+def _download_weights(
+    cfg: dict,
+    weight_root: Path,
+    *,
+    dry_run: bool,
+) -> tuple[dict, dict[str, Path]]:
+    _validate_weight_config(cfg)
+    if dry_run:
+        paths = {}
+        for name, entry in cfg["weights"].items():
+            if name == "moge2" and not entry.get("enabled"):
+                continue
+            existing, _revision = _existing_weight_path(entry)
+            paths[name] = existing or weight_root / name
+        return {"status": "dry_run", "models": {}}, paths
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise GPUExperimentError(
+            "huggingface_hub is required to download weights") from exc
+    models: dict[str, dict] = {}
+    paths: dict[str, Path] = {}
+    for name, entry in cfg["weights"].items():
+        if name == "moge2" and not entry.get("enabled"):
+            continue
+        revision = str(entry["revision"])
+        existing, existing_revision = _existing_weight_path(entry)
+        if existing is not None:
+            destination = existing
+            source = "existing_pinned_snapshot"
+        else:
+            destination = weight_root / name / revision
+            destination.mkdir(parents=True, exist_ok=True)
+            try:
+                snapshot_download(
+                    repo_id=str(entry["repo_id"]),
+                    revision=revision,
+                    local_dir=str(destination),
+                    token=os.environ.get("HF_TOKEN") or None,
+                )
+            except Exception as exc:
+                raise GPUExperimentError(
+                    f"failed to download {name} at pinned revision {revision}: {exc}"
+                ) from exc
+            source = "downloaded_pinned_revision"
+        files = _snapshot_files(destination)
+        models[name] = {
+            "repo_id": str(entry["repo_id"]),
+            "revision": revision,
+            "existing_revision": existing_revision,
+            "source": source,
+            "local_path": str(destination),
+            "n_files": len(files),
+            "total_bytes": sum(row["size"] for row in files),
+            "files": files,
+        }
+        paths[name] = destination
+    manifest = {
+        "schema_version": "skill3d-weight-manifest-v11/1.0",
+        "status": "complete",
+        "models": models,
+    }
+    manifest["manifest_sha256"] = hashlib.sha256(
+        _json_bytes(manifest)).hexdigest()
+    _write_json(weight_root / "weight_manifest.json", manifest)
+    return manifest, paths
+
+
+def _command_env(
+    root: Path,
+    cfg: dict,
+    weights: dict[str, Path],
+) -> dict[str, str]:
+    environment = os.environ.copy()
+    pythonpath = [str(root / "src"), str(root / "third_party" / "vggt")]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment.update({
+        "PYTHONPATH": os.pathsep.join(pythonpath),
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "SKILL3D_VGGT_CHECKPOINT": str(weights["vggt"]),
+        "SKILL3D_SAM2_CHECKPOINT": str(
+            weights["sam2"] / cfg["weights"]["sam2"]["checkpoint_file"]),
+        "SKILL3D_SAM2_CONFIG": str(cfg["weights"]["sam2"]["config"]),
+        "SKILL3D_ALLOW_HF_DOWNLOAD": "",
+    })
+    detector = resolve_detector_endpoint(cfg["experiment"])
+    environment["SKILL3D_DETECTOR_ENDPOINT"] = detector["endpoint"]
+    # Receipt matching is performed by M5 against the live process and endpoint.
+    receipt = cfg["experiment"].get("detector_receipt")
+    if receipt:
+        environment["SKILL3D_DETECTOR_RECEIPT"] = str(receipt)
+    else:
+        environment.pop("SKILL3D_DETECTOR_RECEIPT", None)
+    if "moge2" in weights:
+        environment["SKILL3D_MOGE2_CHECKPOINT"] = str(weights["moge2"] / "model.pt")
+    return environment
+
+
+def _run(
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    dry_run: bool,
+    commands: list[dict],
+    stage: str,
+) -> None:
+    commands.append({"stage": stage, "command": command})
+    print("+", " ".join(command), flush=True)
+    if dry_run:
+        return
+    result = subprocess.run(command, cwd=cwd, env=env, check=False)
+    if result.returncode:
+        raise GPUExperimentError(
+            f"stage {stage} failed with exit code {result.returncode}")
+
+
+def _quality_confirmation_ok(path: Path) -> bool:
+    from skill3d.evaluation.skill_ablation_v11 import quality_contract
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    contract = quality_contract()
+    if "scenes" not in value:
+        return bool(
+            value.get("confirmed") is True
+            and value.get("sha256") == contract["sha256"]
+            and value.get("evidence_ref")
+        )
+    for row in value["scenes"]:
+        scene_path = Path(str(row.get("path") or "")).expanduser()
+        if not scene_path.is_absolute():
+            scene_path = path.parent / scene_path
+        if not scene_path.is_file():
+            return False
+        try:
+            scene = json.loads(scene_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        # M2: this flag confirms the rules/identity, never scene main_gate_passed.
+        # A genuine low-quality scene may (and should) still have confirmed=True.
+        if scene.get("confirmed") is not True:
+            return False
+        if scene.get("sha256", scene.get("quality_contract_sha256")) != contract["sha256"]:
+            return False
+        if not scene.get("evidence_ref"):
+            return False
+        if scene.get("scene_name") != row.get("scene_name"):
+            return False
+    return bool(value["scenes"])
+
+
+def _pipeline(
+    root: Path,
+    run_root: Path,
+    cfg: dict,
+    weights: dict[str, Path],
+    *,
+    dry_run: bool,
+    weight_manifest: dict | None = None,
+) -> list[dict]:
+    experiment = cfg["experiment"]
+    runtime = cfg["runtime"]
+    commands: list[dict] = []
+    env = _command_env(root, cfg, weights)
+    env[MODE_ENV] = experiment.get(
+        "run_mode", "formal" if experiment.get("formal") else "development")
+    from importlib.metadata import distributions
+    sam2_runtime = {"status": "not_probed_dry_run"}
+    if not dry_run:
+        # A dry-run must work before model dependencies are installed.
+        from skill3d.infra.version_lock import sam2_runtime_identity
+        sam2_runtime = sam2_runtime_identity()
+    environment = {
+        "python": sys.version, "platform": platform.platform(),
+        "packages": sorted((dist.metadata["Name"], dist.version)
+                           for dist in distributions() if dist.metadata["Name"]),
+        "sam2_runtime": sam2_runtime,
+    }
+    _write_json(run_root / "environment.json", environment)
+    env["SKILL3D_ENVIRONMENT_SHA256"] = hashlib.sha256(_json_bytes(environment)).hexdigest()
+    python = sys.executable
+    video_root = str(Path(str(experiment["video_root"])).expanduser())
+    runtime_config = load_config(root / "configs" / "config.yaml")
+    runtime_config["seed"] = int(experiment["seed"])
+    runtime_config.setdefault("frame_sampling", {})["n_frames"] = int(runtime["n_images"])
+    runtime_config.setdefault("online_model", {}).update({
+        "n_frames": int(runtime["n_images"]),
+        "max_pixels": int(runtime["max_pixels"]),
+        "max_model_len": int(runtime["max_model_len"]),
+        "max_tokens": runtime.get("max_tokens", 8192),
+    })
+    resolve_runtime(runtime_config, formal=bool(experiment.get("formal")) and not dry_run)
+    model = online_model_from(runtime_config)
+    if model.model != "qwen3.8-flash" or model.provider != "bailian":
+        raise GPUExperimentError(
+            "GPU experiment requires shared Bailian qwen3.8-flash")
+    online_identity = {
+        "provider": model.provider,
+        "model": model.model,
+        "model_revision": model.model_revision,
+        "endpoint_sha256": hashlib.sha256(
+            model.base_url.encode("utf-8")).hexdigest(),
+    }
+    env["SKILL3D_MODEL_WEIGHTS_SHA256"] = hashlib.sha256(
+        _json_bytes(online_identity)).hexdigest()
+    geometry_env = dict(env)
+    geometry_env["CUDA_VISIBLE_DEVICES"] = str(runtime["geometry_gpu"])
+    for key in ("n_frames", "max_pixels", "max_model_len", "max_tokens"):
+        runtime_config.sources[f"online_model.{key}"] = "gpu.runtime"
+    runtime_config.sources["seed"] = "gpu.experiment"
+    runtime_config.sources["frame_sampling.n_frames"] = "gpu.runtime"
+    library = run_root / "skill_library"
+    if not dry_run:
+        shutil.copytree(root / "skill_library", library)
+    runtime_config.setdefault("paths", {}).update({
+        "skill_library": str(library),
+        "active_snapshot": str(library / "snapshots" / "active_snapshot.json"),
+    })
+    for key in ("skill_library", "active_snapshot"):
+        runtime_config.sources[f"paths.{key}"] = "gpu.run_directory"
+    config_file = run_root / "runtime_config.yaml"
+    config_file.write_text(yaml.safe_dump(
+        dict(runtime_config), allow_unicode=True, sort_keys=True), encoding="utf-8")
+    _write_json(run_root / "runtime_configuration.json", config_receipt(runtime_config))
+    config_path = str(config_file)
+    validation = experiment.get("metric_validation")
+    if validation:
+        if experiment.get("formal") or experiment.get("run_evolution"):
+            raise GPUExperimentError("metric_validation requires development mode without evolution")
+        if not cfg["weights"]["moge2"].get("enabled"):
+            raise GPUExperimentError("metric_validation requires weights.moge2.enabled=true")
+        common = [
+            "--panel", str(validation["panel"]),
+            "--archive-root", str(validation["archive_root"]),
+            "--output", str(run_root / "metric_validation"),
+        ]
+        script = str(root / "scripts" / "run_metric_validation_v11.py")
+        prepare = [python, script, "prepare", *common]
+        if validation.get("first_scene_only"):
+            prepare.append("--first-scene-only")
+        if validation.get("prepared_cache"):
+            prepare.extend(["--prepared-cache", str(validation["prepared_cache"])])
+        _run(prepare, cwd=root, env=geometry_env, dry_run=dry_run,
+             commands=commands, stage="metric_prepare")
+        if validation.get("prepare_only"):
+            return commands
+        _run([python, script, "solve", *common, "--config", config_path,
+              "--library-root", str(library)],
+             cwd=root, env=geometry_env, dry_run=dry_run,
+             commands=commands, stage="metric_b01_b11")
+        return commands
+    recon_dir = run_root / "reconstructions"
+    question_type = str(
+        experiment.get("question_types")
+        or experiment.get("question_type")
+        or ""
+    )
+    if not question_type:
+        raise GPUExperimentError("experiment.question_types is empty")
+    slot_manifest_value = str(experiment.get("slot_manifest") or "")
+    slot_manifest = (
+        (root / slot_manifest_value).resolve()
+        if slot_manifest_value
+        and not Path(slot_manifest_value).is_absolute()
+        else Path(slot_manifest_value).resolve()
+        if slot_manifest_value
+        else None
+    )
+    all_reachable_slots = bool(
+        experiment.get("all_reachable_slots", False)
+    )
+    if all_reachable_slots and slot_manifest is not None:
+        raise GPUExperimentError(
+            "all_reachable_slots and slot_manifest are mutually exclusive")
+    evidence_state = str(experiment.get("evidence_state") or "")
+    if (
+        experiment.get("run_evolution")
+        and not all_reachable_slots
+        and slot_manifest is None
+        and evidence_state not in {
+        "g0m0", "g1m0", "g1m1"
+        }
+    ):
+        raise GPUExperimentError(
+            "run_evolution=true requires slot_manifest or evidence_state")
+    if slot_manifest is not None and not slot_manifest.is_file():
+        raise GPUExperimentError(
+            f"slot manifest does not exist: {slot_manifest}")
+    datasets = str(experiment.get("datasets") or "")
+    seed = int(experiment["seed"])
+    sampling = int(experiment["reconstruction_sampling_per_task"])
+    if sampling < max(int(experiment["inner_limit"]),
+                      int(experiment.get("outer_limit", 8)),
+                      int(experiment["induction_limit"]) + int(experiment["post_publish_limit"])):
+        raise GPUExperimentError(
+            "reconstruction panel cannot cover learning/inner/outer/post limits")
+
+    reconstruction = [
+        python,
+        "-m",
+        "skill3d.reconstruction.run",
+        "--config",
+        config_path,
+        "--source",
+        "vsi_bench",
+        "--split",
+        "induction,inner_validation,outer_holdout",
+        "--video-root",
+        video_root,
+        "--recon-dir",
+        str(recon_dir),
+        "--question-types",
+        question_type,
+        "--sampling-per-task",
+        str(sampling),
+        "--episodes-per-scene",
+        "8",
+        "--n-frames",
+        str(runtime["n_images"]),
+        "--seed",
+        str(seed),
+        "--gpus",
+        "0",
+    ]
+    if datasets:
+        reconstruction.extend(["--datasets", datasets])
+    if cfg["weights"]["moge2"].get("enabled"):
+        reconstruction.append("--moge2")
+    _run(
+        reconstruction,
+        cwd=root,
+        env=geometry_env,
+        dry_run=dry_run,
+        commands=commands,
+        stage="reconstruction",
+    )
+
+    confirmation = str(experiment.get("quality_confirmation") or "")
+    if experiment.get("run_evolution"):
+        if not os.environ.get("DEEPSEEK_API_KEY") and not dry_run:
+            raise GPUExperimentError(
+                "run_evolution=true requires DEEPSEEK_API_KEY")
+        stream = [
+            python,
+            str(root / "scripts" / "run_streaming_evolution_v11.py"),
+            "--config",
+            config_path,
+            "--stream-id",
+            str(experiment["campaign_id"]),
+            "--source",
+            "vsi_bench",
+            "--video-root",
+            video_root,
+            "--recon-dir",
+            str(recon_dir),
+            "--induction-limit-per-slot",
+            str(experiment["induction_limit"]),
+            "--induction-candidates-per-task",
+            str(sampling),
+            "--inner-candidates-per-task",
+            str(sampling),
+            "--outer-candidates-per-task",
+            str(sampling),
+            "--post-limit",
+            str(experiment["post_publish_limit"]),
+            "--min-evaluation-pairs",
+            str(experiment.get("min_evaluation_pairs", 8)),
+            "--outer-limit-per-slot",
+            str(experiment.get("outer_limit", 8)),
+            "--batch-size",
+            str(experiment.get("evolution_batch_size", 12)),
+            "--seed",
+            str(seed),
+            "--quality-confirmation",
+            confirmation,
+            "--library-root",
+            str(library),
+            "--run-root",
+            str(run_root / "evolution"),
+            "--binding-store",
+            str(run_root / "prepared_binding_store"),
+            "--prepare-bindings",
+            "--require-prepared-bindings",
+            "--run-outer",
+        ]
+        if slot_manifest is not None:
+            stream.extend(["--slot-manifest", str(slot_manifest)])
+        elif not all_reachable_slots:
+            stream.extend([
+                "--question-types",
+                question_type,
+                "--evidence-states",
+                evidence_state,
+            ])
+        if datasets:
+            stream.extend(["--datasets", datasets])
+        _run(
+            stream,
+            cwd=root,
+            env=geometry_env,
+            dry_run=dry_run,
+            commands=commands,
+            stage="streaming_evolution",
+        )
+        return commands
+
+    parent_trace = run_root / "parent_learning_trace"
+    parent_manifest = run_root / "parent_learning_manifest.json"
+    parent = [
+        python,
+        "-m",
+        "skill3d.online.eval",
+        "--config",
+        config_path,
+        "--mode",
+        "real",
+        "--source",
+        "vsi_bench",
+        "--split",
+        "induction",
+        "--video-root",
+        video_root,
+        "--recon-dir",
+        str(recon_dir),
+        "--question-types",
+        question_type,
+        "--limit",
+        str(experiment["induction_limit"]),
+        "--seed",
+        str(seed),
+        "--trace-dir",
+        str(parent_trace),
+        "--run-manifest",
+        str(parent_manifest),
+    ]
+    if datasets:
+        parent.extend(["--datasets", datasets])
+    _run(
+        parent,
+        cwd=root,
+        env=geometry_env,
+        dry_run=dry_run,
+        commands=commands,
+        stage="parent_learning",
+    )
+
+    ablation_dir = run_root / "b01_b11"
+    ablation = [
+        python,
+        str(root / "scripts" / "run_skill_ablation_v11.py"),
+        "--config",
+        config_path,
+        "--source",
+        "vsi_bench",
+        "--split",
+        "inner_validation",
+        "--video-root",
+        video_root,
+        "--recon-dir",
+        str(recon_dir),
+        "--question-types",
+        question_type,
+        "--limit",
+        str(experiment["inner_limit"]),
+        "--seed",
+        str(seed),
+        "--library-root",
+        str(library),
+        "--output-dir",
+        str(ablation_dir),
+    ]
+    if datasets:
+        ablation.extend(["--datasets", datasets])
+    if confirmation:
+        ablation.extend(["--quality-confirmation", confirmation])
+    _run(
+        ablation,
+        cwd=root,
+        env=geometry_env,
+        dry_run=dry_run,
+        commands=commands,
+        stage="b01_b11",
+    )
+    if experiment.get("formal") and not dry_run:
+        summary = json.loads((ablation_dir / "summary.json").read_bytes())
+        if summary.get("formal_result_eligible") is not True:
+            raise GPUExperimentError("B01/B11 completed without formal eligibility")
+
+    return commands
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Pinned-weight real GPU bootstrap for v11 experiments")
+    parser.add_argument(
+        "--config",
+        default="configs/gpu_experiment_v11.yaml",
+    )
+    parser.add_argument("--work-dir", required=True)
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--download-only", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dev", action="store_true")
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--code-receipt", help=argparse.SUPPRESS)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    root = Path(__file__).resolve().parents[1]
+    config_path = Path(args.config)
+    if not config_path.is_absolute():
+        config_path = root / config_path
+    work_dir = Path(args.work_dir).expanduser().resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    run_id = args.run_id or time.strftime("v11-%Y%m%dT%H%M%SZ", time.gmtime())
+    if not RUN_ID_RE.fullmatch(run_id):
+        print("GPUExperimentError: invalid run ID", file=sys.stderr)
+        return 2
+    run_root = work_dir / "runs" / run_id
+    if run_root.exists():
+        print(f"GPUExperimentError: run directory already exists: {run_root}",
+              file=sys.stderr)
+        return 2
+    pipeline = None
+    try:
+        cfg = configure_run(_read_config(config_path), dev=args.dev,
+                            smoke=args.smoke, dry_run=args.dry_run)
+        _validate_weight_config(cfg)
+        if cfg["experiment"]["run_mode"] == "development" and not args.code_receipt:
+            video = cfg["experiment"].get("video_root")
+            if video and not Path(video).expanduser().is_absolute():
+                cfg["experiment"]["video_root"] = str(root / video)
+            for model in cfg["weights"].values():
+                existing = model.get("existing_path")
+                if existing and not Path(existing).expanduser().is_absolute():
+                    model["existing_path"] = str(root / existing)
+            receipt = freeze_working_tree(root, work_dir / "source_snapshots" / run_id)
+            source_root = Path(receipt["source_root"])
+            frozen_config = source_root.parent / "runtime_input.yaml"
+            frozen_config.write_text(yaml.safe_dump(cfg, allow_unicode=True))
+            # Re-execute the frozen runner before importing any runtime code.
+            env = os.environ.copy()
+            env.update({RECEIPT_ENV: str(source_root.parent / "code_identity.json"),
+                        MODE_ENV: "development", "PYTHONDONTWRITEBYTECODE": "1",
+                        "PYTHONPATH": os.pathsep.join([str(source_root / "src"),
+                                                       str(source_root / "third_party/vggt")])})
+            command = [sys.executable, str(source_root / "scripts/run_gpu_experiment_v11.py"),
+                       "--config", str(frozen_config), "--work-dir", str(work_dir),
+                       "--run-id", run_id, "--code-receipt", env[RECEIPT_ENV]]
+            if args.dry_run:
+                command.append("--dry-run")
+            if args.download_only:
+                command.append("--download-only")
+            return subprocess.call(command, cwd=source_root, env=env)
+        if args.code_receipt:
+            if cfg["experiment"]["run_mode"] != "development":
+                raise GPUExperimentError("A working-source receipt cannot be used for a formal run")
+            os.environ[RECEIPT_ENV] = args.code_receipt
+            verify_source_receipt(Path(args.code_receipt), root)
+        else:
+            os.environ.pop(RECEIPT_ENV, None)
+        os.environ[MODE_ENV] = cfg["experiment"]["run_mode"]
+        run_root.mkdir(parents=True)
+        effective_config = run_root / "experiment_config.yaml"
+        effective_config.write_text(yaml.safe_dump(cfg, allow_unicode=True))
+        preflight = _preflight(
+            root, work_dir, cfg, dry_run=args.dry_run)
+        if cfg["experiment"].get("formal") and not args.dry_run:
+            confirmation = Path(
+                str(cfg["experiment"]["quality_confirmation"])).expanduser()
+            if not _quality_confirmation_ok(confirmation):
+                raise GPUExperimentError(
+                    "quality_confirmation does not match current quality contract")
+        weight_manifest, weights = _download_weights(
+            cfg,
+            work_dir / "weights",
+            dry_run=args.dry_run,
+        )
+        pipeline = {
+            "schema_version": "skill3d-gpu-pipeline-v11/1.0",
+            "run_id": run_id,
+            "config_path": str(effective_config),
+            "config_sha256": _sha256_file(effective_config),
+            "preflight": preflight,
+            "weight_manifest_sha256": weight_manifest.get("manifest_sha256", ""),
+            "formal_requested": bool(cfg["experiment"].get("formal")),
+            "run_mode": cfg["experiment"]["run_mode"],
+            "formal_result_eligible": False,
+            "code_identity": (json.loads(Path(args.code_receipt).read_text())
+                              if args.code_receipt else {"base_commit": preflight["code_commit"],
+                                                        "git_dirty": preflight["git_dirty"]}),
+            "final_test_touched": False,
+            "status": "downloaded",
+            "commands": [],
+        }
+        _write_json(run_root / "pipeline_manifest.json", pipeline)
+        if args.download_only:
+            print(json.dumps(pipeline, ensure_ascii=False, indent=2))
+            return 0
+        commands = _pipeline(
+            root,
+            run_root,
+            cfg,
+            weights,
+            dry_run=args.dry_run,
+            weight_manifest=weight_manifest,
+        )
+        pipeline["commands"] = commands
+        pipeline["status"] = "dry_run" if args.dry_run else "completed"
+        if cfg["experiment"].get("formal") and not args.dry_run:
+            pipeline["formal_result_eligible"] = True
+        _write_json(run_root / "pipeline_manifest.json", pipeline)
+        print(json.dumps(pipeline, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as exc:
+        failure = {
+            "schema_version": "skill3d-gpu-pipeline-v11/1.0",
+            "run_id": run_id,
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "final_test_touched": False,
+        }
+        _write_json(run_root / "failure.json", failure)
+        if pipeline is not None:
+            pipeline.update(status="failed", error=failure["error"])
+            _write_json(run_root / "pipeline_manifest.json", pipeline)
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
