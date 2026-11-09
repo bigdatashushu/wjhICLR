@@ -1,8 +1,8 @@
 # LIBERORunner
 
-`gpt6.1terra` 接入 LIBERO 的基础评测代码。配置中的模型 ID 为 `gpt-6.1-terra`，使用现有 `wjhICLR/xcodeapi` 的 Responses 接口。当前已完成代码和离线测试；尚未在真实 LIBERO 环境中执行 GPT rollout，模型 ID 的服务可用性也尚未通过真实请求验证。
+`gpt6.1terra` 接入 LIBERO 的基础评测代码。配置中的模型 ID 为 `gpt-6.1-terra`，使用现有 `wjhICLR/xcodeapi` 的 Responses 接口。真实官方仿真已在 Titan Linux 通过预检，包括双路 RGB 和 5 步全零动作。2026-11-09 首次 GPT 请求返回 HTTP 503，未获得可执行的 GPT 动作，动作闭环尚未完成。详见 [试跑报告](checks/smoke-20261109/试跑报告.md)。
 
-本机已建立 `LIBERORunner/.venv`（Python 3.11），安装 numpy、Pillow、PyYAML，可直接运行下面的离线命令。Linux 仿真环境由安装脚本另行创建。当前原始 GitHub 源码克隆因连接超时未完成，torch、robosuite、MuJoCo、bddl 尚未安装。
+本机已建立 `LIBERORunner/.venv`（Python 3.11），可运行离线检查。Titan 上已建立独立 Python 3.10 仿真环境，安装 CPU PyTorch、robosuite、MuJoCo、bddl，并加载已核验的原始官方源码归档。
 
 ## 评测流程
 
@@ -38,11 +38,17 @@ bash LIBERORunner/scripts/install.sh
 
 可通过 `LIBERO_REF=<官方commit>` 固定新克隆的源码版本；通过 `LIBERO_SOURCE_ROOT` / `LIBERO_VENV_ROOT` 指定独立路径。脚本不会更新已有 checkout。源码、依赖版本、任务 BDDL、初始状态文件及 Runner 代码的身份会写入运行 manifest。
 
-`requirements-sim.txt` 保留官方 NumPy 1.22.4、OpenCV 4.6.0.66、robosuite 1.4.0 等仿真依赖，不安装训练策略所需的 wandb、transformers、robomimic、Hydra。`constraints-sim.txt` 另固定 MuJoCo 2.3.7、CPU PyTorch 2.2.2 和兼容的 SciPy/Numba。官方历史安装说明使用 Python 3.8 / PyTorch 1.11；这里采用 Python 3.10 以兼容现有 API 客户端，**此依赖组合仍须通过真实仿真预检**。远程 GPT 推理不需要本地模型 GPU，EGL 渲染需可用的图形设备。
+`requirements-sim.txt` 保留官方 NumPy 1.22.4、OpenCV 4.6.0.66、robosuite 1.4.0 等仿真依赖，不安装训练策略所需的 wandb、transformers、robomimic、Hydra；另补齐 robosuite 未声明的 termcolor 依赖。`constraints-sim.txt` 固定 MuJoCo 2.3.7、CPU PyTorch 2.2.2 和兼容的 SciPy/Numba。官方历史安装说明使用 Python 3.8 / PyTorch 1.11；这里采用 Python 3.10 以兼容现有 API 客户端，**该组合已在 Titan 的软件渲染环境通过真实仿真预检**。其他机器仍需先预检。
 
 已有独立 Python 3.10 时，可设置 `LIBERO_PYTHON_BIN=/绝对路径/bin/python3`，不要求安装 uv。网络无法 Git clone 时，可设置 `LIBERO_SOURCE_ARCHIVE=/绝对路径/官方tar.gz`；目前仅接受已核验的官方 commit `8f1084e3132a39270c3a13ebe37270a43ece2a01` 归档（SHA256 `4fd4859991523b2fb0469c346382f5b7b02b69c2f57c05761acf87f747918508`）。归档与逐成员哈希会保留并在运行前校验，不会伪造 Git commit。
 
 无需下载人类演示数据集即可进行评测；需要官方源码中的 BDDL、初始状态和仿真资产。
+
+Titan 当前缺少 NVIDIA EGL 图形组件，本次使用任务目录内提取的 Ubuntu 18.04 OSMesa 20.0.8 软件库，系统驱动保持原样。Mesa 20 的浮点颜色缓冲区不能正常激活上下文，`rendering.py` 在设置 `MUJOCO_GL=osmesa`、`LIBERO_OSMESA_BUFFER=uint8` 时使用 8 位颜色缓冲区。此适配仅作用于当前进程；实际 RGB 仍为 128×128、uint8。渲染后端、缓冲区格式和本地渲染库哈希会写入 manifest，并在运行时核对。
+
+已有远程配置保存在 Git 忽略的 `LIBERORunner/remote.local.json`。工作区的 Run 按钮执行已经验证的远程预检脚本，每次新建一个任务、一个初始状态、最多 3 步的准备目录，模型请求数为 0。显式模型运行使用 `scripts/remote_live.py`，API 密钥仅通过 SSH 标准输入传递到进程内存。首次 503 的目录保留原始状态，不自动重试。
+
+服务器 IPv6 连接不可用时，可对独立安装设置 `LIBERO_IPV4_ONLY=1`；`scripts/network.py` 仅让本次 Python 进程使用 IPv4，不修改全局网络配置。
 
 ## 命令
 
@@ -141,4 +147,4 @@ LIBERORunner/.venv/bin/python -m LIBERORunner report \
 
 - 原始官方源码：<https://github.com/Lifelong-Robot-Learning/LIBERO>，重点是 `metric.py`、`env_wrapper.py`、`bddl_base_domain.py` 和 `benchmark/__init__.py`。
 - 官方结构与安装文档：<https://lifelong-robot-learning.github.io/LIBERO/html/getting_started/code_structure.html>；<https://lifelong-robot-learning.github.io/LIBERO/html/getting_started/installation.html>。
-- 原始 GitHub 源码的本机直连超时；接口核对辅以 PyPI `libero 0.1.1` 源码包中的对应实现（包哈希 `31f17f69ced68e2ecde630353dda924372b0b7b647991e21eade231b241fc373`）。该包属于 HF fork，**没有作为运行依赖采用**；实际运行必须通过原始官方 checkout 的源码与仿真预检。
+- 本次实际运行使用原始官方 commit `8f1084e3132a39270c3a13ebe37270a43ece2a01` 的 GitHub 归档，完整压缩包和 1,116 个成员文件均有哈希记录。原始官方源码保持不变。

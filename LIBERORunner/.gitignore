@@ -2,6 +2,7 @@
 .runtime/
 third_party/
 runs/
+checks/
 __pycache__/
 *.pyc
 *.local.env
