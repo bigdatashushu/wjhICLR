@@ -97,6 +97,7 @@ def _base_config(raw: dict):
         max_retries_per_operation=int(raw["max_retries_per_operation"]),
         finalization_rounds=int(raw["finalization_rounds"]),
         eval_visual_fallback=bool(raw["eval_visual_fallback"]),
+        isolated_choice_visual_fallback=bool(raw["isolated_choice_visual_fallback"]),
         image_layout=vision.layout,
         max_derived_images=int(vision.max_derived_images),
         retrieval_policy=retrieval_policy_from(raw),

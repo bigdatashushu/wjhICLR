@@ -133,6 +133,75 @@ def test_same_decision_yield_reader_and_previous_dependency_then_revoke():
         ResultStore(stale, second.results)
 
 
+def test_task_state_only_rebind_preserves_result_authorization_and_reader_cap():
+    from copy import deepcopy
+    from audit_action_trajectory import audit_result_contexts
+    from action_contract import public_hash
+    binding, snapshot, envelope, prepared = context()
+    first = execute_isolated(
+        "r = point_depth(0,5,5)\nYieldObservations([r['result_id']], 'inspect')",
+        snapshot, binding, envelope, prepared=prepared)
+    result_id = first.yielded_result_ids[0]
+    store = ResultStore(snapshot, first.results, max_reads=1)
+    page = store.read(result_id, ["depth"])
+    updated = replace(snapshot, task_state={"goal": {"id": "find_chair"}})
+    rebound = store.rebind_task_state(updated)
+    assert store.revoked and not store.authorize(result_id, snapshot)
+    assert rebound.authorize(result_id, updated) and not rebound.authorize(result_id, snapshot)
+    assert rebound.records[result_id]["response"] == store.records[result_id]["response"]
+    assert rebound.records[result_id]["authorization"] == store.records[result_id]["authorization"]
+    assert rebound.records[result_id]["sha256"] != store.records[result_id]["sha256"]
+    assert rebound.reads == [page]
+    events = [
+        {"kind": "decision", "snapshot": snapshot.public_dict()},
+        {"kind": "execution", "results": list(store.records.values())},
+        {"kind": "decision_context", "snapshot": updated.public_dict()},
+        {"kind": "result_context", "previous_snapshot_sha256": snapshot.snapshot_sha256,
+         "snapshot_sha256": updated.snapshot_sha256, "reason": "task_state_only",
+         "results": list(rebound.records.values())},
+    ]
+    audit_result_contexts(events)
+    tampered = deepcopy(events)
+    row = tampered[-1]["results"][0]
+    row["response"]["data"]["depth"] = 999
+    row["sha256"] = public_hash({k: v for k, v in row.items() if k != "sha256"})
+    with pytest.raises(ContractError, match="trajectory_result_rebind_receipt"):
+        audit_result_contexts(tampered)
+    with pytest.raises(ContractError, match="reader_cap"):
+        rebound.read(result_id)
+    with pytest.raises(ContractError, match="result_rebind_not_task_state_only"):
+        store.rebind_task_state(updated)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("decision_id", "next"), ("evidence_revision", 1),
+    ("evidence_manifest_sha256", sha256(b"new evidence")),
+    ("capabilities", ("current_rgb",)), ("budget_sha256", sha256(b"new budget")),
+    ("observation", None),
+])
+def test_result_rebind_rejects_non_task_state_changes(field, value):
+    _, snapshot, _, _ = context()
+    store = ResultStore(snapshot)
+    if field == "observation":
+        value = replace(snapshot.observation, observation_revision=1)
+    updated = replace(snapshot, task_state={"goal": {"id": "chair"}}, **{field: value})
+    with pytest.raises(ContractError, match="result_rebind_not_task_state_only"):
+        store.rebind_task_state(updated)
+    assert not store.revoked
+
+
+def test_task_state_rebind_revalidates_original_tool_rows():
+    binding, snapshot, envelope, prepared = context()
+    first = execute_isolated(
+        "r = point_depth(0,5,5)\nYieldObservations([r['result_id']], 'inspect')",
+        snapshot, binding, envelope, prepared=prepared)
+    store = ResultStore(snapshot, first.results)
+    store.records[first.yielded_result_ids[0]]["response"]["data"]["depth"] = 999
+    with pytest.raises(ContractError, match="result_scope_mismatch"):
+        store.rebind_task_state(replace(snapshot, task_state={"goal": {"id": "chair"}}))
+    assert not store.revoked
+
+
 def test_ast_rejection_preserves_prior_result_ledger_and_zero_caps_deny_new_access():
     binding, snapshot, envelope, prepared = context()
     first = execute_isolated(

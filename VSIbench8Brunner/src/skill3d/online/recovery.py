@@ -262,9 +262,18 @@ class ValidatedObservation:
         label = ("summary view of raw list payload"
                  if self.source_tool == "list_objects" and isinstance(self.payload, list)
                  else "data/raw payload")
+        scope = ""
+        if (self.source_tool == "relative_distance_rank" and isinstance(self.payload, dict)
+                and (self.payload.get("status") != "ok"
+                     or self.payload.get("closest_category") is None)):
+            scope = (
+                "\n  Ranking scope: indeterminate. The call succeeded, but the data "
+                "does not establish an overall winner. Distances for measurable candidates "
+                "are local comparisons only; do not select the nearest measurable candidate "
+                "as the closest option when candidates are missing, invalid, or tied.")
         return (f"- {self.source_tool}({_json(self.args)}) [result_id={self.result_id}]"
                 f" ToolResult.status=ok evidence_version={self.evidence_version!r}{flags}"
-                f"\n  {label}={text}")
+                f"{scope}\n  {label}={text}")
 
 
 def observation_feedback(observations: list[ValidatedObservation], *, question_type: str = "",

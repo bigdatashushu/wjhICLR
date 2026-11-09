@@ -4,8 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import MappingProxyType
 
-INTERFACE_VERSION = "mmsigpt-interface/2"
-PROMPT_VERSION = "mmsigpt-prompt/2"
+INTERFACE_VERSION = "mmsigpt-interface/3"
+PROMPT_VERSION = "mmsigpt-prompt/4"
 PUBLIC_CONTEXT_FIELDS = frozenset({"scene", "tools", "frames", "input", "options", "question"})
 
 

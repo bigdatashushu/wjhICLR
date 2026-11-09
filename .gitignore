@@ -81,6 +81,31 @@ qwenkey.md
 /GPTexp/inputs/
 /GPTexp/runs/
 
+# Component-local evaluation outputs; reusable runner code remains tracked.
+/GPTexp/BLINKGPT/runs/
+/GPTexp/MMSIGPT/depth_comparison/work-*/
+/VSIbench8Brunner/trajectory_review_evidence/
+/VSIbench8Brunner/vsi-choice-isolated100-trajectory-review.json
+/embodiedRunner/*/verification/
+/embodiedRunner/*/deployment-snapshots/
+/embodiedRunner/*/remote-evidence/
+/embodiedRunner/groundingdino_probe/responses/
+/embodiedRunner/groundingdino_probe/*.json
+/embodiedRunner/target_detection_qwen3vl/compact20-*/
+/embodiedRunner/target_detection_qwen3vl/extension120-*/
+/embodiedRunner/target_detection_qwen3vl/twenty-*/
+/embodiedRunner/target_detection_qwen3vl/validation-*/
+/embodiedRunner/target_detection_qwen3vl/validation-*.json
+/embodiedRunner/target_detection_twenty/moge_depth_comparison/
+/embodiedRunner/target_detection_twenty/groundingdino_model_views.html
+/embodiedRunner/*/*-results*.json
+/embodiedRunner/*/results.json
+/embodiedRunner/*/context-costs.json
+/embodiedRunner/*/comparison-*.json
+/embodiedRunner/rgbd_twenty/*.json
+!/embodiedRunner/rgbd_twenty/config-*.json
+*.tar.gz
+
 # Learned memories/skills are generated artifacts. The public repository keeps
 # the statics/skill3d_shared directory skeleton through README.md/.gitkeep only.
 /legacy/statics/skill3d_by_benchmark/

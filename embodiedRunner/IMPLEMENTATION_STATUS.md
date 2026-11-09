@@ -6,6 +6,8 @@
 
 2026-11-06 第四环境 EB-Manipulation 也完成真实首动作接入：Direct/Full **2/2**，当前实现支持四环境。最新验收见 [manipulation-acceptance-20261106.json](checks/manipulation-acceptance-20261106.json)，具体公开输入、七维动作与感知覆盖见 [接入说明](MANIPULATION_IMPLEMENTATION_PLAN.md)。
 
+2026-11-06 后续子目标接入见 [任务卡说明](TASK_CARD_IMPLEMENTATION.md)：新 live 的 Full/B11/B01 使用完整 JSON 任务卡，常规目标 4,000 Unicode 字符；用户随后取消必填超长拒发，必要内容超长时完整保留并发送。自动保存公共动作状态，支持子目标、前置检查、动态类别和按需感知。原阶段 16 份公开轨迹重建出 229 张完整卡片，最大 3,912 字符；回放不改变原结果。取消拒发前的阶段身份见 [原验收收据](checks/task-card-acceptance-20261106.json)，新行为按新源码及测试身份记录。
+
 ## 当前目录调整
 
 - 实现入口改为 `/Users/bytedance/wangjh/wjhICLR/embodiedRunner`。

@@ -19,7 +19,7 @@ from budget import RunBudget, policy_for
 from evidence import CurrentEvidencePreparer, PerceptionBackends, POLICY, PARSER_SHA256
 from methods import load_methods
 from mutation_protocol import MutationSession
-from protocol import ContractError, OperationalError, canonical, sha256
+from protocol import ContractError, OperationalError, canonical, json_object, sha256
 
 ROOT = Path(__file__).resolve().parent
 ENVIRONMENTS = ("eb_navigation", "eb_alfred", "eb_habitat", "eb_manipulation")
@@ -46,6 +46,19 @@ class FakeClient:
         actions = [[50, 50, 30, 120, 60, 90, 1], [50, 50, 12, 120, 60, 90, 0]]
         plan = [{"action": a} for a in actions] if manip else [{"action_id": 0}, {"action_id": 1}]
         program = FAKE_SOURCE.replace("[0, 1]", repr(actions)) if manip else FAKE_SOURCE
+        if self.arm != "Direct" and "embodied-task-card/" in text:
+            card = json_object(messages[1]["content"][0]["text"])
+            goal = card["subgoal"] or {"id": "main", "goal": "Advance the public task",
+                                       "object": "", "destination": "", "complete_when": "visual"}
+            result = {"subgoal": goal,
+                      "transition": {"kind": "keep", "source": "none",
+                                     "observation_revision": card["identity"]["observation_revision"],
+                                     "detail": ""}}
+            if card["evidence"]["status"] == "not_requested":
+                result["perception_request"] = {"targets": [], "depth": True}
+            else:
+                result["program_source"] = program
+            return canonical(result).decode()
         return canonical({"executable_plan": plan} if self.arm == "Direct" else
                          {"program_source": program}).decode()
 
@@ -79,7 +92,8 @@ def check():
 
 
 def fake_run(*, process_worker=False, run_id=None, environments=ENVIRONMENTS,
-             client_factory=FakeClient, transport_factory=None, preparer_factory=None):
+             client_factory=FakeClient, transport_factory=None, preparer_factory=None,
+             task_cards=False, trajectory_dir=None):
     methods = load_methods()
     run_id = run_id or "offline-" + uuid.uuid4().hex
     selection = [{
@@ -88,6 +102,8 @@ def fake_run(*, process_worker=False, run_id=None, environments=ENVIRONMENTS,
         "source_sha256": public_hash({"offline_fake": True, "environment": environment,
                                       "subset": "base", "index": 0}),
     } for environment in environments]
+    identity_preparer = (preparer_factory(environments[0]) if preparer_factory else
+                         CurrentEvidencePreparer(PerceptionBackends(depth_estimator=FakeDepth())))
     manifest = {
         "schema": "embodied-paired-run/1", "run_id": run_id,
         "arms": list(ARMS), "selection": selection, "denominator_per_arm": len(selection),
@@ -95,16 +111,22 @@ def fake_run(*, process_worker=False, run_id=None, environments=ENVIRONMENTS,
         "budget_sha256_by_environment": {e: public_hash(policy_for(e)) for e in environments},
         "method_sha256_by_environment": {e: methods[e].content_sha256 for e in environments},
         "method_library_sha256": next(iter(methods.values())).manifest_sha256,
-        "evidence_config_sha256": CurrentEvidencePreparer(
-            PerceptionBackends(depth_estimator=FakeDepth())).config_sha256,
+        "evidence_config_sha256": identity_preparer.config_sha256,
         "input_policy": "current_only", "execution_policy": "single_action",
         "offline_fake": True, "automatic_retry": False, "reference_answer_visible": False,
         "pairing": "same public task/source and policy; action trajectories may diverge",
+        "task_cards": task_cards,
     }
     manifest.update(
         implementation_source=source_identity(), protocol=protocol_identity(),
         configuration=configuration_identity(methods, manifest["evidence_config_sha256"]))
     manifest["sha256"] = public_hash(manifest)
+    trajectories = []
+    if trajectory_dir is not None:
+        from action_live import write_new
+        trajectory_dir = Path(trajectory_dir)
+        trajectory_dir.mkdir(mode=0o700, exist_ok=False)
+        write_new(trajectory_dir / "manifest.json", manifest)
     reports, budgets = [], {}
     for arm in ARMS:
         budget = RunBudget(run_id + ":" + arm, environments)
@@ -113,6 +135,12 @@ def fake_run(*, process_worker=False, run_id=None, environments=ENVIRONMENTS,
             episode_budget = budget.episode(item["episode_id"], environment)
             transport, solver = None, None
             method = methods[environment] if arm == "B11" else None
+            trajectory = None
+            if trajectory_dir is not None:
+                from action_trajectory import Trajectory
+                trajectory = Trajectory(
+                    trajectory_dir / f"trajectory-{selection.index(item):03d}-{arm}",
+                    episode_id=item["episode_id"], arm=arm)
             try:
                 if transport_factory:
                     transport = transport_factory(environment)
@@ -125,13 +153,16 @@ def fake_run(*, process_worker=False, run_id=None, environments=ENVIRONMENTS,
                     transport = LocalTransport(MutationSession(FakeAdapter(environment)))
                 bridge = ActionBridge(transport, environment=environment, episode_id=item["episode_id"],
                                       budget=episode_budget)
-                solver = ActionSolver(client_factory(arm), arm=arm, environment=environment, method=method)
+                solver = ActionSolver(client_factory(arm), arm=arm, environment=environment, method=method,
+                                      task_cards=task_cards, trajectory=trajectory)
                 preparer = (None if arm == "Direct" else
                             preparer_factory(environment) if preparer_factory else
                             CurrentEvidencePreparer(PerceptionBackends(depth_estimator=FakeDepth())))
                 host = ActionHost(bridge, solver, run_id=budget.run_id, arm=arm,
                                   evidence_preparer=preparer,
-                                  method_sha256=method.content_sha256 if method else "")
+                                  method_sha256=method.content_sha256 if method else "", trajectory=trajectory)
+                if preparer is not None:
+                    preparer.trajectory = trajectory
                 report = host.run(subset=item["subset"], index=item["index"],
                                   source_sha256=item["source_sha256"])
             except Exception:
@@ -147,6 +178,10 @@ def fake_run(*, process_worker=False, run_id=None, environments=ENVIRONMENTS,
                           protocol_sha256=manifest["protocol"]["sha256"],
                           prepared_config_sha256=manifest["configuration"]["sha256"])
             reports.append(seal_record(report))
+            if trajectory is not None:
+                trajectories.append({"episode_id": item["episode_id"], "arm": arm,
+                                     "directory": trajectory.directory.name,
+                                     "trajectory": trajectory.finish(report)})
         budgets[arm] = budget.summary()
     result = seal_record({
         "schema": "embodied-offline-run/1", "manifest": manifest,
@@ -156,6 +191,10 @@ def fake_run(*, process_worker=False, run_id=None, environments=ENVIRONMENTS,
         "status": "passed" if all(r["terminal_reason"] == "official_done" for r in reports) else "failed",
     })
     result["audit"] = audit_run(result)
+    if trajectory_dir is not None:
+        write_new(trajectory_dir / "trajectories.json", {
+            "schema": "embodied-comparison-trajectories/1", "run_sha256": result["sha256"],
+            "manifest": manifest, "episodes": trajectories})
     return result
 
 
@@ -185,7 +224,11 @@ def main():
     parser.add_argument("--live-config", type=Path)
     parser.add_argument("--process-worker", action="store_true")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--task-cards", action="store_true",
+                        help="exercise the bounded task-card protocol in offline fake mode")
     args = parser.parse_args()
+    if args.task_cards and not args.fake:
+        parser.error("--task-cards is for offline --fake; live mode selects it in its config")
     if args.output:
         from action_live import private_output
         try:
@@ -210,7 +253,9 @@ def main():
     elif args.check:
         result = check()
     else:
-        result = fake_run(process_worker=args.process_worker)
+        result = fake_run(process_worker=args.process_worker, task_cards=args.task_cards,
+                          trajectory_dir=args.output.with_name(args.output.stem + "-episodes")
+                          if args.task_cards and args.output else None)
     if args.output and not (args.live or args.compare):
         path = args.output.resolve()
         if (not path.is_relative_to(ROOT) or not path.parent.is_dir() or path.exists()):

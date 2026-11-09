@@ -6,7 +6,7 @@ from collections import Counter
 from pathlib import Path
 
 from action_contract import plain, public_hash
-from action_identity import (ARMS, COMPARE_ARMS, ENVIRONMENTS, configuration_identity, protocol_identity,
+from action_identity import (ARMS, COMPARE_ARMS, RERUN_ARMS, ENVIRONMENTS, configuration_identity, protocol_identity,
                              source_identity)
 from action_runtime.execution_contract import ActionExecutionContract
 from action_solver import MODEL_CONFIG
@@ -14,6 +14,7 @@ from budget import STAGES, QWEN_STAGES, numeric_usage, policy_for
 from methods import load_methods
 from protocol import ContractError, canonical, json_object, sha256
 from state import TRANSITIONS
+from task_card import VERSION as CARD_VERSION, MAX_CHARS as CARD_MAX_CHARS
 
 ROOT = Path(__file__).resolve().parent
 DIMENSIONS = ("steps", "invalid", "qwen", "models", "reviews", "dino", "sam",
@@ -59,6 +60,7 @@ def audit_attempt(report, item, manifest):
     require(report["schema"] == "embodied-action-attempt/1", "attempt_schema")
     require(report["sha256"] == record_hash(report), "attempt_hash")
     arm, environment = report["arm"], item["environment"]
+    task_cards = manifest.get("task_cards", False) and arm != "Direct"
     require(report["environment"] == environment and report["episode_id"] == item["episode_id"]
             and report["source_sha256"] == item["source_sha256"]
             and report["run_id"] == manifest["run_id"] + ":" + arm, "attempt_identity")
@@ -212,7 +214,26 @@ def audit_attempt(report, item, manifest):
         else:
             require(row["evidence_config_sha256"] == config["evidence_config_sha256"]
                     and "current_rgb" in row["capabilities"], "decision_evidence")
-            if row["evidence_status"] == "preparing":
+            if task_cards:
+                require(row.get("context_protocol") == CARD_VERSION, "task_card_protocol")
+                versions = row.get("context_versions")
+                require(type(versions) is list and 1 <= len(versions) <= 12, "task_card_versions")
+                for version in versions:
+                    hashed(version["snapshot_sha256"])
+                    hashed(version["task_state_sha256"])
+                    require(version["evidence_revision"] in {0, 1}
+                            and "current_rgb" in version["capabilities"], "task_card_version_evidence")
+                    if version["evidence_revision"]:
+                        hashed(version["evidence_manifest_sha256"])
+                    else:
+                        require(version["evidence_manifest_sha256"] == "", "unrequested_evidence")
+                require(all(row[key] == versions[-1][key] for key in (
+                    "snapshot_sha256", "evidence_manifest_sha256", "evidence_revision", "capabilities")),
+                    "task_card_final_version")
+                require(row["evidence_status"] in {"not_requested", "prepared"}, "task_card_evidence_status")
+                require((row["evidence_status"] == "prepared") == bool(row["evidence_revision"]),
+                        "task_card_evidence_status")
+            elif row["evidence_status"] == "preparing":
                 require(report["status"] == "aborted" and row is report["decisions"][-1]
                         and not any(r["decision_id"] == decision_id for r in report["model_requests"]),
                         "failed_preparation_continued")
@@ -260,10 +281,30 @@ def audit_attempt(report, item, manifest):
     last_observation = -1
     for receipt, permit in zip(solver_requests, solver_permits):
         decision = decisions[receipt["decision_id"]]
+        if task_cards:
+            matching = [v for v in decision["context_versions"]
+                        if v["snapshot_sha256"] == receipt["snapshot_sha256"]]
+            require(len(matching) == 1, "task_card_request_version")
+            decision = {**decision, **matching[0]}
+            require(receipt.get("context_protocol") == CARD_VERSION
+                    and receipt.get("task_card_max_chars") == CARD_MAX_CHARS
+                    and 0 < count(receipt.get("task_card_chars"))
+                    and (receipt["task_card_chars"] <= CARD_MAX_CHARS
+                         or receipt.get("task_card_over_budget") is True)
+                    and receipt.get("task_card_complete") is True
+                    and receipt["task_state_sha256"] == decision["task_state_sha256"],
+                    "task_card_request_cap")
+            hashed(receipt["task_card_sha256"])
+            require(receipt.get("prompt_text_target") == CARD_MAX_CHARS
+                    and receipt.get("prompt_text_over_target") == (receipt["text_chars"] > CARD_MAX_CHARS)
+                    and receipt.get("catalog_complete") is True
+                    and 0 <= count(receipt.get("history_records")) <= 40,
+                    "task_context_coverage")
         require(receipt["stage"] == permit["stage"] and receipt["decision_id"] == permit["decision_id"]
                 and receipt["arm"] == arm and receipt["environment"] == environment
                 and receipt["model_config_sha256"] == manifest["model_config_sha256"]
-                and receipt["contract_sha256"] == ActionExecutionContract(environment=environment).sha256
+                and receipt["contract_sha256"] == ActionExecutionContract(
+                    environment=environment, task_cards=task_cards).sha256
                 and receipt["reference_answer_visible"] is False
                 and type(receipt["input_image_count"]) is int and receipt["input_image_count"] == 1
                 and all(receipt[k] == decision[k] for k in (
@@ -279,7 +320,9 @@ def audit_attempt(report, item, manifest):
         hashed(receipt["messages_sha256"])
         require(count(receipt["text_chars"]) <= 96000, "prompt_context_cap")
         status = receipt["status"]
-        require(status in {"valid_program", "valid_plan", "format_error", "service_error"},
+        require(status in ({"valid_program", "valid_plan", "format_error", "service_error",
+                            "valid_perception_request", "valid_catalog_request"} if task_cards else
+                           {"valid_program", "valid_plan", "format_error", "service_error"}),
                 "solver_service_or_usage_deviation")
         if status == "service_error":
             require(permit["status"] == "error" and receipt["delivery"]["channel"] == "request_failed"
@@ -290,7 +333,8 @@ def audit_attempt(report, item, manifest):
                     and receipt.get("usage", {}) == permit["usage"], "solver_usage")
             if status.startswith("valid_"):
                 require(permit["status"] == "completed"
-                        and status == ("valid_plan" if arm == "Direct" else "valid_program"),
+                        and (status in {"valid_program", "valid_perception_request", "valid_catalog_request"}
+                             if task_cards else status == ("valid_plan" if arm == "Direct" else "valid_program")),
                         "solver_status")
             if "reported_model_sha256" in receipt:
                 expected = sha256(("offline-fake" if manifest["offline_fake"]
@@ -330,9 +374,11 @@ def audit_attempt(report, item, manifest):
         receipt = row["receipt"]
         require(receipt["automatic_retry"] is False, "execution_retry")
         if receipt.get("isolation_sealed"):
+            snapshots = ({v["snapshot_sha256"] for v in decisions[row["decision_id"]]["context_versions"]}
+                         if task_cards else {decisions[row["decision_id"]]["snapshot_sha256"]})
             require(receipt["isolation_sealed"] is True
                     and receipt["program_sha256"] == row["program_sha256"]
-                    and receipt["snapshot_sha256"] == decisions[row["decision_id"]]["snapshot_sha256"]
+                    and receipt["snapshot_sha256"] in snapshots
                     and len(receipt["tool_receipts"]) == row["tool_calls"],
                     "execution_receipt")
             for tool in receipt["tool_receipts"]:
@@ -367,7 +413,9 @@ def audit_run(result, *, verify_current_sources=True):
                 and manifest["sha256"] == record_hash(manifest), "manifest_hash")
         policy_flags(manifest)
         arms = manifest["arms"]
-        require(arms in (list(ARMS), list(COMPARE_ARMS)) and manifest["offline_fake"] is (not live),
+        require(arms in (list(ARMS), list(COMPARE_ARMS), list(RERUN_ARMS))
+                and (arms != list(RERUN_ARMS) or live)
+                and manifest["offline_fake"] is (not live),
                 "run_arms_or_mode")
         if not live:
             require(result["live_requests"] == result["official_simulator_launches"]
@@ -519,7 +567,7 @@ def audit_run(result, *, verify_current_sources=True):
                 "source_reverified": verify_current_sources,
                 "initial_observation_match": initial_matches,
                 "paired_comparison_eligible": (
-                    all(initial_matches.values())
+                    len(arms) > 1 and all(initial_matches.values())
                     and all(r["observations"] for r in attempts)
                     and (not live or manifest["integration_step_limit"] is None)),
                 "validation_scope": ("live integration, protocol and accounting; task success reported separately"

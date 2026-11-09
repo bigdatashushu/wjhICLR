@@ -83,9 +83,16 @@ class MMSIKernel(RestrictedNamespaceKernel):
 
     def run_cell(self, source, *args, **kwargs):
         from ..adapters import jsonable
+        from .evidence import capture
 
         start = len(self.interface_adaptations)
+        self._ns.pop("evidence_audit", None)
         cell = super().run_cell(source, *args, **kwargs)
+        evidence = capture(
+            self._ns.get("evidence_audit"), n_views=len(self._ns["frames"]),
+            labels=tuple(row["label"] for row in self._public_input["options"]),
+            answer=cell.answer,
+        )
         self.execution_trace.append(jsonable({
             "program_source": source, "execution": cell,
             "tool_calls": self.cell_calls, "tool_results": self.cell_results,
@@ -95,5 +102,6 @@ class MMSIKernel(RestrictedNamespaceKernel):
             "contract_violations": self.contract_violations[self._cell_violation_mark:],
             "answer_payload": self.answer_slot.payload,
             "interface_adaptations": self.interface_adaptations[start:],
+            "evidence_audit": evidence,
         }))
         return cell

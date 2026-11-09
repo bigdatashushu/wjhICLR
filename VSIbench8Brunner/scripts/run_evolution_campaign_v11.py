@@ -331,6 +331,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.eval_visual_fallback if args.eval_visual_fallback is not None
                 else bool(raw["eval_visual_fallback"])
             ),
+            isolated_choice_visual_fallback=bool(raw["isolated_choice_visual_fallback"]),
             image_layout=vision.layout,
             max_derived_images=int(vision.max_derived_images),
             retrieval_policy=retrieval_policy_from(raw),

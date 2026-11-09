@@ -11,6 +11,8 @@ from action_runtime.execution_contract import ActionExecutionContract
 from budget import numeric_usage
 from protocol import ContractError, OperationalError, canonical, json_object, sha256
 from skill3d.synthesis.program_assembler import assemble_program_ex, SynthesisError
+from task_card import (VERSION as CARD_VERSION, MAX_CHARS as CARD_MAX_CHARS, build_card,
+                       validate_goal, validate_transition, validate_perception, validate_progress)
 
 VERSION = "embodied-solver/1"
 MODEL_CONFIG = freeze({
@@ -41,6 +43,45 @@ PROGRAM_GUIDANCE = (
     "def solve(ctx):\n"
     "    SubmitActions(ActionPayload(ctx.decision_id, ctx.observation_revision, "
     "ctx.snapshot_sha256, ctx.action_table_sha256, [0], []))\n"
+)
+TASK_CARD_GUIDANCE = (
+    "Task-card decision protocol embodied-task-card/1. Return a complete JSON object with subgoal, "
+    "transition, and exactly ONE of program_source, perception_request, catalog_request. "
+    "subgoal has exactly id,goal,object,destination,complete_when. Keep id stable while working on "
+    "the same goal. goal<=160 chars; other strings<=80. object/destination may be empty. "
+    "For keep, id/object/destination/complete_when stay stable; goal wording may be paraphrased. "
+    "destination names the CURRENT subgoal waypoint or placement target; the ultimate destination "
+    "remains in task. Use revise to change the target or completion condition. "
+    "complete_when is holding,released,navigation_ack,action_ack,or visual. "
+    "transition has kind (keep,advance,revise),source (none,official_feedback,visual),"
+    "observation_revision (current integer),detail (<=160 chars). "
+    "Initialize with keep/none. An advance evaluates the PREVIOUS subgoal, then selects a new one. "
+    "Do not call a grasp complete merely because gripper motion succeeded. "
+    "A successful official find of the matching object can complete a find/locate visual subgoal. "
+    "A named navigation ACK must match the current waypoint; MoveAhead or Rotate ACKs only confirm motion. "
+    "Visual conclusions are model assessments, not official facts. "
+    "The host synchronizes the accepted goal into immutable ctx.task_state before running your program "
+    "and into the next task card. Read snapshot identity from ctx; never hard-code a card snapshot hash. "
+    "Preserve the ultimate object and destination from task; empty detection never proves absence. "
+    "perception_request={\"targets\":[{\"role\":\"object\",\"category\":\"star\"},"
+    "{\"role\":\"destination\",\"category\":\"silver container\"}],\"depth\":false}. "
+    "Use 0..4 distinct lowercase English noun phrases<=64 chars; role is object,destination,support. "
+    "At least one target or depth=true; at most one perception request per decision. "
+    "Request only the evidence required for this subgoal; otherwise directly generate a program. "
+    "No perception has been run when evidence.status is not_requested. "
+    "catalog_request={\"offset\":0} requests a complete next action page; this costs a Qwen turn. "
+    "The card contains whole action records with original IDs; omitted entries remain accessible "
+    "as full strings in ctx.action_table, and manipulation objects in ctx.official_objects. "
+    "You may search/enumerate those immutable runtime tables in your program. "
+    "view_candidates returns result['data']['candidates'] (a list), result['data']['count'], "
+    "and result['data']['coverage']; each candidate has candidate_id,category,box_xyxy "
+    "and category_confirmed. An empty candidates list is legal. Do not index result['data'] as a list. "
+    "Always obey confirmed holding facts and destination control preconditions. "
+    "Never mutate ctx.task_state or ctx.memory. Use the subgoal output instead of writing narrative "
+    "memory_update. On repair keep the same subgoal unless current evidence warrants revision. "
+    "Read remaining limits and loop.switch_strategy. When set, choose a different legal action or waypoint; "
+    "the host blocks loop.cycle_next_action and repeated stationary actions. "
+    "No automatic service/action retry."
 )
 
 
@@ -73,7 +114,7 @@ def make_qwen_client():
 
 
 class ActionSolver:
-    def __init__(self, client, *, arm, environment, method=None, trajectory=None):
+    def __init__(self, client, *, arm, environment, method=None, trajectory=None, task_cards=False):
         if arm not in {"Direct", "B01", "B11", "Full"} or bool(method) != (arm in {"B11", "Full"}):
             raise ContractError("solver_arm_method_mismatch")
         if method is not None and method.environment != environment:
@@ -82,12 +123,15 @@ class ActionSolver:
                 or getattr(client, "timeout_s", 120) != 120):
             raise ContractError("solver_client_policy_mismatch")
         self.client, self.arm, self.environment, self.method = client, arm, environment, method
-        self.contract = ActionExecutionContract(environment=environment)
+        self.task_cards = bool(task_cards) and arm != "Direct"
+        self.contract = ActionExecutionContract(environment=environment, task_cards=self.task_cards)
         self.receipts, self.adapter, self.previous_observation = [], None, None
         self.prompt_hashes = {}
         self.direct_feedback = []
         self.previous_step, self.pending_action = 0, None
         self.trajectory = trajectory
+        self.card_budget, self.card_evidence, self.catalog_offset = None, None, None
+        self.last_card = None
 
     def _direct_messages(self, snapshot):
         obs = snapshot.observation
@@ -164,11 +208,23 @@ class ActionSolver:
                     .replace("[0], []", "[[50, 50, 30, 120, 60, 90, 1]], []"))
             if plan.entries:
                 system += "\nComplete frozen environment Skill:\n" + plan.entries[0].text
+            if self.task_cards:
+                from task_context import render, examples
+                system = render(self.environment, self.contract, snapshot.observation.observation_revision)
+                if plan.entries:
+                    system += "\nComplete frozen environment Skill:\n" + plan.entries[0].text
+                public_examples = examples(self.environment, snapshot.observation.subset)
+                self.prompt_hashes = {"selected_examples": public_hash(public_examples)}
+                self.last_card, user_text = build_card(
+                    snapshot, self.card_budget, repair=feedback, evidence=self.card_evidence,
+                    catalog_offset=self.catalog_offset, fixed_chars=len(system),
+                    examples=public_examples)
+            else:
+                user_text = canonical({"snapshot": snapshot.public_dict(), "repair": feedback}).decode()
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": [
-                    {"type": "text", "text": canonical({
-                        "snapshot": snapshot.public_dict(), "repair": feedback}).decode()},
+                    {"type": "text", "text": user_text},
                     {"type": "image_url", "image_url": {"url":
                         "data:image/png;base64," + base64.b64encode(
                             snapshot.observation.planner_png or snapshot.observation.png).decode("ascii")}},
@@ -181,19 +237,53 @@ class ActionSolver:
         return messages, plan, text_chars
 
     def _parse(self, text, snapshot):
+        self.last_format_feedback = None
+        field, value = "json", None
         try:
             value = json_object(text)
             if self.arm != "Direct":
+                goal = transition = perception = catalog = progress = None
+                if self.task_cards:
+                    field = "output_fields"
+                    outputs = set(value) & {"program_source", "perception_request", "catalog_request"}
+                    if len(outputs) != 1 or set(value) - {"progress"} != {"subgoal", "transition"} | outputs:
+                        raise ContractError("model_output_format_error")
+                    if "progress" in value:
+                        field = "progress"
+                        progress = validate_progress(value["progress"])
+                    field = "subgoal"
+                    goal = validate_goal(value["subgoal"])
+                    field = "transition"
+                    transition = validate_transition(
+                        value["transition"], snapshot.observation.observation_revision)
+                    if "perception_request" in outputs:
+                        field = "perception_request"
+                        perception = validate_perception(value["perception_request"])
+                        return Proposal(subgoal=goal, transition=transition, perception_request=perception,
+                                        progress=progress)
+                    if "catalog_request" in outputs:
+                        field = "catalog_request"
+                        catalog = value["catalog_request"]
+                        if (type(catalog) is not dict or set(catalog) != {"offset"}
+                                or type(catalog["offset"]) is not int
+                                or not 0 <= catalog["offset"] < max(1, len(snapshot.observation.action_table))):
+                            raise ContractError("model_output_format_error")
+                        return Proposal(subgoal=goal, transition=transition,
+                                        catalog_request=freeze(catalog), progress=progress)
+                    value = {"program_source": value["program_source"]}
+                field = "program_source"
                 if (set(value) != {"program_source"} or type(value["program_source"]) is not str
                         or not value["program_source"].strip()):
                     raise ContractError("model_output_format_error")
+                field = "program_assembly"
                 program, recovered = assemble_program_ex(
                     value["program_source"],
                     skill_semver_used=[f"{self.method.skill_id}@{self.method.version}"] if self.method else [],
                     intended_answer_slot="SubmitActions")
                 if recovered or program.program_source.strip() != value["program_source"].strip():
                     raise ContractError("model_output_format_error")
-                return Proposal(source=program.program_source)
+                return Proposal(source=program.program_source, subgoal=goal, transition=transition,
+                                progress=progress)
             if self.environment == "eb_manipulation":
                 from manipulation_planner import parse_plan
                 actions = parse_plan(text)
@@ -217,6 +307,32 @@ class ActionSolver:
             self.pending_action = actions[0] if actions else None
             return Proposal(actions=actions)
         except (KeyError, TypeError, ValueError, SynthesisError, ContractError):
+            if self.task_cards:
+                reason = "invalid_" + field
+                hints = {
+                    "json": "Return one valid JSON object.",
+                    "output_fields": "Return subgoal, transition, optional progress, and exactly one output.",
+                    "progress": "Use completed, remaining, next strings, each at most 240 characters.",
+                    "subgoal": "Use id, goal, object, destination, complete_when; obey the stated lengths and enums.",
+                    "transition": "Use kind, source, integer observation_revision, detail<=160. "
+                        "Advance requires source official_feedback or visual; use keep/none for a pending goal.",
+                    "perception_request": "Use {targets:[{role,category}],depth:false}. "
+                        "Depth is a boolean at the request level, outside targets; "
+                        "target rows contain only role and lowercase category.",
+                    "catalog_request": "Use only an integer offset within the action table. "
+                        "The full action catalog is already supplied; prefer a program.",
+                    "program_source": "Return a nonempty Python program_source string defining solve(ctx).",
+                    "program_assembly": "Define solve(ctx) using injected globals; do not add wrappers or imports.",
+                }
+                row = value.get("transition") if isinstance(value, dict) else None
+                if field == "transition" and isinstance(row, dict):
+                    if row.get("kind") == "advance" and row.get("source") == "none":
+                        reason = "advance_source_none"
+                    elif (type(row.get("observation_revision")) is not int or
+                          row.get("observation_revision") != snapshot.observation.observation_revision):
+                        reason = "observation_revision_type_or_value"
+                self.last_format_feedback = {
+                    "format_field": field, "format_reason": reason, "corrective_action": hints[field]}
             raise ContractError("model_output_format_error") from None
 
     def generate(self, snapshot, *, feedback, usage):
@@ -235,6 +351,18 @@ class ActionSolver:
             "reference_answer_visible": False, "input_image_count": 1,
             "delivery": delivery.to_dict(), "status": "started",
         }
+        if self.task_cards:
+            card_text = messages[1]["content"][0]["text"]
+            receipt.update(
+                context_protocol=CARD_VERSION, task_card_chars=len(card_text),
+                task_card_max_chars=CARD_MAX_CHARS, task_card_sha256=sha256(card_text.encode()),
+                task_state_sha256=public_hash(snapshot.task_state), task_card_complete=True,
+                task_card_over_budget=self.last_card["packing"]["required_fields_over_budget"])
+            receipt.update(prompt_text_target=CARD_MAX_CHARS,
+                           prompt_text_over_target=chars > CARD_MAX_CHARS,
+                           catalog_complete=self.last_card["catalog"]["omitted"] == 0,
+                           history_records=len(self.last_card["history"]),
+                           official_examples=len(self.last_card["official_examples"]))
         self.receipts.append(receipt)
         if self.environment == "eb_manipulation":
             receipt["manipulation_input_sha256"] = snapshot.observation.manipulation_input["sha256"]
@@ -293,11 +421,17 @@ class ActionSolver:
         except ContractError:
             receipt["status"] = "format_error"
             raise
-        receipt["status"] = "valid_program" if proposal.source is not None else "valid_plan"
+        receipt["status"] = ("valid_perception_request" if proposal.perception_request is not None else
+                             "valid_catalog_request" if proposal.catalog_request is not None else
+                             "valid_program" if proposal.source is not None else "valid_plan")
         if proposal.source is not None:
             receipt["program_sha256"] = sha256(proposal.source.encode())
             receipt["program_guard_codes"] = program_guard_codes(proposal.source)
         if self.trajectory:
             self.trajectory.emit("model_proposal", receipt=receipt, program_source=proposal.source,
-                                 actions=proposal.actions)
+                                 actions=proposal.actions, subgoal=proposal.subgoal,
+                                 transition=proposal.transition, perception_request=proposal.perception_request,
+                                 catalog_request=proposal.catalog_request, progress=proposal.progress)
+            self.trajectory.emit("progress_assessment", decision_id=snapshot.decision_id,
+                                 progress=proposal.progress, source="model_assessment")
         return proposal

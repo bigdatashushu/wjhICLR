@@ -159,6 +159,7 @@ def main(argv=None) -> int:
             finalization_rounds=args.finalization_rounds if args.finalization_rounds is not None else raw["finalization_rounds"],
             eval_visual_fallback=(args.eval_visual_fallback if args.eval_visual_fallback is not None
                                   else bool(raw["eval_visual_fallback"])),
+            isolated_choice_visual_fallback=bool(raw["isolated_choice_visual_fallback"]),
             image_layout=vision.layout, max_derived_images=vision.max_derived_images,
             retrieval_policy=retrieval_policy_from(raw),
         )

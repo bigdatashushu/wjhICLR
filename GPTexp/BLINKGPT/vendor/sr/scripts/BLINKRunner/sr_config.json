@@ -1,0 +1,23 @@
+{
+  "schema": "harness3d-blink-sr/1",
+  "model": {
+    "model": "qwen3.8-flash",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key_env": "DASHSCOPE_API_KEY",
+    "timeout_s": 600,
+    "temperature": 0.0,
+    "max_output_tokens": 8192
+  },
+  "solver": {
+    "max_requests": 3,
+    "max_solve_rounds": 2,
+    "max_tokens": 8192,
+    "seed": 137,
+    "enable_thinking": true,
+    "original_image_bytes": true,
+    "explicit_final_answer": true,
+    "capture_responses": true,
+    "expected_model": "qwen3.8-flash",
+    "prompt_profile": "small-image-blink-sr/2"
+  }
+}

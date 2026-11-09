@@ -16,6 +16,43 @@ def require(condition, reason):
         raise ContractError(reason)
 
 
+def audit_result_contexts(events):
+    """Verify host transfers preserve results and change only task-state scope."""
+    snapshots, records = {}, {}
+    for event in events:
+        if event["kind"] in {"decision", "decision_context"}:
+            snapshot = event["snapshot"]
+            require(public_hash({k: v for k, v in snapshot.items() if k != "snapshot_sha256"}) ==
+                    snapshot["snapshot_sha256"], "trajectory_context_hash")
+            snapshots[snapshot["snapshot_sha256"]] = snapshot
+        elif event["kind"] == "execution":
+            for row in event["results"]:
+                records[row["response"]["result_id"]] = row
+        elif event["kind"] == "result_context":
+            before = snapshots.get(event["previous_snapshot_sha256"])
+            after = snapshots.get(event["snapshot_sha256"])
+            require(event["reason"] == "task_state_only" and before is not None and after is not None
+                    and {k: v for k, v in before.items() if k not in {"task_state", "snapshot_sha256"}} ==
+                        {k: v for k, v in after.items() if k not in {"task_state", "snapshot_sha256"}},
+                    "trajectory_result_rebind_context")
+            prior = {rid: row for rid, row in records.items()
+                     if row["scope"]["snapshot_sha256"] == event["previous_snapshot_sha256"]}
+            require(len(event["results"]) == len(prior) and
+                    {row["response"]["result_id"] for row in event["results"]} == set(prior),
+                    "trajectory_result_rebind_denominator")
+            for row in event["results"]:
+                original = prior[row["response"]["result_id"]]
+                require(original["sha256"] == public_hash({k: v for k, v in original.items()
+                                                          if k != "sha256"})
+                        and row["response"] == original["response"]
+                        and row["authorization"] == original["authorization"]
+                        and row["scope"] == {**original["scope"],
+                                             "snapshot_sha256": event["snapshot_sha256"]}
+                        and row["sha256"] == public_hash({k: v for k, v in row.items() if k != "sha256"}),
+                        "trajectory_result_rebind_receipt")
+                records[row["response"]["result_id"]] = row
+
+
 def audit(path):
     result = json_object(Path(path).read_bytes())
     checked = audit_run(result)
@@ -44,15 +81,47 @@ def audit(path):
         require([e["index"] for e in events] == list(range(len(events))), "trajectory_event_order")
         require(events[-1]["kind"] == "episode_result" and events[-1]["report"] == attempt,
                 "trajectory_final_report")
+        audit_result_contexts(events)
         counts = Counter(e["kind"] for e in events)
         requests = [e for e in events if e["kind"] == "model_request"]
         responses = [e for e in events if e["kind"] == "model_response"]
+        snapshots = {e["snapshot"]["snapshot_sha256"]: e["snapshot"] for e in events
+                     if e["kind"] in {"decision", "decision_context"}}
         require(len(requests) == len(attempt["model_requests"]), "trajectory_request_denominator")
         for event, receipt in zip(requests, attempt["model_requests"]):
             require(public_hash(event["messages"]) == receipt["messages_sha256"],
                     "trajectory_messages_hash")
             require(event["receipt"]["decision_id"] == receipt["decision_id"],
                     "trajectory_request_decision")
+            if receipt.get("context_protocol") in {"embodied-task-card/1", "embodied-task-card/2"}:
+                from task_card import validate_card
+                wire = event["messages"][1]["content"][0]["text"]
+                card = validate_card(wire)
+                require(len(wire) == receipt["task_card_chars"]
+                        and sha256(wire.encode()) == receipt["task_card_sha256"]
+                        and card["packing"]["required_fields_over_budget"] ==
+                        receipt.get("task_card_over_budget", False)
+                        and card["identity"]["snapshot_sha256"] == receipt["snapshot_sha256"],
+                        "trajectory_task_card_identity")
+                if card["schema"] == "embodied-task-card/2":
+                    snapshot = snapshots[receipt["snapshot_sha256"]]
+                    obs, state = snapshot["observation"], snapshot["task_state"]
+                    def packed(row):
+                        return {k: row[k] for k in ("revision", "action_id", "action", "success", "feedback")
+                                if k in row}
+                    require(card["task"] == obs["instruction"]
+                            and card["subgoal"] == state.get("goal")
+                            and card["facts"] == state.get("facts", {})
+                            and card["previous_progress"] == state.get("progress")
+                            and card["history"] == [packed(r) for r in state.get("history", [])[-40:]]
+                            and card["catalog"]["text"] == "\n".join(
+                                f"{r['action_id']}:{r['action_name']}" for r in obs["action_table"])
+                            and card["catalog"]["total"] == len(obs["action_table"])
+                            and card["packing"]["fixed_chars"] == len(event["messages"][0]["content"])
+                            and receipt["text_chars"] == len(event["messages"][0]["content"]) + len(wire)
+                            and receipt["history_records"] == len(card["history"])
+                            and receipt["official_examples"] == len(card["official_examples"]),
+                            "trajectory_task_context_coverage")
         for event, receipt in zip(responses, (r for r in attempt["model_requests"]
                                               if "response_sha256" in r)):
             require(sha256(event["text"].encode()) == receipt["response_sha256"],

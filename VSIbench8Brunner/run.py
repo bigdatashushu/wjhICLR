@@ -56,16 +56,23 @@ def check_inputs(data_root, online_config):
     if set(manifest["entries"]) != selected:
         raise ValueError("published input subset differs")
     from skill3d.online.config import load_config
+    from skill3d.synthesis.eval_visual_fallback import ISOLATED_CHOICE_PROMPT_VERSION
     config = load_config(online_config)
     original = load_config(data / "online.yaml")
     changed = json.loads(json.dumps(config))
     changed["online_model"]["mask_review"].pop("target_description")
     changed["online_model"]["enable_thinking"] = original["online_model"]["enable_thinking"]
+    changed["isolated_choice_visual_fallback"] = original["isolated_choice_visual_fallback"]
+    # Existing thinking pilots use 900s transport timeout; keep the allowed delta exact.
+    timeouts = (original["online_model"]["timeout_s"], config["online_model"]["timeout_s"])
+    if timeouts[0] != timeouts[1] and timeouts != (180.0, 900.0):
+        raise ValueError("runner solver timeout changes outside the existing 180s-to-900s pilot override")
+    changed["online_model"]["timeout_s"] = original["online_model"]["timeout_s"]
     # Service location may be overridden, while the original reviewer pin is explicit.
     for field in ("endpoint", "expected_identity_sha256"):
         changed["online_model"]["mask_review"][field] = original["online_model"]["mask_review"][field]
     if changed != original:
-        raise ValueError("runner changes runtime values outside the requested description stage")
+        raise ValueError("runner changes runtime values outside description, thinking, or choice fallback")
     missing_remote_roots = sorted({entry["input_root"] for entry in manifest["entries"].values()
                                    if not Path(entry["input_root"]).is_dir()})
     return {
@@ -77,6 +84,12 @@ def check_inputs(data_root, online_config):
         "reviewer": "Intern-Decision-4B", "reviewer_yes_threshold":
             config["online_model"]["mask_review"]["yes_threshold"],
         "solver_enable_thinking": config["online_model"]["enable_thinking"],
+        "solver_timeout_s": config["online_model"]["timeout_s"],
+        "original_solver_timeout_s": original["online_model"]["timeout_s"],
+        "isolated_choice_visual_fallback": config["isolated_choice_visual_fallback"],
+        "isolated_choice_prompt_version": ISOLATED_CHOICE_PROMPT_VERSION,
+        "eval_visual_fallback_max_requests": int(
+            config["eval_visual_fallback"] or config["isolated_choice_visual_fallback"]),
         "public_questions_sha256": file_hash(data / "questions.jsonl"),
         "published_inputs_sha256": file_hash(data / "published_inputs.json"),
     }

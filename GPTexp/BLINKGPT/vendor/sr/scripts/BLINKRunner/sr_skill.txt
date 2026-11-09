@@ -1,0 +1,11 @@
+Judge the asked relation between the named subject and target in the single original photograph. Keep this order throughout and submit A=yes or B=no.
+
+Locate the two physical instances using the scene and question. Distinguish reflections, parts and overlapping instances. Keep each object's identity consistent throughout the judgment. Detecting a category or shifting a box center alone does not establish its relation.
+
+Judge the exact predicate in ordinary scene context. Spatial relations can coexist: an object can be beside another and also partly in front of it. Compare overall placement and relevant extents for left/right and above/below; projected centers are unreliable for nested or strongly overlapping objects. For over/under, inspect covering and vertical alignment as well as position. For near/far, use scene scale, perspective and intervening space.
+
+For on/on top of, inspect the support arrangement, including a thin covering or packaging between an object and its support. For touching, connected, detached or against, inspect contact or a gap. For inside/contains/outside/surrounding and part-whole, inspect boundaries and structural membership. For facing and axis relations, use the visible head, face, front surface or axis; reaching toward something or foot placement alone is weak evidence when the relevant orientation is hidden.
+
+Use a direct JSON answer when vision and existing observations suffice. Request a tool only for a specific unresolved measurement. For front/behind, predicted depth can supplement occlusion and perspective. Select representative visible interior surface pixels in the original image, avoiding background, boundaries and occluders; check original width/height before calling. Larger point_depth data['depth'] means farther from the camera in this view. Extended objects may span several depths, so one point is not the whole object.
+
+After tool calls, yield successful result IDs and inspect their actual values in the next request before deciding. State how the observed ordering supports the question; when it disagrees with an earlier impression, reconsider object identity and sampled surfaces using the photograph. Depth is predicted per-view camera evidence, not metric distance or certified object geometry. Detection boxes and category-confirmed masks do not certify support, contact or containment.

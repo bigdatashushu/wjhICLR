@@ -25,6 +25,7 @@ ACTION_CONTEXT_FIELDS = frozenset({
     "action_table_sha256", "action_table", "instruction", "feedback", "memory",
     "capabilities", "evidence_revision", "view_id",
     "official_objects", "action_spec", "task_variation",
+    "task_state",
 })
 EMBODIED_ACTIONS_PROFILE = ControlProfile(
     "embodied-actions/1", "SubmitActions", "ActionPayload",
@@ -57,6 +58,7 @@ class ActionContextView:
     official_objects: Any = field(default=None, kw_only=True)
     action_spec: Any = field(default=None, kw_only=True)
     task_variation: str = field(default="", kw_only=True)
+    task_state: Any = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)

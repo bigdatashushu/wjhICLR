@@ -340,6 +340,105 @@ def _suite():
             self.assertEqual(result.status, "prepared_identity_mismatch")
             self.assertEqual(client.calls, [])
 
+        def test_public_evidence_capture_and_missing_never_change_answer(self):
+            summary = {
+                "observations": [{"view_index": 0, "fact": "Synthetic object beside a wall."}],
+                "reference_frame": "Synthetic camera forward.",
+                "relation": "Synthetic left.", "selected_option": "A",
+                "tool_rationale": "Synthetic visual fixture requires no measurement.",
+            }
+            source = "evidence_audit = " + repr(summary) + "\n" + answer
+            result, solver, client = self.solve(source)
+            audit = solver.execution_trace[0]["evidence_audit"]
+            self.assertEqual((result.status, result.answer), ("answered", "A"))
+            self.assertEqual((audit["status"], audit["answer_consistent"]), ("provided", True))
+            self.assertFalse(audit["facts_verified"])
+            self.assertEqual(len(client.calls), 1)
+            result, solver, client = self.solve(answer)
+            self.assertEqual(solver.execution_trace[0]["evidence_audit"]["status"], "missing")
+            self.assertEqual((result.answer, len(client.calls)), ("A", 1))
+            kernel = self.kernel()
+            kernel.run_cell("evidence_audit = " + repr(summary) + "\nYieldObservations([])")
+            kernel.reset_user_namespace()
+            kernel.run_cell(answer)
+            self.assertEqual(kernel.execution_trace[-1]["evidence_audit"]["status"], "missing")
+
+        def test_malformed_or_inconsistent_evidence_is_flagged_without_retry(self):
+            from .evidence import capture
+            base = {
+                "observations": [{"view_index": 0, "fact": "Synthetic visible point."}],
+                "reference_frame": "Synthetic camera.", "relation": "Synthetic right.",
+                "selected_option": "B", "tool_rationale": "No measurement.",
+            }
+            result, solver, client = self.solve("evidence_audit = " + repr(base) + "\n" + answer)
+            self.assertEqual(result.answer, "A")
+            self.assertEqual(len(client.calls), 1)
+            self.assertIn("selected_option_answer_mismatch",
+                          solver.execution_trace[0]["evidence_audit"]["issues"])
+            bad = [
+                object(), {1: "unsupported"},
+                {**base, "observations": [{"view_index": True, "fact": "bad index"}]},
+                {**base, "observations": [{"view_index": 2, "fact": "outside views"}]},
+                {**base, "observations": [object()]},
+                {**base, "observations": base["observations"] * 9},
+                {**base, "relation": "x" * 401},
+            ]
+            for value in bad:
+                audit = capture(value, n_views=2, labels=("A", "B"), answer="A")
+                self.assertEqual(audit["status"], "invalid")
+
+        def test_diagnostic_selection_covers_every_type_without_dispatched_cases(self):
+            from .diagnostic import select_pairs, validate_diagnostic
+            pairs = [
+                {"dataset": "mmsi", "sample_id": f"synthetic-{task}-{i}",
+                 "pair_identity": f"synthetic-pair-{task}-{i}",
+                 "arms": [{"arm": arm, "problem": {"task_type": f"synthetic-type-{task}"}}
+                          for arm in ("direct", "harness")]}
+                for task in range(6) for i in range(8)
+            ]
+            excluded = [row["sample_id"] for row in pairs if row["sample_id"].endswith("-0")]
+            selected = select_pairs(pairs, excluded=excluded)
+            self.assertEqual(len(selected), 30)
+            self.assertEqual(len({p["arms"][0]["problem"]["task_type"] for p in selected[:6]}), 6)
+            self.assertFalse(set(excluded) & {p["sample_id"] for p in selected})
+            self.assertEqual(selected, select_pairs(list(reversed(pairs)), excluded=excluded))
+            manifest = {
+                "diagnostic_only": True, "reference_answer_visible": False, "automatic_retry": False,
+                "host_scoring": "disabled", "questions": 6, "arms": 12,
+                "counts": {"mmsi": 6}, "max_requests": 30, "config": {"max_requests": 30},
+                "pairs": selected[:6],
+            }
+            validate_diagnostic(manifest)
+            with self.assertRaises(ValueError):
+                validate_diagnostic({**manifest, "host_scoring": "enabled"})
+            with self.assertRaises(ValueError):
+                select_pairs(pairs, per_type=6)
+
+        def test_diagnostic_completed_execution_exports_without_loading_references(self):
+            from .. import run as scheduler
+            from ..traces import write
+            directory = Path(self.temp.name) / "diagnostic-export"
+            directory.mkdir()
+            pair = {"dataset": "mmsi", "pair_identity": "synthetic-pair",
+                    "arms": [{"arm": arm} for arm in ("direct", "harness")]}
+            manifest = {"run_identity": "synthetic-run", "pairs": [pair], "arms": 2,
+                        "config": {"model": "synthetic", "max_workers": 2,
+                                   "apis": [{"id": "synthetic-api", "enabled": True,
+                                             "validated": True, "timeout_seconds": 10}]}}
+            write(directory / "manifest.json", manifest)
+            for arm in pair["arms"]:
+                root = directory / "episodes/mmsi/synthetic-pair" / arm["arm"]
+                root.mkdir(parents=True)
+                write(root / "episode.json", {"run_identity": "synthetic-run",
+                                             "pair_identity": "synthetic-pair"})
+            with patch.object(scheduler, "verify_manifest"), patch.object(scheduler, "ApiPool") as pool:
+                pool.return_value.paused.return_value = False
+                pool.return_value.summary.return_value = {"synthetic": True}
+                with patch.object(scheduler.subprocess, "run") as postprocess:
+                    scheduler.execute(directory, score_results=False)
+            self.assertEqual(postprocess.call_args.args[0][3], "GPTexp.export")
+            self.assertEqual(postprocess.call_count, 1)
+
     return unittest.defaultTestLoader.loadTestsFromTestCase(Checks)
 
 

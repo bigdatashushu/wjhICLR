@@ -1,0 +1,10 @@
+# Official simulator pins plus the isolated Python 3.10 adapter runtime.
+numpy==1.22.4
+Pillow==10.4.0
+torch==2.2.2
+torchvision==0.17.2
+robosuite==1.4.0
+mujoco==2.3.7
+opencv-python==4.6.0.66
+numba==0.60.0
+scipy==1.10.1

@@ -236,6 +236,7 @@ class DecisionSnapshot:
     capabilities: tuple[str, ...] = ("current_rgb",)
     input_policy: str = "current_only"
     execution_policy: str = "single_action"
+    task_state: Mapping = field(default_factory=lambda: MappingProxyType({}), kw_only=True)
     snapshot_sha256: str = field(init=False)
 
     def __post_init__(self):
@@ -246,6 +247,7 @@ class DecisionSnapshot:
         integer(self.evidence_revision, name="evidence_revision")
         if self.evidence_manifest_sha256:
             digest(self.evidence_manifest_sha256, name="evidence_manifest_sha256")
+        object.__setattr__(self, "task_state", freeze(self.task_state))
         if (self.input_policy != "current_only" or self.execution_policy != "single_action"
                 or type(self.capabilities) is not tuple
                 or any(not isinstance(c, str) for c in self.capabilities)
@@ -265,6 +267,8 @@ class DecisionSnapshot:
         }
         if include_hash:
             value["snapshot_sha256"] = self.snapshot_sha256
+        if self.task_state:
+            value["task_state"] = plain(self.task_state)
         return value
 
 

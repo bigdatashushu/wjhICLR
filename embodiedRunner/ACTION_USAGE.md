@@ -1,5 +1,7 @@
 # 逐轮快照动作适配 V2
 
+2026-11-06 新运行采用 [子目标任务卡 v2](TASK_CARD_IMPLEMENTATION.md)：Full/B11/B01 每次发送完整动作表、40步动作与反馈、完整环境 Skill 和精选官方示例，整请求文本目标 16,000 字符；必要内容超出时完整发送并记录长度。Qwen 在同一次输出中判断进度、选择子目标并行动或请求感知。Direct 保留官方协议。历史冻结结果按原身份解释，下文固定词表/预感知描述属于 `task_cards=false` 的旧模式。
+
 2026-11-05。实现集中在本目录，复用共享 `src/skill3d` 的程序装配、数值安全、工具授权和 small-image 感知，采用任务专用 `action_runtime/`。已接入正式 live 入口、Linux 隔离和官方 V2 worker；阶段验收见 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md)，本次实施规划见 [LIVE_IMPLEMENTATION_PLAN.md](LIVE_IMPLEMENTATION_PLAN.md)。
 
 最新 r06 部署已完成三环境 × 三臂的真实首动作联调：9/9 轮执行一个官方动作，25 次实际推理，服务器与本地独立审计均通过。[最终验收收据](checks/action-live-acceptance-20261105.json) 记录实际范围；本次没有开展完整任务成功率或方法效果比较。

@@ -1,0 +1,84 @@
+{
+  "schema": "qwen3vl-target-detection-config/1",
+  "model": {
+    "name": "qwen3.8-flash",
+    "api_key_env": "DASHSCOPE_API_KEY",
+    "base_url_env": "DASHSCOPE_BASE_URL",
+    "response_format": "json_object",
+    "max_tokens": 4096,
+    "temperature": 0,
+    "timeout_s": 120,
+    "extra_body": {"enable_thinking": false, "seed": 137}
+  },
+  "runtime": {
+    "transport": "ssh",
+    "ssh_target": "cvailab@10.10.0.198",
+    "code_root": "/home/cvailab/wangjh/embodied-target-detection-20261108-r05/embodiedRunner",
+    "source_root": "/home/cvailab/wangjh/embodied-action-v2-task-card-full-20261106-r06/embodiedRunner",
+    "work_root": "/home/cvailab/wangjh/embodied-target-detection-20261108-r05/embodiedRunner/target_detection_r05/runs/qwen3vl8b",
+    "python": {
+      "alfred": "/home/cvailab/wangjh/embodiedRunner/venv-household/bin/python",
+      "habitat": "/home/cvailab/wangjh/embodiedRunner/venv-household/bin/python",
+      "manipulation": "/home/cvailab/wangjh/embodiedRunner/manipulation-runtime/venv/bin/python",
+      "navigation": "/home/cvailab/wangjh/embodiedRunner/venv-nav/bin/python"
+    },
+    "gpu": {"alfred": null, "habitat": 7, "manipulation": null, "navigation": 7},
+    "gpu_min_free_mb": 4096,
+    "timeout_s": 600,
+    "environment_seed": 137,
+    "manipulation_catalog": "/home/cvailab/wangjh/embodied-official-direct-20261107-r03/embodiedRunner/official_direct/assets/manipulation_assets.json",
+    "manipulation_dataset": "/home/cvailab/wangjh/embodied-official-direct-20261107-r03/embodiedRunner/official_direct/assets/dataset"
+  },
+  "detection": {
+    "backend": "qwen3vl8b",
+    "group_iou": 0.8,
+    "page_size": 12,
+    "max_crop_groups": 2,
+    "temperature": 0,
+    "max_tokens": 4096,
+    "service": {
+      "transport": "ssh",
+      "ssh_target": "cvailab@10.10.0.198",
+      "base_url": "http://10.10.0.198:28101/v1",
+      "model": "Qwen3-VL-8B-Instruct-FP8",
+      "timeout_s": 120,
+      "auth_process_pid": 622294,
+      "auth_process_start_ticks": 1414729525,
+      "auth_process_boot_id": "b256b25a-0876-4438-87e0-fcaa642cfa9a",
+      "model_snapshot": "/home/cvailab/.cache/huggingface/hub/models--Qwen--Qwen3-VL-8B-Instruct-FP8/snapshots/9cdc6310a8cb770ce18efaf4e9935334512aee45",
+      "model_files_sha256": {
+        "config.json": "8bbb7d41e722c000d4079c2520fd7d8438a5c13cf084c89784c0a2770cc9bf88",
+        "generation_config.json": "a8aeb4072b54a2b54755557cad7f2dddc9f99ea858a6eccd704731180b788592",
+        "model.safetensors.index.json": "751e4b7c17b148d5cc8fb1296b281fe98a711c0182d88b8516f459186990f49d"
+      }
+    }
+  },
+  "episodes": [
+    {"environment": "alfred", "subset": "base", "index": 0},
+    {"environment": "alfred", "subset": "base", "index": 1},
+    {"environment": "alfred", "subset": "base", "index": 2},
+    {"environment": "alfred", "subset": "base", "index": 3},
+    {"environment": "alfred", "subset": "base", "index": 4},
+    {"environment": "habitat", "subset": "base", "index": 0},
+    {"environment": "habitat", "subset": "base", "index": 1},
+    {"environment": "habitat", "subset": "base", "index": 2},
+    {"environment": "habitat", "subset": "base", "index": 3},
+    {"environment": "habitat", "subset": "base", "index": 4},
+    {"environment": "manipulation", "subset": "base", "index": 0},
+    {"environment": "manipulation", "subset": "base", "index": 1},
+    {"environment": "manipulation", "subset": "base", "index": 2},
+    {"environment": "manipulation", "subset": "base", "index": 3},
+    {"environment": "manipulation", "subset": "base", "index": 4},
+    {"environment": "navigation", "subset": "base", "index": 0},
+    {"environment": "navigation", "subset": "base", "index": 1},
+    {"environment": "navigation", "subset": "base", "index": 2},
+    {"environment": "navigation", "subset": "base", "index": 3},
+    {"environment": "navigation", "subset": "base", "index": 4}
+  ],
+  "n_shots": {"alfred": 10, "habitat": 10, "manipulation": 4, "navigation": 3},
+  "max_requests": {"alfred": 40, "habitat": 40, "manipulation": 15, "navigation": 20},
+  "execution": {
+    "max_episodes": 1, "max_api_requests": 1, "max_gpu_episodes": 1,
+    "per_environment": {"alfred": 1, "habitat": 1, "manipulation": 1, "navigation": 1}
+  }
+}

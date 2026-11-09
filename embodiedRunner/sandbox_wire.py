@@ -111,6 +111,9 @@ def unpack_prepared(snapshot, value):
         raise ContractError("undeclared_relative_points")
     if candidates and "candidate_category" not in snapshot.capabilities:
         raise ContractError("undeclared_candidates")
+    if ("candidate_detection" in snapshot.capabilities and
+            (snapshot.evidence_revision < 1 or not snapshot.evidence_manifest_sha256)):
+        raise ContractError("undeclared_candidate_detection")
     if not isinstance(candidates, list) or len(candidates) > 128:
         raise ContractError("candidate_cap")
     ids = set()
@@ -136,7 +139,8 @@ def unpack_prepared(snapshot, value):
     with Image.open(io.BytesIO(snapshot.observation.png)) as image:
         rgb = np.array(image.convert("RGB"))
     return SimpleNamespace(frames=[rgb], geometries=geometries, candidates=candidates,
-                           provenance={"public_evidence_sha256": value["sha256"]})
+                           provenance={"public_evidence_sha256": value["sha256"],
+                                       "candidate_detection": "candidate_detection" in snapshot.capabilities})
 
 
 def pack_snapshot(snapshot, binding):
@@ -169,7 +173,7 @@ def unpack_snapshot(value):
         result = DecisionSnapshot(
             observation, wire["decision_id"], wire["method_sha256"], wire["budget_sha256"],
             wire["evidence_revision"], wire["evidence_manifest_sha256"], tuple(wire["capabilities"]),
-            wire["input_policy"], wire["execution_policy"])
+            wire["input_policy"], wire["execution_policy"], task_state=wire.get("task_state", {}))
     except (TypeError, KeyError, ValueError):
         raise ContractError("invalid_sandbox_snapshot") from None
     if result.public_dict() != wire:

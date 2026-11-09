@@ -1,22 +1,30 @@
 # harness3D Skill Library
 
-当前 active snapshot 为 `mixed-r04-20261026-v1`。八个规范题型各保留三个
-初始证据状态，共 24 个活跃槽位、28 个索引条目（其中四个为历史版本）。
+当前 active snapshot 为 `nonmetric-g1m1-aligned-g1m0-20261106-v1`。
+八个规范题型各保留三个初始证据状态，共 24 个活跃槽位；历史版本继续保留。
 运行对象为 `SkillSpecV11`，快照 Schema 为 `runtime-skill-snapshot/3.0`。
 
-本次混合选择仅替换两个槽位：
+本次按用户要求，将五类非米制题的 g1m1 方法正文替换为各自当前 g1m0 正文：
 
-| 槽位 | 活跃版本 | 来源 |
+| 槽位 | 活跃版本 | 方法正文来源 |
 |---|---|---|
-| `object_size_estimation/g1m0` | `S04-g1m0@1.1.0` | r04 双 seed 诊断准入与实际交付通过 |
-| `room_size_estimation/g0m0` | `S05-g0m0@1.1.0` | r04 双 seed 诊断准入与实际交付通过 |
+| `object_counting/g1m1` | `S01-g1m1@1.0.2` | `S01-g1m0@1.0.0` |
+| `object_rel_distance/g1m1` | `S03-g1m1@1.0.2` | `S03-g1m0@1.0.0` |
+| `object_rel_direction/g1m1` | `S06-g1m1@1.0.2` | `S06-g1m0@1.0.0` |
+| `obj_appearance_order/g1m1` | `S07-g1m1@1.0.2` | `S07-g1m0@1.0.0` |
+| `route_planning/g1m1` | `S08-g1m1@1.0.2` | `S08-g1m0@1.0.0` |
 
-其余 22 个槽位使用 `S0-v11-task-tools` Parent。下降与持平候选不进入当前活跃选择，
-历史来源和完整处置保存在 [选择收据](validation/mixed_r04_20261026.json)。
-新快照是按用户选择冻结的混合方法，尚无整库配对成绩；原 r04 混合统计不作为新库成绩。
+完整方法正文逐字一致；只保留 g1m1 的名称、状态描述和真实初始能力声明。
+三类米制题继续使用原版本：绝对距离 `S02-g1m1@1.0.2`、
+物体尺寸 `S04-g1m1@1.0.1`、房间面积 `S05-g1m1@1.0.1`。
+其余 19 个活跃槽位、旧源文件和旧快照均保留。
 
-fit-set 的可达范围仍为 19 槽：八个 `g0m0`、八个 `g1m0`，以及距离、尺寸、面积的
-三个 `g1m1`。其余五个非米制 `g1m1` 保留原 Parent。
+父快照为 `g1m1-manual-trace-feedback-20261105-v1`。
+本次通过原生加载器的全文哈希、24 槽覆盖与五份完整方法交付检查，
+记录见 [对齐核验](validation/nonmetric_g1m1_alignment_20261106.json)。
+该检查没有发出模型请求，不代表新版本的实验得分。
+原 `mixed-r04` 选择历史继续保存在
+[旧选择收据](validation/mixed_r04_20261026.json)。
 
 ## 方法源与运行合同
 

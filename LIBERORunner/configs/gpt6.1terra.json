@@ -1,0 +1,19 @@
+{
+  "model": "gpt-6.1-terra",
+  "base_url": "https://xcode.best/v1",
+  "reasoning_effort": "high",
+  "timeout_seconds": 3600,
+  "max_output_tokens": 4096,
+  "max_requests": 600,
+  "libero_root": "third_party/LIBERO",
+  "suites": ["libero_spatial", "libero_object", "libero_goal", "libero_10"],
+  "task_ids": null,
+  "task_order_index": 0,
+  "seed": 42,
+  "episodes_per_task": null,
+  "max_steps": null,
+  "image_height": null,
+  "image_width": null,
+  "image_orientation": "raw",
+  "render_gpu_device_id": -1
+}

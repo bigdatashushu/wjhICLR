@@ -1,0 +1,14 @@
+# Simulation-only subset of the original LIBERO requirements.txt.
+# Training dependencies (wandb, transformers, robomimic, hydra) are not needed.
+numpy==1.22.4
+easydict==1.9
+opencv-python==4.6.0.66
+einops==0.4.1
+robosuite==1.4.0
+bddl==1.0.1
+future==0.18.2
+matplotlib==3.5.3
+cloudpickle==2.1.0
+gym==0.25.2
+# Logging import omitted from robosuite 1.4.0's dependency metadata.
+termcolor==2.5.0

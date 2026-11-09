@@ -79,13 +79,14 @@ class EpisodeState:
         self.transition("observed", mutation_kind)
 
     def prepare_snapshot(self, *, evidence_revision=0, evidence_manifest_sha256="",
-                         capabilities=("current_rgb",)):
+                         capabilities=("current_rgb",), task_state=None):
         if self.phase != "observed" or self.observation is None:
             raise ContractError("snapshot_requires_current_observation")
         self.transition("preparing", "prepare_current")
         self.snapshot = DecisionSnapshot(
             self.observation, uuid.uuid4().hex, self.method_sha256, self.budget_sha256,
-            evidence_revision, evidence_manifest_sha256, tuple(capabilities))
+            evidence_revision, evidence_manifest_sha256, tuple(capabilities),
+            task_state=task_state or {})
         return self.snapshot
 
     def extend_evidence(self, *, manifest_sha256, capabilities):
@@ -103,6 +104,12 @@ class EpisodeState:
         return validate_memory(payload.memory_update, episode_id=self.binding.episode_id,
                                observation_revision=obs.observation_revision,
                                decision_id=self.snapshot.decision_id)
+
+    def extend_task_state(self, task_state):
+        if self.snapshot is None or self.phase != "synthesizing":
+            raise ContractError("task_state_outside_decision")
+        self.snapshot = replace(self.snapshot, task_state=task_state)
+        return self.snapshot
 
     def finish_episode(self, reason, *, aborted=False, task_success=False, task_progress=0.0):
         if type(task_success) is not bool:

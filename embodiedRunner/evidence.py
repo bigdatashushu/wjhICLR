@@ -14,6 +14,7 @@ from action_host import PreparedEvidence
 from protocol import ContractError, OperationalError, sha256
 from sandbox_wire import pack_prepared
 from skill3d.small_image.precompute import SmallImagePrecomputer, validate_prepared_content
+from task_card import validate_perception
 
 VERSION = "embodied-current-evidence/1"
 POLICY = freeze({
@@ -151,24 +152,32 @@ class CurrentEvidencePreparer:
     def __init__(self, backends=PerceptionBackends()):
         self.backends, self.identities = backends, backends.identities()
         self.config_sha256 = public_hash({
-            "policy": POLICY, "parser_sha256": PARSER_SHA256, "models": self.identities})
+            "policy": POLICY, "parser_sha256": PARSER_SHA256, "models": self.identities,
+            "dynamic_request": {"max_targets": 4, "one_candidate_per_category": True,
+                                "optional_depth": True}})
         self.cache, self.manifests = {}, {}
         self.trajectory = None
 
-    def __call__(self, snapshot, binding, budget):
+    def __call__(self, snapshot, binding, budget, *, request=None):
+        request = validate_perception(request) if request is not None else None
         scope = evidence_scope(snapshot)
-        key = public_hash({"scope": scope, "config_sha256": self.config_sha256})
+        key = public_hash({"scope": scope, "config_sha256": self.config_sha256,
+                           "request": request})
         if key in self.cache:
             result = self.cache[key]
             validate_prepared_content(result.prepared)
             return result
         obs = snapshot.observation
-        categories = public_categories(obs.instruction, obs.action_table)
+        categories = (tuple(row["category"] for row in request["targets"]) if request is not None
+                      else public_categories(obs.instruction, obs.action_table))
+        detector_completed = False
+        max_candidates = max(1, len(categories)) if request is not None else 1
         def governed(name, stage):
             fn = getattr(self.backends, name)
             if fn is None:
                 return None
             def invoke(*args):
+                nonlocal detector_completed
                 try:
                     with budget.request(stage, decision_id=snapshot.decision_id, view_id=obs.view_id) as permit:
                         if self.trajectory:
@@ -182,7 +191,8 @@ class CurrentEvidencePreparer:
                         if name == "reviewer":
                             if not isinstance(value, Mapping) or value.get("status") != "observed":
                                 raise OperationalError("perception_service_error")
-                            permit["usage"] = value.get("raw_response", {}).get("usage")
+                            raw = value.get("raw_response", {})
+                            permit["usage"] = raw.get("result", {}).get("usage", raw.get("usage"))
                         if name == "detector":
                             # Bound iteration; one candidate means at most one native review.
                             rows = []
@@ -193,7 +203,15 @@ class CurrentEvidencePreparer:
                             rows.sort(key=lambda r: (
                                 categories.index(r["category"]), -float(r["confidence"]),
                                 tuple(r["box_xyxy"])))
-                            value = rows[:1]
+                            if request is None:
+                                value = rows[:1]
+                            else:
+                                # Keep a candidate for EACH requested role/category,
+                                # rather than allowing the first category to occupy all slots.
+                                value = [next(row for row in rows if row["category"] == category)
+                                         for category in categories
+                                         if any(row["category"] == category for row in rows)]
+                            detector_completed = bool(categories)
                         return value
                 except Exception as exc:
                     # Never retain or expose provider exception text.
@@ -209,10 +227,11 @@ class CurrentEvidencePreparer:
             pipeline = _MemoryPrecomputer(
                 obs.png, detector=governed("detector", "dino"),
                 segmenter=governed("segmenter", "sam"), reviewer=governed("reviewer", "category_review"),
-                depth_estimator=governed("depth_estimator", "moge"),
+                depth_estimator=(governed("depth_estimator", "moge")
+                                 if request is None or request["depth"] else None),
                 model_identities=self.identities, method_identity=self.config_sha256,
                 expected_review_identity_sha256=self.identities["reviewer"].get("expected_identity_sha256", ""),
-                max_categories=4, max_candidates_per_view=1, max_cache_entries=0)
+                max_categories=4, max_candidates_per_view=max_candidates, max_cache_entries=0)
             prepared = pipeline.process(problem, categories=categories)
         except _StopService as exc:
             from budget import BudgetExhausted
@@ -224,6 +243,8 @@ class CurrentEvidencePreparer:
         validate_prepared_content(prepared)
         wire = pack_prepared(snapshot, prepared)
         capabilities = ["current_rgb"]
+        if detector_completed:
+            capabilities.append("candidate_detection")
         if prepared.candidates:
             capabilities.append("candidate_category")
         if prepared.has_relative_depth:
@@ -239,6 +260,9 @@ class CurrentEvidencePreparer:
             "mask_quality_assessed": False, "metric_world": False, "labels_used": False,
             "reference_answer_visible": False,
         }
+        if request is not None:
+            manifest["request_sha256"] = public_hash(request)
+            manifest["category_source"] = "qwen_current_subgoal"
         manifest_hash = public_hash(manifest)
         result = PreparedEvidence(prepared, manifest_hash, tuple(capabilities))
         # One current decision only. Identical RGB after mutation still re-prepares.
@@ -256,3 +280,23 @@ class CurrentEvidencePreparer:
                 or manifest["wire_sha256"] != pack_prepared(snapshot, result.prepared)["sha256"]):
             raise ContractError("current_evidence_binding_mismatch")
         return plain(manifest)
+
+
+def summarize_requested_evidence(result, request):
+    """Finite semantic summary; arrays remain behind current tool authorization."""
+    rows = []
+    for target in request["targets"]:
+        candidates = [row for row in result.prepared.candidates if row["category"] == target["category"]]
+        if not candidates:
+            status = "no_detection"
+        elif any(row["category_confirmed"] for row in candidates):
+            status = "category_confirmed_mask_unassessed"
+        else:
+            status = "category_unconfirmed"
+        rows.append({**plain(target), "status": status,
+                     "candidates": [{"id": row["candidate_id"], "box_xyxy": list(row["box_xyxy"]),
+                                     "category_confirmed": row["category_confirmed"]}
+                                    for row in candidates]})
+    return {"status": "prepared", "targets": rows, "depth_requested": request["depth"],
+            "capabilities": list(result.capabilities), "unit": "per_view_relative",
+            "mask_quality_assessed": False, "geometry_usable": False}

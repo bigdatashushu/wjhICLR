@@ -20,7 +20,8 @@ from action_audit import audit_run, seal_record
 from action_bridge import ActionBridge, NDJSONTransport, v2_environment
 from action_contract import public_hash
 from action_host import ActionHost
-from action_identity import ARMS, COMPARE_ARMS, ENVIRONMENTS, configuration_identity, protocol_identity, source_identity
+from action_identity import (ARMS, COMPARE_ARMS, RERUN_ARMS, ENVIRONMENTS,
+                             configuration_identity, protocol_identity, source_identity)
 from action_solver import ActionSolver, MODEL_CONFIG, make_qwen_client
 from budget import RunBudget, policy_for
 from evidence import CombinedDINO, CurrentEvidencePreparer, PerceptionBackends
@@ -63,10 +64,13 @@ def load_config(path):
     expected = {"schema", "selection", "arms", "integration_step_limit",
                 "require_identical_initial_observation", "navigation_python", "household_python",
                 "render_gpu", "perception_gpu", "detector", "reviewer", "sam2", "moge2"}
-    if (set(config) not in (expected, expected | {"manipulation_python"}) or config["schema"] != SCHEMA
-            or config["arms"] not in (list(ARMS), list(COMPARE_ARMS))
+    if (not expected <= set(config) or set(config) - expected - {"manipulation_python", "task_cards"}
+            or config["schema"] != SCHEMA
+            or config["arms"] not in (list(ARMS), list(COMPARE_ARMS), list(RERUN_ARMS))
             or type(config["selection"]) is not list or not 1 <= len(config["selection"]) <= 180):
         raise ContractError("live_config_shape")
+    if "task_cards" in config and type(config["task_cards"]) is not bool:
+        raise ContractError("live_task_card_mode")
     for key in ("render_gpu", "perception_gpu"):
         if type(config[key]) is not int or config[key] not in {0, 1, 3, 7}:
             raise ContractError("live_gpu_not_authorized")
@@ -306,7 +310,8 @@ def live_run(config_path, output, *, compare=False):
         raise ContractError("live_model_auth_missing")
     methods, selection = load_methods(), receipt["selection"]
     environments = [i["environment"] for i in selection]
-    capture = compare or "eb_manipulation" in environments
+    task_cards = config.get("task_cards", True)
+    capture = compare or "eb_manipulation" in environments or task_cards
     run_id = "live-" + uuid.uuid4().hex
     manifest = {
         "schema": "embodied-paired-run/1", "run_id": run_id, "arms": arms,
@@ -325,6 +330,7 @@ def live_run(config_path, output, *, compare=False):
         "integration_step_limit": config["integration_step_limit"],
         "require_identical_initial_observation": config["require_identical_initial_observation"],
         "capture_complete_trajectory": capture,
+        "task_cards": task_cards,
     }
     seal_record(manifest)
     write_new(run_dir / "manifest.json", manifest)
@@ -355,7 +361,7 @@ def live_run(config_path, output, *, compare=False):
                     bridge = ActionBridge(transport, environment=item["environment"],
                                           episode_id=item["episode_id"], budget=budget)
                     solver = ActionSolver(make_qwen_client(), arm=arm, environment=item["environment"],
-                                          method=method, trajectory=trajectory)
+                                          method=method, trajectory=trajectory, task_cards=task_cards)
                     preparer.trajectory = trajectory if arm != "Direct" else None
                     host = ActionHost(bridge, solver, run_id=roots[arm].run_id, arm=arm,
                                       evidence_preparer=None if arm == "Direct" else preparer,

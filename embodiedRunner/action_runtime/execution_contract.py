@@ -13,6 +13,7 @@ class ActionExecutionContract:
     method_context_max_chars: int = 16000
     contract_version: str = "embodied-execution-contract/1"
     environment: str = "eb_navigation"
+    task_cards: bool = False
 
     def to_dict(self):
         if type(self.method_context_max_chars) is not int or self.method_context_max_chars <= 0:
@@ -26,7 +27,8 @@ class ActionExecutionContract:
                           "snapshot_sha256, action_table_sha256, actions, evidence_refs, memory_update))",
             "context_fields": ["episode_id", "decision_id", "observation_revision", "snapshot_sha256",
                                "action_table_sha256", "action_table", "instruction", "feedback",
-                               "memory", "capabilities", "evidence_revision", "view_id", "tools", "frames"],
+                               "memory", "capabilities", "evidence_revision", "view_id", "tools", "frames",
+                               "task_state"],
             "rules": [
                 "Define solve(ctx); the host calls it. Every segment has a fresh user namespace.",
                 "SubmitActions submits typed data and immediately terminates execution.",
@@ -43,11 +45,23 @@ class ActionExecutionContract:
                 "ReadObservation pages have at most 4000 characters and 32 items; at most 3 reads per segment.",
                 "The same frozen complete method is delivered on every ordinary and repair request.",
                 "A method cannot grant capabilities, increase budget or determine official success.",
+                "ctx.task_state is read-only public action/feedback state and the model subgoal. "
+                "Proposed goals are not confirmed facts; official action success is not grasp/task success.",
             ],
             "geometry_unit": "per_view_relative", "metric_world": False,
             "history_policy": "current_only", "finalization": False,
             "tool_response_schema_version": TOOL_RESPONSE_VERSION,
         }
+        if self.task_cards:
+            from task_card import POLICY
+            value["output"] = {
+                "required": ["subgoal", "transition"],
+                "optional": ["progress"],
+                "exactly_one": ["program_source", "perception_request", "catalog_request"],
+                "program_source": "Python source string defining solve(ctx)",
+            }
+            value["task_card_policy"] = POLICY
+            value["history_policy"] = "current_rgb_with_40_public_action_feedback_records"
         if self.environment == "eb_manipulation":
             value["context_fields"] += ["official_objects", "action_spec", "task_variation"]
             value["rules"][3] = (

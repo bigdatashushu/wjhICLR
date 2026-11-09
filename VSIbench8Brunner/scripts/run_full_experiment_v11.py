@@ -450,6 +450,7 @@ def runtime_cfg(path, seed):
         max_regen=sandbox.max_regenerate, max_solver_rounds=raw["max_solver_rounds"],
         max_retries_per_operation=raw["max_retries_per_operation"],
         finalization_rounds=raw["finalization_rounds"], eval_visual_fallback=raw["eval_visual_fallback"],
+        isolated_choice_visual_fallback=raw["isolated_choice_visual_fallback"],
         input_diagnostics=raw.get("input_diagnostics", False), image_layout=vision.layout,
         max_derived_images=vision.max_derived_images, retrieval_policy=retrieval_policy_from(raw),
         model_weights_sha256=os.environ.get("SKILL3D_MODEL_WEIGHTS_SHA256", ""),

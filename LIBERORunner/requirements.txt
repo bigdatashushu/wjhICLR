@@ -1,0 +1,4 @@
+# API transport is the existing sibling xcodeapi (standard library only).
+numpy>=1.22.4,<2
+Pillow>=10,<12
+PyYAML>=6,<7

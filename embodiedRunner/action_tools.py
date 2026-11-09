@@ -1,6 +1,8 @@
 """Decision-scoped result receipts and bounded observation reads."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from action_contract import digest, integer, plain, public_hash
 from protocol import ContractError, canonical
 from skill3d.schemas.tool_response import ModelToolResponse, model_tool_response
@@ -75,6 +77,22 @@ class ResultStore:
         return (not self.revoked and scope_of(snapshot) == self.scope
                 and result_id in self.records)
 
+    def rebind_task_state(self, snapshot):
+        """Host-only transfer across a pure task-state change, never new evidence."""
+        if self.revoked or snapshot != replace(self.snapshot, task_state=snapshot.task_state):
+            raise ContractError("result_rebind_not_task_state_only")
+        rows = []
+        for row in self.records.values():
+            # Revalidate the original receipt before issuing its new scope.
+            self.accept(row)
+            rebound = {**plain(row), "scope": scope_of(snapshot)}
+            rebound["sha256"] = public_hash({k: v for k, v in rebound.items() if k != "sha256"})
+            rows.append(rebound)
+        store = ResultStore(snapshot, rows, max_reads=self.max_reads, max_results=self.max_results)
+        store.reads = list(self.reads)
+        self.revoke()
+        return store
+
     def read(self, result_id, fields=None, offset=0, limit=8):
         if not self.authorize(result_id, self.snapshot):
             raise ContractError("reader_scope_denied")
@@ -112,5 +130,8 @@ def action_registry(prepared, binding, *, segment_id):
         frames=prepared.frames, candidates=prepared.candidates,
         geometries=prepared.geometries,
         provenance={**prepared.provenance, "segment_id": segment_id})
-    return build_registry(view, SimpleNamespace(
+    registry, scene = build_registry(view, SimpleNamespace(
         input_sha256=binding.input_sha256, benchmark=binding.environment))
+    if prepared.provenance.get("candidate_detection") is not True:
+        scene.available_artifacts = scene.available_artifacts - {"objects"}
+    return registry, scene

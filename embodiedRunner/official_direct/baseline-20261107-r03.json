@@ -1,0 +1,120 @@
+{
+  "schema": "official-direct-config/1",
+  "model": {
+    "name": "qwen3.8-flash",
+    "api_key_env": "DASHSCOPE_API_KEY",
+    "base_url_env": "DASHSCOPE_BASE_URL",
+    "response_format": "json_object",
+    "max_tokens": 4096,
+    "temperature": 0,
+    "timeout_s": 120,
+    "extra_body": {
+      "seed": 137,
+      "enable_thinking": false
+    }
+  },
+  "runtime": {
+    "transport": "ssh",
+    "ssh_target": "cvailab@10.10.0.198",
+    "code_root": "/home/cvailab/wangjh/embodied-official-direct-20261107-r03/embodiedRunner",
+    "source_root": "/home/cvailab/wangjh/embodied-action-v2-task-card-full-20261106-r06/embodiedRunner",
+    "work_root": "/home/cvailab/wangjh/embodied-official-direct-20261107-r03/embodiedRunner/official_direct/runs",
+    "manipulation_catalog": "/home/cvailab/wangjh/embodied-official-direct-20261107-r03/embodiedRunner/official_direct/assets/manipulation_assets.json",
+    "manipulation_dataset": "/home/cvailab/wangjh/embodied-official-direct-20261107-r03/embodiedRunner/official_direct/assets/dataset",
+    "python": {
+      "navigation": "/home/cvailab/wangjh/embodiedRunner/venv-nav/bin/python",
+      "alfred": "/home/cvailab/wangjh/embodiedRunner/venv-household/bin/python",
+      "habitat": "/home/cvailab/wangjh/embodiedRunner/venv-household/bin/python",
+      "manipulation": "/home/cvailab/wangjh/embodiedRunner/manipulation-runtime/venv/bin/python"
+    },
+    "gpu": {
+      "navigation": 7,
+      "alfred": null,
+      "habitat": 7,
+      "manipulation": null
+    },
+    "gpu_min_free_mb": 4096,
+    "timeout_s": 600,
+    "environment_seed": 137
+  },
+  "episodes": [
+    {
+      "environment": "navigation",
+      "subset": "base",
+      "index": 3
+    },
+    {
+      "environment": "navigation",
+      "subset": "base",
+      "index": 4
+    },
+    {
+      "environment": "alfred",
+      "subset": "base",
+      "index": 3
+    },
+    {
+      "environment": "alfred",
+      "subset": "base",
+      "index": 4
+    },
+    {
+      "environment": "habitat",
+      "subset": "base",
+      "index": 3
+    },
+    {
+      "environment": "habitat",
+      "subset": "base",
+      "index": 4
+    },
+    {
+      "environment": "manipulation",
+      "subset": "base",
+      "index": 0
+    },
+    {
+      "environment": "manipulation",
+      "subset": "base",
+      "index": 1
+    },
+    {
+      "environment": "manipulation",
+      "subset": "base",
+      "index": 2
+    },
+    {
+      "environment": "manipulation",
+      "subset": "base",
+      "index": 3
+    },
+    {
+      "environment": "manipulation",
+      "subset": "base",
+      "index": 4
+    }
+  ],
+  "execution": {
+    "max_episodes": 8,
+    "max_api_requests": 32,
+    "max_gpu_episodes": 1,
+    "per_environment": {
+      "navigation": 1,
+      "alfred": 2,
+      "habitat": 1,
+      "manipulation": 3
+    }
+  },
+  "n_shots": {
+    "navigation": 3,
+    "alfred": 10,
+    "habitat": 10,
+    "manipulation": 4
+  },
+  "max_requests": {
+    "navigation": 20,
+    "alfred": 40,
+    "habitat": 40,
+    "manipulation": 15
+  }
+}

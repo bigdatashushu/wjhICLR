@@ -20,7 +20,7 @@ def ssh(command):
             "-S", str(ROOT / "checks/ssh4090"), HOST, command]
 
 
-def deploy(remote=DEFAULT_REMOTE):
+def deploy(remote=DEFAULT_REMOTE, *, archive_path=None):
     if not remote.startswith(REMOTE_PARENT + "/embodied-action-v2-") or ".." in remote:
         raise ValueError("invalid isolated deployment directory")
     subprocess.run(ssh("ls -d " + shlex.quote(REMOTE_PARENT)), check=True, capture_output=True)
@@ -36,8 +36,9 @@ def deploy(remote=DEFAULT_REMOTE):
     paths = {p for p in paths if not p.startswith(
         ("embodiedRunner/upstream/", "embodiedRunner/upstream-household/",
          "embodiedRunner/upstream-manipulation/"))}
-    archive = ROOT / "tmp/action-v2-code.tar"
-    with tarfile.open(archive, "w") as tar:
+    archive = (Path(archive_path) if archive_path is not None else
+               ROOT / "tmp" / (Path(remote).name + "-code.tar"))
+    with tarfile.open(archive, "x") as tar:
         for name in sorted(paths):
             tar.add(ROOT.parent / name, arcname=name, recursive=False)
     bootstrap = """import sys,tarfile,pathlib
@@ -72,4 +73,6 @@ print('{"status":"deployed","shared_source_modified":false}')
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote", default=DEFAULT_REMOTE)
-    print(canonical(deploy(parser.parse_args().remote)).decode())
+    parser.add_argument("--archive-path", type=Path)
+    args = parser.parse_args()
+    print(canonical(deploy(args.remote, archive_path=args.archive_path)).decode())

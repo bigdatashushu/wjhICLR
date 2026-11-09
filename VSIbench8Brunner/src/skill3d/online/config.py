@@ -78,6 +78,7 @@ _FALLBACK: dict[str, Any] = {
     "max_retries_per_operation": 3,
     "finalization_rounds": 1,
     "eval_visual_fallback": True,
+    "isolated_choice_visual_fallback": False,
     "paths": {
         "data_root": "data",
         "vsi_bench_meta": "data/vsi_bench_meta",
@@ -167,8 +168,9 @@ def load_config(path: Optional[str | Path] = None) -> dict:
     _integer(cfg["seed"], "seed", minimum=0)
     for key in ("max_solver_rounds", "max_retries_per_operation", "finalization_rounds"):
         _integer(cfg[key], key, minimum=0 if key == "finalization_rounds" else 1)
-    if not isinstance(cfg["eval_visual_fallback"], bool):
-        raise ValueError("eval_visual_fallback must be boolean")
+    for key in ("eval_visual_fallback", "isolated_choice_visual_fallback"):
+        if not isinstance(cfg[key], bool):
+            raise ValueError(f"{key} must be boolean")
     cfg["paths"] = asdict(paths_from(cfg))
     if not isinstance(cfg["split_config"], str) or not cfg["split_config"]:
         raise ValueError("split_config must be a non-empty path")

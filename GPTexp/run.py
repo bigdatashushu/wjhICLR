@@ -129,7 +129,7 @@ def verify_manifest(manifest):
                 raise ValueError("frozen_source_changed")
 
 
-def execute(directory):
+def execute(directory, *, score_results=True):
     directory = Path(directory)
     manifest = read(directory / "manifest.json")
     verify_manifest(manifest)
@@ -274,7 +274,7 @@ def execute(directory):
     for name in tuple(env):
         if any(term in name.upper() for term in ("API_KEY", "TOKEN", "ENDPOINT", "BASE_URL", "MODELS_KEY")):
             env.pop(name)
-    action = "GPTexp.score" if complete else "GPTexp.export"
+    action = "GPTexp.score" if complete and score_results else "GPTexp.export"
     subprocess.run([sys.executable, "-B", "-m", action, "--run", str(directory)],
                    cwd=ROOT.parent, env=env, check=True, timeout=864000)
 

@@ -1,0 +1,37 @@
+{
+  "schema": "official-direct-config/1",
+  "model": {
+    "name": "gpt-4o-mini",
+    "api_key_env": "OPENAI_API_KEY",
+    "base_url_env": "OPENAI_BASE_URL",
+    "response_format": "official_schema",
+    "max_tokens": 4096,
+    "temperature": 0,
+    "timeout_s": 120,
+    "extra_body": {}
+  },
+  "runtime": {
+    "transport": "ssh",
+    "ssh_target": "cvailab@10.10.0.198",
+    "code_root": "/home/cvailab/wangjh/embodiedRunner",
+    "source_root": "/home/cvailab/wangjh/embodiedRunner",
+    "work_root": "/home/cvailab/wangjh/embodiedRunner/official_direct/runs",
+    "python": {
+      "navigation": "/home/cvailab/wangjh/embodiedRunner/venv-nav/bin/python",
+      "alfred": "/home/cvailab/wangjh/embodiedRunner/venv-household/bin/python",
+      "habitat": "/home/cvailab/wangjh/embodiedRunner/venv-household/bin/python",
+      "manipulation": "/home/cvailab/wangjh/embodiedRunner/manipulation-runtime/venv/bin/python"
+    },
+    "gpu": {"navigation": 0, "alfred": null, "habitat": 7, "manipulation": null},
+    "timeout_s": 300,
+    "environment_seed": 137
+  },
+  "episodes": [
+    {"environment": "navigation", "subset": "base", "index": 0},
+    {"environment": "alfred", "subset": "base", "index": 0},
+    {"environment": "habitat", "subset": "base", "index": 0},
+    {"environment": "manipulation", "subset": "base", "index": 0}
+  ],
+  "n_shots": {"navigation": 3, "alfred": 10, "habitat": 10, "manipulation": 4},
+  "max_requests": {"navigation": 20, "alfred": 40, "habitat": 40, "manipulation": 15}
+}

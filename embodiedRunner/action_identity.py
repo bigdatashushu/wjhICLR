@@ -13,15 +13,17 @@ from evidence import POLICY, PARSER_SHA256
 from protocol import json_object, sha256
 from mutation_protocol import VERSIONS
 from source_inventory import SHARED_SOURCES
+from task_card import POLICY as TASK_CARD_POLICY
 
 ROOT = Path(__file__).resolve().parent
 ENVIRONMENTS = ("eb_navigation", "eb_alfred", "eb_habitat", "eb_manipulation")
 ARMS = ("Direct", "B01", "B11")
 COMPARE_ARMS = ("Direct", "Full")
+RERUN_ARMS = ("Full",)
 LOCAL_SOURCES = (
     "action_adapters.py", "action_audit.py", "action_bridge.py", "action_contract.py",
     "action_host.py", "action_identity.py", "action_run.py", "action_solver.py", "action_live.py",
-    "action_trajectory.py", "source_inventory.py",
+    "action_trajectory.py", "source_inventory.py", "task_card.py", "task_card_replay.py", "task_context.py",
     "action_household_v2.py", "action_assets.py", "action_alfred_data.json",
     "action_tools.py", "action_worker_v2.py", "budget.py", "evidence.py", "methods.py",
     "mutation_protocol.py", "protocol.py", "state.py", "sandbox_process.py",
@@ -33,7 +35,7 @@ LOCAL_SOURCES = (
     "action_runtime/execution_contract.py", "action_runtime/frozen_method.py",
     "action_runtime/kernel.py", "action_runtime/segment.py", "action_runtime/control_profile.py",
     "methods/manifest.json", "methods/navigation.md", "methods/alfred.md", "methods/habitat.md",
-    "bridge.py", "action_live_launch.py", "action_deploy.py",
+    "bridge.py", "action_live_launch.py", "action_deploy.py", "action_detach.py",
     "manipulation_protocol.py", "manipulation_planner.py", "manipulation_sources.json",
     "manipulation_worker.py", "manipulation_assets.json", "methods/manipulation.md",
     "setup_manipulation.py", "manipulation_smoke.py", "audit_action_trajectory.py",
@@ -41,6 +43,9 @@ LOCAL_SOURCES = (
 HOST_CONFIGS = (
     "config/action-compare-4090.json", "config/action-compare-extra-4090.json",
     "config/action-live-4090.json", "config/action-manipulation-4090.json",
+    "config/action-task-card-15-4090.json",
+    "config/action-task-card-pilot-r05.json",
+    "config/action-task-card-pilot-r06.json",
 )
 
 
@@ -66,6 +71,10 @@ def protocol_identity():
         "manipulation_execution_contract_sha256": ActionExecutionContract(environment="eb_manipulation").sha256,
         "input_policy": "current_only", "execution_policy": "single_action",
         "automatic_retry": False, "reference_answer_visible": False,
+        "task_card_policy": TASK_CARD_POLICY,
+        "task_card_execution_contract_sha256": ActionExecutionContract(task_cards=True).sha256,
+        "manipulation_task_card_execution_contract_sha256": ActionExecutionContract(
+            environment="eb_manipulation", task_cards=True).sha256,
     }
     return {**config, "sha256": public_hash(config)}
 
@@ -76,6 +85,7 @@ def configuration_identity(methods, evidence_config_sha256):
         "budgets": {e: plain(policy_for(e)) for e in ENVIRONMENTS},
         "evidence_policy": plain(POLICY), "parser_sha256": PARSER_SHA256,
         "evidence_config_sha256": evidence_config_sha256,
+        "task_card_policy": TASK_CARD_POLICY,
         "methods": {e: {"content_sha256": m.content_sha256,
                         "skill_version": m.skill_id + "@" + m.version,
                         "complete_body_chars": len(m.skill_md)}

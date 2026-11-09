@@ -251,7 +251,8 @@ class ImageLedger:
     # ---- 每轮清单的布局（§9.4"事先声明的布局或分批观察方案"）----
     def plan_round(self, *, round_index: int, trigger: str,
                    derived_image_ids: Sequence[str],
-                   original_frame_ids: Sequence[int]) -> ImageRound:
+                   original_frame_ids: Sequence[int],
+                   include_scene_overview: bool = True) -> ImageRound:
         """Referenced crops, their sources, then spread across the frozen originals.
 
         Replanning an unsent request replaces its exact manifest. A sent request
@@ -261,7 +262,7 @@ class ImageLedger:
         if existing is not None and existing.delivered:
             raise ValueError("A sent image request is immutable; use a new round_index")
         overview = []
-        if self._scene_overview_descriptor is not None:
+        if include_scene_overview and self._scene_overview_descriptor is not None:
             # Re-read before every request: changed/missing files must not use cached pixels.
             rec = self.register_scene_overview(self._scene_overview_descriptor)
             overview = [rec.image_id]

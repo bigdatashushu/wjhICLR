@@ -85,7 +85,8 @@ def execute(packet):
         obs.public_memory, snapshot.capabilities, snapshot.evidence_revision, obs.view_id,
         official_objects=obs.manipulation_input.get("objects"),
         action_spec=obs.manipulation_input.get("action_spec"),
-        task_variation=obs.manipulation_input.get("task_variation", ""))
+        task_variation=obs.manipulation_input.get("task_variation", ""),
+        task_state=snapshot.task_state)
     calls = [0]
 
     def before_tool(_name):

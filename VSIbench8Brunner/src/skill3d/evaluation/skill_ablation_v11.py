@@ -48,7 +48,9 @@ from skill3d.skills.v11_library import (
     validate_v11_snapshot,
 )
 from skill3d.synthesis.prompt_builder import PROMPT_TEMPLATE_VERSION
-from skill3d.synthesis.eval_visual_fallback import EVAL_VISUAL_PROMPT_VERSION
+from skill3d.synthesis.eval_visual_fallback import (
+    EVAL_VISUAL_PROMPT_VERSION, ISOLATED_CHOICE_PROMPT_VERSION,
+)
 from skill3d.synthesis.request_context import current_request_phase
 from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.registry import TOOL_FACE_VERSION
@@ -522,6 +524,7 @@ def quality_contract() -> dict:
         "tool_docs_version": TOOL_DOCS_VERSION,
         "prompt_template_version": PROMPT_TEMPLATE_VERSION,
         "eval_visual_prompt_version": EVAL_VISUAL_PROMPT_VERSION,
+        "isolated_choice_prompt_version": ISOLATED_CHOICE_PROMPT_VERSION,
     }
     return {**value, "sha256": _hash(value)}
 
@@ -543,6 +546,7 @@ def _common_config(cfg: OnlineRunConfig) -> dict:
     value["tool_task_policy_version"] = TOOL_TASK_POLICY_VERSION
     value["tool_authorization_version"] = DECISION_VERSION
     value["eval_visual_prompt_version"] = EVAL_VISUAL_PROMPT_VERSION
+    value["isolated_choice_prompt_version"] = ISOLATED_CHOICE_PROMPT_VERSION
     return _clean(value)
 
 

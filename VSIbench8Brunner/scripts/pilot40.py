@@ -243,11 +243,26 @@ def base_config():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     cfg = module._base_config(load_config(ROOT / "runner.yaml"))
+    # The sampled panel is a validation experiment; retain each original source split.
+    cfg.evaluation_execution_role = "validation"
     cfg.skills, warnings, snapshot = load_active_skills(ROOT / "skill_library/snapshots")
     if warnings or not cfg.skills or not cfg.online_enable_thinking:
         raise RuntimeError("pilot Skill or thinking configuration unavailable")
     cfg.active_snapshot_ref = snapshot
     return cfg, snapshot
+
+
+def solver_policy_identity(cfg):
+    from skill3d.synthesis.eval_visual_fallback import ISOLATED_CHOICE_PROMPT_VERSION
+    return {
+        "eval_visual_fallback": cfg.eval_visual_fallback,
+        "isolated_choice_visual_fallback": cfg.isolated_choice_visual_fallback,
+        "evaluation_execution_role": cfg.evaluation_execution_role,
+        "max_solver_rounds": cfg.max_solver_rounds,
+        "eval_visual_fallback_max_requests": int(
+            cfg.eval_visual_fallback or cfg.isolated_choice_visual_fallback),
+        "isolated_choice_prompt_version": ISOLATED_CHOICE_PROMPT_VERSION,
+    }
 
 
 def variant(question, entry):
@@ -307,6 +322,12 @@ def initialize(args):
     sampling = json.loads(args.sampling.read_text())
     validate_panel(sampling, args.expected_questions)
     cfg, snapshot = base_config()
+    existing_identity = root / "runtime_identity.json"
+    policy = solver_policy_identity(cfg)
+    if existing_identity.exists():
+        saved = json.loads(existing_identity.read_text())
+        if any(saved.get(key) != value for key, value in policy.items()):
+            raise ValueError("pilot solver policy changed; use a new run directory")
     provider = PublishedFitSetInputProvider(args.published_inputs, max_scenes=1)
     overview = SceneOverviewStore(args.published_inputs.parent /
                                  "scene_overviews_20261031/manifest.json")
@@ -338,6 +359,7 @@ def initialize(args):
         "schema": "vsi8b-pilot-runtime/1", "sampling_sha256": file_identity(args.sampling)["sha256"],
         "published_inputs_sha256": file_identity(args.published_inputs)["sha256"],
         "solver_model": cfg.online_model, "solver_enable_thinking": True,
+        **policy,
         "description": description, "reviewer_identity_sha256": health["identity_sha256"],
         "sam2_identity_sha256": predictor.identity_sha256, "skill_snapshot": snapshot,
         "n_skills": len(cfg.skills), "reference_answer_visible": False,
@@ -346,7 +368,6 @@ def initialize(args):
         "new_detector_requests": 0,
         "new_reconstruction_requests": 0,
     }
-    existing_identity = root / "runtime_identity.json"
     if existing_identity.exists():
         if json.loads(existing_identity.read_text()) != identity:
             raise ValueError("pilot runtime identity changed")

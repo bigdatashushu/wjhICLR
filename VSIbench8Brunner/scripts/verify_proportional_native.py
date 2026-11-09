@@ -27,14 +27,137 @@ def write(path, value):
     temporary.replace(path)
 
 
+def verify_native_continuation(root, selected, admission):
+    directory = root / "harness"
+    recovery = root / "recovery_r02"
+    plan, started, status = [read(recovery / name) for name in
+                             ("plan.json", "started.json", "status.json")]
+    if (status["status"] != "complete" or status["pending_solves_completed"] != 37
+            or status["preserved_native_questions"] != 63
+            or status["issued_model_requests_repeated"] != 0
+            or (recovery / "execute_failed.json").exists()
+            or sha(recovery / "plan.json") != started["plan_sha256"]
+            or plan["sampling_sha256"] != sha(root / "sampling_manifest.json")
+            or plan["source_manifest_sha256"] != sha(root / "source_manifest.json")
+            or plan["script_sha256"] != sha(root / "resume_fixed100_r02.py")):
+        raise ValueError("native continuation has not passed its terminal checks")
+    for receipt in (plan, started):
+        if (receipt["automatic_retry"] is not False
+                or receipt["reference_answers_read"] is not False
+                or receipt["reference_answer_visible"] is not False
+                or receipt["scientific_configuration_changed"] is not False
+                or receipt["source_frozen_modified"] is not False):
+            raise ValueError("native continuation changed the fixed protocol")
+    preserved = plan["preserved_outcome_sha256"]
+    final_ids = {qa for qa, q in selected.items() if q["source_split"] == "final_test"}
+    if (len(preserved) != 63 or set(preserved) & final_ids
+            or set(plan["pending_qa_ids"]) != set(selected) - set(preserved)
+            or set(admission["preserved_outcome_sha256"]) != set(preserved)
+            or set(admission["unissued_qa_ids"]) != set(plan["unissued_final_test_qa_ids"])
+            or set(plan["gated_qa_ids"]) | set(admission["unissued_qa_ids"]) != final_ids
+            or len(plan["gated_qa_ids"]) != 28 or len(admission["unissued_qa_ids"]) != 5):
+        raise ValueError("continuation preserved or unissued denominators changed")
+    for name, identity in plan["preserved_native_files"].items():
+        p = directory / name
+        if p.stat().st_size != identity["size"] or sha(p) != identity["sha256"]:
+            raise ValueError("a previously issued native response changed")
+    original_index = read(recovery / "original_trajectory_index.json")["questions"]
+    current_index = read(directory / "trajectory_index.json")["questions"]
+    for qa, identity in preserved.items():
+        if (sha(directory / "outcomes" / (qa + ".json")) != identity
+                or current_index[qa]["sha256"] != original_index[qa]["sha256"]):
+            raise ValueError("a previously completed native trajectory changed")
+    if len(started["failed_preparation_archives"]) != 4:
+        raise ValueError("failed preparation history denominator changed")
+    verified_archives = {}
+    for archive in started["failed_preparation_archives"]:
+        for row in archive["files"]:
+            p = directory / row["file"]
+            identity = row["identity"]
+            if (not p.resolve().is_relative_to(directory.resolve())
+                    or p.stat().st_size != identity["size"] or sha(p) != identity["sha256"]
+                    or identity != plan["failed_native_files"][row["original_file"]]):
+                raise ValueError("failed preparation native evidence changed")
+            verified_archives[row["original_file"]] = identity
+    if verified_archives != plan["failed_native_files"]:
+        raise ValueError("failed native history was not fully preserved")
+    old = read(recovery / "original_request_budget.json")
+    budget = read(directory / "request_budget.json")
+    if (sha(recovery / "original_request_budget.json") != plan["original_budget_sha256"]
+            or old["used"] != 9710 or old["max_requests"] != 9710
+            or budget["requests"][:9710] != old["requests"]
+            or budget["max_requests"] != plan["continued_budget_max"]
+            or budget["used"] > budget["max_requests"]
+            or len(budget["requests"]) != budget["used"]):
+        raise ValueError("continuation preparation budget provenance changed")
+    additional = budget["requests"][9710:]
+    if len(additional) != plan["additional_preparation_request_cap"]:
+        raise ValueError("remaining preparation request denominator changed")
+    seen = set()
+    counts = {}
+    for row in additional:
+        qa, provider, digest = row["qa_id"], row["provider"], row["request_sha256"]
+        key = qa, provider, digest
+        detail = plan["preparation"][qa]
+        if (key in seen or row["automatic_retry"] is not False
+                or any(r["provider"] == provider and r["request_sha256"] == digest
+                       for r in detail["prior_issued"])):
+            raise ValueError("continuation repeated an issued model request")
+        seen.add(key)
+        counts[qa] = counts.get(qa, 0) + 1
+    if any(counts.get(qa, 0) != detail["additional_description_binary_cap"]
+           for qa, detail in plan["preparation"].items()):
+        raise ValueError("per-question remaining preparation scope changed")
+    sam2 = read(recovery / "sam2_new_admission.json")["requests"]
+    sam_seen, sam_counts = set(), {}
+    for row in sam2:
+        key = row["qa_id"], row["request_sha256"]
+        if key in sam_seen or row["automatic_retry"] is not False:
+            raise ValueError("continuation repeated a SAM2 inference request")
+        sam_seen.add(key)
+        sam_counts[row["qa_id"]] = sam_counts.get(row["qa_id"], 0) + 1
+    for qa, detail in started["preparation"].items():
+        if sam_counts.get(qa, 0) > detail["new_sam2_batch_cap"]:
+            raise ValueError("SAM2 continuation exceeded its fixed frame scope")
+        if detail["sam2_replay_batches"]:
+            current = read(directory / "sam2_receipts" / (qa + ".json"))
+            if (len(current) != len(detail["sam2_replay_batches"])
+                    or any(not row.get("native_replay") for row in current)):
+                raise ValueError("issued SAM2 batches were not fully replayed")
+        replay_root = recovery / "review_replay" / qa
+        for cid, row in detail["native_visual"].items():
+            p = replay_root / "visual" / (cid + ".json")
+            if p.stat().st_size != row["identity"]["size"] or sha(p) != row["identity"]["sha256"]:
+                raise ValueError("native description/review replay bytes changed")
+    return {
+        "schema": "vsi-native-continuation-verification/2",
+        "preserved_native_questions": 63, "new_native_questions": 37,
+        "archived_zero_call_gates": 28, "previously_unissued_final_questions": 5,
+        "failed_preparation_questions_replayed": 4,
+        "original_preparation_cap": 9710,
+        "additional_preparation_requests": len(additional),
+        "continued_preparation_cap": budget["max_requests"],
+        "new_sam2_batches": len(sam2),
+        "issued_model_requests_repeated": 0,
+        "reference_answers_read": False, "reference_answer_visible": False,
+        "plan_sha256": sha(recovery / "plan.json"),
+        "started_receipt_sha256": sha(recovery / "started.json"),
+        "status_sha256": sha(recovery / "status.json"),
+    }
+
+
 def verify_final_test_admission(root, selected):
     path = root / "final_test_admission.json"
     if not path.exists():
         return None
-    deadline = time.monotonic() + 30
+    admission = read(path)
+    continued = admission["schema"] == "vsi-fixed-panel-final-test-admission/2"
+    deadline = time.monotonic() + 120
     status_path = root / "final_test_admission_status.json"
     while read(status_path)["status"] != "complete":
-        if ((root / "final_test_admission_failed.json").exists()
+        failure = (root / "recovery_r02/execute_failed.json" if continued else
+                   root / "final_test_admission_failed.json")
+        if (failure.exists()
                 or time.monotonic() > deadline):
             raise ValueError("final-test admission has not passed its terminal checks")
         time.sleep(0.2)
@@ -61,13 +184,14 @@ def verify_final_test_admission(root, selected):
     if sha(root / old_guard["file"]) != old_guard["sha256"]:
         raise ValueError("original operational guard changed")
     preserved = admission["preserved_outcome_sha256"]
-    if set(preserved) != set(selected) - expected:
+    if not continued and set(preserved) != set(selected) - expected:
         raise ValueError("admission changed previously issued episode scope")
     for qa, identity in preserved.items():
         if sha(root / "harness" / "outcomes" / f"{qa}.json") != identity:
             raise ValueError("a previously issued episode outcome changed")
     archives = admission["archived_episodes"]
-    if {record["qa_id"] for record in archives} != expected or len(archives) != 33:
+    archived_ids = expected - set(admission["unissued_qa_ids"]) if continued else expected
+    if {record["qa_id"] for record in archives} != archived_ids or len(archives) != len(archived_ids):
         raise ValueError("archived pre-model admission denominator changed")
     directory = root / "harness"
     for archive in archives:
@@ -76,8 +200,10 @@ def verify_final_test_admission(root, selected):
         archived_outcome = None
         for record in archive["files"]:
             file = directory / record["file"]
+            identity = record["identity"] if continued else {
+                "size": record["bytes"], "sha256": record["sha256"]}
             if (not file.resolve().is_relative_to(directory.resolve())
-                    or file.stat().st_size != record["bytes"] or sha(file) != record["sha256"]):
+                    or file.stat().st_size != identity["size"] or sha(file) != identity["sha256"]):
                 raise ValueError("archived pre-model trace identity changed")
             if record["original_file"] == f"outcomes/{archive['qa_id']}.json":
                 archived_outcome = read(file)
@@ -90,6 +216,9 @@ def verify_final_test_admission(root, selected):
                     "split=final_test：硬约束 9 禁止默认进在线链"
                     "（需 allow_final_test 显式盲评）"]):
             raise ValueError("archived episode was not the exact zero-call split gate")
+    if continued:
+        admission["native_continuation_verification"] = verify_native_continuation(
+            root, selected, admission)
     return admission
 
 
@@ -231,6 +360,9 @@ def main():
     guard = read(args.root / "harness.pid.json")["identity_guard"]
     if sha(args.root / guard["file"]) != guard["sha256"]:
         raise ValueError("owned operational identity guard changed")
+    adapter = guard.get("execution_adapter")
+    if adapter and sha(args.root / adapter["file"]) != adapter["sha256"]:
+        raise ValueError("owned native request replay adapter changed")
     admission = verify_final_test_admission(args.root, selected)
     receipts = {arm: verify(args.root, arm, selected) for arm in ("direct", "harness")}
     write(args.root / "paired_native_verified.json", {

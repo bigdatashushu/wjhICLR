@@ -16,9 +16,10 @@ from protocol import sha256
 
 
 @pytest.mark.parametrize("environment", ["eb_navigation", "eb_manipulation"])
-def test_two_complete_arms_and_lossless_trajectory(tmp_path, monkeypatch, environment):
+@pytest.mark.parametrize("arms", [["Direct", "Full"], ["Full"]])
+def test_two_complete_arms_and_lossless_trajectory(tmp_path, monkeypatch, environment, arms):
     monkeypatch.setattr(live, "ROOT", tmp_path)
-    config = {"arms": ["Direct", "Full"], "integration_step_limit": None,
+    config = {"arms": arms, "integration_step_limit": None,
               "require_identical_initial_observation": False}
     item = {"environment": environment, "subset": "base", "index": 0,
             "episode_id": environment + ":base:000", "source_sha256": public_hash({"task": 0})}
@@ -58,9 +59,12 @@ def test_two_complete_arms_and_lossless_trajectory(tmp_path, monkeypatch, enviro
             self.last_response_identity = {"model": "qwen3.8-flash"}
             return text
     monkeypatch.setattr(live, "make_qwen_client", lambda: ReplayClient("Direct"))
-    result = live.live_run(tmp_path / "unused.json", tmp_path / "compare.json", compare=True)
+    result = live.live_run(tmp_path / "unused.json", tmp_path / "compare.json",
+                           compare=arms != ["Full"])
     assert result["audit"]["status"] == "passed", result["audit"]
-    assert [r["arm"] for r in result["attempts"]] == ["Direct", "Full"]
+    assert [r["arm"] for r in result["attempts"]] == arms
+    if arms == ["Full"]:
+        assert result["audit"]["paired_comparison_eligible"] is False
     assert all(r["terminal_reason"] == "official_done" for r in result["attempts"])
     from audit_action_trajectory import audit
     assert audit(tmp_path / "compare.json")["status"] == "passed"

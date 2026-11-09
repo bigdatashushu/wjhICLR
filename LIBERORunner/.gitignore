@@ -1,0 +1,10 @@
+.venv/
+.runtime/
+third_party/
+runs/
+__pycache__/
+*.pyc
+*.local.env
+*.local.json
+.local/
+.pytest_cache/

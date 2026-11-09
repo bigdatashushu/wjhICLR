@@ -1,0 +1,100 @@
+{
+  "active_slot_count": 24,
+  "changed_slots": [
+    {
+      "after": "S07-g1m1@1.0.2",
+      "before": "S07-g1m1@1.0.1",
+      "content_sha256": "81ca374b364db83d1e5659005019b1dfacd15ba51f673bc087cef4e3ff8a4cfb",
+      "method_body_equal": true,
+      "method_body_sha256": "177d0deaa5525f15a19901c5ed3620516d203a3050060b64f5b2612a37a09f2e",
+      "method_source": "S07-g1m0@1.0.0",
+      "slot": "obj_appearance_order/g1m1",
+      "source_ref": "versions/S07-g1m1/1.0.2/order-first-appearances-g1m1/SKILL.md"
+    },
+    {
+      "after": "S01-g1m1@1.0.2",
+      "before": "S01-g1m1@1.0.1",
+      "content_sha256": "42d0f6e8c984024c1b01efa8529b81610484bf4d967095c87c8c391ec38630a5",
+      "method_body_equal": true,
+      "method_body_sha256": "e0b3cea913302569c6912b9205f2adc6c1e14fb82a229b8ac5ce544dbae5b395",
+      "method_source": "S01-g1m0@1.0.0",
+      "slot": "object_counting/g1m1",
+      "source_ref": "versions/S01-g1m1/1.0.2/count-scene-objects-g1m1/SKILL.md"
+    },
+    {
+      "after": "S06-g1m1@1.0.2",
+      "before": "S06-g1m1@1.0.1",
+      "content_sha256": "d8ba1394f47d475d0bfd14f05bf9610873b5fbd31608aff1a06f305357872e45",
+      "method_body_equal": true,
+      "method_body_sha256": "0e0dea1bb5e247095b68e7015af3a1641f1a7ca59fe599340a06d09ce69207e5",
+      "method_source": "S06-g1m0@1.0.0",
+      "slot": "object_rel_direction/g1m1",
+      "source_ref": "versions/S06-g1m1/1.0.2/judge-relative-direction-g1m1/SKILL.md"
+    },
+    {
+      "after": "S03-g1m1@1.0.2",
+      "before": "S03-g1m1@1.0.1",
+      "content_sha256": "044256f12c09c9553d72b1d6110ab11e94a17d9cff374acc68871a63eb40de40",
+      "method_body_equal": true,
+      "method_body_sha256": "19f9911e023b39ba0a542de87cc068d37775208a0d6b6723e8124cf1cb78193a",
+      "method_source": "S03-g1m0@1.0.0",
+      "slot": "object_rel_distance/g1m1",
+      "source_ref": "versions/S03-g1m1/1.0.2/rank-object-distances-g1m1/SKILL.md"
+    },
+    {
+      "after": "S08-g1m1@1.0.2",
+      "before": "S08-g1m1@1.0.1",
+      "content_sha256": "b8f0faf0acbf1c24c2d72d242a772d54cb45ddc14ae4646f724a06ec900b2fd4",
+      "method_body_equal": true,
+      "method_body_sha256": "05e523475b8ef89ce751154cfcd9170e794beb5bf580b16d3e9d3c9fca97339c",
+      "method_source": "S08-g1m0@1.0.0",
+      "slot": "route_planning/g1m1",
+      "source_ref": "versions/S08-g1m1/1.0.2/infer-route-turns-g1m1/SKILL.md"
+    }
+  ],
+  "full_method_delivery_checked": 5,
+  "historical_source_hashes_preserved": {
+    "versions/S01-g0m0/1.0.0/count-scene-objects-g0m0/SKILL.md": "4960897d12b5fc30895169bcb79820e13f71748ae15ac3fc0b9838ec36b80804",
+    "versions/S01-g1m0/1.0.0/count-scene-objects-g1m0/SKILL.md": "45f3028324d97a7cc53d88cb67a4e5f1b83c62152d169076993ff29888704cd6",
+    "versions/S01-g1m1/1.0.1/count-scene-objects-g1m1/SKILL.md": "797df717f18e42fa72d3e23922d399b52d385683b229d4d5fb1909bbbdf5918e",
+    "versions/S02-g0m0/1.0.0/estimate-object-distance-g0m0/SKILL.md": "18173b2ab253ab5dc9937c6672f9a5dc1c44d3801f100cf60dc7b6fde8b6849e",
+    "versions/S02-g1m0/1.0.1/estimate-object-distance-g1m0/SKILL.md": "ad381a4a4508950803956cb139e5266f6b4aefa6d159d7bf8a94df9f90e2a604",
+    "versions/S02-g1m1/1.0.2/estimate-object-distance-g1m1/SKILL.md": "7d20e0c39e96d5ba7d4c212054d0cd9181f31c37fa23883226fe7e7da688d8b4",
+    "versions/S03-g0m0/1.0.0/rank-object-distances-g0m0/SKILL.md": "a59e169ee5b4c2c156ae53da61af6ca5339c6a3d88860556f84d3c1d4ebe600e",
+    "versions/S03-g1m0/1.0.0/rank-object-distances-g1m0/SKILL.md": "2e2f6eaa1f1dcb46b32cb92de5a3c42605f8261ea237842100b37bba00212129",
+    "versions/S03-g1m1/1.0.1/rank-object-distances-g1m1/SKILL.md": "3bccecc37246a878bb2e4e6ed881f0c5ac75ba76cdb75252a7e022cf57ed2eda",
+    "versions/S04-g0m0/1.0.0/estimate-object-size-g0m0/SKILL.md": "61680fa84389f4d49148e57ab37a0624207f05351c7d5d9129df379c2b917753",
+    "versions/S04-g1m0/1.1.0/estimate-object-size-g1m0/SKILL.md": "da85fa745511c29140787f37cec2a53759500802e2ff5ff0aafd7c27846d999f",
+    "versions/S04-g1m1/1.0.1/estimate-object-size-g1m1/SKILL.md": "646a5159269a85e9ca9d545a7647d6b1a990cdb618bded778a6142c09715b1c8",
+    "versions/S05-g0m0/1.1.0/estimate-room-area-g0m0/SKILL.md": "82a9289a528bc1ba6426cd59e10c20429d47ed7b935c3939c02f9c570a49967e",
+    "versions/S05-g1m0/1.0.0/estimate-room-area-g1m0/SKILL.md": "968b36b58507f42f35c0c674545a063fbab54e879e33a6d8783ff2ce14a19141",
+    "versions/S05-g1m1/1.0.1/estimate-room-area-g1m1/SKILL.md": "8ecb7068c739551ff5d44bc60781ac017aa7dd0e69fef5850ad39086f672280c",
+    "versions/S06-g0m0/1.0.0/judge-relative-direction-g0m0/SKILL.md": "a98217a42b3e79a137d9cf1494fe30b7e6e37e19cb134a12db799eba78069b14",
+    "versions/S06-g1m0/1.0.0/judge-relative-direction-g1m0/SKILL.md": "b174c9f1ef239970d338591d329eabcf09fb74cc04ded544905fe430f4e5e83d",
+    "versions/S06-g1m1/1.0.1/judge-relative-direction-g1m1/SKILL.md": "0adbc5a91d4ec8579ce62b5ec5253101e1c591c24b2922af32d8a5fe54ac393f",
+    "versions/S07-g0m0/1.0.0/order-first-appearances-g0m0/SKILL.md": "7be0a670d707a1a782281e516c865323044afbaaeadbb1c28eb375823f221fcd",
+    "versions/S07-g1m0/1.0.0/order-first-appearances-g1m0/SKILL.md": "36893e43415689555f9b2493c9f4601a214a854f437fd56126d50807c3ca13d3",
+    "versions/S07-g1m1/1.0.1/order-first-appearances-g1m1/SKILL.md": "5caf54ffe35355f68ee6844a4932938a83cf1c086717b2f38432aed0ed0737b9",
+    "versions/S08-g0m0/1.0.0/infer-route-turns-g0m0/SKILL.md": "76cdbfefe0ed014364f23416bd22624622767be8dedc3dba6988855ff099c222",
+    "versions/S08-g1m0/1.0.0/infer-route-turns-g1m0/SKILL.md": "f9c1fda4ce043ac1fb02b685d60564911248ef4169524468e32764f7ed6153f3",
+    "versions/S08-g1m1/1.0.1/infer-route-turns-g1m1/SKILL.md": "424de7ed76c343c9217f8cadfb8ee49bc5d9ad1df8b0fc4f98389c16494e4ef6"
+  },
+  "identity_change_only": [
+    "frontmatter name",
+    "frontmatter description evidence-state name",
+    "initial capability declaration"
+  ],
+  "manifest_sha256": "8778fac9cdcb30635f78328f78c211f904337ef078facdbf4246340d0e1eb36b",
+  "new_model_quality_evaluated": false,
+  "new_model_requests": 0,
+  "parent_snapshot_id": "g1m1-manual-trace-feedback-20261105-v1",
+  "reference_labels_read": false,
+  "schema": "vsi-nonmetric-g1m1-method-alignment/1",
+  "snapshot_id": "nonmetric-g1m1-aligned-g1m0-20261106-v1",
+  "unchanged_active_slots": 19,
+  "unchanged_metric_tasks": [
+    "object_abs_distance",
+    "object_size_estimation",
+    "room_size_estimation"
+  ]
+}

@@ -6,7 +6,7 @@ import base64
 import sys
 
 from action_adapters import validate_packet
-from action_contract import (ActionPayload, EpisodeBinding, ExecutionEnvelope, plain,
+from action_contract import (ActionPayload, EpisodeBinding, ExecutionEnvelope, plain, public_hash,
                              public_observation, validate_action_payload)
 from action_tools import ResultStore
 from budget import BudgetExhausted
@@ -28,6 +28,11 @@ class Proposal:
     """Exactly one completion decoded/assembled by a task-local solver."""
     source: str | None = None
     actions: tuple | None = None
+    subgoal: object = None
+    transition: object = None
+    perception_request: object = None
+    catalog_request: object = None
+    progress: object = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,16 @@ class ActionHost:
         self.decisions, self.executions, self.errors, self.observations = [], [], [], []
         self.integration_step_limit = None
         self.trajectory = trajectory
+        self.task_cards = bool(getattr(solver, "task_cards", False))
+        if self.task_cards:
+            from task_card import SubgoalLedger
+            self.task_ledger = SubgoalLedger(bridge.environment)
+        else:
+            self.task_ledger = None
+        self.pending_actual_action = None
+        self.pending_actual_name = None
+        self.pending_actual_decision = ""
+        self.evidence_summary = None
 
     def _observe(self, packet, kind, *, memory=None):
         png = validate_packet(packet)
@@ -90,6 +105,16 @@ class ActionHost:
             planner_png=base64.b64decode(packet["planner_image_base64"], validate=True)
             if "planner_image_base64" in packet else None)
         self.state.advance_observation(observation, mutation_kind=kind)
+        if self.task_ledger:
+            self.task_ledger.observe(
+                observation, action=self.pending_actual_action,
+                action_name=self.pending_actual_name, decision_id=self.pending_actual_decision,
+                succeeded=packet["last_action_success"],
+                ack_id=self.bridge.receipts[-1]["command_id"] if self.bridge.receipts else "",
+                kind=kind)
+            self.pending_actual_action = None
+            self.pending_actual_name = None
+            self.pending_actual_decision = ""
         self.state.invalid_actions = packet["official"]["invalid_actions"]
         self.observations.append({
             "observation_revision": revision, "mutation_kind": kind,
@@ -146,10 +171,15 @@ class ActionHost:
         }
 
     def _new_decision(self):
-        snapshot = self.state.prepare_snapshot()
-        evidence_status, prepared = "preparing" if self.evidence_preparer else "not_used", None
+        snapshot = self.state.prepare_snapshot(
+            task_state=self.task_ledger.public_state() if self.task_ledger else None)
+        evidence_status, prepared = ("not_requested" if self.task_cards else
+                                    "preparing" if self.evidence_preparer else "not_used"), None
+        self.evidence_summary = None
+        if self.task_cards:
+            self.solver.catalog_offset = None
         try:
-            if self.evidence_preparer is not None:
+            if self.evidence_preparer is not None and not self.task_cards:
                 prepared = self.evidence_preparer(snapshot, self.state.binding, self.budget)
                 if not isinstance(prepared, PreparedEvidence):
                     raise ContractError("invalid_evidence_preparer_result")
@@ -171,6 +201,60 @@ class ActionHost:
         self.state.transition("synthesizing", "current_evidence_ready")
         return prepared
 
+    def _refresh_decision(self, evidence_status=None, *, store=None):
+        snapshot = self.state.snapshot
+        row = self.decisions[-1]
+        version = {
+            "snapshot_sha256": snapshot.snapshot_sha256,
+            "evidence_manifest_sha256": snapshot.evidence_manifest_sha256,
+            "evidence_revision": snapshot.evidence_revision,
+            "task_state_sha256": public_hash(snapshot.task_state),
+            "capabilities": list(snapshot.capabilities),
+        }
+        if version not in row["context_versions"]:
+            row["context_versions"].append(version)
+        row.update({k: v for k, v in version.items() if k != "task_state_sha256"})
+        if evidence_status:
+            row["evidence_status"] = evidence_status
+        if self.store and self.store is not store:
+            self.store.revoke()
+        self.store = store if store is not None else ResultStore(snapshot)
+        if self.trajectory:
+            self.trajectory.emit("decision_context", snapshot=snapshot.public_dict(), version=version)
+
+    def _sync_task_state(self):
+        if self.task_ledger and plain(self.state.snapshot.task_state) != self.task_ledger.public_state():
+            old_snapshot = self.state.snapshot
+            snapshot = self.state.extend_task_state(self.task_ledger.public_state())
+            store = self.store.rebind_task_state(snapshot)
+            self._refresh_decision(store=store)
+            if self.trajectory and store.records:
+                self.trajectory.emit(
+                    "result_context", previous_snapshot_sha256=old_snapshot.snapshot_sha256,
+                    snapshot_sha256=snapshot.snapshot_sha256,
+                    reason="task_state_only", results=list(store.records.values()))
+        return tuple(self.store.records.values())
+
+    def _requested_evidence(self, request):
+        if self.evidence_summary is not None:
+            raise ContractError("perception_already_requested")
+        if self.evidence_preparer is None:
+            raise ContractError("perception_unavailable")
+        prepared = self.evidence_preparer(
+            self.state.snapshot, self.state.binding, self.budget, request=request)
+        self.state.extend_evidence(manifest_sha256=prepared.manifest_sha256,
+                                   capabilities=prepared.capabilities)
+        manifest = self.evidence_preparer.validate(self.state.snapshot, prepared)
+        from evidence import summarize_requested_evidence
+        self.evidence_summary = summarize_requested_evidence(prepared, request)
+        self._refresh_decision("prepared")
+        if self.trajectory:
+            from sandbox_wire import pack_prepared
+            self.trajectory.emit("prepared_evidence", decision_id=self.state.snapshot.decision_id,
+                                 manifest=manifest,
+                                 evidence=pack_prepared(self.state.snapshot, prepared.prepared))
+        return prepared
+
     def _record_decision(self, snapshot, evidence_status):
         self.decisions.append({
             "decision_id": snapshot.decision_id, "snapshot_sha256": snapshot.snapshot_sha256,
@@ -189,6 +273,11 @@ class ActionHost:
         if snapshot.observation.environment == "eb_manipulation":
             self.decisions[-1]["manipulation_input_sha256"] = snapshot.observation.manipulation_input["sha256"]
             self.decisions[-1]["planner_rgb_sha256"] = sha256(snapshot.observation.planner_png)
+        if self.task_cards:
+            from task_card import VERSION
+            self.decisions[-1]["context_protocol"] = VERSION
+            self.decisions[-1]["context_versions"] = []
+            self._refresh_decision()
         if self.trajectory:
             self.trajectory.emit("decision", snapshot=snapshot.public_dict(),
                                  receipt=self.decisions[-1])
@@ -215,18 +304,58 @@ class ActionHost:
                 if self.bridge.step_count >= self.budget.policy["steps"]:
                     return self._finish("budget_exhausted:steps")
                 prepared = self._new_decision()
-                feedback, records = {}, ()
+                feedback, records = getattr(self, "last_protocol_error", {}), ()
+                self.last_protocol_error = {}
                 restart = False
                 while not restart:
+                    if self.task_ledger:
+                        records = self._sync_task_state()
                     snapshot = self.state.snapshot
                     stage = "repair" if feedback else "synthesis"
                     try:
                         # The generator must make exactly one service request;
                         # bounded parser/assembler work belongs to this permit.
+                        if self.task_cards:
+                            self.solver.card_budget = self.budget
+                            self.solver.card_evidence = self.evidence_summary
+                            # Validate complete structure before reserving a call;
+                            # required-field length is not a delivery gate.
+                            self.solver.messages(snapshot, feedback)
                         with self.budget.request(stage, decision_id=snapshot.decision_id) as permit:
                             proposal = self.solver.generate(snapshot, feedback=feedback, usage=permit)
                         if not isinstance(proposal, Proposal):
                             raise ContractError("model_output_format_error")
+                        if self.task_cards:
+                            try:
+                                self.task_ledger.accept_goal(
+                                    proposal.subgoal, proposal.transition,
+                                    snapshot.observation.observation_revision)
+                                self.task_ledger.accept_progress(
+                                    proposal.progress, snapshot.observation.observation_revision)
+                            except ContractError as error:
+                                feedback = self.task_ledger.repair_feedback(str(error))
+                                continue
+                            if self.trajectory:
+                                self.trajectory.emit("subgoal_proposal",
+                                                     decision_id=snapshot.decision_id,
+                                                     subgoal=proposal.subgoal, transition=proposal.transition,
+                                                     progress=proposal.progress)
+                            records = self._sync_task_state()
+                            snapshot = self.state.snapshot
+                            if proposal.perception_request is not None or proposal.catalog_request is not None:
+                                try:
+                                    if proposal.perception_request is not None:
+                                        prepared = self._requested_evidence(proposal.perception_request)
+                                        records = ()
+                                    else:
+                                        self.solver.catalog_offset = proposal.catalog_request["offset"]
+                                except ContractError as error:
+                                    if str(error) not in {"perception_already_requested", "perception_unavailable"}:
+                                        raise
+                                    feedback = self.task_ledger.repair_feedback(str(error))
+                                    continue
+                                feedback = {}
+                                continue
                         if self.arm == "Direct":
                             if proposal.source is not None or proposal.actions is None:
                                 raise ContractError("model_output_format_error")
@@ -305,6 +434,13 @@ class ActionHost:
                             actual_result_ids=tuple(self.store.records), authorize_result=self.store.authorize)
                         if not payload.actions:
                             return self._finish("empty_plan_stop")
+                        if self.task_ledger:
+                            conflict = self.task_ledger.check_action(payload.actions[0], snapshot.observation)
+                            if conflict:
+                                feedback = self.task_ledger.repair_feedback(conflict)
+                                self.errors.append({"code": conflict, "decision_id": snapshot.decision_id})
+                                self.state.transition("synthesizing", "subgoal_action_conflict")
+                                continue
                         memory = self.state.adopt_memory(payload)
                         self.state.transition("applying", "validated_single_action")
                         if self.trajectory:
@@ -316,6 +452,10 @@ class ActionHost:
                                     "action_submission", payload=payload.to_dict(),
                                     action_id=payload.actions[0],
                                     action_name=snapshot.observation.action_table[payload.actions[0]])
+                        self.pending_actual_action = payload.actions[0]
+                        self.pending_actual_name = (snapshot.observation.action_table[payload.actions[0]]
+                                                    if self.bridge.environment != "eb_manipulation" else None)
+                        self.pending_actual_decision = snapshot.decision_id
                         self._observe(self.bridge.step(payload.actions[0]), "step", memory=memory)
                         restart = True
                     except ContractError as exc:
@@ -323,12 +463,19 @@ class ActionHost:
                         if code not in FORMAT_ERRORS:
                             # Contract defects are not fed back as invented
                             # environment feedback or automatic model retries.
+                            if code in {"task_card_context_cap",
+                                        "task_card_catalog_offset", "task_card_incomplete"}:
+                                self.errors.append({"code": code, "decision_id": snapshot.decision_id})
+                                return self._finish(code, aborted=True)
                             return self._finish("contract_failure", aborted=True)
                         if self.state.phase == "validating":
                             self.state.transition("synthesizing", code)
                         restart = self._format_failure(code)
-                        if not restart:
-                            feedback = {"code": code}
+                        correction = (getattr(self.solver, "last_format_feedback", None) or {}
+                                      if code == "model_output_format_error" else {})
+                        feedback = {"code": code, **correction}
+                        if self.task_cards and restart:
+                            self.last_protocol_error = feedback
         except BudgetExhausted as exc:
             return self._finish("budget_exhausted:" + exc.dimension)
         except OperationalError as exc:

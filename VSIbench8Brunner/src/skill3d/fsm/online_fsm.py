@@ -74,7 +74,7 @@ class OnlineFSM:
         if event == "solver_failed" and s not in TERMINAL:
             self.state = OnlineState.ANSWER
             return self.state
-        # driver 仅在评测失败后的独立视觉答案通过合同验收时发出此事件。
+        # driver 在独立视觉答案通过合同验收后重入评测；已有合法答案时仍在评测态。
         if event == "eval_visual_answer" and s is OnlineState.ANSWER:
             self.state = OnlineState.BENCHMARK_EVAL
             return self.state

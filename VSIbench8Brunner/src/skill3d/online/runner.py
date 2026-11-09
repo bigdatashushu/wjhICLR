@@ -225,6 +225,8 @@ class OnlineRunConfig:
     finalization_rounds: Optional[int] = None
     # 仅评测失败后追加一次干净视觉请求，不占原 solver 轮数。
     eval_visual_fallback: bool = False
+    # 选择题的视觉估计统一换成独立原帧作答；共享上述一次补答额度。
+    isolated_choice_visual_fallback: bool = False
     # QA 分区角色与原始数据 split 分开；学习禁用，验证可覆盖 induction 来源。
     evaluation_execution_role: Optional[str] = None
     # Content-addressed provenance for the active skill snapshot. The human
@@ -252,6 +254,9 @@ class OnlineRunConfig:
             raise ValueError("mode 只支持 real 或 mock_light")
         if self.evaluation_execution_role not in {None, "learning", "validation"}:
             raise ValueError("evaluation_execution_role must be learning, validation or None")
+        for key in ("eval_visual_fallback", "isolated_choice_visual_fallback"):
+            if type(getattr(self, key)) is not bool:
+                raise ValueError(f"{key} must be boolean")
         if (self.prepared_binding_seed is not None
                 and type(self.prepared_binding_seed) is not int):
             raise ValueError("prepared_binding_seed must be an int or None")
@@ -1046,7 +1051,9 @@ def _budget_receipt(cfg: OnlineRunConfig) -> dict:
         "finalization_rounds": int(cfg.finalization_rounds or 0),
         "max_retries_per_operation": int(cfg.max_retries_per_operation or 0),
         "max_regen": int(cfg.max_regen),
-        "eval_visual_fallback_max_requests": int(cfg.eval_visual_fallback),
+        "eval_visual_fallback_max_requests": int(
+            cfg.eval_visual_fallback or cfg.isolated_choice_visual_fallback),
+        "isolated_choice_visual_fallback": cfg.isolated_choice_visual_fallback,
     }
 
 
@@ -1612,19 +1619,37 @@ def run_episode(
     # ---------------- M12 BENCHMARK_EVAL ----------------
     answer: Optional[str] = kernel.answer_slot.answer if kernel is not None else None
     visual_payload = None
-    if (cfg.eval_visual_fallback and cfg.mode == "real"
-            and (cfg.evaluation_execution_role == "validation"
+    cls = cls or classify(episode)
+    eval_role = (cfg.evaluation_execution_role == "validation"
                  or (cfg.evaluation_execution_role is None
                      and episode.split in EVAL_VISUAL_SPLITS))
-            and outcome.final_state == "run_error" and outcome.agent_rounds > 0
-            and answer is None):
+    eligible = cfg.mode == "real" and eval_role and outcome.agent_rounds > 0
+    failed_without_answer = outcome.final_state == "run_error" and answer is None
+    # The route is decided using only verified provenance, before any reference scoring.
+    accepted_visual = False
+    if (eligible and cfg.isolated_choice_visual_fallback and cls.is_mca
+            and answer is not None and outcome.verify is not None and outcome.verify.passed):
+        _record_answer_attribution(outcome, episode, kernel, answer)
+        accepted_visual = outcome.answer_basis == "visual_estimate"
+    isolated_choice = (eligible and cfg.isolated_choice_visual_fallback and cls.is_mca
+                       and (accepted_visual or failed_without_answer))
+    if isolated_choice or (eligible and cfg.eval_visual_fallback and failed_without_answer):
+        trigger = "accepted_visual_estimate" if accepted_visual else "solver_run_error"
         original = {
-            "final_state": outcome.final_state, "answer": None,
+            "final_state": "answer" if answer is not None else outcome.final_state,
+            "answer": answer,
+            "answer_payload": (outcome.answer_payload.model_dump(mode="json")
+                               if outcome.answer_payload is not None else None),
+            "answer_basis": outcome.answer_basis,
+            "attribution": (outcome.attribution.model_dump(mode="json")
+                            if outcome.attribution is not None else None),
+            "used_result_ids": list(outcome.used_result_ids),
+            "used_evidence_flags": list(outcome.used_evidence_flags),
             **_evaluation_values(
-                episode, None, cls or classify(episode),
+                episode, answer, cls,
                 incomplete=any(r.get("service_errors") for r in outcome.rounds),
-                force_wrong=True),
-            "submission_status": ("rejected" if any(
+                force_wrong=answer is None),
+            "submission_status": ("accepted" if answer is not None else "rejected" if any(
                 r.get("submission_accepted") is False for r in outcome.rounds)
                 else "not_submitted"),
             "failure_code": outcome.failure_code,
@@ -1635,6 +1660,19 @@ def run_episode(
             "geometry_verify": (outcome.verify.model_dump(mode="json")
                                 if outcome.verify is not None else None),
         }
+        if isolated_choice:
+            # Preserve the host ledger and original audit, revoke the answer and user state.
+            # A failed fresh request must never resurrect the history-conditioned answer.
+            if kernel is not None:
+                kernel.reset_user_namespace()
+            answer = None
+            outcome.answer_payload = None
+            outcome.answer_basis = ""
+            outcome.attribution = None
+            outcome.used_result_ids = []
+            outcome.used_evidence_flags = []
+            outcome.verify = None
+            outcome.final_state = "run_error"
         visual_payload, audit = request_visual_answer(
             question=episode.question, options=list(episode.options or []),
             question_type=str(outcome.task or canonical_task(episode.question_type)),
@@ -1642,7 +1680,8 @@ def run_episode(
             client=llm if llm is not None else _make_online_client(cfg),
             round_index=outcome.agent_rounds + 1, max_images=cfg.max_images,
             max_tokens=cfg.max_tokens, seed=int(cfg.seed),
-            enable_thinking=cfg.online_enable_thinking)
+            enable_thinking=cfg.online_enable_thinking,
+            isolated_choice=isolated_choice, trigger=trigger)
         outcome.eval_visual_fallback = {**audit, "original_result": original}
         receipts.append("eval_visual_fallback", outcome.eval_visual_fallback)
         if visual_payload is not None:
@@ -1674,8 +1713,9 @@ def run_episode(
                 }, derivation_replay=dict(audit.get("derivation_replay") or {}))
             outcome.used_evidence_flags = []
             outcome.answer_flags.append("eval_visual_fallback")
-            fsm.step("eval_visual_answer")
-            states.append(fsm.state.value)
+            if fsm.state is not OnlineState.BENCHMARK_EVAL:
+                fsm.step("eval_visual_answer")
+                states.append(fsm.state.value)
         elif audit.get("service_error"):
             outcome.final_state = "unavailable"
             outcome.failure_code = "service_unavailable"
@@ -1683,6 +1723,13 @@ def run_episode(
                 "code": "service_unavailable",
                 "stage": "EVAL_VISUAL_FALLBACK",
                 "termination_reason": "visual_request_failed",
+                "round": outcome.agent_rounds + 1,
+            }
+        elif isolated_choice:
+            outcome.failure_code = "isolated_visual_answer_rejected"
+            outcome.terminal_failure = {
+                "code": outcome.failure_code, "stage": "EVAL_VISUAL_FALLBACK",
+                "termination_reason": audit.get("skipped_reason") or "invalid_visual_answer",
                 "round": outcome.agent_rounds + 1,
             }
         notes.append(
@@ -1707,7 +1754,7 @@ def run_episode(
         outcome.answer = answer
         outcome.answer_source = answer_source
         # ---- v9 §10.1/§12：答案载荷 + 框架核验的工具归因 ----
-        if answer is not None:
+        if answer is not None and (visual_payload is not None or outcome.answer_payload is None):
             _record_answer_attribution(
                 outcome, episode, kernel, answer, payload_override=visual_payload)
         if kernel is not None:
@@ -3266,6 +3313,10 @@ def _record_evaluation(outcome, episode):
     accepted = (bool(outcome.eval_visual_fallback.get("accepted"))
                 or any(row.get("submission_accepted") is True for row in outcome.rounds))
     rejected = any(row.get("submission_accepted") is False for row in outcome.rounds)
+    if (outcome.eval_visual_fallback.get("isolated_choice")
+            and not outcome.eval_visual_fallback.get("accepted")):
+        accepted = False
+        rejected = True
     outcome.submission_status = "accepted" if accepted else "rejected" if rejected else "not_submitted"
 
 

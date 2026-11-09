@@ -195,6 +195,22 @@ def score(metadata_path):
         "轨迹、原生源文件与掩码已在 Titan 逐字节哈希核验；"
         "Mac 保存小型评分输入与核验回执，不代表 Mac 有完整轨迹副本。",
     ]
+    continuation = (audit.get("final_test_admission") or {}).get(
+        "native_continuation_verification")
+    if continuation:
+        summary["native_continuation"] = continuation
+        write(LOCAL / "direct_vs_8b_scores.json", summary)
+        lines += [
+            "",
+            "运行恢复记录：原准备额度 9710 次耗尽后，按固定剩余候选补充 "
+            f"{continuation['additional_preparation_requests']} 次，最终上限为 "
+            f"{continuation['continued_preparation_cap']} 次。"
+            "4 题复用原生 SAM2 掩码和已返回的 8B 描述、二元审核响应；"
+            "只发起此前尚未发出的请求。63 题已完成的答案及完整轨迹保持逐字节一致。",
+            "原来的 28 条零请求 final_test 准入结果已存入失败历史，另 5 题此前未发起解题请求；"
+            "这 33 题均以显式盲评准入完成。全部失败历史保留，未重复已发出的模型请求，"
+            "未修改冻结源码、样本或方法配置。",
+        ]
     (LOCAL / "comparison_report.md").write_text("\n".join(lines) + "\n")
     print(json.dumps({k: summary[k] for k in (
         "completed_each_arm", "paired_mutually_legal", "direct_all100_mean_score",
@@ -221,7 +237,7 @@ def main():
             if all(r["state"]["status"] == "complete" and r["state"]["completed"] == 100
                    and r["native_trajectories"] == 100 for r in status["arms"].values()):
                 break
-            if any(r["launched"] and (not r["alive"] or r["state"]["status"].startswith("stopped"))
+            if any(r["launched"] and not r["alive"]
                    and r["state"]["status"] != "complete" for r in status["arms"].values()):
                 write(LOCAL / "collector_stopped.json", status)
                 raise RuntimeError("owned arm stopped; native attempts retained without retry")
@@ -229,6 +245,8 @@ def main():
                 raise RuntimeError("paired collection exceeded its six-hour bound")
             time.sleep(15)
         audit_file = Path(__file__).with_name("verify_proportional_native.py")
+        audit_remote = REMOTE + "/verify_proportional_native_" + hashlib.sha256(
+            audit_file.read_bytes()).hexdigest()[:16] + ".py"
         upload = """import sys
 from pathlib import Path
 p=Path(%r)
@@ -237,11 +255,11 @@ if p.exists():
     assert p.read_bytes()==b
 else:
     p.write_bytes(b)
-""" % (REMOTE + "/verify_proportional_native.py")
+""" % audit_remote
         remote(args.control_path, upload, stdin=audit_file.read_bytes())
         command = [
             "ssh", "-S", args.control_path, "-o", "BatchMode=yes", "wangy@10.10.0.34",
-            PYTHON_TITAN + " " + shlex.quote(REMOTE + "/verify_proportional_native.py")
+            PYTHON_TITAN + " " + shlex.quote(audit_remote)
             + " --root " + shlex.quote(REMOTE),
         ]
         subprocess.run(command, check=True, timeout=3600)
