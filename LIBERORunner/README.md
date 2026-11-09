@@ -4,6 +4,8 @@
 
 本机已建立 `LIBERORunner/.venv`（Python 3.11），可运行离线检查。Titan 上已建立独立 Python 3.10 仿真环境，安装 CPU PyTorch、robosuite、MuJoCo、bddl，并加载已核验的原始官方源码归档。
 
+2026-11-09 20:53 再次试跑：新建独立准备目录，仿真预检通过；本轮第 1 次模型请求仍返回 HTTP 503，GPT 动作执行数为 0。详见 [再次试跑报告](../../LIBERO再次试跑-20261109-r02/试跑报告.md)。
+
 ## 评测流程
 
 实现对应原始 LIBERO 的 `libero/lifelong/metric.py::evaluate_one_task_success`，用 GPT 动作适配器替换原来的训练策略网络：
