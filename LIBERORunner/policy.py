@@ -5,11 +5,17 @@ import json
 import math
 
 from .observation import build_messages, public_observation
-from .storage import write_json
+from .storage import file_digest, write_json
+
+ACTION_COMPONENTS = ("dx", "dy", "dz", "drx", "dry", "drz", "gripper")
 
 
 class InvalidAction(ValueError):
-    pass
+    def __init__(self, *args, branch="unspecified", details=None):
+        super().__init__(*args)
+        self.branch = branch
+        self.details = details if details is not None else {}
+        self.diagnostic = None
 
 
 class ModelIdentityError(RuntimeError):
@@ -25,17 +31,41 @@ def parse_action(text: str, low, high) -> list[float]:
         clean = clean[4:-4].strip()
     try:
         body = json.loads(clean)
-    except (TypeError, ValueError):
-        raise InvalidAction("Expected one JSON action object.") from None
-    if not isinstance(body, dict) or set(body) != {"action"}:
-        raise InvalidAction("Expected exactly the action field.")
+    except (TypeError, ValueError) as exc:
+        details = {"error_type": type(exc).__name__}
+        if isinstance(exc, json.JSONDecodeError):
+            details.update(parser_message=exc.msg, line=exc.lineno,
+                           column=exc.colno, position=exc.pos)
+        raise InvalidAction("Expected one JSON action object.",
+                            branch="json_decode", details=details) from None
+    if not isinstance(body, dict):
+        raise InvalidAction("Expected exactly the action field.", branch="root_type",
+                            details={"actual_type": type(body).__name__})
+    if set(body) != {"action"}:
+        raise InvalidAction("Expected exactly the action field.", branch="action_fields",
+                            details={"expected_fields": ["action"],
+                                     "actual_fields": sorted(body)})
     action = body["action"]
-    if not isinstance(action, list) or len(action) != 7:
-        raise InvalidAction("Expected a 7-dimensional action.")
+    if not isinstance(action, list):
+        raise InvalidAction("Expected a 7-dimensional action.", branch="action_type",
+                            details={"actual_type": type(action).__name__})
+    if len(action) != 7:
+        raise InvalidAction("Expected a 7-dimensional action.", branch="action_dimension",
+                            details={"expected_length": 7, "actual_length": len(action)})
     for i, value in enumerate(action):
-        if (type(value) not in (int, float) or not math.isfinite(value)
-                or not low[i] <= value <= high[i]):
-            raise InvalidAction(f"Invalid action coordinate {i}.")
+        details = {"coordinate": i, "component": ACTION_COMPONENTS[i],
+                   "actual_type": type(value).__name__}
+        if type(value) not in (int, float):
+            raise InvalidAction(f"Invalid action coordinate {i}.", branch="value_type",
+                                details={**details, "actual_value": repr(value)})
+        if not math.isfinite(value):
+            # A string keeps diagnostics valid JSON even for NaN / Infinity.
+            raise InvalidAction(f"Invalid action coordinate {i}.", branch="nonfinite",
+                                details={**details, "actual_value": repr(value)})
+        if not low[i] <= value <= high[i]:
+            raise InvalidAction(f"Invalid action coordinate {i}.", branch="out_of_bounds",
+                                details={**details, "actual_value": value,
+                                         "low": low[i], "high": high[i]})
     return [float(v) for v in action]
 
 
@@ -63,12 +93,14 @@ def make_system_prompt(controller: dict, orientation: str) -> str:
 
 
 class GPTPolicy:
-    def __init__(self, client, config, controller: dict, journal, image_dir):
+    def __init__(self, client, config, controller: dict, journal, image_dir, *,
+                 failure_dir=None):
         self.client = client
         self.config = config
         self.controller = controller
         self.journal = journal
         self.image_dir = image_dir
+        self.failure_dir = failure_dir if failure_dir is not None else image_dir / "failures"
         self.prompt = make_system_prompt(controller, config.image_orientation)
         self.last_action = None
 
@@ -90,23 +122,54 @@ class GPTPolicy:
             messages, max_output_tokens=self.config.max_output_tokens,
             extra_body={"reasoning": {"effort": self.config.reasoning_effort}},
         )
+        request_index = self.client.attempts + 1
+        payload_sha256 = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, allow_nan=False).encode()).hexdigest()
         self.journal({"event": "request_started", "step": step,
-                      "request_index": self.client.attempts + 1,
-                      "payload_sha256": hashlib.sha256(json.dumps(
-                          payload, sort_keys=True, allow_nan=False).encode()).hexdigest(),
+                      "request_index": request_index,
+                      "payload_sha256": payload_sha256,
                       "images": identity})
         reply = self.client.send(payload)
         # Persist only fixed-format response metadata, never a native API body.
+        metadata = reply.metadata()
+        response_text_sha256 = hashlib.sha256(reply.text.encode()).hexdigest()
         self.journal({"event": "response_received", "step": step,
-                      "metadata": reply.metadata(),
+                      "metadata": metadata,
                       "model_matches": reply.returned_model == self.config.model,
                       "finish_reason": reply.finish_reason,
-                      "response_text_sha256": hashlib.sha256(reply.text.encode()).hexdigest()})
+                      "response_text_sha256": response_text_sha256})
         if reply.returned_model != self.config.model:
             raise ModelIdentityError("Returned model does not match the requested model.")
-        if reply.finish_reason != "completed":
-            raise InvalidAction("Responses API did not finish the action output.")
-        action = parse_action(reply.text, self.controller["action_low"], self.controller["action_high"])
+        try:
+            if reply.finish_reason != "completed":
+                raise InvalidAction("Responses API did not finish the action output.",
+                                    branch="response_status",
+                                    details={"expected_finish_reason": "completed",
+                                             "actual_finish_reason": reply.finish_reason})
+            action = parse_action(reply.text, self.controller["action_low"],
+                                  self.controller["action_high"])
+        except InvalidAction as exc:
+            validation = {"branch": exc.branch, "message": str(exc), "details": exc.details}
+            identity = {"step": step, "request_index": request_index,
+                        "payload_sha256": payload_sha256,
+                        "response_text_sha256": response_text_sha256}
+            path = self.failure_dir / f"{step:04d}-action.json"
+            # Preserve final answer text exactly, before stripping fences or whitespace.
+            # Reasoning, native bodies, request contents and credentials are excluded.
+            write_json(path, {
+                "schema_version": 1, **identity, "validation": validation,
+                "requested_model": self.config.model, "returned_model": reply.returned_model,
+                "finish_reason": reply.finish_reason, "metadata": metadata,
+                "response_text": reply.text,
+            })
+            exc.diagnostic = {
+                **validation, **identity,
+                "file": str(path.relative_to(self.image_dir.parent)),
+                "sha256": file_digest(path),
+            }
+            self.journal({"event": "action_rejected", "step": step,
+                          "action_failure": exc.diagnostic})
+            raise
         self.last_action = action
         self.journal({"event": "action_parsed", "step": step, "action": action})
         return action

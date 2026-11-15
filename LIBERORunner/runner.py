@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
+import hashlib
+import json
 from pathlib import Path
 
 from xcodeapi import HTTPAPIError, XcodeClient, RequestLimitError
@@ -10,7 +12,7 @@ from .config import Config, RunnerError
 from .environment import Runtime, controller_spec
 from .policy import GPTPolicy
 from .rollout import rollout
-from .storage import Journal, digest, read_json, source_identity, verify_files, write_json
+from .storage import Journal, digest, file_digest, read_json, source_identity, verify_files, write_json
 
 COMPLETED = {"success", "task_failure", "invalid_action"}
 
@@ -67,18 +69,61 @@ def verified_manifest(directory: Path) -> dict:
 
 
 def _ack_count(path: Path) -> int:
-    import json
     if not path.exists():
         return 0
     return sum(json.loads(line).get("event") == "action_ack"
                for line in path.read_text().splitlines())
 
 
+def _verify_action_failure(episode: Path, row: dict):
+    # Old frozen results did not contain rejection text; do not invent it.
+    if "action_failure" not in row:
+        return
+    failure = row["action_failure"]
+    if not isinstance(failure, dict) or row["status"] != "invalid_action":
+        raise RunnerError("An action failure has an inconsistent result status.")
+    step = failure.get("step")
+    if type(step) is not int or step < 0 or step != row["control_steps"]:
+        raise RunnerError("An action failure does not match its rejected control step.")
+    name = f"failures/{step:04d}-action.json"
+    if failure.get("file") != name:
+        raise RunnerError("An action failure has an unexpected artifact path.")
+    path = episode / name
+    if (not path.resolve().is_relative_to(episode.resolve()) or not path.is_file()
+            or file_digest(path) != failure.get("sha256")):
+        raise RunnerError("An action failure artifact is missing or changed.")
+    artifact = read_json(path)
+    if not isinstance(artifact, dict) or artifact.get("schema_version") != 1:
+        raise RunnerError("An action failure artifact has an invalid schema.")
+    text = artifact.get("response_text")
+    if (not isinstance(text, str)
+            or hashlib.sha256(text.encode()).hexdigest() != failure.get("response_text_sha256")):
+        raise RunnerError("An action failure does not match its response text hash.")
+    validation = {key: failure.get(key) for key in ("branch", "message", "details")}
+    if artifact.get("validation") != validation or any(
+        artifact.get(key) != failure.get(key)
+        for key in ("step", "request_index", "payload_sha256", "response_text_sha256")
+    ):
+        raise RunnerError("An action failure artifact does not match its result.")
+    events = [json.loads(line) for line in (episode / "trace.jsonl").read_text().splitlines()]
+    requests = [e for e in events if e.get("event") == "request_started" and e.get("step") == step]
+    responses = [e for e in events if e.get("event") == "response_received" and e.get("step") == step]
+    rejections = [e for e in events if e.get("event") == "action_rejected"]
+    if (len(requests) != 1 or len(responses) != 1 or len(rejections) != 1
+            or any(requests[0].get(key) != failure.get(key)
+                   for key in ("request_index", "payload_sha256"))
+            or responses[0].get("response_text_sha256") != failure.get("response_text_sha256")
+            or responses[0].get("finish_reason") != artifact.get("finish_reason")
+            or responses[0].get("metadata") != artifact.get("metadata")
+            or rejections[0].get("step") != step
+            or rejections[0].get("action_failure") != failure):
+        raise RunnerError("An action failure does not match its request/response/rejection trace.")
+
+
 def summarize(directory: Path) -> dict:
     manifest = verified_manifest(directory)
     receipt_path = directory / "final_collection.json"
     if receipt_path.exists():
-        from .storage import file_digest
         receipt = read_json(receipt_path)
         if receipt.get("manifest_sha256") != digest(manifest):
             raise RunnerError("Final collection belongs to a different manifest.")
@@ -97,6 +142,7 @@ def summarize(directory: Path) -> dict:
                 raise RunnerError("An episode result does not match its action ACK count.")
             if row.get("success") != (row["status"] == "success"):
                 raise RunnerError("An episode result has inconsistent success/status fields.")
+            _verify_action_failure(path.parent, row)
         rows.append({**item, **row})
     complete = all(r["status"] in COMPLETED for r in rows)
     per_suite = {}
@@ -125,11 +171,11 @@ def summarize(directory: Path) -> dict:
     write_json(directory / "summary.json", summary)
     write_json(directory / "episode_results.json", rows)
     if complete:
-        from .storage import file_digest
         receipt_files = [directory / "manifest.json", directory / "episode_results.json",
                          directory / "summary.json"]
         receipt_files += list((directory / "episodes").glob("*/result.json"))
         receipt_files += list((directory / "episodes").glob("*/trace.jsonl"))
+        receipt_files += list((directory / "episodes").glob("*/failures/*.json"))
         write_json(directory / "final_collection.json", {
             "complete": True, "manifest_sha256": digest(manifest),
             "expected_episodes": len(rows),
@@ -164,7 +210,6 @@ def run(directory: Path, *, credentials_file: Path | None = None,
                 raise RunnerError("This run has results. Use --resume to skip completed episodes.")
         # Budget is cumulative across invocations, including outcomes unknown.
         used = 0
-        import json
         for path in (directory / "episodes").glob("*/trace.jsonl"):
             used += sum(json.loads(line).get("event") == "request_started"
                         for line in path.read_text().splitlines())
@@ -192,7 +237,8 @@ def run(directory: Path, *, credentials_file: Path | None = None,
                 expected = manifest["preflight"][manifest["tasks"].index(task)]["controller"]
                 if controller != expected:
                     raise RunnerError("Controller changed after preflight.")
-                policy = GPTPolicy(client, config, controller, journal, episode / "observations")
+                policy = GPTPolicy(client, config, controller, journal, episode / "observations",
+                                   failure_dir=episode / "failures")
                 states = runtime.initial_states(item["suite"], item["task_id"])
                 result = rollout(env, policy, states[item["initial_state_index"]],
                                  task["language"], runtime.settings["max_steps"],

@@ -1,0 +1,304 @@
+"""M1 VSI-Bench Adapter：meta 加载、32 帧均匀采样、四层 split 分层隔离。
+
+在线模块，严禁任何 GPT-6 相关依赖（硬约束 1）。
+split 划分：按 scene_id + task_type 分层，不共享 scene（硬约束 19）；
+final_test 完全隔离（硬约束 9）。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable, Iterable, NamedTuple, Optional, Sequence
+
+import numpy as np
+
+from skill3d.schemas.episode import (
+    DataSplitConfig,
+    FrameSet,
+    InputFrame,
+    VSIBenchEpisode,
+)
+
+from .frame_set import N_FRAMES, FrameSetError, build_frame_set, uniform_frame_ids
+from .frame_set import frame_set_hash as _frame_set_hash
+from .split_builder import SPLIT_RATIOS
+
+__all__ = [
+    "N_FRAMES", "SPLIT_RATIOS", "EpisodeUnavailable", "FrameSetError",
+    "VIDEO_CONTAINER_SUFFIXES", "VideoSource", "load_meta",
+    "sample_uniform_indices", "video_id_for", "video_path_for",
+    "video_source_candidates", "build_episode",
+    "make_split_config", "assert_final_test_isolation", "split_of",
+    "build_frame_set", "_frame_set_hash",
+]
+
+
+class EpisodeUnavailable(Exception):
+    """scene 原始视频缺失等导致 episode 不可用时抛出（§4 M1 字段 9）。"""
+
+
+# 本地 meta 约定路径（官方 HF 仓库的 test.jsonl；免 `datasets` 依赖，§13.3）
+LOCAL_META_JSONL = "data/vsi_bench_meta/test.jsonl"
+
+
+def load_meta(cache_dir: Optional[str] = None,
+              local_path: Optional[str | Path] = None) -> list[dict]:
+    """加载 VSI-Bench QA meta-info。
+
+    优先读本地导出（`LOCAL_META_JSONL` / `local_path`，官方仓库的 `test.jsonl`，
+    5130 行 / 288 scene），本地不存在时回退 HF `load_dataset`（lazy import）。
+
+    HF 仅提供 QA meta，原始视频需另行获取（TODO_USER_INPUT 视频访问方式）。
+    """
+    from skill3d.online.config import resolve_path
+
+    path = resolve_path(local_path if local_path is not None else LOCAL_META_JSONL)
+    if path.is_dir():
+        path = path / "test.jsonl"
+    if local_path is not None and not path.is_file():
+        # An explicit source typo must not silently download a different panel.
+        raise FileNotFoundError(f"Configured VSI metadata not found: {path}")
+    if path.is_file():
+        from skill3d.adapters.split_builder import load_local_meta
+
+        return load_local_meta(path)
+
+    try:
+        from datasets import load_dataset  # lazy import：未安装库禁止顶层导入
+    except ImportError as exc:  # 本地 meta 缺失且无 datasets → 明确报错，不静默返回空
+        raise ImportError(
+            f"本地 meta 不存在（{path}）且未安装 datasets："
+            "请下载 nyu-visionx/vsi-bench 的 test.jsonl 到该路径，或 pip install datasets"
+        ) from exc
+
+    ds = load_dataset("nyu-visionx/vsi-bench", cache_dir=cache_dir)
+    # 官方列：id/dataset/scene_name/question_type/question/ground_truth/options
+    rows = [dict(r) for split in ds for r in ds[split]]
+    return rows
+
+
+def sample_uniform_indices(total_frames: int, n: int = N_FRAMES) -> list[int]:
+    """时间均匀采样索引（§4 M1）：严格单调递增、唯一、确定性。
+
+    委托 `adapters/frame_set.uniform_frame_ids`（单一事实源）。视频不足 n 帧时按
+    v9 §5.2 返回**全部可用帧**（不重复填充凑数），由 `FrameSet.n_frames` /
+    `decode_status` 与 `input_degraded` 显式记录；只有"一帧都没有"才抛
+    `FrameSetError`。
+    """
+    return uniform_frame_ids(total_frames, n)
+
+
+def _default_frame_reader(video_path: str, indices: Sequence[int]) -> list[np.ndarray]:
+    """用 OpenCV 抽帧（cv2 已安装，可顶层使用）。"""
+    import cv2
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise EpisodeUnavailable(f"视频无法打开: {video_path}")
+    frames = []
+    try:
+        for i in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+            ok, frame = cap.read()
+            if not ok:
+                raise EpisodeUnavailable(f"视频第 {i} 帧读取失败: {video_path}")
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    finally:
+        cap.release()
+    return frames
+
+
+def video_path_for(qa_row: dict, video_root: str | Path) -> Path:
+    """由 qa_row 定位原始视频文件（目录组织方式 TODO_USER_INPUT）。"""
+    root = Path(video_root)
+    # 起始约定：<root>/<dataset>/<scene_name>.mp4；真实布局待用户确认
+    return root / str(qa_row["dataset"]) / f"{qa_row['scene_name']}.mp4"
+
+
+# 视频容器后缀（同一 scene 的**同名副本**可能是另一种编码/容器）
+VIDEO_CONTAINER_SUFFIXES: tuple[str, ...] = (".mp4", ".mkv", ".avi", ".mov", ".webm")
+
+
+class VideoSource(NamedTuple):
+    """一个**来源候选**：视频路径 + 来源标签（标签进 `video_id`，见 §5.2 缓存身份）。"""
+
+    path: Path
+    tag: str          # "" = 主约定（`<root>/<dataset>/<scene>.mp4`）
+    convention: str   # primary | alt_container | mirror_dir | mirror_flat
+
+
+def video_source_candidates(
+    qa_row: dict,
+    video_root: str | Path,
+    fallback_roots: Sequence[str | Path] = (),
+) -> list[VideoSource]:
+    """按优先级返回该 scene 的**来源候选**（§5.2"可重试加载"）。
+
+    规范原文（§5.2）："全部指定图像缺失或无法解码：`input_error`，记录原因；
+    **可重试加载**，不生成伪答案。"
+
+    **决策记录（用户 2026-09-27）**：这里的"重试"指**换来源/换副本**（另一个根目录、
+    镜像目录或同名不同容器的副本），**不是**对同一个文件反复解码 —— 同一文件重解码
+    只会得到同一结果，那等于没重试。因此候选顺序是：
+
+    1. 主约定 `<root>/<dataset>/<scene>.mp4`（现行布局）；
+    2. 同目录其它容器 `<root>/<dataset>/<scene>.<ext>`（同名副本，可能是另一种编码）；
+    3. 每个备用根（`fallback_roots`，来自配置；**默认空**，不隐式启用）：
+       a. `<fb>/<dataset>/<scene>.mp4`（目录式镜像）；
+       b. `<fb>/<dataset>_<scene>.mp4`（平铺式镜像，例如 `<root>/VSI_videos/`）。
+
+    顺序即优先级；按路径去重后返回。**只有主来源失败时才会用到后面的候选**，
+    因此主来源正常时行为与本次改动前逐字一致。
+    """
+    root = Path(video_root)
+    dataset = str(qa_row["dataset"])
+    scene = str(qa_row["scene_name"])
+    out: list[VideoSource] = []
+    seen: set[str] = set()
+
+    def _add(path: Path, tag: str, convention: str) -> None:
+        key = str(path)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(VideoSource(path=path, tag=tag, convention=convention))
+
+    for i, suffix in enumerate(VIDEO_CONTAINER_SUFFIXES):
+        _add(root / dataset / f"{scene}{suffix}",
+             "" if i == 0 else suffix.lstrip("."),
+             "primary" if i == 0 else "alt_container")
+    for fb in (fallback_roots or ()):
+        fb_root = Path(fb)
+        tag = fb_root.name or str(fb_root)
+        for suffix in VIDEO_CONTAINER_SUFFIXES:
+            _add(fb_root / dataset / f"{scene}{suffix}", tag, "mirror_dir")
+        for suffix in VIDEO_CONTAINER_SUFFIXES:
+            _add(fb_root / f"{dataset}_{scene}{suffix}", tag, "mirror_flat")
+    return out
+
+
+def video_id_for(qa_row: dict, source: VideoSource) -> str:
+    """`video_id`（§5.2 源标识，参与缓存身份）：主来源用原名，副本带来源标签。
+
+    §5.2 明文禁止"仅凭相同的帧索引列表跨视频复用"缓存。**副本可能是另一种编码**
+    （同一 scene、不同字节），所以从副本加载时必须让身份与主来源不同 —— 否则主来源
+    算好的 artifact 会被副本的 episode 直接复用，而两者像素并不相同。
+    主来源保持不变（历史缓存键不失效，§17.2）。
+
+    基准名取**逻辑身份**（`video_id` 字段，缺省 = scene 名，与主约定 `<scene>.mp4`
+    的 stem 一致），而不是副本自己的文件名 —— 平铺镜像的文件名是
+    `<dataset>_<scene>.mp4`，若拿它当基准，身份会连带文件名约定一起变。
+    """
+    base = str(qa_row.get("video_id", "") or qa_row.get("scene_name", "")
+               or Path(source.path).stem)
+    if not source.tag or source.convention == "primary":
+        return base
+    return f"{base}@{source.tag}"
+
+
+def build_episode(
+    qa_row: dict,
+    split: str,
+    video_path: Optional[str | Path] = None,
+    frame_reader: Callable[[str, Sequence[int]], list[np.ndarray]] = _default_frame_reader,
+    n_frames: int = N_FRAMES,
+) -> VSIBenchEpisode:
+    """由单行 QA meta 构造 VSIBenchEpisode（§4 M1 伪代码）。
+
+    视频缺失时抛 EpisodeUnavailable，由调用方标记 unavailable 且不进任何 split。
+    """
+    if video_path is None or not Path(video_path).exists():
+        raise EpisodeUnavailable(f"scene {qa_row.get('scene_name')} 视频缺失")
+
+    import cv2  # 用于读取总帧数
+
+    cap = cv2.VideoCapture(str(video_path))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    if total < 1:
+        raise EpisodeUnavailable(f"视频无有效帧: {video_path}")
+
+    # M1 冻结帧集：32 个唯一物理帧 + frame_set_hash（硬约束 21）
+    try:
+        fset = build_frame_set(total, n_frames=n_frames, fps=float(fps))
+    except FrameSetError as exc:
+        raise EpisodeUnavailable(f"scene {qa_row.get('scene_name')} {exc}") from exc
+    indices = list(fset.frame_ids)
+    images = frame_reader(str(video_path), indices)
+
+    frames = []
+    for i, img in zip(indices, images):
+        h, w = img.shape[:2]
+        frames.append(
+            InputFrame(
+                frame_idx=int(i),
+                timestamp=float(i) / float(fps),
+                width=w,
+                height=h,
+                # 逐帧质量统计由 M2 input_gate 计算；此处先填占位，
+                # quality_ok 默认 True，等待门禁覆写（M2 只打权重，不改帧集）
+                blur_var=0.0,
+                overexposed_ratio=0.0,
+                underexposed_ratio=0.0,
+                quality_ok=True,
+            )
+        )
+
+    return VSIBenchEpisode(
+        qa_id=str(qa_row["id"]),
+        scene_name=str(qa_row["scene_name"]),
+        dataset=str(qa_row["dataset"]),
+        question_type=str(qa_row["question_type"]),
+        question=str(qa_row["question"]),
+        options=list(qa_row["options"]) if qa_row.get("options") else None,
+        ground_truth=str(qa_row["ground_truth"]),
+        frames=frames,
+        split=split,  # type: ignore[arg-type]
+        frame_set=fset,
+    )
+
+
+def make_split_config(
+    qa_rows: Iterable[dict],
+    final_test_scene_ids: Sequence[str],
+    seed: int = 0,
+    log_ref: str = "",
+) -> DataSplitConfig:
+    """使用正式整场景构建器切分 induction/inner/outer（硬约束 19）。
+
+    final_test 由调用方显式指定。多题型场景只分配一次；四层互斥、覆盖与
+    分层代表性共用正式验证。非法或无法分层的输入抛出 SplitBuildError。
+    已保存的 split 配置不重新生成。
+    """
+    from .split_builder import build_split_config
+
+    cfg, _ = build_split_config(
+        list(qa_rows),
+        seed=seed,
+        final_scene_ids=final_test_scene_ids,
+        ratios=SPLIT_RATIOS,
+        log_ref=log_ref,
+    )
+    return cfg
+
+
+def assert_final_test_isolation(cfg: DataSplitConfig) -> None:
+    """final_test 完全隔离断言（硬约束 9，§4 M1 验收条件 c）。"""
+    final_set = set(cfg.final_test_scene_ids)
+    for name in ("induction_scene_ids", "inner_validation_scene_ids", "outer_holdout_scene_ids"):
+        overlap = final_set & set(getattr(cfg, name))
+        assert not overlap, f"final_test 隔离被违反: {name} 含 {overlap}"
+
+
+def split_of(scene_name: str, cfg: DataSplitConfig) -> Optional[str]:
+    """查询 scene 所属 split；未分配返回 None。"""
+    for split, key in (
+        ("induction", "induction_scene_ids"),
+        ("inner_validation", "inner_validation_scene_ids"),
+        ("outer_holdout", "outer_holdout_scene_ids"),
+        ("final_test", "final_test_scene_ids"),
+    ):
+        if scene_name in set(getattr(cfg, key)):
+            return split
+    return None

@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Freeze a paired held-out sample for specified VSI question types."""
+
+import argparse
+from collections import Counter
+import hashlib
+import json
+import math
+from pathlib import Path
+import random
+import shutil
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from skill3d.infra.m5_identity import content_sha256
+from skill3d.infra.vsi_runner_source import freeze_source
+
+
+def write(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--native-root", required=True)
+    parser.add_argument("--native-catalog", required=True)
+    parser.add_argument("--perception-endpoint", required=True)
+    parser.add_argument("--types", nargs="+", required=True)
+    parser.add_argument("--per-type", type=int, default=10)
+    parser.add_argument("--concurrency", type=int, default=32)
+    parser.add_argument("--sample-from", type=Path,
+                        help="Reuse the exact requested-type QA IDs from a prior sample.")
+    parser.add_argument("--exclude-sample", type=Path, action="append", default=[],
+                        help="Exclude QA IDs from a prior sample; may be repeated.")
+    parser.add_argument("--detector-endpoint", default="",
+                        help="Record and enable an existing native-compatible detector proxy.")
+    parser.add_argument("--min-free-gib", type=float, default=80)
+    parser.add_argument("--timeout-s", type=float, default=660,
+                        help="Transport wait limit; does not change model output budgets.")
+    parser.add_argument("--arms", nargs="+", choices=("system", "direct"),
+                        default=("system", "direct"))
+    parser.add_argument("--preflight-mode", choices=("required_zero_model_calls",
+                                                   "per_episode_before_first_call"),
+                        default="per_episode_before_first_call")
+    args = parser.parse_args()
+    root, package = args.run_root.resolve(), args.package.resolve()
+    assert not root.exists() and root.parent.is_dir()
+    assert args.per_type > 0 and len(set(args.types)) == len(args.types)
+    assert 1 <= args.concurrency <= 64
+    assert math.isfinite(args.min_free_gib) and args.min_free_gib >= 0
+    assert math.isfinite(args.timeout_s) and 0 < args.timeout_s <= 1800
+    assert len(set(args.arms)) == len(args.arms)
+    panel = json.loads((package / "panel.json").read_text())
+    by_qa = {row["qa_id"]: row for row in panel["system_variants"]}
+    tests = [json.loads(line) for line in (package / "test.jsonl").read_text().splitlines()]
+    rng, selected = random.Random(137), []
+    previous_sample = (json.loads(args.sample_from.read_text(encoding="utf-8"))
+                       if args.sample_from else None)
+    excluded_samples = [
+        {
+            "source": str(path.resolve()),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "qa_ids": sorted({row["qa_id"] for row in json.loads(path.read_text(encoding="utf-8"))}),
+        }
+        for path in args.exclude_sample
+    ]
+    excluded_ids = {qa for sample in excluded_samples for qa in sample["qa_ids"]}
+    for task in sorted(args.types):
+        pool = sorted((row for row in tests
+                       if by_qa[row["qa_id"]]["question_type"] == task
+                       and row["qa_id"] not in excluded_ids),
+                      key=lambda row: row["qa_id"])
+        assert len(pool) >= args.per_type, f"insufficient held-out questions after exclusions: {task}"
+        if previous_sample is None:
+            selected.extend(rng.sample(pool, args.per_type))
+        else:
+            fixed_ids = {row["qa_id"] for row in previous_sample
+                         if by_qa[row["qa_id"]]["question_type"] == task}
+            fixed = [row for row in pool if row["qa_id"] in fixed_ids]
+            assert len(fixed) == len(fixed_ids) == args.per_type
+            selected.extend(fixed)
+    selected.sort(key=lambda row: (by_qa[row["qa_id"]]["question_type"], row["qa_id"]))
+    ids = {row["qa_id"] for row in selected}
+    n = len(ids)
+    assert n == args.per_type * len(args.types)
+    assert not ids & excluded_ids
+    assert all(row["experiment_split"] == "test" for row in selected)
+    root.mkdir()
+    inputs = root / "inputs"
+    inputs.mkdir()
+    for name in ("online.yaml", "split.json", "questions.jsonl", "train.jsonl", "test.jsonl"):
+        shutil.copyfile(package / name, inputs / name)
+    shutil.copytree(package / "host_evaluation", inputs / "host_evaluation")
+    shutil.copytree(package / "scene_overviews", inputs / "scene_overviews")
+    # Transport timeout is independent of model budgets and recorded before freezing.
+    import yaml
+    config_path = inputs / "online.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["online_model"]["timeout_s"] = args.timeout_s
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    write(inputs / "sample_questions.json", selected)
+    panel["system_variants"] = [row for row in panel["system_variants"] if row["qa_id"] in ids]
+    panel["direct_qwen_rows"] = [row for row in panel["direct_qwen_rows"] if row["qa_id"] in ids]
+    panel["experiment_id"] += "-" + root.name
+    slots = sorted({row["question_type"] + "/" + row["evidence_state"]
+                    for row in panel["system_variants"]})
+    for value in panel["panels"].values():
+        value["system_input_variants"] = n
+        value["skill_slots"] = slots
+        value["skill_slot_count"] = len(slots)
+    panel["proposal_sha256"] = content_sha256({k: v for k, v in panel.items()
+                                             if k != "proposal_sha256"})
+    write(inputs / "panel.json", panel)
+    published = json.loads((package / "published_inputs.json").read_text())
+    original_locator = published["source_catalog_file"]
+    published["source_catalog_file"] = args.native_catalog
+    write(inputs / "published_inputs.json", published)
+    runner = Path(__file__).resolve().parents[1]
+    receipt = freeze_source(runner, root / "code")
+    receipt["source_root"] = str(Path(args.native_root) / "code/source")
+    write(root / "code/code_identity.json", receipt)
+    shutil.copyfile(runner / "scripts/run_g1m1_diagnostic.py", root / "controller.py")
+    shutil.copyfile(runner / "scripts/launch_small_comparison.py", root / "launcher.py")
+    manifest = {
+        "schema": "vsi-small-paired-comparison/1", "seed": 137, "role": "test",
+        "selection": "random.Random(137), sorted requested types and lexically sorted held-out QA pools",
+        "questions_per_type": args.per_type, "n_questions": n,
+        "n_scenes": len({row["scene_name"] for row in selected}),
+        "task_counts": dict(sorted(Counter(by_qa[q]["question_type"] for q in ids).items())),
+        "variants": panel["system_variants"], "native_root": args.native_root,
+        "runtime": {
+            "workers": args.concurrency, "episode_concurrency": min(n, args.concurrency),
+            "request_concurrency": args.concurrency, "direct_workers": min(n, args.concurrency),
+            "max_requests": n * 8, "scene_cache_size": n, "min_free_gib": args.min_free_gib,
+            "phase": "final_system", "automatic_model_retry": False, "skill_evolution": False,
+            "enable_thinking": True, "max_solver_rounds": 6, "max_requests_per_episode": 7,
+            "visual_fallback_max_requests": 1, "question_preflight": args.preflight_mode,
+            "input_scheduler": "independent_scene_providers_v1",
+            "perception_endpoint": args.perception_endpoint,
+            "transport_timeout_s": args.timeout_s,
+        },
+        "comparison": {
+            "arms": list(args.arms), "same_questions_and_rgb_bytes": True,
+            "both_enable_thinking": True, "direct_protocol": "prepared-32",
+            "direct_rgb_only": True, "system_request_cap": n * 7, "direct_request_cap": n,
+            "system_prompt": "vsi-prompt-compaction/1.0",
+            "system_scene_overview": True, "direct_scene_overview": False,
+        },
+        "source_package": str(package),
+        "source_panel_sha256": hashlib.sha256((package / "panel.json").read_bytes()).hexdigest(),
+        "source_sha256": receipt["source_sha256"],
+        "published_locator_adaptation": {
+            "original_locator": original_locator, "native_locator": args.native_catalog,
+            "catalog_sha256": published["source_catalog_sha256"],
+            "entries_and_scopes_unchanged": True,
+        },
+        "input_files": {str(p.relative_to(inputs)): hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in sorted(inputs.rglob("*")) if p.is_file()},
+        "controller_sha256": hashlib.sha256((root / "controller.py").read_bytes()).hexdigest(),
+        "launcher_sha256": hashlib.sha256((root / "launcher.py").read_bytes()).hexdigest(),
+        "reference_answer_visible": False,
+    }
+    if args.sample_from:
+        manifest["selection"] = "Exact requested-type QA IDs from a prior frozen sample"
+        manifest["prior_sample_sha256"] = hashlib.sha256(args.sample_from.read_bytes()).hexdigest()
+    if excluded_samples:
+        manifest["excluded_samples"] = excluded_samples
+        manifest["excluded_qa_ids"] = sorted(excluded_ids)
+        manifest["selection"] += "; prior sample QA IDs excluded before sampling"
+    if args.detector_endpoint:
+        manifest["runtime"]["detector_endpoint"] = args.detector_endpoint
+    if args.types == ["object_counting"]:
+        from skill3d.synthesis.counting_context import COUNTING_CONTEXT_VERSION
+        manifest["comparison"]["system_prompt"] = COUNTING_CONTEXT_VERSION
+    manifest["identity_sha256"] = content_sha256(manifest)
+    write(root / "diagnostic.json", manifest)
+    # Published input directories may be read-only; deployment needs to populate them.
+    for path in root.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o755)
+    print(json.dumps({k: manifest[k] for k in (
+        "n_questions", "n_scenes", "task_counts", "identity_sha256", "source_sha256")},
+        sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

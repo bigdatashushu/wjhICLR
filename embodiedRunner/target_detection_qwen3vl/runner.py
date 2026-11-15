@@ -10,8 +10,9 @@ from .sources import ContractError, LIMITS, OperationalError, REVISION, canonica
 DEVIATIONS = [row for row in ORIGINAL_DEVIATIONS if not row.startswith(
     ("Same Qwen", "All perception rounds"))] + [
     "One independent request to the configured planning model extracts targets from public "
-    "instruction text only. Frozen targets drive automatic Qwen3-VL-8B-Instruct-FP8 category "
-    "detection on original unannotated RGB before each main planning call.",
+    "instruction text only. Each category is a referring phrase retaining the instruction's "
+    "identifying qualifiers. Frozen phrases drive automatic Qwen3-VL-8B-Instruct-FP8 detection "
+    "on original unannotated RGB before each main planning call; the detector matches all qualifiers.",
     "Normalized 0-1000 boxes are mapped to actual image pixel edges before overlap grouping "
     "and rendering. The added RGB image shows all retained groups with category labels.",
     "Qwen3-VL supplies no calibrated detection confidence; no scores or score threshold are invented.",

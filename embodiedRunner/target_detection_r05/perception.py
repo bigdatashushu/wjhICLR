@@ -20,7 +20,13 @@ def normalized(text):
     return " ".join(text.casefold().split())
 
 
-def validate_targets(value, instruction):
+def valid_category(category):
+    return (isinstance(category, str)
+            and re.fullmatch(r"[A-Za-z][A-Za-z -]{0,59}", category) is not None
+            and 1 <= len(category.split()) <= 6)
+
+
+def validate_targets(value, instruction, *, category_validator=valid_category):
     if not isinstance(value, list) or not 1 <= len(value) <= 4:
         raise PlannerError("targets_require_one_to_four_entries")
     fields = {"id", "role", "category", "source_phrase", "quantity", "attributes", "relation", "aliases"}
@@ -35,8 +41,7 @@ def validate_targets(value, instruction):
         if not isinstance(row["aliases"], list) or len(row["aliases"]) > 3:
             raise PlannerError("invalid_target_aliases")
         for category in [row["category"]] + row["aliases"]:
-            if (not isinstance(category, str) or not re.fullmatch(r"[A-Za-z][A-Za-z -]{0,59}", category)
-                    or not 1 <= len(category.split()) <= 6):
+            if not category_validator(category):
                 raise PlannerError("invalid_english_category")
         if (not isinstance(row["source_phrase"], str) or not row["source_phrase"].strip()
                 or normalized(row["source_phrase"]) not in normalized(instruction)):
@@ -160,8 +165,11 @@ class Perception:
                                  "environment_step": public["step"], "raw_rgb_sha256": identity[2],
                                  "expired_group_ids": expired})
 
+    def _validate_targets(self, value):
+        return validate_targets(value, self.public["instruction"])
+
     def set_targets(self, value):
-        validated = validate_targets(value, self.public["instruction"])
+        validated = self._validate_targets(value)
         if self.targets is not None and validated != self.targets:
             raise PlannerError("frozen_targets_changed")
         if self.targets is None:

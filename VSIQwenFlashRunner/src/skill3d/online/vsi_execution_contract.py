@@ -6,9 +6,11 @@ import hashlib
 import json
 
 from skill3d.schemas import CANONICAL_UNIT_BY_QUESTION_TYPE
+from skill3d.synthesis.counting_context import COUNTING_CONTEXT_VERSION
 
-VSI_INTERFACE_VERSION = "vsi-execution-interfaces/1.0"
-VSI_INTERFACE_NAMES = frozenset({"ToolData", "ReadNextObservation", "MeasurementAnswer"})
+VSI_INTERFACE_VERSION = "vsi-execution-interfaces/2.0-compact"
+VSI_INTERFACE_NAMES = frozenset(
+    {"ToolData", "ReadNextObservation", "MeasurementAnswer", "CountingEvidence"})
 
 # tool, raw-root field, source unit, submission unit; no inferred alternatives.
 MEASUREMENT_FIELDS = {
@@ -53,89 +55,87 @@ def finalization_example(question_type: str) -> str:
     }, separators=(",", ":"))
 
 
-_INTERFACE_RULES = """VSI host interfaces (ordinary Python phase only):
-- ToolData(response) extracts data from a tool-response envelope or a ReadObservation page.
-  Original tool data keeps its list/dict/scalar shape. Reader page data is ALWAYS a list:
-  rows = ToolData(page); a scalar/dict tool page has its original root at rows[0].
-  Do not call .get("objects", []) on a list. An absent field is unknown, not an empty list or zero.
-  Original tool responses must include their actual data and match the current ledger.
-  An ID-only or edited envelope is rejected; use ReadNextObservation for historical lists.
-- ReadNextObservation(result_or_id, fields=None, limit=8) reads the first remaining gap
-  using the same ReadObservation budget (3 reads per round, at most 32 items and 4000 chars
-  per page). It never reruns the original tool. Pass a response/page or its actual host ID.
-  Cumulative coverage is supplementary metadata; original reader pages keep their byte cap.
-  The host keeps progress across namespace resets. Omitted fields inherit the previous
-  selection for that result; changing the selected fields starts an independent coverage.
-  page["vsi_read_progress"]["coverage_complete"] reports coverage accumulated across
-  successful reads of those fields. page["coverage_complete"] describes this page alone;
-  next_cursor=None on a tail page does not prove earlier rows were read.
-  A page can be shorter than limit. Use ReadNextObservation, not offset += limit.
-  YieldObservations([page["result_id"]], "reason") delivers the actual page to the next request.
-  Reuse the literal result ID from feedback; variables from the previous round no longer exist.
-- MeasurementAnswer(result_or_id) builds an AnswerPayload from the CURRENT real tool ledger.
-  It uses only the registered field for this task: absolute distance=distance with unit m;
-  object size=extent_longest_metric in m converted exactly once to cm; room area=room_area_m2;
-  object count=count. Failed, invalidated, unresolved, unhealthy, missing, negative,
-  nonfinite, wrong-tool or normalized-only measurements are rejected.
-  Submit with return ReturnAnswer(MeasurementAnswer(result)).
-  The helper keeps full numeric precision, actual used_result_ids and a field/convert
-  derivation. Geometry and deterministic replay still decide acceptance.
-  Do not round a tool-derived value or stringify it with .2f: replay checks the exact
-  underlying measurement (tolerance 1e-9). Round only diagnostic print output.
-- These names are reserved host interfaces, not tools. They do not grant new tool
-  authorization, geometry, model calls, or extra reader budget. No helper is available
-  in finalization. Never fabricate IDs or submit the illustrative values below.
+_INTERFACE_RULES = """Host helpers are reserved ordinary-phase interfaces, not tools or new authorization.
+ToolData(response) and ReadNextObservation use the envelope/paging rules above and the
+same reader budget. No helper is available in finalization. Examples are syntax only:
+replace their values and IDs with evidence from this request.
 """
 
 
-def program_instructions(question_type: str) -> str:
+def program_instructions(question_type: str, *, authorized_tools=None) -> str:
+    if question_type == "object_counting":
+        text = (
+            "\n\nVSI counting interfaces [" + VSI_INTERFACE_VERSION + "; " + COUNTING_CONTEXT_VERSION + "]\n"
+            "Define answer from whole-instance evidence before submitting. Image-only expression: "
+            "`return ReturnAnswer(AnswerPayload(value=answer, unit='count', "
+            "basis='visual_estimate', used_result_ids=[], derivation=None))`. This expression "
+            "requires a defined answer; no illustrative fixed count. Combined evidence uses mixed "
+            "with actual IDs; one operation alone establishing the total uses tool_derived.\n"
+            "For candidate pages choose needed fields once (e.g. obj_id,category_name,"
+            "visible_frames,track_id,duplicate_suspect), then ReadNextObservation with the actual "
+            "result ID and unchanged/omitted fields. Yield each page; do not restart completed coverage.\n"
+        )
+        if authorized_tools is None or "count_objects" in authorized_tools:
+            text += (
+                "MeasurementAnswer(result_or_id) only reads/replays count_objects.count from a "
+                "valid current-ledger result. It does not certify category, identity or coverage; "
+                "cross-check whole instances first. Faults/unhealthy/unresolved/invalidated data "
+                "are rejected; a failed supplement never validates an old count.\n")
+        return text
     text = (
-        "\n\nVSI executable output supplement [" + VSI_INTERFACE_VERSION + "]\n"
-        "Output one fenced Python block. Define every variable before use; Python uses "
-        "None/True/False. A valid branch must end in ReturnAnswer or YieldObservations. "
-        "Never output a bare answer, pseudocode, or prose as the program.\n"
+        "\n\nVSI host examples [" + VSI_INTERFACE_VERSION + "]\n"
         + _INTERFACE_RULES
         + "\nComplete visual-submission syntax (illustrative value):\n```python\n"
         + visual_example(question_type) + "```\n"
-        + "\nCandidate observation syntax (only when list_objects is authorized):\n```python\n"
-        + OBSERVATION_EXAMPLE + "```\n"
         + "\nNext-round paging syntax (replace ACTUAL_RESULT_ID):\n```python\n"
         + PAGING_EXAMPLE + "```\n"
     )
-    if question_type in MEASUREMENT_FIELDS:
+    if authorized_tools is None or "list_objects" in authorized_tools:
+        text += (
+            "\nCandidate observation syntax (only when list_objects is authorized):\n```python\n"
+            + OBSERVATION_EXAMPLE + "```\n")
+    if question_type in MEASUREMENT_FIELDS and (
+            authorized_tools is None or MEASUREMENT_FIELDS[question_type][0] in authorized_tools):
         tool, field, from_unit, to_unit = MEASUREMENT_FIELDS[question_type]
         text += (
-            f"\nFor this task, MeasurementAnswer requires {tool}.{field} "
-            f"({from_unit} -> {to_unit}). First select the intended referents and call "
-            "the currently authorized tool with its documented arguments, then use "
-            "`return ReturnAnswer(MeasurementAnswer(result))`. No early rounding.\n"
+            f"\nMeasurementAnswer(result_or_id) uses only the current ledger's {tool}.{field} "
+            f"({from_unit} -> {to_unit}), keeping full precision, actual used_result_ids and "
+            "a field/convert derivation (replay tolerance 1e-9). Submit with "
+            "`return ReturnAnswer(MeasurementAnswer(result))`. Select intended referents and "
+            "use authorized tool arguments first. Failed/invalidated/unresolved/unhealthy/missing/"
+            "negative/nonfinite/wrong-tool/normalized-only measurements are rejected. "
+            "Geometry and replay still decide acceptance.\n"
         )
     return text
 
 
 def finalization_instructions(question_type: str) -> str:
+    if question_type == "object_counting":
+        return (
+            "\n\nVSI counting final JSON [" + COUNTING_CONTEXT_VERSION + "]\n"
+            "JSON uses null/true/false. Set action='answer', value to your supported whole-instance "
+            "integer, basis to actual evidence, used_result_ids and derivation accordingly. "
+            "No fixed-value example; no tools/helpers/Python in finalization.\n")
     return (
         "\n\nVSI final JSON supplement [" + VSI_INTERFACE_VERSION + "]\n"
-        "Output exactly one JSON object: no markdown fences, Python, assignments, "
-        "ReturnAnswer, YieldObservations, helper calls, or text outside the object. "
-        "JSON uses null/true/false. Include action, value, unit, basis, used_result_ids "
-        "and derivation. Numeric answers must be JSON numbers, not strings or arrays. "
-        "Retain full measurement precision and any real derivation already established. "
-        "Use only valid result IDs shown in this request. Choose basis from the evidence "
-        "actually used; changing basis does not repair invalid geometry.\n"
+        "JSON uses null/true/false; no markdown fences, Python or helper calls.\n"
         "Complete syntax example (illustrative value and visual basis; replace both "
         "according to your actual evidence):\n" + finalization_example(question_type) + "\n"
     )
 
 
-def round_reminder(*, finalizing: bool) -> str:
+def round_reminder(*, finalizing: bool, question_type: str = "") -> str:
     if finalizing:
         return "VSI format reminder: one JSON object; null, no Python or code fences."
-    return (
-        "VSI format reminder: executable Python; define variables and use None. "
-        "End with ReturnAnswer(AnswerPayload(...)), ReturnAnswer(MeasurementAnswer(result)), "
-        "or YieldObservations([actual_result_id], 'reason'). Reuse host IDs for paging."
-    )
+    if question_type == "object_counting":
+        return ("Counting check: whole-instance anchors, identity and missed regions. Use targeted "
+                "evidence only for a concrete doubt; an unchanged failed scan or completed page "
+                "read adds nothing. MeasurementAnswer replays a value, not completeness.")
+    if question_type in MEASUREMENT_FIELDS:
+        tool, field, from_unit, to_unit = MEASUREMENT_FIELDS[question_type]
+        return (f"Measurement helper: return ReturnAnswer(MeasurementAnswer(real_result_or_id)); "
+                f"requires {tool}.{field} ({from_unit}->{to_unit}), no early rounding.")
+    return ""
 
 
 VSI_INTERFACE_SHA256 = hashlib.sha256(json.dumps({
@@ -143,5 +143,6 @@ VSI_INTERFACE_SHA256 = hashlib.sha256(json.dumps({
     "measurement_fields": MEASUREMENT_FIELDS, "rules": _INTERFACE_RULES,
     "program": {task: program_instructions(task) for task in CANONICAL_UNIT_BY_QUESTION_TYPE},
     "finalization": {task: finalization_instructions(task) for task in CANONICAL_UNIT_BY_QUESTION_TYPE},
-    "round_reminders": [round_reminder(finalizing=False), round_reminder(finalizing=True)],
+    "round_reminders": {task: round_reminder(finalizing=False, question_type=task)
+                        for task in CANONICAL_UNIT_BY_QUESTION_TYPE},
 }, sort_keys=True).encode()).hexdigest()

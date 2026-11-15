@@ -42,14 +42,14 @@ def test_default_profile_and_local_stage_wiring():
     expected["inputs"]["seed_library"] = "{seed_root}"
     expected["inputs"].pop("derived_binding_root")
     expected["runtime"]["derived_binding_root"] = (
-        "{run_root}/prepared_cache/derived_bindings_v4_metric")
+        "{run_root}/prepared_cache/derived_bindings_v4")
     assert json.loads((ROOT / "configs/vsi_m4_1000.json").read_text()) == expected
     _, run_root, _, profile, _, profile_path, context = campaign.resolve_new(
         campaign.parser().parse_args(["--dry-run"]))
     assert profile_path == ROOT / "configs/vsi_m4_1000.json"
     assert run_root.is_relative_to(ROOT / "runs")
     assert Path(context["data_root"]) == (
-        ROOT / "prepared_cache/vsibench-m4-success-g1m1-1000-seed137-metric-r02")
+        ROOT / "prepared_cache/vsibench-m4-success-g1m1-1000-seed137-r01")
     assert Path(profile["inputs"]["seed_library"]) == source.seed_library_root(ROOT)
     assert Path(stages.fitset_cli().__file__) == ROOT / "scripts/run_fitset_v11.py"
     manifest = {"profile": profile, "run_root": str(run_root)}
@@ -74,8 +74,10 @@ def test_loaded_core_is_local_and_utilities_are_shared():
             row["path"].removeprefix("src/").removesuffix(".py").replace("/", "."))
         assert Path(module.__file__) == ROOT / row["path"]
         assert hashlib.sha256((SHARED / row["path"]).read_bytes()).hexdigest() == row["original_sha256"]
+    assert Path(importlib.import_module("skill3d.online.config").__file__) == (
+        ROOT / "src/skill3d/online/config.py")
     for name in ("skill3d.adapters.vsibench_loader", "skill3d.tools.category_match",
-                 "skill3d.online.config", "skill3d.segmentation.question_binding"):
+                 "skill3d.segmentation.question_binding"):
         assert Path(importlib.import_module(name).__file__).is_relative_to(SHARED / "src")
 
 
@@ -326,6 +328,8 @@ def test_real_snapshot_loads_pipeline_and_preserves_shared_m5_sources(tmp_path):
     assert source_identity(snapshot / "src/skill3d") == original_m5
     for relative in ("src/skill3d/online/vsi_kernel.py",
                      "src/skill3d/online/vsi_execution_contract.py",
+                     "src/skill3d/synthesis/prompt_builder.py",
+                     "src/skill3d/synthesis/prompt_compaction.py",
                      "src/skill3d/sandbox/ast_guard.py"):
         assert receipt["file_origins"][relative] == "local"
         assert source.sha256(snapshot / relative) == source.sha256(ROOT / relative)
@@ -339,11 +343,13 @@ def test_real_snapshot_loads_pipeline_and_preserves_shared_m5_sources(tmp_path):
         "import sys,pathlib;root=pathlib.Path(sys.argv[1]);sys.path.insert(0,str(root/'src'));"
         "from skill3d.infra import experiment_stages_v11 as stages;"
         "from skill3d.online import runner,config,vsi_kernel,vsi_execution_contract;"
+        "from skill3d.synthesis import prompt_builder,prompt_compaction,execution_contract;"
         "from skill3d.sandbox import ast_guard;"
         "from skill3d.evolution import fitset_stream_v11,fitset_revision_v11;"
         "from skill3d.evaluation import fitset_v11;"
         "assert all(pathlib.Path(m.__file__).is_relative_to(root) for m in "
-        "(stages,runner,config,vsi_kernel,vsi_execution_contract,ast_guard,"
+        "(stages,runner,config,vsi_kernel,vsi_execution_contract,prompt_builder,"
+        "prompt_compaction,execution_contract,ast_guard,"
         "fitset_stream_v11,fitset_revision_v11,fitset_v11));"
         "assert runner.RestrictedNamespaceKernel is vsi_kernel.RestrictedNamespaceKernel;"
         "assert ast_guard.ast_guard('ReturnAnswer(MeasurementAnswer(\"actual-id\"))',set()).ok;"

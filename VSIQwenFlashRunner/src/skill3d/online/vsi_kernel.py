@@ -51,13 +51,15 @@ class RestrictedNamespaceKernel(SharedKernel):
         self._vsi_last_fields = {}
         self.vsi_reader_progress = []
         self._cell_vsi_page_mark = 0
+        self.counting_evidence = []
         super().__init__(*args, **kwargs)
         self._install_vsi_interfaces()
 
     def _install_vsi_interfaces(self):
         self._ns.update(
             ToolData=self._tool_data, ReadNextObservation=self._read_next,
-            MeasurementAnswer=self._measurement_answer)
+            MeasurementAnswer=self._measurement_answer,
+            CountingEvidence=self._counting_evidence)
 
     def inject(self, **kwargs):
         if VSI_INTERFACE_NAMES & kwargs.keys():
@@ -73,7 +75,29 @@ class RestrictedNamespaceKernel(SharedKernel):
         self._vsi_ranges = {}
         self._vsi_last_fields = {}
         self.vsi_reader_progress = []
+        self.counting_evidence = []
         super().reset_episode_ledger()
+
+    def _counting_evidence(self, items):
+        from .counting_state import validate_instance_evidence
+        receipt = {"name": "CountingEvidence", "interface_version": VSI_INTERFACE_VERSION,
+                   "allowed": False}
+        try:
+            if (not self._tools_enabled or self.answer_slot.given or self.yield_slot.given
+                    or canonical_task(str(self._scene.question_type or "")) != "object_counting"):
+                raise ValueError("CountingEvidence is an ordinary-phase counting interface")
+            ledger = getattr(self._scene, "_ledger", None)
+            clean = validate_instance_evidence(items, ledger)
+        except ValueError:
+            self.answer_untrusted = True
+            receipt["reason_code"] = "instance_reference_rejected"
+            self.vsi_interface_calls.append(receipt)
+            raise
+        self.counting_evidence.append({"round": int(ledger.current_round), "items": clean})
+        receipt.update(allowed=True, reason_code="image_references_and_regions_only",
+                       n_records=len(clean), semantic_verification="not_performed")
+        self.vsi_interface_calls.append(receipt)
+        return copy.deepcopy(clean)
 
     def mark_cell_start(self):
         super().mark_cell_start()

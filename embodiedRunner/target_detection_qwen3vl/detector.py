@@ -26,17 +26,29 @@ def pixel_box(box, size):
             box[2] * width / 1000, box[3] * height / 1000]
 
 
+def valid_detection_query(query):
+    """Accept bounded English referring phrases, including ordinals and relations."""
+    return (isinstance(query, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 '-]{0,199}", query) is not None
+            and re.search(r"[A-Za-z]", query) is not None
+            and 1 <= len(query.split()) <= 24)
+
+
 def detection_prompt(category):
     return (
-        "Locate every clearly visible instance of this category in the supplied original RGB: "
+        "Locate every clearly visible object matching this target phrase in the supplied original RGB: "
         + json.dumps(category) + ". Return only a JSON object in this exact format: "
         '{"detections":[{"label":' + json.dumps(category)
         + ',"bbox_2d":[x1,y1,x2,y2]}]}. '
+        "Match ALL stated color, shape, size, material, state, ordinal and spatial qualifiers. "
+        "Use reference objects to resolve relations; box only the target object. "
+        "Do not drop qualifiers or return other instances of the bare category. "
+        "label must exactly repeat the target phrase. "
         "bbox_2d is [left,top,right,bottom] in NORMALIZED 0-1000 coordinates: "
         "x=0 is the left edge, x=1000 the right edge, y=0 the top edge, y=1000 the bottom edge. "
         "Use tight boxes around the visible object. Return each physical instance once. "
-        "Only detect the requested category; never substitute a robot, background, or nearby object. "
-        'If none is visible return {"detections":[]}. Do not output confidence scores, '
+        "Never substitute a robot, background, or nearby object. "
+        'If no matching object is visible return {"detections":[]}. Do not output confidence scores, '
         "explanations, markdown, or pixel coordinates."
     )
 
@@ -79,8 +91,7 @@ class Detector:
         return self.request("status")
 
     def detect(self, image, category):
-        if (not isinstance(category, str)
-                or not re.fullmatch(r"[A-Za-z][A-Za-z -]{0,59}", category)):
+        if not valid_detection_query(category):
             raise OperationalError("invalid_detection_category")
         from PIL import Image
         try:

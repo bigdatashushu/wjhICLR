@@ -113,8 +113,15 @@ from skill3d.synthesis.eval_visual_fallback import (
     request_visual_answer,
 )
 from skill3d.synthesis.request_context import request_phase
+from skill3d.synthesis.prompt_compaction import (
+    COMPACTION_VERSION, SOURCE_TOOL_DOCS_VERSION,
+    TOOL_DOCS_VERSION, compact_m5_coverage, compact_tool_docs,
+)
+from skill3d.synthesis.counting_context import (
+    COUNTING_CONTEXT_VERSION, compact_counting_scene_summary, finalization_pages_text,
+    observation_feedback,
+)
 from skill3d.tools import REGISTRY
-from skill3d.tools.docs_v11 import TOOL_DOCS_VERSION
 from skill3d.tools.mock_switch import MockSwitch
 from skill3d.tools.scene_handle import SceneHandle
 from skill3d.segmentation.open_vocab_detector import (
@@ -133,7 +140,6 @@ from skill3d.online.recovery import (
     field_repair_instructions,
     invalidate_objects,
     invalidate_results,
-    observation_feedback,
     premise_of_failure,
 )
 from skill3d.schemas.trace import EPISODE_TRACE_SCHEMA_VERSION, TraceRecord
@@ -166,13 +172,14 @@ from .submission import (
 _REPLAY_EPOCH = 0.0
 _Path_ = Path
 RuntimeSkillSpec = SkillSpecV11
-PROMPT_TEMPLATE_VERSION = BASE_PROMPT_TEMPLATE_VERSION + "+vsi-interfaces-1"
-FINALIZATION_PROMPT_VERSION = BASE_FINALIZATION_PROMPT_VERSION + "+vsi-interfaces-1"
+PROMPT_TEMPLATE_VERSION = BASE_PROMPT_TEMPLATE_VERSION + "+vsi-interfaces-2"
+FINALIZATION_PROMPT_VERSION = BASE_FINALIZATION_PROMPT_VERSION + "+vsi-interfaces-2"
 
 
 def round_action_instructions(question_type: str, *, finalizing: bool = False) -> str:
-    return (base_round_action_instructions(question_type, finalizing=finalizing)
-            + "\n" + round_reminder(finalizing=finalizing))
+    base = base_round_action_instructions(question_type, finalizing=finalizing)
+    reminder = "" if finalizing else round_reminder(finalizing=False, question_type=question_type)
+    return base + ("\n" + reminder if reminder else "")
 
 
 @dataclass
@@ -269,8 +276,8 @@ class OnlineRunConfig:
         for value in (self.model_weights_sha256, self.environment_sha256):
             if value and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value)):
                 raise ValueError("模型/环境身份必须是 SHA256")
-        if self.online_model_provider != "bailian":
-            raise ValueError("online model provider must be bailian")
+        if self.online_model_provider not in {"bailian", "xcodeapi"}:
+            raise ValueError("unsupported online model provider")
         if not self.online_model or not self.online_base_url.startswith("https://"):
             raise ValueError("online model and HTTPS base URL are required")
         if self.semantic_min_pixels <= 0 or self.semantic_min_pixels > self.semantic_max_pixels:
@@ -1168,6 +1175,8 @@ def _record_first_synthesis(outcome: EpisodeOutcome, res: _SynthResult,
         "source": str(res.source or ""),
         "template_version": PROMPT_TEMPLATE_VERSION,
         "tool_docs_version": TOOL_DOCS_VERSION,
+        "source_tool_docs_version": SOURCE_TOOL_DOCS_VERSION,
+        "prompt_compaction_version": COMPACTION_VERSION,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         if prompt else "",
         "prompt_present": bool(prompt),
@@ -1739,6 +1748,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                    states, receipts, *, pixels, geometry):
     """M8–M11 单一循环。每轮最多一次生成请求；所有出口都撤掉未验收的答案。"""
     from skill3d.online.progress import ProgressState, transient_results
+    from .counting_state import episode_feedback
 
     progress = ProgressState()
     kernel = None
@@ -1823,7 +1833,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 traceback_feedback=feedback, prior_program=prior_source,
                 observation_image_ids=observation_images,
                 finalization_observations=(observations() if finalizing else None),
-                finalization_pages=(valid_pages()[-3:] if finalizing else None),
+                finalization_pages=(valid_pages()[-3:] if finalizing
+                                    and outcome.task != "object_counting" else None),
+                finalization_episode_state=(
+                    episode_feedback(kernel, observations()) if finalizing
+                    and outcome.task == "object_counting" and kernel is not None else None),
                 round_index=index, trigger=trigger)
         _record_skill_delivery(outcome, res.delivery, round_index=index,
                                skills=skills, program=res.program)
@@ -1840,6 +1854,7 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
         record.update(execution_protocol_version=EXECUTION_PROTOCOL_VERSION,
                       vsi_interface_version=VSI_INTERFACE_VERSION,
                       vsi_interface_contract_sha256=VSI_INTERFACE_SHA256,
+                      prompt_compaction_version=COMPACTION_VERSION,
                       feedback=feedback or "", executed=False,
                       generation=dict(res.generation))
         if finalizing:
@@ -1903,7 +1918,8 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 record["error_code"] = (
                     "program_syntax_error" if any(p.startswith("Syntax error:") for p in problems)
                     else "ast_violation")
-                feedback = "The previous program was rejected by the AST check: " + "; ".join(problems)
+                feedback = ("The previous program was rejected by the AST check; no calls executed: "
+                            + "; ".join(problems))
                 failure_key = "ast"
             elif not action.ok and not observation_fallthrough:
                 record["error_code"] = action.error_code
@@ -1963,6 +1979,9 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                 record["observation_reads"] = kernel.observation_reads[kernel._cell_read_mark:]
                 record["vsi_interface_calls"] = kernel.cell_vsi_interface_calls
                 record["vsi_reader_progress"] = kernel.cell_vsi_reader_progress
+                if outcome.task == "object_counting":
+                    record["instance_evidence"] = [
+                        item for item in kernel.counting_evidence if item["round"] == index]
                 round_results = trace.results
                 receipts.append("cell_run", {"program_id": program.program_id,
                                              "error_code": cell.error_code,
@@ -2033,6 +2052,13 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
                     verify.check_status["answer_contract"] = "pass" if replay.passed else "fail"
                     verify.check_details["answer_contract"] = {
                         "execution_count": 1, "reason": "; ".join(i.reason for i in replay.issues)}
+                    if outcome.task == "object_counting":
+                        from .counting_state import verification_scope
+                        # Compatibility booleans now mean actually checked and passed.
+                        # Overall admission still uses the established applicable-check policy.
+                        verify.checks = {key: status == "pass"
+                                         for key, status in verify.check_status.items()}
+                        record["verification_scope"] = verification_scope(verify, kernel)
                     outcome.verify = verify
                     record["geometry_verify"] = verify.model_dump(mode="json")
                     record["verification_result_ids"] = [r.result_id for r in scope.results]
@@ -2211,7 +2237,11 @@ def _solve_program(episode, scene, handle, skills, cfg, llm, outcome, fsm,
             current_ids = {o.result_id for o in valid}
             pages = [page for page in record.get("observation_reads", [])
                      if page["result_id"] in current_ids]
-            if pages:
+            if outcome.task == "object_counting":
+                state_text = episode_feedback(kernel, valid)
+                feedback += "\n" + state_text
+                record["episode_state_feedback"] = state_text
+            elif pages:
                 feedback += "\nRequested observation pages (raw data, original references):\n" + json.dumps(
                     pages, ensure_ascii=False, sort_keys=True)
             record["recovery_observation_ids"] = [o.result_id for o in valid]
@@ -2605,7 +2635,8 @@ def _m5_out_dir(art) -> Optional[str]:
 
 def _prompt_messages(prompt: str, pixels, cfg: OnlineRunConfig,
                      expected_frames: Optional[int] = None,
-                     extra_images: Optional[Sequence] = None) -> list[dict]:
+                     extra_images: Optional[Sequence] = None,
+                     image_labels: Optional[Sequence[str]] = None) -> list[dict]:
     """文本 prompt → OpenAI messages；`mode=real` 必须带图（多模态，硬约束 26）。
 
     `mode=real` 下缺帧或帧数与统一 FrameSet 不一致时**直接报错**：既不允许静默
@@ -2628,7 +2659,7 @@ def _prompt_messages(prompt: str, pixels, cfg: OnlineRunConfig,
         from skill3d.synthesis.prompt_builder import build_image_messages
 
         return build_image_messages(prompt, pixels, max_images=cfg.max_images,
-                                    extra=extra_images)
+                                    extra=extra_images, image_labels=image_labels)
     return [{"role": "user", "content": prompt}]
 
 
@@ -2690,9 +2721,13 @@ def _image_manifest_text(ledger, plan) -> str:
             f"{idx}. [Crop] image_id={rec.image_id} source_frame={rec.source_frame_id} "
             f"crop_box(x0,y0,x1,y1)={rec.box_xyxy} source_size={rec.source_hw} "
             f"delivered_size={rec.sent_hw} scale={rec.scale}")
-    for i in plan.original_image_ids:
-        idx += 1
-        lines.append(f"{idx}. [Original frame] frame_id={i.split('-', 1)[1]}")
+    if plan.original_image_ids:
+        slots = [int(i.split("-", 1)[1]) for i in plan.original_image_ids]
+        end = idx + len(slots)
+        positions = str(end) if end == idx + 1 else f"{idx + 1}..{end}"
+        lines.append(
+            f"{positions}. [Original frames] frozen frame slots in image order: "
+            + json.dumps(slots, separators=(",", ":")))
     if plan.omitted_originals:
         lines.append(
             f"({len(plan.omitted_originals)} original frames are absent from this request: "
@@ -2711,6 +2746,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                 observation_image_ids: Optional[Sequence[str]] = None,
                 finalization_observations: Optional[Sequence] = None,
                 finalization_pages: Optional[Sequence] = None,
+                finalization_episode_state: Optional[str] = None,
                 round_index: int = 1,
                 trigger: str = "initial") -> _SynthResult:
     """M8：生成 program。
@@ -2756,11 +2792,14 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
             observations=observation_feedback(
                 list(finalization_observations or []), question_type=canonical_task(episode.question_type),
                 include_reader=False)
-                + "\nRecent requested valid pages (at most 3):\n"
-                + json.dumps(list(finalization_pages or []), ensure_ascii=False, sort_keys=True),
+                + finalization_pages_text(
+                    list(finalization_pages or []),
+                    question_type=canonical_task(episode.question_type)),
             remaining_requests=int(cfg.max_solver_rounds) - round_index + 1,
             method_context_max_chars=delivery.max_chars)
         prompt += finalization_instructions(canonical_task(episode.question_type))
+        if finalization_episode_state:
+            prompt += "\n" + finalization_episode_state
     else:
         prompt, delivery = _build_prompt_ex(episode, scene, handle, skills, feedback,
                                         scope_override=scope_override,
@@ -2787,6 +2826,7 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
     elif ledger is not None and ledger.scene_overview_image_id is not None:
         raise ValueError("A scene overview ledger requires scene_overview to be enabled")
     extra_images: list = []
+    image_labels = None
     frames_for_request = list(pixels or [])
     if ledger is not None and ledger.has_frames():
         plan = ledger.plan_round(
@@ -2800,12 +2840,26 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
         frames_for_request = [p for fid, p in zip(ledger.frame_ids, frames_for_request)
                               if fid in chosen_orig]
         prompt += _image_manifest_text(ledger, plan)
+        if canonical_task(episode.question_type) == "object_counting":
+            image_labels = []
+            for image_id in plan.image_ids:
+                if image_id.startswith("orig-"):
+                    slot = int(image_id.split("-", 1)[1])
+                    image_labels.append(f"image_id={image_id}; frozen_frame_slot={slot}")
+                else:
+                    entry = ledger.get(image_id)
+                    if entry.kind == "scene_overview":
+                        image_labels.append(scene_overview_manifest_text(entry))
+                    else:
+                        image_labels.append(
+                            f"image_id={image_id}; source_frame_slot={entry.source_frame_id}; "
+                            f"source_box_xyxy={entry.box_xyxy}; delivered_hw={entry.sent_hw}")
 
     # 多模态：把本轮布局规定的帧（+ 派生图）连同 prompt 一起送进模型
     expected = (len(frames_for_request) if getattr(episode, "frame_set", None) is not None
                 else None)
     messages = _prompt_messages(prompt, frames_for_request, cfg, expected_frames=expected,
-                                extra_images=extra_images)
+                                extra_images=extra_images, image_labels=image_labels)
     n_images = len([1 for m in messages
                     if isinstance(m.get("content"), list)
                     for part in m["content"]
@@ -2825,12 +2879,13 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
 
         scope = scope_override or getattr(scene, "question_tool_scope", "")
         gate = getattr(scene, "metric_evidence_gate_result", None)
-        tools = REGISTRY.docs(
+        raw_qtype = str(getattr(scene, "question_type", "") or "") or str(episode.question_type or "")
+        tools = "" if finalizing else compact_tool_docs(REGISTRY,
             scope or None, available=(handle.available_artifacts if handle is not None else None),
             evidence_profile=getattr(scene, "evidence_profile", None),
             gate_passed=None if gate is None else gate.gate_passed,
             local_facts=handle.local_facts if handle is not None else {},
-            question_type=canonical_task(episode.question_type))
+            question_type=canonical_question_type(raw_qtype) or raw_qtype)
         image_mapping = []
         if ledger is not None and ledger.has_frames():
             for image_id in plan.image_ids:
@@ -2859,8 +2914,13 @@ def _synthesize(episode: VSIBenchEpisode, scene, handle, skills, cfg: OnlineRunC
                 cfg.retrieval_policy.method_context_max_chars).sha256,
             "vsi_interface_version": VSI_INTERFACE_VERSION,
             "vsi_interface_contract_sha256": VSI_INTERFACE_SHA256,
+            "prompt_compaction_version": COMPACTION_VERSION,
+            "counting_context_version": (
+                COUNTING_CONTEXT_VERSION if canonical_task(raw_qtype) == "object_counting" else None),
             "tool_docs_version": TOOL_DOCS_VERSION,
+            "source_tool_docs_version": SOURCE_TOOL_DOCS_VERSION,
             "tool_directory_sha256": hashlib.sha256(tools.encode()).hexdigest(),
+            "tool_docs_delivered": not finalizing,
             "tool_execution_allowed": not finalizing,
             "delivered_method_hashes": [entry.content_sha256 for entry in delivery.entries],
             "image_round": _round_dict(ledger, round_index),
@@ -3013,29 +3073,39 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
     plan = plan_delivery(
         skills, max_chars=(policy.method_context_max_chars if policy is not None else None))
     scene_summary = scene.summary if scene is not None else ""
-    if handle is not None and handle.grounding_coverage:
-        coverage = handle.grounding_coverage
-        # Request/response histories stay in receipts; the prompt needs coverage facts.
-        public = {k: v for k, v in coverage.items() if k not in {
-            "phase_receipts", "noun_extraction", "stages", "request_identity", "elapsed_s"}}
-        public["requirements"] = [{
-            k: v for k, v in row.items() if k not in {"detector_errors", "vlm_errors"}
-        } for row in coverage.get("requirements", [])]
+    if qtype == "object_counting":
+        scene_summary = compact_counting_scene_summary(scene_summary)
+        from .counting_state import count_tool_status
+        scene_summary += count_tool_status(handle)
+    docs_kwargs = dict(
+        available=handle.available_artifacts if handle is not None else None,
+        evidence_profile=profile, gate_passed=None if gate is None else gate.gate_passed,
+        local_facts=handle.local_facts if handle is not None else {}, question_type=qtype)
+    authorized_tools = REGISTRY.names_for_scope(scope or None, **docs_kwargs)
+    if qtype == "object_rel_direction":
+        coverage = getattr(handle, "grounding_coverage", {}) if handle is not None else {}
+        checker = getattr(handle, "binding_usable", None) if handle is not None else None
+        public = compact_m5_coverage(
+            coverage, question_type=qtype,
+            binding_usable=checker if callable(checker) else None,
+            authorized_tools=authorized_tools)
+        scene_summary += (
+            "\nDirection candidate coverage and binding preconditions: "
+            + json.dumps(public, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\nUsable IDs do not certify referents. Catalog authorization and the selected "
+            "triple's world conventions and numerical validity still apply.")
+    elif handle is not None and handle.grounding_coverage:
+        public = compact_m5_coverage(handle.grounding_coverage)
         scene_summary += "\nM5 candidate coverage (technical scan facts only; the model must resolve question referents using images): " + json.dumps(
-            public, ensure_ascii=False, sort_keys=True)
+            public, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    tool_docs = compact_tool_docs(REGISTRY, scope or None, **docs_kwargs)
     text = PromptBuilder().render(
         question=episode.question,
         scene_summary=scene_summary,
         scene_frame="world",
         # 静态裁剪：scope + EvidenceProfile + 句柄实际装载产物 三条件，
         # 使 prompt 列出的 Tool 在执行期一定不会因缺产物/证据不足抛错
-        tool_docs=REGISTRY.docs(scope or None,
-                                available=(handle.available_artifacts
-                                           if handle is not None else None),
-                                evidence_profile=profile,
-                                gate_passed=(None if gate is None else gate.gate_passed),
-                                local_facts=(handle.local_facts if handle is not None else {}),
-                                question_type=qtype),
+        tool_docs=tool_docs,
         options=episode.options,
         skills=skills,
         scope=scope,
@@ -3046,7 +3116,12 @@ def _build_prompt_ex(episode, scene, handle, skills, feedback, *,
         gate_missing=(None if gate is None else gate.missing_subconditions),
         skill_plan=plan,
     )
-    text += program_instructions(canonical_task(qtype))
+    if qtype == "object_counting":
+        from skill3d.sandbox.ast_guard import model_execution_rules
+        text += model_execution_rules()
+    text += program_instructions(
+        canonical_task(qtype),
+        authorized_tools=authorized_tools)
     if feedback:
         text += f"\nThe previous program was rejected by the AST check: {feedback}\nCorrect it and output the program again."
     if traceback_feedback:
@@ -3121,12 +3196,16 @@ def _make_online_client(cfg: OnlineRunConfig):
     """Build the one shared Qwen client used by every online model phase."""
     if not cfg.online_model_enabled:
         return None
-    if cfg.online_model_provider != "bailian":
+    if cfg.online_model_provider not in {"bailian", "xcodeapi"}:
         raise ValueError(
             f"unsupported online model provider: {cfg.online_model_provider}")
     from skill3d.synthesis.bailian_client import BailianClient
 
-    client = BailianClient(
+    client_type = BailianClient
+    if cfg.online_model_provider == "xcodeapi":
+        from skill3d.synthesis.xcode_client import get_xcode_client_class
+        client_type = get_xcode_client_class(cfg.online_model)
+    client = client_type(
         model=cfg.online_model,
         model_revision=cfg.online_model_revision,
         base_url=cfg.online_base_url,
@@ -3221,7 +3300,9 @@ def _yield_feedback(cell: CellResult, kernel, scene,
     if include_observations:
         valid = collect_validated(kernel)
         selected = [obs for obs in valid if obs.result_id in wanted] if wanted else valid
-        lines.append(observation_feedback(selected or valid))
+        qtype = canonical_task(getattr(scene, "question_type", "") or "")
+        lines.append(observation_feedback(
+            selected or valid, question_type="object_counting" if qtype == "object_counting" else ""))
     return "\n".join(lines)
 
 

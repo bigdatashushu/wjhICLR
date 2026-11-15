@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Freeze a paired held-out sample for specified VSI question types."""
+
+import argparse
+from collections import Counter
+import hashlib
+import json
+from pathlib import Path
+import random
+import shutil
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from skill3d.infra.m5_identity import content_sha256
+from skill3d.infra.vsi_runner_source import freeze_source
+
+
+def write(path, value):
+    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--native-root", required=True)
+    parser.add_argument("--native-catalog", required=True)
+    parser.add_argument("--perception-endpoint", required=True)
+    parser.add_argument("--types", nargs="+", required=True)
+    parser.add_argument("--per-type", type=int, default=10)
+    args = parser.parse_args()
+    root, package = args.run_root.resolve(), args.package.resolve()
+    assert not root.exists() and root.parent.is_dir()
+    assert args.per_type > 0 and len(set(args.types)) == len(args.types)
+    panel = json.loads((package / "panel.json").read_text())
+    by_qa = {row["qa_id"]: row for row in panel["system_variants"]}
+    tests = [json.loads(line) for line in (package / "test.jsonl").read_text().splitlines()]
+    rng, selected = random.Random(137), []
+    for task in sorted(args.types):
+        pool = sorted((row for row in tests if by_qa[row["qa_id"]]["question_type"] == task),
+                      key=lambda row: row["qa_id"])
+        selected.extend(rng.sample(pool, args.per_type))
+    selected.sort(key=lambda row: (by_qa[row["qa_id"]]["question_type"], row["qa_id"]))
+    ids = {row["qa_id"] for row in selected}
+    n = len(ids)
+    assert n == args.per_type * len(args.types)
+    assert all(row["experiment_split"] == "test" for row in selected)
+    root.mkdir()
+    inputs = root / "inputs"
+    inputs.mkdir()
+    for name in ("online.yaml", "split.json", "questions.jsonl", "train.jsonl", "test.jsonl"):
+        shutil.copyfile(package / name, inputs / name)
+    shutil.copytree(package / "host_evaluation", inputs / "host_evaluation")
+    shutil.copytree(package / "scene_overviews", inputs / "scene_overviews")
+    # Match the established thinking run's transport timeout; model budgets stay unchanged.
+    import yaml
+    config_path = inputs / "online.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    config["online_model"]["timeout_s"] = 660.0
+    config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+    write(inputs / "sample_questions.json", selected)
+    panel["system_variants"] = [row for row in panel["system_variants"] if row["qa_id"] in ids]
+    panel["direct_qwen_rows"] = [row for row in panel["direct_qwen_rows"] if row["qa_id"] in ids]
+    panel["experiment_id"] += "-" + root.name
+    for value in panel["panels"].values():
+        value["system_input_variants"] = n
+    panel["proposal_sha256"] = content_sha256({k: v for k, v in panel.items()
+                                             if k != "proposal_sha256"})
+    write(inputs / "panel.json", panel)
+    published = json.loads((package / "published_inputs.json").read_text())
+    original_locator = published["source_catalog_file"]
+    published["source_catalog_file"] = args.native_catalog
+    write(inputs / "published_inputs.json", published)
+    runner = Path(__file__).resolve().parents[1]
+    receipt = freeze_source(runner, root / "code")
+    receipt["source_root"] = str(Path(args.native_root) / "code/source")
+    write(root / "code/code_identity.json", receipt)
+    shutil.copyfile(runner / "scripts/run_g1m1_diagnostic.py", root / "controller.py")
+    shutil.copyfile(runner / "scripts/launch_small_comparison.py", root / "launcher.py")
+    manifest = {
+        "schema": "vsi-small-paired-comparison/1", "seed": 137, "role": "test",
+        "selection": "random.Random(137), sorted requested types and lexically sorted held-out QA pools",
+        "questions_per_type": args.per_type, "n_questions": n,
+        "n_scenes": len({row["scene_name"] for row in selected}),
+        "task_counts": dict(sorted(Counter(by_qa[q]["question_type"] for q in ids).items())),
+        "variants": panel["system_variants"], "native_root": args.native_root,
+        "runtime": {
+            "workers": 16, "episode_concurrency": 16, "request_concurrency": 8,
+            "max_requests": n * 8, "scene_cache_size": n, "min_free_gib": 80,
+            "phase": "final_system", "automatic_model_retry": False, "skill_evolution": False,
+            "enable_thinking": True, "max_solver_rounds": 6, "max_requests_per_episode": 7,
+            "visual_fallback_max_requests": 1, "question_preflight": "required_zero_model_calls",
+            "input_scheduler": "independent_scene_providers_v1",
+            "perception_endpoint": args.perception_endpoint,
+        },
+        "comparison": {
+            "arms": ["system", "direct"], "same_questions_and_rgb_bytes": True,
+            "both_enable_thinking": True, "direct_protocol": "prepared-32",
+            "direct_rgb_only": True, "system_request_cap": n * 7, "direct_request_cap": n,
+            "system_prompt": "vsi-prompt-compaction/1.0",
+            "system_scene_overview": True, "direct_scene_overview": False,
+        },
+        "source_package": str(package),
+        "source_panel_sha256": hashlib.sha256((package / "panel.json").read_bytes()).hexdigest(),
+        "source_sha256": receipt["source_sha256"],
+        "published_locator_adaptation": {
+            "original_locator": original_locator, "native_locator": args.native_catalog,
+            "catalog_sha256": published["source_catalog_sha256"],
+            "entries_and_scopes_unchanged": True,
+        },
+        "input_files": {str(p.relative_to(inputs)): hashlib.sha256(p.read_bytes()).hexdigest()
+                        for p in sorted(inputs.rglob("*")) if p.is_file()},
+        "controller_sha256": hashlib.sha256((root / "controller.py").read_bytes()).hexdigest(),
+        "launcher_sha256": hashlib.sha256((root / "launcher.py").read_bytes()).hexdigest(),
+        "reference_answer_visible": False,
+    }
+    manifest["identity_sha256"] = content_sha256(manifest)
+    write(root / "diagnostic.json", manifest)
+    print(json.dumps({k: manifest[k] for k in (
+        "n_questions", "n_scenes", "task_counts", "identity_sha256", "source_sha256")},
+        sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

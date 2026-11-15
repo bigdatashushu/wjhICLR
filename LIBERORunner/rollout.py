@@ -18,9 +18,12 @@ def rollout(env, policy, initial_state, language: str, max_steps: int,
     for step in range(max_steps):
         try:
             action = policy.act(obs, language, step)
-        except InvalidAction:
-            return {"status": "invalid_action", "success": False,
-                    "control_steps": ack_count}
+        except InvalidAction as exc:
+            result = {"status": "invalid_action", "success": False,
+                      "control_steps": ack_count}
+            if exc.diagnostic is not None:
+                result["action_failure"] = exc.diagnostic
+            return result
         journal({"event": "action_started", "step": step, "action": action})
         obs, reward, done, _ = env.step(action)
         success = bool(env.check_success())

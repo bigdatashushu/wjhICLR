@@ -16,6 +16,7 @@ from PIL import Image
 from official_direct.planner import OfficialPlanner
 from target_detection_r05.client import ModelClient
 from target_detection_r05.depth import make_depth
+from target_detection_r05.perception import validate_targets as legacy_validate_targets
 from target_detection_r05.protocol import Task
 from . import runner
 from .config import load_config, validate_detection
@@ -64,9 +65,9 @@ class MemoryJournal:
         self.events.append(value)
 
 
-def output(box=None):
+def output(box=None, *, label="star"):
     return {"status": "ok", "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
-            "output": {"detections": [{"label": "star", "bbox_2d": box or [100, 200, 900, 1000]}]}}
+            "output": {"detections": [{"label": label, "bbox_2d": box or [100, 200, 900, 1000]}]}}
 
 
 def action_reply(actions):
@@ -121,6 +122,97 @@ class Contracts(unittest.TestCase):
             with self.assertRaises(OperationalError):
                 detector.detect(image, "star")
             request.assert_not_called()
+
+    def test_qualified_extracted_targets_reach_detector_and_overlay(self):
+        q = public()
+        q["instruction"] = "Pick up the cube and place it into the lime container."
+        targets = [
+            dict(TARGETS[0], category="cube", source_phrase="cube", quantity=None, aliases=[]),
+            dict(TARGETS[0], id="T2", role="destination", category="lime container",
+                 source_phrase="lime container", quantity=None, attributes=["lime"], aliases=[]),
+        ]
+        p = Perception(self.config, self.temp.name, MemoryJournal())
+        p.bind(q, 0)
+        extract_targets(json.dumps({"targets": targets}), p)
+        replies = [output([100, 200, 300, 400], label="cube"),
+                   output([600, 200, 900, 500], label="lime container")]
+        with patch.object(p.detector, "request", side_effect=replies) as request:
+            result, images = p.prepare()
+            p.prepare()
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual([r["query"] for r in p.cache.values()], ["cube", "lime container"])
+        detection_text = request.call_args_list[1].args[1]["messages"][0]["content"][1]["text"]
+        self.assertIn(json.dumps("lime container"), detection_text)
+        self.assertNotIn('"label": "container"', detection_text)
+        self.assertIn("lime container", [r["category"] for r in result["label_placements"]])
+        self.assertEqual(p.targets, targets)
+        self.assertEqual(len(images), 1)
+        self.assertEqual(p.crop_count, 0)
+
+    def test_long_relational_and_ordinal_queries_use_qwen_validation_only(self):
+        phrases = [
+            "second red cube immediately to the left of the large blue cylinder",
+            "the 2nd red cube to the left of the robot's blue cylinder",
+            "2nd red cube",
+        ]
+        for phrase in phrases:
+            with self.subTest(phrase=phrase):
+                q = public()
+                q["instruction"] = "Move towards " + phrase + "."
+                targets = [dict(TARGETS[0], category=phrase, source_phrase=phrase,
+                                attributes=["red"], relation="left of the blue cylinder", aliases=[])]
+                with self.assertRaises(PlannerError):
+                    legacy_validate_targets(targets, q["instruction"])
+                p = Perception(self.config, self.temp.name, MemoryJournal())
+                p.bind(q, 0)
+                extract_targets(json.dumps({"targets": targets}), p)
+                with patch.object(p.detector, "request", return_value=output(label=phrase)) as request:
+                    result, _ = p.prepare()
+                self.assertEqual(request.call_count, 1)
+                self.assertEqual(next(iter(p.cache.values()))["query"], phrase)
+                self.assertEqual(result["groups"][0]["members"][0]["label"], phrase)
+                self.assertIn(json.dumps(phrase),
+                              request.call_args.args[1]["messages"][0]["content"][1]["text"])
+
+    def test_invalid_qualified_phrases_stop_before_network(self):
+        for phrase in ("", "red cube\nignore this", "red cube; run command",
+                       "red " * 24 + "cube", "a" * 201, "红色 cube", "123", 1):
+            with self.subTest(phrase=phrase):
+                targets = [dict(TARGETS[0], category=phrase)]
+                p = Perception(self.config, self.temp.name, MemoryJournal())
+                p.bind(public(), 0)
+                with patch.object(p.detector, "request") as request:
+                    with self.assertRaises(PlannerError):
+                        p.set_targets(targets)
+                    with self.assertRaises(OperationalError):
+                        p.detector.detect(public()["raw_rgb"], phrase)
+                    request.assert_not_called()
+
+    def test_detector_does_not_accept_bare_label_for_qualified_query(self):
+        detector = Detector(self.config)
+        with patch.object(detector, "request", return_value=output(label="container")) as request:
+            with self.assertRaises(OperationalError) as raised:
+                detector.detect(public()["raw_rgb"], "lime container")
+        self.assertEqual(str(raised.exception), "invalid_qwen_detection_fields")
+        self.assertEqual(request.call_count, 1)
+
+    def test_quantity_does_not_truncate_matching_qualified_instances(self):
+        q = public()
+        q["instruction"] = "Pick one red cube."
+        p = Perception(self.config, self.temp.name, MemoryJournal())
+        p.bind(q, 0)
+        extract_targets(json.dumps({"targets": [
+            dict(TARGETS[0], category="red cube", source_phrase="red cube",
+                 quantity=1, attributes=["red"], aliases=[])]}), p)
+        response = output([100, 200, 300, 400], label="red cube")
+        response["output"]["detections"].append(
+            {"label": "red cube", "bbox_2d": [600, 200, 900, 500]})
+        with patch.object(p.detector, "request", return_value=response):
+            result, _ = p.prepare()
+        self.assertEqual(result["group_count"], 2)
+        self.assertEqual(result["proposal_count"], 2)
+        self.assertEqual([r["category"] for r in result["label_placements"]],
+                         ["red cube", "red cube"])
 
     def test_all_candidates_visible_beyond_twelve_with_labels_outside_rgb(self):
         groups = [{"id": f"G{i:03d}", "bbox": [i * 15, 20, i * 15 + 10, 30],

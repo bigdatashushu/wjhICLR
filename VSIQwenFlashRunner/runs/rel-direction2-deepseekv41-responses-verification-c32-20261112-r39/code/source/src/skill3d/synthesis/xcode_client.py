@@ -1,0 +1,251 @@
+"""Native Responses adapter; credentials are loaded only at the send boundary."""
+from __future__ import annotations
+
+import hashlib
+import os
+from xcodeapi.client import XcodeClient, normalize_response
+from xcodeapi.config import Profile
+from xcodeapi.transport import JSONTransport, ResponsesStreamTransport, MessagesStreamTransport, ChatStreamTransport
+from xcodeapi.errors import XcodeAPIError
+from skill3d.synthesis.bailian_client import BailianClient
+from skill3d.synthesis.client_errors import ServiceUnavailable
+from skill3d.synthesis.request_audit import describe_request
+
+
+class XcodeResponsesClient(BailianClient):
+    provider = "xcodeapi"
+    protocol = "responses"
+    stream_transport = ResponsesStreamTransport
+    supported_efforts = {"", "low", "medium", "high"}
+    streaming_efforts = {"high"}
+    revision_in_response = False
+    require_effort_echo = True
+
+    def __init__(self, *, reasoning_effort="", **kwargs):
+        super().__init__(**kwargs)
+        if reasoning_effort not in self.supported_efforts:
+            raise ValueError("unsupported native reasoning effort")
+        self.reasoning_effort = reasoning_effort
+        self.profile = Profile(self.protocol, self.base_url, self.model,
+                               self.api_key_env, timeout_seconds=self.timeout_s)
+        self.endpoint_hash = hashlib.sha256(self.profile.endpoint.encode()).hexdigest()
+        self._native_builder = XcodeClient(self.profile)
+        self.returned_effort = None
+        self.last_native_response_metadata = {}
+
+    def audit_identity(self, *, seed=None):
+        # Responses has no seed. Framework sampling seed is recorded separately.
+        return {**super().audit_identity(seed=None), "protocol": self.protocol}
+
+    def build_payload(self, messages, max_tokens=2048, seed=None, temperature=None,
+                      response_format=None, enable_thinking=False, top_p=None):
+        if response_format is not None or top_p is not None:
+            raise ValueError("unsupported Responses sampling parameter")
+        effort = self.reasoning_effort or ("high" if enable_thinking else "low")
+        return self._native_builder.prepare(
+            messages, max_output_tokens=min(int(max_tokens), self.max_output_tokens),
+            temperature=self.temperature if temperature is None else temperature,
+            extra_body={"reasoning": {"effort": effort}}, stream=effort in self.streaming_efforts)
+
+    def validate_native(self, payload):
+        self._native_builder._validate_payload(payload)
+        required = {"model", "input", "temperature", "max_output_tokens", "reasoning",
+                    "stream", "store"}
+        if (not required <= set(payload) or set(payload) - required - {"instructions"}
+                or payload["stream"] is not (payload["reasoning"].get("effort") in self.streaming_efforts)
+                or payload["store"] is not False
+                or payload["temperature"] != self.temperature
+                or type(payload["max_output_tokens"]) is not int
+                or not 0 < payload["max_output_tokens"] <= self.max_output_tokens
+                or payload["reasoning"] not in [
+                    {"effort": value} for value in self.supported_efforts - {""}]):
+            raise ValueError("native payload differs from frozen settings")
+
+    def chat(self, messages, **kwargs):
+        return self.send_native(self.build_payload(messages, **kwargs))
+
+    def payload_effort(self, payload):
+        return payload["reasoning"]["effort"]
+
+    def send_native(self, payload, *, api_key=None):
+        self.validate_native(payload)
+        self.last_usage = {}
+        self.last_response_identity = {}
+        self.last_native_response_metadata = {}
+        self.last_request_identity = describe_request(payload, model_identity=self.audit_identity())
+        self.last_generation = {
+            "mode": "stream" if payload["stream"] else "nonstream",
+            "usage_status": "unknown", "provider": self.provider,
+            "endpoint_sha256": self.endpoint_hash, "request_identity": self.last_request_identity}
+        token = api_key or os.environ.get(self.api_key_env, "").strip()
+        if not token:
+            raise ServiceUnavailable("Xcode credential unavailable")
+        try:
+            transport_type = self.stream_transport if payload["stream"] else JSONTransport
+            transport = transport_type(token, "bearer", self.timeout_s)
+            reply = transport.request("POST", self.profile.endpoint, payload)
+        except XcodeAPIError as error:
+            self.last_generation["transport_error"] = {
+                "kind": type(error).__name__,
+                "http_status": getattr(error, "status", None),
+            }
+            # Xcode errors contain only locally authored, sanitized messages.
+            self.last_native_response_metadata = {
+                "transport_error": {**self.last_generation["transport_error"],
+                                    "message": str(error)},
+                "transport_observation": transport.last_transport_metadata}
+            raise ServiceUnavailable("Xcode HTTPS request unsuccessful") from None
+        usage = reply.body.get("usage") or {}
+        blocks = reply.body.get("content")
+        self.last_native_response_metadata = {
+            "transport_observation": transport.last_transport_metadata,
+            "returned_model": reply.body.get("model"), "stop_reason": reply.body.get("stop_reason"),
+            "content_is_list": isinstance(blocks, list),
+            "blocks": [{"type": b.get("type"),
+                        "text_characters": len(b.get("text", "")) if isinstance(b.get("text", ""), str) else None,
+                        "thinking_characters": len(b.get("thinking", "")) if isinstance(b.get("thinking", ""), str) else None}
+                       for b in blocks if isinstance(b, dict)] if isinstance(blocks, list) else [],
+        }
+        if self.protocol == "chat_completions":
+            choice = (reply.body.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            self.last_native_response_metadata.update(
+                stop_reason=choice.get("finish_reason"),
+                content_characters=len(message.get("content") or ""),
+                thinking_characters=len(message.get("reasoning_content") or ""))
+        # Preserve known paid usage even when answer parsing subsequently fails.
+        mapping = {"prompt_tokens": "input_tokens", "completion_tokens": "output_tokens",
+                   "total_tokens": "total_tokens"}
+        if self.protocol == "chat_completions":
+            mapping.update(prompt_tokens="prompt_tokens", completion_tokens="completion_tokens")
+        self.last_usage = {out: usage[name] for out, name in mapping.items()
+                           if type(usage.get(name)) is int and usage[name] >= 0}
+        for name, section, field in (
+            ("reasoning_tokens", "output_tokens_details", "reasoning_tokens"),
+            ("cached_input_tokens", "input_tokens_details", "cached_tokens")):
+            if self.protocol == "chat_completions":
+                section = {"output_tokens_details": "completion_tokens_details",
+                           "input_tokens_details": "prompt_tokens_details"}.get(section, section)
+            value = (usage.get(section) or {}).get(field)
+            if type(value) is int and value >= 0:
+                self.last_usage[name] = value
+        if self.protocol == "messages":
+            for source, name in (("cache_read_input_tokens", "cached_input_tokens"),
+                                 ("cache_creation_input_tokens", "cache_creation_input_tokens")):
+                if type(usage.get(source)) is int and usage[source] >= 0:
+                    self.last_usage[name] = usage[source]
+            if "prompt_tokens" in self.last_usage:
+                self.last_usage["prompt_tokens"] += sum(
+                    self.last_usage.get(name, 0) for name in (
+                        "cached_input_tokens", "cache_creation_input_tokens"))
+            if "prompt_tokens" in self.last_usage and "completion_tokens" in self.last_usage:
+                self.last_usage["total_tokens"] = (
+                    self.last_usage["prompt_tokens"] + self.last_usage["completion_tokens"])
+        self.returned_effort = (reply.body.get("reasoning") or {}).get("effort")
+        self.last_response_identity = {
+            "id": str(reply.body.get("id") or ""), "model": str(reply.body.get("model") or ""),
+            "created": reply.body.get("created_at"), "backend_fingerprint": None,
+            "model_reported": isinstance(reply.body.get("model"), str)}
+        result = normalize_response(self.profile, reply)
+        expected_model = ((self.model_revision or self.model)
+                          if self.revision_in_response else self.model)
+        if result.returned_model != expected_model or (
+                self.protocol == "responses"
+                and (self.require_effort_echo or self.returned_effort is not None)
+                and self.returned_effort != self.payload_effort(payload)):
+            raise ValueError("native returned model or effort mismatch")
+        self.last_reasoning_content = result.reasoning or None
+        self.last_generation.update(
+            usage_status="measured" if self.last_usage else "unknown",
+            finish_reason=result.finish_reason or "unknown",
+            response_identity=self.last_response_identity)
+        return result.text
+
+
+class XcodeMessagesClient(XcodeResponsesClient):
+    protocol = "messages"
+    stream_transport = MessagesStreamTransport
+
+    def build_payload(self, messages, max_tokens=2048, seed=None, temperature=None,
+                      response_format=None, enable_thinking=False, top_p=None):
+        if response_format is not None or top_p is not None:
+            raise ValueError("unsupported Messages sampling parameter")
+        effort = self.reasoning_effort or ("high" if enable_thinking else "low")
+        return self._native_builder.prepare(
+            messages, max_output_tokens=min(int(max_tokens), self.max_output_tokens),
+            temperature=self.temperature if temperature is None else temperature,
+            extra_body={"thinking": {"type": "adaptive"}, "output_config": {"effort": effort}},
+            stream=True)
+
+    def payload_effort(self, payload):
+        return payload["output_config"]["effort"]
+
+    def validate_native(self, payload):
+        self._native_builder._validate_payload(payload)
+        required = {"model", "messages", "temperature", "max_tokens", "thinking",
+                    "output_config", "stream"}
+        if (not required <= set(payload) or set(payload) - required - {"system"}
+                or payload["stream"] is not True or payload["temperature"] != self.temperature
+                or type(payload["max_tokens"]) is not int
+                or not 0 < payload["max_tokens"] <= self.max_output_tokens
+                or payload["thinking"] != {"type": "adaptive"}
+                or payload["output_config"] not in [
+                    {"effort": value} for value in ("high", "low", "medium")]):
+            raise ValueError("native payload differs from frozen settings")
+
+
+class DeepSeekChatClient(XcodeResponsesClient):
+    protocol = "chat_completions"
+    stream_transport = ChatStreamTransport
+    supported_efforts = {"", "low", "high", "max"}
+    revision_in_response = True
+
+    def build_payload(self, messages, max_tokens=2048, seed=None, temperature=None,
+                      response_format=None, enable_thinking=False, top_p=None):
+        if response_format is not None or top_p is not None:
+            raise ValueError("unsupported DeepSeek sampling parameter")
+        return self._native_builder.prepare(
+            messages, max_output_tokens=min(int(max_tokens), self.max_output_tokens),
+            temperature=self.temperature if temperature is None else temperature,
+            extra_body={"thinking": {"type": "enabled"},
+                        "reasoning_effort": self.reasoning_effort or ("high" if enable_thinking else "low"),
+                        "stream_options": {"include_usage": True}}, stream=True)
+
+    def payload_effort(self, payload):
+        return payload["reasoning_effort"]
+
+    def validate_native(self, payload):
+        self._native_builder._validate_payload(payload)
+        required = {"model", "messages", "temperature", "max_tokens", "thinking",
+                    "reasoning_effort", "stream", "stream_options"}
+        if (set(payload) != required or payload["stream"] is not True
+                or payload["stream_options"] != {"include_usage": True}
+                or payload["temperature"] != self.temperature
+                or type(payload["max_tokens"]) is not int
+                or not 0 < payload["max_tokens"] <= self.max_output_tokens
+                or payload["thinking"] != {"type": "enabled"}
+                or payload["reasoning_effort"] not in {"low", "high", "max"}):
+            raise ValueError("native payload differs from frozen settings")
+
+
+class DeepSeekResponsesClient(XcodeResponsesClient):
+    """Use native Responses to avoid the gateway's failing Chat conversion.
+
+    The provider reports the concrete revision but does not echo reasoning effort.
+    Validate the exact outgoing effort and any echo that is supplied.
+    """
+    supported_efforts = {"", "low", "high", "max"}
+    streaming_efforts = {"low", "high", "max"}
+    revision_in_response = True
+    require_effort_echo = False
+
+
+def get_xcode_client_class(model, *, remote=False):
+    if remote:
+        from skill3d.cluster.xcode_client import RemoteXcodeClient, RemoteXcodeMessagesClient, RemoteDeepSeekResponsesClient
+        if model.startswith("deepseek-"):
+            return RemoteDeepSeekResponsesClient
+        return RemoteXcodeMessagesClient if model.startswith("claude-") else RemoteXcodeClient
+    if model.startswith("deepseek-"):
+        return DeepSeekResponsesClient
+    return XcodeMessagesClient if model.startswith("claude-") else XcodeResponsesClient

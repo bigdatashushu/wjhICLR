@@ -1,0 +1,509 @@
+"""M6 Tool 契约：scene_route → 产物映射 + 证据驱动的 Tool 收窄 + fail-closed 异常族。
+
+v6（D4/D6/D7）三条纪律同时落地：
+
+1. **scene_route 只挂产物**（§5.3）：`ROUTE_ARTIFACTS[scene_route]` 是纯函数，
+   只由 M4 质量决定，**不含 `scale`** —— `scale` 是 `question_tool_scope` 派生的
+   条件集（米制题 ∧ gate_passed）；
+2. **逐 Tool 证据收窄**（§7.2）：`docs()` 按每个 Tool 的
+   `requires_evidence` 与当前 `EvidenceProfile` 逐项匹配，
+   **单项失败只收回依赖该项的 Tool**，不做全局降级；
+3. **执行期 fail-closed**（硬约束 23）：`call_tool` 在 `fn` 之前校验产物与证据，
+   缺失抛 `ArtifactUnavailableError` / `ConfidenceGateError`，
+   **绝不静默返回 False/0**。
+
+`ROUTE_ARTIFACTS` 是纯函数映射，`tools.registry`、`routing.skill_retriever`、
+`reconstruction_gate.scene_state` 共用同一份判定（单一事实源）。
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
+
+from skill3d.schemas.evidence import (
+    CAPABILITIES,
+    EvidenceProfile,
+)
+from skill3d.schemas.tool import FailureCause
+from skill3d.tools.task_policy import task_allows
+
+if TYPE_CHECKING:
+    from skill3d.schemas.authorization import AuthorizationDecision
+
+# 产物词汇表（与 SceneHandle / ReconstructionArtifact 的可用产物口径一致）
+ARTIFACT_FRAMES = "frames"
+ARTIFACT_INTRINSICS = "intrinsics"
+ARTIFACT_DEPTH = "depth"
+ARTIFACT_POSES = "poses"
+ARTIFACT_POINT_CLOUD = "point_cloud"
+ARTIFACT_OBJECTS = "objects"
+ARTIFACT_SCALE = "scale"
+
+KNOWN_ARTIFACTS: frozenset[str] = frozenset({
+    ARTIFACT_FRAMES, ARTIFACT_INTRINSICS, ARTIFACT_DEPTH, ARTIFACT_POSES,
+    ARTIFACT_POINT_CLOUD, ARTIFACT_OBJECTS, ARTIFACT_SCALE,
+})
+
+# scene_route → 可用重建产物集合（v6 §5.3：纯函数，**只挂 scene_route**）
+#
+# 与 v5 的关键差异：`scale` **不在** `full_3d` 里。v6 §5.3 定义
+#   available_artifacts = ROUTE_ARTIFACTS[scene_route] ∪ ({scale} if 米制题 ∧ gate_passed)
+# 把 `scale` 收进条件集，使"米制尺度不可用"不再与"几何不可用"混为一谈（D3/D4）。
+ROUTE_ARTIFACTS: dict[str, frozenset[str]] = {
+    "full_3d": frozenset({
+        ARTIFACT_FRAMES, ARTIFACT_INTRINSICS, ARTIFACT_DEPTH, ARTIFACT_POSES,
+        ARTIFACT_POINT_CLOUD, ARTIFACT_OBJECTS,
+    }),
+    "fallback_2d_only": frozenset({
+        ARTIFACT_FRAMES, ARTIFACT_INTRINSICS, ARTIFACT_OBJECTS}),
+    "unanswerable": frozenset(),
+}
+
+# ---- question_tool_scope（§5.3 D4：与 scene_route 正交的第二字段）----
+SCOPE_FULL_3D = "full_3d"
+SCOPE_METRIC_ENABLED = "metric_enabled"
+SCOPE_FALLBACK_2D_ONLY = "fallback_2d_only"
+
+QUESTION_TOOL_SCOPES: tuple[str, ...] = (
+    SCOPE_FULL_3D, SCOPE_METRIC_ENABLED, SCOPE_FALLBACK_2D_ONLY,
+)
+
+# 米制题型的**证据依赖名**：任何 requires_evidence 含此项的 Tool 都是米制 Tool。
+# 用它替代 v5 的 `supported_metric_tasks` 作为"是否米制工具"的判据，
+# 使 Tool 暴露规则只有一条（证据），不必再维护第二份题型白名单。
+EVIDENCE_METRIC_SCALE = "metric_scale"
+
+SHARED_PREMISE_BY_REF = {
+    "geometry_3d": "geometry_3d", "depth": "geometry_3d",
+    "poses": "geometry_3d", "point_cloud": "geometry_3d",
+    "intrinsics": "geometry_3d", "world_frame": "world_frame",
+    "metric_scale": "metric_scale", "scale": "metric_scale",
+    "object_detection": "object_detection", "objects": "object_detection",
+}
+
+
+def failure_cause_from_missing(missing, *, message="") -> FailureCause:
+    """仅根据已定位的缺失项归因；未知能力、缺画像不证明共享证据失效。"""
+    premises = sorted({
+        SHARED_PREMISE_BY_REF[ref.split("(")[0].strip()]
+        for value in missing
+        if (ref := str(value)).split("(")[0].strip() in SHARED_PREMISE_BY_REF
+        and "no evidence profile" not in ref and "unknown capability" not in ref
+    })
+    return FailureCause(
+        code="missing_shared_evidence" if premises else "unlocated_contract_failure",
+        scope="shared_evidence" if premises else "unknown",
+        shared_premises=premises, message=message)
+
+
+def available_artifacts_for(route: str, *,
+                            question_type: str = "",
+                            gate_passed: bool = False,
+                            metric_question: bool = False) -> frozenset[str]:
+    """scene_route → 可用产物集合（§5.3；未知 route 保守取空集：fail-closed）。
+
+    `metric_question` 为真且 `gate_passed` 为真时才追加 `scale`（D3 条件集）。
+    注意 `metric_question` 由调用方按**题型**判定；`gate_passed` 由
+    `MetricEvidenceGate` 判定 —— 两者都不看 VLM 裁决。
+    """
+    base = ROUTE_ARTIFACTS.get(str(route), frozenset())
+    if not base:
+        return base
+    if ARTIFACT_SCALE in ROUTE_ARTIFACTS.get(str(route), frozenset()):
+        # 未来若把 scale 放回基础集，这里保持兼容（当前不会发生）
+        return base
+    if metric_question and gate_passed and route == "full_3d":
+        return base | {ARTIFACT_SCALE}
+    return base
+
+
+def question_tool_scope_of(scene_route: str, *,
+                           metric_question: bool = False,
+                           gate_passed: bool = False) -> str:
+    """scene_route × 题级条件 → `question_tool_scope`（§5.3 D4）。
+
+    不变量（§5.3）：`docs(question_tool_scope) ⊆ docs(scene_route)` —— 逐题只收窄。
+    故 `scene_route != full_3d` 时 scope 只能是 2D-only（收窄），
+    绝不允许出现"scene_route=fallback_2d_only 但 scope=full_3d"的越权。
+    """
+    if str(scene_route) != "full_3d":
+        return SCOPE_FALLBACK_2D_ONLY
+    if metric_question and gate_passed:
+        return SCOPE_METRIC_ENABLED
+    return SCOPE_FULL_3D
+
+
+# ------------------------------------------------- 证据驱动的 Tool 可见性 ----
+
+def evidence_visible(spec, profile: Optional[EvidenceProfile]) -> bool:
+    """逐 Tool 判定：所有公共依赖必须 available。
+
+    `profile=None`（无证据画像，例如 mock_light 早期路径）→ 按"全部 available"
+    处理**不成立**：此时只允许**无证据依赖**的 Tool 通过（fail-closed）。
+    """
+    required = list(getattr(spec, "requires_evidence", None) or [])
+    if not required:
+        return True
+    if profile is None:
+        return False
+    for cap in required:
+        if cap not in CAPABILITIES:
+            return False   # 未知能力名 = 声明错误 → 不暴露（fail-closed）
+        state = profile.state(cap)
+        if state != "available":
+            return False
+    return True
+
+
+def degraded_evidence_flags(spec, profile: Optional[EvidenceProfile]) -> list[str]:
+    """历史结果字段保留可读；当前二值画像不产生降级状态标记。"""
+    return []
+
+
+def effective_tool_spec(spec, args: Optional[dict] = None):
+    """Resolve parameter-dependent requirements before visibility or execution."""
+    if spec.name != "object_surface_distance" or (args or {}).get(
+            "unit", "normalized") != "m":
+        return spec
+    return spec.model_copy(update={
+        "requires_artifacts": sorted(set(spec.requires_artifacts) | {"scale"}),
+        "requires_evidence": sorted(set(spec.requires_evidence) | {"metric_scale"}),
+    })
+
+
+def scope_allows(spec, scope: str) -> bool:
+    """`question_tool_scope` 对某 Tool 的收窄判定（§5.3）。
+
+    - `metric_enabled`：允许全部（`docs(metric_enabled) ⊇ docs(full_3d)` 仅限
+      米制 Tool 的追加，不含"新增工具"）；
+    - `full_3d`：米制 Tool 一律不可见（gate 未过）；
+    - `fallback_2d_only`：只允许不依赖 `depth/poses/point_cloud/scale` 的 Tool。
+    """
+    required = set(getattr(spec, "requires_evidence", None) or [])
+    if scope == SCOPE_METRIC_ENABLED:
+        return True
+    if scope == SCOPE_FULL_3D:
+        return EVIDENCE_METRIC_SCALE not in required
+    if scope == SCOPE_FALLBACK_2D_ONLY:
+        return EVIDENCE_METRIC_SCALE not in required and \
+            set(spec.requires_artifacts).issubset(ROUTE_ARTIFACTS["fallback_2d_only"])
+    return False
+
+
+def route_aware_available(saved: Optional[Iterable[str]], route: str) -> set[str]:
+    """可用产物集合：以 route 映射为准，SceneState 显式声明仅作上界补充。
+
+    取交集语义：`SceneState.available_artifacts` 若已按 route 填好则与映射一致；
+    若调用方手工缩小（例如候选产物未生成），以更小者为准（fail-closed）。
+    """
+    base = set(available_artifacts_for(route, metric_question=True, gate_passed=True))
+    if saved is None:
+        return base
+    declared = set(saved)
+    if not declared:
+        return base
+    return declared & base
+
+
+def check_metric_task_contract(
+    tool: str,
+    supported_metric_tasks: Sequence[str],
+    allowed_metric_tasks: Iterable[str],
+    question_type: str,
+    *,
+    args: Optional[dict] = None,
+) -> None:
+    """米制 Tool 的逐题授权校验（v5 HC33 语义，v6 由证据门主导）。
+
+    v6 的主判据是 `EvidenceProfile.metric_scale == available`（= gate 通过），
+    由 `docs()` 裁剪与 `check_evidence_contract` 的执行期二次校验承担。
+    本函数保留为**题型维度**的补充校验：声明了 `supported_metric_tasks` 的 Tool
+    仍要求 `question_type` 在 `allowed_metric_tasks ∩ supported_metric_tasks` 内。
+
+    仍然 fail-closed：不满足抛 `ConfidenceGateError`，**不**静默返回相对单位数值。
+    """
+    if not supported_metric_tasks:
+        return
+    qt = str(question_type or "")
+    allowed = {str(t) for t in (allowed_metric_tasks or set())}
+    if not allowed:
+        # v6：逐题型授权集合为空时，授权判定完全交给证据门（gate）——
+        # 若证据门已通过（metric_scale=available），此处不再二次否决。
+        return
+    if not qt:
+        raise ConfidenceGateError(
+            tool,
+            f"Tool {tool} requires metric scale, but this episode has no classified question type"
+            " (metric tools are not authorized for unknown question types)",
+            args=args, failure_cause=FailureCause(
+                code="question_type_unclassified", scope="local_call"))
+    if qt not in allowed:
+        raise ConfidenceGateError(
+            tool,
+            f"Tool {tool} requires metric scale, but question type {qt} is not authorized by this scale assessment"
+            f" (allowed_metric_tasks={sorted(allowed)})",
+            args=args, failure_cause=FailureCause(
+                code="question_type_unauthorized", scope="local_call"))
+    if qt not in set(supported_metric_tasks):
+        raise ConfidenceGateError(
+            tool,
+            f"Tool {tool} does not support question type {qt} (supported_metric_tasks="
+            f"{sorted(supported_metric_tasks)})",
+            args=args, failure_cause=FailureCause(
+                code="unsupported_question_type", scope="local_call"))
+
+
+def check_artifact_contract(
+    tool: str,
+    requires_artifacts: Sequence[str],
+    available_artifacts: Iterable[str],
+    route: str = "",
+    args: Optional[dict] = None,
+) -> None:
+    """执行期 fail-closed 校验：缺产物直接抛 `ArtifactUnavailableError`。"""
+    available = set(available_artifacts)
+    missing = sorted(set(requires_artifacts) - available)
+    if missing:
+        raise ArtifactUnavailableError(tool, missing, route=route,
+                                       available=available, args=args)
+
+
+def check_evidence_contract(
+    tool: str,
+    spec,
+    profile: Optional[EvidenceProfile],
+    *,
+    gate_passed: Optional[bool] = None,
+    route: str = "",
+    args: Optional[dict] = None,
+) -> None:
+    """执行期**二次校验** `requires_evidence`（§13.2 双重 fail-closed）。
+
+    与 `docs()` 的静态裁剪同源：静态层藏起来，执行层也要拦住 ——
+    否则模型凭记忆写出被隐藏的 Tool 名就能绕过证据门。
+    """
+    if not evidence_visible(spec, profile):
+        # 逐项报出**具体**未达标的能力名（此前统一写 "(证据不足)"，
+        # 导致归因侧无法判断是缺几何还是缺米制，级联撤销还会误判前提 —— 实测踩过）。
+        missing: list[str] = []
+        for cap in (getattr(spec, "requires_evidence", None) or []):
+            if cap not in CAPABILITIES:
+                missing.append(f"{cap}(unknown capability)")
+                continue
+            if profile is None:
+                missing.append(f"{cap}(no evidence profile)")
+                continue
+            state = profile.state(cap)
+            if state == "unavailable":
+                missing.append(f"{cap}(unavailable)")
+        raise ArtifactUnavailableError(
+            tool, missing or ["(insufficient evidence)"], route=route,
+            available=[], args=args)
+    # 米制 Tool 的专项二次校验（§13.2：执行层也校验 gate_passed）
+    required = list(getattr(spec, "requires_evidence", None) or [])
+    if EVIDENCE_METRIC_SCALE in required and gate_passed is not None and not gate_passed:
+        raise ConfidenceGateError(
+            tool,
+            f"Tool {tool} requires metric scale, but MetricEvidenceGate did not pass"
+            " (§13.2 runtime recheck)",
+            args=args, failure_cause=FailureCause(
+                code="metric_gate_failed", scope="shared_evidence",
+                shared_premises=["metric_scale"]))
+
+
+# --------------------------------------------------------------- 异常族 ----
+
+class ToolContractError(Exception):
+    """Tool 契约违规基类（§9.12）：确定性异常，进 FailureTaxonomy。"""
+
+    error_code = "tool_contract"
+
+    def __init__(self, tool: str, message: str, *, args: Optional[dict] = None,
+                 route: str = "", missing: Optional[Sequence[str]] = None,
+                 available: Optional[Iterable[str]] = None,
+                 failure_cause: Optional[FailureCause] = None) -> None:
+        super().__init__(message)
+        self.tool = tool
+        # 注意：不要赋值 self.args —— 那会覆盖 BaseException.args（异常消息会丢失）
+        self.call_args = dict(args or {})
+        self.route = route
+        self.missing = sorted(missing or [])
+        self.available = sorted(available or [])
+        self.failure_cause = failure_cause or FailureCause(
+            code="unlocated_tool_failure", scope="unknown", message=message)
+        if not self.failure_cause.message:
+            self.failure_cause = self.failure_cause.model_copy(update={"message": message})
+
+    def detail(self) -> dict:
+        return {
+            "error_code": self.error_code,
+            "tool": self.tool,
+            "route": self.route,
+            "missing": list(self.missing),
+            "available": list(self.available),
+            "message": str(self),
+            "failure_cause": self.failure_cause.model_dump(mode="json"),
+        }
+
+
+class ArtifactUnavailableError(ToolContractError):
+    """所需重建产物/证据不在可用集（硬约束 23、§13.2）。"""
+
+    error_code = "tool_contract"
+
+    def __init__(self, tool: str, missing: Sequence[str], route: str = "",
+                 available: Optional[Iterable[str]] = None,
+                 args: Optional[dict] = None,
+                 failure_cause: Optional[FailureCause] = None) -> None:
+        msg = (f"Tool {tool} is missing required artifacts/evidence: {sorted(missing)}; "
+               f"route={route or 'unknown'}, available artifacts={sorted(available or [])}"
+               " (hard constraint 23: fail closed; never silently return False/0)")
+        super().__init__(tool, msg, args=args, route=route, missing=sorted(missing),
+                         available=available,
+                         failure_cause=failure_cause or failure_cause_from_missing(
+                             missing, message=msg))
+
+
+class ConfidenceGateError(ToolContractError):
+    """局部质量门未过（MetricEvidenceGate 未过 / 米制题型未授权）。"""
+
+    error_code = "confidence_gate"
+
+
+class DomainValueError(ToolContractError):
+    """域值错误（负距离 / 点在相机后方 / 超包围盒 / 单位错）。"""
+
+    error_code = "domain_value"
+
+
+class AnswerAlreadyGiven(ToolContractError):
+    """`ReturnAnswer` 之后再调 Tool（§15.1 运行层保护）。
+
+    v6 D7：`ReturnAnswer` 保留"记录/反作弊"语义（不中止执行），但一旦它被调用，
+    后续任何 Tool 调用都必须抛本异常 —— 而不是让程序继续跑到 `IndexError`
+    崩成"服务故障"。
+
+    背景 [已实测]：v5 模型自然写出 `if not ids: ReturnAnswer("abstain")` 然后继续
+    `object_centroid(ids[0])` → IndexError → `violation_runtime`，内测方向题全栽在这里。
+    """
+
+    error_code = "answer_already_given"
+
+
+# --------------------------------------------------- §6.4 单一授权判定函数 ----
+
+def authorize_tool_call(
+    tool: str,
+    spec,
+    *,
+    scope: str = "",
+    profile: Optional[EvidenceProfile] = None,
+    available_artifacts: Iterable[str] = (),
+    gate: Optional[object] = None,
+    supported_metric_tasks: Sequence[str] = (),
+    allowed_metric_tasks: Iterable[str] = (),
+    question_type: str = "",
+    args: Optional[dict] = None,
+    tools_enabled: bool = True,
+    local_facts: Optional[dict[str, bool]] = None,
+    gate_passed: Optional[bool] = None,
+    model_call: bool = True,
+    consumed_dependency_refs: Iterable[str] = (),
+) -> "AuthorizationDecision":
+    """§6.4：**唯一**的授权判定函数，产出结构化决策（允许与否 + 原因码）。
+
+    它按既有顺序执行与执行期相同的检查（作用域 → 证据 → 米制题级 → 产物），
+    但**不抛异常**，而是把失败折成 `reason_codes`。调用方据此生成
+    `ToolAuthorizationReceipt`，再决定是否把异常抛给生成程序 —— 因此"收据"与
+    "实际是否放行"必然同源，不会出现事后拼凑的通过凭据。
+
+    §6.4：实参涉及的具体对象仍需执行前检查 —— 对象绑定失败（`domain_value`）
+    同样进原因码，而不是只报"工具不可见"。
+    """
+    from skill3d.schemas.authorization import AuthorizationDecision, gate_result_payload
+
+    spec = effective_tool_spec(spec, args)
+    # Optional outputs add requirements only after execution reports consumption.
+    consumed = set(consumed_dependency_refs)
+    if consumed:
+        spec = spec.model_copy(update={
+            "requires_artifacts": sorted(set(spec.requires_artifacts) | (
+                consumed & KNOWN_ARTIFACTS)),
+            "requires_evidence": sorted(set(spec.requires_evidence) | (
+                consumed & set(CAPABILITIES))),
+            "requires_local_facts": sorted(set(spec.requires_local_facts) | (
+                consumed & {"world_frame"})),
+        })
+    gate_payload, gate_applicable = gate_result_payload(gate)
+    metric_required = ARTIFACT_SCALE in set(
+        getattr(spec, "requires_artifacts", None) or []) or (
+        EVIDENCE_METRIC_SCALE in (getattr(spec, "requires_evidence", None) or []))
+    deps = sorted(set(getattr(spec, "requires_artifacts", None) or []) |
+                  set(getattr(spec, "requires_evidence", None) or []) |
+                  set(getattr(spec, "requires_local_facts", None) or []))
+    reasons: list[str] = []
+    missing: list[str] = []
+
+    if not tools_enabled:
+        reasons.append("tools_disabled")
+
+    if model_call and not task_allows(tool, question_type):
+        reasons.append("task_denied")
+    if tool == "object_surface_distance" and (args or {}).get(
+            "unit", "normalized") not in ("normalized", "m"):
+        reasons.append("domain_value")
+        missing.append("unit(must be normalized or m)")
+
+    if scope and not scope_allows(spec, scope):
+        reasons.append("scope_denied")
+
+    if not evidence_visible(spec, profile):
+        reasons.append("tool_contract")
+        for cap in (getattr(spec, "requires_evidence", None) or []):
+            if cap not in CAPABILITIES:
+                missing.append(f"{cap}(unknown capability)")
+            elif profile is None:
+                missing.append(f"{cap}(no evidence profile)")
+            elif profile.state(cap) == "unavailable":
+                missing.append(f"{cap}(unavailable)")
+
+    for fact in (getattr(spec, "requires_local_facts", None) or []):
+        if not (local_facts or {}).get(fact, False):
+            reasons.append("tool_contract")
+            missing.append(f"{fact}(local fact unavailable)")
+
+    need = set(getattr(spec, "requires_artifacts", None) or [])
+    absent = sorted(need - set(available_artifacts))
+    if absent:
+        reasons.append("tool_contract")
+        missing.extend(f"{a}(artifact missing)" for a in absent)
+
+    if metric_required:
+        effective_gate = gate_passed if gate_passed is not None else getattr(
+            gate, "gate_passed", None)
+        if effective_gate is False:
+            reasons.append("confidence_gate")
+            missing.append("metric_scale(gate failed)")
+        if tool == "object_surface_distance" and (
+            effective_gate is not True or scope != SCOPE_METRIC_ENABLED
+            or question_type not in (
+                "object_abs_distance", "object_size_estimation", "room_size_estimation")
+        ):
+            reasons.append("confidence_gate")
+            missing.append("metric_scale(question authorization missing)")
+        try:
+            check_metric_task_contract(tool, supported_metric_tasks,
+                                       allowed_metric_tasks, question_type, args=args)
+        except ConfidenceGateError:
+            reasons.append("confidence_gate")
+
+    allowed = not reasons
+    return AuthorizationDecision(
+        allowed=allowed,
+        reason_codes=sorted(set(reasons)) if not allowed else ["allowed"],
+        dependency_refs=deps,
+        missing_refs=sorted(set(missing)),
+        metric_gate_result=(gate_payload if metric_required
+                            else {"status": "not_applicable", "gate_passed": None}),
+        metric_gate_applicable=bool(metric_required and gate_applicable),
+    )

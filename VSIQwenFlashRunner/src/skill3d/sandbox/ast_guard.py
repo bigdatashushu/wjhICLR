@@ -65,6 +65,25 @@ _REGEX_BLACKLIST = [
 ]
 
 
+def model_execution_rules() -> str:
+    """Present the enforcement constants themselves instead of a second handwritten list."""
+    import json
+    return (
+        "\nAST execution rules (generated from the active checker): "
+        + json.dumps({
+            "imports_and_exports": {k: sorted(v) for k, v in NUMERICAL_EXPORTS.items()},
+            "safe_builtin_calls": sorted(SAFE_BUILTINS),
+            "forbidden_calls": sorted(FORBIDDEN_CALLS),
+            "forbidden_attributes": sorted(FORBIDDEN_ATTRS),
+            "reserved_names": sorted(RESERVED_NAMES),
+            "safe_scene_attributes": sorted(SAFE_SCENE_ATTRS),
+            "secondary_regex_blacklist": [p.pattern for p in _REGEX_BLACKLIST],
+        }, sort_keys=True, separators=(",", ":"))
+        + "\nNo classes, bare except, internal names or underscore attributes. "
+        "Other bare calls must be authorized tools, host interfaces, imported exports or "
+        "locally defined functions. The host executes no calls when AST validation rejects a cell.")
+
+
 def _attribute_path(node: ast.AST) -> tuple[str, ...]:
     if isinstance(node, ast.Name):
         return (node.id,)

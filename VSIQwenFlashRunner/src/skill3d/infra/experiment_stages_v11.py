@@ -306,9 +306,12 @@ def baseline32(manifest, destination, *, variants=None, enable_thinking=False, r
         max_scenes=min(2, runtime["scene_cache_size"]) if rgb_only else runtime["scene_cache_size"])
     model = online_model_from(resolve_runtime(load_config(profile["inputs"]["online_config"]),
                                              seed=runtime["seed"]))
-    require(model.enabled and model.provider == "bailian" and model.model == "qwen3.8-flash"
+    if model.provider == "xcodeapi":
+        from dataclasses import replace
+        model = replace(model, reasoning_effort=runtime["direct_reasoning_effort"])
+    require(model.enabled and model.provider in {"bailian", "xcodeapi"}
             and model.n_frames == 32 and model.temperature == 0,
-            "Baseline requires the same enabled deterministic 32-frame Qwen model")
+            "Baseline requires the same enabled 32-frame model")
     client_config = {"online_model": asdict(model)}
     governor_root = (Path(manifest["run_root"]) / "requests" if request_governor_root is None
                      else Path(request_governor_root))
@@ -395,7 +398,10 @@ def baseline32(manifest, destination, *, variants=None, enable_thinking=False, r
             atomic(output, response)
             raise CampaignError("Baseline service stopped; no automatic retry") from None
         actual_model = (getattr(client, "last_response_identity", {}) or {}).get("model")
-        require(actual_model == model.model, "Baseline response model differs from frozen model")
+        expected_model = ((model.model_revision or model.model)
+                          if model.provider == "xcodeapi" and model.model.startswith("deepseek-")
+                          else model.model)
+        require(actual_model == expected_model, "Baseline response model differs from frozen model")
         response["observed_model"] = actual_model
         response.update(
             response_text=text, usage=dict(getattr(client, "last_usage", {}) or {}),
@@ -405,8 +411,16 @@ def baseline32(manifest, destination, *, variants=None, enable_thinking=False, r
             reference_answer_visible=False, tool_calls=0,
         )
         if enable_thinking or rgb_only:
-            require(response["actual_request_identity"]["parameters"]["enable_thinking"]
-                    is enable_thinking, "Baseline thinking parameter differs from requested value")
+            if model.provider == "xcodeapi":
+                effort_field = ("reasoning_effort" if client.protocol == "chat_completions" else
+                                "output_config" if client.protocol == "messages" else "reasoning")
+                require(response["actual_request_identity"]["parameters"][effort_field]
+                        == (model.reasoning_effort if effort_field == "reasoning_effort"
+                            else {"effort": model.reasoning_effort}),
+                        "Baseline native effort differs from requested value")
+            else:
+                require(response["actual_request_identity"]["parameters"]["enable_thinking"]
+                        is enable_thinking, "Baseline thinking parameter differs from requested value")
         try:
             answer, _ = parse_visual_answer(text, question_type=variant["question_type"],
                                            options=row["options"])

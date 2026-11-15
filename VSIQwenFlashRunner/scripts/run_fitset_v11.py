@@ -332,9 +332,15 @@ class _RevisionClientFactory:
         model = online_model_from(self.config)
         client_type = BailianClient
         options = {}
+        if model.provider == "xcodeapi":
+            from skill3d.synthesis.xcode_client import get_xcode_client_class
+            client_type = get_xcode_client_class(model.model)
+            options["reasoning_effort"] = model.reasoning_effort
         if self.perception_endpoint:
             from skill3d.cluster.perception_client import RemoteBailianClient
             client_type = RemoteBailianClient
+            if model.provider == "xcodeapi":
+                client_type = get_xcode_client_class(model.model, remote=True)
             options["endpoint"] = self.perception_endpoint
         return client_type(
             model=model.model, model_revision=model.model_revision,

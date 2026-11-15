@@ -30,10 +30,35 @@ catalog_required = pytest.mark.skipif(
 
 
 @catalog_required
-def test_default_metric_catalog_and_all_qa_roles_validate():
+def test_default_base_catalog_and_g1m0_skill_routing(tmp_path):
     _, _, _, profile, _, _, _ = campaign.resolve_new(
         campaign.parser().parse_args(["--dry-run"]))
     campaign.check_train_test_inputs(profile)
+    assert Path(profile["inputs"]["published_inputs"]) == OLD / "published_inputs.json"
+    provider = PublishedFitSetInputProvider(profile["inputs"]["published_inputs"], max_scenes=1)
+    variants = select_panel_variants(load_fitset_panel(profile["inputs"]["panel"]), "ready_579")
+    assert len(variants) == 1000
+    assert provider.catalog_variant == "base"
+    assert {row["evidence_state"] for row in variants} == {"g1m0"}
+    assert all(entry["variant"] == "base" for entry in provider._source_entries.values())
+    parents, identity = load_active_parent_slots(profile["inputs"]["seed_library"])
+    build_fit_skill_bundle(output_dir=tmp_path / "bundle", bundle_id="base-seed", candidates={},
+                           active_parents=parents, source_run_identity=identity)
+    bundle = load_fit_skill_bundle(tmp_path / "bundle/manifest.json")
+    for row in variants:
+        assert provider.public_entry(row)["reference"]["key"] == row["binding_key"]
+        task, state = row["question_type"], row["evidence_state"]
+        assert bundle.skill_for(task, state).skill_md == parents[task, state].skill_md
+    assert SceneOverviewStore(OLD / "scene_overviews/manifest.json").validate_entries(
+        provider.entries)["n_scenes"] == 160
+
+
+@catalog_required
+def test_explicit_metric_catalog_and_all_qa_roles_validate():
+    _, _, _, profile, _, _, _ = campaign.resolve_new(
+        campaign.parser().parse_args(["--dry-run", "--data-root", str(NEW)]))
+    campaign.check_train_test_inputs(profile)
+    assert Path(profile["inputs"]["published_inputs"]) == NEW / "published_inputs.json"
     provider = PublishedFitSetInputProvider(NEW / "published_inputs.json", max_scenes=1)
     panel = load_fitset_panel(NEW / "panel.json")
     variants = select_panel_variants(panel, "ready_579")

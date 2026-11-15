@@ -1,7 +1,8 @@
 # VSIQwenFlashRunner 开发约束
 
 本目录服务于 VSI-Bench 1000 题的 Qwen Flash 实验，当前使用独立的
-`prepared_cache/vsibench-m4-success-g1m1-1000-seed137-metric-r02` 数据包。
+`prepared_cache/vsibench-m4-success-g1m1-1000-seed137-r01` 数据包，
+默认恢复 base/g1m0 运行；包名中的 g1m1 表示抽样资格，不表示运行状态。
 用户要求进一步优化实验的新逻辑全部放在本目录，外层代码已被其他数据集和
 实验配置使用。
 
@@ -17,7 +18,8 @@
 - 当前题单按已授权的 20 组替换保留 980 题，使用 1000 题、
   300 训练/700 测试、160 场景和原 seed 137；两种角色均覆盖 160 场景。
   原始题型（含方向难度）、source split 和角色联合配额保持不变。
-  全部题目使用已核验的 metric/g1m1 资产及对应 Skill 槽位。
+  全部题目默认使用原 base 资产及对应题型的 g1m0 Skill 槽位。
+  metric/g1m1 包保留用于显式指定输入的历史复现。
   场景能力覆盖 24 个槽位；米制工具仍只对三类测量题授权。
   旧的 19 槽合同保留只读加载兼容，新绑定派生写入每轮 runs 内的缓存。
   保持原始 source split 及标签访问来源。测试题不用于 Skill 修订或候选选择。

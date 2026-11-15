@@ -13,14 +13,21 @@ IMAGE_PROMPT = (
 )
 
 TARGET_EXTRACTION_PROMPT = """Extract 1-4 detection targets from the public task instruction.
-Return only a JSON object: {"targets":[{"id":"T1","role":"object","category":"star",
-"source_phrase":"star","quantity":null,"attributes":[],"relation":"","aliases":[]}]}.
+Return only a JSON object: {"targets":[{"id":"T1","role":"destination","category":"lime container",
+"source_phrase":"lime container","quantity":null,"attributes":["lime"],"relation":"","aliases":[]}]}.
 Each target has exactly these eight fields. IDs are unique T1-T4; role is
 object/destination/support. Include task-relevant objects, destinations and supports.
-source_phrase must be verbatim from the instruction. category is a short English
-category of 1-6 words; separate color, quantity, attributes and spatial relation.
-quantity is null or an integer 1-100; attributes is a list of strings; relation is
-a string; aliases is a list of at most three short English category phrases.
+category is the English detection phrase (1-24 words, at most 200 characters).
+Use letters, digits, spaces, hyphens and apostrophes.
+Include ALL stated identifying color, shape, size, material, state, ordinal and
+spatial qualifiers, including reference objects: e.g. red cube left of the blue cylinder.
+Never reduce a qualified target to its bare category or invent unstated features.
+Exclude action verbs and requested future states. source_phrase must be verbatim
+from the instruction and retain the target's stated qualifiers.
+Keep counts in quantity, not category. quantity is null or an integer 1-100;
+attributes is a list of strings; relation is
+a string. Keep these metadata fields, but also include identifying qualifiers in
+category. aliases is empty or at most three phrases preserving ALL qualifiers.
 Use only the supplied instruction."""
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -40,12 +41,14 @@ def observation():
 
 
 class FakeClient:
-    def __init__(self, *, model="gpt-6.1-terra", error=None, text=None, budget=10):
+    def __init__(self, *, model="gpt-6.1-terra", error=None, text=None, budget=10,
+                 finish_reason="completed"):
         self.config = Config()
         self.serializer = XcodeClient(self.config.api_profile(), max_requests=0)
         self.returned_model = model
         self.error = error
-        self.text = text or '{"action":[0,0,0,0,0,0,-1]}'
+        self.text = text if text is not None else '{"action":[0,0,0,0,0,0,-1]}'
+        self.finish_reason = finish_reason
         self.attempts = 0
         self.max_requests = budget
         self.payloads = []
@@ -59,8 +62,9 @@ class FakeClient:
         if self.error:
             raise self.error
         return SimpleNamespace(
-            returned_model=self.returned_model, finish_reason="completed",
+            returned_model=self.returned_model, finish_reason=self.finish_reason,
             text=self.text, metadata=lambda: {"input_tokens": 1, "output_tokens": 1},
+            raw={"private": "DO_NOT_STORE_NATIVE_BODY"}, reasoning="DO_NOT_STORE_REASONING",
         )
 
 
@@ -110,16 +114,34 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(parse_action("```json\n" + text + "\n```", [-1] * 7, [1] * 7)[0], 0.1)
 
     def test_action_rejects_invalid_values_and_extra_fields(self):
-        for text in (
-            '{"action":[2,0,0,0,0,0,-1]}',
-            '{"action":[true,0,0,0,0,0,-1]}',
-            '{"action":[NaN,0,0,0,0,0,-1]}',
-            '{"action":[0,0,0]}',
-            '{"action":[0,0,0,0,0,0,-1],"success":true}',
-            'I think {"action":[0,0,0,0,0,0,-1]}',
+        for text, branch, details in (
+            ('{"action":[2,0,0,0,0,0,-1]}', "out_of_bounds",
+             {"coordinate": 0, "component": "dx", "actual_value": 2, "low": -1, "high": 1}),
+            ('{"action":[0,0,0,0,0,0,-2]}', "out_of_bounds",
+             {"coordinate": 6, "component": "gripper", "actual_value": -2}),
+            ('{"action":[true,0,0,0,0,0,-1]}', "value_type",
+             {"coordinate": 0, "actual_type": "bool", "actual_value": "True"}),
+            ('{"action":["0",0,0,0,0,0,-1]}', "value_type", {"actual_type": "str"}),
+            ('{"action":[{"x":NaN},0,0,0,0,0,-1]}', "value_type", {"actual_type": "dict"}),
+            ('{"action":[NaN,0,0,0,0,0,-1]}', "nonfinite", {"actual_value": "nan"}),
+            ('{"action":[Infinity,0,0,0,0,0,-1]}', "nonfinite", {"actual_value": "inf"}),
+            ('{"action":[1e400,0,0,0,0,0,-1]}', "nonfinite", {"actual_value": "inf"}),
+            ('{"action":[0,0,0]}', "action_dimension", {"expected_length": 7, "actual_length": 3}),
+            ('{"action":"0,0,0,0,0,0,-1"}', "action_type", {"actual_type": "str"}),
+            ('{"action":[0,0,0,0,0,0,-1],"success":true}', "action_fields",
+             {"actual_fields": ["action", "success"]}),
+            ('[]', "root_type", {"actual_type": "list"}),
+            ('I think {"action":[0,0,0,0,0,0,-1]}', "json_decode",
+             {"line": 1, "column": 1, "position": 0}),
+            ('', "json_decode", {"error_type": "JSONDecodeError"}),
         ):
-            with self.subTest(text=text), self.assertRaises(InvalidAction):
-                parse_action(text, [-1] * 7, [1] * 7)
+            with self.subTest(text=text):
+                with self.assertRaises(InvalidAction) as caught:
+                    parse_action(text, [-1] * 7, [1] * 7)
+                self.assertEqual(caught.exception.branch, branch)
+                for key, expected in details.items():
+                    self.assertEqual(caught.exception.details[key], expected)
+                json.dumps(caught.exception.details, allow_nan=False)
 
     def test_observation_excludes_scene_ground_truth(self):
         state, images = public_observation(observation(), "raw")
@@ -202,6 +224,40 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(sum(p["type"] == "input_image" for p in inputs), 2)
             self.assertEqual(client.attempts, 1)
             self.assertNotIn("DO_NOT_SEND", json.dumps(client.payloads))
+
+    def test_rejected_reply_preserves_text_and_never_executes_or_retries(self):
+        for text, finish, branch in (
+            (' \n```json\n{"action":[NaN,0,0,0,0,0,-1]}\n```\n ', "completed", "nonfinite"),
+            ('动作如下：\r\n{"action":[0,0,0,0,0,0,-1]}\n', "completed", "json_decode"),
+            ('{"action":[0,0,0,0,0,0,-1]}', "incomplete", "response_status"),
+        ):
+            with self.subTest(branch=branch), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                client, env = FakeClient(text=text, finish_reason=finish), FakeEnv()
+                journal = Journal(root / "trace.jsonl")
+                policy = GPTPolicy(client, Config(), CONTROLLER, journal, root / "observations",
+                                   failure_dir=root / "failures")
+                result = rollout(env, policy, "state", "task", 3, 5, journal)
+                self.assertEqual(result["status"], "invalid_action")
+                self.assertEqual(result["control_steps"], 0)
+                self.assertEqual(env.actions, [[0.] * 7] * 5)
+                self.assertEqual(client.attempts, 1)
+                self.assertIsNone(policy.last_action)
+                failure = result["action_failure"]
+                self.assertEqual(failure["branch"], branch)
+                artifact_path = root / failure["file"]
+                artifact = json.loads(artifact_path.read_text())
+                self.assertEqual(artifact["response_text"], text)
+                self.assertEqual(failure["sha256"], file_digest(artifact_path))
+                self.assertEqual(failure["response_text_sha256"],
+                                 hashlib.sha256(text.encode()).hexdigest())
+                events = [json.loads(line) for line in (root / "trace.jsonl").read_text().splitlines()]
+                rejection = next(e for e in events if e["event"] == "action_rejected")
+                self.assertEqual(rejection["action_failure"], failure)
+                request = next(e for e in events if e["event"] == "request_started")
+                self.assertEqual(request["payload_sha256"], failure["payload_sha256"])
+                self.assertFalse(any(e["event"] == "action_started" for e in events))
+                self.assertNotIn("DO_NOT_STORE", json.dumps(artifact) + json.dumps(events))
 
     def test_wrong_model_is_rejected_before_execution(self):
         with tempfile.TemporaryDirectory(prefix="libero-test-") as temp:
@@ -305,6 +361,16 @@ class RunnerTests(unittest.TestCase):
             "control_steps": ack, "manifest_sha256": digest(self.manifest),
         })
 
+    def rejected_result(self, index):
+        directory = self.directory / "episodes" / f"episode-{index}"
+        journal = Journal(directory / "trace.jsonl")
+        policy = GPTPolicy(FakeClient(text='{"action":[0,0,0]}'), Config(), CONTROLLER,
+                           journal, directory / "observations",
+                           failure_dir=directory / "failures")
+        result = rollout(FakeEnv(), policy, "state", "task", 2, 5, journal)
+        write_json(directory / "result.json", {**result, "manifest_sha256": digest(self.manifest)})
+        return directory
+
     def test_partial_summary_has_no_final_success_rate(self):
         self.result(0, "success", 1)
         summary = summarize(self.directory)
@@ -369,6 +435,99 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaises(RunnerError):
                 run(self.directory, resume=True)
             self.assertEqual(client.attempts, 1)
+
+    def test_live_loop_collects_failure_artifacts_and_rejects_later_tampering(self):
+        env = FakeEnv()
+        runtime = SimpleNamespace(
+            identity=self.manifest["upstream"], versions={},
+            settings=self.manifest["evaluation_settings"],
+            create_env=lambda task: env, initial_states=lambda suite, task_id: ["s0", "s1"],
+        )
+        text = ' \n{"action":[0,0,0,0,0,0,NaN]}\n'
+        client = FakeClient(text=text)
+        with patch("LIBERORunner.runner.Runtime", return_value=runtime), \
+             patch("LIBERORunner.runner.controller_spec", return_value=CONTROLLER), \
+             patch("LIBERORunner.runner.XcodeClient", return_value=client), \
+             patch("builtins.print"):
+            summary = run(self.directory)
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["per_suite"]["libero_spatial"]["protocol_failures"], 2)
+        self.assertEqual(client.attempts, 2)  # One request per episode, no repair request.
+        self.assertTrue(env.closed)
+        receipt = json.loads((self.directory / "final_collection.json").read_text())
+        for index in range(2):
+            episode = self.directory / "episodes" / f"episode-{index}"
+            result = json.loads((episode / "result.json").read_text())
+            failure = result["action_failure"]
+            path = episode / failure["file"]
+            self.assertEqual(failure["details"]["coordinate"], 6)
+            self.assertEqual(failure["details"]["component"], "gripper")
+            self.assertEqual(json.loads(path.read_text())["response_text"], text)
+            self.assertEqual(receipt["files"][str(path.relative_to(self.directory))],
+                             file_digest(path))
+            self.assertEqual(result["control_steps"], 0)
+        self.assertEqual(summarize(self.directory), summary)
+        path.write_text("changed")
+        with self.assertRaises(RunnerError):
+            summarize(self.directory)
+
+    def test_missing_or_inconsistent_failure_evidence_prevents_summary(self):
+        episode = self.rejected_result(0)
+        artifact_path = episode / "failures/0000-action.json"
+        trace_path = episode / "trace.jsonl"
+        result_path = episode / "result.json"
+        originals = {path: path.read_bytes() for path in (artifact_path, trace_path, result_path)}
+        for change in ("missing", "changed_text", "changed_trace", "changed_branch"):
+            with self.subTest(change=change):
+                for path, raw in originals.items():
+                    path.write_bytes(raw)
+                if change == "missing":
+                    artifact_path.unlink()
+                elif change == "changed_text":
+                    artifact = json.loads(artifact_path.read_text())
+                    artifact["response_text"] = '{"action":[1,1,1]}'
+                    write_json(artifact_path, artifact)
+                elif change == "changed_trace":
+                    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+                    next(e for e in events if e["event"] == "response_received")[
+                        "response_text_sha256"] = "changed"
+                    trace_path.write_text("".join(json.dumps(e) + "\n" for e in events))
+                else:
+                    result = json.loads(result_path.read_text())
+                    result["action_failure"]["branch"] = "out_of_bounds"
+                    write_json(result_path, result)
+                with self.assertRaises(RunnerError):
+                    summarize(self.directory)
+                self.assertFalse((self.directory / "final_collection.json").exists())
+
+    def test_failure_log_write_error_stops_run_as_operational_error(self):
+        env = FakeEnv()
+        runtime = SimpleNamespace(
+            identity=self.manifest["upstream"], versions={},
+            settings=self.manifest["evaluation_settings"],
+            create_env=lambda task: env, initial_states=lambda suite, task_id: ["s0", "s1"],
+        )
+        client = FakeClient(text='{"action":[0,0,0]}')
+
+        def fail_only_artifact(path, value):
+            if path.parent.name == "failures":
+                raise OSError("fixture")
+            write_json(path, value)
+
+        with patch("LIBERORunner.runner.Runtime", return_value=runtime), \
+             patch("LIBERORunner.runner.controller_spec", return_value=CONTROLLER), \
+             patch("LIBERORunner.runner.XcodeClient", return_value=client), \
+             patch("LIBERORunner.policy.write_json", side_effect=fail_only_artifact), \
+             patch("builtins.print"):
+            summary = run(self.directory)
+        self.assertFalse(summary["complete"])
+        self.assertEqual(client.attempts, 1)
+        self.assertEqual(env.actions, [[0.] * 7] * 5)
+        self.assertTrue(env.closed)
+        result = json.loads((self.directory / "episodes/episode-0/result.json").read_text())
+        self.assertEqual(result["status"], "operational_error")
+        self.assertEqual(result["error_type"], "OSError")
+        self.assertFalse((self.directory / "episodes/episode-1").exists())
 
     def test_prepare_probes_before_freezing_without_api(self):
         fresh = Path(self.temp.name) / "prepared"

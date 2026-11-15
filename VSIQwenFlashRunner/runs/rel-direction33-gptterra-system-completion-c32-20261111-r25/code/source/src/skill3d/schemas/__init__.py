@@ -1,0 +1,135 @@
+"""Skill3D 系统 Pydantic v2 Schema 单一事实源（对应系统架构.md §5）。
+
+所有模型统一 ``extra="forbid"``，字段 snake_case。
+所有阈值字段标注 TODO_CALIBRATE；GPT-6 相关字段标注 TODO_USER_INPUT。
+
+``ser_json_inf_nan="constants"``：G1–G11 等指标在数据缺失时按约定取 NaN
+（见 reconstruction_gate/quality_metrics.py），必须能经 JSON 往返而不丢语义；
+默认的 null 序列化会让 NaN 变成 None 并在回读时验证失败。
+"""
+
+from pydantic import BaseModel, ConfigDict
+
+
+class Spec(BaseModel):
+    """统一基类：禁止额外字段；NaN/Inf 以常量形式序列化（可无损往返）。"""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=(),
+                              ser_json_inf_nan="constants")
+
+
+from .episode import (
+    DataSplitConfig,
+    FrameSet,
+    InputFrame,
+    InputErrorRecord,
+    InputGateVerdict,
+    VSIBenchEpisode,
+)
+from .authorization import (
+    DECISION_VERSION,
+    DENIAL_REASON_CODES,
+    AuthorizationDecision,
+    ToolAuthorizationReceipt,
+    gate_result_payload,
+    not_applicable_gate,
+)
+from .answer import (
+    ADAPTER_VERSION_LEGACY_SHORT_FORM,
+    CANONICAL_UNIT_BY_QUESTION_TYPE,
+    DERIVATION_OPS,
+    AnswerBasis,
+    AnswerPayload,
+    AnswerUnit,
+    AttributionLedger,
+    AttributionVerification,
+    EpisodeStatus,
+    parse_answer_payload,
+    verify_attribution,
+)
+from .data_access import (
+    ACCESS_PURPOSES,
+    COMPONENT_ROLES,
+    DATA_SPLITS,
+    REFUSAL_REASON_CODES,
+    DataAccessRecord,
+    utcnow_iso,
+)
+from .evidence import (
+    CAPABILITIES,
+    CAPABILITY_ORDER,
+    GATE_SUBCONDITIONS,
+    GATE_VERSION,
+    UNAVAILABLE_REASON_CODES,
+    PROFILE_VERSION,
+    CapabilityState,
+    EvidenceProfile,
+    MetricGateStatus,
+    MetricEvidenceGateResult,
+    capability_at_least,
+    metric_scale_state_from_gate,
+    worst_state,
+)
+from .reconstruction import (
+    LEGACY_ONLY_FIELDS,
+    METRIC_TASK_TYPES,
+    QUALITY_METRIC_VERSION,
+    ConfidenceMap,
+    ObjectInstance,
+    ObjectRecord,
+    QualityMetrics,
+    ReconstructionArtifact,
+    SceneState,
+)
+from .legacy import LegacyArtifact, LegacyArtifactError
+from .retrieval import (
+    CANDIDATE_REASON_CODES,
+    DELIVERY_CHANNELS,
+    DELIVERY_STATES,
+    RETRIEVAL_RECORD_SCHEMA_VERSION,
+    RETRIEVAL_TRIGGERS,
+    SkillCandidateRecord,
+    SkillRetrievalRecord,
+    short_method_summary,
+)
+from .tool import FailureCause, ToolCall, ToolResult, ToolSpec
+from .program import ASTCheckResult, EpisodeProgram, ProgramExecutionTrace
+from .skill import (
+    RetrievedSkill,
+    SkillCandidateV11,
+    SkillSpecV11,
+    normalize_skill_markdown,
+    parse_skill_markdown,
+)
+from .evolution import GPUJob, SkillEvaluationBinding
+from .evolution_v11 import (
+    V11_CAMPAIGN_SCHEMA_VERSION,
+    V11_EVALUATION_SCHEMA_VERSION,
+    V11_EXPERIENCE_SCHEMA_VERSION,
+    V11CampaignCheckpoint,
+    V11CampaignDecision,
+    V11CampaignStatus,
+    V11EvaluationArm,
+    V11ExperienceBundle,
+    V11ExperienceCase,
+    V11PairedEvaluationReceipt,
+    V11PostPublishObservation,
+    V11PostPublishReceipt,
+    V11PublicationReceipt,
+    V11ReceiptRef,
+    V11RollbackReceipt,
+    V11RevisionAttemptReceipt,
+    V11RevisionProposal,
+    V11StaticValidationReceipt,
+)
+from .trace import (
+    EpisodeInputTrace,
+    EpisodeTrace,
+    EvaluationResultTrace,
+    EvaluationRun,
+    FailureTaxonomy,
+    RunManifest,
+    TraceRecord,
+)
+
+__all__ = [name for name in dir() if not name.startswith("_")]

@@ -96,12 +96,13 @@ class DiagnosticClientFactory:
     output: Path
     endpoint: str
     enable_thinking: bool = False
+    perception_capacity: int = 8
 
     def __call__(self, variant_id):
         from skill3d.infra.experiment_stages_v11 import fitset_cli
         return FailClosedClient(fitset_cli()._SeededClientFactory(
             self.config, 137, self.output, self.endpoint,
-            perception_capacity=8, deferred_admission=True)(variant_id),
+            perception_capacity=self.perception_capacity, deferred_admission=True)(variant_id),
             enable_thinking=self.enable_thinking)
 
 
@@ -112,7 +113,7 @@ def write(path, value):
     temporary.replace(path)
 
 
-def authenticate(endpoint):
+def authenticate(endpoint, expected_capacity=8):
     env_file = Path("/home/wangy/wangjh/harness3d/precompute-20261022-r01/.transfer.env")
     values = {}
     for line in env_file.read_text().splitlines():
@@ -138,7 +139,7 @@ def authenticate(endpoint):
         raw = response.read(65537)
     assert token.encode() not in raw
     health = json.loads(raw)
-    assert health["status"] == "ready" and health["max_concurrency"] == 8
+    assert health["status"] == "ready" and health["max_concurrency"] == expected_capacity
     return {k: health[k] for k in ("schema_version", "status", "identity",
                                   "max_concurrency", "upstream") if k in health}
 
@@ -151,6 +152,8 @@ def main():
     args = parser.parse_args()
     root = args.run_root.resolve()
     manifest = json.loads((root / "diagnostic.json").read_text())
+    if manifest["runtime"].get("detector_endpoint"):
+        os.environ["SKILL3D_DETECTOR_ENDPOINT"] = manifest["runtime"]["detector_endpoint"]
     source = root / "code/source"
     sys.path.insert(0, str(source / "src"))
     from skill3d.evaluation.fitset_v11 import (
@@ -188,10 +191,11 @@ def main():
     )
     panel = load_fitset_panel(inputs / "panel.json")
     variants, gates, split = cli._select_experiment_variants(panel, selector)
-    assert len(variants) == 40 and not gates
+    assert len(variants) == manifest["n_questions"] and not gates
     assert Counter(row["question_type"] for row in variants) == manifest["task_counts"]
     endpoint = manifest["runtime"].get("perception_endpoint", "http://10.10.0.198:27035")
-    health = authenticate(endpoint)
+    capacity = manifest["runtime"]["request_concurrency"]
+    health = authenticate(endpoint, expected_capacity=capacity)
     model_config = {"online_model": asdict(online_model_from(raw))}
     client = cli._RevisionClientFactory(model_config, cfg.max_tokens, endpoint)()
     assert health["identity"] == client.audit_identity()
@@ -199,7 +203,8 @@ def main():
     thinking = manifest["runtime"].get("enable_thinking", False)
     if args.action == "direct":
         from skill3d.infra.experiment_stages_v11 import baseline32
-        assert thinking is True
+        direct_thinking = manifest["runtime"].get("direct_enable_thinking", thinking)
+        assert isinstance(direct_thinking, bool)
         governor_root = None
         continuation = manifest.get("direct_continuation")
         if continuation:
@@ -230,7 +235,7 @@ def main():
         write(root / "direct_start.json", {
             "started_at": start, "pid": os.getpid(), "diagnostic_identity": manifest["identity_sha256"],
             "automatic_model_retry": False, "reference_answer_visible": False,
-            "enable_thinking": True, "max_requests_per_question": 1})
+            "enable_thinking": direct_thinking, "max_requests_per_question": 1})
         direct_manifest = {
             "run_root": str(root), "identity_sha256": manifest["identity_sha256"],
             "profile": {
@@ -239,11 +244,11 @@ def main():
                            "online_config": str(inputs / "online.yaml")},
                 "runtime": {**manifest["runtime"], "seed": 137, "requests_per_second": 0,
                             "perception_endpoint": endpoint},
-                "baseline": {"workers": 4},
+                "baseline": {"workers": manifest["runtime"].get("direct_workers", 4)},
             },
         }
         summary = baseline32(direct_manifest, root / "direct", variants=variants,
-                             enable_thinking=True, rgb_only=True,
+                             enable_thinking=direct_thinking, rgb_only=True,
                              request_governor_root=governor_root)
         write(root / "direct_receipt.json", {
             "status": "complete", "started_at": start, "finished_at": time.time(),
@@ -254,12 +259,19 @@ def main():
     if not bundle.exists():
         parents, snapshot = load_active_parent_slots(source / "skill_library")
         build_fit_skill_bundle(
-            output_dir=bundle.parent, bundle_id="diagnostic40-" + manifest["identity_sha256"][:16],
+            output_dir=bundle.parent, bundle_id="diagnostic-" + manifest["identity_sha256"][:16],
             candidates={}, active_parents=parents, source_run_identity=snapshot)
+    replay = manifest.get("derived_replay")
+    binding_cfg = (cli._base_config(resolve_runtime(
+        load_config(inputs / replay["binding_config"]), seed=137)) if replay else cfg)
     provider = SceneParallelInputs(DerivedPublishedFitSetInputProvider(
         inputs / "published_inputs.json",
-        derivation_root=root / "prepared_cache/derived_bindings_v4_metric",
-        binding_cfg=cfg, max_scenes=manifest["runtime"]["scene_cache_size"],
+        derivation_root=(replay["derivation_root"] if replay
+                         else root / "prepared_cache/derived_bindings_v4"),
+        derived_replay=(json.loads((inputs / replay["file"]).read_text()) if replay else None),
+        transport_locator=({"schema_version": "published-physical-transport-v1",
+                            "files": {}, "roots": {}} if replay else None),
+        binding_cfg=binding_cfg, max_scenes=manifest["runtime"]["scene_cache_size"],
         audit_mode="reuse_source_audit"))
     runner = SystemVariantRunner(
         output_root=output, panel=panel, panel_name="ready_579",
@@ -269,32 +281,35 @@ def main():
             **provider.input_contract_identity,
             "offline_metadata": file_identity(inputs / "host_evaluation/metadata.jsonl"),
             "diagnostic_identity": manifest["identity_sha256"],
-            "model_transport": {"kind": "perception_rpc", "upstream_capacity": 8,
+            "model_transport": {"kind": "perception_rpc", "upstream_capacity": capacity,
                                 "endpoint_sha256": hashlib.sha256(endpoint.encode()).hexdigest()},
         },
         binding_refs={row["variant_id"]: provider.public_entry(row)["reference"] for row in variants},
         base_cfg=cfg, phase="final_system", published_inputs=provider,
         experiment_split=split, scene_overviews=SceneOverviewStore(inputs / "scene_overviews/manifest.json"),
         skills_for_variant=cli._fit_skill_provider(bundle),
-        min_free_gib=80, workers=16, scheduler="episode_pool", skill_owners=4,
+        min_free_gib=manifest["runtime"].get("min_free_gib", 80),
+        workers=manifest["runtime"]["workers"], scheduler="episode_pool", skill_owners=4,
         offline_frame_storage="shared_scene_v2", prefetch_scenes=True,
-        episode_concurrency=16,
-        request_governor_config=RequestGovernorConfig(manifest["runtime"]["max_requests"], 8, 0),
-        client_factory=DiagnosticClientFactory(model_config, output, endpoint, thinking),
+        episode_concurrency=manifest["runtime"]["episode_concurrency"],
+        request_governor_config=RequestGovernorConfig(manifest["runtime"]["max_requests"], capacity, 0),
+        client_factory=DiagnosticClientFactory(model_config, output, endpoint, thinking, capacity),
     )
     runner._request_governor_root = root / "requests"
     start = time.time()
     if args.action == "preflight":
         assert not (output / "manifest.json").exists()
         summary = runner.preflight(resume=False)
-        assert summary["status"] == "complete" and summary["completed_preflights"] == 40
+        assert summary["status"] == "complete" and summary["completed_preflights"] == manifest["n_questions"]
         assert summary["model_requests"] == 0
+        expected_states = {row["variant_id"]: row["evidence_state"] for row in variants}
         for receipt in (output / "preflight").glob("*.json"):
             value = json.loads(receipt.read_text())
-            assert value["runtime_evidence_state"] == "g1m1"
+            assert value["runtime_evidence_state"] == expected_states[value["variant_id"]]
     else:
         if args.skip_validated_preflight:
-            assert manifest["runtime"]["question_preflight"] == "skipped_per_user_instruction"
+            assert manifest["runtime"]["question_preflight"] in {
+                "skipped_per_user_instruction", "per_episode_before_first_call"}
         else:
             preflight = json.loads((output / "preflight_summary.json").read_text())
             assert preflight["status"] == "complete" and preflight["model_requests"] == 0
@@ -303,9 +318,10 @@ def main():
             "started_at": start, "pid": os.getpid(), "diagnostic_identity": manifest["identity_sha256"],
             "automatic_model_retry": False, "reference_answer_visible": False,
             "enable_thinking": thinking,
-            "question_preflight_skipped": args.skip_validated_preflight})
+            "question_preflight_skipped": args.skip_validated_preflight,
+            "per_episode_input_validation": True})
         summary = runner.run(resume=(output / "manifest.json").exists())
-        assert summary["status"] == "complete" and summary["completed_variants"] == 40
+        assert summary["status"] == "complete" and summary["completed_variants"] == manifest["n_questions"]
     write(root / (args.action + "_receipt.json"), {
         "status": "complete", "started_at": start, "finished_at": time.time(),
         "summary": summary, "reference_answer_visible": False})

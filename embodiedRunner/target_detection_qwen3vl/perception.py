@@ -4,9 +4,9 @@ import io
 import math
 
 from target_detection_r05.perception import (
-    COLORS, Perception as ParentPerception, PlannerError, png_bytes,
+    COLORS, Perception as ParentPerception, PlannerError, png_bytes, validate_targets,
 )
-from .detector import Detector
+from .detector import Detector, valid_detection_query
 from .sources import digest
 
 
@@ -87,6 +87,10 @@ class Perception(ParentPerception):
         self.overlay, self.crops, self.page = None, [], 0
         self.pipeline_preparations = 0
         self.token_usage = {}
+
+    def _validate_targets(self, value):
+        return validate_targets(value, self.public["instruction"],
+                                category_validator=valid_detection_query)
 
     def bind(self, public, serial):
         previous = self.current

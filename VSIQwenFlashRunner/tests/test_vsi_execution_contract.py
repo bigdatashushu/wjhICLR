@@ -340,9 +340,13 @@ def test_source_report_and_runner_prompt_have_truthful_supplement_identity():
     assert Path(importlib.import_module("skill3d.sandbox.kernel").__file__).is_relative_to(
         ROOT.parent / "src")  # shared runtime stays read-only
     episode = SimpleNamespace(question="Synthetic question", question_type="object_counting", options=[])
-    prompt, _plan = runner._build_prompt_ex(episode, scene(), scene(), [], None)
-    assert VSI_INTERFACE_VERSION in prompt and OBSERVATION_EXAMPLE in prompt
-    assert len(VSI_INTERFACE_SHA256) == 64 and runner.PROMPT_TEMPLATE_VERSION.endswith("+vsi-interfaces-1")
+    loaded = scene()
+    loaded.available_artifacts = {"objects"}
+    prompt, _plan = runner._build_prompt_ex(episode, loaded, loaded, [], None)
+    assert VSI_INTERFACE_VERSION in prompt and OBSERVATION_EXAMPLE not in prompt
+    from skill3d.synthesis.counting_context import COUNTING_CONTEXT_VERSION
+    assert COUNTING_CONTEXT_VERSION in prompt and "no illustrative fixed count" in prompt
+    assert len(VSI_INTERFACE_SHA256) == 64 and runner.PROMPT_TEMPLATE_VERSION.endswith("+vsi-interfaces-2")
     assert hashlib.sha256(prompt.encode()).hexdigest()
 
 
@@ -369,8 +373,10 @@ def test_actual_synthesis_request_uses_phase_format_and_separate_contract_identi
         question="Estimate the largest dimension in centimeters.",
         question_type="object_size_estimation", options=[])
     cfg = runner.OnlineRunConfig(mode="real", online_model_enabled=False)
+    loaded = scene("object_size_estimation")
+    loaded.available_artifacts = {"objects"}
     result = runner._synthesize(
-        episode, scene("object_size_estimation"), scene("object_size_estimation"),
+        episode, loaded, loaded,
         [], cfg, client, pixels=[np.zeros((8, 8, 3), dtype=np.uint8)],
         trigger="finalize" if finalizing else "initial")
     assert result.program is not None, result.note
@@ -380,7 +386,7 @@ def test_actual_synthesis_request_uses_phase_format_and_separate_contract_identi
     assert context["execution_contract_sha256"] == ExecutionContract(
         cfg.retrieval_policy.method_context_max_chars).sha256
     assert context["tool_execution_allowed"] is (not finalizing)
-    assert context["prompt_version"].endswith("+vsi-interfaces-1")
+    assert context["prompt_version"].endswith("+vsi-interfaces-2")
     if finalizing:
         assert finalization_example(episode.question_type) in result.prompt
         assert "no markdown fences, Python" in result.prompt

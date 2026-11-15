@@ -12,7 +12,7 @@
   },
   "runtime": {
     "seed": 137,
-    "derived_binding_root": "{run_root}/prepared_cache/derived_bindings_v4_metric",
+    "derived_binding_root": "{run_root}/prepared_cache/derived_bindings_v4",
     "binding_derivation_audit_mode": "reuse_source_audit",
     "panel_name": "ready_579",
     "workers": 16,
